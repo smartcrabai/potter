@@ -20,7 +20,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GENERATOR = os.path.join(HERE, "realtime_transparent_tint.py")
-METHODS = ["BLENDED", "DITHERED"]
+METHODS = ["BLENDED", "MIX", "DITHERED"]
 SHIFTS = [k * 0.0001 for k in range(1, 9)]
 
 

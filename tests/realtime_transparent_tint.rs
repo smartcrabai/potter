@@ -1,7 +1,9 @@
-//! Realtime Beauty tints what a Transparent BSDF passes, as EEVEE 5.2.2 does, for a BLENDED pane.
+//! Realtime Beauty tints what a Transparent BSDF passes, as EEVEE 5.2.2 does, for a BLENDED pane and for a Mix Shader of
+//! a Transparent and an opaque closure.
 //!
 //! `realtime_transparent_tint.py` renders a pane whose Transparent BSDF has the Color (0.2, 0.8, 0.4) in front of an
-//! emitter of radiance 1. A BLENDED pane keeps the Color per channel, and EEVEE's mean matches Potter's within the
+//! emitter of radiance 1. A BLENDED pane keeps the Color per channel; a MIX pane (Mix 0.5 with an opaque black Principled)
+//! passes 0.5 of it, which tests the weighted sum over transparent closures. EEVEE's means match Potter's within the
 //! half-float rounding of the EXR. This test writes the scene with Blender and renders only Potter.
 //!
 //! DITHERED is not asserted. EEVEE's dithered mean sits 0.00956 above the Color's channel mean, 13 standard errors, and
@@ -41,8 +43,10 @@ const EEVEE: &str = include_str!("fixtures/native_oracle/realtime_transparent_ti
 const PATCH: [f64; 9] = [
     0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
 ];
-/// The render methods the oracle asserts. DITHERED is recorded in `realtime_transparent_tint.json` but not asserted.
-const METHODS: [&str; 1] = ["BLENDED"];
+/// The render methods the oracle asserts. BLENDED is one Transparent closure; MIX is a Mix(0.5) of a Transparent and an
+/// opaque closure, so the surface's tint is the weighted sum over the transparent closures. DITHERED is recorded in
+/// `realtime_transparent_tint.json` but not asserted.
+const METHODS: [&str; 2] = ["BLENDED", "MIX"];
 
 /// The expected patch mean per channel and tolerance for `method`: EEVEE's measured mean, within the half-float
 /// rounding of its EXR.

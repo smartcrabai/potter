@@ -8,6 +8,12 @@
       "tolerance": 0.000244140625,
       "derivation": "EEVEE's value is the same at every shift (sigma 0). The EXR is half-float; for values in [0.5, 1) the rounding error is at most 2^-12 = 0.000244140625. The test asserts Potter against this mean with that bound alone."
     },
+    "MIX": {
+      "eevee_patch_mean": [0.0999755859375, 0.39990234375, 0.199951171875],
+      "eevee_sigma": 0.0,
+      "tolerance": 0.000244140625,
+      "derivation": "A Mix Shader at Fac 0.5 of the Transparent pane (Color TINT) and an opaque black Principled, rendered BLENDED. The opaque closure passes nothing, so EEVEE sums the transmittance to 0.5 * TINT (`eevee_nodetree_lib.bsl.hh`, closure_eval(ClosureTransparency), weighted by the closure weights), and the pane shows that over the radiance-1 backdrop: (0.1, 0.4, 0.2). EEVEE's value is the same at every one of the 8 shifts (sigma 0). The half-float rounding bound of the EXR for these values is at most 2^-13; the test uses 2^-12, the bound BLENDED uses, as a margin. Potter's weighted sum (`render/scene.rs` surface_tint) gives the same 0.5 * TINT by hand (`weighted_tint` tests)."
+    },
     "DITHERED": {
       "exact_channel_mean": 0.4666666666666666,
       "eevee_patch_mean_over_shifts": 0.4762264298804012,

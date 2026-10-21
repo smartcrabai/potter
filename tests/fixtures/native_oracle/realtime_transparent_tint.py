@@ -68,7 +68,7 @@ bpy.context.object.data.materials.append(backdrop)
 
 pane = bpy.data.materials.new("Pane")
 pane.use_nodes = True
-if method == "BLENDED":
+if method == "BLENDED" or method == "MIX":
     pane.surface_render_method = "BLENDED"
 elif method == "DITHERED":
     pane.surface_render_method = "DITHERED"
@@ -81,7 +81,20 @@ for node in list(tree.nodes):
 output = next(node for node in tree.nodes if node.type == "OUTPUT_MATERIAL")
 transparent = tree.nodes.new("ShaderNodeBsdfTransparent")
 transparent.inputs["Color"].default_value = (TINT[0], TINT[1], TINT[2], 1.0)
-tree.links.new(transparent.outputs["BSDF"], output.inputs["Surface"])
+if method == "MIX":
+    # Mix(0.5) of the Transparent pane and an opaque black Principled: the opaque closure passes nothing, so the pane's
+    # transmittance is 0.5 * TINT, summed over the two closures (`eevee_nodetree_lib.bsl.hh`, closure_eval).
+    opaque = tree.nodes.new("ShaderNodeBsdfPrincipled")
+    opaque.inputs["Base Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    opaque.inputs["Specular IOR Level"].default_value = 0.0
+    opaque.inputs["Emission Strength"].default_value = 0.0
+    mix = tree.nodes.new("ShaderNodeMixShader")
+    mix.inputs["Fac"].default_value = 0.5
+    tree.links.new(transparent.outputs["BSDF"], mix.inputs[1])
+    tree.links.new(opaque.outputs["BSDF"], mix.inputs[2])
+    tree.links.new(mix.outputs["Shader"], output.inputs["Surface"])
+else:
+    tree.links.new(transparent.outputs["BSDF"], output.inputs["Surface"])
 bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, SHIFT_Y, 1.0))
 bpy.context.object.data.materials.append(pane)
 
