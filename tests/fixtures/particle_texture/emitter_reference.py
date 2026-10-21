@@ -1,10 +1,11 @@
 """Float32 reference of Blender 5.2.2 particle emitter placement, checked against Blender in headless mode.
 
 It reproduces `distribute_particles` with `distribute_from_faces_exec` and `distribute_from_volume_exec`
-(FACE, VOLUME), `distribute_grid` (GRID, with the watertight ray test), `psys_frand`, and the jitter
-tables, all with float32 steps. It needs Blender's numpy, so run it inside Blender with a script that
-imports this file. The Blender values it is checked against are `particles[p].location` in
-`blender_expected.json` from `generate.py`, whose cases give the meshes and settings.
+(FACE, VOLUME), `distribute_grid` (GRID, with the watertight ray test), `psys_frand`, the jitter tables,
+and the vertex-group density weights (`psys_cache_vgroup`), all with float32 steps. It needs Blender's
+numpy, so run it inside Blender with a script that imports this file. The Blender values it is checked
+against are `particles[p].location` in `blender_expected.json` from `generate.py`, whose cases give the
+meshes and settings.
 """
 import math
 import os
@@ -18,7 +19,6 @@ PSYS_RND_DIST_SKIP = 3
 
 class Rng:
     """BLI RandomNumberGenerator (rand.cc / BLI_rand.hh)."""
-    HASH = None
 
     def __init__(self, state):
         self.x = state & 0xFFFFFFFFFFFF
@@ -435,7 +435,7 @@ def array_randomize(pairs, num, seed):
 
 
 def face_tables(polys, positions, smooth_flags, normals, count, seed, from_volume, distr,
-                even, use_random, jitfac, userjit):
+                even, use_random, jitfac, userjit, density=None):
     """Returns per-particle (element, fuv(4), foffset) following distribute_particles + exec."""
     # Tessfaces: (vertex indices (4 entries, v4=-1 for tri), smooth flag, source poly)
     tess = []
@@ -466,12 +466,22 @@ def face_tables(polys, positions, smooth_flags, normals, count, seed, from_volum
     else:
         mn = F(F(1.0) / F(min(totelem, totpart)))
         weight = [mn] * totelem
+    if density is not None:
+        for i, (t, _s) in enumerate(tess):
+            vs = [t[0], t[1], t[2]] + ([t[3]] if t[3] >= 0 else [])
+            tweight = F(0.0)
+            for v in vs:
+                tweight = F(tweight + density[v])
+            weight[i] = F(weight[i] * F(tweight / F(len(vs))))
     totweight = F(0.0)
     totmapped = 0
     for w in weight:
         if w > F(0.0):
             totmapped += 1
             totweight = F(totweight + w)
+    if totmapped == 0:
+        # Blender leaves the particles zeroed: element 0 with the origin as its position.
+        return [(0, [F(0.0)] * 4, F(0.0), None, None) for _ in range(totpart)], tess
     inv = F(F(1.0) / totweight)
     element_sum = []
     element_map = []
@@ -807,3 +817,48 @@ def distribute_grid(positions, tess, res, grid_rand, hexagonal, invert, volume, 
 
 def sub(a, b):
     return [F(a[0] - b[0]), F(a[1] - b[1]), F(a[2] - b[2])]
+
+
+def vertex_tables(positions, count, seed, use_random, density=None):
+    """VERT: the element of each particle, from the density-weighted vertex weights (distribute_particles)."""
+    n = len(positions)
+    if n == 0 or count == 0:
+        return []
+    weight = F(F(1.0) / F(min(n, count)))
+    weights = [weight] * n
+    if density is not None:
+        weights = [F(weights[i] * density[i]) for i in range(n)]
+    total = F(0.0)
+    for w in weights:
+        if w > F(0.0):
+            total = F(total + w)
+    if total == F(0.0):
+        return [0] * count
+    inv = F(F(1.0) / total)
+    element_sum, element_map = [], []
+    first = next(i for i in range(n) if weights[i] > F(0.0))
+    element_sum.append(F(weights[first] * inv))
+    element_map.append(first)
+    for k in range(first + 1, n):
+        if weights[k] > F(0.0):
+            nxt = F(element_sum[-1] + F(weights[k] * inv))
+            if nxt > element_sum[-1]:
+                element_sum.append(nxt)
+                element_map.append(k)
+    mapped = len(element_sum)
+    out = []
+    if use_random:
+        rng = Rng.seed_random((31415926 + seed) & 0xFFFFFFFF)
+        for p in range(count):
+            pos = F(F(rng.get_float()) * element_sum[mapped - 1])
+            out.append(element_map[binary_search(element_sum, mapped, pos)])
+    else:
+        step = 0.5 if count < 2 else 1.0 / float(count)
+        pos = 0.5 / float(mapped) if count < mapped else step * 0.5
+        i = 0
+        for p in range(count):
+            while i < mapped - 1 and pos > float(element_sum[i]):
+                i += 1
+            out.append(element_map[i])
+            pos += step
+    return out

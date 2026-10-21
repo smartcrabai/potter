@@ -652,12 +652,15 @@ fn simulate_with_lifecycle(
         .get("use_emit_random")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    // Blender's `psys_cache_vgroup` density weights scale each element's weight (`distribute_particles`).
+    let density = vertex_density(mesh, settings)?;
     let vertex_elements = if from_vertex {
         particle_distribution::vertex_elements(
             mesh.vertices.len(),
             count as usize,
             system_seed,
             use_emit_random,
+            density.as_deref(),
         )
     } else {
         Vec::new()
@@ -672,6 +675,7 @@ fn simulate_with_lifecycle(
             system_seed,
             from_volume,
             emitter_distribution,
+            density.as_deref(),
         )?
     };
     // Index of the next particle that exists; Blender renumbers particles after removing the others.
@@ -713,14 +717,14 @@ fn simulate_with_lifecycle(
             let normal = normal_transform
                 .transform_vector3(local_normal)
                 .normalize_or_zero();
-            // Blender's grid normal stays zero, so a grid birth adds no normal velocity; other emitters
-            // without a normal point along +Z.
+            // A birth without a normal adds no normal velocity: Blender's normal stays zero for a grid cell
+            // and for a face left zeroed by an empty distribution. Only a vertex falls back to +Z.
             let direction = if normal.length_squared() > 0.0 {
                 normal
-            } else if grid_resolution.is_some() {
-                DVec3::ZERO
-            } else {
+            } else if from_vertex {
                 DVec3::Z
+            } else {
+                DVec3::ZERO
             };
             let local_random = DVec3::new(
                 random.signed() * random_velocity.x,
@@ -1246,8 +1250,63 @@ fn grid_resolution_setting(settings: &Value) -> Result<usize> {
     Ok(resolution as usize)
 }
 
+/// Blender's `psys_cache_vgroup` for `PSYS_VG_DENSITY`: each vertex's weight in the density group, or one
+/// minus it with `invert_vertex_group_density`. A vertex outside the group weighs zero. No density applies
+/// when no group is named, the named group is missing, or the mesh has no vertex weights at all, as
+/// Blender then has no weight array.
+fn vertex_density(mesh: &Mesh, settings: &Value) -> Result<Option<Vec<f32>>> {
+    let name = match settings.get("vertex_group_density") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(name)) => name.as_str(),
+        Some(_) => {
+            return Err(invalid(
+                "particle vertex_group_density must be a group name",
+            ));
+        }
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let invert = settings
+        .get("invert_vertex_group_density")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(groups) = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let weighted = groups
+        .values()
+        .any(|values| values.as_object().is_some_and(|map| !map.is_empty()));
+    let Some(group) = groups.get(name).and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    if !weighted {
+        return Ok(None);
+    }
+    let mut density = Vec::with_capacity(mesh.vertices.len());
+    for vertex in &mesh.vertices {
+        let weight = match group.get(&format!("v{}", vertex.id)) {
+            None => 0.0,
+            Some(value) => value
+                .as_f64()
+                .filter(|weight| weight.is_finite() && (0.0..=1.0).contains(weight))
+                .ok_or_else(|| {
+                    invalid("particle density vertex group weights must be in [0, 1]")
+                })?,
+        };
+        let weight = if invert { 1.0 - weight } else { weight };
+        density.push(weight as f32);
+    }
+    Ok(Some(density))
+}
+
 /// Blender's `distribute_particles` for `PART_FROM_FACE` and `PART_FROM_VOLUME`: the birth sample of
-/// each particle, or none where a grid cell is removed or no element can take a particle.
+/// each particle, or none where a grid cell is removed. `density` is the density group's weight per
+/// vertex, when the emitter has one; a grid ignores it, as Blender's grid does.
 fn face_emitter_samples(
     mesh: &Mesh,
     settings: &Value,
@@ -1255,6 +1314,7 @@ fn face_emitter_samples(
     system_seed: u32,
     volume: bool,
     distribution: EmitterDistribution,
+    density: Option<&[f32]>,
 ) -> Result<Vec<Option<particle_distribution::FaceSample>>> {
     if count > MAX_PARTICLES as f64 {
         return Err(limit(
@@ -1334,6 +1394,7 @@ fn face_emitter_samples(
     Ok(particle_distribution::distribute_faces(
         &emitter,
         settings_for_distribution,
+        density,
     ))
 }
 

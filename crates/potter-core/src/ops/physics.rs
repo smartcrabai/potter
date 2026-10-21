@@ -1213,6 +1213,8 @@ fn validate_physics_settings(
             "frame_start",
             "frame_end",
             "instance_collection",
+            "vertex_group_density",
+            "invert_vertex_group_density",
         ],
         "fluid" => &[
             "type",
@@ -1272,8 +1274,15 @@ fn validate_physics_settings(
             | "child_size_random" | "child_roundness" | "virtual_parents" | "restitution" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
-            "use_particle_kill" | "collision_enabled" | "use_collision" | "use_self_collision"
-            | "use_culling" | "use_normal" | "use_emit_random" => value.is_boolean(),
+            "use_particle_kill"
+            | "collision_enabled"
+            | "use_collision"
+            | "use_self_collision"
+            | "use_culling"
+            | "use_normal"
+            | "use_emit_random"
+            | "invert_vertex_group_density" => value.is_boolean(),
+            "vertex_group_density" => value.is_string(),
             "seed" | "child_seed" => value
                 .as_u64()
                 .is_some_and(|seed| u32::try_from(seed).is_ok()),

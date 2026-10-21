@@ -605,6 +605,10 @@ def _physics_modifier_settings(obj, modifier):
         if particle_system:
             result["seed"] = int(particle_system.seed)
             result["child_seed"] = int(particle_system.child_seed)
+            # The density group belongs to the particle system (`psys->vgroup`), not its settings.
+            result["vertex_group_density"] = particle_system.vertex_group_density
+            result["invert_vertex_group_density"] = bool(
+                particle_system.invert_vertex_group_density)
             source_systems = obj.particle_systems
             system_index = next(
                 (index for index, system in enumerate(source_systems)
@@ -3794,6 +3798,10 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         particle_type = settings.pop("type", None) if kind == "particle_system" else None
         particle_hair_key_data = (settings.pop("_potter_hair_key_data", None)
                                   if kind == "particle_system" else None)
+        particle_density_group = (settings.pop("vertex_group_density", None)
+                                  if kind == "particle_system" else None)
+        particle_density_invert = (settings.pop("invert_vertex_group_density", None)
+                                   if kind == "particle_system" else None)
         for internal_key in (
             "_potter_path_keys", "_potter_child_path_keys", "_potter_path_interpolation",
             "_potter_hair_current_states",
@@ -3823,6 +3831,10 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
             particle_system.seed = int(particle_seed)
         if particle_system is not None and particle_child_seed is not None:
             particle_system.child_seed = int(particle_child_seed)
+        if particle_system is not None and particle_density_group is not None:
+            particle_system.vertex_group_density = str(particle_density_group)
+        if particle_system is not None and particle_density_invert is not None:
+            particle_system.invert_vertex_group_density = bool(particle_density_invert)
         if particle_hair_key_data is not None:
             if particle_system is None or particle_type != "HAIR":
                 raise ValueError("Hair key data requires a Hair particle system")

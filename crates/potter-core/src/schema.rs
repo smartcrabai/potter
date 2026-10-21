@@ -2597,6 +2597,8 @@ fn physics_settings_properties(operation: &str) -> Value {
             "child_roundness":{"type":"number","minimum":0,"maximum":1},
             "virtual_parents":{"type":"number","minimum":0,"maximum":1},
             "use_emit_random":{"type":"boolean"},
+            "vertex_group_density":{"type":"string"},
+            "invert_vertex_group_density":{"type":"boolean"},
             "frame_start":{"type":"number"},
             "frame_end":{"type":"number"}
         }),

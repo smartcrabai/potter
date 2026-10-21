@@ -230,6 +230,9 @@ PENTAGON_VERTICES = [(0.0, 0.0, 0.0), (3.0, 0.0, 0.0), (3.0, 3.0, 0.0), (1.5, 1.
 HEXAGON_VERTICES = [(0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (4.0, 4.0, 0.0), (2.0, 1.0, 0.0),
                     (0.0, 4.0, 0.0), (-1.0, 2.0, 0.0)]
 
+# Vertex-group density weights of the cube; vertex 5 is outside the group and weighs zero.
+CUBE_DENSITY = {0: 0.0, 1: 0.25, 2: 0.5, 3: 1.0, 4: 0.75, 6: 1.0, 7: 0.5}
+
 # (name, vertices, faces, count, emit_from, options): options set the distribution fields.
 EMITTER_CASES = [
     ("face_quad_jit", SQUARE_VERTICES, [(0, 1, 2, 3)], 8, "FACE", {}),
@@ -259,7 +262,22 @@ EMITTER_CASES = [
     ("ngon_face_pentagon_jit", PENTAGON_VERTICES, [(0, 1, 2, 3, 4)], 20, "FACE", {}),
     ("ngon_face_hexagon_rand_uneven", HEXAGON_VERTICES, [(0, 1, 2, 3, 4, 5)], 25, "FACE",
      {"distribution": "RAND", "even": False}),
-]
+    # Density group cases: `density` maps vertex index to weight (absent vertices weigh zero), and
+    # `invert` negates it. Cube vertex 5 is outside the group.
+    ("density_vertex_cube", CUBE_VERTICES, CUBE_FACES, 20, "VERT", {"density": CUBE_DENSITY}),
+    ("density_vertex_cube_inverted", CUBE_VERTICES, CUBE_FACES, 20, "VERT",
+     {"density": CUBE_DENSITY, "invert": True}),
+    ("density_face_cube", CUBE_VERTICES, CUBE_FACES, 30, "FACE", {"density": CUBE_DENSITY}),
+    ("density_face_cube_uneven_rand_inverted", CUBE_VERTICES, CUBE_FACES, 25, "FACE",
+     {"density": CUBE_DENSITY, "invert": True, "distribution": "RAND", "even": False}),
+    ("density_volume_tetra", TETRA_VERTICES, TETRA_FACES, 20, "VOLUME",
+     {"density": {0: 1.0, 1: 0.5, 2: 0.25, 3: 0.0}}),
+    # All weights zero: Blender leaves the particles zeroed, on vertex 0 (VERT) or the origin (FACE).
+    ("density_zero_vertex", CUBE_VERTICES, CUBE_FACES, 6, "VERT",
+     {"density": {0: 0.0, 1: 0.0, 2: 0.0}}),
+    ("density_zero_face", CUBE_VERTICES, CUBE_FACES, 6, "FACE",
+     {"density": {0: 0.0, 1: 0.0, 2: 0.0}}),
+ ]
 for name, vertices, faces, count, emit_from, options in EMITTER_CASES:
     obj = emitter_object(name, vertices, faces, smooth=options.get("smooth", False))
     settings = add_emitter(obj, count, 1, 1, 500.0, 1.0, emit_from=emit_from,
@@ -273,6 +291,13 @@ for name, vertices, faces, count, emit_from, options in EMITTER_CASES:
         settings.hexagonal_grid = options.get("hexagonal", False)
         settings.invert_grid = options.get("invert", False)
         settings.grid_random = options.get("grid_random", 0.0)
+    if "density" in options:
+        group = obj.vertex_groups.new(name="Density")
+        for index, weight in options["density"].items():
+            group.add([index], weight, "REPLACE")
+        system = obj.particle_systems[-1]
+        system.vertex_group_density = "Density"
+        system.invert_vertex_group_density = options.get("invert", False)
     case(name, obj, 2)
 
 frames = sorted({frame for frame, _, _, _, _ in reads})

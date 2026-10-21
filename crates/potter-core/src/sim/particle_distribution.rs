@@ -137,20 +137,33 @@ fn assign_elements(
 
 /// The vertex that each of the `count` particles is emitted from (`particle_element` for `PART_FROM_VERT`).
 ///
-/// `vertex_count` is the number of emitting vertices. `system_seed` is `ParticleSystem.seed`.
-/// Vertex emission ignores `use_even_distribution`: every vertex weighs `1 / min(vertices, particles)`.
+/// `vertex_count` is the number of emitting vertices. `system_seed` is `ParticleSystem.seed`. `density` is
+/// the per-vertex density group weight (`psys_cache_vgroup`), when the emitter has a density group.
+/// Vertex emission ignores `use_even_distribution`: every vertex weighs `1 / min(vertices, particles)`,
+/// times its density. When no vertex has weight, Blender's zeroed particles stay on vertex 0.
 pub(crate) fn vertex_elements(
     vertex_count: usize,
     count: usize,
     system_seed: u32,
     random: bool,
+    density: Option<&[f32]>,
 ) -> Vec<usize> {
     if vertex_count == 0 || count == 0 {
         return Vec::new();
     }
     let weight = 1.0_f32 / (vertex_count.min(count) as f32);
-    let weights = vec![weight; vertex_count];
-    assign_elements(&weights, count, system_seed, random).0
+    let mut weights = vec![weight; vertex_count];
+    if let Some(density) = density {
+        for (weight, &value) in weights.iter_mut().zip(density) {
+            *weight *= value;
+        }
+    }
+    let elements = assign_elements(&weights, count, system_seed, random).0;
+    if elements.is_empty() {
+        vec![0; count]
+    } else {
+        elements
+    }
 }
 
 /// Blender's legacy `MFace` (`BKE_mesh_tessface_calc`): a triangle or quad, in corner order.
@@ -278,19 +291,27 @@ impl FaceEmitter {
     }
 
     /// `distribute_particles`' element weights: each face's area as a share of the total with
-    /// `PART_EDISTR`, otherwise `1 / min(elements, particles)` for every element.
-    fn element_weights(&self, even: bool, count: usize) -> Vec<f32> {
+    /// `PART_EDISTR`, otherwise `1 / min(elements, particles)`, each then times the face's mean density
+    /// (`tweight`) when the emitter has a density group.
+    fn element_weights(&self, even: bool, count: usize, density: Option<&[f32]>) -> Vec<f32> {
         let elements = self.tessfaces.len();
-        if !even {
-            return vec![1.0_f32 / (elements.min(count) as f32); elements];
-        }
-        let mut weights: Vec<f32> = self.tessfaces.iter().map(|face| self.area(face)).collect();
-        let mut total = 0.0_f32;
-        for &weight in &weights {
-            total += weight;
-        }
-        for weight in &mut weights {
-            *weight /= total;
+        let mut weights = if even {
+            let mut weights: Vec<f32> = self.tessfaces.iter().map(|face| self.area(face)).collect();
+            let mut total = 0.0_f32;
+            for &weight in &weights {
+                total += weight;
+            }
+            for weight in &mut weights {
+                *weight /= total;
+            }
+            weights
+        } else {
+            vec![1.0_f32 / (elements.min(count) as f32); elements]
+        };
+        if let Some(density) = density {
+            for (weight, face) in weights.iter_mut().zip(&self.tessfaces) {
+                *weight *= face_density(face, density);
+            }
         }
         weights
     }
@@ -309,22 +330,28 @@ impl FaceEmitter {
 /// Distributes `settings.count` particles over `emitter` (`distribute_particles`), then places each
 /// one (`distribute_from_faces_exec`, `distribute_from_volume_exec`, `psys_particle_on_dm`).
 ///
-/// Returns one entry per particle, in particle order: `Some` for each emitted particle, or none when
-/// no element can take a particle (as when every face has zero area).
+/// Returns one entry per particle, in particle order. When the emitter has no face, or no element can
+/// take a particle (as when every face has zero area or zero density), Blender leaves the particles
+/// zeroed, at the origin (`distribute_invalid` and the `totmapped == 0` return), so each entry is the
+/// origin.
 pub(crate) fn distribute_faces(
     emitter: &FaceEmitter,
     settings: FaceSettings,
+    density: Option<&[f32]>,
 ) -> Vec<Option<FaceSample>> {
     let elements = emitter.tessfaces.len();
     let count = settings.count;
-    if elements == 0 || count == 0 {
+    if count == 0 {
         return Vec::new();
     }
-    let weights = emitter.element_weights(settings.even, count);
+    if elements == 0 {
+        return origin_samples(count);
+    }
+    let weights = emitter.element_weights(settings.even, count, density);
     let (particle_element, jitter_offset) =
         assign_elements(&weights, count, settings.seed, settings.random);
     if particle_element.len() != count {
-        return Vec::new();
+        return origin_samples(count);
     }
 
     // `distribute_particles`: a zero `userjit` sizes the jitter to the particles per element.
@@ -426,6 +453,27 @@ pub(crate) fn distribute_faces(
         }));
     }
     samples
+}
+
+/// `distribute_particles`' `tweight`: the mean density of a tessface's corners.
+fn face_density(face: &Tessface, density: &[f32]) -> f32 {
+    let count = if face.quad { 4 } else { 3 };
+    let mut sum = 0.0_f32;
+    for &vertex in &face.vertices[..count] {
+        sum += density[vertex];
+    }
+    sum / count as f32
+}
+
+/// Particles left zeroed at the origin, as Blender has them when no element takes a particle.
+fn origin_samples(count: usize) -> Vec<Option<FaceSample>> {
+    vec![
+        Some(FaceSample {
+            position: DVec3::ZERO,
+            normal: DVec3::ZERO,
+        });
+        count
+    ]
 }
 
 /// The settings of `PART_DISTR_GRID` (`distribute_grid`): the resolution, the random offset, and the
@@ -1029,14 +1077,25 @@ mod tests {
     #[test]
     fn one_vertex_per_particle_when_counts_match_without_randomness() {
         // Evenly spaced positions over equal weights hit each vertex once, in order.
-        assert_eq!(vertex_elements(4, 4, 0, false), vec![0, 1, 2, 3]);
+        assert_eq!(vertex_elements(4, 4, 0, false, None), vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn every_particle_names_a_vertex() {
-        let elements = vertex_elements(8, 20, 7, true);
+        let elements = vertex_elements(8, 20, 7, true, None);
         assert_eq!(elements.len(), 20);
         assert!(elements.iter().all(|index| *index < 8));
+    }
+
+    #[test]
+    fn density_zeroes_out_vertices_and_zeroed_emitters_stay_on_vertex_zero() {
+        // Weights 0, 0.25, 0, 0.25 keep only vertices 1 and 3, and the regular placement splits them.
+        assert_eq!(
+            vertex_elements(4, 4, 0, false, Some(&[0.0, 1.0, 0.0, 1.0])),
+            vec![1, 1, 3, 3]
+        );
+        // Every density is zero: Blender's zeroed particles sit on vertex 0.
+        assert_eq!(vertex_elements(3, 2, 0, true, Some(&[0.0; 3])), vec![0, 0]);
     }
 
     #[test]
