@@ -344,7 +344,8 @@ def evaluate_frame(obj, frame):
 
 def cache_settings(cache):
     return {
-        "filepath": cache.filepath,
+        # Basename only: the absolute path Blender reports is machine-specific and must not be committed.
+        "filepath": os.path.basename(cache.filepath),
         "is_sequence": cache.is_sequence,
         "override_frame": cache.override_frame,
         "frame": cache.frame,

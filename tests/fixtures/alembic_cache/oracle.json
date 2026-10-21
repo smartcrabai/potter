@@ -3,7 +3,7 @@
  "cases": [
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -1833,7 +1833,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 1.0,
@@ -3363,7 +3363,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": -0.5,
@@ -4593,7 +4593,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 2.5,
     "frame_offset": 0.0,
@@ -5823,7 +5823,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 2.5,
     "frame_offset": 0.0,
@@ -6453,7 +6453,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -7083,7 +7083,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -7713,7 +7713,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -8007,7 +8007,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -8301,7 +8301,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -8595,7 +8595,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -9225,7 +9225,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -9579,7 +9579,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -10061,7 +10061,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -10544,7 +10544,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/uv_only.abc",
+    "filepath": "uv_only.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -11026,7 +11026,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -11380,7 +11380,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -12028,7 +12028,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -12672,7 +12672,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/topo.abc",
+    "filepath": "topo.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -14614,7 +14614,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/topo.abc",
+    "filepath": "topo.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -15476,7 +15476,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/reordered.0001.abc",
+    "filepath": "reordered.0001.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -15931,7 +15931,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/seq.0001.abc",
+    "filepath": "seq.0001.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -17161,7 +17161,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/seq.0001.abc",
+    "filepath": "seq.0001.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 10.0,
@@ -17791,7 +17791,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/seq.0001.abc",
+    "filepath": "seq.0001.abc",
     "forward_axis": "POS_X",
     "frame": 3.0,
     "frame_offset": 0.0,
@@ -18421,7 +18421,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/seq.0001.abc",
+    "filepath": "seq.0001.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -18579,7 +18579,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_Y",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -19209,7 +19209,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/reordered_animated.abc",
+    "filepath": "reordered_animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -19665,7 +19665,7 @@
  ],
  "defaults": {
   "cache_file": {
-   "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+   "filepath": "animated.abc",
    "forward_axis": "POS_X",
    "frame": 0.0,
    "frame_offset": 0.0,

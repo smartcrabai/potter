@@ -681,22 +681,19 @@ fn prepare_blend_export_resources(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let source_path = resolve_export_resource_path(project, uri);
-        let bytes = if let Some(packed) = resource.get("bytes").and_then(Value::as_array) {
-            let mut bytes = Vec::with_capacity(packed.len());
-            for value in packed {
-                let byte = value
-                    .as_u64()
-                    .filter(|value| *value <= u8::MAX.into())
-                    .and_then(|value| u8::try_from(value).ok())
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::SceneInvalid,
-                            "packed resource contains a byte outside 0..255",
-                        )
-                    })?;
-                bytes.push(byte);
+        if let Some(frames) = resource.get("sequence_frames").and_then(Value::as_object) {
+            let first = export_sequence_frame_files(project, &id, frames, &sidecar, &mut files)?;
+            if let Some(resource) = document
+                .get_mut("resources")
+                .and_then(Value::as_object_mut)
+                .and_then(|resources| resources.get_mut(&id))
+            {
+                resource["export_path"] = json!(first);
             }
-            Some(bytes)
+            continue;
+        }
+        let bytes = if let Some(packed) = resource.get("bytes").and_then(Value::as_array) {
+            Some(packed_resource_bytes(packed)?)
         } else if let Some(path) = &source_path {
             match fs::read(path) {
                 Ok(bytes) => Some(bytes),
@@ -1630,6 +1627,133 @@ fn resolve_export_resource_path(project: &Project, uri: &str) -> Option<PathBuf>
     } else {
         project.path().join(path)
     })
+}
+
+/// Decodes a packed resource's inline byte array.
+fn packed_resource_bytes(packed: &[Value]) -> Result<Vec<u8>> {
+    packed
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "packed resource contains a byte outside 0..255",
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Writes a sequence resource's frame files into a folder named for the resource inside the sidecar. The frames keep
+/// their file names, so Blender's CacheFile finds the rest of the sequence beside its first frame. Returns that first
+/// frame's path, which becomes the resource's export path.
+fn export_sequence_frame_files(
+    project: &Project,
+    id: &str,
+    frames: &Map<String, Value>,
+    sidecar: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<PathBuf> {
+    let mut ordered = frames
+        .iter()
+        .map(|(key, record)| {
+            key.parse::<i64>()
+                .map(|frame| (frame, record))
+                .map_err(|_| {
+                    PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "sequence frame key is not a frame number",
+                        json!({"resource_id":id,"frame":key}),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_by_key(|(frame, _)| *frame);
+    let folder = sidecar.join(id);
+    fs::create_dir_all(&folder).map_err(|error| PotError::io(&error))?;
+    let mut first = None;
+    for (frame, record) in ordered {
+        let bytes = sequence_frame_bytes(project, id, frame, record)?;
+        let uri = record
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = Path::new(uri)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "sequence frame has no file name",
+                    json!({"resource_id":id,"frame":frame,"uri":uri}),
+                )
+            })?;
+        let destination = folder.join(name);
+        if destination.exists() {
+            if fs::read(&destination).map_err(|error| PotError::io(&error))? != bytes {
+                return Err(PotError::with_details(
+                    ErrorCode::ExportFailed,
+                    "sequence frame file already exists with different content",
+                    json!({"resource_id":id,"frame":frame,"path":destination}),
+                ));
+            }
+        } else {
+            write_asset_sidecar(&destination, &bytes)?;
+        }
+        let absolute = fs::canonicalize(&destination).map_err(|error| PotError::io(&error))?;
+        first.get_or_insert(absolute);
+        if !files.contains(&destination) {
+            files.push(destination);
+        }
+    }
+    first.ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "sequence resource has no frames",
+            json!({"resource_id":id}),
+        )
+    })
+}
+
+/// The bytes of one sequence frame: its packed bytes, or its file when unpacked, checked against its hash.
+fn sequence_frame_bytes(
+    project: &Project,
+    id: &str,
+    frame: i64,
+    record: &Value,
+) -> Result<Vec<u8>> {
+    let bytes = if let Some(packed) = record.get("bytes").and_then(Value::as_array) {
+        packed_resource_bytes(packed)?
+    } else {
+        let uri = record
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = resolve_export_resource_path(project, uri).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::ExportFailed,
+                "sequence frame URI cannot be resolved as a local file",
+                json!({"resource_id":id,"frame":frame,"uri":uri}),
+            )
+        })?;
+        fs::read(&path).map_err(|error| PotError::io(&error))?
+    };
+    let digest = crate::hash::sha256(&bytes);
+    if record
+        .get("hash")
+        .and_then(Value::as_str)
+        .is_some_and(|expected| expected != digest)
+    {
+        return Err(PotError::with_details(
+            ErrorCode::ValidationFailed,
+            "sequence frame content does not match its expected hash",
+            json!({"resource_id":id,"frame":frame,"hash":digest}),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn sidecar_destination(
