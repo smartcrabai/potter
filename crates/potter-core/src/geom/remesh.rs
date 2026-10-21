@@ -2,14 +2,18 @@
 
 use std::collections::{HashMap, HashSet};
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{Edge, Face, Mesh, MeshError},
 };
 
-use super::edge_key;
+use super::{
+    bvh::{KdopTree, NearestHit},
+    edge_key,
+    modifiers::shrinkwrap::closest_on_triangle,
+};
 
 const MAX_GRID_SAMPLES: usize = 1_000_000;
 const MAX_GRID_CELLS: usize = 250_000;
@@ -368,6 +372,125 @@ pub fn remesh(mesh: &Mesh, voxel_size: f64) -> Result<Mesh> {
         ));
     }
     Ok(output)
+}
+
+/// Blender's `mesh_remesh_reproject_attributes` for the face domain (`blenkernel/intern/mesh_remesh_voxel.cc`,
+/// `find_nearest_faces`): each destination face takes the source face of the triangle nearest to its center.
+/// Triangles come from the source's tessellation and are searched in a tree with no epsilon
+/// (`BLI_bvhtree_new(n, 0.0, 2, 6)`), depth-first, so ties keep the first leaf at the strict minimum.
+pub(crate) fn nearest_source_faces(source: &Mesh, destination: &Mesh) -> Result<Vec<usize>> {
+    let source_index: HashMap<u32, usize> = source
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let source_points: Vec<Vec3> = source
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.as_vec3())
+        .collect();
+    let tessellation = source.tessellate().map_err(|error| {
+        PotError::invalid_argument(format!("invalid source triangulation: {error}"))
+    })?;
+    let expected: usize = source
+        .faces
+        .iter()
+        .map(|face| face.vertices.len().saturating_sub(2))
+        .sum();
+    if tessellation.len() != expected {
+        return Err(PotError::invalid_argument(
+            "source tessellation does not match its faces",
+        ));
+    }
+    let mut triangles = Vec::with_capacity(expected);
+    let mut triangle_index = 0;
+    for (face_index, face) in source.faces.iter().enumerate() {
+        for _ in 0..face.vertices.len().saturating_sub(2) {
+            let ids = tessellation[triangle_index];
+            triangle_index += 1;
+            let mut points = [Vec3::ZERO; 3];
+            for (slot, id) in ids.into_iter().enumerate() {
+                let index = source_index.get(&id).ok_or_else(|| {
+                    PotError::invalid_argument("source triangle references a missing vertex")
+                })?;
+                points[slot] = source_points[*index];
+            }
+            triangles.push((points, face_index));
+        }
+    }
+    let bounds: Vec<[f32; 6]> = triangles
+        .iter()
+        .map(|(points, _)| KdopTree::leaf_bounds_for_triangle_exact(*points))
+        .collect();
+    let tree = KdopTree::from_leaf_bounds(&bounds);
+    let destination_index: HashMap<u32, usize> = destination
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let destination_points: Vec<Vec3> = destination
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.as_vec3())
+        .collect();
+    let mut map = Vec::with_capacity(destination.faces.len());
+    for face in &destination.faces {
+        let corners = face
+            .vertices
+            .iter()
+            .map(|id| {
+                destination_index
+                    .get(id)
+                    .map(|index| destination_points[*index])
+                    .ok_or_else(|| {
+                        PotError::invalid_argument("destination face references a missing vertex")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let center = face_center(&corners);
+        let mut nearest = NearestHit {
+            index: -1,
+            co: Vec3::ZERO,
+            dist_sq: f32::MAX,
+        };
+        tree.find_nearest(
+            center,
+            &mut nearest,
+            &mut |index: usize, point: Vec3, hit: &mut NearestHit| {
+                let [a, b, c] = triangles[index].0;
+                let closest = closest_on_triangle(point, a, b, c);
+                let dist_sq = (point - closest).length_squared();
+                if dist_sq < hit.dist_sq {
+                    hit.index = index as isize;
+                    hit.dist_sq = dist_sq;
+                    hit.co = closest;
+                }
+            },
+            false,
+        );
+        let triangle = usize::try_from(nearest.index).map_err(|_| {
+            PotError::invalid_argument("remesh reprojection found no source triangle")
+        })?;
+        map.push(triangles[triangle].1);
+    }
+    Ok(map)
+}
+
+/// Blender's `face_center_calc` (`blenkernel/intern/mesh_evaluate.cc`) in f32: triangles and quads average
+/// with `/ 3` and `/ 4`, and other sizes add each corner times `1 / n`.
+fn face_center(corners: &[Vec3]) -> Vec3 {
+    match corners {
+        [a, b, c] => (*a + *b + *c) / 3.0,
+        [a, b, c, d] => (*a + *b + *c + *d) / 4.0,
+        _ => {
+            let weight = 1.0 / f32::from(u16::try_from(corners.len()).unwrap_or(u16::MAX));
+            corners
+                .iter()
+                .fold(Vec3::ZERO, |center, corner| center + *corner * weight)
+        }
+    }
 }
 
 fn add_neighbor(

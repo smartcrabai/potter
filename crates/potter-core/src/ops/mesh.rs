@@ -238,7 +238,7 @@ pub(super) fn apply(
         if scope == Some("shared") && edited_data.contains(&data_id) {
             continue;
         }
-        let (data_changed, had_descriptor, mapping) = {
+        let (data_changed, had_descriptor, mapping, dropped) = {
             let data = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::TargetNotFound,
@@ -254,6 +254,15 @@ pub(super) fn apply(
                 )
             })?;
             let had_descriptor = data.descriptor.is_some();
+            let dropped = if name == "mesh.remesh" {
+                mesh.attributes
+                    .keys()
+                    .filter(|key| key.as_str() != "shade_smooth")
+                    .cloned()
+                    .collect::<Vec<String>>()
+            } else {
+                Vec::new()
+            };
             let mut edited = mesh.clone();
             let mapping =
                 edit::apply_with_source(&mut edited, mesh, name, &Value::Object(args.clone()))?;
@@ -262,8 +271,11 @@ pub(super) fn apply(
                 *mesh = edited;
                 data.descriptor = None;
             }
-            (changed, had_descriptor, mapping)
+            (changed, had_descriptor, mapping, dropped)
         };
+        if !dropped.is_empty() {
+            record_remesh_loss(engine, &data_id, &dropped)?;
+        }
         if data_changed {
             engine.mark("data_blocks", &data_id, ChangeKind::Updated);
             super::clear_primitive_metadata(engine, &data_id);
@@ -284,6 +296,45 @@ pub(super) fn apply(
         edited_data.push(data_id);
     }
     Ok(changed)
+}
+
+/// Records in `compatibility.losses` the attributes a voxel remesh drops. Blender's remesh reprojects every
+/// attribute (`mesh_remesh_reproject_attributes`), and Potter carries only `sharp_face`, so each other
+/// attribute is reported rather than silently removed. `curve.rs` records its losses the same way.
+fn record_remesh_loss(engine: &mut Engine<'_>, data_id: &Id, dropped: &[String]) -> Result<()> {
+    let existed = engine.doc.compatibility.contains_key("losses");
+    let slot = engine
+        .doc
+        .compatibility
+        .entry("losses".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let losses = slot.as_array_mut().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "compatibility losses must be an array",
+        )
+    })?;
+    losses.push(json!({
+        "feature_id": "mesh.remesh.attributes",
+        "data_id": data_id,
+        "reason": format!(
+            "Voxel remesh reprojects attributes that Potter does not carry: {}.",
+            dropped.join(", ")
+        ),
+        "suggestion": "Reapply the attributes after remeshing, or keep the original mesh.",
+    }));
+    let compatibility_id = Id::new("losses")
+        .map_err(|error| PotError::new(ErrorCode::InternalError, error.message))?;
+    engine.mark(
+        "compatibility",
+        &compatibility_id,
+        if existed {
+            ChangeKind::Updated
+        } else {
+            ChangeKind::Created
+        },
+    );
+    Ok(())
 }
 
 fn split_target(engine: &Engine<'_>, value: Option<&Value>) -> Result<(Value, Option<Value>)> {

@@ -64,9 +64,9 @@ fn axis_dominant(v: Vec3) -> usize {
     }
 }
 
-/// Leaf box of one triangle: its extent on x, y and z (`create_kdop_hull`), inflated by the tree epsilon
+/// Leaf box of one triangle: its extent on x, y and z (`create_kdop_hull`), inflated by `epsilon`
 /// (`bvhtree_node_inflate`). The axis lengths are 1 for x, y and z.
-fn triangle_bounds(tri: [Vec3; 3]) -> [f32; 6] {
+fn triangle_bounds(tri: [Vec3; 3], epsilon: f32) -> [f32; 6] {
     let mut bounds = [0.0_f32; 6];
     for axis in 0..3 {
         let mut min = f32::MAX;
@@ -75,8 +75,8 @@ fn triangle_bounds(tri: [Vec3; 3]) -> [f32; 6] {
             min = min.min(point[axis]);
             max = max.max(point[axis]);
         }
-        bounds[2 * axis] = min - TREE_EPSILON;
-        bounds[2 * axis + 1] = max + TREE_EPSILON;
+        bounds[2 * axis] = min - epsilon;
+        bounds[2 * axis + 1] = max + epsilon;
     }
     bounds
 }
@@ -495,12 +495,18 @@ impl KdopTree {
 
     /// The leaf box of one triangle: its extent inflated by the tree epsilon (`create_kdop_hull`).
     pub(crate) fn leaf_bounds_for_triangle(tri: [Vec3; 3]) -> [f32; 6] {
-        triangle_bounds(tri)
+        triangle_bounds(tri, TREE_EPSILON)
+    }
+
+    /// The leaf box of one triangle with no inflation, as `BLI_bvhtree_new(elems, 0.0, ...)` builds the
+    /// mesh corner-triangle tree that the voxel remesh attribute reprojection searches.
+    pub(crate) fn leaf_bounds_for_triangle_exact(tri: [Vec3; 3]) -> [f32; 6] {
+        triangle_bounds(tri, 0.0)
     }
 
     /// The leaf box of one vertex: the point inflated by the tree epsilon, as Blender's vertex tree.
     pub(crate) fn leaf_bounds_for_point(point: Vec3) -> [f32; 6] {
-        triangle_bounds([point; 3])
+        triangle_bounds([point; 3], TREE_EPSILON)
     }
 
     /// `BLI_bvhtree_ray_cast_ex` with `BVH_RAYCAST_WATERTIGHT`. `callback` receives each leaf index the

@@ -52,7 +52,7 @@ mod mirror;
 pub(crate) mod multires;
 mod ocean;
 mod remesh_modes;
-mod shrinkwrap;
+pub(crate) mod shrinkwrap;
 pub mod simulation;
 mod skin;
 mod smoothing;

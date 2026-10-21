@@ -417,7 +417,7 @@ fn build_vertex_surface(mesh: &Mesh) -> Surface {
         .collect();
     let bounds: Vec<[f32; 6]> = positions
         .iter()
-        .map(|point| KdopTree::leaf_bounds_for_point(point.to_array()))
+        .map(|point| KdopTree::leaf_bounds_for_point(*point))
         .collect();
     Surface {
         tree: KdopTree::from_leaf_bounds(&bounds),
@@ -546,11 +546,7 @@ fn build_surface(mesh: &Mesh, needs: SurfaceNeeds) -> Result<Surface> {
     }
     let bounds: Vec<[f32; 6]> = tris
         .iter()
-        .map(|tri| {
-            KdopTree::leaf_bounds_for_triangle(
-                tri.vertices.map(|vertex| positions[vertex].to_array()),
-            )
-        })
+        .map(|tri| KdopTree::leaf_bounds_for_triangle(tri.vertices.map(|vertex| positions[vertex])))
         .collect();
     Ok(Surface {
         tree: KdopTree::from_leaf_bounds(&bounds),
@@ -687,7 +683,7 @@ fn nearest_vertex_points(
 ) -> Vec<Option<Vec3>> {
     let mut nearest = NearestHit {
         index: -1,
-        co: [0.0; 3],
+        co: Vec3::ZERO,
         dist_sq: f32::MAX,
     };
     positions
@@ -704,9 +700,9 @@ fn nearest_vertex_points(
                 (target - Vec3::from(nearest.co)).length_squared()
             };
             surface.tree.find_nearest(
-                target.to_array(),
+                target,
                 &mut nearest,
-                &mut |index: usize, point: [f32; 3], hit: &mut NearestHit| {
+                &mut |index: usize, point: Vec3, hit: &mut NearestHit| {
                     // Blender's leaf has no callback: the leaf's inflated box gives the nearest point.
                     let vertex = surface.positions[index];
                     let query = Vec3::from(point);
@@ -716,7 +712,7 @@ fn nearest_vertex_points(
                     if dist_sq < hit.dist_sq {
                         hit.index = index as isize;
                         hit.dist_sq = dist_sq;
-                        hit.co = nearest_point.to_array();
+                        hit.co = nearest_point;
                     }
                 },
                 false,
@@ -748,7 +744,7 @@ fn nearest_surface_points(
 ) -> Vec<Option<Vec3>> {
     let mut nearest = NearestHit {
         index: -1,
-        co: [0.0; 3],
+        co: Vec3::ZERO,
         dist_sq: f32::MAX,
     };
     let mut normal = Vec3::ZERO;
@@ -795,9 +791,9 @@ fn find_nearest_surface(
 ) {
     if target_project {
         surface.tree.find_nearest(
-            co.to_array(),
+            co,
             nearest,
-            &mut |index: usize, point: [f32; 3], hit: &mut NearestHit| {
+            &mut |index: usize, point: Vec3, hit: &mut NearestHit| {
                 target_project_triangle(surface, index, Vec3::from(point), hit, normal);
             },
             true,
@@ -807,9 +803,9 @@ fn find_nearest_surface(
         }
     }
     surface.tree.find_nearest(
-        co.to_array(),
+        co,
         nearest,
-        &mut |index: usize, point: [f32; 3], hit: &mut NearestHit| {
+        &mut |index: usize, point: Vec3, hit: &mut NearestHit| {
             nearest_triangle(surface, index, Vec3::from(point), hit, normal);
         },
         false,
@@ -830,7 +826,7 @@ fn nearest_triangle(
     if dist_sq < hit.dist_sq {
         hit.index = index as isize;
         hit.dist_sq = dist_sq;
-        hit.co = closest.to_array();
+        hit.co = closest;
         *normal = normal_tri(v1, v2, v3);
     }
 }
@@ -873,7 +869,7 @@ fn update_hit(
     if dist_sq < hit.dist_sq {
         hit.index = index as isize;
         hit.dist_sq = dist_sq;
-        hit.co = hit_co.to_array();
+        hit.co = hit_co;
         *normal = normalize(hit_no);
     }
 }
@@ -1125,7 +1121,7 @@ fn clamp_barycentric(x: &mut [f32; 3]) {
 }
 
 /// Blender's `closest_on_tri_to_point_v3` (Ericson's region tests).
-fn closest_on_triangle(point: Vec3, v1: Vec3, v2: Vec3, v3: Vec3) -> Vec3 {
+pub(crate) fn closest_on_triangle(point: Vec3, v1: Vec3, v2: Vec3, v3: Vec3) -> Vec3 {
     let ab = v2 - v1;
     let ac = v3 - v1;
     let ap = point - v1;
@@ -1374,14 +1370,11 @@ fn project_normal(
         dist: bound,
     };
     let found = target.surface.tree.ray_cast(
-        ray_origin.to_array(),
-        ray_direction.to_array(),
+        ray_origin,
+        ray_direction,
         &mut ray,
         &mut |triangle: usize, ray: &Ray, hit: &mut RayHit| {
-            let [v0, v1, v2] = target
-                .surface
-                .triangle(triangle)
-                .map(|point| point.to_array());
+            let [v0, v1, v2] = target.surface.triangle(triangle);
             if let Some(distance) = ray.watertight(v0, v1, v2)
                 && distance < hit.dist
             {
@@ -1590,9 +1583,7 @@ mod tests {
         ];
         let leaves: Vec<[f32; 6]> = triangles
             .iter()
-            .map(|triangle| {
-                KdopTree::leaf_bounds_for_triangle(triangle.map(|point| point.to_array()))
-            })
+            .map(|triangle| KdopTree::leaf_bounds_for_triangle(*triangle))
             .collect();
         let tree = KdopTree::from_leaf_bounds(&leaves);
         let mut ray_hit = RayHit {
@@ -1601,11 +1592,11 @@ mod tests {
         };
         // The ray crosses the shared diagonal exactly; watertight casting must not miss it.
         let found = tree.ray_cast(
-            [0.5, 0.5, 1.0],
-            [0.0, 0.0, -1.0],
+            Vec3::new(0.5, 0.5, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
             &mut ray_hit,
             &mut |triangle: usize, ray: &Ray, hit: &mut RayHit| {
-                let [v0, v1, v2] = triangles[triangle].map(|point| point.to_array());
+                let [v0, v1, v2] = triangles[triangle];
                 if let Some(distance) = ray.watertight(v0, v1, v2)
                     && distance < hit.dist
                 {

@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 
 use crate::geom::modifiers::multires::{self, MultiresGridData};
 use crate::{
-    error::{ErrorCode, PotError, Result},
+    error::{PotError, Result},
     geom::{
         Face, Mesh, MeshError,
         attribute_keys::storage_key,
@@ -6939,16 +6939,6 @@ fn apply_remesh(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges>
     if voxel_size <= 0.0 {
         return Err(invalid("remesh voxel_size must be positive"));
     }
-    // Blender reprojects `sharp_face` from the nearest input triangle (`mesh_remesh_reproject_attributes`,
-    // on by default). Potter does not sample attributes, so an input that carries `sharp_face` is refused
-    // rather than remeshed with the wrong shading.
-    if crate::geom::normals::sharp_face_flags(mesh)?.is_some() {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "voxel remesh of a mesh with sharp_face needs attribute reprojection, which is not implemented",
-            json!({ "feature_id": "mesh.remesh.sharp_face" }),
-        ));
-    }
     let remeshed = crate::geom::remesh::remesh(mesh, voxel_size)?;
     let mut replacement = Mesh {
         next_id: mesh.next_id,
@@ -6987,15 +6977,41 @@ fn apply_remesh(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges>
     for face in &mesh.faces {
         changes.delete(Domain::Face, face.id);
     }
+    // Blender reprojects `sharp_face` from the nearest source triangle (`mesh_remesh_reproject_attributes`):
+    // each new face takes the flag of the source face its center is nearest to. The source is still intact here.
+    let reprojected_sharp = match crate::geom::normals::sharp_face_flags(mesh)? {
+        Some(flags) => {
+            let sources = crate::geom::remesh::nearest_source_faces(mesh, &replacement)?;
+            Some(
+                sources
+                    .into_iter()
+                    .map(|source| flags[source])
+                    .collect::<Vec<bool>>(),
+            )
+        }
+        None => None,
+    };
     // Voxel remesh replaces the mesh and drops loop-domain multires data.
     *mesh = replacement;
-    // Blender's `object.voxel_remesh` gives every new face `!sharp_face[0]` (`object_remesh.cc`), and the
-    // guard above means the input has no `sharp_face`, so every new face is smooth.
-    let all_faces = Selection {
-        domain: Domain::Face,
-        ids: mesh.faces.iter().map(|face| face.id).collect(),
-    };
-    apply_shade(mesh, &all_faces, true)?;
+    // Blender's `object.voxel_remesh` keeps `sharp_face` through the reprojection, so an input that had it
+    // keeps an attribute (even all smooth) and an input without it gives smooth faces without one.
+    let smooth: Vec<bool> = reprojected_sharp.as_ref().map_or_else(
+        || vec![true; mesh.faces.len()],
+        |sharp| sharp.iter().map(|flag| !flag).collect(),
+    );
+    let values = mesh
+        .faces
+        .iter()
+        .zip(&smooth)
+        .map(|(face, smooth)| (format!("f{}", face.id), Value::Bool(*smooth)))
+        .collect::<Map<String, Value>>();
+    mesh.attributes.insert(
+        "shade_smooth".to_owned(),
+        json!({"domain":"face","type":"bool","values":values}),
+    );
+    if reprojected_sharp.is_some() {
+        crate::geom::normals::record_sharp_face(mesh);
+    }
     Ok(changes)
 }
 
@@ -7033,15 +7049,17 @@ pub(crate) fn apply_with_source(
 
 /// Blender keeps `sharp_face` presence through the operators that write attributes directly:
 /// `rna_MeshPolygon_use_smooth_set` and the attribute API (`lookup_or_add`), and
-/// `Mesh.normals_split_custom_set`, which only touches custom normals. Every other operator is an
-/// edit-mode operator (or a rebuild) that goes through BMesh and settles presence on exit
-/// (`BM_mesh_bm_to_me`, `normals::settle_sharp_face`).
-const ATTRIBUTE_WRITE_OPERATIONS: [&str; 5] = [
+/// `Mesh.normals_split_custom_set`, which only touches custom normals. Voxel remesh reprojects the
+/// `sharp_face` of its source (`mesh_remesh_reproject_attributes`), so it sets presence from that source.
+/// Every other operator is an edit-mode operator (or a rebuild) that goes through BMesh and settles
+/// presence on exit (`BM_mesh_bm_to_me`, `normals::settle_sharp_face`).
+const ATTRIBUTE_WRITE_OPERATIONS: [&str; 6] = [
     "set_attribute",
     "attribute_create",
     "attribute_update",
     "attribute_delete",
     "set_custom_normals",
+    "remesh",
 ];
 
 fn apply_inner(

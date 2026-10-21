@@ -632,14 +632,56 @@ fn remesh_of_an_all_smooth_mesh_stays_smooth() {
     mesh.validate().unwrap();
 }
 
-/// Blender reprojects `sharp_face` from the nearest input triangle on remesh; Potter does not sample
-/// attributes, so an input that carries `sharp_face` is refused with `UnsupportedFeature`.
+/// Blender 5.2.2 `object.voxel_remesh` on a flat cube, probed: all 150 new faces are flat and `sharp_face`
+/// is present. The default cube is flat, so this is the common case that must not fail.
 #[test]
-fn remesh_refuses_an_input_with_sharp_face() {
+fn remesh_of_a_flat_cube_keeps_every_face_flat() {
     let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
-    let error = edit::apply(&mut mesh, "remesh", &json!({"voxel_size": 0.5})).unwrap_err();
+    edit::apply(&mut mesh, "remesh", &json!({"voxel_size": 0.5})).unwrap();
+    let values = mesh.attributes["shade_smooth"]["values"]
+        .as_object()
+        .unwrap();
+    assert_eq!(values.len(), 150);
+    assert!(values.values().all(|value| value == &json!(false)));
     assert_eq!(
-        error.code,
-        potter_core::error::ErrorCode::UnsupportedFeature
+        mesh.attributes["shade_smooth"]["sharp_face_present"],
+        json!(true)
     );
+    mesh.validate().unwrap();
+}
+
+/// Blender 5.2.2 `object.voxel_remesh` on a cube with face 4 flat and the rest smooth, probed: each new
+/// face takes the `sharp_face` of its nearest source triangle. `1` marks a flat face, in face order.
+const MIXED_REMESH_FLAT: &str = "000000110011000000000000000000000011100111000000000000000000000000011001100100100000000000000000000000111001110010010010000000000000000000000000000000";
+
+#[test]
+fn remesh_reprojects_sharp_face_from_nearest_source_triangles() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    edit::apply(
+        &mut mesh,
+        "shade_smooth",
+        &json!({"elements":{"domain":"face","ids":["f0","f1","f2","f3","f5"]}}),
+    )
+    .unwrap();
+    edit::apply(&mut mesh, "remesh", &json!({"voxel_size": 0.5})).unwrap();
+    let values = mesh.attributes["shade_smooth"]["values"]
+        .as_object()
+        .unwrap();
+    let flat: String = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            if values[format!("f{}", face.id).as_str()] == json!(false) {
+                '1'
+            } else {
+                '0'
+            }
+        })
+        .collect();
+    assert_eq!(flat, MIXED_REMESH_FLAT);
+    assert_eq!(
+        mesh.attributes["shade_smooth"]["sharp_face_present"],
+        json!(true)
+    );
+    mesh.validate().unwrap();
 }
