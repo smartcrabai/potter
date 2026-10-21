@@ -862,6 +862,21 @@ pub(super) fn render(
     })?;
     let environment = world.max(DVec3::ZERO);
 
+    let scene = SceneRefs {
+        doc,
+        snapshot,
+        geometry,
+        bvh: &bvh,
+        lights: &lights,
+        volumes: &volumes,
+        images,
+        importance: world_importance.as_ref(),
+    };
+    let budget = PathBudget {
+        max_bounces,
+        transparent_max_bounces,
+    };
+
     for y in 0..height {
         for x in 0..width {
             let index = usize::try_from(y)
@@ -893,19 +908,11 @@ pub(super) fn render(
                     // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
                     let (left, left_alpha) = match left_ray {
                         Some((left_origin, left_direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
+                            &scene,
                             left_origin,
                             left_direction,
                             environment,
-                            max_bounces,
-                            transparent_max_bounces,
+                            budget,
                             &mut left_rng,
                             &mut evaluator_workspace,
                         )?,
@@ -913,19 +920,11 @@ pub(super) fn render(
                     };
                     let (right, right_alpha) = match right_ray {
                         Some((right_origin, right_direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
+                            &scene,
                             right_origin,
                             right_direction,
                             environment,
-                            max_bounces,
-                            transparent_max_bounces,
+                            budget,
                             &mut right_rng,
                             &mut evaluator_workspace,
                         )?,
@@ -938,19 +937,11 @@ pub(super) fn render(
                 } else {
                     match ray_for_sample(camera, width, height, x, y, sample_x, sample_y)? {
                         Some((origin, direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
+                            &scene,
                             origin,
                             direction,
                             environment,
-                            max_bounces,
-                            transparent_max_bounces,
+                            budget,
                             &mut rng,
                             &mut evaluator_workspace,
                         )?,
@@ -1227,28 +1218,60 @@ fn world_radiance(
     crate::shader::evaluate_world(world, &doc.node_groups, images, direction)
 }
 
+/// The scene one frame traces against: the document and its snapshot, the render geometry and its BVH, the point lights,
+/// the volumes, the images, and the world importance sampler. Every path, light and shadow query reads it by reference.
+#[derive(Clone, Copy)]
+struct SceneRefs<'a, 'v> {
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    geometry: &'a Geometry,
+    bvh: &'a Bvh,
+    lights: &'a [PointLight],
+    volumes: &'a [VolumeInstance<'v>],
+    images: &'a BTreeMap<String, ImageData>,
+    importance: Option<&'a WorldImportanceSampler>,
+}
+
+/// One path's bounce budgets: the surface bounces and the transparent passes it may take.
+#[derive(Clone, Copy)]
+struct PathBudget {
+    max_bounces: u32,
+    transparent_max_bounces: u32,
+}
+
+/// A shadow ray from a receiver: its start point and normal, the direction to the light sample, and the distance to it.
+#[derive(Clone, Copy)]
+struct ShadowRay {
+    point: DVec3,
+    normal: DVec3,
+    direction: DVec3,
+    distance: f64,
+}
+
 /// The volume and transport state of one path: the scene, the bounce budgets and the sampling state.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one path's ray, scene state, sampling, and world context are explicit"
-)]
 fn trace_path(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
-    bvh: &Bvh,
-    lights: &[PointLight],
-    volumes: &[VolumeInstance<'_>],
-    images: &BTreeMap<String, ImageData>,
-    importance: Option<&WorldImportanceSampler>,
+    scene: &SceneRefs<'_, '_>,
     mut origin: DVec3,
     mut direction: DVec3,
     environment: DVec3,
-    max_bounces: u32,
-    transparent_max_bounces: u32,
+    budget: PathBudget,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, f64)> {
+    let SceneRefs {
+        doc,
+        snapshot,
+        geometry,
+        bvh,
+        lights,
+        volumes,
+        images,
+        importance,
+    } = *scene;
+    let PathBudget {
+        max_bounces,
+        transparent_max_bounces,
+    } = budget;
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
     let mut escaped = false;
@@ -1316,14 +1339,7 @@ fn trace_path(
             throughput *= event.albedo / scatter_probability;
             radiance += throughput
                 * direct_volume_lighting(
-                    doc,
-                    snapshot,
-                    geometry,
-                    bvh,
-                    lights,
-                    volumes,
-                    images,
-                    importance,
+                    scene,
                     event,
                     direction,
                     environment,
@@ -1456,14 +1472,7 @@ fn trace_path(
         if surface.closures.reflect_total > 0.0 {
             radiance += throughput
                 * direct_lighting(
-                    doc,
-                    snapshot,
-                    geometry,
-                    bvh,
-                    lights,
-                    volumes,
-                    images,
-                    importance,
+                    scene,
                     &surface,
                     environment,
                     bounce < max_bounces,
@@ -2068,19 +2077,8 @@ pub(super) fn object_for_index(
         .and_then(|index| objects.get(index))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "direct-light sampling needs full material, shadow, and medium context"
-)]
 fn direct_lighting(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
-    bvh: &Bvh,
-    lights: &[PointLight],
-    volumes: &[VolumeInstance<'_>],
-    images: &BTreeMap<String, ImageData>,
-    importance: Option<&WorldImportanceSampler>,
+    scene: &SceneRefs<'_, '_>,
     surface: &Surface,
     environment: DVec3,
     // Whether the path samples a BSDF continuation here. Only then does a BSDF ray pair with the
@@ -2090,6 +2088,15 @@ fn direct_lighting(
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
+    let SceneRefs {
+        doc,
+        snapshot,
+        lights,
+        volumes,
+        images,
+        importance,
+        ..
+    } = *scene;
     let normal = surface.normal;
     let geometric = surface.geometric_normal;
     let closures = &surface.closures;
@@ -2105,16 +2112,13 @@ fn direct_lighting(
             continue;
         }
         let visibility = shadow_transmittance(
-            doc,
-            snapshot,
-            geometry,
-            bvh,
-            volumes,
-            images,
-            surface.shadow_point,
-            geometric,
-            sample.direction,
-            sample.distance,
+            scene,
+            ShadowRay {
+                point: surface.shadow_point,
+                normal: geometric,
+                direction: sample.direction,
+                distance: sample.distance,
+            },
             transparent_budget,
             rng,
             evaluator_workspace,
@@ -2147,16 +2151,13 @@ fn direct_lighting(
         let environment_sample =
             world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let visibility = shadow_transmittance(
-            doc,
-            snapshot,
-            geometry,
-            bvh,
-            volumes,
-            images,
-            surface.shadow_point,
-            geometric,
-            direction,
-            f64::INFINITY,
+            scene,
+            ShadowRay {
+                point: surface.shadow_point,
+                normal: geometric,
+                direction,
+                distance: f64::INFINITY,
+            },
             transparent_budget,
             rng,
             evaluator_workspace,
@@ -2173,19 +2174,8 @@ fn direct_lighting(
 
 /// The direct light of a volume scatter: each light's next-event estimate weighted by the scatter's phase function, and one
 /// environment sample with MIS against the phase function.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "volume direct lighting needs explicit transport and world state"
-)]
 fn direct_volume_lighting(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
-    bvh: &Bvh,
-    lights: &[PointLight],
-    volumes: &[VolumeInstance<'_>],
-    images: &BTreeMap<String, ImageData>,
-    importance: Option<&WorldImportanceSampler>,
+    scene: &SceneRefs<'_, '_>,
     event: VolumeEvent,
     incoming_direction: DVec3,
     environment: DVec3,
@@ -2193,6 +2183,15 @@ fn direct_volume_lighting(
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
+    let SceneRefs {
+        doc,
+        snapshot,
+        lights,
+        volumes,
+        images,
+        importance,
+        ..
+    } = *scene;
     let mut contribution = DVec3::ZERO;
     for light in lights {
         let Some(sample) = sample_light(light, event.point, rng) else {
@@ -2202,16 +2201,13 @@ fn direct_volume_lighting(
             continue;
         }
         let visibility = shadow_transmittance(
-            doc,
-            snapshot,
-            geometry,
-            bvh,
-            volumes,
-            images,
-            event.point,
-            DVec3::ZERO,
-            sample.direction,
-            sample.distance,
+            scene,
+            ShadowRay {
+                point: event.point,
+                normal: DVec3::ZERO,
+                direction: sample.direction,
+                distance: sample.distance,
+            },
             transparent_budget,
             rng,
             evaluator_workspace,
@@ -2230,16 +2226,13 @@ fn direct_volume_lighting(
     if pdf > 0.0 {
         let incoming = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let visibility = shadow_transmittance(
-            doc,
-            snapshot,
-            geometry,
-            bvh,
-            volumes,
-            images,
-            event.point,
-            DVec3::ZERO,
-            direction,
-            f64::INFINITY,
+            scene,
+            ShadowRay {
+                point: event.point,
+                normal: DVec3::ZERO,
+                direction,
+                distance: f64::INFINITY,
+            },
             transparent_budget,
             rng,
             evaluator_workspace,
@@ -2271,25 +2264,28 @@ fn power_heuristic(first_pdf: f64, second_pdf: f64) -> f64 {
 
 /// The transmittance of a shadow ray: opaque hits block it, transparent surfaces and medium boundaries pass it, and each
 /// medium it crosses attenuates it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "shadow traversal needs exact scene visibility, materials, and medium state"
-)]
 fn shadow_transmittance(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
-    bvh: &Bvh,
-    volumes: &[VolumeInstance<'_>],
-    images: &BTreeMap<String, ImageData>,
-    point: DVec3,
-    normal: DVec3,
-    direction: DVec3,
-    distance: f64,
+    scene: &SceneRefs<'_, '_>,
+    ray: ShadowRay,
     transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<DVec3> {
+    let SceneRefs {
+        doc,
+        snapshot,
+        geometry,
+        bvh,
+        volumes,
+        images,
+        ..
+    } = *scene;
+    let ShadowRay {
+        point,
+        normal,
+        direction,
+        distance,
+    } = ray;
     let mut transmittance = DVec3::ONE;
     let mut transparent_hits = 0u32;
     let mut blocked = false;
