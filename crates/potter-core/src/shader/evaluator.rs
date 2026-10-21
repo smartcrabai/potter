@@ -8,6 +8,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    geom::{GeneratedCorners, TextureSpace},
     graph::{GraphKind, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef},
@@ -428,7 +429,11 @@ pub struct HitContext<'a> {
     pub uv_layers: Option<HitUvLayers<'a>>,
     /// Sink for `uv.layer_missing` warnings; see [`HitContext::with_warnings`].
     pub warnings: Option<&'a RefCell<Vec<JsonValue>>>,
+    /// The Generated texture coordinate: the object's texture space applied to its local point (see
+    /// [`HitContext::with_generated`]).
     pub generated: DVec3,
+    /// How far `generated` moves per unit of object-local movement (`1 / (2 size)` per axis).
+    pub generated_per_local: DVec3,
     pub position: DVec3,
     pub object: DVec3,
     pub normal: DVec3,
@@ -451,6 +456,7 @@ impl<'a> HitContext<'a> {
             uv_layers: None,
             warnings: None,
             generated: DVec3::ZERO,
+            generated_per_local: DVec3::ONE,
             position: DVec3::ZERO,
             object: DVec3::ZERO,
             normal: DVec3::Z,
@@ -472,6 +478,31 @@ impl<'a> HitContext<'a> {
     #[must_use]
     pub const fn with_uv_layers(mut self, layers: HitUvLayers<'a>) -> Self {
         self.uv_layers = Some(layers);
+        self
+    }
+
+    /// Set the Generated coordinate of the object-local point `local` through the object's texture space
+    /// (Cycles' `ATTR_STD_GENERATED`), and the Jacobian that moves it with `local` in shifted samples.
+    #[must_use]
+    pub fn with_generated(mut self, texture_space: TextureSpace, local: DVec3) -> Self {
+        self.generated = texture_space.generated(local);
+        self.generated_per_local = texture_space.generated_per_local();
+        self
+    }
+
+    /// Set the Generated coordinate of a hit on a triangle whose corners carry theirs: the barycentric blend of the
+    /// corner values, as Cycles interpolates the per-vertex `ATTR_STD_GENERATED` (`intern/cycles/blender/mesh.cpp`).
+    /// A corner at zero contributes exactly zero, so a face at the texture space's edge stays at zero, as it does in
+    /// Cycles. The Jacobian is the triangle's, since a triangle belongs to one object or collection member.
+    #[must_use]
+    pub fn with_generated_corners(
+        mut self,
+        generated: GeneratedCorners,
+        barycentric: [f64; 3],
+    ) -> Self {
+        let [first, second, third] = generated.corners;
+        self.generated = first * barycentric[0] + second * barycentric[1] + third * barycentric[2];
+        self.generated_per_local = generated.per_local;
         self
     }
 
@@ -500,7 +531,7 @@ impl<'a> HitContext<'a> {
     /// the moved position; without them only `uv` moves, by the step's UV change.
     fn shifted(&self, step: SurfaceStep) -> Self {
         let mut shifted = *self;
-        shifted.generated += step.world;
+        shifted.generated += step.world * self.generated_per_local;
         shifted.position += step.world;
         shifted.object += step.world;
         if let Some(layers) = self.uv_layers {
@@ -3983,5 +4014,62 @@ mod subsurface_method_tests {
             Some(SubsurfaceMethod::RandomWalkLegacy)
         );
         assert_eq!(SubsurfaceMethod::parse("random_walk"), None);
+    }
+}
+
+#[cfg(test)]
+mod generated_corner_tests {
+    use glam::DVec3;
+
+    use crate::{geom::GeneratedCorners, geom::TextureSpace, graph::NodeGroup, model::Registry};
+
+    use super::HitContext;
+
+    /// A texture space of half-extent 2 at the origin: Generated is `local / 4 + 0.5` per axis.
+    fn texture_space() -> TextureSpace {
+        TextureSpace::manual(DVec3::ZERO, DVec3::splat(2.0))
+    }
+
+    #[test]
+    fn zero_corner_generated_stays_exactly_zero_under_any_weights() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let generated = GeneratedCorners {
+            corners: [DVec3::ZERO; 3],
+            per_local: texture_space().generated_per_local(),
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, [0.2, 0.3, 0.5]);
+        assert_eq!(context.generated, DVec3::ZERO);
+    }
+
+    #[test]
+    fn corner_generated_blends_to_the_generated_of_the_interpolated_point() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let space = texture_space();
+        let local = [
+            DVec3::new(-2.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+        ];
+        let barycentric = [0.5, 0.25, 0.25];
+        let point =
+            local[0] * barycentric[0] + local[1] * barycentric[1] + local[2] * barycentric[2];
+        let generated = GeneratedCorners {
+            corners: local.map(|corner| space.generated(corner)),
+            per_local: space.generated_per_local(),
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, barycentric);
+        assert!((context.generated - space.generated(point)).length() < 1e-12);
+    }
+
+    #[test]
+    fn corner_hit_takes_the_triangles_jacobian() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let per_local = DVec3::new(0.1, 0.2, 0.3);
+        let generated = GeneratedCorners {
+            corners: [DVec3::ZERO; 3],
+            per_local,
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, [1.0 / 3.0; 3]);
+        assert_eq!(context.generated_per_local, per_local);
     }
 }

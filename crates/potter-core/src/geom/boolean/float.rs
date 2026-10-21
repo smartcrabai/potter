@@ -32,7 +32,6 @@ use crate::geom::{
 };
 
 use super::dissolve::Poly;
-use super::float_connect::{BVH_AXIS, BVH_TREE_TYPE};
 use super::float_split_net::CornerSource;
 use super::imesh::NO_INDEX;
 use super::{BooleanOperand, Operation};
@@ -2428,7 +2427,7 @@ fn side_tree(state: &State, side: u8, pad: f32) -> SideTree {
     let (entries, leaves) = tri_leaf_bounds(state, side, pad);
     SideTree {
         entries,
-        tree: KdopTree::new(leaves, BVH_TREE_TYPE, BVH_AXIS),
+        tree: KdopTree::new(leaves, 8, 8),
     }
 }
 
@@ -2442,7 +2441,7 @@ fn tri_leaf_bounds(state: &State, side: u8, pad: f32) -> (Vec<usize>, Vec<Bounds
         .filter(|(_, tri)| tri.side == side)
         .map(|(index, tri)| {
             let points = tri.verts.map(|v| state.verts[v].co);
-            (index, kdop_bounds(&points, pad, BVH_AXIS))
+            (index, kdop_bounds(&points, pad, 8))
         })
         .unzip()
 }

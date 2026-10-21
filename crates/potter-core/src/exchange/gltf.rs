@@ -1791,7 +1791,10 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             | "sharp"
             | "color_layers"
             | "custom_normal"
-            | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES => true,
+            | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES
+            // glTF has no texture space: a stored one is a reported loss (`unwritten_attribute_losses`), so lossy export
+            // proceeds and strict export refuses through the loss report, as for other unwritten attributes.
+            | crate::geom::TEXTURE_SPACE_KEY => true,
             "blender_metadata" => value["custom_properties"]
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty),
@@ -8760,7 +8763,7 @@ fn weld_copies(
 }
 
 /// Whether morph NORMAL deltas disagree with normals derived from the morphed geometry.
-/// Runs after `shading::import_shading`, so `mesh` already carries the imported shading.
+/// Runs after `shading::import_shading_flags`, so `mesh` already carries the imported shading.
 /// `normals` and each target's NORMAL deltas hold one value per face corner in `mesh.faces` order.
 fn morph_normals_disagree(
     mesh: &Mesh,

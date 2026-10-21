@@ -32,9 +32,9 @@ const ENDPOINT_BIAS: f32 = 1.0e-4;
 /// Blender `BLI_bvhtree_new` epsilon (`1e-4f`, above `FLT_EPSILON`), inflating every leaf box.
 const BVH_EPSILON: f32 = 1.0e-4;
 /// Blender `BLI_bvhtree_new` `tree_type`: children per node of the edge tree.
-pub(super) const BVH_TREE_TYPE: usize = 8;
+const BVH_TREE_TYPE: usize = 8;
 /// Blender `BLI_bvhtree_new` `axis`: bound entries per edge box (`x`, `y`, `z`, `x + y + z`).
-pub(super) const BVH_AXIS: usize = 8;
+const BVH_AXIS: usize = 8;
 
 /// Returns the connection edges Blender creates for one face, in creation order, as `(origin, end)`.
 ///

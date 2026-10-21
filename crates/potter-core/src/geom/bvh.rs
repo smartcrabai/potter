@@ -5,6 +5,8 @@
 //!   each leaf, then [`KdopTree::new`] (`BLI_bvhtree_balance`, `non_recursive_bvh_div_nodes`).
 //! - `BLI_bvhtree_ray_cast_ex` with zero radius is [`KdopTree::ray_cast`] (`dfs_raycast`).
 //! - `BLI_bvhtree_overlap` is [`overlap_pairs`] (`tree_overlap_traverse`).
+//! - `BLI_bvhtree_find_nearest_ex` is [`KdopTree::find_nearest`] (`dfs_find_nearest_dfs` and the
+//!   heap-ordered `heap_find_nearest_inner`).
 //!
 //! `tree_type` is the number of children per branch, and `axis` the number of bound entries per box:
 //! 6 for the three slabs `x`, `y`, `z`, or 8 for those plus `x + y + z`. The ray test reads the first
@@ -14,6 +16,8 @@
 //! The Watertight ray ([`Ray::watertight`]) is `isect_ray_tri_watertight_v3`, used by the cage ray cast.
 
 use std::cmp::Ordering;
+
+use crate::geom::heap_simple::HeapSimple;
 
 /// A point or direction in `f32`, as Blender stores them.
 pub(crate) type Vec3 = [f32; 3];
@@ -42,8 +46,12 @@ const EMPTY_BOUNDS: Bounds = [
     f32::MAX,
     -f32::MAX,
 ];
-/// Blender `BVH_RAYCAST_DIST_MAX` (`BLI_kdopbvh.hh`).
-const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
+/// `BLI_bvhtree_new` clamps the tree epsilon to `FLT_EPSILON` (`BLI_kdopbvh.cc`).
+pub(crate) const TREE_EPSILON: f32 = f32::EPSILON;
+/// Blender `BVH_RAYCAST_DIST_MAX` (`BLI_kdopbvh.hh`): `FLT_MAX / 2`, the open ray length.
+pub(crate) const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
+/// Blender `MAX_TREETYPE`: the most children a branch may have.
+const MAX_TREE_TYPE: usize = 32;
 
 pub(crate) fn sub(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -100,7 +108,7 @@ pub(crate) fn kdop_bounds(points: &[Vec3], epsilon: f32, axis: usize) -> Bounds 
             bounds[2 * slab + 1] = d.max(bounds[2 * slab + 1]);
         }
     }
-    let epsilon = epsilon.max(f32::EPSILON);
+    let epsilon = epsilon.max(TREE_EPSILON);
     for (slab, &length) in AXES_LENGTH.iter().take(slabs).enumerate() {
         let dist = epsilon * length;
         bounds[2 * slab] -= dist;
@@ -141,17 +149,22 @@ enum Child {
     Branch(usize),
 }
 
-/// Blender `BVHNode` of a branch: its box over every leaf below it, its split slab, and its children.
-#[derive(Clone, Default)]
+/// The link stored in a branch's unused child slots. Only the first `node_num` slots are read.
+const UNUSED_LINK: Child = Child::Leaf(0);
+
+/// Blender `BVHNode` of a branch: its box over every leaf below it, its split slab, and how many of its
+/// child links are in use. The links live in [`KdopTree::links`].
+#[derive(Clone, Copy, Default)]
 struct Branch {
     bounds: Bounds,
     /// Blender `main_axis`: the slab (0, 1, 2) of the split axis.
     main_axis: usize,
-    children: Vec<Child>,
+    node_num: usize,
 }
 
 /// Blender `BVHBuildHelper`: the layout of `leafs_num` leaves in an implicit `tree_type`-ary tree.
 struct Implicit {
+    tree_type: usize,
     leafs_num: usize,
     leafs_per_child: [usize; 32],
     branches_on_level: [usize; 32],
@@ -177,6 +190,7 @@ impl Implicit {
         let remain = leafs_num - leafs_per_child[1];
         let nnodes = (remain + tree_type - 2) / (tree_type - 1);
         Self {
+            tree_type,
             leafs_num,
             leafs_per_child,
             branches_on_level,
@@ -306,6 +320,7 @@ fn partition_nth_element(
 }
 
 /// Blender `split_leafs`: each child range gets the leaves it would get from a full sort on `axis`.
+/// `nth` holds the `tree_type + 1` split points of the branch.
 fn split_leafs(
     order: &mut [usize],
     nth: &[usize],
@@ -321,73 +336,101 @@ fn split_leafs(
     }
 }
 
-/// Blender `non_recursive_bvh_div_nodes_task_cb`: fits branch `j`, splits its leaves along its largest
-/// axis, and links its children.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors the Blender helper's state, one value each"
-)]
-fn divide(
-    branches: &mut [Branch],
-    order: &mut [usize],
-    leaves: &[Bounds],
-    implicit: &Implicit,
-    level: Level,
-    j: usize,
-    tree_type: usize,
+/// The state of `BLI_bvhtree_balance` while it divides the implicit tree level by level.
+struct TreeBuilder<'a> {
+    leaves: &'a [Bounds],
+    implicit: Implicit,
+    /// Bound entries per box: `axis / 2` slabs take part in the refit.
     axis: usize,
-) {
-    let parent_level_index = j - level.start;
-    let begin = implicit.leafs_index(level.depth, parent_level_index);
-    let end = implicit.leafs_index(level.depth, parent_level_index + 1);
-    let bounds = refit(leaves, &order[begin..end], axis / 2);
-    let split_axis = largest_axis(&bounds);
+    /// Blender `leaf_index`: the leaves in the order the divisions have arranged them.
+    order: Vec<usize>,
+    branches: Vec<Branch>,
+    /// The child links of branch `j` are `links[j * tree_type..][..node_num]`.
+    links: Vec<Child>,
+}
 
-    let mut nth = vec![0usize; tree_type + 1];
-    nth[0] = begin;
-    nth[tree_type] = end;
-    for (k, slot) in nth.iter_mut().enumerate().take(tree_type).skip(1) {
-        let child_level_index = child_index(j, k, tree_type) - level.next;
-        *slot = implicit.leafs_index(level.depth + 1, child_level_index);
-    }
-    split_leafs(order, &nth, split_axis, leaves, tree_type);
+impl TreeBuilder<'_> {
+    /// Blender `non_recursive_bvh_div_nodes_task_cb`: fits branch `j`, splits its leaves along its largest
+    /// axis, and links its children.
+    fn divide(&mut self, level: Level, j: usize) {
+        let tree_type = self.implicit.tree_type;
+        let parent_level_index = j - level.start;
+        let begin = self.implicit.leafs_index(level.depth, parent_level_index);
+        let end = self
+            .implicit
+            .leafs_index(level.depth, parent_level_index + 1);
+        let bounds = refit(self.leaves, &self.order[begin..end], self.axis / 2);
+        let split_axis = largest_axis(&bounds);
 
-    let mut children = Vec::with_capacity(tree_type);
-    for k in 0..tree_type {
-        let index = child_index(j, k, tree_type);
-        let child_level_index = index - level.next;
-        let first = implicit.leafs_index(level.depth + 1, child_level_index);
-        let last = implicit.leafs_index(level.depth + 1, child_level_index + 1);
-        match last.cmp(&(first + 1)) {
-            Ordering::Greater => children.push(Child::Branch(index)),
-            Ordering::Equal => children.push(Child::Leaf(order[first])),
-            Ordering::Less => break,
+        let mut nth = [0usize; MAX_TREE_TYPE + 1];
+        nth[0] = begin;
+        nth[tree_type] = end;
+        for (k, slot) in nth.iter_mut().enumerate().take(tree_type).skip(1) {
+            let child_level_index = child_index(j, k, tree_type) - level.next;
+            *slot = self
+                .implicit
+                .leafs_index(level.depth + 1, child_level_index);
         }
+        split_leafs(
+            &mut self.order,
+            &nth[..=tree_type],
+            split_axis,
+            self.leaves,
+            tree_type,
+        );
+
+        let mut node_num = 0;
+        for k in 0..tree_type {
+            let index = child_index(j, k, tree_type);
+            let child_level_index = index - level.next;
+            let first = self
+                .implicit
+                .leafs_index(level.depth + 1, child_level_index);
+            let last = self
+                .implicit
+                .leafs_index(level.depth + 1, child_level_index + 1);
+            let child = match last.cmp(&(first + 1)) {
+                Ordering::Greater => Child::Branch(index),
+                Ordering::Equal => Child::Leaf(self.order[first]),
+                Ordering::Less => break,
+            };
+            self.links[j * tree_type + node_num] = child;
+            node_num += 1;
+        }
+        self.branches[j] = Branch {
+            bounds,
+            main_axis: split_axis / 2,
+            node_num,
+        };
     }
-    branches[j] = Branch {
-        bounds,
-        main_axis: split_axis / 2,
-        children,
-    };
 }
 
 /// Blender `BLI_bvhtree_balance` (`non_recursive_bvh_div_nodes`) over the leaf boxes, in insertion
-/// order. Returns the branches indexed from 1: branch `j` is Blender's `tree[j]`, and the root is 1.
-fn build_branches(leaves: &[Bounds], tree_type: usize, axis: usize) -> Vec<Branch> {
+/// order. Returns the branches indexed from 1 (branch `j` is Blender's `tree[j]`, the root is 1) and
+/// their child links, `tree_type` per branch.
+fn build_tree(leaves: &[Bounds], tree_type: usize, axis: usize) -> (Vec<Branch>, Vec<Child>) {
     let leafs_num = leaves.len();
     let branches_num = ((leafs_num + tree_type - 3) / (tree_type - 1)).max(1);
     let mut branches = vec![Branch::default(); branches_num + 1];
+    let mut links = vec![UNUSED_LINK; (branches_num + 1) * tree_type];
     if leafs_num == 1 {
         // A one-leaf tree still has a root branch that holds the leaf.
         branches[1] = Branch {
             bounds: leaves[0],
             main_axis: largest_axis(&leaves[0]) / 2,
-            children: vec![Child::Leaf(0)],
+            node_num: 1,
         };
-        return branches;
+        links[tree_type] = Child::Leaf(0);
+        return (branches, links);
     }
-    let implicit = Implicit::new(leafs_num, tree_type);
-    let mut order: Vec<usize> = (0..leafs_num).collect();
+    let mut builder = TreeBuilder {
+        leaves,
+        implicit: Implicit::new(leafs_num, tree_type),
+        axis,
+        order: (0..leafs_num).collect(),
+        branches,
+        links,
+    };
     let mut start = 1;
     let mut depth = 1;
     while start <= branches_num {
@@ -395,30 +438,34 @@ fn build_branches(leaves: &[Bounds], tree_type: usize, axis: usize) -> Vec<Branc
         let stop = next.min(branches_num + 1);
         let level = Level { start, next, depth };
         for j in start..stop {
-            divide(
-                &mut branches,
-                &mut order,
-                leaves,
-                &implicit,
-                level,
-                j,
-                tree_type,
-                axis,
-            );
+            builder.divide(level, j);
         }
         start = next;
         depth += 1;
     }
-    branches
+    (builder.branches, builder.links)
 }
 
 /// A balanced k-DOP tree over leaf boxes. Leaf `i` is the `i`-th box given to [`KdopTree::new`].
 pub(crate) struct KdopTree {
     /// Blender `axis`: the bound entries per box, 6 or 8.
     axis: usize,
+    /// Blender `tree_type`: the child slots per branch, the stride of [`Self::links`].
+    tree_type: usize,
     leaves: Vec<Bounds>,
     /// Branch `j` is `branches[j]`, Blender's implicit numbering. Empty when there are no leaves.
     branches: Vec<Branch>,
+    /// The child links of branch `j` are `links[j * tree_type..][..node_num]`.
+    links: Vec<Child>,
+}
+
+/// Blender's `BVHTreeNearest`: the nearest leaf found so far, its nearest point, and the squared
+/// distance to it. `index` is -1 when no leaf has been accepted.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NearestHit {
+    pub(crate) index: isize,
+    pub(crate) co: Vec3,
+    pub(crate) dist_sq: f32,
 }
 
 impl KdopTree {
@@ -427,16 +474,25 @@ impl KdopTree {
     ///
     /// Cost: O(T log T) time and O(T) memory for T leaves.
     pub(crate) fn new(leaves: Vec<Bounds>, tree_type: usize, axis: usize) -> Self {
-        let branches = if leaves.is_empty() {
-            Vec::new()
+        debug_assert!((2..=MAX_TREE_TYPE).contains(&tree_type));
+        let (branches, links) = if leaves.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            build_branches(&leaves, tree_type, axis)
+            build_tree(&leaves, tree_type, axis)
         };
         Self {
             axis,
+            tree_type,
             leaves,
             branches,
+            links,
         }
+    }
+
+    /// The child links of branch `branch`, in Blender's `node_num` order.
+    fn children(&self, branch: usize) -> &[Child] {
+        let start = branch * self.tree_type;
+        &self.links[start..start + self.branches[branch].node_num]
     }
 
     /// The leaves reachable from the root, in depth-first order (every leaf once for a valid tree).
@@ -450,9 +506,7 @@ impl KdopTree {
         while let Some(child) = stack.pop() {
             match child {
                 Child::Leaf(leaf) => out.push(leaf),
-                Child::Branch(branch) => {
-                    stack.extend(self.branches[branch].children.iter().rev().copied());
-                }
+                Child::Branch(branch) => stack.extend(self.children(branch).iter().rev().copied()),
             }
         }
         out
@@ -469,9 +523,6 @@ impl KdopTree {
     /// `callback` is called for each leaf whose box can still hold a closer hit (`dist < hit.dist`), with
     /// the ray, and may update `hit`. The walk stops descending into boxes behind the ray or beyond
     /// `hit.dist`. Returns the index of the hit leaf, or -1.
-    ///
-    /// `origin` and `dir` are as Blender passes them. `dir` must be nonzero in every component for the
-    /// slab tests, which the callers ensure.
     pub(crate) fn ray_cast<F>(
         &self,
         origin: Vec3,
@@ -494,30 +545,130 @@ impl KdopTree {
     where
         F: FnMut(usize, &Ray, &mut RayHit),
     {
-        let bounds = match child {
-            Child::Leaf(leaf) => self.leaves[leaf],
-            Child::Branch(branch) => self.branches[branch].bounds,
-        };
-        let dist = ray.fast_nearest_hit(&bounds, hit.dist);
+        let dist = ray.fast_nearest_hit(&self.child_bounds(child), hit.dist);
         if dist >= hit.dist {
             return;
         }
         match child {
             Child::Leaf(leaf) => callback(leaf, ray, hit),
             Child::Branch(branch) => {
-                let branch = &self.branches[branch];
                 // Dive in the direction of the ray along the split axis.
-                if ray.dot_axis[branch.main_axis] > 0.0 {
-                    for &next in &branch.children {
+                if ray.dot_axis[self.branches[branch].main_axis] > 0.0 {
+                    for &next in self.children(branch) {
                         self.dfs(ray, next, hit, callback);
                     }
                 } else {
-                    for &next in branch.children.iter().rev() {
+                    for &next in self.children(branch).iter().rev() {
                         self.dfs(ray, next, hit, callback);
                     }
                 }
             }
         }
+    }
+
+    /// `BLI_bvhtree_find_nearest_ex`: the leaf nearest to `co`, searched from `nearest` (its `dist_sq`
+    /// bounds the search; a `dist_sq` of `f32::MAX` is an open search). `callback` receives the leaf
+    /// index, the query point and the running nearest, and writes the leaf's nearest point into it.
+    /// `optimal_order` selects best-first search with a heap (`BVH_NEAREST_OPTIMAL_ORDER`) instead of
+    /// depth-first search. Returns the index of the nearest leaf, or -1.
+    pub(crate) fn find_nearest<F>(
+        &self,
+        co: Vec3,
+        nearest: &mut NearestHit,
+        callback: &mut F,
+        optimal_order: bool,
+    ) -> isize
+    where
+        F: FnMut(usize, Vec3, &mut NearestHit),
+    {
+        if !self.branches.is_empty() {
+            let root = Child::Branch(1);
+            if self.nearest_box(co, root).0 < nearest.dist_sq {
+                if optimal_order {
+                    let mut heap = HeapSimple::new();
+                    self.heap_nearest_expand(co, root, &mut heap, nearest, callback);
+                    while !heap.is_empty() && heap.top_value() < nearest.dist_sq {
+                        let Some(node) = heap.pop_min() else {
+                            break;
+                        };
+                        self.heap_nearest_expand(co, node, &mut heap, nearest, callback);
+                    }
+                } else {
+                    self.dfs_nearest(co, root, nearest, callback);
+                }
+            }
+        }
+        nearest.index
+    }
+
+    /// `dfs_find_nearest_dfs`: prune children by their box distance, dive toward the query side of
+    /// each branch's split axis, and let the callback decide leaves.
+    fn dfs_nearest<F>(&self, co: Vec3, node: Child, nearest: &mut NearestHit, callback: &mut F)
+    where
+        F: FnMut(usize, Vec3, &mut NearestHit),
+    {
+        match node {
+            Child::Leaf(leaf) => callback(leaf, co, nearest),
+            Child::Branch(branch) => {
+                let children = self.children(branch);
+                let main_axis = self.branches[branch].main_axis;
+                // The first child decides the side of the split the query lies on; a branch without
+                // children has nothing to visit.
+                let Some(&first) = children.first() else {
+                    return;
+                };
+                let forward = co[main_axis] <= self.child_bounds(first)[main_axis * 2 + 1];
+                // Blender's order without collecting the children: forward, or the reverse.
+                for step in 0..children.len() {
+                    let child = if forward {
+                        children[step]
+                    } else {
+                        children[children.len() - 1 - step]
+                    };
+                    if self.nearest_box(co, child).0 >= nearest.dist_sq {
+                        continue;
+                    }
+                    self.dfs_nearest(co, child, nearest, callback);
+                }
+            }
+        }
+    }
+
+    /// `heap_find_nearest_inner`: a leaf goes to the callback; a branch queues each child closer than
+    /// the current nearest, keyed by its box distance.
+    fn heap_nearest_expand<F>(
+        &self,
+        co: Vec3,
+        node: Child,
+        heap: &mut HeapSimple<Child>,
+        nearest: &mut NearestHit,
+        callback: &mut F,
+    ) where
+        F: FnMut(usize, Vec3, &mut NearestHit),
+    {
+        match node {
+            Child::Leaf(leaf) => callback(leaf, co, nearest),
+            Child::Branch(branch) => {
+                for &child in self.children(branch) {
+                    let dist_sq = self.nearest_box(co, child).0;
+                    if dist_sq < nearest.dist_sq {
+                        heap.insert(dist_sq, child);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `calc_nearest_point_squared`: the squared distance from `co` to the node's box, and the box point
+    /// nearest to `co`. Each axis is clamped to the box slab, lower bound first, as Blender does.
+    fn nearest_box(&self, co: Vec3, node: Child) -> (f32, Vec3) {
+        let bv = self.child_bounds(node);
+        let mut nearest = [0.0_f32; 3];
+        for axis in 0..3 {
+            nearest[axis] = co[axis].max(bv[2 * axis]).min(bv[2 * axis + 1]);
+        }
+        let offset = sub(co, nearest);
+        (dot(offset, offset), nearest)
     }
 }
 
@@ -561,12 +712,12 @@ fn overlap_traverse(
     match (node1, node2) {
         (Child::Leaf(id1), Child::Leaf(id2)) => out.push((id1, id2)),
         (Child::Leaf(_), Child::Branch(index)) => {
-            for &child in &tree2.branches[index].children {
+            for &child in tree2.children(index) {
                 overlap_traverse(tree1, node1, tree2, child, slabs, out);
             }
         }
         (Child::Branch(index), _) => {
-            for &child in &tree1.branches[index].children {
+            for &child in tree1.children(index) {
                 overlap_traverse(tree1, child, tree2, node2, slabs, out);
             }
         }
@@ -707,7 +858,7 @@ impl Ray {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bounds, KdopTree, RayHit, kdop_bounds, overlap_pairs};
+    use super::{Bounds, KdopTree, NearestHit, RayHit, Vec3, dot, kdop_bounds, overlap_pairs, sub};
 
     /// A small deterministic generator, so the fixtures do not depend on a library RNG.
     struct Lcg(u64);
@@ -737,24 +888,17 @@ mod tests {
     }
 
     #[test]
-    fn every_leaf_is_reachable_from_the_root_for_every_tree_type() {
+    fn every_leaf_is_reachable_from_the_root_once_for_every_tree_type() {
         for (tree_type, axis) in [(2, 6), (4, 6), (8, 8)] {
             for count in [1_usize, 2, 3, 37] {
                 let mut rng = Lcg(7 + count as u64);
                 let leaves = random_leaves(&mut rng, count, 1.0e-4, axis);
                 let tree = KdopTree::new(leaves, tree_type, axis);
-                let mut seen = vec![false; count];
-                let mut stack = vec![super::Child::Branch(1)];
-                while let Some(node) = stack.pop() {
-                    match node {
-                        super::Child::Leaf(leaf) => seen[leaf] = true,
-                        super::Child::Branch(branch) => {
-                            stack.extend(tree.branches[branch].children.iter().copied());
-                        }
-                    }
-                }
-                assert!(
-                    seen.iter().all(|&s| s),
+                let mut reached = tree.reachable_leaves();
+                reached.sort_unstable();
+                assert_eq!(
+                    reached,
+                    (0..count).collect::<Vec<_>>(),
                     "tree_type {tree_type}, {count} leaves"
                 );
             }
@@ -844,6 +988,60 @@ mod tests {
             got.sort_unstable();
             expected.sort_unstable();
             assert_eq!(got, expected, "tree_type {tree_type}, axis {axis}");
+        }
+    }
+
+    /// The nearest leaf by box distance, for both search orders, equals a brute-force scan.
+    #[test]
+    fn find_nearest_matches_brute_force_over_boxes() {
+        for (tree_type, axis) in [(2, 6), (8, 8)] {
+            let mut rng = Lcg(41);
+            let leaves = random_leaves(&mut rng, 70, 1.0e-4, axis);
+            let tree = KdopTree::new(leaves.clone(), tree_type, axis);
+            let box_distance = |leaf: usize, point: Vec3| -> (f32, Vec3) {
+                let bounds = leaves[leaf];
+                let mut nearest = [0.0_f32; 3];
+                for k in 0..3 {
+                    nearest[k] = point[k].max(bounds[2 * k]).min(bounds[2 * k + 1]);
+                }
+                let offset = sub(point, nearest);
+                (dot(offset, offset), nearest)
+            };
+            for optimal_order in [false, true] {
+                for _ in 0..200 {
+                    let co = [
+                        rng.unit() * 3.0 - 1.0,
+                        rng.unit() * 3.0 - 1.0,
+                        rng.unit() * 3.0 - 1.0,
+                    ];
+                    let mut expected = f32::MAX;
+                    for leaf in 0..leaves.len() {
+                        expected = expected.min(box_distance(leaf, co).0);
+                    }
+                    let mut nearest = NearestHit {
+                        index: -1,
+                        co: [0.0; 3],
+                        dist_sq: f32::MAX,
+                    };
+                    tree.find_nearest(
+                        co,
+                        &mut nearest,
+                        &mut |leaf: usize, point: Vec3, hit: &mut NearestHit| {
+                            let (dist_sq, nearest_point) = box_distance(leaf, point);
+                            if dist_sq < hit.dist_sq {
+                                hit.index = leaf as isize;
+                                hit.dist_sq = dist_sq;
+                                hit.co = nearest_point;
+                            }
+                        },
+                        optimal_order,
+                    );
+                    assert_eq!(
+                        nearest.dist_sq, expected,
+                        "tree_type {tree_type}, optimal_order {optimal_order}"
+                    );
+                }
+            }
         }
     }
 }
