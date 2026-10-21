@@ -1025,12 +1025,13 @@ mod oracle_tests {
         out
     }
 
-    /// Distance from every pixel centre to the nearest point centre.
+    /// Distance from every pixel centre within 14 px of a point centre to the nearest point centre (the dot
+    /// neighbourhood the points test measures; pixels further out stay at `f64::MAX`).
     fn point_distance(centres: &[[f64; 2]]) -> Vec<f64> {
         let (width, height) = (WIDTH as usize, HEIGHT as usize);
         let mut out = vec![f64::MAX; width * height];
         for centre in centres {
-            let reach = 10.0;
+            let reach = 14.0;
             let x0 = (centre[0] - reach).floor().max(0.0) as usize;
             let x1 = ((centre[0] + reach).ceil().max(0.0) as usize).min(width - 1);
             let y0 = (centre[1] - reach).floor().max(0.0) as usize;
