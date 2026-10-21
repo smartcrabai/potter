@@ -30,6 +30,9 @@ scene.cycles.device = "CPU"
 scene.cycles.samples = 64
 scene.cycles.use_denoising = False
 scene.cycles.max_bounces = 1
+# Potter samples each pixel with a one-pixel box, so the oracle uses Cycles' box filter of width 1, as the other oracles do.
+scene.cycles.pixel_filter_type = "BOX"
+scene.cycles.filter_width = 1.0
 scene.cycles.seed = 0
 scene.cycles.blur_glossy = 1.0
 scene.render.resolution_x = 16

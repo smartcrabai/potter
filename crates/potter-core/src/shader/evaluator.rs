@@ -1361,6 +1361,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         }
     }
 
+    /// Whether `socket` of `node_id` takes a link, so its value comes from another node rather than the socket's
+    /// stored default.
+    fn is_linked(&self, node_id: &Id, socket: &str) -> bool {
+        self.group
+            .links
+            .iter()
+            .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket))
+    }
+
     fn output(&mut self, node_id: &Id, socket: &str, socket_index: usize) -> Result<Value> {
         let Some((node_key, node)) = self.group.nodes.get_key_value(node_id) else {
             return Err(invalid(format!(
@@ -1849,7 +1858,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         if socket != "Normal" {
             return Err(invalid(format!("unknown Bump output `{socket}`")));
         }
-        let normal = self.vector_input(id, &["Normal"], self.hit_ctx.normal)?;
+        // Cycles' `stack_load_float3_default(stack, normal_offset, sd->N)` (`kernel/svm/displace.h`): an unlinked
+        // Normal is the shading normal, whatever the socket stores (Blender stores a zero vector there).
+        let normal = if self.is_linked(id, "Normal") {
+            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?
+        } else {
+            self.hit_ctx.normal
+        };
         let strength = self.scalar_input(id, &["Strength"], 1.0)?.max(0.0);
         let distance = self.scalar_input(id, &["Distance"], 0.001)?;
         let invert = self
@@ -1859,24 +1874,20 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
         let scale = if invert { -distance } else { distance };
-        match self.hit_ctx.footprint {
-            Some(footprint) => {
-                let filter_width = self.scalar_input(id, &["Filter Width"], 0.1)?;
-                self.footprint_bump(id, normal, strength, scale, filter_width, footprint)
+        if let Some(footprint) = self.hit_ctx.footprint {
+            let filter_width = self.scalar_input(id, &["Filter Width"], 0.1)?;
+            self.footprint_bump(id, normal, strength, scale, filter_width, footprint)
+        } else {
+            // Without a camera footprint (realtime, preview, baking) the height is a symmetric finite difference
+            // over a fixed step, and Filter Width has no footprint to scale: a known gap against Cycles.
+            if strength.abs() <= f64::EPSILON || distance.abs() <= f64::EPSILON {
+                return Ok(Value::Vector(normalize_or(normal, self.hit_ctx.normal)));
             }
-            None => {
-                // Without a camera footprint (realtime, preview, baking) the height is a symmetric finite difference
-                // over a fixed step, and Filter Width has no footprint to scale: a known gap against Cycles.
-                if strength.abs() <= f64::EPSILON || distance.abs() <= f64::EPSILON {
-                    return Ok(Value::Vector(normalize_or(normal, self.hit_ctx.normal)));
-                }
-                let unit = normalize_or(normal, self.hit_ctx.normal);
-                let context = self.hit_ctx;
-                let gradient =
-                    height_gradient(&context, unit, |context| self.height_at(id, context))?;
-                let perturbed = unit - gradient * (strength * scale);
-                Ok(Value::Vector(normalize_or(perturbed, unit)))
-            }
+            let unit = normalize_or(normal, self.hit_ctx.normal);
+            let context = self.hit_ctx;
+            let gradient = height_gradient(&context, unit, |context| self.height_at(id, context))?;
+            let perturbed = unit - gradient * (strength * scale);
+            Ok(Value::Vector(normalize_or(perturbed, unit)))
         }
     }
 
