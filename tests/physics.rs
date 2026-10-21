@@ -523,15 +523,16 @@ fn cloth_keeps_a_pinned_corner_and_bounds_spring_lengths() {
 }
 
 #[test]
-fn soft_body_sphere_on_collider_rebounds_below_its_drop_height() {
+fn soft_body_sphere_on_collider_sticks_at_contact_as_blender_does() {
     use glam::DVec3;
     use potter_core::geom::{Mesh, UvSphereParams};
     use potter_core::sim::ColliderTriangle;
 
-    // Potter's soft-body collision has no restitution, so the centre cannot rise back to its release
-    // height after contact. The body is deformable, so kinetic plus potential energy is not monotone
-    // (stored elastic energy returns on release, as Blender's own rebound shows); the invariant is the
-    // apex bound and no penetration.
+    // Blender 5.2.2 measured headless (goals off, the sphere of this test on a floor at z = -0.5): the
+    // sphere reaches the floor near frame 17 and its centre then falls monotonically and stays there, so
+    // the body sticks and does not rebound. With goals on, Blender holds the sphere in the air instead, so
+    // this test uses goals off, the measured case. The invariants are no penetration, contact, and no
+    // rise above the contact centre.
     let mut sphere = Mesh::uv_sphere(UvSphereParams {
         segments: 8,
         ring_count: 6,
@@ -561,7 +562,7 @@ fn soft_body_sphere_on_collider_rebounds_below_its_drop_height() {
             DVec3::new(-10.0, 10.0, plane_height),
         ]),
     ];
-    let settings = json!({"substeps":4,"iterations":12});
+    let settings = json!({"substeps":4,"iterations":12,"use_goal":false});
     let fps = 24.0;
     let gravity = DVec3::new(0.0, 0.0, -9.81);
     let frames: Vec<Vec<DVec3>> = (0..=120)
@@ -611,13 +612,13 @@ fn soft_body_sphere_on_collider_rebounds_below_its_drop_height() {
         .fold(f64::NEG_INFINITY, f64::max);
     assert!(
         apex < release_height - 1.0e-6,
-        "soft-body rebound apex {apex} is not strictly below the drop height {release_height}"
+        "soft-body apex {apex} is not strictly below the drop height {release_height}"
     );
-    // A body that sticks to the floor keeps its contact height; a rebound rises above it.
+    // Blender sticks: after contact the centre never rises above its contact height.
     let centre_at_contact = centers[contact];
     assert!(
-        apex > centre_at_contact + 1.0e-6,
-        "soft body did not rebound: apex {apex} after contact, centre {centre_at_contact} at contact"
+        apex <= centre_at_contact + 1.0e-9,
+        "soft body rose after contact: apex {apex}, centre {centre_at_contact} at contact"
     );
 }
 
