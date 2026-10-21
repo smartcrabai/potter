@@ -2574,14 +2574,34 @@ fn set_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str, value: b
         clear_output_edge_flag(mesh, edge_index, name);
     }
 }
-/// Blender's new `BMesh` edges start with zeroed attributes. An output edge that is not an input edge
-/// (kept input edges keep their values) loses its edge-domain attribute values, except the seam and
-/// sharp flags, which the marks set. Rebuilt rungs copy their source values afterwards.
-fn zero_generated_edge_attributes(output: &mut Mesh, source_edges: &HashSet<(u32, u32)>) {
+
+/// Blender's new loops keep their layer's zero default, so a bevel face with no UV source still has UV
+/// values (oracle: `(0, 0)` V-up, stored as `[0, 1]` V-down). Each face without a row gets that default.
+fn fill_generated_uv_faces(mesh: &mut Mesh) {
+    if !uv_layers::has_uv_layers(mesh) {
+        return;
+    }
+    let corner_counts: Vec<usize> = mesh.faces.iter().map(|face| face.vertices.len()).collect();
+    let mut layers = uv_layers::read_layers(mesh);
+    for layer in &mut layers {
+        for (index, face) in layer.faces.iter_mut().enumerate() {
+            if face.is_none()
+                && let Some(&count) = corner_counts.get(index)
+            {
+                *face = Some(vec![[0.0, 1.0]; count]);
+            }
+        }
+    }
+    uv_layers::write_layers(mesh, &layers);
+}
+/// Blender's new `BMesh` edges start with zeroed attributes. An output edge not in `kept` loses its
+/// edge-domain attribute values, except the seam and sharp flags, which the marks set. Rebuilt rungs copy
+/// their source values afterwards.
+fn zero_generated_edge_attributes(output: &mut Mesh, kept: &HashSet<(u32, u32)>) {
     let generated: Vec<String> = output
         .edges
         .iter()
-        .filter(|edge| !source_edges.contains(&edge_key(edge.vertices[0], edge.vertices[1])))
+        .filter(|edge| !kept.contains(&edge_key(edge.vertices[0], edge.vertices[1])))
         .map(|edge| format!("e{}", edge.id))
         .collect();
     for (name, attribute) in &mut output.attributes {
@@ -2597,6 +2617,63 @@ fn zero_generated_edge_attributes(output: &mut Mesh, source_edges: &HashSet<(u32
             }
         }
     }
+}
+
+/// Output edges that are Blender's surviving input `BMEdge`s, keyed by output vertex IDs. An output edge
+/// survives when both endpoints are input vertices still at their input positions (Blender never moves a
+/// vertex whose edge survives) and the two input vertices form an input edge. Strip and rung edges have a
+/// moved endpoint, so they are generated.
+fn surviving_input_edges(mesh: &Mesh, output: &Mesh, identities: &[usize]) -> HashSet<(u32, u32)> {
+    let input_index: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let pair = |a: usize, b: usize| (a.min(b), a.max(b));
+    let input_edges: HashSet<(usize, usize)> = mesh
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let first = *input_index.get(&edge.vertices[0])?;
+            let second = *input_index.get(&edge.vertices[1])?;
+            Some(pair(first, second))
+        })
+        .collect();
+    let unmoved: Vec<Option<usize>> = output
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| {
+            let source = *identities.get(index)?;
+            let input = mesh.vertices.get(source)?;
+            input.co.abs_diff_eq(vertex.co, 0.0).then_some(source)
+        })
+        .collect();
+    let output_index: HashMap<u32, usize> = output
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    output
+        .edges
+        .iter()
+        .filter(|edge| {
+            let (Some(first), Some(second)) = (
+                output_index
+                    .get(&edge.vertices[0])
+                    .and_then(|i| unmoved[*i]),
+                output_index
+                    .get(&edge.vertices[1])
+                    .and_then(|i| unmoved[*i]),
+            ) else {
+                return false;
+            };
+            input_edges.contains(&pair(first, second))
+        })
+        .map(|edge| edge_key(edge.vertices[0], edge.vertices[1]))
+        .collect()
 }
 
 /// Blender's `BM_elem_attrs_copy` for one edge: each edge-domain attribute of input edge `source_index`
@@ -3467,12 +3544,9 @@ pub(super) fn finish(
     let mut result =
         build_mesh_with_edge_identity(points, polygons, loose, &origin, Some(&identities), mesh)?;
     clear_origindex(&mut result);
-    let source_edges: HashSet<(u32, u32)> = mesh
-        .edges
-        .iter()
-        .map(|edge| edge_key(edge.vertices[0], edge.vertices[1]))
-        .collect();
-    zero_generated_edge_attributes(&mut result, &source_edges);
+    fill_generated_uv_faces(&mut result);
+    let kept = surviving_input_edges(mesh, &result, &identities);
+    zero_generated_edge_attributes(&mut result, &kept);
     if !emitted_edge_flag_suppressions.is_empty()
         || !emitted_seam_edges.is_empty()
         || !emitted_sharp_edges.is_empty()
