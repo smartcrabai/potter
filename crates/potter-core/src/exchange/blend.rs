@@ -122,12 +122,15 @@ pub fn export_blend(
     check_blender_version(&blender)?;
     let mut losses = export_losses(doc);
     losses.extend(native_bind_export_losses(doc, project));
+    // An accepted import loss for a physics setting is re-reported from its compatibility payload, so
+    // re-exporting that setting adds no new loss. Other accepted losses (images, materials) still refuse.
+    losses.retain(|loss| {
+        !(loss.feature_id.starts_with("blender.physics.")
+            && doc.accepted_losses.contains(&loss.feature_id))
+    });
     let (texture_losses, texture_edits) =
         crate::exchange::material_graph::plan_blend_textures(doc)?;
     losses.extend(texture_losses);
-    // A loss the user accepted at import is carried on as compatibility data, so re-exporting it adds no new
-    // loss (the accepted set is `SceneDoc::accepted_losses`).
-    losses.retain(|loss| !doc.accepted_losses.contains(&loss.feature_id));
     if !losses.is_empty() && !opts.allow_lossy {
         return Err(PotError::with_details(
             ErrorCode::UnrepresentableFeature,
