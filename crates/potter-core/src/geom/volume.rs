@@ -13,11 +13,14 @@ use crate::{
     geom::{Mesh, MeshError},
 };
 
+use super::edge_key;
+
 const MAX_GRID_SAMPLES: usize = 1_000_000;
 const MAX_GRID_AXIS: usize = 512;
 const MAX_GRID_CELLS: usize = 250_000;
 const MAX_INPUT_VERTICES: usize = 100_000;
 const MAX_INPUT_TRIANGLES: usize = 100_000;
+const MAX_DISTANCE_TESTS: usize = 100_000_000;
 const MAX_GRID_COUNT: usize = 64;
 const MAX_OUTPUT_FACES: usize = 500_000;
 
@@ -71,12 +74,12 @@ impl Default for VolumeSource {
 pub struct VolumeGrid {
     /// Sample dimensions along x, y, and z.
     pub dims: [u32; 3],
-    /// Legacy uniform voxel spacing; affine grids store their maximum voxel side here.
+    /// Legacy uniform spacing; affine grids store their maximum voxel side here.
     pub voxel_size: f64,
-    /// Volume-local position of sample `[0, 0, 0]` when `index_to_local` is absent.
+    /// Volume-local position of sample `[0, 0, 0]`, used when `index_to_local` is absent.
     pub origin: DVec3,
-    /// Optional column-major affine transform from grid indices to volume-local coordinates.
-    /// When absent, the legacy origin-plus-uniform-voxel-size mapping applies.
+    /// Optional column-major 4x4 matrix mapping grid index coordinates to volume-local space.
+    /// When absent, the legacy `origin + voxel_size * index` transform is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_to_local: Option<[f64; 16]>,
     /// Optional inline f32 samples, laid out with x as the fastest-changing axis.
@@ -87,6 +90,7 @@ pub struct VolumeGrid {
     /// when present, are the decoded samples for this reference.
     pub content_ref: Option<String>,
 }
+
 impl VolumeGrid {
     pub(crate) fn checked_index_to_local_matrix(&self) -> Result<DMat4> {
         let Some(columns) = self.index_to_local else {
@@ -94,10 +98,14 @@ impl VolumeGrid {
                 * DMat4::from_scale(DVec3::splat(self.voxel_size)));
         };
         let matrix = DMat4::from_cols_array(&columns);
+        #[expect(
+            clippy::float_cmp,
+            reason = "affine matrices carry an exact 1.0 homogeneous corner"
+        )]
         let is_affine = matrix.x_axis.w == 0.0
             && matrix.y_axis.w == 0.0
             && matrix.z_axis.w == 0.0
-            && matrix.w_axis.w.to_bits() == 1.0_f64.to_bits();
+            && matrix.w_axis.w == 1.0;
         let determinant = matrix.determinant();
         if !matrix.is_finite()
             || !is_affine
@@ -161,8 +169,8 @@ impl Default for VolumeGrid {
     fn default() -> Self {
         Self {
             dims: [1, 1, 1],
-            origin: DVec3::ZERO,
             voxel_size: 1.0,
+            origin: DVec3::ZERO,
             index_to_local: None,
             values: Some(vec![0.0]),
             blob_f32: None,
@@ -208,8 +216,7 @@ impl GridSamples<'_> {
     }
 }
 
-/// Validate inline volume grids or file-source metadata. Grid-less generated volumes are valid
-/// and empty.
+/// Validate inline volume grids or file-source metadata.
 ///
 /// # Errors
 ///
@@ -231,8 +238,9 @@ pub fn validate_data(volume: &VolumeData) -> Result<()> {
             if volume.grids.len() > MAX_GRID_COUNT {
                 return Err(resource_error());
             }
-            // A grid-less volume is Blender's empty volume (no grid was created), e.g. a
-            // mesh-to-volume conversion that produced nothing; it has no density and no bounds.
+            if volume.grids.is_empty() {
+                return Err(invalid_volume("volume must contain at least one grid"));
+            }
             for grid in &volume.grids {
                 validate_grid(grid)?;
             }
@@ -243,8 +251,8 @@ pub fn validate_data(volume: &VolumeData) -> Result<()> {
 
 /// Sample the first grid using deterministic trilinear interpolation.
 ///
-/// Positions are volume-local coordinates. Inline grids use `index_to_local` when present,
-/// otherwise the stored origin and voxel size; decoded VDB grids apply their index-to-world transform.
+/// Positions are volume-local world coordinates. Inline grids use `index_to_local` when present,
+/// otherwise their stored origin and voxel size; decoded VDB grids apply their own index transform.
 /// This convenience API cannot return an error, so malformed data or unresolved resources return `NaN`;
 /// use [`sample_density_checked`] when the caller needs a typed error.
 #[must_use]
@@ -259,14 +267,6 @@ pub fn sample_density(position: DVec3, volume: &VolumeData) -> f64 {
 /// Returns `UnsupportedFeature` for preserve-only file inputs and `InvalidArgument`
 /// for malformed grids or sample positions.
 pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f64> {
-    sample_density_checked_with_inverse(position, volume, None)
-}
-
-pub(crate) fn sample_density_checked_with_inverse(
-    position: DVec3,
-    volume: &VolumeData,
-    local_to_index: Option<DMat4>,
-) -> Result<f64> {
     ensure_evaluable_source(volume)?;
     if !position.is_finite() {
         return Err(invalid_volume("sample position must be finite"));
@@ -281,31 +281,16 @@ pub(crate) fn sample_density_checked_with_inverse(
             .ok_or_else(|| invalid_volume("VDB archive contains no density grid"))?;
         return Ok(grid.sample_world(position));
     }
-    let Some(grid) = volume.grids.first() else {
-        // Blender's empty volume has no grid and therefore no density anywhere.
-        return Ok(0.0);
-    };
-    let values = if grid.index_to_local.is_some() && local_to_index.is_some() {
-        validate_grid_samples(grid)?
-    } else {
-        validate_grid(grid)?
-    };
+    let grid = first_grid(volume)?;
+    let values = validate_grid(grid)?;
 
     let coordinate = if grid.index_to_local.is_some() {
-        let local_to_index = match local_to_index {
-            Some(matrix) => matrix,
-            None => grid.checked_index_to_local_matrix()?.inverse(),
-        };
-        if !local_to_index.is_finite() {
-            return Err(invalid_volume(
-                "volume grid index transform is not invertible",
-            ));
-        }
-        local_to_index.transform_point3(position)
+        grid.checked_index_to_local_matrix()?
+            .inverse()
+            .transform_point3(position)
     } else {
         (position - grid.origin) / grid.voxel_size
     };
-
     if !coordinate.is_finite() || coordinate.cmplt(DVec3::ZERO).any() {
         return Ok(0.0);
     }
@@ -365,7 +350,7 @@ pub(crate) fn sample_density_checked_with_inverse(
                 let sample = values
                     .get(index)
                     .ok_or_else(|| invalid_volume("volume sample index is out of range"))?;
-                result += sample * wx * wy * wz;
+                result += f64::from(sample) * wx * wy * wz;
             }
         }
     }
@@ -1594,6 +1579,173 @@ fn vdb_resource_unavailable() -> PotError {
     )
 }
 
+/// Sample a closed mesh's signed-distance approximation onto a regular grid.
+///
+/// The grid includes at least one exterior sample on every side; `padding` adds
+/// further voxels beyond that minimum.
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` for invalid/open meshes or a non-positive/non-finite
+/// voxel size, and `LimitExceeded` when bounded grid or distance work is exceeded.
+pub fn mesh_to_volume(mesh: &Mesh, voxel_size: f64, padding: u32) -> Result<VolumeData> {
+    if !voxel_size.is_finite() || voxel_size <= 0.0 {
+        return Err(invalid_volume("voxel_size must be finite and positive"));
+    }
+    if mesh.vertices.len() > MAX_INPUT_VERTICES
+        || mesh.faces.len() > MAX_INPUT_TRIANGLES
+        || mesh.edges.len() > MAX_INPUT_TRIANGLES * 3
+    {
+        return Err(resource_error());
+    }
+    let input_corner_count = mesh
+        .faces
+        .iter()
+        .try_fold(0_usize, |count, face| {
+            count.checked_add(face.vertices.len())
+        })
+        .ok_or_else(resource_error)?;
+    if input_corner_count > MAX_INPUT_TRIANGLES * 3 {
+        return Err(resource_error());
+    }
+    mesh.validate()
+        .map_err(|error| invalid_mesh_input(&error))?;
+    let bounds = mesh
+        .bounds()
+        .ok_or_else(|| invalid_volume("mesh_to_volume requires a non-empty closed mesh"))?;
+    if mesh.faces.is_empty() {
+        return Err(invalid_volume(
+            "mesh_to_volume requires a non-empty closed mesh",
+        ));
+    }
+
+    let mut edge_uses = HashMap::new();
+    let mut surface_vertices = HashSet::with_capacity(mesh.vertices.len());
+    let mut triangle_count = 0_usize;
+    for face in &mesh.faces {
+        triangle_count = triangle_count
+            .checked_add(face.vertices.len() - 2)
+            .ok_or_else(resource_error)?;
+        for index in 0..face.vertices.len() {
+            let first = face.vertices[index];
+            let second = face.vertices[(index + 1) % face.vertices.len()];
+            surface_vertices.insert(first);
+            let key = edge_key(first, second);
+            let uses = edge_uses.entry(key).or_insert(0_u8);
+            *uses = uses.saturating_add(1);
+        }
+    }
+    if triangle_count == 0 || triangle_count > MAX_INPUT_TRIANGLES {
+        return Err(resource_error());
+    }
+    if surface_vertices.len() != mesh.vertices.len() || edge_uses.values().any(|count| *count != 2)
+    {
+        return Err(invalid_volume(
+            "mesh_to_volume requires a closed two-manifold mesh",
+        ));
+    }
+
+    let triangles = mesh
+        .tessellate()
+        .map_err(|error| invalid_mesh_input(&error))?;
+    let vertex_positions: HashMap<_, _> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| (vertex.id, vertex.co))
+        .collect();
+    let mut surface = Vec::with_capacity(triangles.len());
+    for triangle in triangles {
+        let points = [
+            *vertex_positions
+                .get(&triangle[0])
+                .ok_or_else(|| invalid_volume("mesh triangle references a missing vertex"))?,
+            *vertex_positions
+                .get(&triangle[1])
+                .ok_or_else(|| invalid_volume("mesh triangle references a missing vertex"))?,
+            *vertex_positions
+                .get(&triangle[2])
+                .ok_or_else(|| invalid_volume("mesh triangle references a missing vertex"))?,
+        ];
+        surface.push(points);
+    }
+
+    let effective_padding = padding.max(1) as usize;
+    let size = bounds.size();
+    if !size.is_finite() || size.cmplt(DVec3::ZERO).any() {
+        return Err(invalid_volume("mesh bounds are not finite"));
+    }
+    let dims = [
+        grid_axis(size.x, voxel_size, effective_padding)?,
+        grid_axis(size.y, voxel_size, effective_padding)?,
+        grid_axis(size.z, voxel_size, effective_padding)?,
+    ];
+    let sample_count = dims[0]
+        .checked_mul(dims[1])
+        .and_then(|count| count.checked_mul(dims[2]))
+        .ok_or_else(resource_error)?;
+    let cell_count = (dims[0] - 1)
+        .checked_mul(dims[1] - 1)
+        .and_then(|count| count.checked_mul(dims[2] - 1))
+        .ok_or_else(resource_error)?;
+    let distance_tests = sample_count
+        .checked_mul(surface.len())
+        .ok_or_else(resource_error)?;
+    if sample_count > MAX_GRID_SAMPLES
+        || cell_count > MAX_GRID_CELLS
+        || distance_tests > MAX_DISTANCE_TESTS
+    {
+        return Err(resource_error());
+    }
+
+    let origin = bounds.min - DVec3::splat(voxel_size * effective_padding as f64);
+    let last_position = origin
+        + voxel_size
+            * DVec3::new(
+                (dims[0] - 1) as f64,
+                (dims[1] - 1) as f64,
+                (dims[2] - 1) as f64,
+            );
+    if !origin.is_finite() || !last_position.is_finite() {
+        return Err(invalid_volume(
+            "voxel grid transform produces non-finite positions",
+        ));
+    }
+
+    let mut values = Vec::with_capacity(sample_count);
+    for z in 0..dims[2] {
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
+                let point = origin + voxel_size * DVec3::new(x as f64, y as f64, z as f64);
+                let distance = signed_distance(point, &surface);
+                let value = distance as f32;
+                if !distance.is_finite() || !value.is_finite() {
+                    return Err(resource_error());
+                }
+                values.push(value);
+            }
+        }
+    }
+    Ok(VolumeData {
+        grids: vec![VolumeGrid {
+            dims: [
+                u32::try_from(dims[0]).map_err(|_| resource_error())?,
+                u32::try_from(dims[1]).map_err(|_| resource_error())?,
+                u32::try_from(dims[2]).map_err(|_| resource_error())?,
+            ],
+            voxel_size,
+            origin,
+            index_to_local: None,
+            values: Some(values),
+            blob_f32: None,
+            content_ref: None,
+        }],
+        source: VolumeSource::Generated(VolumeGeneratedSource {
+            algorithm: "signed_distance".to_owned(),
+        }),
+        decoded_vdb: None,
+    })
+}
+
 /// Rasterize a mesh as a Blender-compatible fog-density grid.
 ///
 /// The dense inline representation stores integer-index samples over the source bounds plus one
@@ -2243,6 +2395,32 @@ fn validate_grid_samples(grid: &VolumeGrid) -> Result<GridSamples<'_>> {
     Ok(samples)
 }
 
+fn grid_axis(extent: f64, voxel_size: f64, padding: usize) -> Result<usize> {
+    let axis = (extent / voxel_size).ceil() + 1.0 + 2.0 * padding as f64;
+    if !axis.is_finite() || axis < 3.0 || axis > MAX_GRID_AXIS as f64 {
+        return Err(resource_error());
+    }
+    Ok(axis as usize)
+}
+
+fn signed_distance(point: DVec3, triangles: &[[DVec3; 3]]) -> f64 {
+    let mut closest_squared = f64::INFINITY;
+    let mut intersections = 0_usize;
+    let ray = DVec3::new(1.0, 0.371_390_676_354_103_7, 0.529_173_248_214_697_2);
+    for triangle in triangles {
+        closest_squared = closest_squared.min(point_triangle_distance_squared(point, *triangle));
+        if ray_intersects_triangle(point, ray, *triangle) {
+            intersections += 1;
+        }
+    }
+    let distance = closest_squared.sqrt();
+    if intersections % 2 == 1 {
+        -distance
+    } else {
+        distance
+    }
+}
+
 #[expect(
     clippy::many_single_char_names,
     reason = "point-triangle distance uses standard barycentric variables"
@@ -2340,6 +2518,16 @@ fn resource_error() -> PotError {
     )
 }
 
+/// Blender's empty volume: no grid, hence no density and no bounds.
+fn empty_fog_volume() -> VolumeData {
+    VolumeData {
+        source: VolumeSource::Generated(VolumeGeneratedSource {
+            algorithm: "mesh_to_volume_fog".to_owned(),
+        }),
+        ..VolumeData::default()
+    }
+}
+
 /// Blender's `BKE_modifier_set_error` for a Volume to Mesh grid name that does not exist. It is a
 /// modifier warning: the modifier yields Blender's empty mesh.
 fn grid_not_found(grid_name: &str) -> PotError {
@@ -2351,16 +2539,6 @@ fn grid_not_found(grid_name: &str) -> PotError {
             "feature_id": "modifier.volume_to_mesh.grid_name",
         }),
     )
-}
-
-/// Blender's empty volume: no grid, hence no density and no bounds.
-fn empty_fog_volume() -> VolumeData {
-    VolumeData {
-        source: VolumeSource::Generated(VolumeGeneratedSource {
-            algorithm: "mesh_to_volume_fog".to_owned(),
-        }),
-        ..VolumeData::default()
-    }
 }
 
 #[cfg(test)]
@@ -2376,25 +2554,9 @@ mod tests {
     };
 
     use super::{
-        VolumeData, VolumeGrid, mesh_to_fog_volume, sample_density, sample_density_checked,
+        VolumeData, VolumeGrid, mesh_to_fog_volume, mesh_to_volume, sample_density,
+        sample_density_checked, volume_to_mesh,
     };
-
-    #[test]
-    fn coarse_mesh_to_fog_returns_a_zero_density_grid() {
-        let mut mesh = Mesh::box_mesh(BoxParams {
-            size: DVec3::splat(0.1),
-        })
-        .unwrap();
-        for vertex in &mut mesh.vertices {
-            vertex.co += DVec3::splat(0.5);
-        }
-
-        let volume = mesh_to_fog_volume(&mesh, 1.0, 0.2, 1.0).unwrap();
-        let grid = volume.grids.first().unwrap();
-        assert!(grid.values.as_ref().is_some_and(|values| {
-            !values.is_empty() && values.iter().all(|value| value.abs() <= f32::EPSILON)
-        }));
-    }
 
     #[test]
     fn density_sampling_is_trilinear_and_zero_outside() {
@@ -2417,25 +2579,20 @@ mod tests {
     }
 
     #[test]
-    fn affine_grid_density_sampling_maps_volume_local_to_index() {
-        let index_to_local = DMat4::from_cols_array(&[
-            0.0, 2.0, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.5, 0.25, 1.0, 0.0, 2.0, -1.0, 0.25, 1.0,
-        ]);
-        let volume = VolumeData {
-            grids: vec![VolumeGrid {
-                dims: [2, 2, 2],
-                voxel_size: 3.0,
-                origin: index_to_local.transform_point3(DVec3::ZERO),
-                index_to_local: Some(index_to_local.to_cols_array()),
-                values: Some(vec![0.0, 1.0, 2.0, 3.0, 3.0, 4.0, 5.0, 6.0]),
-                blob_f32: None,
-                content_ref: None,
-            }],
-            ..VolumeData::default()
-        };
-        let point = DVec3::new(0.25, 0.5, 0.75);
-        let local = index_to_local.transform_point3(point);
-        assert!((sample_density(local, &volume) - 3.5).abs() < 1.0e-12);
+    fn mesh_volume_mesh_preserves_bounds_within_one_voxel() {
+        let source = Mesh::box_mesh(BoxParams {
+            size: DVec3::new(1.7, 2.1, 1.3),
+        })
+        .unwrap();
+        let voxel_size = 0.3;
+        let volume = mesh_to_volume(&source, voxel_size, 2).unwrap();
+        let result = volume_to_mesh(&volume, 0.0).unwrap();
+        let source_bounds = source.bounds().unwrap();
+        let result_bounds = result.bounds().unwrap();
+        for axis in 0..3 {
+            assert!((source_bounds.min[axis] - result_bounds.min[axis]).abs() <= voxel_size);
+            assert!((source_bounds.max[axis] - result_bounds.max[axis]).abs() <= voxel_size);
+        }
     }
 
     #[test]
@@ -2481,5 +2638,44 @@ mod tests {
             let expected = x + 2.0 * y + 3.0 * z;
             prop_assert!((actual - expected).abs() <= 1.0e-12);
         }
+    }
+
+    #[test]
+    fn coarse_mesh_to_fog_returns_a_zero_density_grid() {
+        let mut mesh = Mesh::box_mesh(BoxParams {
+            size: DVec3::splat(0.1),
+        })
+        .unwrap();
+        for vertex in &mut mesh.vertices {
+            vertex.co += DVec3::splat(0.5);
+        }
+
+        let volume = mesh_to_fog_volume(&mesh, 1.0, 0.2, 1.0).unwrap();
+        let grid = volume.grids.first().unwrap();
+        assert!(grid.values.as_ref().is_some_and(|values| {
+            !values.is_empty() && values.iter().all(|value| value.abs() <= f32::EPSILON)
+        }));
+    }
+
+    #[test]
+    fn affine_grid_density_sampling_maps_volume_local_to_index() {
+        let index_to_local = DMat4::from_cols_array(&[
+            0.0, 2.0, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.5, 0.25, 1.0, 0.0, 2.0, -1.0, 0.25, 1.0,
+        ]);
+        let volume = VolumeData {
+            grids: vec![VolumeGrid {
+                dims: [2, 2, 2],
+                voxel_size: 3.0,
+                origin: index_to_local.transform_point3(DVec3::ZERO),
+                index_to_local: Some(index_to_local.to_cols_array()),
+                values: Some(vec![0.0, 1.0, 2.0, 3.0, 3.0, 4.0, 5.0, 6.0]),
+                blob_f32: None,
+                content_ref: None,
+            }],
+            ..VolumeData::default()
+        };
+        let point = DVec3::new(0.25, 0.5, 0.75);
+        let local = index_to_local.transform_point3(point);
+        assert!((sample_density(local, &volume) - 3.5).abs() < 1.0e-12);
     }
 }
