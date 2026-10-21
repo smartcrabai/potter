@@ -25,7 +25,7 @@ import bpy
 
 WIDTH = 48
 HEIGHT = 48
-SAMPLES = 32
+SAMPLES = 96
 SEED = 0
 MAX_BOUNCES = 8
 # Orthographic frame: the view spans +-1.5 m on both axes.

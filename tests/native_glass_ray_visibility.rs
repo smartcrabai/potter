@@ -2,7 +2,7 @@
 //! the same scene.
 //!
 //! `fixtures/native_oracle/glass_ray_visibility.py` renders a tinted glass sphere in front of an
-//! emitting backdrop twice with Cycles (48 x 48, 32 samples, seed 0): once with the sphere's
+//! emitting backdrop twice with Cycles (48 x 48, 96 samples, seed 0): once with the sphere's
 //! `visible_transmission` off and once at the default. The test runs it headless into a temporary
 //! directory and imports the flagged `.blend`. Potter renders it with the same settings, and both
 //! images are reduced to the mean RGB of square patches in world metres on the 3 m frame (+Y up).
@@ -34,7 +34,7 @@ const SCRIPT: &str = include_str!("fixtures/native_oracle/glass_ray_visibility.p
 
 /// Render settings shared with `glass_ray_visibility.py`.
 const RESOLUTION: u32 = 48;
-const SAMPLES: u32 = 32;
+const SAMPLES: u32 = 96;
 const MAX_BOUNCES: u32 = 8;
 /// The orthographic frame spans this many metres on each axis, centred on the origin.
 const FRAME_SIZE: f64 = 3.0;
