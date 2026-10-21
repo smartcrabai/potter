@@ -18,38 +18,12 @@ pub(crate) type Vec3 = [f32; 3];
 const AXES: [Vec3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 /// `BLI_bvhtree_new` clamps the tree epsilon to `FLT_EPSILON`; leaf boxes are inflated by it.
 const TREE_EPSILON: f32 = f32::EPSILON;
-/// `BVH_RAYCAST_DIST_MAX` (`BLI_kdopbvh.hh`).
-const RAYCAST_DIST_MAX: f32 = f32::MAX;
-
 pub(crate) fn sub(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn scale(a: Vec3, factor: f32) -> Vec3 {
-    [a[0] * factor, a[1] * factor, a[2] * factor]
-}
-
 pub(crate) fn dot(a: Vec3, b: Vec3) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-pub(crate) fn cross(a: Vec3, b: Vec3) -> Vec3 {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-/// `normalize_v3_v3`: the unit vector and its length. A near-zero vector stays unchanged with length 0.
-pub(crate) fn normalize(v: Vec3) -> (Vec3, f32) {
-    let squared = dot(v, v);
-    if squared > 1.0e-35 {
-        let length = squared.sqrt();
-        (scale(v, 1.0 / length), length)
-    } else {
-        (v, 0.0)
-    }
 }
 
 /// `axis_dominant_v3_single` (`BLI_math_geom_inline.cc`): the axis of largest magnitude.
@@ -346,7 +320,6 @@ fn build_branches(leaf_bv: &[[f32; 6]]) -> Vec<Branch> {
 /// The watertight ray with Blender's per-ray state: `BVHRayCastData` bounds and `IsectRayPrecalc`.
 pub(crate) struct Ray {
     origin: Vec3,
-    pub(crate) dir: Vec3,
     dot_axis: [f32; 3],
     idot_axis: [f32; 3],
     index: [usize; 6],
@@ -390,7 +363,6 @@ impl Ray {
         let inv_dir_z = 1.0 / dir[kz];
         Self {
             origin,
-            dir,
             dot_axis,
             idot_axis,
             index,
@@ -458,16 +430,6 @@ impl Ray {
 pub(crate) struct RayHit {
     pub(crate) index: isize,
     pub(crate) dist: f32,
-}
-
-impl RayHit {
-    /// The open cast start: no leaf, distance `BVH_RAYCAST_DIST_MAX`.
-    pub(crate) fn open() -> Self {
-        Self {
-            index: -1,
-            dist: RAYCAST_DIST_MAX,
-        }
-    }
 }
 
 /// A binary k-DOP tree over leaf boxes, balanced as `BLI_bvhtree_balance` does. Leaf `i` is the
@@ -557,7 +519,7 @@ impl KdopTree {
     }
 
     /// `BLI_bvhtree_find_nearest_ex`: the leaf nearest to `co`, searched from `nearest` (its `dist_sq`
-    /// bounds the search; `NearestHit::unbounded` for an open search). `callback` receives the leaf
+    /// bounds the search; a `dist_sq` of `f32::MAX` is an open search). `callback` receives the leaf
     /// index, the query point and the running nearest, and writes the leaf's nearest point into it.
     /// `optimal_order` selects best-first search with a heap (`BVH_NEAREST_OPTIMAL_ORDER`) instead of
     /// depth-first search. Returns the index of the nearest leaf, or -1.
@@ -689,17 +651,6 @@ pub(crate) struct NearestHit {
     pub(crate) dist_sq: f32,
 }
 
-impl NearestHit {
-    /// The open search start: no leaf, infinite distance (`FLT_MAX`).
-    pub(crate) fn unbounded() -> Self {
-        Self {
-            index: -1,
-            co: [0.0; 3],
-            dist_sq: f32::MAX,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used, reason = "small tree fixtures")]
@@ -723,7 +674,7 @@ mod tests {
     #[test]
     fn every_leaf_is_reachable_from_the_root() {
         let tree = KdopTree::from_leaf_bounds(&leaves(37));
-        let mut seen = vec![false; 37];
+        let mut seen = [false; 37];
         let mut stack = vec![tree.root.expect("tree has leaves")];
         while let Some(node) = stack.pop() {
             match node {

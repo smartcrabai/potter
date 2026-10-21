@@ -374,7 +374,7 @@ fn eigen_preciprocal(value: f32) -> f32 {
 /// `Matrix4f::computeInverseWithCheck`, whose float kernel is `Eigen/src/LU/arch/InverseSize4.h`
 /// with NEON packets. `None` when the determinant is zero or not normal, where Blender returns a
 /// zero matrix. The x86 Blender build uses Eigen's SSE packets, whose reciprocal is not replicated.
-fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
+pub(crate) fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
     // Eigen's columns are Blender's `matrix[c]`; the 2x2 blocks are `[A B; C D]`.
     let a = movelh(matrix[0], matrix[1]);
     let b = movehl(matrix[1], matrix[0]);
@@ -483,6 +483,22 @@ pub(crate) fn operand_to_subject(
     let inverse = blender_invert_m4(&subject)?;
     let object = object_to_world(doc, object_id, world_matrices, 0)?;
     Some(dmat4_from_blender(&blender_mul_m4(&inverse, &object)))
+}
+
+/// Blender's f32 Shrinkwrap `local2target` (`BLI_space_transform_from_matrices`, `math_matrix_c.cc`):
+/// `invert(target_world) * subject_world`, the subject's object-local space mapped into the target's.
+/// `None` when either object has no exact replica or the target is not invertible; the caller then
+/// keeps its f64 path.
+pub(crate) fn shrinkwrap_subject_to_target(
+    doc: &SceneDoc,
+    subject_id: &Id,
+    target_id: &Id,
+    world_matrices: &BTreeMap<Id, DMat4>,
+) -> Option<DMat4> {
+    let subject = object_to_world(doc, subject_id, world_matrices, 0)?;
+    let target = object_to_world(doc, target_id, world_matrices, 0)?;
+    let inverse = blender_invert_m4(&target)?;
+    Some(dmat4_from_blender(&blender_mul_m4(&inverse, &subject)))
 }
 
 /// Blender `is_negative_m4`: sign of the upper 3x3 determinant after the f32 matrix boundary.

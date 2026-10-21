@@ -96,7 +96,7 @@ pub(crate) fn geometric_vertex_normals(mesh: &Mesh, positions: &[DVec3]) -> Resu
     Ok(float_normals(mesh, positions, &index_by_id)?
         .vertices
         .into_iter()
-        .map(|normal| normal.as_dvec3())
+        .map(Vec3::as_dvec3)
         .collect())
 }
 
@@ -270,7 +270,7 @@ fn shade(
         float_normals(mesh, positions, &index_by_id)?
             .vertices
             .into_iter()
-            .map(|normal| normal.as_dvec3())
+            .map(Vec3::as_dvec3)
             .collect()
     };
     let data_smooth = mesh
@@ -315,18 +315,10 @@ fn point_domain_shading(
         })
         .collect();
     Ok(Shading {
-        corners: normals
-            .corners
-            .into_iter()
-            .map(|normal| normal.as_dvec3())
-            .collect(),
+        corners: normals.corners.into_iter().map(Vec3::as_dvec3).collect(),
         smooth,
         data_smooth,
-        vertices: normals
-            .vertices
-            .into_iter()
-            .map(|normal| normal.as_dvec3())
-            .collect(),
+        vertices: normals.vertices.into_iter().map(Vec3::as_dvec3).collect(),
     })
 }
 

@@ -1664,8 +1664,12 @@ pub struct ModifierRuntime {
     pub target_mesh: Option<Value>,
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
+    /// Shrinkwrap `local2target`: the subject's object-local space in the target's, in f32.
     #[doc(hidden)]
-    pub auxiliary_target_to_subject: Option<[f64; 16]>,
+    pub shrinkwrap_subject_to_target: Option<[f64; 16]>,
+    /// Shrinkwrap `local2target` for the auxiliary target, in f32.
+    #[doc(hidden)]
+    pub shrinkwrap_auxiliary_subject_to_target: Option<[f64; 16]>,
     pub shrinkwrap_target_mesh: Option<Mesh>,
     pub shrinkwrap_auxiliary_target_mesh: Option<Mesh>,
     /// Boolean operands in the subject's space (subject excluded), in Blender order.

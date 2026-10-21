@@ -179,7 +179,11 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         return Ok(mesh.clone());
     }
 
-    let space = space_from_runtime(modifier.runtime.target_to_subject, modifier, "target")?;
+    let space = space_from_runtime(
+        modifier.runtime.shrinkwrap_subject_to_target,
+        modifier,
+        "target",
+    )?;
     let offset = number_param(modifier, "offset")? as f32;
     let positions: Vec<Vec3> = mesh
         .vertices
@@ -278,7 +282,7 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             let auxiliary =
                 auxiliary_surface(modifier.runtime.shrinkwrap_auxiliary_target_mesh.as_ref())?;
             let auxiliary_space = space_from_runtime(
-                modifier.runtime.auxiliary_target_to_subject,
+                modifier.runtime.shrinkwrap_auxiliary_subject_to_target,
                 modifier,
                 "auxiliary_target",
             )?;
@@ -320,18 +324,19 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-/// Blender's `BLI_SPACE_TRANSFORM_SETUP` in float: the object matrix is f32 and its inverse comes
-/// from `invert_m4` (`blender_invert_m4`), so both directions are built from one f32 matrix.
+/// Blender's `BLI_space_transform_from_matrices` in float: `subject_to_target` is the f32
+/// `local2target` the caller builds as `invert(target) * subject`, and `target_to_subject` is its
+/// `invert_m4` (`blender_invert_m4`), as `target2local` is in Blender.
 fn space_from_runtime(
     matrix: Option<[f64; 16]>,
     modifier: &Modifier,
     parameter: &str,
 ) -> Result<Space> {
-    let target_to_subject =
+    let subject_to_target =
         to_mat(matrix.map_or(DMat4::IDENTITY, |matrix| DMat4::from_cols_array(&matrix)));
     let finite = |matrix: &Mat| matrix.iter().flatten().all(|value| value.is_finite());
-    match blender_invert_m4(&target_to_subject) {
-        Some(subject_to_target) if finite(&target_to_subject) && finite(&subject_to_target) => {
+    match blender_invert_m4(&subject_to_target) {
+        Some(target_to_subject) if finite(&subject_to_target) && finite(&target_to_subject) => {
             Ok(Space {
                 subject_to_target,
                 target_to_subject,
@@ -668,10 +673,10 @@ fn nearest_vertex_points(
                 return None;
             }
             let target = transform_point(&space.subject_to_target, co);
-            nearest.dist_sq = if nearest.index != -1 {
-                (target - Vec3::from(nearest.co)).length_squared()
-            } else {
+            nearest.dist_sq = if nearest.index == -1 {
                 f32::MAX
+            } else {
+                (target - Vec3::from(nearest.co)).length_squared()
             };
             surface.tree.find_nearest(
                 target.to_array(),
@@ -1166,7 +1171,7 @@ fn tri_weights(v1: Vec3, v2: Vec3, v3: Vec3, co: Vec3) -> [f32; 3] {
         (1, 2)
     };
     let area = |a: Vec3, b: Vec3, c: Vec3| {
-        0.5 * ((a[i] - b[i]) * (b[j] - c[j]) + (a[j] - b[j]) * (c[i] - b[i]))
+        f32::midpoint((a[i] - b[i]) * (b[j] - c[j]), (a[j] - b[j]) * (c[i] - b[i]))
     };
     let mut weights = [area(v2, v3, co), area(v3, v1, co), area(v1, v2, co)];
     let total = weights[0] + weights[1] + weights[2];
@@ -1177,39 +1182,6 @@ fn tri_weights(v1: Vec3, v2: Vec3, v3: Vec3, co: Vec3) -> [f32; 3] {
     } else {
         [1.0 / 3.0; 3]
     }
-}
-
-/// Blender's `isect_ray_tri_epsilon_v3` with `FLT_EPSILON`: the ray distance and
-/// `[1 - u - v, u, v]`.
-fn intersect_ray_triangle_f32(
-    origin: Vec3,
-    direction: Vec3,
-    triangle: [Vec3; 3],
-) -> Option<(f32, [f32; 3])> {
-    let [v0, v1, v2] = triangle;
-    let e1 = v1 - v0;
-    let e2 = v2 - v0;
-    let p = direction.cross(e2);
-    let a = e1.dot(p);
-    if a == 0.0 {
-        return None;
-    }
-    let f = 1.0 / a;
-    let s = origin - v0;
-    let u = f * s.dot(p);
-    if !(-f32::EPSILON..=1.0 + f32::EPSILON).contains(&u) {
-        return None;
-    }
-    let q = s.cross(e1);
-    let v = f * direction.dot(q);
-    if !(-f32::EPSILON..=1.0 + f32::EPSILON).contains(&v) || u + v > 1.0 + f32::EPSILON {
-        return None;
-    }
-    let distance = f * e2.dot(q);
-    if distance < 0.0 {
-        return None;
-    }
-    Some((distance, [1.0 - u - v, u, v]))
 }
 
 /// Blender's `BKE_shrinkwrap_snap_point_to_surface`: places the projected point at `offset` from
@@ -1226,17 +1198,15 @@ fn snap_point(
         WrapMode::OnSurface if offset != 0.0 => {
             snap_with_side(point, hit.co, hit.normal, offset, 0.0, true)
         }
-        WrapMode::OnSurface => hit.co,
         WrapMode::Inside => snap_with_side(point, hit.co, hit.normal, offset, -1.0, false),
         WrapMode::Outside => snap_with_side(point, hit.co, hit.normal, offset, 1.0, false),
         WrapMode::OutsideSurface if offset != 0.0 => {
             snap_with_side(point, hit.co, hit.normal, offset, 1.0, true)
         }
-        WrapMode::OutsideSurface => hit.co,
         WrapMode::AboveSurface if offset != 0.0 => {
             hit.co + smooth_normal(surface, space, hit) * offset
         }
-        WrapMode::AboveSurface => hit.co,
+        WrapMode::OnSurface | WrapMode::OutsideSurface | WrapMode::AboveSurface => hit.co,
     }
 }
 
@@ -1378,10 +1348,12 @@ fn project_normal(
         ray_origin.to_array(),
         ray_direction.to_array(),
         &mut ray,
-        &mut |triangle: usize, _: &Ray, hit: &mut RayHit| {
-            let triangle_positions = target.surface.triangle(triangle);
-            if let Some((distance, _)) =
-                intersect_ray_triangle_f32(ray_origin, ray_direction, triangle_positions)
+        &mut |triangle: usize, ray: &Ray, hit: &mut RayHit| {
+            let [v0, v1, v2] = target
+                .surface
+                .triangle(triangle)
+                .map(|point| point.to_array());
+            if let Some(distance) = ray.watertight(v0, v1, v2)
                 && distance < hit.dist
             {
                 hit.index = triangle as isize;
@@ -1505,7 +1477,7 @@ fn to_mat(matrix: DMat4) -> Mat {
 }
 
 fn to_vec3s(values: Vec<DVec3>) -> Vec<Vec3> {
-    values.into_iter().map(|value| value.as_vec3()).collect()
+    values.into_iter().map(DVec3::as_vec3).collect()
 }
 
 #[cfg(test)]
@@ -1513,9 +1485,12 @@ mod tests {
     use glam::{DMat4, DQuat, DVec3, Vec3};
     use serde_json::json;
 
-    use super::{evaluate, intersect_ray_triangle_f32};
+    use super::evaluate;
     use crate::{
-        geom::{Mesh, UvSphereParams},
+        geom::{
+            Mesh, UvSphereParams,
+            bvh::{KdopTree, Ray, RayHit},
+        },
         model::{Id, Modifier, ModifierRuntime},
     };
 
@@ -1551,6 +1526,8 @@ mod tests {
             modifier_type: "shrinkwrap".to_owned(),
             name: "Shrinkwrap".to_owned(),
             enabled: true,
+            show_viewport: true,
+            show_render: true,
             params: serde_json::from_value(params).test_value(),
             binding_data: None,
             runtime: ModifierRuntime::default(),
@@ -1577,15 +1554,39 @@ mod tests {
     }
 
     #[test]
-    fn project_ray_intersection_uses_blender_edge_epsilon() {
-        let triangle = [Vec3::ZERO, Vec3::X, Vec3::Y];
-        let direction = Vec3::NEG_Z;
-        let inside_epsilon = Vec3::new(-0.5 * f32::EPSILON, 0.25, 1.0);
-        let (_, barycentric) = intersect_ray_triangle_f32(inside_epsilon, direction, triangle)
-            .expect("a ray within Blender's barycentric epsilon must hit");
-        assert!(barycentric[1] < 0.0);
-        let outside_epsilon = Vec3::new(-2.0 * f32::EPSILON, 0.25, 1.0);
-        assert!(intersect_ray_triangle_f32(outside_epsilon, direction, triangle).is_none());
+    fn ray_through_shared_edge_hits_one_of_two_triangles() {
+        let triangles = [
+            [Vec3::ZERO, Vec3::X, Vec3::Y],
+            [Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y],
+        ];
+        let leaves: Vec<[f32; 6]> = triangles
+            .iter()
+            .map(|triangle| {
+                KdopTree::leaf_bounds_for_triangle(triangle.map(|point| point.to_array()))
+            })
+            .collect();
+        let tree = KdopTree::from_leaf_bounds(&leaves);
+        let mut ray_hit = RayHit {
+            index: -1,
+            dist: f32::MAX,
+        };
+        // The ray crosses the shared diagonal exactly; watertight casting must not miss it.
+        let found = tree.ray_cast(
+            [0.5, 0.5, 1.0],
+            [0.0, 0.0, -1.0],
+            &mut ray_hit,
+            &mut |triangle: usize, ray: &Ray, hit: &mut RayHit| {
+                let [v0, v1, v2] = triangles[triangle].map(|point| point.to_array());
+                if let Some(distance) = ray.watertight(v0, v1, v2)
+                    && distance < hit.dist
+                {
+                    hit.index = triangle as isize;
+                    hit.dist = distance;
+                }
+            },
+        );
+        assert!(found >= 0);
+        assert!((ray_hit.dist - 1.0).abs() < 1.0e-6);
     }
     #[test]
     fn nearest_surface_respects_wrap_mode_and_offset() {
@@ -1662,7 +1663,9 @@ mod tests {
         let no_axis = project(json!({
             "wrap_method":"PROJECT","use_positive_direction":false,"use_negative_direction":true
         }));
-        assert_eq!(no_axis.vertices[0].co, source.vertices[0].co);
+        // Blender's normals_calc_verts gives a loose vertex normalize(position) = +Z, so the
+        // negative cast from z = 1 reaches the plane at the origin.
+        assert_eq!(no_axis.vertices[0].co, DVec3::ZERO);
         let no_direction = project(json!({
             "wrap_method":"PROJECT","use_project_z":true,
             "use_positive_direction":false,"use_negative_direction":false
@@ -1872,8 +1875,8 @@ mod tests {
             json!({"wrap_method":"NEAREST_SURFACEPOINT","wrap_mode":"ON_SURFACE"}),
             plane(0.0),
         );
-        transformed.runtime.target_to_subject =
-            Some(DMat4::from_translation(DVec3::new(0.0, 0.0, 1.0)).to_cols_array());
+        transformed.runtime.shrinkwrap_subject_to_target =
+            Some(DMat4::from_translation(DVec3::new(0.0, 0.0, -1.0)).to_cols_array());
         let projected = evaluate(&source, &transformed).test_value();
         assert!(projected.vertices[0].co.distance(DVec3::Z) < F32_TOLERANCE);
 
@@ -1885,8 +1888,8 @@ mod tests {
             plane(0.0),
         );
         auxiliary.runtime.shrinkwrap_auxiliary_target_mesh = Some(plane(0.0));
-        auxiliary.runtime.auxiliary_target_to_subject =
-            Some(DMat4::from_translation(DVec3::new(0.0, 0.0, 3.0)).to_cols_array());
+        auxiliary.runtime.shrinkwrap_auxiliary_subject_to_target =
+            Some(DMat4::from_translation(DVec3::new(0.0, 0.0, -3.0)).to_cols_array());
         let source = one_point(DVec3::new(0.0, 0.0, 1.0));
         let projected = evaluate(&source, &auxiliary).test_value();
         assert!(projected.vertices[0].co.distance(DVec3::new(0.0, 0.0, 3.0)) < F32_TOLERANCE);
@@ -1895,14 +1898,16 @@ mod tests {
     fn above_surface_uses_custom_target_normals_under_reflected_nonuniform_transform() {
         let mut target = plane(0.0);
         crate::geom::normals::shade_faces_smooth(&mut target);
-        target.attributes.insert(
-            "custom_normal".to_owned(),
-            json!({
-                "domain":"corner",
-                "type":"float3",
-                "values":{"f0":[[0.0,1.0,0.0],[0.0,1.0,0.0],[0.0,1.0,0.0],[0.0,1.0,0.0]]}
-            }),
-        );
+        let up = [Some(DVec3::Y); 4];
+        crate::geom::clnor::encode_vectors(
+            &mut target,
+            Some(&up[..]),
+            crate::geom::clnor::NormalCodeOptions {
+                corner_order: None,
+                setter_input: crate::geom::clnor::SetterInput::NormalizeInput,
+            },
+        )
+        .test_value();
         let source = one_point(DVec3::new(0.25, 0.5, 1.0));
         let projected = evaluate(
             &source,
@@ -1937,7 +1942,7 @@ mod tests {
             }),
             plane(0.0),
         );
-        modifier.runtime.target_to_subject = Some(transform.to_cols_array());
+        modifier.runtime.shrinkwrap_subject_to_target = Some(transform.inverse().to_cols_array());
         let projected = evaluate(&source, &modifier).test_value();
         let expected = transform.transform_point3(DVec3::new(0.25, 0.5, 0.25));
         assert!(projected.vertices[0].co.distance(expected) < F32_TOLERANCE);
