@@ -1742,9 +1742,9 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// Blender's `BM_FACES_OF_VERT` walk over the input BMesh (`bmesh_iterators.cc`, `bmiter__face_of_vert_*`
+/// Blender's `BM_FACES_OF_VERT` walk over the input `BMesh` (`bmesh_iterators.cc`, `bmiter__face_of_vert_*`
 /// with `bmesh_structure.cc`). A vertex's edges form a disk cycle in ascending edge index from its first
-/// edge `v->e`; each edge's loops form a radial cycle, headed by the loop of its last-created face. BMesh
+/// edge `v->e`; each edge's loops form a radial cycle, headed by the loop of its last-created face. `BMesh`
 /// creates faces and edges in mesh order, so the input indices give that order. Faces are yielded per
 /// loop at the vertex, as the iterator does.
 struct FaceWalk<'a> {
@@ -1822,7 +1822,10 @@ impl<'a> FaceWalk<'a> {
 
     fn disk_next(&self, edge: usize, vertex: usize) -> usize {
         let disk = &self.disk[vertex];
-        let position = disk.iter().position(|candidate| *candidate == edge).unwrap_or(0);
+        let position = disk
+            .iter()
+            .position(|candidate| *candidate == edge)
+            .unwrap_or(0);
         disk[(position + 1) % disk.len()]
     }
 
