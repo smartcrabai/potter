@@ -3766,7 +3766,12 @@ mod node_bake_tests {
 
     #[test]
     fn typed_bake_values_and_material_references_roundtrip() {
-        let values = [
+        let mut carrier = triangle(0.0, 3, [0, 1, 2]);
+        carrier.attributes.insert(
+            "attr".to_owned(),
+            json!({"domain": "POINT", "type": "float", "data": [1.0, 2.0, 3.0]}),
+        );
+        let mut values: std::collections::BTreeMap<String, NodeBakeValue> = [
             ("float", json!(0.75)),
             ("integer", json!(7)),
             ("boolean", json!(true)),
@@ -3778,14 +3783,14 @@ mod node_bake_tests {
         ]
         .into_iter()
         .map(|(socket, value)| (socket.to_owned(), NodeBakeValue::Scalar { value }))
-        .chain([(
+        .collect();
+        values.insert("carrier".to_owned(), geometry(carrier));
+        values.insert(
             "field".to_owned(),
             NodeBakeValue::Field {
-                domain: "POINT".to_owned(),
-                values: vec![json!(1.0), json!(2.0)],
+                attribute_name: "attr".to_owned(),
             },
-        )])
-        .collect();
+        );
         let record = NodeBakeRecord {
             storage: "inline".to_owned(),
             kind: "node_bake".to_owned(),
@@ -3807,8 +3812,7 @@ mod node_bake_tests {
                 .expect("field item is valid")
                 .expect("field item is present"),
             NodeBakeValue::Field {
-                domain: "POINT".to_owned(),
-                values: vec![json!(1.0), json!(2.0)],
+                attribute_name: "attr".to_owned(),
             }
         );
     }

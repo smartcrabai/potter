@@ -3,8 +3,6 @@ mod evaluator;
 mod model;
 mod sockets;
 
-#[cfg(test)]
-pub(crate) use bake::read_node_bake_payload;
 pub(crate) use bake::{
     MAX_NODE_BAKE_FRAME_COUNT, MAX_NODE_BAKE_PACKED_BYTES, NODE_BAKE_JSON_MEMORY_MULTIPLIER,
     node_bake_frame_memory_bytes, read_node_bake_payload_limited, validate_node_bake_config,
