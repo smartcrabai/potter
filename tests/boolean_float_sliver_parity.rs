@@ -20,11 +20,6 @@ use serde_json::{Value, json};
 
 const ORACLE: &str = "tests/fixtures/boolean_parity/float_sliver/float_sliver_union.json";
 
-/// Absolute tolerance on the signed volume. Both sides use the same f32-rounded inputs, so what remains is
-/// rounding of the output vertices (Blender keeps its mesh in f32). It is below the 5.8e-6 sliver volume of
-/// the failing input, so a result that drops the sliver fails here.
-const VOLUME_TOLERANCE: f64 = 1.0e-6;
-
 fn modifier(modifier_type: &str, params: Value) -> Modifier {
     Modifier {
         id: Id::new("modifier_test").unwrap(),
@@ -39,26 +34,56 @@ fn modifier(modifier_type: &str, params: Value) -> Modifier {
     }
 }
 
-/// `value` rounded to f32, as Blender stores it.
+/// `value` rounded to the nearest f32, as Blender stores it.
 fn f32_exact(value: f64) -> f64 {
     f64::from(value as f32)
 }
 
-fn signed_volume(mesh: &Mesh) -> f64 {
-    let vertices: HashMap<_, _> = mesh
+/// The position with each coordinate rounded to f32, as Blender's mesh holds it.
+fn round_to_f32(point: DVec3) -> DVec3 {
+    DVec3::new(f32_exact(point.x), f32_exact(point.y), f32_exact(point.z))
+}
+
+/// The spacing of f32 values at the magnitude of `value`: one unit in the last place.
+fn f32_ulp(value: f64) -> f64 {
+    let magnitude = (value as f32).abs();
+    f64::from(f32::from_bits(magnitude.to_bits() + 1) - magnitude)
+}
+
+/// The signed volume of a mesh whose positions are rounded to f32, and a bound on how far that volume moves when
+/// every coordinate moves by one f32 ulp.
+///
+/// The volume is the fan sum of `p0 . (p1 x p2) / 6` over each face's triangles. The derivative of a triangle's
+/// term with respect to corner `k` is the cross product of the other two corners, divided by 6, so the first-order
+/// change from moving coordinate `c` of corner `k` by one ulp is `|grad_c| * ulp(c)`. The bound sums that over all
+/// corners and coordinates. It is first order: second-order terms are of order ulp squared, far below the bound.
+struct F32Volume {
+    volume: f64,
+    ulp_bound: f64,
+}
+
+fn f32_volume(mesh: &Mesh) -> F32Volume {
+    let vertices: HashMap<_, DVec3> = mesh
         .vertices
         .iter()
-        .map(|vertex| (vertex.id, vertex.co))
+        .map(|vertex| (vertex.id, round_to_f32(vertex.co)))
         .collect();
-    mesh.faces
-        .iter()
-        .map(|face| {
-            let points: Vec<_> = face.vertices.iter().map(|id| vertices[id]).collect();
-            (1..points.len() - 1)
-                .map(|index| points[0].dot(points[index].cross(points[index + 1])) / 6.0)
-                .sum::<f64>()
-        })
-        .sum::<f64>()
+    let mut volume = 0.0;
+    let mut ulp_bound = 0.0;
+    for face in &mesh.faces {
+        let points: Vec<DVec3> = face.vertices.iter().map(|id| vertices[id]).collect();
+        for index in 1..points.len() - 1 {
+            let triangle = [points[0], points[index], points[index + 1]];
+            volume += triangle[0].dot(triangle[1].cross(triangle[2])) / 6.0;
+            for corner in 0..3 {
+                let gradient = triangle[(corner + 1) % 3].cross(triangle[(corner + 2) % 3]) / 6.0;
+                for axis in 0..3 {
+                    ulp_bound += gradient[axis].abs() * f32_ulp(triangle[corner][axis]);
+                }
+            }
+        }
+    }
+    F32Volume { volume, ulp_bound }
 }
 
 /// The number of edges that do not border exactly two faces.
@@ -136,7 +161,7 @@ fn boolean_float_sliver_sweep_matches_blender() {
         let blender_volume = record["volume"].as_f64().unwrap();
         let faces = mesh.faces.len() as u64;
         let open = edges_not_two_faces(&mesh) as u64;
-        let volume = signed_volume(&mesh);
+        let F32Volume { volume, ulp_bound } = f32_volume(&mesh);
         if faces != blender_faces {
             failures.push(format!("{label}: {faces} faces, Blender {blender_faces}"));
         }
@@ -145,9 +170,10 @@ fn boolean_float_sliver_sweep_matches_blender() {
                 "{label}: {open} edges not bordering two faces, Blender {blender_open}"
             ));
         }
-        if (volume - blender_volume).abs() > VOLUME_TOLERANCE {
+        if (volume - blender_volume).abs() > ulp_bound {
             failures.push(format!(
-                "{label}: volume {volume:.9}, Blender {blender_volume:.9}"
+                "{label}: volume {volume:.9}, Blender {blender_volume:.9}, difference {:.3e} exceeds the one-ulp bound {ulp_bound:.3e}",
+                (volume - blender_volume).abs()
             ));
         }
     }

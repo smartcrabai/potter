@@ -10,8 +10,10 @@ Run headless from the repository root:
         --python tests/fixtures/boolean_parity/float_sliver/generate_union_sliver.py -- \
         tests/fixtures/boolean_parity/float_sliver
 
-Writes `float_sliver_union.json`: for each threshold, the evaluated mesh's volume, face count, edge
-manifold counts, and the analytic union volume in double precision (the test's formula).
+Writes `float_sliver_union.json`. Per case and threshold it records Blender's evaluated mesh: f32
+`positions`, `polygons` (vertex indices), and `triangles` (the loop triangles the volume is summed over), the
+signed `volume`, the face and vertex counts, the number of edges not bordering two faces, and the analytic
+union volume in double precision.
 """
 
 import json
@@ -23,17 +25,19 @@ import bpy
 
 OUTPUT = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 
-# The shrunk proptest input, and controls with the same overlap pattern but no sub-threshold gap: the
-# control's operand -x face is inside the subject (x - size/2 > -1). Blender stores coordinates as f32.
+SWEEP_SIZE = 1.424841830952486
+# Operand offsets are placed so the operand's -x face sits `gap` outside (positive) or inside (negative) the
+# subject's -x face. The failing proptest input is the gap 2.846e-6 case, which matches its x exactly.
+SWEEP_GAPS = [
+    1.0e-7, 5.0e-7, 1.0e-6, 2.0e-6, 2.846e-6, 5.0e-6, 2.0e-5, 1.0e-4,
+    -1.0e-7, -1.0e-6, -2.846e-6, -2.0e-5, -1.0e-4,
+]
+# Blender stores coordinates as f32, so the operand is rebuilt from these values.
 CASES = [
     {"name": "failing_sliver", "x": -0.2875819305642165, "y": 0.0, "z": 0.0, "size": 1.424841830952486},
     {"name": "control_no_gap", "x": -0.2875819305642165, "y": 0.0, "z": 0.0, "size": 1.3},
     {"name": "control_offset", "x": -0.25, "y": 0.0, "z": 0.0, "size": 1.424841830952486},
 ]
-# Gap sweep: the operand's -x face sits `gap` outside the subject's -x face. The failing input has gap
-# 2.846e-6 (x - size/2 + 1 = -gap); the sweep brackets the default double_threshold 1e-6.
-SWEEP_SIZE = 1.424841830952486
-SWEEP_GAPS = [1.0e-7, 5.0e-7, 1.0e-6, 2.0e-6, 2.846e-6, 5.0e-6, 2.0e-5, 1.0e-4, -1.0e-7, -1.0e-6, -2.846e-6, -2.0e-5, -1.0e-4]
 CASES += [
     {"name": f"gap_{gap:g}", "x": -1.0 - gap + SWEEP_SIZE * 0.5, "y": 0.0, "z": 0.0, "size": SWEEP_SIZE}
     for gap in SWEEP_GAPS
@@ -64,11 +68,12 @@ def cube(name, size, location):
     return obj
 
 
-def signed_volume_and_topology(mesh):
+def describe(mesh):
     mesh.calc_loop_triangles()
+    triangles = [list(tri.vertices) for tri in mesh.loop_triangles]
     volume = 0.0
-    for tri in mesh.loop_triangles:
-        a, b, c = (mesh.vertices[i].co for i in tri.vertices)
+    for a_index, b_index, c_index in triangles:
+        a, b, c = (mesh.vertices[i].co for i in (a_index, b_index, c_index))
         volume += (
             a.x * (b.y * c.z - b.z * c.y)
             - a.y * (b.x * c.z - b.z * c.x)
@@ -78,12 +83,14 @@ def signed_volume_and_topology(mesh):
     for poly in mesh.polygons:
         for key in poly.edge_keys:
             edge_faces[key] = edge_faces.get(key, 0) + 1
-    counts = list(edge_faces.values())
     return {
         "volume": volume,
         "faces": len(mesh.polygons),
         "vertices": len(mesh.vertices),
-        "edges_not_two_faces": sum(1 for count in counts if count != 2),
+        "edges_not_two_faces": sum(1 for count in edge_faces.values() if count != 2),
+        "positions": [[v.co.x, v.co.y, v.co.z] for v in mesh.vertices],
+        "polygons": [list(poly.vertices) for poly in mesh.polygons],
+        "triangles": triangles,
     }
 
 
@@ -100,11 +107,16 @@ def run_case(case, results):
         modifier.double_threshold = threshold
         depsgraph = bpy.context.evaluated_depsgraph_get()
         evaluated = subject.evaluated_get(depsgraph).to_mesh()
-        record = signed_volume_and_topology(evaluated)
-        record.update({"case": case["name"], "threshold": threshold, "analytic_volume": analytic_union_volume(size, x, y, z)})
-        record["error"] = record["volume"] - record["analytic_volume"]
+        record = describe(evaluated)
+        analytic = analytic_union_volume(size, x, y, z)
+        record.update({
+            "case": case["name"],
+            "threshold": threshold,
+            "analytic_volume": analytic,
+            "error": record["volume"] - analytic,
+        })
         results.append(record)
-        print(json.dumps(record), flush=True)
+        print(json.dumps({k: record[k] for k in ("case", "threshold", "volume", "faces", "edges_not_two_faces")}), flush=True)
         subject.evaluated_get(depsgraph).to_mesh_clear()
         bpy.data.objects.remove(subject, do_unlink=True)
         bpy.data.objects.remove(operand, do_unlink=True)
