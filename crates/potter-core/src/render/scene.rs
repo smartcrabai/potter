@@ -11,7 +11,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot},
     geom::{
-        TextureSpace,
+        Mesh, TextureSpace,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         normals::{render_corner_normals, smooth_face_flags},
         uv_layers::{self, UvStore},
@@ -533,7 +533,9 @@ pub(super) fn extract_geometry(
             index: object_index,
             node_id: node_id.clone(),
             data_id: node.data.clone(),
-            texture_space: TextureSpace::automatic(mesh.and_then(|mesh| mesh.bounds())),
+            texture_space: mesh
+                .and_then(Mesh::manual_texture_space)
+                .unwrap_or_else(|| TextureSpace::automatic(mesh.and_then(|mesh| mesh.bounds()))),
             instance_path: snapshot
                 .instance_paths
                 .get(node_id)

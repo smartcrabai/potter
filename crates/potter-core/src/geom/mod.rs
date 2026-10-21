@@ -224,19 +224,55 @@ impl TextureSpace {
         }
     }
 
-    /// The Generated coordinate of the object-local point `local`.
+    /// A texture space with the stored location and size of a `.blend` mesh whose texture space is not automatic
+    /// (`use_auto_texspace` off). The size is used as stored, as Cycles' `BKE_mesh_texspace_get` returns it.
     #[must_use]
-    pub fn generated(self, local: DVec3) -> DVec3 {
-        (local - self.location) / (self.size * 2.0) + DVec3::splat(0.5)
+    pub fn manual(location: DVec3, size: DVec3) -> Self {
+        Self { location, size }
     }
 
-    /// How far the Generated coordinate moves per unit of object-local movement: `1 / (2 size)` per
-    /// axis, the Jacobian of [`TextureSpace::generated`].
+    /// The Generated coordinate of the object-local point `local`: `(P - location) · 0.5 / size + 0.5` per axis
+    /// (Cycles' `size_c = 0.5 / size` and `loc_c` in `blender/mesh.cpp`). A zero size gives a zero scale on
+    /// that axis, so the axis maps to `0.5`.
+    #[must_use]
+    pub fn generated(self, local: DVec3) -> DVec3 {
+        (local - self.location) * self.generated_per_local() + DVec3::splat(0.5)
+    }
+
+    /// How far the Generated coordinate moves per unit of object-local movement: `0.5 / size` per axis, and zero
+    /// on an axis of zero size. This is the Jacobian of [`TextureSpace::generated`].
     #[must_use]
     pub fn generated_per_local(self) -> DVec3 {
-        (self.size * 2.0).recip()
+        DVec3::from_array(self.size.to_array().map(|size| {
+            if size.abs() < f64::MIN_POSITIVE {
+                0.0
+            } else {
+                0.5 / size
+            }
+        }))
     }
 }
+
+impl Mesh {
+    /// The mesh-level record that carries a manual texture space: `{"location": [x, y, z], "size": [x, y, z]}` under
+    /// [`TEXTURE_SPACE_KEY`]. `None` for an automatic texture space, which is the bounds of the mesh.
+    #[must_use]
+    pub fn manual_texture_space(&self) -> Option<TextureSpace> {
+        let record = self.attributes.get(TEXTURE_SPACE_KEY)?;
+        let vector = |key: &str| -> Option<DVec3> {
+            let values = record.get(key)?.as_array()?;
+            let [x, y, z] = values.as_slice() else {
+                return None;
+            };
+            Some(DVec3::new(x.as_f64()?, y.as_f64()?, z.as_f64()?))
+        };
+        Some(TextureSpace::manual(vector("location")?, vector("size")?))
+    }
+}
+
+/// The mesh attribute record that holds a manual texture space (`TextureSpace::manual`), written and read by the
+/// Blender bridge as `use_auto_texspace` off with `texspace_location` and `texspace_size`.
+pub const TEXTURE_SPACE_KEY: &str = "texture_space";
 
 impl Default for TextureSpace {
     fn default() -> Self {

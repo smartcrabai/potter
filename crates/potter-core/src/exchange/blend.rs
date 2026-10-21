@@ -15,7 +15,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     float::{equal_f64, equal_f64_array},
     geom::{
-        Edge, Face, IdCounters, Mesh, Vertex, attribute_keys, clnor,
+        Edge, Face, IdCounters, Mesh, TEXTURE_SPACE_KEY, Vertex, attribute_keys, clnor,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         uv_layers::{self, UvLayer, UvStore},
     },
@@ -3163,7 +3163,8 @@ fn build_imported_graph(
             &mut mappings,
             "Mesh",
         )?;
-        let mesh = convert_mesh(item)?;
+        let mut mesh = convert_mesh(item)?;
+        insert_texture_space_record(item, name, &mut mesh)?;
         let (shape_keys, key_group_names) = parse_shape_keys(item, &mesh, name, &mut mappings)?;
         if !key_group_names.is_empty() {
             shape_key_vertex_groups.insert(id.clone(), key_group_names);
@@ -6653,6 +6654,37 @@ fn unique_id(name: &str, prefix: &str, used: &mut BTreeSet<String>) -> String {
     value
 }
 
+/// Stores a mesh's manual texture space (`use_auto_texspace` off) as its texture-space record, from the RNA
+/// properties the bridge dumps: `texspace_location` and `texspace_size`. An automatic texture space is not stored,
+/// since it is the bounds of the mesh.
+fn insert_texture_space_record(item: &Value, name: &str, mesh: &mut Mesh) -> Result<()> {
+    let Some(rna) = item.get("rna_properties") else {
+        return Ok(());
+    };
+    if rna.get("use_auto_texspace").and_then(Value::as_bool) != Some(false) {
+        return Ok(());
+    }
+    let vector = |key: &str| -> Result<Value> {
+        let values = rna
+            .get(key)
+            .and_then(Value::as_array)
+            .filter(|values| {
+                values.len() == 3 && values.iter().all(|value| value.as_f64().is_some())
+            })
+            .ok_or_else(|| {
+                invalid_intermediate(&format!(
+                    "mesh {name} has a manual texture space without a valid {key}"
+                ))
+            })?;
+        Ok(Value::Array(values.clone()))
+    };
+    mesh.attributes.insert(
+        TEXTURE_SPACE_KEY.to_owned(),
+        json!({"location": vector("texspace_location")?, "size": vector("texspace_size")?}),
+    );
+    Ok(())
+}
+
 fn convert_mesh(item: &Value) -> Result<Mesh> {
     let vertices_raw = item
         .get("vertices")
@@ -7025,7 +7057,8 @@ fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bo
 }
 
 /// Mesh-level keys that the `.blend` writer recreates or restores itself.
-const BLENDER_HANDLED_MESH_KEYS: [&str; 12] = [
+const BLENDER_HANDLED_MESH_KEYS: [&str; 13] = [
+    "texture_space",
     "uv_layers",
     "color_layers",
     "shade_smooth",
