@@ -600,11 +600,8 @@ def _physics_modifier_settings(obj, modifier):
         settings = getattr(particle_system, "settings", None) if particle_system else None
         result = _physics_rna_values(settings)
         if settings is not None:
-            # Fluid particle systems carry FLIP/SPRAY/FOAM/BUBBLE/TRACER, which Blender's fluid modifier sets, not
-            # the ParticleSettings.type enum (EMITTER/HAIR). Only the enum is part of the particle system.
-            particle_type = str(settings.type)
-            if particle_type in settings.bl_rna.properties["type"].enum_items.keys():
-                result["type"] = particle_type
+            # Fluid particle systems (FLIP/SPRAY/FOAM/BUBBLE/TRACER) are created by the fluid domain flags.
+            result["type"] = str(settings.type)
             result["texture_slots"] = _particle_texture_slots(settings)
         if particle_system:
             result["seed"] = int(particle_system.seed)
@@ -3426,6 +3423,104 @@ def _execute_stack_op(obj, operation, modifiers_by_id):
         raise RuntimeError("cannot reconstruct modifier %s" % identifier) from error
 
 
+# Blender's fluid domain flags that create a fluid particle system (`rna_fluid.cc`: each update calls
+# `BKE_fluid_particle_system_create`, or `BKE_fluid_particle_system_destroy` when the flag is cleared).
+FLUID_PARTICLE_FLAGS = {
+    "FLIP": "use_flip_particles",
+    "SPRAY": "use_spray_particles",
+    "FOAM": "use_foam_particles",
+    "BUBBLE": "use_bubble_particles",
+    "TRACER": "use_tracer_particles",
+}
+
+
+def _fluid_particle_type(doc, node_id, item):
+    """The fluid particle type of a particle system item, or None for an emitter or hair system."""
+    if item.get("type") != "particle_system":
+        return None
+    node_properties = doc.get("nodes", {}).get(node_id, {}).get("properties", {})
+    settings_id = item.get("params", {}).get("settings_id")
+    settings = node_properties.get("physics_particle_systems", {}).get(settings_id, {})
+    particle_type = settings.get("type")
+    return particle_type if particle_type in FLUID_PARTICLE_FLAGS else None
+
+
+def _set_fluid_particle_flag(obj, particle_type, present):
+    """Make the fluid domain flag for `particle_type` match `present`, recreating a missing system.
+
+    Setting a flag that is already set deletes its system (the update callback sees it exists), so the
+    flag is only written when the system's state differs: clear it to remove, or clear then set to create.
+    """
+    domain = next((modifier for modifier in obj.modifiers
+                   if modifier.type == "FLUID" and modifier.fluid_type == "DOMAIN"), None)
+    if domain is None:
+        if present:
+            raise ValueError("fluid particle system %s on %s needs a fluid domain"
+                             % (particle_type, obj.name))
+        return
+    flag = FLUID_PARTICLE_FLAGS[particle_type]
+    settings = domain.domain_settings
+    has_system = any(system.settings.type == particle_type for system in obj.particle_systems)
+    if present and has_system and getattr(settings, flag):
+        return
+    if getattr(settings, flag) or has_system:
+        setattr(settings, flag, False)
+    if present:
+        setattr(settings, flag, True)
+        if not any(system.settings.type == particle_type for system in obj.particle_systems):
+            raise ValueError("Blender did not create the %s particle system on %s; the fluid "
+                             "domain must be a Liquid domain" % (particle_type, obj.name))
+
+
+def _finish_fluid_particle_systems(obj, modifier_items, fluid_items, modifiers_by_id, doc, node_id,
+                                   id_lookup, texture_lookup, target, pack):
+    """Create the fluid particle systems through the domain flags, then bind, configure, and order them.
+
+    Runs after the domain is configured, so the Liquid domain check sees the Potter domain type.
+    """
+    present_types = {}
+    for item in fluid_items:
+        particle_type = _fluid_particle_type(doc, node_id, item)
+        if particle_type in present_types:
+            raise ValueError("%s has two %s particle systems; Blender allows one per fluid type"
+                             % (obj.name, particle_type))
+        present_types[particle_type] = item
+    for particle_type in FLUID_PARTICLE_FLAGS:
+        _set_fluid_particle_flag(obj, particle_type, particle_type in present_types)
+    for particle_type, item in present_types.items():
+        systems = [system for system in obj.particle_systems
+                   if system.settings.type == particle_type]
+        if len(systems) != 1:
+            raise ValueError("%s must have exactly one %s particle system, found %d"
+                             % (obj.name, particle_type, len(systems)))
+        system = systems[0]
+        modifier = next(modifier for modifier in obj.modifiers
+                        if modifier.type == "PARTICLE_SYSTEM" and modifier.particle_system == system)
+        modifier.name = item["name"]
+        modifiers_by_id[item["id"]] = modifier
+        modifier.show_viewport = bool(item.get("enabled", True) and item.get("show_viewport", True))
+        modifier.show_render = bool(item.get("enabled", True) and item.get("show_render", True))
+        rna_item = dict(item, params={key: value for key, value in item.get("params", {}).items()
+                                      if key != "use_pin_to_last"})
+        set_modifier_params(modifier, rna_item, id_lookup, texture_lookup, doc, target, node_id,
+                            obj, pack)
+        modifier.use_pin_to_last = bool(item.get("params", {}).get("use_pin_to_last", False))
+    expected = [modifiers_by_id[item["id"]] for item in modifier_items]
+    for index, modifier in enumerate(expected):
+        current = [candidate.name for candidate in obj.modifiers].index(modifier.name)
+        if current != index:
+            try:
+                obj.modifiers.move(current, index)
+            except RuntimeError:
+                pass
+    if [candidate.name for candidate in obj.modifiers] != [modifier.name for modifier in expected]:
+        raise ValueError("%s modifier order cannot match Potter's stack after fluid particle systems"
+                         % obj.name)
+    annotations = {modifier.name: {"id": item["id"], "name": item["name"]}
+                   for modifier, item in zip(expected, modifier_items)}
+    obj["potter.modifier_ids_json"] = json.dumps(annotations, sort_keys=True)
+
+
 def _restore_modifier_stack(obj, modifier_items):
     """Make Blender's stack equal Potter's order and pin flags, or raise a precise ValueError.
 
@@ -3793,8 +3888,12 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
                 raise ValueError("UV Project projector references missing object %s" % reference)
             modifier.projectors[index].object = candidate
     if physics_property:
-        settings = dict(settings)
         settings.pop("role", None)
+        if kind == "fluid":
+            # The domain's particle flags create or remove fluid particle systems; they are applied after the
+            # domain is configured (`_finish_fluid_particle_systems`), so they are not set here.
+            for flag in FLUID_PARTICLE_FLAGS.values():
+                settings.pop(flag, None)
         canvas_surfaces = settings.pop("canvas_surfaces", [])
         point_cache = settings.pop("point_cache", None)
         collision_settings = settings.pop("collision_settings", None)
@@ -3829,9 +3928,15 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         else:
             particle_system = getattr(modifier, "particle_system", None)
             settings_block = getattr(particle_system, "settings", None) if particle_system else None
-        if settings_block is not None and particle_type is not None:
+        if settings_block is not None and particle_type in FLUID_PARTICLE_FLAGS:
+            # Blender creates fluid particle systems through the domain flags; they are never assigned.
+            if settings_block.type != particle_type:
+                raise ValueError("%s particle settings are %s, not %s"
+                                 % (obj.name, settings_block.type, particle_type))
+        elif settings_block is not None and particle_type is not None:
             if particle_type not in settings_block.bl_rna.properties["type"].enum_items.keys():
-                raise ValueError("particle settings type %r is not a ParticleSettings type" % particle_type)
+                raise ValueError("particle settings type %r is not a ParticleSettings type"
+                                 % particle_type)
             settings_block.type = particle_type
         if settings_block is not None:
             set_rna(settings_block, settings, id_lookup)
@@ -8038,8 +8143,14 @@ def export_doc(doc, target, pack, scene_hash, context):
             for modifier in source_object.get("modifiers", [])
         }
         modifier_items = item.get("modifiers", [])
-        modifiers_by_id = _restore_modifier_stack(obj, modifier_items)
+        fluid_items = [item for item in modifier_items
+                       if _fluid_particle_type(doc, node_id, item) is not None]
+        fluid_ids = {item["id"] for item in fluid_items}
+        modifiers_by_id = _restore_modifier_stack(
+            obj, [item for item in modifier_items if item["id"] not in fluid_ids])
         for modifier_item in modifier_items:
+            if modifier_item["id"] in fluid_ids:
+                continue
             try:
                 params = modifier_item.get("params", {})
                 modifier = modifiers_by_id[modifier_item["id"]]
@@ -8091,6 +8202,10 @@ def export_doc(doc, target, pack, scene_hash, context):
                 raise RuntimeError(
                     "cannot reconstruct modifier %s (%s)" % (modifier_item.get("name"), modifier_item.get("type"))
                 ) from error
+        if fluid_items:
+            _finish_fluid_particle_systems(
+                obj, modifier_items, fluid_items, modifiers_by_id, doc, node_id, id_lookup,
+                texture_map, target, pack)
     for node_id, item in doc.get("nodes", {}).items():
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]
