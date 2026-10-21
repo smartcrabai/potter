@@ -173,6 +173,21 @@ impl SceneDoc {
                 "active_scene does not reference a scene",
             ));
         }
+        for (resource_id, resource) in &self.resources {
+            let resource_kind = crate::model::migrate::inline_resource_kind(resource)?;
+            if resource.get("storage").is_some()
+                && resource.get("storage").and_then(Value::as_str) != Some("inline")
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "typed resources must use storage `inline`",
+                    json!({ "resource": resource_id }),
+                ));
+            }
+            if resource_kind == Some(crate::geom::legacy_texture::LEGACY_TEXTURE_KIND) {
+                crate::geom::legacy_texture::validate_record_in_scene(self, resource_id, resource)?;
+            }
+        }
         for clip in self.movie_clips.values() {
             clip.validate()?;
         }
@@ -1675,17 +1690,32 @@ impl Modifier {
     }
 }
 
+/// Blender's ordered f32 texture-coordinate stages, retained without matrix composition.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextureCoordinateMapping {
+    pub subject_to_world_f32: [f32; 16],
+    pub world_to_mapping_f32: Option<[f32; 16]>,
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModifierRuntime {
-    pub target_mesh: Option<Value>,
+    pub target_mesh: Option<Mesh>,
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
     /// Boolean operands in the subject's space (subject excluded), in Blender order.
     pub boolean_operands: Vec<crate::geom::boolean::BooleanOperand>,
-    pub warp_from: Option<[f64; 3]>,
-    pub warp_to: Option<[f64; 3]>,
-    pub hook_target_position: Option<[f64; 3]>,
+    /// `inv(subject_world) * reference_world` (column-major) for Hook, Cast, Simple Deform origin,
+    /// Curve, and Wave's start object. A bone reference is `armature_world * pose_mat`.
+    pub object_matrix: Option<[f64; 16]>,
+    /// `inv(subject_world) * source_world` for generic Warp source object or pose bone.
+    pub warp_from_matrix: Option<[f64; 16]>,
+    /// `inv(subject_world) * destination_world` for generic Warp destination object or pose bone.
+    pub warp_to_matrix: Option<[f64; 16]>,
+    /// Raw subject-to-world and optional world-to-mapping matrices for ordered f32 texture mapping.
+    #[doc(hidden)]
+    pub texture_mapping: Option<TextureCoordinateMapping>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

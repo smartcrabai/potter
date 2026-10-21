@@ -1,5 +1,7 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    fmt::Write as _,
+    hash::{Hash, Hasher},
     sync::{LazyLock, Mutex},
 };
 
@@ -8,7 +10,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{GridParams, IcosphereParams, Mesh, MeshError, modifiers::evaluate_modifiers},
+    geom::{
+        GridParams, IcosphereParams, Mesh, MeshError, ORIGINDEX_NONE,
+        modifiers::evaluate_modifiers, origindex_values, set_origindex,
+    },
     model::{Id, Modifier},
 };
 
@@ -95,6 +100,7 @@ struct Evaluator<'a> {
     group: &'a NodeGroup,
     input: Option<&'a Mesh>,
     overrides: &'a Map<String, Value>,
+    subject_name: &'a str,
     frame: f64,
     simulation_signature: Option<String>,
     simulation_states: HashMap<Id, GeometryValue>,
@@ -108,6 +114,7 @@ struct Evaluator<'a> {
 ///
 /// Inputs are keyed by interface socket ID or name. Generated instances are realized
 /// into `mesh` for bounds and rendering while `instance_paths` records each instance.
+/// `subject_name` is forwarded to modifier nodes, which use it to seed texture noise.
 ///
 /// # Errors
 ///
@@ -118,8 +125,9 @@ pub fn evaluate(
     group: &NodeGroup,
     input: Option<&Mesh>,
     overrides: &Map<String, Value>,
+    subject_name: &str,
 ) -> Result<GraphEvaluation> {
-    evaluate_at_frame(group, input, overrides, 1.0)
+    evaluate_at_frame(group, input, overrides, 1.0, subject_name)
 }
 
 /// Evaluate a geometry node group at a scene frame.
@@ -134,6 +142,7 @@ pub fn evaluate_at_frame(
     input: Option<&Mesh>,
     overrides: &Map<String, Value>,
     frame: f64,
+    subject_name: &str,
 ) -> Result<GraphEvaluation> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
@@ -160,7 +169,15 @@ pub fn evaluate_at_frame(
                     )
                 })
                 .and_then(|value| {
-                    crate::hash::canonicalize(&value).map(|bytes| crate::hash::sha256(&bytes))
+                    crate::hash::canonicalize(&value).map(|bytes| {
+                        let mut signature = crate::hash::sha256(&bytes);
+                        if let Some(indices) = input.and_then(origindex_values) {
+                            let mut hasher = DefaultHasher::new();
+                            indices.hash(&mut hasher);
+                            let _ = write!(signature, "-{:016x}", hasher.finish());
+                        }
+                        signature
+                    })
                 })
         })
         .transpose()?;
@@ -223,6 +240,7 @@ pub fn evaluate_at_frame(
         input,
         overrides,
         frame,
+        subject_name,
         simulation_signature,
         simulation_states: HashMap::new(),
         repeat_states: HashMap::new(),
@@ -335,7 +353,14 @@ impl Evaluator<'_> {
         })?;
         let result = self.evaluate_node(id, &node, socket);
         self.active.remove(id);
-        let value = result?;
+        let mut value = result?;
+        if let EvalValue::Geometry(geometry) = &mut value
+            && origindex_values(&geometry.mesh).is_none()
+            && self.input.and_then(origindex_values).is_some()
+        {
+            let vertex_count = geometry.mesh.vertices.len();
+            set_origindex(&mut geometry.mesh, &vec![ORIGINDEX_NONE; vertex_count]);
+        }
         self.cache.insert(key, value.clone());
         Ok(value)
     }
@@ -1236,6 +1261,28 @@ impl Evaluator<'_> {
             EvalValue::Scalar(json!(0.05)),
         )?);
         let mut points = Mesh::new();
+        let source_indices = origindex_values(&geometry.mesh);
+        let mut source_vertices = source_indices.as_ref().map(|_| Vec::new());
+        let corner_vertices = if domain == "CORNER" && source_vertices.is_some() {
+            let vertex_index: HashMap<u32, usize> = geometry
+                .mesh
+                .vertices
+                .iter()
+                .enumerate()
+                .map(|(index, vertex)| (vertex.id, index))
+                .collect();
+            Some(
+                geometry
+                    .mesh
+                    .faces
+                    .iter()
+                    .flat_map(|face| face.vertices.iter())
+                    .map(|id| vertex_index.get(id).copied())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
         let mut radii = Vec::new();
         for index in 0..count {
             if field_bool(&selection, &geometry.mesh, index, domain, false)? {
@@ -1250,11 +1297,27 @@ impl Evaluator<'_> {
                     .insert_vertex(position)
                     .map_err(|error| mesh_evaluation_error(&error))?;
                 radii.push(json!(radius));
+                if let Some(source_vertices) = &mut source_vertices {
+                    let source_vertex = match domain {
+                        "POINT" | "POINTS" => Some(index),
+                        "CORNER" => corner_vertices
+                            .as_ref()
+                            .and_then(|vertices| vertices.get(index).copied().flatten()),
+                        _ => None,
+                    };
+                    let original_index = source_vertex
+                        .and_then(|source| source_indices.as_ref()?.get(source).copied())
+                        .unwrap_or(ORIGINDEX_NONE);
+                    source_vertices.push(original_index);
+                }
             }
         }
         points
             .attributes
             .insert("radius".to_owned(), json!({"domain":"POINT","data":radii}));
+        if let Some(vertices) = source_vertices {
+            set_origindex(&mut points, &vertices);
+        }
         Ok(EvalValue::Geometry(GeometryValue {
             mesh: points,
             instance_paths: geometry.instance_paths,
@@ -1284,7 +1347,7 @@ impl Evaluator<'_> {
             baked_ocean_cache: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        let mesh = evaluate_modifiers(&geometry.mesh, &[modifier])?;
+        let mesh = evaluate_modifiers(&geometry.mesh, &[modifier], self.subject_name)?;
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: geometry.instance_paths,
@@ -3046,8 +3109,18 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
             "joined geometry exceeds vertex ID range",
         ));
     }
+    let tracks_origindex = meshes.iter().any(|mesh| origindex_values(mesh).is_some());
+    let mut original_vertices = tracks_origindex.then(|| Vec::with_capacity(vertex_count));
     let mut result = Mesh::new();
     for mesh in meshes {
+        if let Some(output_indices) = &mut original_vertices {
+            match origindex_values(mesh) {
+                Some(indices) => output_indices.extend_from_slice(&indices),
+                None => {
+                    output_indices.extend(std::iter::repeat_n(ORIGINDEX_NONE, mesh.vertices.len()));
+                }
+            }
+        }
         let mut mapping = HashMap::with_capacity(mesh.vertices.len());
         for vertex in &mesh.vertices {
             let id = result
@@ -3088,6 +3161,9 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
                     .map_err(|error| mesh_evaluation_error(&error))?;
             }
         }
+    }
+    if let Some(vertices) = original_vertices {
+        set_origindex(&mut result, &vertices);
     }
     Ok(result)
 }

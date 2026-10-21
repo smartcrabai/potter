@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
-    model::{Id, LibraryKind, SceneDoc},
+    model::{Id, LibraryKind, SceneDoc, migrate::inline_resource_kind},
 };
 
 pub(crate) const REGISTRIES: &[&str] = &[
@@ -141,11 +141,20 @@ fn linked_blend_bytes(
         .resource
         .as_ref()
         .and_then(|resource_id| doc.resources.get(resource_id));
-    if resource
-        .is_some_and(|resource| resource.get("packed").and_then(Value::as_bool) == Some(true))
+    let resource = if let Some(resource) = resource {
+        if inline_resource_kind(resource)?.is_some() {
+            None
+        } else {
+            Some(resource)
+        }
+    } else {
+        None
+    };
+    if let Some(resource) = resource
+        && resource.get("packed").and_then(Value::as_bool) == Some(true)
     {
         let values = resource
-            .and_then(|resource| resource.get("bytes"))
+            .get("bytes")
             .and_then(Value::as_array)
             .ok_or_else(|| {
                 PotError::new(

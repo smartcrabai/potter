@@ -8,7 +8,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     exchange::{self, ImportedGraph, Loss},
     hash,
-    model::{AvatarVersion, Id, SceneDoc},
+    model::{AvatarVersion, Id, SceneDoc, migrate::inline_resource_kind},
     response::SceneInfo,
     store::Project,
 };
@@ -70,13 +70,18 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
     if !imported.losses.is_empty() && !args.allow_lossy {
         return Err(lossy_error(format, &imported.losses));
     }
-    let packed_resource_hashes = imported
-        .doc
-        .resources
-        .values()
-        .filter(|resource| resource["source_packed"] == true)
-        .filter_map(|resource| resource["hash"].as_str().map(str::to_owned))
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut packed_resource_hashes = std::collections::BTreeSet::new();
+    for resource in imported.doc.resources.values() {
+        if inline_resource_kind(resource)?.is_some() {
+            continue;
+        }
+        if resource["source_packed"] == true
+            && let Some(digest) = resource["hash"].as_str()
+        {
+            packed_resource_hashes.insert(digest.to_owned());
+        }
+    }
+
     let mut asset_blobs = BTreeMap::new();
     for (digest, bytes) in imported.assets {
         if format == "blend"
@@ -130,7 +135,7 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
     candidate.revision = before.revision;
     candidate.history = before.history.clone();
     let (external_resources, resource_warnings) = if format == "blend" {
-        configure_blender_resources(&mut candidate, &asset_blobs, args.asset_policy)
+        configure_blender_resources(&mut candidate, &asset_blobs, args.asset_policy)?
     } else {
         (Vec::new(), Vec::new())
     };
@@ -278,7 +283,7 @@ fn configure_blender_resources(
     doc: &mut SceneDoc,
     staged_assets: &BTreeMap<String, Vec<u8>>,
     policy: AssetPolicy,
-) -> (Vec<Value>, Vec<Value>) {
+) -> Result<(Vec<Value>, Vec<Value>)> {
     let sources = doc
         .resources
         .iter()
@@ -288,6 +293,9 @@ fn configure_blender_resources(
     let mut result = Vec::with_capacity(sources.len());
     let mut warnings = Vec::new();
     for (id, source) in sources {
+        if inline_resource_kind(&source)?.is_some() {
+            continue;
+        }
         let original_path = source
             .get("original_path")
             .and_then(Value::as_str)
@@ -364,7 +372,7 @@ fn configure_blender_resources(
             }
         }
     }
-    (result, warnings)
+    Ok((result, warnings))
 }
 
 fn append_graph(
@@ -828,5 +836,26 @@ mod tests {
         let scene = imported.scenes.get(&base.active_scene).unwrap();
         assert_eq!(scene.world, Some(base_world));
         assert_eq!(scene.camera, Some(base_camera));
+    }
+
+    #[test]
+    fn blender_import_preserves_inline_resources() -> Result<()> {
+        let mut doc = SceneDoc::new("inline_import_test".to_owned());
+        let inline_id = Id::new("inline_texture")?;
+        let inline = json!({
+            "storage":"inline",
+            "kind":"legacy_texture",
+            "texture_type":"BLEND",
+            "settings":{}
+        });
+        doc.resources.insert(inline_id.clone(), inline.clone());
+
+        let (external, warnings) =
+            configure_blender_resources(&mut doc, &BTreeMap::new(), AssetPolicy::Link)?;
+
+        assert_eq!(doc.resources[&inline_id], inline);
+        assert_eq!(external, Vec::<Value>::new());
+        assert_eq!(warnings, Vec::<serde_json::Value>::new());
+        Ok(())
     }
 }

@@ -44,8 +44,8 @@ pub use scene::{
     Node, OceanBakeCache, PlaneHomography, PlaneTrack, PrimitiveDescriptor, Profile,
     ReconstructedPoint, Reconstruction, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
     RigidBodyWorld, Scene, SceneDoc, SolvedCamera, SurfaceData, SurfacePoint, TextObjectData,
-    TextureRef, TimelineMarker, TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack,
-    UnitSettings, ViewLayer, ViewportDisplay, World,
+    TextureCoordinateMapping, TextureRef, TimelineMarker, TrackingMarker, TrackingObject,
+    TrackingObjectPose, TrackingTrack, UnitSettings, ViewLayer, ViewportDisplay, World,
 };
 pub(crate) use scene::{
     is_identity_matrix, material_link_at, material_slot_count, resolve_material_slot,

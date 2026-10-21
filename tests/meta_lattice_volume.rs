@@ -64,6 +64,7 @@ fn little_endian_f32_blob_samples_match_inline_density() {
             dims: [2, 2, 2],
             voxel_size: 1.0,
             origin: DVec3::ZERO,
+            index_to_local: None,
             values: None,
             blob_f32: Some(blob),
             content_ref: Some("sha256:sample-grid".to_owned()),
@@ -88,7 +89,7 @@ proptest! {
                 .collect(),
             Vec::new(),
         ).unwrap();
-        let output = lattice::deform_mesh(&mesh, &LatticeData::default(), None).unwrap();
+        let output = lattice::deform_mesh(&mesh, &LatticeData::default()).unwrap();
         prop_assert_eq!(output, mesh);
     }
 }
@@ -119,7 +120,12 @@ fn mesh_volume_round_trip_stays_within_one_voxel_of_source_bounds() {
         baked_ocean_cache: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     };
-    let modified = potter_core::geom::modifiers::evaluate_modifiers(&source, &[modifier]).unwrap();
+    let modified = potter_core::geom::modifiers::evaluate_modifiers(
+        &source,
+        &[modifier],
+        "VolumeRoundTripBox",
+    )
+    .unwrap();
     let modifier_bounds = modified.bounds().unwrap();
     for axis in 0..3 {
         assert!((result_bounds.min[axis] - source_bounds.min[axis]).abs() <= voxel_size);
@@ -214,6 +220,51 @@ fn lattice_modifier_blends_by_vertex_group_in_object_space() {
         assert!((after.co.x - before.co.x).abs() <= 1.0e-12);
         assert!((after.co.y - before.co.y - 0.5).abs() <= 1.0e-12);
         assert!((after.co.z - before.co.z).abs() <= 1.0e-12);
+    }
+}
+
+#[test]
+fn lattice_named_unweighted_group_applies_full_influence() {
+    let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+    let source = apply(
+        &base,
+        &json!([{"op":"node.create","id":"body","kind":"box","params":{"size":2.0}}]),
+    );
+    let mesh_data = source.nodes[&Id::new("body").unwrap()]
+        .data
+        .as_ref()
+        .unwrap();
+    let original = source.data_blocks[mesh_data].mesh.as_ref().unwrap();
+    let points = LatticeData::default()
+        .points
+        .iter()
+        .map(|point| (*point + DVec3::X).to_array())
+        .collect::<Vec<_>>();
+    // The group exists on the body but stores no weights: Blender's null `dvert`.
+    let scene = |params: Value| {
+        let doc = apply(
+            &source,
+            &json!([
+                {"op":"vertex_group.create","target":{"id":"body"},"id":"region","name":"Region"},
+                {"op":"lattice.create","id":"cage","points":points,"transform":{"translation":[0.0,0.0,0.0],"rotation":[0.0,0.0,std::f64::consts::FRAC_1_SQRT_2,std::f64::consts::FRAC_1_SQRT_2],"scale":[1.0,1.0,1.0]}},
+                {"op":"modifier.create","target":{"id":"body"},"id":"deform","type":"lattice","params":params}
+            ]),
+        );
+        evaluated(&doc).meshes[&Id::new("body").unwrap()].clone()
+    };
+    let plain = scene(json!({"object":"cage"}));
+    let grouped = scene(json!({"object":"cage","vertex_group":"region"}));
+    assert!(
+        plain
+            .vertices
+            .iter()
+            .zip(&original.vertices)
+            .any(|(after, before)| (after.co - before.co).length() > 0.5),
+        "lattice must move the body at full influence"
+    );
+    assert_eq!(grouped.vertices.len(), plain.vertices.len());
+    for (after, expected) in grouped.vertices.iter().zip(&plain.vertices) {
+        assert!((after.co - expected.co).length() <= 1.0e-12);
     }
 }
 

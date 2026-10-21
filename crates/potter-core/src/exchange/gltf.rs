@@ -6578,7 +6578,8 @@ fn import_skins(
                         envelope_weight: 1.0,
                         head_radius: 0.1,
                         tail_radius: 0.1,
-                        bbone_settings: BTreeMap::new(),
+                        select: false,
+                        bbone_settings: std::collections::BTreeMap::new(),
                     },
                 );
             }
@@ -9420,13 +9421,8 @@ fn import_animations(
                 } else if path == "transform.rotation_quaternion" {
                     let rotation = DQuat::from_xyzw(value[0], value[1], value[2], value[3]);
                     let potter_rotation = basis_rotation.conjugate() * rotation * basis_rotation;
-                    // F-Curve rotation components use Blender's (w, x, y, z) order.
-                    value.copy_from_slice(&[
-                        potter_rotation.w,
-                        potter_rotation.x,
-                        potter_rotation.y,
-                        potter_rotation.z,
-                    ]);
+                    // glTF and Potter both store rotations as (x, y, z, w); F-Curve indices match.
+                    value.copy_from_slice(&potter_rotation.to_array());
                 }
                 for (component, value) in value.into_iter().enumerate() {
                     component_values[component].push(value);
@@ -10800,13 +10796,13 @@ mod tests {
             },
             { "op": "action.create", "id": "turn", "name": "Turn" },
             { "op": "node.update", "target": { "id": "animated" }, "set": { "action": "turn" } },
-            // Animation components use Blender's WXYZ order; this is the same quarter turn about Z.
-            { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 0, "frame": 1.0, "value": quarter_turn },
-            { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 0, "frame": 3.0, "value": quarter_turn },
+            // Animation components use Potter's (x, y, z, w) order; this is the quarter turn about Z.
+            { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 0, "frame": 1.0, "value": 0.0 },
+            { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 0, "frame": 3.0, "value": 0.0 },
             { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 1, "frame": 1.0, "value": 0.0 },
             { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 1, "frame": 3.0, "value": 0.0 },
-            { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 2, "frame": 1.0, "value": 0.0 },
-            { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 2, "frame": 3.0, "value": 0.0 },
+            { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 2, "frame": 1.0, "value": quarter_turn },
+            { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 2, "frame": 3.0, "value": quarter_turn },
             { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 3, "frame": 1.0, "value": quarter_turn },
             { "op": "keyframe.insert", "target": { "id": "animated" }, "path": "transform.rotation_quaternion", "index": 3, "frame": 3.0, "value": quarter_turn }
         ]))?;
@@ -10963,7 +10959,7 @@ mod tests {
             .as_ref()
             .and_then(|action_id| imported.doc.actions.get(action_id))
             .ok_or("rotation animation was not imported")?;
-        for (component, expected) in [quarter_turn, 0.0, 0.0, quarter_turn]
+        for (component, expected) in [0.0, 0.0, quarter_turn, quarter_turn]
             .into_iter()
             .enumerate()
         {

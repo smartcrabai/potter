@@ -16,9 +16,6 @@ use crate::{
     },
 };
 
-/// Blender F-Curve indices are `(w, x, y, z)`; `Transform::rotation` is `(x, y, z, w)`.
-const BLENDER_QUATERNION_COMPONENTS: [usize; 4] = [3, 0, 1, 2];
-
 /// Evaluate NLA tracks bottom-to-top, then the node's active action.
 ///
 /// # Errors
@@ -410,7 +407,8 @@ fn sample_action_transform(
             }
             "transform.rotation_quaternion" | "transform.rotation" => {
                 let component = component_index(curve, 4)?;
-                quaternion[BLENDER_QUATERNION_COMPONENTS[component]] = value;
+                // Potter component order (x, y, z, w); importers map Blender's indices to it.
+                quaternion[component] = value;
                 quaternion_modified = true;
                 channels.rotation = true;
             }
