@@ -678,7 +678,9 @@ def _particle_texture_slots(settings):
         record = {
             "slot": index,
             "texture": plain(slot.texture),
+            "texture_type": slot.texture.type,
             "texture_coords": slot.texture_coords,
+            "mapping": slot.mapping,
             "object": plain(slot.object) if slot.object else None,
             "mapping_x": slot.mapping_x,
             "mapping_y": slot.mapping_y,

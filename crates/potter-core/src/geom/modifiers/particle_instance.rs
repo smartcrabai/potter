@@ -139,10 +139,6 @@ pub fn particle_instance(
             ParticleLifeState::Dead if !show_dead => return true,
             _ => {}
         }
-        // `particle_skip`: `PARS_UNEXIST` particles are never instanced.
-        if !parent.exists {
-            return true;
-        }
         if amount == 1.0 {
             return false;
         }

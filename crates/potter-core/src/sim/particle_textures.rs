@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Portions derived from Blender (https://www.blender.org): `psys_get_texture` (`particle.cc`),
-// `RE_texture_evaluate` placement (`texture_procedural.cc`), and `texture_value_blend`.
+// `RE_texture_evaluate` placement, `do_2d_mapping` and `cubemap_glob` (`texture_procedural.cc`),
+// `map_to_tube`, `map_to_sphere`, and `snap_coordinate` (`math_geom.cc`), and `texture_value_blend`.
 
 //! Blender's particle texture influences (`psys_get_texture`).
 //!
@@ -9,7 +10,8 @@
 //! (`PAMAP_TIME`), density (`PAMAP_DENS`, which decides whether the particle exists), size
 //! (`PAMAP_SIZE`), and life (`PAMAP_LIFE`). Blender samples the texture at the particle's birth
 //! point through the slot's coordinates, placement, and blend mode. Channels and coordinate types
-//! that are not modelled here are reported as import losses by the `.blend` importer.
+//! that are not modelled here, and Noise textures, are reported as import losses by the `.blend`
+//! importer.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +21,7 @@ use serde_json::Value;
 use crate::{
     blender_rng::BlenderRng,
     error::{ErrorCode, PotError, Result},
-    geom::legacy_texture::{self, ResolvedTexture},
+    geom::legacy_texture::{self, ResolvedTexture, TextureSource},
     model::Id,
 };
 
@@ -109,6 +111,15 @@ enum Coords {
     Object(DMat4),
 }
 
+/// Blender's `MTex.mapping` for image textures (`do_2d_mapping`).
+#[derive(Clone, Copy)]
+enum Mapping2d {
+    Flat,
+    Cube,
+    Tube,
+    Sphere,
+}
+
 /// A texture slot that drives at least one supported particle setting.
 pub struct TextureSlot<'a> {
     texture: &'a ResolvedTexture,
@@ -119,6 +130,7 @@ pub struct TextureSlot<'a> {
     scale: [f64; 3],
     default_value: f64,
     blend: Blend,
+    mapping: Mapping2d,
     channels: Vec<(Channel, f64)>,
 }
 
@@ -143,19 +155,10 @@ pub fn texture_ids(settings: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Whether a slot maps emission time, which moves births off the count schedule.
-pub(crate) fn maps_time(slots: &[TextureSlot<'_>]) -> bool {
-    slots.iter().any(|slot| {
-        slot.channels
-            .iter()
-            .any(|(channel, _)| *channel == Channel::Time)
-    })
-}
-
 /// Builds the supported texture slots from the particle settings' `texture_slots`.
 ///
-/// Slots without a texture, without a supported mapped channel, or with a coordinate type other
-/// than GLOBAL or OBJECT are left out; the importer reports them as losses.
+/// Slots without a texture, without a supported mapped channel, with a Noise texture, or with a
+/// coordinate type other than GLOBAL or OBJECT are left out; the importer reports them as losses.
 pub fn texture_slots<'a>(
     settings: &Value,
     textures: &'a BTreeMap<String, ResolvedTexture>,
@@ -223,6 +226,21 @@ pub fn texture_slots<'a>(
                 .and_then(Value::as_str)
                 .unwrap_or("MIX"),
         )?;
+        let mapping = match slot
+            .get("mapping")
+            .and_then(Value::as_str)
+            .unwrap_or("FLAT")
+        {
+            "FLAT" => Mapping2d::Flat,
+            "CUBE" => Mapping2d::Cube,
+            "TUBE" => Mapping2d::Tube,
+            "SPHERE" => Mapping2d::Sphere,
+            _ => {
+                return Err(PotError::invalid_argument(
+                    "particle texture image mapping is invalid",
+                ));
+            }
+        };
         slots.push(TextureSlot {
             texture,
             coords,
@@ -231,10 +249,27 @@ pub fn texture_slots<'a>(
             scale: vector(slot, "scale", [1.0; 3])?,
             default_value: number(slot, "default_value", 1.0)?,
             blend,
+            mapping,
             channels: supported_channels(slot)?,
         });
     }
     Ok(slots)
+}
+
+/// Whether a slot maps emission time, which moves births off the count schedule.
+pub(crate) fn maps_time(slots: &[TextureSlot<'_>]) -> bool {
+    maps(slots, Channel::Time)
+}
+
+/// Whether a slot maps density, which removes particles that are not kept (`free_unexisting_particles`).
+pub(crate) fn maps_density(slots: &[TextureSlot<'_>]) -> bool {
+    maps(slots, Channel::Density)
+}
+
+fn maps(slots: &[TextureSlot<'_>], channel: Channel) -> bool {
+    slots
+        .iter()
+        .any(|slot| slot.channels.iter().any(|(mapped, _)| *mapped == channel))
 }
 
 /// Samples the mapped settings at a birth point, as `psys_get_texture` does for each event.
@@ -298,7 +333,7 @@ impl TextureSlot<'_> {
             Coords::Global => birth,
             Coords::Object(world_to_object) => world_to_object.transform_point3(birth),
         };
-        let mut texvec = [0.0; 3];
+        let mut texvec = DVec3::ZERO;
         for axis in 0..3 {
             let base = match self.projection[axis] {
                 0 => self.offset[axis],
@@ -306,7 +341,14 @@ impl TextureSlot<'_> {
             };
             texvec[axis] = self.scale[axis] * base;
         }
-        let result = legacy_texture::sample(self.texture.source(), DVec3::from_array(texvec), rng)?;
+        // `do_2d_mapping` runs only for image textures (`tex->type == TEX_IMAGE`).
+        if matches!(
+            self.texture.source(),
+            TextureSource::Image(_) | TextureSource::ImageWithSettings(..)
+        ) {
+            texvec = image_coordinates(self.mapping, texvec);
+        }
+        let result = legacy_texture::sample(self.texture.source(), texvec, rng)?;
         // `RE_texture_evaluate` sets `tin` to the luminance of an RGB result.
         Ok(if result.is_rgb {
             0.2126 * result.rgb[0] + 0.7152 * result.rgb[1] + 0.0722 * result.rgb[2]
@@ -316,8 +358,64 @@ impl TextureSlot<'_> {
     }
 }
 
-/// The slot objects that the simulation can use: a texture, a supported coordinate type, and at
-/// least one supported channel.
+/// Blender's `do_2d_mapping` for an image texture. The placed point becomes the image's `[0, 1]`
+/// coordinates through the flat, tube, sphere, or cube projection. `legacy_texture::sample` maps
+/// its input from `[-1, 1]` to `[0, 1]`, so this returns the `[-1, 1]` values that give those
+/// coordinates. The image's repeat, mirror, and crop settings are applied by that sampler.
+fn image_coordinates(mapping: Mapping2d, point: DVec3) -> DVec3 {
+    let (u, v) = match mapping {
+        Mapping2d::Flat => ((point.x + 1.0) / 2.0, (point.y + 1.0) / 2.0),
+        Mapping2d::Tube => {
+            let u = if point.x * point.x + point.y * point.y < 1.0e-12 {
+                0.5
+            } else {
+                snap_coordinate(point.x.atan2(-point.y) / std::f64::consts::TAU)
+            };
+            (u, (point.z + 1.0) / 2.0)
+        }
+        Mapping2d::Sphere => {
+            let len_xy = (point.x * point.x + point.y * point.y).sqrt();
+            let u = if len_xy <= point.z.abs() * SNAP_EPSILON {
+                0.5
+            } else {
+                snap_coordinate(point.x.atan2(-point.y) / std::f64::consts::TAU)
+            };
+            (
+                u,
+                snap_coordinate(len_xy.atan2(-point.z) / std::f64::consts::PI),
+            )
+        }
+        Mapping2d::Cube => {
+            let (x1, y1, z1) = (point.x.abs(), point.y.abs(), point.z.abs());
+            if z1 >= x1 && z1 >= y1 {
+                ((point.x + 1.0) / 2.0, (point.y + 1.0) / 2.0)
+            } else if y1 >= x1 && y1 >= z1 {
+                ((point.x + 1.0) / 2.0, (point.z + 1.0) / 2.0)
+            } else {
+                ((point.y + 1.0) / 2.0, (point.z + 1.0) / 2.0)
+            }
+        }
+    };
+    DVec3::new(2.0 * u - 1.0, 2.0 * v - 1.0, point.z)
+}
+
+/// A quarter of a texel on a 65536 by 65536 texture (`snap_coordinate`).
+const SNAP_EPSILON: f64 = 0.25 / 65536.0;
+
+/// Blender's `snap_coordinate`: wraps into the unit interval and snaps values within a texel of its ends.
+fn snap_coordinate(value: f64) -> f64 {
+    let value = if value < 0.0 { value + 1.0 } else { value };
+    if value < SNAP_EPSILON {
+        0.0
+    } else if 1.0 - SNAP_EPSILON < value {
+        1.0
+    } else {
+        value
+    }
+}
+
+/// The slot objects that the simulation can use: a texture that is not Noise, a supported
+/// coordinate type, and at least one supported channel.
 fn usable_slots(settings: &Value) -> Vec<&Value> {
     settings
         .get("texture_slots")
@@ -326,6 +424,7 @@ fn usable_slots(settings: &Value) -> Vec<&Value> {
         .flatten()
         .filter(|slot| {
             slot.get("texture").and_then(Value::as_str).is_some()
+                && slot.get("texture_type").and_then(Value::as_str) != Some("NOISE")
                 && matches!(
                     slot.get("texture_coords")
                         .and_then(Value::as_str)
@@ -416,7 +515,9 @@ fn vector(slot: &Value, key: &str, default: [f64; 3]) -> Result<[f64; 3]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blend, texture_value_blend};
+    use glam::DVec3;
+
+    use super::{Blend, Mapping2d, image_coordinates, texture_value_blend};
 
     #[test]
     fn blend_modes_match_blender_texture_value_blend_formulas() {
@@ -429,5 +530,20 @@ mod tests {
         assert_eq!(texture_value_blend(0.0, 0.5, 1.0, 1.0, Blend::Divide), 0.0);
         // A negative factor flips which side takes the texture weight.
         assert!((texture_value_blend(1.0, 0.0, 0.5, -1.0, Blend::Mix) - 0.5).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn image_mappings_match_blender_do_2d_mapping_coordinates() {
+        // Flat: (x+1)/2, mapped back by the sampler to the same value.
+        let flat = image_coordinates(Mapping2d::Flat, DVec3::new(0.5, -0.5, 0.0));
+        assert!((flat.x - 0.5).abs() < 1.0e-12 && (flat.y + 0.5).abs() < 1.0e-12);
+        // Tube at +X: atan2(1, -0) = pi/2, so u = 0.25, and v = (z+1)/2.
+        let tube = image_coordinates(Mapping2d::Tube, DVec3::new(1.0, 0.0, 0.0));
+        assert!((tube.x - (2.0 * 0.25 - 1.0)).abs() < 1.0e-12);
+        assert!((tube.y - 0.0).abs() < 1.0e-12);
+        // X is the largest component, so the cube projection takes (y, z) for the image.
+        let cube = image_coordinates(Mapping2d::Cube, DVec3::new(0.9, 0.2, -0.4));
+        assert!((cube.x - 0.2).abs() < 1.0e-12);
+        assert!((cube.y + 0.4).abs() < 1.0e-12);
     }
 }

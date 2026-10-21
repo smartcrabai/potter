@@ -8592,10 +8592,12 @@ fn canonicalize_particle_texture_slots(
         let Some(slot) = slot.as_object_mut() else {
             continue;
         };
+        let noise = slot.get("texture_type").and_then(Value::as_str) == Some("NOISE");
         let resource = slot
             .get("texture")
             .and_then(|reference| reference.get("name"))
             .and_then(Value::as_str)
+            .filter(|_| !noise)
             .and_then(|name| resource_ids.get(name))
             .cloned();
         slot.insert(
@@ -8655,6 +8657,16 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     .and_then(|reference| reference.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                if slot.get("texture_type").and_then(Value::as_str) == Some("NOISE") {
+                    losses.push(loss(
+                        "blender.particle_system.texture_noise",
+                        name,
+                        &format!(
+                            "Blender's particle texture slot {index} (texture `{texture}`) is a Noise texture, which Blender seeds from the process clock, so its values cannot be reproduced; the slot is not applied and the particle settings stay constant"
+                        ),
+                    ));
+                    continue;
+                }
                 if slot.get("texture_exported").and_then(Value::as_bool) != Some(true) {
                     losses.push(loss(
                         "blender.particle_system.texture_slot",

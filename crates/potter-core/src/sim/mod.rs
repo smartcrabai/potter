@@ -213,8 +213,6 @@ pub struct ParticleState {
     pub path_interpolation: ParticlePathInterpolation,
     pub size: f64,
     pub mass: f64,
-    /// Blender's `PARS_UNEXIST` is its inverse: false when the density texture keeps the particle from existing.
-    pub exists: bool,
 }
 
 impl Default for ParticleState {
@@ -240,7 +238,6 @@ impl Default for ParticleState {
             path_interpolation: ParticlePathInterpolation::Hermite,
             size: 1.0,
             mass: 1.0,
-            exists: true,
         }
     }
 }
@@ -288,7 +285,6 @@ fn particle_state(particle: particles::Particle, system_index: u32) -> ParticleS
         path_interpolation: particle.path_interpolation,
         size: particle.size,
         mass: particle.mass,
-        exists: particle.exists,
     }
 }
 
@@ -1609,7 +1605,6 @@ mod tests {
             path,
             size: 1.0,
             mass: 1.0,
-            exists: true,
         }
     }
 

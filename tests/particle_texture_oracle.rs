@@ -156,7 +156,6 @@ fn particle_texture_influences_and_count_schedule_match_blender() -> Result<(), 
         let states = frame["particles"][&node_id].as_array().unwrap();
         let mut potter: Vec<Sample> = states
             .iter()
-            .filter(|state| state["exists"].as_bool().unwrap_or(true))
             .map(|state| {
                 let birth_frame = state["birth_frame"].as_f64().unwrap();
                 Sample {

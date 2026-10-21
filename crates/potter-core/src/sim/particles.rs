@@ -1,6 +1,6 @@
 //! Deterministic mesh-emitter particle simulation.
 
-use super::particle_textures::{TextureSlot, birth_values, maps_time};
+use super::particle_textures::{TextureSlot, birth_values, maps_density, maps_time};
 use super::{ParticleLifeState, ParticlePathInterpolation, ParticlePathKey};
 use std::collections::HashMap;
 
@@ -58,9 +58,6 @@ pub struct Particle {
     pub path: Vec<ParticlePathKey>,
     pub size: f64,
     pub mass: f64,
-    /// False when the density texture keeps this particle from existing (Blender's `PARS_UNEXIST`).
-    #[serde(default = "particle_exists_default")]
-    pub exists: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -245,10 +242,6 @@ pub fn simulate_lifecycle_textured(
         true,
         textures,
     )
-}
-
-fn particle_exists_default() -> bool {
-    true
 }
 
 fn simulate_with_lifecycle(
@@ -443,9 +436,11 @@ fn simulate_with_lifecycle(
     if !emitted_float.is_finite() || emitted_float >= u64::MAX as f64 {
         return Err(limit("particle emission count exceeds the supported range"));
     }
-    // A time-mapped texture moves births off the schedule, so every particle is considered.
+    // Texture influences that move births or remove particles act on every particle in order: Blender
+    // removes unexisting particles and renumbers the rest, so the schedule shortcuts do not apply.
     let time_mapped = !is_hair && maps_time(textures);
-    let emitted = if time_mapped {
+    let all_events = time_mapped || maps_density(textures);
+    let emitted = if all_events {
         count.floor() as u64
     } else {
         emitted_float.floor() as u64
@@ -460,7 +455,7 @@ fn simulate_with_lifecycle(
     } else {
         world
     };
-    let first_event = if include_lifecycle || time_mapped {
+    let first_event = if include_lifecycle || all_events {
         0
     } else {
         // Births before `frame - maximum_lifetime` are dead by `frame`; keep one earlier event as margin.
@@ -633,6 +628,8 @@ fn simulate_with_lifecycle(
         .last()
         .map_or(0.0, |triangle| triangle.cumulative_area);
     let mut texture_rng = BlenderRng::seed_random(system_seed);
+    // Index of the next particle that exists; Blender renumbers particles after removing the others.
+    let mut survivors: u32 = 0;
     for event in first_event..emitted {
         let particle_index =
             u32::try_from(event).map_err(|_| limit("particle index exceeds supported range"))?;
@@ -719,6 +716,15 @@ fn simulate_with_lifecycle(
         } else {
             frame_start + frame_span * values.time
         };
+        // Blender's `PARS_UNEXIST` (`init_particle_texture`): `free_unexisting_particles` removes those
+        // particles, so the survivors' index drives the later per-particle random draws.
+        let exists = !(values.density
+            < f64::from(psys_frand(system_seed, particle_index.wrapping_add(125))));
+        if !exists {
+            continue;
+        }
+        let survivor = survivors;
+        survivors = survivors.wrapping_add(1);
         let actual_lifetime = if is_hair {
             100.0
         } else {
@@ -726,11 +732,8 @@ fn simulate_with_lifecycle(
                 * values.life
                 * (1.0
                     - lifetime_random
-                        * f64::from(psys_frand(system_seed, particle_index.wrapping_add(21))))
+                        * f64::from(psys_frand(system_seed, survivor.wrapping_add(21))))
         };
-        // Blender's `PARS_UNEXIST`: the density texture value below a particle's random draw removes it.
-        let exists = !(values.density
-            < f64::from(psys_frand(system_seed, particle_index.wrapping_add(125))));
         let raw_age = frame - birth_frame;
         let unborn = raw_age < 0.0;
         if unborn && !include_lifecycle {
@@ -819,8 +822,7 @@ fn simulate_with_lifecycle(
         }
         let size = particle_size
             * values.size
-            * (1.0
-                - size_random * f64::from(psys_frand(system_seed, particle_index.wrapping_add(1))));
+            * (1.0 - size_random * f64::from(psys_frand(system_seed, survivor.wrapping_add(1))));
         let mass = setting_alias_number(settings, &["mass"], 1.0)?;
         if mass <= 0.0 {
             return Err(invalid("particle mass must be positive"));
@@ -845,7 +847,6 @@ fn simulate_with_lifecycle(
             path,
             size,
             mass,
-            exists,
         });
     }
     if include_lifecycle {
@@ -1775,7 +1776,6 @@ fn append_simple_children(
                                 child_number.wrapping_add(26),
                             ))),
                 mass: parent.mass,
-                exists: true,
             });
         }
     }
@@ -1907,7 +1907,6 @@ fn append_interpolated_children(
                             child_index.wrapping_add(26),
                         ))),
             mass,
-            exists: true,
         });
     }
     if settings.virtual_parents > 0.0 {
@@ -2483,7 +2482,6 @@ mod tests {
             ],
             size: 3.0,
             mass: 1.0,
-            exists: true,
         };
         let settings = ChildSettings {
             count: 1,
