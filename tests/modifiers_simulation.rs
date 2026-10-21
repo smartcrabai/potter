@@ -1711,13 +1711,15 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     }
     let expected_faces = json!(expected_faces);
     let exported = root.join("explode_cli_roundtrip.blend");
-    let mut export = pot()
+    let blender_path = blender_executable().ok_or("Blender is unavailable")?;
+    let mut export = pot();
+    export
         .arg("export")
         .arg(&scene_path)
         .args(["--format", "blend", "--out"])
         .arg(&exported)
         .arg("--blender")
-        .arg(&blender)
+        .arg(&blender_path)
         .arg("--json");
     run(&mut export, "exporting applied Explode mesh")?;
     let reopen_script = root.join("reopen_explode_cli.py");
@@ -1737,7 +1739,7 @@ with open(output, 'w', encoding='utf-8') as handle:
     json.dump(result, handle)
 "#,
     )?;
-    let mut reopen = Command::new(&blender);
+    let mut reopen = Command::new(&blender_path);
     reopen
         .args(["--background", "--disable-autoexec"])
         .arg(&exported)
@@ -1955,7 +1957,8 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
 
     let project = root.join("particle-project");
     initialize(&project)?;
-    let mut import = pot()
+    let mut import = pot();
+    import
         .arg("import")
         .arg(&project)
         .arg("--file")
@@ -2090,7 +2093,8 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
     assert_cli_mesh(&applied, blender_frame_one, "applied particle mesh");
 
     let exported = root.join("particle_cli_roundtrip.blend");
-    let mut export = pot()
+    let mut export = pot();
+    export
         .arg("export")
         .arg(&project)
         .args(["--format", "blend", "--out"])
@@ -2147,7 +2151,8 @@ with open(output, 'w', encoding='utf-8') as handle:
 
     let reimport_project = root.join("particle-reimport-project");
     initialize(&reimport_project)?;
-    let mut reimport = pot()
+    let mut reimport = pot();
+    reimport
         .arg("import")
         .arg(&reimport_project)
         .arg("--file")
@@ -2386,7 +2391,8 @@ bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_baked_path.ble
 
     let project = root.join("particle-baked-path-project");
     initialize(&project)?;
-    let mut import = pot()
+    let mut import = pot();
+    import
         .arg("import")
         .arg(&project)
         .arg("--file")
@@ -2609,20 +2615,15 @@ bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_hair_lifecycle
     let emitter_id = node_id_by_name("HairLifecycleEmitter")?;
     let instancer_id = node_id_by_name("HairLifecycleInstancer")?;
     let typed_document: potter_core::model::SceneDoc = serde_json::from_value(document)?;
-    let matrices = std::collections::BTreeMap::from([
-        (emitter_id.clone(), DMat4::IDENTITY),
-        (instancer_id.clone(), DMat4::IDENTITY),
-    ]);
-    let evaluated = potter_core::sim::evaluate(
+    let evaluated = potter_core::eval::Snapshot::evaluate(
         &typed_document,
-        &typed_document.active_scene,
-        1.0,
-        &matrices,
-        None,
-    )?
-    .ok_or("Hair lifecycle simulation state is missing")?;
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
     let native_particles = evaluated
-        .particle_states
+        .simulated_particles
         .get(&emitter_id)
         .ok_or("native Hair ParticleStates are missing")?;
     assert_eq!(native_particles.len(), expected_particles.len());
@@ -3184,12 +3185,12 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
         root_error <= MODIFIER_POSITION_TOLERANCE,
         "native emitter root frame error {root_error} exceeds {MODIFIER_POSITION_TOLERANCE}",
     );
-    let emitter_id = potter_core::model::Id::from_static("hair_emitter");
-    let data_id = potter_core::model::Id::from_static("hair_emitter_mesh");
+    let emitter_id = potter_core::model::Id::new("hair_emitter")?;
+    let data_id = potter_core::model::Id::new("hair_emitter_mesh")?;
     let mut state_doc = potter_core::model::SceneDoc::new("hair-path-state".to_owned());
     state_doc
         .collections
-        .get_mut(&potter_core::model::Id::from_static("collection_root"))
+        .get_mut(&potter_core::model::Id::new("collection_root")?)
         .expect("default root collection")
         .objects
         .push(emitter_id.clone());
@@ -3200,12 +3201,20 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
             ..potter_core::model::DataBlock::default()
         },
     );
+    // The recorded Blender world matrix is the emitter's transform (TRS; Blender object matrices are affine).
+    let (scale, rotation, translation) = source_world.to_scale_rotation_translation();
     state_doc.nodes.insert(
         emitter_id.clone(),
         potter_core::model::Node {
             name: "Hair emitter".to_owned(),
             kind: "mesh".to_owned(),
             data: Some(data_id),
+            transform: potter_core::model::Transform {
+                translation: translation.to_array(),
+                rotation: rotation.to_array(),
+                scale: scale.to_array(),
+                ..potter_core::model::Transform::default()
+            },
             properties: Map::from_iter([(
                 "physics_particle_emitter".to_owned(),
                 simulation_settings.clone(),
@@ -3213,16 +3222,18 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
             ..potter_core::model::Node::default()
         },
     );
-    let instancer_id = potter_core::model::Id::from_static("hair_instancer");
+    let instancer_id = potter_core::model::Id::new("hair_instancer")?;
     state_doc.nodes.insert(
         instancer_id,
         potter_core::model::Node {
             name: "Hair instancer".to_owned(),
             modifiers: vec![potter_core::model::Modifier {
-                id: potter_core::model::Id::from_static("hair_instance"),
+                id: potter_core::model::Id::new("hair_instance")?,
                 modifier_type: "particle_instance".to_owned(),
                 name: "Hair path instance".to_owned(),
                 enabled: true,
+                show_viewport: true,
+                show_render: true,
                 params: Map::from_iter([
                     ("object".to_owned(), json!("hair_emitter")),
                     ("particle_system_index".to_owned(), json!(1)),
@@ -3234,16 +3245,15 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
             ..potter_core::model::Node::default()
         },
     );
-    let evaluated = potter_core::sim::evaluate(
+    let evaluated = potter_core::eval::Snapshot::evaluate(
         &state_doc,
-        &state_doc.active_scene,
-        1.0,
-        &std::collections::BTreeMap::from([(emitter_id.clone(), source_world)]),
-        None,
-    )?
-    .ok_or("Hair path simulation state is missing")?;
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
     let hair_state = evaluated
-        .particle_states
+        .simulated_particles
         .get(&emitter_id)
         .and_then(|states| states.first())
         .ok_or("generated Hair ParticleState is missing")?;
