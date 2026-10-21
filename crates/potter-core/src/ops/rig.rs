@@ -85,6 +85,7 @@ fn bone_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
             "inherit_rotation",
             "use_connect",
             "custom_shape",
+            "select",
             "envelope_distance",
             "envelope_weight",
             "head_radius",
@@ -117,6 +118,7 @@ fn bone_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
     let use_connect = read_bool(engine, operation, "use_connect", false)?;
     let custom_shape = optional_id(engine, operation.get("custom_shape"), "custom_shape")?;
     validate_custom_shape_reference(engine, custom_shape.as_ref(), "custom_shape")?;
+    let select = read_bool(engine, operation, "select", false)?;
     let envelope_distance = nonnegative_optional(
         engine,
         operation.get("envelope_distance"),
@@ -124,7 +126,7 @@ fn bone_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
         0.25,
     )?;
     let envelope_weight = operation.get("envelope_weight").map_or(Ok(1.0), |value| {
-        ranged_number(engine, value, 0.0, 1.0, "envelope_weight")
+        ranged_number(engine, value, 0.0, 1000.0, "envelope_weight")
     })?;
     let head_radius =
         nonnegative_optional(engine, operation.get("head_radius"), "head_radius", 0.1)?;
@@ -158,29 +160,31 @@ fn bone_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
     let data = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
         PotError::new(ErrorCode::InternalError, "armature data block disappeared")
     })?;
-    data.armature
+    let armature = data
+        .armature
         .as_mut()
-        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "armature model disappeared"))?
-        .bones
-        .insert(
-            id,
-            Bone {
-                name,
-                parent,
-                head,
-                tail,
-                roll,
-                deform,
-                inherit_rotation,
-                use_connect,
-                custom_shape,
-                envelope_distance,
-                envelope_weight,
-                head_radius,
-                tail_radius,
-                bbone_settings: BTreeMap::new(),
-            },
-        );
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "armature model disappeared"))?;
+    armature.bones.insert(
+        id.clone(),
+        Bone {
+            name,
+            parent,
+            head,
+            tail,
+            roll,
+            deform,
+            inherit_rotation,
+            use_connect,
+            custom_shape,
+            select,
+            envelope_distance,
+            envelope_weight,
+            head_radius,
+            tail_radius,
+            bbone_settings: BTreeMap::new(),
+        },
+    );
+    armature.bone_order.push(id);
     engine.mark("data_blocks", &data_id, ChangeKind::Updated);
     Ok(true)
 }
@@ -208,6 +212,7 @@ fn bone_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
             "inherit_rotation",
             "use_connect",
             "custom_shape",
+            "select",
             "envelope_distance",
             "envelope_weight",
             "head_radius",
@@ -249,6 +254,9 @@ fn bone_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
         next.custom_shape = optional_id(engine, Some(value), "set/custom_shape")?;
         validate_custom_shape_reference(engine, next.custom_shape.as_ref(), "set/custom_shape")?;
     }
+    if let Some(value) = set.get("select") {
+        next.select = bool_value(engine, value, "set/select")?;
+    }
     next.envelope_distance = nonnegative_optional(
         engine,
         set.get("envelope_distance"),
@@ -256,7 +264,7 @@ fn bone_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
         next.envelope_distance,
     )?;
     if let Some(value) = set.get("envelope_weight") {
-        next.envelope_weight = ranged_number(engine, value, 0.0, 1.0, "set/envelope_weight")?;
+        next.envelope_weight = ranged_number(engine, value, 0.0, 1000.0, "set/envelope_weight")?;
     }
     next.head_radius = nonnegative_optional(
         engine,
@@ -378,6 +386,7 @@ fn bone_delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
     for collection in armature.bone_collections.values_mut() {
         collection.bones.retain(|bone_id| bone_id != &id);
     }
+    armature.bone_order.retain(|bone_id| bone_id != &id);
     let bones = &mut armature.bones;
     if bones.remove(&id).is_none() {
         return Err(PotError::new(ErrorCode::InternalError, "bone disappeared"));
@@ -890,6 +899,7 @@ fn append_human_bone(
         inherit_rotation: true,
         use_connect: false,
         custom_shape: None,
+        select: false,
         envelope_distance: 0.25,
         envelope_weight: 1.0,
         head_radius: 0.1,
@@ -990,7 +1000,25 @@ fn pose_set(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<b
         return Err(missing(engine, "bone", &bone_id, "bone_id"));
     }
     let set = read_set(engine, operation)?;
-    reject_unknown_set_fields(engine, set, &["translation", "rotation", "scale"])?;
+    reject_unknown_set_fields(
+        engine,
+        set,
+        &[
+            "translation",
+            "rotation",
+            "scale",
+            "bbone_curveinx",
+            "bbone_curveinz",
+            "bbone_curveoutx",
+            "bbone_curveoutz",
+            "bbone_rollin",
+            "bbone_rollout",
+            "bbone_scalein",
+            "bbone_scaleout",
+            "bbone_easein",
+            "bbone_easeout",
+        ],
+    )?;
     let old = engine
         .doc
         .nodes
@@ -1014,6 +1042,36 @@ fn pose_set(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<b
     }
     if let Some(value) = set.get("scale") {
         next.scale = read_vec3(engine, value, "set/scale")?;
+    }
+    if let Some(value) = set.get("bbone_curveinx") {
+        next.bbone_curveinx = finite_value(engine, value, "set/bbone_curveinx")?;
+    }
+    if let Some(value) = set.get("bbone_curveinz") {
+        next.bbone_curveinz = finite_value(engine, value, "set/bbone_curveinz")?;
+    }
+    if let Some(value) = set.get("bbone_curveoutx") {
+        next.bbone_curveoutx = finite_value(engine, value, "set/bbone_curveoutx")?;
+    }
+    if let Some(value) = set.get("bbone_curveoutz") {
+        next.bbone_curveoutz = finite_value(engine, value, "set/bbone_curveoutz")?;
+    }
+    if let Some(value) = set.get("bbone_rollin") {
+        next.bbone_rollin = finite_value(engine, value, "set/bbone_rollin")?;
+    }
+    if let Some(value) = set.get("bbone_rollout") {
+        next.bbone_rollout = finite_value(engine, value, "set/bbone_rollout")?;
+    }
+    if let Some(value) = set.get("bbone_scalein") {
+        next.bbone_scalein = read_vec3(engine, value, "set/bbone_scalein")?;
+    }
+    if let Some(value) = set.get("bbone_scaleout") {
+        next.bbone_scaleout = read_vec3(engine, value, "set/bbone_scaleout")?;
+    }
+    if let Some(value) = set.get("bbone_easein") {
+        next.bbone_easein = finite_value(engine, value, "set/bbone_easein")?;
+    }
+    if let Some(value) = set.get("bbone_easeout") {
+        next.bbone_easeout = finite_value(engine, value, "set/bbone_easeout")?;
     }
     if next == old
         && engine
@@ -1932,12 +1990,11 @@ fn vertex_group_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) 
     let data_id = mesh_data_id(engine, &node_id)?;
     let id = read_id(engine, operation, "id")?;
     let name = read_string(engine, operation, "name")?;
-    if engine
-        .doc
-        .data_blocks
-        .get(&data_id)
-        .is_some_and(|data| data.vertex_groups.iter().any(|group| group.id == id))
-    {
+    let data =
+        engine.doc.data_blocks.get(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "mesh data block disappeared")
+        })?;
+    if data.vertex_groups.iter().any(|group| group.id == id) {
         return Err(engine.error(
             ErrorCode::IdExists,
             format!("vertex group ID `{id}` already exists"),

@@ -258,8 +258,8 @@ pub(crate) struct Triangle {
     /// Corner colors of every color layer the object carries, in `ObjectRecord::color_layers`
     /// order; empty without color layers.
     pub(crate) layer_colors: Vec<[[f64; 4]; 3]>,
-    /// Lit per pixel by the surface shader instead of once per triangle: realtime Beauty triangles
-    /// whose material graph reads color layers. Smooth triangles are lit per pixel regardless.
+    /// Evaluates the material graph at each hit of a realtime Beauty triangle whose graph reads color layers or needs
+    /// hit data. Every realtime Beauty hit is shaded per pixel regardless, flat triangles included.
     pub(crate) lit_per_pixel: bool,
     /// The owning object's ray mask (one `RayKind` bit each); realtime Beauty filters primary rays.
     pub(crate) ray_mask: u8,
@@ -322,12 +322,6 @@ pub(crate) struct SurfaceHit {
 /// Linear RGBA at `hit` on `triangle`.
 pub(crate) trait SurfaceShader {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]>;
-
-    /// Whether every hit is shaded, flat triangles included. Workbench's studio lighting depends
-    /// on the view ray at each pixel, so flat faces cannot take a colour baked per triangle.
-    fn shades_every_hit(&self) -> bool {
-        false
-    }
 }
 
 /// The camera's view axes in world space, in Blender's view-space order: `right`, `up`, and
@@ -1596,7 +1590,7 @@ fn shading_normal(triangle: &PreparedTriangle, hit: Hit) -> DVec3 {
     })
 }
 
-/// Linear RGBA at a visible hit. Triangles lit per pixel use the shader when one is present.
+/// Linear RGBA at a visible hit: the surface shader's when one is present, otherwise the triangle's colour.
 fn hit_color(
     triangle: &PreparedTriangle,
     hit: Hit,
@@ -1604,11 +1598,7 @@ fn hit_color(
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<[f64; 4]> {
     match shader {
-        Some(shader)
-            if shader.shades_every_hit()
-                || triangle.source.normals.is_some()
-                || triangle.source.lit_per_pixel =>
-        {
+        Some(shader) => {
             let point = ray.origin + ray.direction * hit.distance;
             let surface = SurfaceHit {
                 point,
@@ -2848,14 +2838,29 @@ mod smooth_shading_tests {
     }
 
     #[test]
-    fn flat_triangles_bypass_the_shader() {
+    fn flat_triangles_are_shaded_per_hit_with_their_geometric_normal() {
         let shader = RecordingShader {
             calls: RefCell::new(Vec::new()),
         };
         let output = render(&[triangle(None)], Mode::Solid, Some(&shader));
-        assert!(shader.calls.borrow().is_empty());
         let color = output.linear_rgba[CENTER];
-        assert!((f64::from(color[0]) - 0.8).abs() < 1e-5, "color {color:?}");
+        for (channel, expected) in color.iter().zip([0.25, 0.5, 0.75, 1.0]) {
+            assert!(
+                (f64::from(*channel) - expected).abs() < 1e-5,
+                "color {color:?}"
+            );
+        }
+        let calls = shader.calls.borrow();
+        let center_point = DVec3::new(1.0 / 64.0, -1.0 / 64.0, 0.0);
+        let (_, normal, geometric) = *calls
+            .iter()
+            .find(|(point, _, _)| point.abs_diff_eq(center_point, 1e-9))
+            .expect("shader ran at the centre pixel");
+        assert!(normal.abs_diff_eq(DVec3::Z, 1e-9), "normal {normal:?}");
+        assert!(
+            geometric.abs_diff_eq(DVec3::Z, 1e-9),
+            "geometric {geometric:?}"
+        );
     }
 
     #[test]

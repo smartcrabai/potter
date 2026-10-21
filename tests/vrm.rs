@@ -1882,6 +1882,9 @@ fn vrm_expressions_target_every_material_uv_variant() -> TestResult<()> {
                 "params": {"size": 0.5},
                 "material": "skin_material"
             }),
+            // A box starts with Blender's default `UVMap`; this scenario's layers are BaseUV then
+            // VariantUV, so the default is removed first.
+            json!({"op": "uv.layer_delete", "target": {"id": "uv_variant"}, "name": "UVMap"}),
             json!({"op": "uv.layer_create", "target": {"id": "uv_variant"}, "name": "BaseUV"}),
             json!({"op": "uv.layer_create", "target": {"id": "uv_variant"}, "name": "VariantUV"}),
             json!({"op": "uv.layer_set_render", "target": {"id": "uv_variant"}, "name": "VariantUV"}),
@@ -2886,6 +2889,7 @@ fn vrm_output_preflight_matches_emitter_for_ordinary_materials_and_shape_keys() 
                 "params": {"size": 0.5},
                 "material": "uvless_ordinary_material",
             }),
+            json!({"op": "uv.layer_delete", "target": {"id": "uvless_ordinary_surface"}, "name": "UVMap"}),
         ],
     )?;
     assert_format_loss_both_versions(&project, "uv.layer_missing")?;
@@ -3080,6 +3084,7 @@ fn vrm_reports_mtoon_textures_without_uv_layer_as_loss() -> TestResult {
                 "params": {"size": 0.5},
                 "material": "uvless_mtoon_material",
             }),
+            json!({"op": "uv.layer_delete", "target": {"id": "uvless_surface"}, "name": "UVMap"}),
             json!({"op": "avatar.update", "set": {"mtoon": mtoon_settings}}),
         ],
     )?;

@@ -1,0 +1,21 @@
+{
+ "output_vertices_without_hook": 5,
+ "origin_of_output_vertex": {
+  "0": [
+   0
+  ],
+  "2": [
+   3
+  ],
+  "3": [
+   4
+  ],
+  "4": [
+   5
+  ]
+ },
+ "hook_6_0_moved": [
+  0
+ ],
+ "hook_6_0_output_vertices": 5
+}

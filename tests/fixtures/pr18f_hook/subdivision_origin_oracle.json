@@ -1,0 +1,20 @@
+{
+ "A": {
+  "output_vertices": 7,
+  "origin_of_output_vertex": {
+   "0": [
+    0
+   ],
+   "1": [
+    1
+   ],
+   "2": [
+    2
+   ]
+  }
+ },
+ "B": {
+  "output_vertices": 26,
+  "origin_of_output_vertex": {}
+ }
+}

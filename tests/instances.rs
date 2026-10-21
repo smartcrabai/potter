@@ -244,6 +244,7 @@ fn collection_instance_keeps_each_members_material_slots() {
             {"op":"mesh.set_attribute","target":{"id":"box_a"},"elements":{"domain":"face","ids":["f1"]},"material_index":1},
             {"op":"uv.unwrap","target":{"id":"box_a"},"method":"smart"},
             {"op":"node.create","id":"box_b","kind":"box","collection":"source","params":{"size":1.0},"transform":{"translation":[2.0,0.0,0.0]}},
+            {"op":"uv.layer_delete","target":{"id":"box_b"},"name":"UVMap"},
             {"op":"node.update","target":{"id":"box_b"},"set":{"materials":["skin"]}},
             {"op":"collection.instance_create","id":"instance","collection":"source","transform":{"translation":[4.0,0.0,0.0]}}
         ]),
