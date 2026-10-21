@@ -428,7 +428,7 @@ fn inline_node(grid: &VolumeGrid, values: &GridSamples<'_>, node: [i64; 3]) -> R
     let sample = values
         .get(index)
         .ok_or_else(|| invalid_volume("volume sample index is out of range"))?;
-    Ok(f64::from(sample))
+    Ok(sample)
 }
 
 /// The density with the material's interpolation, as a `NaN` where [`sample_density_checked_with`] errors.
@@ -452,7 +452,7 @@ pub fn sample_density_with(
 /// data or iso-levels, and resource-limit violations. A field that does not cross the iso-level
 /// yields an empty mesh, as `OpenVDB` and Blender do.
 pub fn volume_to_mesh(volume: &VolumeData, iso_level: f64) -> Result<Mesh> {
-    volume_to_mesh_for_grid(volume, iso_level, None, 0.0)
+    volume_to_mesh_for_grid(volume, iso_level, None, 0.0, DMat4::IDENTITY)
 }
 
 /// Extract a named volume grid with `OpenVDB`'s adaptive merging threshold (`0.0..=1.0`).
@@ -462,7 +462,36 @@ pub fn volume_to_mesh_named_adaptive(
     grid_name: &str,
     adaptivity: f64,
 ) -> Result<Mesh> {
-    volume_to_mesh_for_grid(volume, iso_level, Some(grid_name), adaptivity)
+    volume_to_mesh_for_grid(
+        volume,
+        iso_level,
+        Some(grid_name),
+        adaptivity,
+        DMat4::IDENTITY,
+    )
+}
+
+/// `volume_to_mesh_named_adaptive` with the output transform `output` applied in double precision
+/// before the single rounding to `float` (`OpenVDB` `VolumeToMesh` `indexToWorld`, then `Vec3s`).
+/// A Volume to Mesh modifier passes `source_world^-1 * volume_world` here.
+///
+/// # Errors
+///
+/// Returns the same errors as [`volume_to_mesh_named_adaptive`], and `InvalidArgument` when the
+/// output transform is not finite.
+pub fn volume_to_mesh_placed(
+    volume: &VolumeData,
+    iso_level: f64,
+    grid_name: &str,
+    adaptivity: f64,
+    output: DMat4,
+) -> Result<Mesh> {
+    if !output.is_finite() {
+        return Err(invalid_volume(
+            "volume_to_mesh output transform is not finite",
+        ));
+    }
+    volume_to_mesh_for_grid(volume, iso_level, Some(grid_name), adaptivity, output)
 }
 
 /// Whether the grid a Volume to Mesh modifier selects has any active voxel.
@@ -500,6 +529,7 @@ fn volume_to_mesh_for_grid(
     iso_level: f64,
     grid_name: Option<&str>,
     adaptivity: f64,
+    output: DMat4,
 ) -> Result<Mesh> {
     ensure_evaluable_source(volume)?;
     if !iso_level.is_finite() {
@@ -536,7 +566,7 @@ fn volume_to_mesh_for_grid(
                 "level set" | "Level Set" | "LevelSet" | "level_set" | "levelset"
             )
         });
-        return vdb_grid_to_mesh(grid, iso_level, inside_is_low, adaptivity);
+        return vdb_grid_to_mesh(grid, iso_level, inside_is_low, adaptivity, output);
     }
     if let Some(grid_name) = grid_name
         && (grid_name != "density" || volume.grids.is_empty())
@@ -572,9 +602,18 @@ fn volume_to_mesh_for_grid(
             inside_is_low,
             adaptivity,
             0.0,
+            output,
         )?
     } else {
-        dual_contour_grid_to_mesh(grid, values, iso_level, inside_is_low, adaptivity, 0.0)?
+        dual_contour_grid_to_mesh(
+            grid,
+            values,
+            iso_level,
+            inside_is_low,
+            adaptivity,
+            0.0,
+            output,
+        )?
     };
     if boundary_crosses {
         let maximum_index = DVec3::new(
@@ -582,20 +621,20 @@ fn volume_to_mesh_for_grid(
             f64::from(grid.dims[1] - 1),
             f64::from(grid.dims[2] - 1),
         );
-        let index_to_local = grid.checked_index_to_local_matrix()?;
-        let local_to_index = index_to_local.inverse();
-        if !local_to_index.is_finite() {
+        let index_to_output = output * grid.checked_index_to_local_matrix()?;
+        let output_to_index = index_to_output.inverse();
+        if !output_to_index.is_finite() {
             return Err(invalid_volume(
                 "volume grid index transform is not invertible",
             ));
         }
         grid.local_bounds(DVec3::ZERO, maximum_index)?;
         for vertex in &mut mesh.vertices {
-            let index = local_to_index.transform_point3(vertex.co);
+            let index = output_to_index.transform_point3(vertex.co);
             if !index.is_finite() {
                 return Err(invalid_volume("volume contour index is not finite"));
             }
-            vertex.co = index_to_local.transform_point3(index.clamp(DVec3::ZERO, maximum_index));
+            vertex.co = index_to_output.transform_point3(index.clamp(DVec3::ZERO, maximum_index));
             if !vertex.co.is_finite() {
                 return Err(invalid_volume("volume contour position is not finite"));
             }
@@ -757,6 +796,7 @@ fn dual_contour_grid_to_mesh(
     inside_is_low: bool,
     adaptivity: f32,
     outside_value: f64,
+    output: DMat4,
 ) -> Result<Mesh> {
     let nx = usize::try_from(grid.dims[0]).map_err(|_| resource_error())?;
     let ny = usize::try_from(grid.dims[1]).map_err(|_| resource_error())?;
@@ -770,6 +810,7 @@ fn dual_contour_grid_to_mesh(
         return Err(resource_error());
     }
     let index_to_local = grid.checked_index_to_local_matrix()?;
+    let index_to_output = output * index_to_local;
 
     let mut positions = Vec::new();
     let mut cell_edges = HashMap::<usize, [usize; 12]>::new();
@@ -890,7 +931,7 @@ fn dual_contour_grid_to_mesh(
                     }
                     let point = grouped_points[group] / f64::from(grouped_counts[group]);
                     let index_position = DVec3::new(x as f64, y as f64, z as f64) + point;
-                    let position = index_to_local.transform_point3(index_position);
+                    let position = index_to_output.transform_point3(index_position);
                     if !position.is_finite() || positions.len() >= u32::MAX as usize {
                         return Err(resource_error());
                     }
@@ -1017,9 +1058,10 @@ fn dual_contour_grid_to_mesh(
     Mesh::from_positions_and_faces(positions, faces).map_err(|error| mesh_output_error(&error))
 }
 
+/// Stores each position as a `float`, as Blender's `Vec3s` mesh positions are.
 fn round_mesh_positions_to_f32(mesh: &mut Mesh) {
     for vertex in &mut mesh.vertices {
-        vertex.co = vertex.co.map(|component| f64::from(component as f32));
+        vertex.co = vertex.co.as_vec3().as_dvec3();
     }
 }
 
@@ -1530,6 +1572,7 @@ fn vdb_grid_to_mesh(
     iso_level: f64,
     inside_is_low: bool,
     adaptivity: f32,
+    output: DMat4,
 ) -> Result<Mesh> {
     if !grid.is_scalar() {
         return Ok(Mesh::default());
@@ -1643,9 +1686,9 @@ fn vdb_grid_to_mesh(
         inside_is_low,
         adaptivity,
         outside_value,
+        output * grid.transform.index_to_world,
     )?;
     for vertex in &mut mesh.vertices {
-        vertex.co = grid.transform.index_to_world.transform_point3(vertex.co);
         if !vertex.co.is_finite() {
             return Err(PotError::with_details(
                 ErrorCode::EvaluationFailed,

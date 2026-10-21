@@ -1784,7 +1784,7 @@ impl Snapshot {
                         // `world_to_object(owner) * object_to_world(operand)` in float (`MOD_mesh_to_volume.cc`);
                         // the exact replay of the operand's composition is used when it applies.
                         let mesh_to_owner = match crate::geom::blender_matrix::operand_to_subject(
-                            doc, id, &object_id, matrices,
+                            doc, id, &object_id, &matrices,
                         ) {
                             Some(replayed) => {
                                 crate::geom::blender_matrix::blender_matrix_from_f64(replayed)
@@ -4858,16 +4858,23 @@ pub(crate) fn apply_volume_to_mesh_modifier(
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0),
     };
-    let mut extracted = crate::geom::volume::volume_to_mesh_named_adaptive(
-        volume, threshold, &grid_name, adaptivity,
+    // The output transform is applied inside the extraction, in double precision, before the single
+    // rounding to `float` that Blender's mesh positions carry (`MOD_volume_to_mesh.cc`).
+    let extracted = crate::geom::volume::volume_to_mesh_placed(
+        volume,
+        threshold,
+        &grid_name,
+        adaptivity,
+        volume_to_mesh,
     )?;
-    for vertex in &mut extracted.vertices {
-        vertex.co = volume_to_mesh.transform_point3(vertex.co);
-        if !vertex.co.is_finite() {
-            return Err(PotError::invalid_argument(
-                "volume_to_mesh produced non-finite mesh coordinates",
-            ));
-        }
+    if extracted
+        .vertices
+        .iter()
+        .any(|vertex| !vertex.co.is_finite())
+    {
+        return Err(PotError::invalid_argument(
+            "volume_to_mesh produced non-finite mesh coordinates",
+        ));
     }
     *mesh = extracted;
     Ok(())

@@ -242,9 +242,12 @@ impl VdbGrid {
     pub(crate) fn sample_index_component_box(&self, index: DVec3, component: usize) -> f32 {
         box_sample_trilinear(
             |point| {
-                self.sample_value(IVec3::from_array(point.map(|value| value as i32)))
+                let value = self
+                    .sample_value(IVec3::from_array(point.map(|value| value as i32)))
                     .component(component)
-                    .unwrap_or(0.0)
+                    .unwrap_or(0.0);
+                // Blender's float grid stores each sample as `float`; a double grid rounds here.
+                value as f32
             },
             index,
         )
@@ -319,11 +322,11 @@ impl VdbGrid {
     #[must_use]
     pub fn sample_world_cubic(&self, position: DVec3) -> f64 {
         if !position.is_finite() {
-            return f64::from(self.tree.background);
+            return self.tree.background;
         }
         let index = self.transform.world_to_index.transform_point3(position);
         if !index.is_finite() {
-            return f64::from(self.tree.background);
+            return self.tree.background;
         }
         let lower = index.floor();
         if lower
@@ -331,7 +334,7 @@ impl VdbGrid {
             .iter()
             .any(|value| *value < f64::from(i32::MIN) + 1.0 || *value >= f64::from(i32::MAX) - 2.0)
         {
-            return f64::from(self.tree.background);
+            return self.tree.background;
         }
         let base = lower.as_ivec3();
         let fraction = index - lower;

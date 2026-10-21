@@ -615,7 +615,7 @@ impl<'a> VolumeDisplacement<'a> {
     }
 
     /// Blender's `index_to_texture` (`MOD_volume_displace.cc`, `get_index_to_texture_transform`) as
-    /// OpenVDB multiplies it: `index_to_object` for `LOCAL`, `index_to_object * object_to_world` for
+    /// `OpenVDB` multiplies it: `index_to_object` for `LOCAL`, `index_to_object * object_to_world` for
     /// `GLOBAL`, and `index_to_object * object_to_world * world_to_texture` for `OBJECT`.
     fn texture_matrix(&self, index_to_object: &[f32; 16]) -> [f32; 16] {
         match self.mapping_mode {
@@ -998,7 +998,7 @@ fn append_instances(mesh: &Mesh, transforms: &[(DMat4, DVec3)]) -> Result<Mesh> 
     Ok(output)
 }
 
-/// OpenVDB's `Mat4 * Mat4` (`openvdb/math/Mat4.h`, `operator*=`) on the memory of two float
+/// `OpenVDB`'s `Mat4 * Mat4` (`openvdb/math/Mat4.h`, `operator*=`) on the memory of two float
 /// matrices: `result(i, j) = a(i, 0) b(0, j) + a(i, 1) b(1, j) + a(i, 2) b(2, j) + a(i, 3) b(3, j)`,
 /// summed left to right in `float`. Blender's `float[4][4]` has the same memory layout.
 pub(crate) fn openvdb_mat4_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
