@@ -2526,7 +2526,7 @@ def material_dump(material):
                     ior = float(ior_socket.default_value)
             except Exception:
                 pass
-    item = {"name": material.name_full, "potter_id": material.get("potter.id"),
+    return {"name": material.name_full, "potter_id": material.get("potter.id"),
             "library": library_reference(material),
             "base_color": base_color,
             "viewport_display": {"diffuse_color": [float(c) for c in material.diffuse_color],
@@ -2545,8 +2545,6 @@ def material_dump(material):
             "fake_user": bool(material.use_fake_user), "users": int(material.users),
             "field_graph_unchanged": _field_graph_verdict(material.node_tree),
             **_material_field_values(material)}
-    _attach_import_baseline(item)
-    return item
 
 
 def dump_all():
@@ -6507,91 +6505,42 @@ def _clip_cutoff(material):
     return float(compare.inputs[1].default_value)
 
 
-# The Material fields Potter's Principled setter writes, and the Blender Principled inputs each one sets.
-_MATERIAL_FIELDS = ("base_color", "metallic", "roughness", "alpha_mode", "alpha_threshold",
-                    "emission_color", "emission_strength", "transmission", "ior")
-_PRINCIPLED_INPUT_FIELDS = {
-    "Base Color": ("base_color",),
-    "Alpha": ("base_color", "alpha_mode", "alpha_threshold"),
-    "Metallic": ("metallic",),
-    "Roughness": ("roughness",),
-    "Emission Color": ("emission_color",),
-    "Emission": ("emission_color",),
-    "Emission Strength": ("emission_strength",),
-    "Transmission Weight": ("transmission",),
-    "Transmission": ("transmission",),
-    "IOR": ("ior",),
-}
-_IMPORT_BASELINE_PROPERTY = "potter_import_baseline"
-
-
 def _generated_principled(tree):
     """The Principled BSDF Potter generated in `tree`, marked by `_mark_generated_field_graph`, or None.
 
-    A tree without that marker is an authored graph, whose Principled inputs are its own.
+    Only a generated Principled takes the Material's values on export. An authored graph is exported as it is: Potter
+    renders the graph's own inputs, so a Material value written into it would make the file differ from the render.
     """
     return next((node for node in tree.nodes
                  if node.type == "BSDF_PRINCIPLED" and node.get("potter_simple_material") is True), None)
 
 
-def _import_baseline(item):
-    """The Material fields of `item` as they stand at import, recorded on the authored Principled node."""
-    return json.dumps({field: item.get(field) for field in _MATERIAL_FIELDS}, sort_keys=True)
-
-
-def _attach_import_baseline(item):
-    """Records `item`'s Material fields on its authored Principled node, the baseline `export_doc` compares against.
-
-    A generated Principled carries no baseline: Potter writes all its Material fields on export.
-    """
-    tree = item.get("nodes") or {}
-    for node in tree.get("nodes", []):
-        if node.get("type") != "ShaderNodeBsdfPrincipled":
-            continue
-        if node.get("properties", {}).get("potter_simple_material") is True:
-            return
-        node.setdefault("custom_properties", {})[_IMPORT_BASELINE_PROPERTY] = _import_baseline(item)
-        return
-
-
-def _set_principled_values(shader, item, sockets=None):
-    """Writes the Material's values into the Principled BSDF `shader`.
-
-    `sockets` names the inputs to write; None writes all of them. `export_doc` passes only the inputs an authored graph
-    does not carry itself, plus the inputs whose Material field changed since import. Writing every input would
-    overwrite a graph edit with an untouched Material, and skipping every input would leave Blender's default where
-    the document holds no value (see `export_doc`).
-    """
-    def wants(name):
-        return sockets is None or name in sockets
-
-    if wants("Base Color"):
-        shader.inputs["Base Color"].default_value = item["base_color"]
-    if wants("Metallic"):
-        shader.inputs["Metallic"].default_value = item["metallic"]
+def _set_principled_values(shader, item):
+    """Writes the Material's values into the Principled BSDF `shader`."""
+    shader.inputs["Base Color"].default_value = item["base_color"]
+    shader.inputs["Metallic"].default_value = item["metallic"]
     alpha = shader.inputs.get("Alpha")
-    if alpha is not None and wants("Alpha"):
+    if alpha is not None:
         # Opaque ignores alpha, as Potter's renderer does. Clip is binary, as Blender's glTF importer builds a
         # factor-only MASK (`pbrMetallicRoughness.py` 630-640); blend keeps the base colour alpha.
         alpha.default_value = _constant_alpha(item)
-    if wants("Roughness"):
-        shader.inputs["Roughness"].default_value = item["roughness"]
+    shader.inputs["Roughness"].default_value = item["roughness"]
     emission = shader.inputs.get("Emission Color")
     if emission is None:
         emission = shader.inputs.get("Emission")
-    if emission is not None and wants(emission.name):
+    if emission is not None:
         color = item.get("emission_color", [0.0, 0.0, 0.0])
         emission.default_value = (color[0], color[1], color[2], 1.0)
     emission_power = shader.inputs.get("Emission Strength")
-    if emission_power is not None and wants("Emission Strength"):
+    if emission_power is not None:
         emission_power.default_value = item.get("emission_strength", 0.0)
     transmission_socket = shader.inputs.get("Transmission Weight")
     if transmission_socket is None:
         transmission_socket = shader.inputs.get("Transmission")
-    if transmission_socket is not None and wants(transmission_socket.name):
+    if transmission_socket is not None:
         transmission_socket.default_value = item.get("transmission", 0.0)
     ior_socket = shader.inputs.get("IOR")
-    if ior_socket is not None and wants("IOR"):
+    if ior_socket is not None:
         ior_socket.default_value = item.get("ior", 1.5)
 
 
@@ -7628,24 +7577,6 @@ def export_doc(doc, target, pack, scene_hash, context):
             generated = _generated_principled(material.node_tree)
             if generated is not None:
                 _set_principled_values(generated, item)
-            else:
-                # The document holds an authored graph's Principled input only when the graph's value differs from its
-                # Material field, so an input it lacks reads Blender's default after the restore: Potter writes the
-                # Material's value there. A Material field that changed since the import is written over a graph input
-                # too, so `material.update` is not ignored (`_attach_import_baseline`).
-                authored = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
-                if authored is not None:
-                    carried = {socket.get("name") for node in tree_source.get("nodes", [])
-                               if node.get("type") == "ShaderNodeBsdfPrincipled"
-                               for socket in node.get("inputs", [])}
-                    sockets = {name for name in _PRINCIPLED_INPUT_FIELDS if name not in carried}
-                    baseline_text = authored.get(_IMPORT_BASELINE_PROPERTY)
-                    if baseline_text is not None:
-                        baseline = json.loads(baseline_text)
-                        sockets |= {name for name, fields in _PRINCIPLED_INPUT_FIELDS.items()
-                                    if any(item.get(field) != baseline.get(field) for field in fields)}
-                    if sockets:
-                        _set_principled_values(authored, item, sockets)
         if item.get("owns_shader_graph") is True:
             _restore_material_field_nodes(material, item)
     for world_id, item in doc.get("worlds", {}).items():

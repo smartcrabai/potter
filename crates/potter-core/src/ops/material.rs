@@ -198,11 +198,8 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             &operation_pointer(engine.operation_index, "ior"),
         )?;
     }
-    let mut authored_graph = None;
     if let Some(graph) = operation.get("graph") {
-        let graph_id = super::shader::resolve_graph(engine, graph)?;
-        material.node_tree = Some(graph_id.clone());
-        authored_graph = Some(graph_id);
+        material.node_tree = Some(super::shader::resolve_graph(engine, graph)?);
     } else {
         super::shader::attach_default_graph(engine, &id, &mut material)?;
     }
@@ -226,11 +223,6 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .map(|value| parse_texture_ref(engine, value, "normal_texture"))
         .transpose()?
         .flatten();
-    if let Some(graph_id) = authored_graph
-        && let Some(graph) = engine.doc.node_groups.get_mut(&graph_id)
-    {
-        super::shader::stamp_principled_baseline(graph, &material, None)?;
-    }
     engine.doc.materials.insert(id.clone(), material);
     engine.mark("materials", &id, ChangeKind::Created);
     Ok(true)
@@ -504,8 +496,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .map(|value| read_unit_interval(engine, value, "set/displacement_midlevel"))
         .transpose()?;
     let mut changed = false;
+    let mut graph_writes = Vec::new();
     for id in targets {
         let item_changed = if let Some(material) = engine.doc.materials.get_mut(&id) {
+            let before = material.clone();
             let mut item_changed = false;
             if let Some(name) = &name
                 && material.name != *name
@@ -651,6 +645,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 material.displacement_midlevel = value;
                 item_changed = true;
             }
+            let writes = super::shader::principled_writes(&before, material);
+            if !writes.is_empty() {
+                graph_writes.push((id.clone(), writes));
+            }
             item_changed
         } else {
             false
@@ -659,6 +657,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine.mark("materials", &id, ChangeKind::Updated);
             changed = true;
         }
+    }
+    for (id, writes) in graph_writes {
+        super::shader::write_authored_inputs(engine, &id, &writes)?;
     }
     Ok(changed)
 }

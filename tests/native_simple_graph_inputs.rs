@@ -154,8 +154,8 @@ bpy.context.object.data.materials.append(material)
 bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
 "#;
 
-/// A graph edit on an imported authored graph survives export when its Material is untouched, and the untouched fields
-/// stay as the author made them: the import's baseline shows no Material field changed, so export writes nothing.
+/// A graph edit on an imported authored graph reaches the export, and the input it leaves alone comes out as the author
+/// made it: an authored graph is exported as it is, so the file holds the values Potter renders.
 #[test]
 fn graph_edit_survives_export_with_untouched_material() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
@@ -190,12 +190,15 @@ fn graph_edit_survives_export_with_untouched_material() -> TestResult {
         })
         .map(|(id, _)| id.clone())
         .ok_or("the Authored graph has no Principled node")?;
+    // `graph.node_update` replaces the node's whole input map, so the edit sends every input the node holds.
+    let mut inputs = scene["node_groups"][&graph_id]["nodes"][&principled_id]["inputs"].clone();
+    inputs["Roughness"] = json!(0.4);
     let applied = apply_operations(
         &project,
         root.path(),
         json!([
             {"op": "graph.node_update", "graph": &graph_id, "node_id": &principled_id,
-             "set": {"inputs": {"Roughness": 0.4}}}
+             "set": {"inputs": inputs}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "graph edit failed: {applied}");
@@ -224,9 +227,9 @@ fn graph_edit_survives_export_with_untouched_material() -> TestResult {
     Ok(())
 }
 
-/// A Potter-authored graph is stamped with its material's baseline when the material is created, so a `material.update`
-/// after that reaches the graph: the edited Base Colour replaces the graph's own. The untouched Roughness keeps the
-/// graph's value, because the Material's Roughness still equals its baseline.
+/// A `material.update` on a Potter-authored graph writes the changed field into that graph's Principled input, so the
+/// edited Base Colour reaches both the rendered graph and the export. The Roughness the update does not change keeps the
+/// graph's own value.
 #[test]
 fn material_edit_reaches_a_potter_authored_graph() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
@@ -284,6 +287,86 @@ fn material_edit_reaches_a_potter_authored_graph() -> TestResult {
             *expected,
             FLOAT_TOLERANCE,
             "material base colour edit reaches the authored graph",
+        );
+    }
+    Ok(())
+}
+
+/// The graph Potter renders is the graph the export writes. After a `material.update` on an authored graph, the Roughness
+/// the document's graph holds (the input the renderer reads) is the Roughness the exported file carries, and the untouched
+/// Base Colour is the graph's own.
+#[test]
+fn export_matches_the_graph_potter_renders() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let (oracle, _) = build_oracle(&blender, root.path())?;
+    let (project, report) = import_blend(&blender, root.path(), "project", &oracle)?;
+    assert!(
+        losses(&report).is_empty(),
+        "oracle import lost data: {report}"
+    );
+
+    let edited_roughness = 0.9;
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "graph.create", "id": "authored_graph", "kind": "shader"},
+            {"op": "graph.node_add", "graph": "authored_graph", "id": "output",
+             "type": "ShaderNodeOutputMaterial"},
+            {"op": "graph.node_add", "graph": "authored_graph", "id": "principled",
+             "type": "ShaderNodeBsdfPrincipled",
+             "inputs": {"Roughness": GRAPH_ROUGHNESS, "Base Color": GRAPH_BASE}},
+            {"op": "graph.link", "graph": "authored_graph", "from_node": "principled",
+             "from_socket": "BSDF", "to_node": "output", "to_socket": "Surface"},
+            {"op": "material.create", "id": "authored_material", "name": "Authored Graph",
+             "graph": "authored_graph", "base_color": MATERIAL_BASE,
+             "roughness": MATERIAL_ROUGHNESS, "alpha_mode": "opaque"},
+            {"op": "node.create", "id": "authored_body", "kind": "box",
+             "params": {"size": 0.5}, "material": "authored_material"},
+            {"op": "material.update", "target": {"id": "authored_material"},
+             "set": {"roughness": edited_roughness}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "authoring failed: {applied}");
+
+    // The renderer reads the material's graph: the edit must be in that graph's Principled input.
+    let scene = read_scene(&project)?;
+    let graph_id = scene["materials"]["authored_material"]["node_tree"]
+        .as_str()
+        .ok_or("the material has no shader graph")?
+        .to_owned();
+    let rendered_roughness =
+        &scene["node_groups"][&graph_id]["nodes"]["principled"]["inputs"]["Roughness"];
+    assert_close(
+        number(rendered_roughness)?,
+        edited_roughness,
+        FLOAT_TOLERANCE,
+        "the graph the renderer reads holds the edited roughness",
+    );
+
+    let exported = root.path().join("consistency.blend");
+    let export_report = export(&blender, &project, "blend", &exported)?;
+    assert!(
+        losses(&export_report).is_empty(),
+        "export lost data: {export_report}"
+    );
+    let read = blender_principled(&blender, root.path(), &exported)?;
+    let node = &read["Authored Graph"];
+    assert_close(
+        number(&node["roughness"])?,
+        edited_roughness,
+        FLOAT_TOLERANCE,
+        "the exported roughness matches the graph the renderer reads",
+    );
+    for (channel, expected) in GRAPH_BASE.iter().take(3).enumerate() {
+        assert_close(
+            number(&node["base_color"][channel])?,
+            *expected,
+            FLOAT_TOLERANCE,
+            "the untouched base colour is the graph's own",
         );
     }
     Ok(())

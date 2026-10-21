@@ -194,20 +194,8 @@ fn node_add(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<b
             &operation_pointer(engine.operation_index, "inputs"),
         )?;
     }
-    let baseline_fields: Vec<&str> = if super::shader::is_principled(&node.node_type) {
-        node.inputs
-            .keys()
-            .flat_map(|input| super::shader::principled_input_fields(input))
-            .copied()
-            .collect()
-    } else {
-        Vec::new()
-    };
     if let Some(graph) = engine.doc.node_groups.get_mut(&graph_id) {
         graph.nodes.insert(node_id, node);
-    }
-    if !baseline_fields.is_empty() {
-        super::shader::stamp_graph_baseline(engine.doc, &graph_id, Some(&baseline_fields))?;
     }
     engine.mark("node_groups", &graph_id, ChangeKind::Updated);
     Ok(true)
@@ -298,21 +286,6 @@ fn node_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
         })
         .transpose()?;
 
-    let principled_fields: Vec<&str> = match (
-        &inputs,
-        engine
-            .doc
-            .node_groups
-            .get(&graph_id)
-            .and_then(|graph| graph.nodes.get(&node_id)),
-    ) {
-        (Some(inputs), Some(node)) if super::shader::is_principled(&node.node_type) => inputs
-            .keys()
-            .flat_map(|input| super::shader::principled_input_fields(input))
-            .copied()
-            .collect(),
-        _ => Vec::new(),
-    };
     let mut changed = false;
     if let Some(graph) = engine.doc.node_groups.get_mut(&graph_id)
         && let Some(node) = graph.nodes.get_mut(&node_id)
@@ -329,18 +302,11 @@ fn node_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
             node.location = location;
             changed = true;
         }
-        if let Some(mut properties) = properties {
-            // The Blender custom properties (`_blender_custom_properties`) are not part of `set.properties`: they hold
-            // a node's import baseline, so a replacement keeps them.
-            if let Some(custom) = node.properties.get(super::shader::CUSTOM_PROPERTIES) {
-                properties
-                    .entry(super::shader::CUSTOM_PROPERTIES.to_owned())
-                    .or_insert_with(|| custom.clone());
-            }
-            if node.properties != properties {
-                node.properties = properties;
-                changed = true;
-            }
+        if let Some(properties) = properties
+            && node.properties != properties
+        {
+            node.properties = properties;
+            changed = true;
         }
         if let Some(inputs) = inputs
             && node.inputs != inputs
@@ -348,9 +314,6 @@ fn node_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resul
             node.inputs = inputs;
             changed = true;
         }
-    }
-    if !principled_fields.is_empty() {
-        super::shader::stamp_graph_baseline(engine.doc, &graph_id, Some(&principled_fields))?;
     }
     if changed {
         engine.mark("node_groups", &graph_id, ChangeKind::Updated);
