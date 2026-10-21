@@ -21,12 +21,17 @@
 //! follow EEVEE's closures. Measured on Blender 5.2.2 with a white world of 1 and a white glass sphere (IOR 1.45,
 //! roughness 0), EEVEE's centre pixel is 0.9668 and this model's R + T² is 0.9674.
 //!
-//! Not reproduced: ray-traced refraction (`use_raytrace_refraction`), which EEVEE leaves off by default, and direct
-//! light through glass, which EEVEE integrates with its LTC transmission lobe (the path tracer's glass lobe is used).
+//! Direct light through glass is EEVEE's LTC light pass (`eevee_ltc.rs`): the reflection's and the transmission's colours
+//! ([`GlassLight`]) integrate each light's emitter with the closure's inverse matrix. The transmission's shadow is the
+//! thickness-amended ray of `shadow_eval` (`render/scene.rs`). Not reproduced: ray-traced refraction
+//! (`use_raytrace_refraction`), which EEVEE leaves off by default.
 
 use glam::DVec3;
 
-use super::eevee_transmission_tables::{brdf, bsdf, btdf};
+use super::{
+    eevee_ltc::{PackedMatrix, sample_matrix},
+    eevee_transmission_tables::{brdf, bsdf, btdf},
+};
 use crate::shader::BsdfParams;
 
 /// The last texel index of EEVEE's utility-texture LUTs, which are 64 texels across.
@@ -35,13 +40,13 @@ const LAST_TEXEL: usize = 63;
 const ROUGHNESS_LAYERS: usize = 16;
 
 /// Linear blend of `a` and `b` at `t`.
-fn blend(a: f64, b: f64, t: f64) -> f64 {
+pub(super) fn blend(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
 /// EEVEE's `sample_lut` addressing for a coordinate in `[0, 1]`: the two texels around it and the blend weight of the
 /// second. Texel `i` sits at coordinate `i / 63` (`UTIL_TEX_UV_SCALE` and `UTIL_TEX_UV_BIAS`).
-fn texel_weights(coordinate: f64) -> (usize, usize, f64) {
+pub(super) fn texel_weights(coordinate: f64) -> (usize, usize, f64) {
     let position = coordinate.clamp(0.0, 1.0) * LAST_TEXEL as f64;
     let low = (position.floor() as usize).min(LAST_TEXEL);
     let high = (low + 1).min(LAST_TEXEL);
@@ -192,7 +197,7 @@ fn dominant_mix(roughness: f64) -> f64 {
 }
 
 /// GLSL `reflect(incident, normal)`.
-fn reflect(incident: DVec3, normal: DVec3) -> DVec3 {
+pub(crate) fn reflect(incident: DVec3, normal: DVec3) -> DVec3 {
     incident - normal * (2.0 * normal.dot(incident))
 }
 
@@ -236,6 +241,13 @@ pub(crate) fn transmission_roughness(roughness: f64, ior: f64) -> f64 {
     roughness * factor.max(0.0).sqrt()
 }
 
+/// `ThicknessIsect::hit_N` of the sphere model (`eevee_thickness_lib.bsl.hh`): the normal where the entry direction
+/// `entry` leaves a sphere that is tangent to the shading point with normal `normal`.
+pub(crate) fn sphere_exit_normal(normal: DVec3, entry: DVec3) -> DVec3 {
+    let cos_alpha = entry.dot(-normal);
+    (normal + entry * (2.0 * cos_alpha)).normalize_or(normal)
+}
+
 /// An object's refraction thickness, as EEVEE's `Thickness` holds it: a value and a model. A zero value is no thickness.
 /// The probe samples only the exit normal, which does not depend on the size, so the value matters only as zero or not;
 /// it places the exit point, which the probe does not read.
@@ -249,6 +261,14 @@ pub(crate) enum Thickness {
 }
 
 impl Thickness {
+    /// The thickness value (`Thickness::value`): zero for no thickness, whichever model is set.
+    pub(crate) fn value(self) -> f64 {
+        match self {
+            Self::None => 0.0,
+            Self::Sphere(value) | Self::Slab(value) => value,
+        }
+    }
+
     /// EEVEE's `Thickness::from(value, mode)`: no thickness for a zero value, otherwise the model's.
     pub(crate) fn new(value: f64, slab: bool) -> Self {
         if value <= 0.0 {
@@ -278,11 +298,7 @@ pub(crate) fn transmission_direction(
     let entry = dominant_transmission(normal, view, ior, perceived);
     let (amended_normal, amended_view) = match thickness {
         Thickness::None => return entry,
-        Thickness::Sphere(_) => {
-            let cos_alpha = entry.dot(-normal);
-            let exit_normal = (normal + entry * (2.0 * cos_alpha)).normalize_or(normal);
-            (-exit_normal, -entry)
-        }
+        Thickness::Sphere(_) => (-sphere_exit_normal(normal, entry), -entry),
         Thickness::Slab(_) => (normal, -entry),
     };
     // The probe's amended normal and view, with EEVEE's `1 / ior` argument (a thickness inverts it).
@@ -333,16 +349,36 @@ pub(crate) struct GlassClosures {
     pub(crate) transmission_roughness: f64,
 }
 
-/// The glass closures of a Principled Transmission or Glass BSDF at a shading point with `normal`, seen along `view`,
-/// with `lower` the layers above it (coat and sheen) and `thickness` the object's thickness. `None` when the
-/// transmission weight `(1 - metallic) · transmission` is zero or the view is below the normal.
-pub(crate) fn glass_closures(
-    params: &BsdfParams,
-    normal: DVec3,
-    view: DVec3,
-    lower: DVec3,
-    thickness: Thickness,
-) -> Option<GlassClosures> {
+/// The direct light of the glass closures at one shading point, as EEVEE's light pass evaluates them
+/// (`eevee_light_eval.bsl.hh`, `eval_single_closure`): each closure's colour, with the inverse LTC matrix and the normal
+/// its lobe integrates around.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GlassLight {
+    /// The reflection closure's colour: its weight times the glass reflectance and the tint, over the layers above.
+    pub(crate) reflection: DVec3,
+    /// The reflection's inverse LTC matrix, sampled at `N · V` and the roughness (`bxdf_ggx_light_reflection`).
+    pub(crate) reflection_matrix: PackedMatrix,
+    /// The transmission closure's colour, squared with a thickness (two events; `eevee_deferred_combine.bsl.hh`).
+    pub(crate) transmission: DVec3,
+    /// The normal the transmission lobe integrates around (`light.N`): `-N`, or the exit normal of a thickness.
+    pub(crate) transmission_normal: DVec3,
+    /// The transmission's inverse LTC matrix, sampled at the refracted cosine and the perceived roughness.
+    pub(crate) transmission_matrix: PackedMatrix,
+}
+
+/// The inputs both glass evaluations share at a shading point: the clamped IOR and roughness, the `bsdf_lut` split, the
+/// reflection tint, and the lobe weight `lower · (1 - metallic) · transmission`.
+struct GlassLobe {
+    ior: f64,
+    roughness: f64,
+    split: GlassSplit,
+    reflection_tint: DVec3,
+    lobe_weight: DVec3,
+}
+
+/// The glass lobe at a shading point, or `None` when its weight `(1 - metallic) · transmission` is zero or the view is
+/// below the normal.
+fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> Option<GlassLobe> {
     let weight = (1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0);
     if weight <= 0.0 || normal.dot(view) <= 0.0 {
         return None;
@@ -355,22 +391,102 @@ pub(crate) fn glass_closures(
         .clamp(DVec3::ZERO, DVec3::ONE);
     let transmission_tint = DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
     let reflection_tint = DVec3::from_array(params.glass_reflection_tint).max(DVec3::ZERO);
-    let split = glass_split(ior, roughness, normal.dot(view), f0, transmission_tint);
+    Some(GlassLobe {
+        ior,
+        roughness,
+        split: glass_split(ior, roughness, normal.dot(view), f0, transmission_tint),
+        reflection_tint,
+        lobe_weight: lower * weight,
+    })
+}
 
-    let lobe_weight = lower * weight;
-    let reflection = split.reflectance * reflection_tint * lobe_weight;
-    let mut transmission = split.transmittance * lobe_weight;
+/// The glass closures of a Principled Transmission or Glass BSDF at a shading point with `normal`, seen along `view`,
+/// with `lower` the layers above it (coat and sheen) and `thickness` the object's thickness. `None` when the
+/// transmission weight `(1 - metallic) · transmission` is zero or the view is below the normal.
+pub(crate) fn glass_closures(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+    lower: DVec3,
+    thickness: Thickness,
+) -> Option<GlassClosures> {
+    let lobe = glass_lobe(params, normal, view, lower)?;
+    let reflection = lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight;
+    let mut transmission = lobe.split.transmittance * lobe.lobe_weight;
     if thickness != Thickness::None {
         transmission *= transmission;
     }
     Some(GlassClosures {
         reflection,
-        reflection_direction: reflection_direction(normal, view, roughness),
-        reflection_roughness: roughness,
+        reflection_direction: reflection_direction(normal, view, lobe.roughness),
+        reflection_roughness: lobe.roughness,
         transmission,
-        transmission_direction: transmission_direction(normal, view, ior, roughness, thickness),
-        transmission_roughness: transmission_roughness(roughness, ior),
+        transmission_direction: transmission_direction(
+            normal,
+            view,
+            lobe.ior,
+            lobe.roughness,
+            thickness,
+        ),
+        transmission_roughness: transmission_roughness(lobe.roughness, lobe.ior),
     })
+}
+
+/// The direct light of the glass closures at a shading point: `glass_closures`' colours with the LTC inputs of
+/// `bxdf_ggx_light_reflection` and `bxdf_ggx_light_transmission`. `None` where `glass_closures` is `None`.
+pub(crate) fn glass_light(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+    lower: DVec3,
+    thickness: Thickness,
+) -> Option<GlassLight> {
+    let lobe = glass_lobe(params, normal, view, lower)?;
+    let mut transmission = lobe.split.transmittance * lobe.lobe_weight;
+    if thickness != Thickness::None {
+        transmission *= transmission;
+    }
+    let (transmission_normal, cos_theta) =
+        transmission_light_normal(normal, view, lobe.ior, lobe.roughness, thickness);
+    Some(GlassLight {
+        reflection: lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight,
+        reflection_matrix: sample_matrix(normal.dot(view), lobe.roughness),
+        transmission,
+        transmission_normal,
+        transmission_matrix: sample_matrix(
+            cos_theta,
+            transmission_roughness(lobe.roughness, lobe.ior),
+        ),
+    })
+}
+
+/// `bxdf_ggx_light_transmission`: the normal the transmission lobe integrates around, and the cosine its matrix is
+/// sampled at. Without a thickness the lobe is `refract(-V, N, 1 / ior)` about `-N`. With one, the point moves to the
+/// sphere's exit (or the slab's plane, which is `-N`) along the entry direction, and the cosine is that of the exit's
+/// refraction `refract(entry, -exit, ior)` about `-exit`.
+fn transmission_light_normal(
+    normal: DVec3,
+    view: DVec3,
+    ior: f64,
+    roughness: f64,
+    thickness: Thickness,
+) -> (DVec3, f64) {
+    match thickness {
+        Thickness::None => {
+            let refracted = refract(-view, normal, 1.0 / ior);
+            (-normal, (-normal).dot(refracted))
+        }
+        Thickness::Sphere(_) | Thickness::Slab(_) => {
+            let perceived = transmission_roughness(roughness, ior);
+            let entry = dominant_transmission(normal, view, ior, perceived);
+            let exit = match thickness {
+                Thickness::Sphere(_) => sphere_exit_normal(normal, entry),
+                _ => -normal,
+            };
+            let refracted = refract(entry, -exit, ior);
+            (exit, exit.dot(refracted))
+        }
+    }
 }
 
 #[cfg(test)]

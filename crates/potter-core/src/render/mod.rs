@@ -1,6 +1,7 @@
 pub mod raster;
 
 mod bvh;
+mod eevee_ltc;
 mod eevee_transmission;
 mod eevee_transmission_tables;
 mod light_model;
