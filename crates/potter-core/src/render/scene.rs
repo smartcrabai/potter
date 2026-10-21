@@ -26,14 +26,15 @@ use crate::{
 
 use super::{
     bvh::{Bvh, BvhHit},
+    eevee_transmission::{self, GlassClosures},
     light_model::{
         area_irradiance_per_radiance, area_radiance, area_shape, area_visibility_samples,
         point_intensity, spot_attenuation,
     },
     path::{hit_params, object_for_index},
     principled_bsdf::{
-        Layers, coat_coefficient, diffuse_coefficient, layers as principled_layers,
-        sheen_coefficient, specular_coefficient,
+        Layers, coat_coefficient, diffuse_coefficient, glass_coefficient,
+        layers as principled_layers, sheen_coefficient, specular_coefficient,
     },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
@@ -70,6 +71,9 @@ pub(super) struct ObjectRecord {
     /// Joined color registry indices, matching `color_layers`.
     #[serde(skip)]
     pub color_layer_indices: Vec<usize>,
+    /// EEVEE's default refraction thickness of the object (`transmission_thickness`). Not part of the output.
+    #[serde(skip)]
+    pub thickness: f64,
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -531,6 +535,7 @@ pub(super) fn extract_geometry(
             .iter()
             .map(|&index| &color_store.layers[index])
             .collect();
+        let thickness = mesh.map_or(0.0, |mesh| transmission_thickness(mesh, matrix));
         objects.push(ObjectRecord {
             index: object_index,
             node_id: node_id.clone(),
@@ -550,6 +555,7 @@ pub(super) fn extract_geometry(
             color_layer_indices: carried,
             color_render_layers: BTreeMap::new(),
             color_available_masks: BTreeMap::new(),
+            thickness,
         });
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
@@ -758,7 +764,7 @@ pub(super) fn extract_geometry(
                         let params = shading_params(material, base_color, normal, &shader_warnings);
                         shade(
                             doc, snapshot, center, center, normal, normal, &params, mode, None,
-                            images,
+                            thickness, images,
                         )?
                     };
                     let triangle = Triangle {
@@ -1816,6 +1822,8 @@ impl SurfaceShader for SceneShader<'_> {
             point_maps: &shadows.point_maps,
             occluders: shadows.transparent_casters.then_some(&occluders),
         });
+        let thickness = object_for_index(&self.geometry.objects, triangle.object_index)
+            .map_or(0.0, |object| object.thickness);
         let color = shade(
             self.doc,
             self.snapshot,
@@ -1826,6 +1834,7 @@ impl SurfaceShader for SceneShader<'_> {
             &params,
             self.mode,
             shadow,
+            thickness,
             self.images,
         )?;
         occluders.finish()?;
@@ -1884,6 +1893,26 @@ impl SceneShader<'_> {
         evaluate_surface_with_workspace(material, prepared, &context, &mut workspace)
     }
 }
+/// EEVEE's default refraction thickness of an object: the smallest dimension of its bounds, in world units. EEVEE takes
+/// the bounds' size along each axis times the object's scale along it, then the minimum (`eevee_shader.cc`,
+/// `nodetree_thickness`, `ws_dimensions`). It is a sphere model's diameter (`eevee_thickness_lib.bsl.hh`).
+fn transmission_thickness(mesh: &crate::geom::Mesh, matrix: DMat4) -> f64 {
+    let Some(first) = mesh.vertices.first() else {
+        return 0.0;
+    };
+    let (mut min, mut max) = (first.co, first.co);
+    for vertex in &mesh.vertices {
+        min = min.min(vertex.co);
+        max = max.max(vertex.co);
+    }
+    let scale = DVec3::new(
+        matrix.x_axis.truncate().length(),
+        matrix.y_axis.truncate().length(),
+        matrix.z_axis.truncate().length(),
+    );
+    ((max - min) * scale).min_element().max(0.0)
+}
+
 /// Face-corner index of each triangle vertex; the UV and shading-normal lookups share it.
 fn triangle_corners(face: &crate::geom::Face, triangle: &[u32; 3]) -> [Option<usize>; 3] {
     triangle.map(|vertex_id| {
@@ -2175,6 +2204,7 @@ fn shade(
     params: &BsdfParams,
     mode: Mode,
     shadow: ShadowContext<'_>,
+    thickness: f64,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<[f64; 4]> {
     let albedo = DVec3::new(
@@ -2212,15 +2242,22 @@ fn shade(
         let diffuse_environment = prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
         let metallic = params.metallic.clamp(0.0, 1.0);
         let roughness = params.roughness.clamp(0.0, 1.0);
+        // The dielectric layer and the diffuse base share what the transmission closures leave (EEVEE's `weight`).
+        let dielectric = (1.0 - metallic) * (1.0 - params.transmission.clamp(0.0, 1.0));
         // The coat attenuates every layer below it, including the environment terms.
         let lower = shading.lower();
-        result += albedo * diffuse_environment * (1.0 - metallic) * lower;
+        result += albedo * diffuse_environment * dielectric * lower;
         let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
         let specular_environment =
             prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
         let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
-        let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
+        let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
         result += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
+        if let Some(closures) =
+            eevee_transmission::glass_closures(params, normal, view, lower, thickness)
+        {
+            result += glass_environment(world, &doc.node_groups, images, &closures)?;
+        }
     }
     for (id, light_node) in &doc.nodes {
         let Some(light) = light_node
@@ -2260,6 +2297,31 @@ fn shade(
         DVec3::from_array(params.emission_color) * params.emission_strength * shading.lower();
     let result = result + emission;
     Ok([result.x, result.y, result.z, alpha])
+}
+
+/// The environment's share of the glass closures: the reflection at its mirror direction and the transmission at the
+/// probe direction, each blurred with its roughness as EEVEE's light probe is (`eevee_transmission`).
+fn glass_environment(
+    world: &crate::model::World,
+    groups: &crate::model::Registry<crate::graph::NodeGroup>,
+    images: &BTreeMap<String, ImageData>,
+    closures: &GlassClosures,
+) -> Result<DVec3> {
+    let reflected = prefiltered_world(
+        world,
+        groups,
+        images,
+        closures.reflection_direction,
+        closures.reflection_roughness,
+    )?;
+    let transmitted = prefiltered_world(
+        world,
+        groups,
+        images,
+        closures.transmission_direction,
+        closures.transmission_roughness,
+    )?;
+    Ok(reflected * closures.reflection + transmitted * closures.transmission)
 }
 
 fn prefiltered_world(
@@ -2399,12 +2461,13 @@ fn light_contribution(
                 return DVec3::ZERO;
             }
             // Integrated Lambert irradiance is exact for rectangles and the visibility weight
-            // scales it. The specular, sheen and coat lobes are evaluated towards the emitter centre.
+            // scales it. The specular, sheen, coat and glass lobes are evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
             (diffuse_coefficient(params, shading)
                 + specular_coefficient(params, shading, toward_centre)
                 + sheen_coefficient(params, shading, toward_centre)
-                + coat_coefficient(params, shading, toward_centre))
+                + coat_coefficient(params, shading, toward_centre)
+                + glass_coefficient(params, shading, toward_centre))
                 * color
                 * (irradiance * visible_weight / total_weight)
         }
@@ -2515,7 +2578,7 @@ fn shadow_visibility(
 }
 
 /// Radiance a point, spot or sun light reflects toward the view of `shading`: the Principled
-/// diffuse, specular, sheen and coat lobes along `light`, times the light colour and `intensity`
+/// diffuse, specular, sheen, coat and glass lobes along `light`, times the light colour and `intensity`
 /// weighted by the receiver cosine.
 fn punctual_radiance(
     params: &BsdfParams,
@@ -2524,14 +2587,20 @@ fn punctual_radiance(
     color: DVec3,
     intensity: f64,
 ) -> DVec3 {
-    let normal_light_cosine = shading.normal.dot(light).max(0.0);
+    let normal_light_cosine = shading.normal.dot(light).abs();
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    (diffuse_coefficient(params, shading)
-        + specular_coefficient(params, shading, light)
-        + sheen_coefficient(params, shading, light)
-        + coat_coefficient(params, shading, light))
+    // The diffuse, specular, sheen and coat lobes sit above the surface; the glass lobe takes both sides.
+    let reflective = if shading.normal.dot(light) > 0.0 {
+        diffuse_coefficient(params, shading)
+            + specular_coefficient(params, shading, light)
+            + sheen_coefficient(params, shading, light)
+            + coat_coefficient(params, shading, light)
+    } else {
+        DVec3::ZERO
+    };
+    (reflective + glass_coefficient(params, shading, light))
         * color
         * (intensity * normal_light_cosine)
 }
