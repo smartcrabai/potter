@@ -48,10 +48,13 @@ const FILTER_SIZES: [&str; 3] = ["0.01", "0.5", "1.5"];
 const COLUMNS: std::ops::RangeInclusive<usize> = 28..=36;
 
 /// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL. Potter's Halton pattern is
-/// deterministic, so its own seed spread is zero; the residual is Potter's quadrature at `SAMPLES` plus EEVEE's
-/// single 256-sample profile, whose noise is not yet measured. Measured worst deviations at `SAMPLES` 16: 0.0000 at
-/// 0.01 px, 0.0062 at 0.5 px, 0.0157 at 1.5 px (at 64 samples: 0.0111 and 0.0027). The three-sigma margin the bound
-/// needs awaits EEVEE's noise measurement; the sample count is the lever, not this bound.
+/// deterministic, and EEVEE's 256-sample profiles are committed. Potter at 16 samples (this test) deviates by up to
+/// 0.0157 (1.5 px), a quadrature error. Potter at EEVEE's 256 samples, same pattern and same film, deviates by up to
+/// 0.0095 at 0.5 px (column 32, the edge), 0.0022 at 1.5 px, and 0 at 0.01 px. That 0.0095 is not EXR quantisation: the
+/// committed profile is half-float, but that error is near 5e-4. EEVEE's film also weights each sample by Karis's
+/// `1 / (4 + Y)` luma (`eevee_film.bsl.hh`, `sample_accum_combined`). Applying it in Potter closes the 0.5 px gap to
+/// 0.0036 but opens 1.5 px to 0.048, so the source model does not yet explain EEVEE's weighting. Until it does, the
+/// bound stays at 0.03.
 const TOLERANCE: f64 = 0.03;
 
 /// The mean red value of each column of the image `id`, averaged over the rows, read with Potter's own EXR loader.
