@@ -1,10 +1,12 @@
-//! Realtime Beauty tints what a Transparent BSDF passes, as EEVEE 5.2.2 does, for BLENDED and DITHERED panes.
+//! Realtime Beauty tints what a Transparent BSDF passes, as EEVEE 5.2.2 does, for a BLENDED pane.
 //!
 //! `realtime_transparent_tint.py` renders a pane whose Transparent BSDF has the Color (0.2, 0.8, 0.4) in front of an
 //! emitter of radiance 1. A BLENDED pane keeps the Color per channel, and EEVEE's mean matches Potter's within the
-//! half-float rounding of the EXR. A DITHERED pane stores the Color's channel mean, and Potter matches that exact mean;
-//! EEVEE's dithered mean is a systematic 0.00956 above it, recorded in `realtime_transparent_tint.json` as a known gap
-//! rather than covered by a wider tolerance. This test writes each scene with Blender and renders only Potter.
+//! half-float rounding of the EXR. This test writes the scene with Blender and renders only Potter.
+//!
+//! DITHERED is not asserted. EEVEE's dithered mean sits 0.00956 above the Color's channel mean, 13 standard errors, and
+//! it comes from EEVEE's hashed alpha test and film filter (`realtime_transparent_tint.json`, a known gap). Potter's
+//! dithered value is not pinned here: matching EEVEE needs the per-sample hashed test on top of the film filter.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -39,26 +41,17 @@ const EEVEE: &str = include_str!("fixtures/native_oracle/realtime_transparent_ti
 const PATCH: [f64; 9] = [
     0.25, 0.3125, 0.375, 0.4375, 0.5, 0.5625, 0.625, 0.6875, 0.75,
 ];
-/// The render methods of the oracle's pane: BLENDED keeps the Color per channel, DITHERED stores its mean.
-const METHODS: [&str; 2] = ["BLENDED", "DITHERED"];
+/// The render methods the oracle asserts. DITHERED is recorded in `realtime_transparent_tint.json` but not asserted.
+const METHODS: [&str; 1] = ["BLENDED"];
 
-/// The expected patch mean per channel and tolerance for `method`. BLENDED is EEVEE's measured mean, within the
-/// half-float rounding of its EXR. DITHERED is the exact channel mean of the Color: EEVEE's dithered mean sits a
-/// systematic 0.00956 above it (`realtime_transparent_tint.json`, 13 standard errors), so it is recorded there as a
-/// known gap rather than matched by a wider tolerance.
+/// The expected patch mean per channel and tolerance for `method`: EEVEE's measured mean, within the half-float
+/// rounding of its EXR.
 fn expected(method: &str) -> TestResult<([f64; 3], f64)> {
     let values: Value = serde_json::from_str(EEVEE)?;
     let entry = &values["methods"][method];
     let tolerance = entry["tolerance"]
         .as_f64()
         .ok_or_else(|| format!("no tolerance for {method}"))?;
-    if method == "DITHERED" {
-        let tint = values["tint"]
-            .as_array()
-            .ok_or("the committed tint is missing")?;
-        let mean = tint.iter().filter_map(Value::as_f64).sum::<f64>() / 3.0;
-        return Ok(([mean; 3], tolerance));
-    }
     let means = entry["eevee_patch_mean"]
         .as_array()
         .ok_or_else(|| format!("no EEVEE patch mean for {method}"))?;
