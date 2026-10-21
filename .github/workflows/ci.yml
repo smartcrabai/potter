@@ -68,15 +68,16 @@ jobs:
           "$HOME/blender/blender" --version
           echo "POTTER_BLENDER=$HOME/blender/blender" >> "$GITHUB_ENV"
 
-      - name: Run tests
-        shell: bash
-        env:
-          POTTER_REQUIRE_BLENDER: "1"
-        run: cargo test --workspace --all-features
-
       - name: Run clippy
         shell: bash
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          POTTER_REQUIRE_BLENDER: "1"
+        run: cargo test --workspace --all-features --no-fail-fast
 
   vrm-consumer:
     runs-on: ubuntu-latest
