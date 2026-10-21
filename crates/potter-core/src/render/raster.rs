@@ -2922,8 +2922,8 @@ mod smooth_shading_tests {
     use glam::DVec3;
 
     use super::{
-        AlphaMode, Camera, Mode, Projection, RasterOutput, StereoMode, SurfaceHit, SurfaceShader,
-        Triangle, rasterize_with_samples,
+        AlphaMode, Camera, Mode, Projection, RasterOutput, StereoMode, SurfaceHit, SurfaceSample,
+        SurfaceShader, Triangle, rasterize_with_samples,
     };
     use crate::error::Result;
 
@@ -3237,9 +3237,9 @@ mod visibility_tests {
     use glam::DVec3;
 
     use super::{
-        AlphaMode, Camera, CameraFrame, Hit, PreparedTriangle, Projection, Ray, StereoMode,
-        Triangle, camera_frame, composite_sample, hit_opacity, intersect_triangle,
-        nearest_visible_hit, prepare_triangles, ray_for_pixel_in_frame,
+        AlphaMode, Camera, CameraFrame, Hit, Layer, PreparedTriangle, Projection, Ray, StereoMode,
+        Triangle, camera_frame, composite_layers, composite_sample, hit_opacity,
+        intersect_triangle, nearest_visible_hit, prepare_triangles, ray_for_pixel_in_frame,
     };
     use crate::float::equal_f64;
     use crate::render::bvh::Bvh;

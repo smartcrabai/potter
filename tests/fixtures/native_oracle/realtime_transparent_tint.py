@@ -25,6 +25,9 @@ import bpy
 ARGS = sys.argv[sys.argv.index("--") + 1:]
 blend_out, image_out, json_out, method = ARGS[:4]
 RENDER = ARGS[4] != "0" if len(ARGS) > 4 else True
+# A shift of the whole scene along y gives an independent realisation of EEVEE's dither noise (it hashes world position),
+# which `measure` uses to estimate the noise. The default is no shift.
+SHIFT_Y = float(ARGS[5]) if len(ARGS) > 5 else 0.0
 
 WIDTH = 64
 HEIGHT = 64
@@ -59,7 +62,7 @@ emitter.inputs["Base Color"].default_value = (0.0, 0.0, 0.0, 1.0)
 emitter.inputs["Specular IOR Level"].default_value = 0.0
 emitter.inputs["Emission Color"].default_value = (1.0, 1.0, 1.0, 1.0)
 emitter.inputs["Emission Strength"].default_value = 1.0
-bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, 0.0, 0.0))
+bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, SHIFT_Y, 0.0))
 bpy.context.object.data.materials.append(backdrop)
 
 pane = bpy.data.materials.new("Pane")
@@ -78,7 +81,7 @@ output = next(node for node in tree.nodes if node.type == "OUTPUT_MATERIAL")
 transparent = tree.nodes.new("ShaderNodeBsdfTransparent")
 transparent.inputs["Color"].default_value = (TINT[0], TINT[1], TINT[2], 1.0)
 tree.links.new(transparent.outputs["BSDF"], output.inputs["Surface"])
-bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, 0.0, 1.0))
+bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, SHIFT_Y, 1.0))
 bpy.context.object.data.materials.append(pane)
 
 camera_data = bpy.data.cameras.new("Camera")
@@ -86,7 +89,7 @@ camera_data.type = "ORTHO"
 camera_data.ortho_scale = 2.0
 camera = bpy.data.objects.new("Camera", camera_data)
 scene.collection.objects.link(camera)
-camera.location = (-1.5, 0.0, 6.0)
+camera.location = (-1.5, SHIFT_Y, 6.0)
 scene.camera = camera
 
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
@@ -112,6 +115,6 @@ for v in PATCH:
 
 with open(json_out, "w", encoding="utf-8") as handle:
     json.dump(
-        {"method": method, "patch_mean": [value / count for value in sums], "tint": list(TINT)},
+        {"method": method, "patch_mean": [value / count for value in sums], "tint": list(TINT), "shift_y": SHIFT_Y},
         handle,
     )

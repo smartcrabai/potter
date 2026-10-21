@@ -1,15 +1,21 @@
 {
   "tint": [0.2, 0.8, 0.4],
+  "measured_over": "8 sub-millimetre shifts of the whole scene along y (realisations of EEVEE's dither), 64 by 64 frame, 16 samples, 9 by 9 patch mean. Potter's realtime render of the same scenes (the same shifts) gave patch means identical to 1e-8 at every shift.",
   "methods": {
     "BLENDED": {
-      "patch_mean": [0.199951171875, 0.7998046875, 0.39990234375],
-      "tolerance": 0.002,
-      "note": "EEVEE keeps the transmittance per channel (forward pass, use_colored_transparency). The means are half-float EXR values, so each channel is within 5e-4 of the Color; the tolerance covers that quantisation."
+      "eevee_patch_mean": [0.199951171875, 0.7998046875, 0.39990234375],
+      "eevee_sigma": 0.0,
+      "tolerance": 0.000244140625,
+      "derivation": "EEVEE's value is constant across all 8 shifts (sigma 0). The EXR is half-float; for values in [0.5, 1) the rounding error is at most 2^-12 = 0.000244140625. Potter's realtime output is exact (sigma 0), so the tolerance is that rounding bound alone."
     },
     "DITHERED": {
-      "patch_mean": [0.47025101273148145, 0.47025101273148145, 0.47025101273148145],
-      "tolerance": 0.005,
-      "note": "EEVEE stores one alpha, 1 - average(transmittance), for a dithered surface, so each channel is the background times the Color's mean (0.46667). EEVEE measures 0.47025, 0.0036 above that exact mean, at 16 samples; the two renders are identical. The tolerance covers that offset."
+      "exact_channel_mean": 0.4666666666666666,
+      "eevee_patch_mean_over_shifts": 0.4762264298804012,
+      "eevee_sigma": 0.0020656468108460084,
+      "eevee_standard_error": 0.000730316433742789,
+      "eevee_offset_from_exact": 0.009559763213734584,
+      "tolerance": 0.00001,
+      "derivation": "The expectation is the channel mean of the Transparent Color, (0.2 + 0.8 + 0.4) / 3. Potter asserts that expectation to f32 storage (tolerance 1e-5). EEVEE's dithered mean sits 0.00956 above it, 13 standard errors (sigma 0.00207 over 8 shifts), so it is a systematic difference and not noise: it is a known gap, not tolerated by widening the tolerance. [INFERENCE: EEVEE's dither quantises the transparency over its 16 samples, which is what the offset is consistent with; the cause is not verified in source.]"
     }
   }
 }
