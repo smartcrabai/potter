@@ -2484,6 +2484,7 @@ fn set_schema(operation: &str) -> Value {
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "filter_glossy":{"type":"number","minimum":0,"maximum":1000},
             "film_transparent":{"type":"boolean"},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},

@@ -1181,8 +1181,8 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_transparent_max_bounces"
     )]
     pub transparent_max_bounces: u32,
-    /// Cycles' `filter_glossy` (`scene.cycles.filter_glossy`): the widening of the ray differentials after glossy and
-    /// diffuse bounces, which bump nodes read. Omitted when equal to Blender's default of 0.
+    /// Blender's Filter Glossy (`scene.cycles.blur_glossy`): the widening of the ray differentials after a bounce,
+    /// which bump nodes read. Omitted when equal to Blender's default of 1.0.
     #[serde(
         default = "default_filter_glossy",
         skip_serializing_if = "is_default_filter_glossy"
@@ -1241,7 +1241,7 @@ impl Default for RenderSettings {
             seed: 0,
             max_bounces: 4,
             transparent_max_bounces: 8,
-            filter_glossy: 0.0,
+            filter_glossy: 1.0,
             film_transparent: false,
             engine: "path".to_owned(),
             use_sequencer: false,
@@ -2176,7 +2176,7 @@ fn default_transparent_max_bounces() -> u32 {
 }
 
 fn default_filter_glossy() -> f64 {
-    0.0
+    1.0
 }
 
 #[expect(
@@ -2184,7 +2184,7 @@ fn default_filter_glossy() -> f64 {
     reason = "serde skip_serializing_if passes a reference"
 )]
 fn is_default_filter_glossy(value: &f64) -> bool {
-    value.to_bits() == 0.0_f64.to_bits()
+    value.to_bits() == 1.0_f64.to_bits()
 }
 
 #[expect(

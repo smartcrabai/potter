@@ -207,7 +207,7 @@ fn camera_footprint(
 }
 
 /// The filter glossy widening scale of the scene, Cycles' `differential_widen_scale = min(1, filter_glossy)`
-/// (`intern/cycles/scene/integrator.cpp`). Blender's Filter Glossy defaults to 0, which never widens `dD`.
+/// (`intern/cycles/scene/integrator.cpp`). Blender's Filter Glossy (`cycles.blur_glossy`) defaults to 1.0.
 fn filter_glossy_widen_scale(doc: &SceneDoc) -> f64 {
     doc.scenes
         .get(&doc.active_scene)
