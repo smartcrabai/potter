@@ -145,7 +145,7 @@ fn parameter_case(
         "sharp_edges":sharp_edges,
         "smooth":smooth,
         "custom_normals":custom_normals,
-        "subject_transform":None,
+        "subject_transform":Value::Null,
     })
 }
 
@@ -771,6 +771,7 @@ fn evaluate_case(case: &Value, transform: Option<&Value>) -> Result<Mesh, Box<dy
         &modifier(case)?,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
         "TestObject",
         &AttributeLayerSelection::default(),
@@ -1003,6 +1004,7 @@ fn weighted_normal_uses_blenders_ranked_weight_curve() -> Result<(), Box<dyn Err
         &modifier,
         &BTreeMap::new(),
         None,
+        None,
         DMat4::IDENTITY,
         "TestObject",
         &AttributeLayerSelection::default(),
@@ -1049,6 +1051,7 @@ fn weighted_normal_threshold_includes_exact_compare_boundary() -> Result<(), Box
         &mesh,
         &modifier,
         &BTreeMap::new(),
+        None,
         None,
         DMat4::IDENTITY,
         "TestObject",
@@ -1107,6 +1110,7 @@ fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>
         &mesh,
         &modifier,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "TestObject",

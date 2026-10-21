@@ -8,10 +8,9 @@ use std::{
 use glam::{DMat4, DVec3, Mat4};
 use potter_core::{
     geom::{
-        Mesh, ResolvedTexture,
+        Mesh,
         modifiers::attributes::{
-            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32,
-            evaluate_with_context as evaluate_attribute,
+            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32, evaluate_with_context,
         },
     },
     model::{CameraData, Modifier, ModifierRuntime},
@@ -39,29 +38,6 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
-}
-
-/// Evaluates an attribute modifier with no texture, so no texture coordinate mapping applies. These
-/// fixtures never sample a mask texture.
-fn evaluate_with_context(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
-    texture: Option<&ResolvedTexture>,
-    subject_world: DMat4,
-    subject_name: &str,
-    subject_layer_selection: &AttributeLayerSelection,
-) -> potter_core::error::Result<Mesh> {
-    evaluate_attribute(
-        mesh,
-        modifier,
-        operands,
-        texture,
-        None,
-        subject_world,
-        subject_name,
-        subject_layer_selection,
-    )
 }
 
 fn layer_selection(groups: &[&str], active_group: Option<usize>) -> AttributeLayerSelection {
@@ -542,7 +518,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
         let mut destination =
             Mesh::from_positions_and_faces(destination_positions.to_vec(), vec![vec![0, 1, 2]])?;
         set_group(&mut destination, "A", &[0.2, 0.3, 0.4]);
-        let modifier = modifier(
+        let modifier_1 = modifier(
             "data_transfer",
             json!({
                 "object":"source","use_object_transform":true,"use_vert_data":true,
@@ -551,9 +527,9 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
                 "max_distance":10.0,"ray_radius":0.01
             }),
         )?;
-        let actual = evaluate_attribute(
+        let actual = evaluate_with_context(
             &destination,
-            &modifier,
+            &modifier_1,
             &source_operands,
             None,
             None,
@@ -575,7 +551,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
             "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":10.0,
         }),
     )?;
-    let no_transform_actual = evaluate_attribute(
+    let no_transform_actual = evaluate_with_context(
         &no_transform_destination,
         &no_transform_modifier,
         &source_operands,
@@ -609,7 +585,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
             "vert_mapping":"NEAREST","mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":0.1
         }),
     )?;
-    let cutoff_actual = evaluate_attribute(
+    let cutoff_actual = evaluate_with_context(
         &cutoff,
         &cutoff_modifier,
         &source_operands,
@@ -638,7 +614,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
     )?;
     let mut topology = topology;
     set_group(&mut topology, "A", &[0.2, 0.3, 0.4, 0.5]);
-    let modifier = modifier(
+    let modifier_2 = modifier(
         "data_transfer",
         json!({
             "object":"source","use_object_transform":true,"use_vert_data":true,
@@ -646,9 +622,9 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
             "mix_mode":"REPLACE","mix_factor":1.0
         }),
     )?;
-    let actual = evaluate_attribute(
+    let actual = evaluate_with_context(
         &topology,
-        &modifier,
+        &modifier_2,
         &source_operands,
         None,
         None,
@@ -740,14 +716,15 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
         set_group(&mut destination, "D0", &[0.2, 0.4, 0.6, 0.8]);
         set_group(&mut destination, "D1", &[0.7, 0.5, 0.3, 0.1]);
         set_group(&mut destination, "Mask", &[0.25, 0.75, 0.5, 1.0]);
-        let modifier = modifier(
+        let modifier_3 = modifier(
             "data_transfer",
             json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ALL","layers_vgroup_select_dst":"INDEX","mix_mode":mode,"mix_factor":0.4,"vertex_group":"Mask"}),
         )?;
         let actual = evaluate_with_context(
             &destination,
-            &modifier,
+            &modifier_3,
             &operands,
+            None,
             None,
             DMat4::IDENTITY,
             "destination",
@@ -771,6 +748,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
         &inverted_modifier,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
         "destination",
         &layer_selection(&["D0", "D1", "Mask"], Some(1)),
@@ -793,6 +771,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
         &destination,
         &active_modifier,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -818,6 +797,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
         &named_modifier,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
         "destination",
         &layer_selection(&["D0", "D1"], Some(1)),
@@ -840,6 +820,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
             &missing_source,
             &operands,
             None,
+            None,
             DMat4::IDENTITY,
             "destination",
             &layer_selection(&["D0", "D1"], Some(1))
@@ -859,6 +840,7 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
             &destination,
             &missing_destination,
             &operands,
+            None,
             None,
             DMat4::IDENTITY,
             "destination",
@@ -914,6 +896,7 @@ fn vertex_group_bone_selectors_filter_source_layers() -> Result<(), Box<dyn Erro
             &transfer,
             &operands,
             None,
+            None,
             DMat4::IDENTITY,
             "destination",
             &layer_selection(&["D0", "D1", "D2"], None),
@@ -946,6 +929,7 @@ fn absent_transfer_source_is_an_input_mesh_noop() -> Result<(), Box<dyn Error>> 
         &destination,
         &transfer,
         &BTreeMap::new(),
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -1329,6 +1313,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         &transfer,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
         "destination",
         &AttributeLayerSelection::default(),
@@ -1353,6 +1338,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         &active_transfer,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
         "destination",
         &AttributeLayerSelection::default(),
@@ -1367,6 +1353,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         &no_active_destination,
         &active_transfer,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -1387,6 +1374,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         &active_destination,
         &active_transfer,
         &no_active_source_operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -1410,6 +1398,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         &named_transfer,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
         "destination",
         &AttributeLayerSelection::default(),
@@ -1431,6 +1420,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
             &missing_uv_source,
             &operands,
             None,
+            None,
             DMat4::IDENTITY,
             "destination",
             &AttributeLayerSelection::default()
@@ -1450,6 +1440,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
             &active_destination,
             &missing_uv_destination,
             &operands,
+            None,
             None,
             DMat4::IDENTITY,
             "destination",
@@ -1491,6 +1482,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         &point_destination,
         &point_transfer,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -1537,6 +1529,7 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         &corner_destination,
         &corner_transfer,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -1632,6 +1625,7 @@ fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box
         &destination,
         &transfer,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -1749,6 +1743,7 @@ fn float_and_byte_color_mix_modes_match_blender() -> Result<(), Box<dyn Error>> 
             &destination,
             &transfer,
             &operands,
+            None,
             None,
             DMat4::IDENTITY,
             "destination",
@@ -1878,6 +1873,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
         &transfer,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
         "destination",
         &AttributeLayerSelection::default(),
@@ -1905,6 +1901,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
         &transfer,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
         "destination",
         &AttributeLayerSelection::default(),
@@ -1927,6 +1924,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
         &destination,
         &transfer,
         &no_active_source_operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -2056,7 +2054,7 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
             )],
             "UVMap",
         );
-        let modifier = modifier(
+        let modifier_4 = modifier(
             "data_transfer",
             json!({
                 "object":"source","use_object_transform":true,"use_loop_data":true,"data_types_loops":["UV"],
@@ -2066,8 +2064,9 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
         )?;
         let actual = evaluate_with_context(
             &destination,
-            &modifier,
+            &modifier_4,
             &operands,
+            None,
             None,
             DMat4::IDENTITY,
             "destination",
@@ -2192,6 +2191,7 @@ fn loop_mapping_families_match_blender_with_corner_association() -> Result<(), B
             &destination,
             &transfer,
             &operands,
+            None,
             None,
             DMat4::IDENTITY,
             "destination",
@@ -2442,6 +2442,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             &transfer,
             &operands,
             None,
+            None,
             DMat4::IDENTITY,
             "destination",
             &AttributeLayerSelection::default(),
@@ -2471,6 +2472,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         &radius_zero_destination,
         &radius_zero_transfer,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -2513,6 +2515,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         &topology_destination,
         &transfer,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",
@@ -2575,6 +2578,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             &destination,
             &transfer,
             &face_operands,
+            None,
             None,
             DMat4::IDENTITY,
             "destination",
@@ -2652,6 +2656,7 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             &oblique_destination,
             &oblique_transfer,
             &oblique_operands,
+            None,
             None,
             DMat4::IDENTITY,
             "destination",
@@ -2851,6 +2856,7 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
             &transfer,
             &operands,
             None,
+            None,
             DMat4::IDENTITY,
             "destination",
             &AttributeLayerSelection::default(),
@@ -2946,6 +2952,7 @@ fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<d
         &destination,
         &transfer,
         &operands,
+        None,
         None,
         DMat4::IDENTITY,
         "destination",

@@ -7,8 +7,7 @@ use potter_core::{
         Mesh, ResolvedTexture, edit,
         modifiers::{
             attributes::{
-                AttributeLayerSelection, SceneOperand, evaluate_mesh_cache,
-                evaluate_with_context as evaluate_attribute,
+                AttributeLayerSelection, SceneOperand, evaluate_mesh_cache, evaluate_with_context,
             },
             evaluate_modifiers,
         },
@@ -83,31 +82,6 @@ fn scene_operand(mesh: Mesh, local_to_subject: DMat4, camera: Option<CameraData>
         layer_selection: potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(
         ),
     }
-}
-
-/// Attribute evaluation for fixtures without a scene subject beyond `subject_world`. A texture is
-/// sampled through the subject's own space, as Blender's LOCAL and GLOBAL mappings do for a subject.
-fn evaluate_with_context(
-    mesh: &Mesh,
-    modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
-    texture: Option<&ResolvedTexture>,
-    subject_world: DMat4,
-) -> Result<Mesh, Box<dyn Error>> {
-    let mapping = texture.map(|_| TextureCoordinateMapping {
-        subject_to_world_f32: subject_world.to_cols_array().map(|value| value as f32),
-        world_to_mapping_f32: None,
-    });
-    Ok(evaluate_attribute(
-        mesh,
-        modifier,
-        operands,
-        texture,
-        mapping.as_ref(),
-        subject_world,
-        "TestObject",
-        &AttributeLayerSelection::default(),
-    )?)
 }
 
 #[test]
@@ -353,7 +327,16 @@ fn proximity_modifier_uses_target_object_distance_and_assigns_vertex_weights()
             "normalize":false
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &proximity, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &proximity,
+        &operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_eq!(weights(&result, "A")?, [0.5, 0.5]);
     Ok(())
 }
@@ -381,7 +364,16 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
             "mix_limit":std::f64::consts::PI
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &edit,
+        &operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     let evaluated = evaluated_face_normals(&result, "f0")?;
     let normal = evaluated[0].as_array().ok_or("custom normal missing")?;
     let tolerance = exchange_normals::normal_tolerance(true);
@@ -425,7 +417,16 @@ fn uv_project_uses_camera_projection_and_writes_corner_uvs() -> Result<(), Box<d
             "uv_layer":"UVMap"
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &projection, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &projection,
+        &operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     let uv = result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"][0]
         .as_array()
         .ok_or("projected UV missing")?;
@@ -459,7 +460,16 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
             "mix_factor":1.0
         }),
     )?;
-    let result = evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &destination,
+        &transfer,
+        &operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     let transferred = weights(&result, "A")?;
     assert!((transferred[0] - 0.9).abs() < 1.0e-12);
     assert!((transferred[1] - 0.1).abs() < 1.0e-12);
@@ -528,7 +538,13 @@ fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Err
         &edit,
         &BTreeMap::new(),
         Some(&texture),
+        Some(&TextureCoordinateMapping {
+            subject_to_world_f32: DMat4::IDENTITY.to_cols_array().map(|value| value as f32),
+            world_to_mapping_f32: None,
+        }),
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_eq!(weights(&result, "A")?, [0.25, 0.75]);
     Ok(())
@@ -1856,7 +1872,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &proximity,
         &proximity_operands,
         None,
+        None,
         proximity_subject_world,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "vertex_weight_proximity OBJECT",
@@ -1895,7 +1914,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &geometry_modifier,
         &geometry_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "vertex_weight_proximity GEOMETRY/VERTEX",
@@ -1958,7 +1980,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 )?,
                 &proximity_surface_operands,
                 None,
+                None,
                 DMat4::IDENTITY,
+                "TestObject",
+                &AttributeLayerSelection::default(),
             )?;
             let key = format!("{geometry}_{falloff}");
             let label = format!("vertex_weight_proximity GEOMETRY/{geometry} {falloff}");
@@ -2076,8 +2101,16 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "normal_edit",
         json!({"mode":"RADIAL","target":"target","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"use_direction_parallel":false}),
     )?;
-    let normals =
-        evaluate_with_context(&quad, &normal_edit, &normal_operands, None, DMat4::IDENTITY)?;
+    let normals = evaluate_with_context(
+        &quad,
+        &normal_edit,
+        &normal_operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_normal_stimulus(
         "normal_edit RADIAL/COPY",
         &expected["baseline_normal_edit"],
@@ -2106,7 +2139,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &directional,
         &directional_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_normal_stimulus(
         "normal_edit DIRECTIONAL/ADD",
@@ -2151,7 +2187,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         )?,
         &projectors,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let projected_uvs = json!([
         flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -2200,7 +2239,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             )],
         )]),
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let orthographic_uvs = json!([
         flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -2243,7 +2285,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             )],
         )]),
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let orthographic_clamped_uvs = json!([
         flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -2319,7 +2364,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         )?,
         &warp_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "uv_warp object transforms and vertex group",
@@ -2357,7 +2405,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         )?,
         &source_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "data_transfer VGROUP_WEIGHTS/TOPOLOGY",
@@ -2414,7 +2465,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             )?,
             &point_operands,
             None,
+            None,
             DMat4::IDENTITY,
+            "TestObject",
+            &AttributeLayerSelection::default(),
         )?;
         assert_material_change(
             &format!("data_transfer VGROUP_WEIGHTS/{mapping}"),
@@ -2495,7 +2549,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &domain_transfer,
         &domain_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let domain_values = transfer_domain_values(&domains)?;
     assert_material_change(
@@ -2586,7 +2643,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 world_to_mapping_f32: None,
             }
         };
-        let masked = evaluate_attribute(
+        let masked = evaluate_with_context(
             &mask_mesh,
             &mask_modifier,
             &operands,
@@ -3204,7 +3261,10 @@ fn run_uv_transfer(
         &transfer,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?)
 }
 
@@ -3301,7 +3361,13 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
         &mix,
         &BTreeMap::new(),
         Some(&texture),
+        Some(&TextureCoordinateMapping {
+            subject_to_world_f32: DMat4::IDENTITY.to_cols_array().map(|value| value as f32),
+            world_to_mapping_f32: None,
+        }),
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let weights = vertex_weights(&result, "A")?;
     assert_eq!(weights.len(), 4);
