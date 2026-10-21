@@ -1,4 +1,4 @@
-use std::{error::Error, fs, path::Path, process::Command};
+use std::{error::Error, path::Path, process::Command};
 
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -9,6 +9,31 @@ use blender_file::blender_executable;
 
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
+}
+
+/// Reads a file, naming the path when it fails (a bare `NotFound` does not say which file was missing).
+fn read_at(path: impl AsRef<Path>) -> Result<Vec<u8>, Box<dyn Error>> {
+    let path = path.as_ref();
+    std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()).into())
+}
+
+/// Writes a file, naming the path when it fails.
+fn write_at(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<(), Box<dyn Error>> {
+    let path = path.as_ref();
+    std::fs::write(path, contents).map_err(|error| format!("{}: {error}", path.display()).into())
+}
+
+/// Copies a file, naming both paths when it fails.
+fn copy_at(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<u64, Box<dyn Error>> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    std::fs::copy(from, to)
+        .map_err(|error| format!("copy {} to {}: {error}", from.display(), to.display()).into())
+}
+
+/// Creates a directory tree, naming the path when it fails.
+fn create_dir_at(path: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
+    let path = path.as_ref();
+    std::fs::create_dir_all(path).map_err(|error| format!("{}: {error}", path.display()).into())
 }
 
 fn run_ok(command: &mut Command) -> Result<std::process::Output, Box<dyn Error>> {
@@ -29,9 +54,9 @@ fn init(scene: &Path) -> Result<(), Box<dyn Error>> {
 
 fn apply(scene: &Path, operations: &Value) -> Result<(), Box<dyn Error>> {
     let document_path = scene.join("scene.json");
-    let document: Value = serde_json::from_slice(&fs::read(&document_path)?)?;
+    let document: Value = serde_json::from_slice(&read_at(&document_path)?)?;
     let batch = scene.with_extension("alembic-cache-ops.json");
-    fs::write(
+    write_at(
         &batch,
         serde_json::to_vec(&json!({
             "schema_version": 1,
@@ -50,9 +75,9 @@ fn apply(scene: &Path, operations: &Value) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 fn apply_output(scene: &Path, operations: &Value) -> Result<std::process::Output, Box<dyn Error>> {
-    let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let document: Value = serde_json::from_slice(&read_at(scene.join("scene.json"))?)?;
     let batch = scene.with_extension("sequence-unpack-ops.json");
-    fs::write(
+    write_at(
         &batch,
         serde_json::to_vec(&json!({
             "schema_version":1,
@@ -77,11 +102,11 @@ fn assert_failed_sequence_unpack_is_atomic(
     let scene = directory.join(name);
     init(&scene)?;
     let scene_path = scene.join("scene.json");
-    fs::write(&scene_path, serde_json::to_vec_pretty(source_document)?)?;
+    write_at(&scene_path, serde_json::to_vec_pretty(source_document)?)?;
     let pattern = scene.join("unpacked.####.abc");
     let existing = scene.join("unpacked.0001.abc");
     let sentinel = b"existing sequence frame must not be overwritten";
-    fs::write(&existing, sentinel)?;
+    write_at(&existing, sentinel)?;
     let absent = scene.join("unpacked.0002.abc");
     assert!(!absent.exists());
 
@@ -95,7 +120,7 @@ fn assert_failed_sequence_unpack_is_atomic(
     );
     let error: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(error["error"]["code"], expected_code);
-    let actual = fs::read(&existing)?;
+    let actual = read_at(&existing)?;
     assert_eq!(actual.as_slice(), &sentinel[..]);
     assert!(!absent.exists(), "failed unpack created a later frame");
     for frame in 3..=4 {
@@ -104,7 +129,7 @@ fn assert_failed_sequence_unpack_is_atomic(
             "failed unpack created frame {frame}"
         );
     }
-    let after: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let after: Value = serde_json::from_slice(&read_at(&scene_path)?)?;
     assert_eq!(&after, source_document);
     Ok(())
 }
@@ -139,14 +164,14 @@ fn add_external_cache_modifier(
     expected_hash: &str,
 ) -> Result<(), Box<dyn Error>> {
     let document_path = scene.join("scene.json");
-    let mut document: Value = serde_json::from_slice(&fs::read(&document_path)?)?;
+    let mut document: Value = serde_json::from_slice(&read_at(&document_path)?)?;
     document["resources"]["cache"] = json!({
         "uri": resource_path,
         "hash": expected_hash,
         "kind": "alembic",
         "packed": false,
     });
-    fs::write(&document_path, serde_json::to_vec_pretty(&document)?)?;
+    write_at(&document_path, serde_json::to_vec_pretty(&document)?)?;
     apply(
         scene,
         &json!([{
@@ -314,20 +339,20 @@ fn mesh_sequence_cache_samples_and_interpolates_exported_alembic_meshes()
             {"op":"modifier.create", "target":{"id":"body"}, "id":"cache", "type":"mesh_sequence_cache", "params":{"resource":"cache", "object_path":"/root/body/geometry", "read_data":["VERT","POLY","UV","COLOR"], "use_vertex_interpolation":true}}
         ]),
     )?;
-    let archive_hash = potter_core::hash::sha256(&fs::read(&archive)?);
+    let archive_hash = potter_core::hash::sha256(&read_at(&archive)?);
     let hash_hex = archive_hash.strip_prefix("sha256:").unwrap_or_default();
     let asset_uri = format!("assets/sha256/{hash_hex}/animated.abc");
     let asset_path = target.join(&asset_uri);
-    fs::create_dir_all(asset_path.parent().ok_or("asset path has no parent")?)?;
-    fs::copy(&archive, &asset_path)?;
+    create_dir_at(asset_path.parent().ok_or("asset path has no parent")?)?;
+    copy_at(&archive, &asset_path)?;
     let scene_path = target.join("scene.json");
-    let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let mut document: Value = serde_json::from_slice(&read_at(&scene_path)?)?;
     document["resources"]["cache"]["uri"] = json!(asset_uri);
     document["resources"]["cache"]["packed"] = json!(false);
     if let Some(resource) = document["resources"]["cache"].as_object_mut() {
         resource.remove("bytes");
     }
-    fs::write(scene_path, serde_json::to_vec_pretty(&document)?)?;
+    write_at(scene_path, serde_json::to_vec_pretty(&document)?)?;
 
     for frame in [1.0, 3.0] {
         assert_positions_close(
@@ -355,7 +380,7 @@ fn set_receiver_mesh(
     seeded_uv: bool,
 ) -> Result<(), Box<dyn Error>> {
     let scene_path = scene.join("scene.json");
-    let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let mut document: Value = serde_json::from_slice(&read_at(&scene_path)?)?;
     let data_id = document["nodes"]["body"]["data"]
         .as_str()
         .ok_or("oracle receiver mesh data block is missing")?
@@ -420,7 +445,7 @@ fn set_receiver_mesh(
     }
     document["data_blocks"][data_id.as_str()]["descriptor"] = Value::Null;
     document["data_blocks"][data_id.as_str()]["mesh"] = serde_json::to_value(mesh)?;
-    fs::write(&scene_path, serde_json::to_vec_pretty(&document)?)?;
+    write_at(&scene_path, serde_json::to_vec_pretty(&document)?)?;
     Ok(())
 }
 
@@ -503,7 +528,7 @@ fn add_sequence_resource(
         if !source.is_file() {
             break;
         }
-        let digest = potter_core::hash::sha256(&fs::read(&source)?);
+        let digest = potter_core::hash::sha256(&read_at(&source)?);
         sequence_frames.insert(
             frame.to_string(),
             json!({
@@ -520,7 +545,7 @@ fn add_sequence_resource(
         return Err("Blender oracle sequence has no numbered frame files".into());
     }
     let scene_path = scene.join("scene.json");
-    let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let mut document: Value = serde_json::from_slice(&read_at(&scene_path)?)?;
     document["resources"]["oracle_cache"] = json!({
         "uri":sequence_pattern,
         "kind":"alembic",
@@ -530,7 +555,7 @@ fn add_sequence_resource(
         "sequence_end":end,
         "sequence_frames":sequence_frames
     });
-    fs::write(&scene_path, serde_json::to_vec_pretty(&document)?)?;
+    write_at(&scene_path, serde_json::to_vec_pretty(&document)?)?;
     Ok(())
 }
 
@@ -785,7 +810,7 @@ fn uv_cache_summary(fixture_dir: &Path, oracle_case: &Value) -> String {
     else {
         return "cache unavailable: no archive or object path".to_owned();
     };
-    let summary = fs::read(&archive)
+    let summary = read_at(&archive)
         .map_err(|error| error.to_string())
         .and_then(|bytes| {
             potter_core::exchange::alembic::mesh_cache_uv_layers(&bytes, object_path)
@@ -1157,9 +1182,9 @@ fn add_oracle_cache(
             &json!([{"op":"resource.pack","id":"oracle_cache","uri":archive,"kind":"alembic"}]),
         )?;
         let scene_path = scene.join("scene.json");
-        let mut document: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+        let mut document: Value = serde_json::from_slice(&read_at(&scene_path)?)?;
         document["resources"]["oracle_cache"]["cache_file"] = cache_file.clone();
-        fs::write(&scene_path, serde_json::to_vec_pretty(&document)?)?;
+        write_at(&scene_path, serde_json::to_vec_pretty(&document)?)?;
     }
     apply(
         scene,
@@ -1171,7 +1196,7 @@ fn add_oracle_cache(
             "params":oracle_cache_params(oracle_case)?
         }]),
     )?;
-    let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let document: Value = serde_json::from_slice(&read_at(scene.join("scene.json"))?)?;
     assert_eq!(
         document["resources"]["oracle_cache"]["cache_file"], *cache_file,
         "CacheFile settings were not persisted for {}",
@@ -1309,7 +1334,7 @@ with open(output_path, "w", encoding="utf-8") as handle:
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let actual: Value = serde_json::from_slice(&fs::read(output_path)?)?;
+    let actual: Value = serde_json::from_slice(&read_at(output_path)?)?;
     let expected_frames = oracle_case["frames"]
         .as_array()
         .ok_or("sequence oracle frames are missing")?;
@@ -1687,8 +1712,8 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
     for frame in 1..=4 {
         let source = fixture_dir.join(format!("seq.{frame:04}.abc"));
         let destination = temporary.path().join(format!("seq.{frame:04}.abc"));
-        fs::copy(&source, &destination)?;
-        let digest = potter_core::hash::sha256(&fs::read(&destination)?);
+        copy_at(&source, &destination)?;
+        let digest = potter_core::hash::sha256(&read_at(&destination)?);
         sequence_frames.insert(
             frame.to_string(),
             json!({
@@ -1699,9 +1724,9 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
             }),
         );
     }
-    fs::copy(&source_archive, temporary.path().join("seq.0005.abc"))?;
+    copy_at(&source_archive, temporary.path().join("seq.0005.abc"))?;
     let sequence_path = temporary.path().join("seq.####.abc");
-    let mut document: Value = serde_json::from_slice(&fs::read(target.join("scene.json"))?)?;
+    let mut document: Value = serde_json::from_slice(&read_at(target.join("scene.json"))?)?;
     document["resources"]["oracle_sequence"] = json!({
         "uri": sequence_path,
         "kind": "alembic",
@@ -1710,7 +1735,7 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
         "sequence_end": 4,
         "sequence_frames": sequence_frames,
     });
-    fs::write(
+    write_at(
         target.join("scene.json"),
         serde_json::to_vec_pretty(&document)?,
     )?;
@@ -1776,10 +1801,10 @@ fn blender_file_sequence_uses_frame_files_and_validates_each_hash() -> Result<()
     );
 
     let changed_path = temporary.path().join("seq.0002.abc");
-    let mut changed = fs::read(&changed_path)?;
+    let mut changed = read_at(&changed_path)?;
     let last = changed.len() - 1;
     changed[last] ^= 1;
-    fs::write(changed_path, changed)?;
+    write_at(changed_path, changed)?;
     let project = potter_core::store::Project::open(&target)?;
     let Err(error) = potter_core::eval::Snapshot::evaluate_with_cache(
         project.doc(),
@@ -2007,20 +2032,20 @@ fn resource_pack_sequence_rejects_out_of_directory_symlink_without_commit()
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alembic_cache");
     let sequence_root = temporary.path().join("sequence");
     let outside_root = temporary.path().join("outside");
-    fs::create_dir_all(&sequence_root)?;
-    fs::create_dir_all(&outside_root)?;
-    fs::copy(
+    create_dir_at(&sequence_root)?;
+    create_dir_at(&outside_root)?;
+    copy_at(
         fixture_dir.join("seq.0001.abc"),
         sequence_root.join("seq.0001.abc"),
     )?;
     let outside_frame = outside_root.join("seq.0002.abc");
-    fs::copy(fixture_dir.join("seq.0002.abc"), &outside_frame)?;
+    copy_at(fixture_dir.join("seq.0002.abc"), &outside_frame)?;
     std::os::unix::fs::symlink(&outside_frame, sequence_root.join("seq.0002.abc"))?;
 
     let scene_path = target.join("scene.json");
-    let before: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let before: Value = serde_json::from_slice(&read_at(&scene_path)?)?;
     let batch = target.with_extension("sequence-symlink-ops.json");
-    fs::write(
+    write_at(
         &batch,
         serde_json::to_vec(&json!({
             "schema_version":1,
@@ -2048,7 +2073,7 @@ fn resource_pack_sequence_rejects_out_of_directory_symlink_without_commit()
     let error: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(error["error"]["code"], "INVALID_ARGUMENT");
     assert_eq!(error["error"]["details"]["frame"], 2);
-    let after: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let after: Value = serde_json::from_slice(&read_at(&scene_path)?)?;
     assert_eq!(after["revision"], before["revision"]);
     assert!(
         after["resources"].get("escaped_sequence").is_none(),
@@ -2118,7 +2143,7 @@ fn mesh_sequence_cache_reports_missing_and_changed_external_files() -> Result<()
     let source = temporary.path().join("source.pot");
     let archive = temporary.path().join("animated.abc");
     export_animated_cache(&source, &archive)?;
-    let original = fs::read(&archive)?;
+    let original = read_at(&archive)?;
     let expected_hash = potter_core::hash::sha256(&original);
 
     let missing_scene = temporary.path().join("missing.pot");
@@ -2138,7 +2163,7 @@ fn mesh_sequence_cache_reports_missing_and_changed_external_files() -> Result<()
     let mut changed = original;
     let last = changed.len() - 1;
     changed[last] ^= 1;
-    fs::write(&changed_file, changed)?;
+    write_at(&changed_file, changed)?;
     let changed_scene = temporary.path().join("changed.pot");
     init(&changed_scene)?;
     apply(
