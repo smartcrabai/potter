@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use glam::{DMat4, DQuat, DVec3};
+use glam::{DMat4, DQuat, DVec3, Mat4};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -1817,7 +1817,9 @@ impl Snapshot {
                             }
                             "VOXEL_AMOUNT" => {
                                 let amount = number("voxel_amount")?;
-                                let bounds = transformed.bounds().ok_or_else(|| {
+                                // Blender's `volume_compute_voxel_size` takes the operand's local bounds, not
+                                // the bounds of its transformed vertices (`MOD_mesh_to_volume.cc`).
+                                let bounds = operand_mesh.bounds().ok_or_else(|| {
                                     PotError::with_details(
                                         ErrorCode::InvalidArgument,
                                         "mesh-to-volume operand mesh is empty",
@@ -1831,8 +1833,18 @@ impl Snapshot {
                                         json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
                                     ));
                                 }
-                                (amount >= 1.0)
-                                    .then(|| (bounds.size().length() / amount) as f32 as f64)
+                                // Blender computes the diagonal between the transformed bounds corners and the
+                                // voxel size in single precision (`volume_compute_voxel_size`, float4x4 and
+                                // float3), then divides by max(1, amount) in single precision.
+                                (amount >= 1.0).then(|| {
+                                    let to_owner = Mat4::from_cols_array(
+                                        &operand_to_owner.to_cols_array().map(|value| value as f32),
+                                    );
+                                    let minimum = to_owner.transform_point3(bounds.min.as_vec3());
+                                    let maximum = to_owner.transform_point3(bounds.max.as_vec3());
+                                    let diagonal = (maximum - minimum).length();
+                                    f64::from(diagonal / (amount as f32).max(1.0))
+                                })
                             }
                             _ => {
                                 return Err(PotError::with_details(

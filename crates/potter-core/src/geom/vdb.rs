@@ -102,7 +102,70 @@ pub struct VdbTree {
     pub active_bbox: Option<([i32; 3], [i32; 3])>,
 }
 
-impl VdbTree {}
+impl VdbTree {
+    /// Index coordinates Blender treats as active: stored samples plus every voxel of an active tile.
+    /// Stored inactive non-background samples count as active because the reader keeps no per-voxel
+    /// activity flags.
+    pub(crate) fn active_seeds(&self, limit: usize) -> Result<Vec<IVec3>> {
+        let mut seeds: Vec<IVec3> = self.values.keys().copied().collect();
+        for tile in self.tiles.values().filter(|tile| tile.active) {
+            let count = (0..3)
+                .try_fold(1_usize, |count, axis| {
+                    let extent =
+                        usize::try_from(i64::from(tile.max[axis]) - i64::from(tile.min[axis]) + 1)
+                            .ok()?;
+                    count.checked_mul(extent)
+                })
+                .ok_or_else(|| limit_error("VDB active tile voxel count overflow"))?;
+            if seeds
+                .len()
+                .checked_add(count)
+                .is_none_or(|total| total > limit)
+            {
+                return Err(limit_error(
+                    "VDB active voxels exceed the displacement budget",
+                ));
+            }
+            for z in tile.min[2]..=tile.max[2] {
+                for y in tile.min[1]..=tile.max[1] {
+                    for x in tile.min[0]..=tile.max[0] {
+                        seeds.push(IVec3::new(x, y, z));
+                    }
+                }
+            }
+        }
+        Ok(seeds)
+    }
+
+    /// A tree with this background whose only voxels are `values`, with tight active bounds.
+    pub(crate) fn with_samples(&self, values: HashMap<IVec3, VdbValue>) -> Self {
+        let active_bbox = values.keys().fold(None, |bounds, point| {
+            let point = point.to_array();
+            Some(match bounds {
+                None => (point, point),
+                Some((minimum, maximum)) => (
+                    [
+                        minimum[0].min(point[0]),
+                        minimum[1].min(point[1]),
+                        minimum[2].min(point[2]),
+                    ],
+                    [
+                        maximum[0].max(point[0]),
+                        maximum[1].max(point[1]),
+                        maximum[2].max(point[2]),
+                    ],
+                ),
+            })
+        });
+        Self {
+            background: self.background,
+            background_value: self.background_value,
+            values,
+            tiles: HashMap::new(),
+            active_bbox,
+        }
+    }
+}
 
 /// An `OpenVDB` tile, whose value is constant over a power-of-two cube.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -147,6 +210,31 @@ impl VdbGrid {
     pub fn sample_index_component(&self, ijk: [i32; 3], component: usize) -> Option<f64> {
         self.sample_value(IVec3::from_array(ijk))
             .component(component)
+    }
+
+    /// Trilinearly sample one component at a fractional index position (`BoxSampler`), with the
+    /// background outside active data.
+    pub(crate) fn sample_index_component_trilinear(&self, index: DVec3, component: usize) -> f64 {
+        let lower = index.floor();
+        let fraction = index - lower;
+        let base = lower.to_array().map(|value| value as i32);
+        let mut result = 0.0_f64;
+        for z in 0..=1 {
+            for y in 0..=1 {
+                for x in 0..=1 {
+                    let weight = (if x == 0 { 1.0 - fraction.x } else { fraction.x })
+                        * (if y == 0 { 1.0 - fraction.y } else { fraction.y })
+                        * (if z == 0 { 1.0 - fraction.z } else { fraction.z });
+                    let point = IVec3::new(base[0] + x, base[1] + y, base[2] + z);
+                    let value = self
+                        .sample_value(point)
+                        .component(component)
+                        .map_or(0.0, f64::from);
+                    result += weight * value;
+                }
+            }
+        }
+        result
     }
 
     /// Trilinearly sample the grid in world coordinates.

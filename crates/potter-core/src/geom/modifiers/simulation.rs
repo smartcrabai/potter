@@ -1,12 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
-use glam::{DMat3, DMat4, DQuat, DVec3};
+use glam::{DMat3, DMat4, DQuat, DVec3, IVec3};
 use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
         Edge, Face, Mesh, Vertex, edge_key,
+        vdb::{VdbGrid, VdbValue, VdbVolume},
         volume::{VolumeData, VolumeGeneratedSource, VolumeGrid, VolumeSource},
     },
     sim::ParticleState,
@@ -750,6 +754,8 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<
     Ok(())
 }
 
+/// Blender's `MOD_volume_displace.cc` displaces every grid of the volume with the same texture
+/// (`DisplaceGridOp` in a loop over `BKE_volume_num_grids`), so each decoded grid is displaced in turn.
 fn displace_vdb_volume(
     volume: &VolumeData,
     texture: &mut VolumeDisplacement<'_>,
@@ -761,35 +767,47 @@ fn displace_vdb_volume(
             json!({"feature_id":"volume.openvdb_evaluation.resource"}),
         )
     })?;
-    if decoded.grids.len() > 1 {
-        return Err(unsupported(
-            "modifier.volume_displace.vdb_multiple_grids",
-            "Volume Displace supports one scalar VDB density grid at a time",
-        ));
-    }
-    let Some(grid) = decoded.density_grid() else {
-        return Err(unsupported(
-            "modifier.volume_displace.vdb_density_grid",
-            "VDB volume has no scalar density grid to displace",
-        ));
+    let grids = decoded
+        .grids
+        .iter()
+        .map(|grid| displace_vdb_grid(grid, texture))
+        .collect::<Result<Vec<_>>>()?;
+    let mut displaced = volume.clone();
+    displaced.decoded_vdb = Some(Arc::new(VdbVolume {
+        grids,
+        uuid: decoded.uuid.clone(),
+        library_version: decoded.library_version,
+    }));
+    Ok(displaced)
+}
+
+/// Upper bound on the displaced VDB samples, one million as Blender's `dilateActiveValues` budget.
+const MAX_DISPLACED_SAMPLES: usize = 1_000_000;
+
+/// Displaces one VDB grid as Blender's `DisplaceGridOp` does: the active voxels are dilated by the
+/// sample radius (`dilateActiveValues`, `NN_FACE_EDGE`), then each dilated voxel takes the
+/// box-sampled value of the original grid at `index - displacement`, where the displacement is
+/// `(texture - mid_level) * strength / max_voxel_side` in index units. Only float and vector grids
+/// are displaced.
+fn displace_vdb_grid(grid: &VdbGrid, texture: &mut VolumeDisplacement<'_>) -> Result<VdbGrid> {
+    let vector = match grid.value_type.split('_').nth(1) {
+        Some("float") => false,
+        Some("vec3s") => true,
+        _ => {
+            return Err(unsupported(
+                "modifier.volume_displace.vdb_grid_type",
+                "only float and vector VDB grids can be displaced",
+            ));
+        }
     };
-    if grid.value_type.split('_').nth(1) != Some("float") {
-        return Err(unsupported(
-            "modifier.volume_displace.vdb_grid_type",
-            "only scalar float VDB density grids can be displaced",
-        ));
-    }
-    let Some((active_minimum, active_maximum)) = grid.active_bbox else {
-        return Ok(volume.clone());
-    };
-    let voxel_size = grid.voxel_size().max_element();
-    if !voxel_size.is_finite() || voxel_size <= 0.0 {
+    let max_voxel_side = grid.voxel_size().max_element();
+    if !max_voxel_side.is_finite() || max_voxel_side <= 0.0 {
         return Err(invalid(
-            "VDB density grid transform must be finite with positive voxel_size",
+            "VDB grid transform must be finite with positive voxel_size",
         ));
     }
     let dilation_radius =
-        (texture.sample_radius * texture.strength.abs() / voxel_size / 2.0).ceil();
+        (texture.sample_radius * texture.strength.abs() / max_voxel_side / 2.0).ceil();
     if !dilation_radius.is_finite() || dilation_radius > 16.0 {
         return Err(limit("VDB displacement dilation exceeds 16 voxels"));
     }
@@ -797,88 +815,67 @@ fn displace_vdb_volume(
         clippy::cast_possible_truncation,
         reason = "validated ceil radius is integral and bounded to 16"
     )]
-    let padding = dilation_radius as i32;
-    let mut output_minimum = [0_i32; 3];
-    let mut output_maximum = [0_i32; 3];
-    let mut dimensions = [0_usize; 3];
-    for axis in 0..3 {
-        output_minimum[axis] = active_minimum[axis]
-            .checked_sub(padding)
-            .ok_or_else(|| limit("VDB displacement minimum index overflows"))?;
-        output_maximum[axis] = active_maximum[axis]
-            .checked_add(padding)
-            .ok_or_else(|| limit("VDB displacement maximum index overflows"))?;
-        let length = i64::from(output_maximum[axis]) - i64::from(output_minimum[axis]) + 1;
-        dimensions[axis] = usize::try_from(length)
-            .ok()
-            .filter(|dimension| *dimension > 0 && *dimension <= 512)
-            .ok_or_else(|| limit("displaced VDB grid exceeds the 512-voxel axis limit"))?;
+    let rounds = dilation_radius as i32;
+    let domain = dilate_face_edge(grid.tree.active_seeds(MAX_DISPLACED_SAMPLES)?, rounds)?;
+    let mut values = HashMap::with_capacity(domain.len());
+    for point in domain {
+        let index = DVec3::new(f64::from(point.x), f64::from(point.y), f64::from(point.z));
+        let object_position = grid.transform.index_to_world.transform_point3(index);
+        let source = index - texture.displacement_at(object_position)? / max_voxel_side;
+        let value = if vector {
+            VdbValue::Vec3(std::array::from_fn(|component| {
+                grid.sample_index_component_trilinear(source, component) as f32
+            }))
+        } else {
+            VdbValue::Float(grid.sample_index_component_trilinear(source, 0) as f32)
+        };
+        values.insert(point, value);
     }
-    let sample_count = dimensions
-        .iter()
-        .try_fold(1_usize, |count, dimension| count.checked_mul(*dimension))
-        .ok_or_else(|| limit("displaced VDB grid sample count overflows"))?;
-    if sample_count > 1_000_000 {
-        return Err(limit("displaced VDB grid exceeds one million samples"));
-    }
-    let index_to_world = grid.transform.index_to_world;
-    let output_offset = DVec3::new(
-        f64::from(output_minimum[0]),
-        f64::from(output_minimum[1]),
-        f64::from(output_minimum[2]),
-    );
-    let output_index_to_local = index_to_world * DMat4::from_translation(output_offset);
-    let output_origin = output_index_to_local.transform_point3(DVec3::ZERO);
-    let mut values = Vec::with_capacity(sample_count);
-    for z in 0..dimensions[2] {
-        for y in 0..dimensions[1] {
-            for x in 0..dimensions[0] {
-                let index = [
-                    output_minimum[0]
-                        + i32::try_from(x)
-                            .map_err(|_| limit("VDB output x index exceeds signed range"))?,
-                    output_minimum[1]
-                        + i32::try_from(y)
-                            .map_err(|_| limit("VDB output y index exceeds signed range"))?,
-                    output_minimum[2]
-                        + i32::try_from(z)
-                            .map_err(|_| limit("VDB output z index exceeds signed range"))?,
-                ];
-                let index_position = DVec3::new(
-                    f64::from(index[0]),
-                    f64::from(index[1]),
-                    f64::from(index[2]),
-                );
-                let object_position = index_to_world.transform_point3(index_position);
-                let displacement = texture.displacement_at(object_position)? / voxel_size;
-                let source_position =
-                    index_to_world.transform_point3(index_position - displacement);
-                let value = grid.sample_world(source_position).max(0.0);
-                if !value.is_finite() || value > f64::from(f32::MAX) {
-                    return Err(invalid("VDB displacement produced a non-finite density"));
+    let tree = grid.tree.with_samples(values);
+    Ok(VdbGrid {
+        name: grid.name.clone(),
+        class: grid.class.clone(),
+        value_type: grid.value_type.clone(),
+        transform: grid.transform,
+        active_bbox: tree.active_bbox,
+        tree: Arc::new(tree),
+    })
+}
+
+/// Blender's `dilateActiveValues` with `NN_FACE_EDGE`: each round adds the 18 face and edge
+/// neighbours of the voxels the previous round added.
+fn dilate_face_edge(seeds: Vec<IVec3>, rounds: i32) -> Result<HashSet<IVec3>> {
+    let mut offsets = Vec::with_capacity(18);
+    for z in -1_i32..=1 {
+        for y in -1_i32..=1 {
+            for x in -1_i32..=1 {
+                if (1..=2).contains(&(x.abs() + y.abs() + z.abs())) {
+                    offsets.push(IVec3::new(x, y, z));
                 }
-                values.push(value as f32);
             }
         }
     }
-    let mut displaced = volume.clone();
-    displaced.source = VolumeSource::Generated(VolumeGeneratedSource {
-        algorithm: "volume_displace_vdb".to_owned(),
-    });
-    displaced.decoded_vdb = None;
-    displaced.grids = vec![VolumeGrid {
-        dims: [
-            u32::try_from(dimensions[0]).map_err(|_| limit("VDB grid dimension exceeds limits"))?,
-            u32::try_from(dimensions[1]).map_err(|_| limit("VDB grid dimension exceeds limits"))?,
-            u32::try_from(dimensions[2]).map_err(|_| limit("VDB grid dimension exceeds limits"))?,
-        ],
-        voxel_size,
-        origin: output_origin,
-        index_to_local: Some(output_index_to_local.to_cols_array()),
-        values: Some(values),
-        ..VolumeGrid::default()
-    }];
-    Ok(displaced)
+    let mut domain: HashSet<IVec3> = seeds.into_iter().collect();
+    let mut frontier: Vec<IVec3> = domain.iter().copied().collect();
+    for _ in 0..rounds {
+        let mut added = Vec::new();
+        for point in &frontier {
+            for offset in &offsets {
+                let candidate = *point + *offset;
+                if domain.insert(candidate) {
+                    if domain.len() > MAX_DISPLACED_SAMPLES {
+                        return Err(limit("displaced VDB grid exceeds one million samples"));
+                    }
+                    added.push(candidate);
+                }
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        frontier = added;
+    }
+    Ok(domain)
 }
 
 fn append_instances(mesh: &Mesh, transforms: &[(DMat4, DVec3)]) -> Result<Mesh> {
