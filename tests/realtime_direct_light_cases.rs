@@ -137,10 +137,6 @@ fn realtime_direct_light_cases_match_eevee() -> TestResult {
             serde_json::from_value(read_scene(&project)?["images"]["render"].clone())?;
         let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
         let deviation = deviation(&data, &oracle)?;
-        if case.name == "sun_angle" {
-            // Diagnostic: Potter's and EEVEE's full row through the sphere's penumbra, printed on failure.
-            dump_row(&data, &oracle, -0.515_625)?;
-        }
         assert!(
             deviation.max <= case.max,
             "{}: the largest deviation {} at world {:?} (Potter {:?}, EEVEE {:?}) exceeds {}",
@@ -158,35 +154,6 @@ fn realtime_direct_light_cases_match_eevee() -> TestResult {
             deviation.mean,
             case.mean
         );
-    }
-    Ok(())
-}
-
-/// Prints Potter's and EEVEE's red channel along the plane row nearest `y`, as `x, potter, eevee`.
-fn dump_row(
-    data: &potter_core::image::ImageData,
-    oracle: &Value,
-    y: f64,
-) -> Result<(), Box<dyn Error>> {
-    let samples = oracle["samples"]
-        .as_array()
-        .ok_or("the EEVEE samples are missing")?;
-    let mut row = Vec::new();
-    for sample_value in samples {
-        let world = pair(&sample_value["world"])?;
-        if (world[1] - y).abs() < 0.5 * ORTHO_SCALE / SIZE as f64 {
-            let uv = [
-                (world[0] + ORTHO_SCALE / 2.0) / ORTHO_SCALE,
-                (world[1] + ORTHO_SCALE / 2.0) / ORTHO_SCALE,
-            ];
-            let potter = sample(data, uv, false)[0];
-            let eevee = triple(&sample_value["rgb"])?[0];
-            row.push((world[0], potter, eevee));
-        }
-    }
-    row.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (x, potter, eevee) in row {
-        eprintln!("ROW x={x:+.4} potter={potter:.4} eevee={eevee:.4}");
     }
     Ok(())
 }

@@ -42,8 +42,8 @@ use super::{
         make_orthonormals, sheen_coefficient, specular_coefficient,
     },
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
-        blend_corner_normals, blend_uv,
+        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, ambient_visibility,
+        blend_color, blend_corner_normals, blend_uv,
     },
     studio,
     wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
@@ -2332,6 +2332,16 @@ fn shade(
             )
         })
         .transpose()?;
+    // Ambient occlusion attenuates the environment (indirect) light only, as EEVEE's horizon scan does; EEVEE's direct
+    // light is never occluded by it. The hemisphere is the one the raster's occlusion pass casts (`ambient_visibility`).
+    let ambient = shadow.map_or(1.0, |scene| {
+        let facing = if geometric.dot(view) < 0.0 {
+            -geometric
+        } else {
+            geometric
+        };
+        ambient_visibility(scene.bvh, scene.triangles, point, facing, normal, 1.0)
+    });
     // A closure's reflective share is its weight times its alpha. The raster composite multiplies a straight colour
     // by the opaque share (`render/raster.rs`, `composite_sample`), so the premultiplied sums are divided by it below.
     let mut reflected = DVec3::ZERO;
@@ -2361,18 +2371,19 @@ fn shade(
         );
         let mut lobes = DVec3::ZERO;
         if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
-            lobes += albedo * diffuse_environment * dielectric * lower;
+            let mut environment = albedo * diffuse_environment * dielectric * lower;
             let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
             let specular_environment =
                 prefiltered_probe(world, &doc.node_groups, images, reflection, roughness)?;
             let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
             let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
-            lobes += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
+            environment += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
             if let Some(glass) =
                 eevee_transmission::glass_closures(params, normal, view, lower, thickness)
             {
-                lobes += glass_environment(world, &doc.node_groups, images, &glass)?;
+                environment += glass_environment(world, &doc.node_groups, images, &glass)?;
             }
+            lobes += environment * ambient;
         }
         let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
         for (id, light_node) in &doc.nodes {

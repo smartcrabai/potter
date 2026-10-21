@@ -802,8 +802,9 @@ pub(crate) fn rasterize_with_samples(
                             average[channel] * previous_weight + sample_color[channel] / count;
                     }
                 }
-                // Solid mirrors Blender Workbench, which shows no ambient occlusion by default.
-                let ao_in_color = !matches!(mode, Mode::Solid);
+                // Beauty applies occlusion to the environment light in its shading (`scene.rs` `shade`), as EEVEE's horizon
+                // scan does. Workbench (Solid) shows none by default, and the wire overlay keeps the composite's.
+                let ao_in_color = matches!(mode, Mode::Wire);
                 if let Some(ao) = ambient_occlusion
                     .get(pixel_index)
                     .copied()
