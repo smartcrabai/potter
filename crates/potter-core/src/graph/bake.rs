@@ -10,6 +10,7 @@ use std::{
 use cap_fs_ext::OpenOptionsExt as CapOpenOptionsExt;
 use cap_fs_ext::OpenOptionsFollowExt;
 use cap_primitives::fs as cap_fs;
+#[cfg(not(unix))]
 use cap_std::{ambient_authority, fs::Dir as CapDir};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
@@ -993,9 +994,29 @@ pub(crate) fn read_node_bake_payload_limited(
 }
 
 fn open_project_root(project_root: &Path) -> Result<File> {
-    CapDir::open_ambient_dir(project_root, ambient_authority())
-        .map(CapDir::into_std_file)
-        .map_err(|error| PotError::io(&error))
+    // cap-std's Linux ambient open uses O_PATH, which rejects fsync with EBADF; a plain read-only
+    // directory descriptor is needed for the directory sync after each rename.
+    #[cfg(unix)]
+    {
+        let root = File::open(project_root).map_err(|error| PotError::io(&error))?;
+        if !root
+            .metadata()
+            .map_err(|error| PotError::io(&error))?
+            .is_dir()
+        {
+            return Err(PotError::new(
+                ErrorCode::InvalidArgument,
+                "node-bake project root is not a directory",
+            ));
+        }
+        Ok(root)
+    }
+    #[cfg(not(unix))]
+    {
+        CapDir::open_ambient_dir(project_root, ambient_authority())
+            .map(CapDir::into_std_file)
+            .map_err(|error| PotError::io(&error))
+    }
 }
 
 fn open_directory_chain(root: &File, relative: &Path, create: bool) -> Result<Option<File>> {

@@ -685,7 +685,7 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     transaction.commit()?;
     Ok((
         Some(scene),
-        json!({"kind":"node-bake","action":"bake","target":target,"modifier":modifier_id,"node":node_id,"storage":bake_target.to_ascii_lowercase(),"resource_id":resource_id,"frames":frames,"scene_modified":true}),
+        json!({"kind":"node-bake","action":"bake","target":target,"modifier":modifier_id,"node":node_id,"storage":bake_target.to_ascii_lowercase(),"resource_id":resource_id,"frame_count":frames.len(),"scene_modified":true}),
     ))
 }
 

@@ -532,7 +532,7 @@
       "observations": {
         "initial_bake": {
           "bake_count": 1,
-          "bake_id": 2105303525,
+          "bake_id": 633451654,
           "node": "Bake",
           "bake_mode": "STILL",
           "bake_target": "INHERIT",
@@ -2451,7 +2451,7 @@
       "observations": {
         "before_bake": {
           "bake_count": 1,
-          "bake_id": 506245631,
+          "bake_id": 664125680,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -2466,7 +2466,7 @@
         },
         "after_bake": {
           "bake_count": 1,
-          "bake_id": 506245631,
+          "bake_id": 664125680,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -2481,7 +2481,7 @@
         },
         "after_delete": {
           "bake_count": 1,
-          "bake_id": 506245631,
+          "bake_id": 664125680,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -3248,7 +3248,7 @@
       "observations": {
         "default_bake": {
           "bake_count": 1,
-          "bake_id": 1126683190,
+          "bake_id": 491231871,
           "node": "Bake",
           "bake_mode": "STILL",
           "bake_target": "INHERIT",
@@ -3263,7 +3263,7 @@
         },
         "after_still_bake": {
           "bake_count": 1,
-          "bake_id": 1126683190,
+          "bake_id": 491231871,
           "node": "Bake",
           "bake_mode": "STILL",
           "bake_target": "INHERIT",
@@ -3278,7 +3278,7 @@
         },
         "after_scene_range_change": {
           "bake_count": 1,
-          "bake_id": 1126683190,
+          "bake_id": 491231871,
           "node": "Bake",
           "bake_mode": "STILL",
           "bake_target": "INHERIT",
@@ -4138,7 +4138,7 @@
       "observations": {
         "before_save": {
           "bake_count": 1,
-          "bake_id": 1802473270,
+          "bake_id": 645270619,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -4158,7 +4158,7 @@
         "extra_directories_after_save": [],
         "after_reopen_bake": {
           "bake_count": 1,
-          "bake_id": 1802473270,
+          "bake_id": 645270619,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -5862,7 +5862,7 @@
       "observations": {
         "after_bake": {
           "bake_count": 1,
-          "bake_id": 950397073,
+          "bake_id": 2079169420,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -5877,22 +5877,22 @@
         },
         "disk_root_absolute": "/private/tmp/pr18n/oracle/work/s5/oracle_disk_bake",
         "disk_tree": [
-          "950397073/",
-          "950397073/blobs/",
-          "950397073/blobs/00001_00000.blob",
-          "950397073/blobs/00002_00000.blob",
-          "950397073/blobs/00003_00000.blob",
-          "950397073/blobs/00004_00000.blob",
-          "950397073/blobs/00005_00000.blob",
-          "950397073/meta/",
-          "950397073/meta/00001_00000.json",
-          "950397073/meta/00002_00000.json",
-          "950397073/meta/00003_00000.json",
-          "950397073/meta/00004_00000.json",
-          "950397073/meta/00005_00000.json"
+          "2079169420/",
+          "2079169420/blobs/",
+          "2079169420/blobs/00001_00000.blob",
+          "2079169420/blobs/00002_00000.blob",
+          "2079169420/blobs/00003_00000.blob",
+          "2079169420/blobs/00004_00000.blob",
+          "2079169420/blobs/00005_00000.blob",
+          "2079169420/meta/",
+          "2079169420/meta/00001_00000.json",
+          "2079169420/meta/00002_00000.json",
+          "2079169420/meta/00003_00000.json",
+          "2079169420/meta/00004_00000.json",
+          "2079169420/meta/00005_00000.json"
         ],
         "meta_example": {
-          "path": "950397073/meta/00001_00000.json",
+          "path": "2079169420/meta/00001_00000.json",
           "head_300": "{\"version\":3,\"items\":{\"0\":{\"value_name\":\"Geometry\",\"type\":\"GEOMETRY\",\"data\":{\"mesh\":{\"num_vertices\":8,\"num_edges\":12,\"num_polygons\":6,\"num_corners\":24,\"poly_offsets\":{\"name\":\"00001_00000.blob\",\"start\":0,\"size\":28},\"materials\":[],\"default_uv_map_name\":\"UVMap\",\"attributes\":[{\"name\":\"UVMap\",\"domain\":\"C",
           "top_level_keys": [
             "items",
@@ -5911,7 +5911,7 @@
         },
         "after_reopen_bake": {
           "bake_count": 1,
-          "bake_id": 950397073,
+          "bake_id": 2079169420,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -5936,7 +5936,7 @@
         },
         "after_dir_deleted_bake": {
           "bake_count": 1,
-          "bake_id": 950397073,
+          "bake_id": 2079169420,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -5962,19 +5962,19 @@
       },
       "files": [
         "/tmp/pr18n/oracle/work/s5/s5.blend",
-        "950397073/",
-        "950397073/blobs/",
-        "950397073/blobs/00001_00000.blob",
-        "950397073/blobs/00002_00000.blob",
-        "950397073/blobs/00003_00000.blob",
-        "950397073/blobs/00004_00000.blob",
-        "950397073/blobs/00005_00000.blob",
-        "950397073/meta/",
-        "950397073/meta/00001_00000.json",
-        "950397073/meta/00002_00000.json",
-        "950397073/meta/00003_00000.json",
-        "950397073/meta/00004_00000.json",
-        "950397073/meta/00005_00000.json"
+        "2079169420/",
+        "2079169420/blobs/",
+        "2079169420/blobs/00001_00000.blob",
+        "2079169420/blobs/00002_00000.blob",
+        "2079169420/blobs/00003_00000.blob",
+        "2079169420/blobs/00004_00000.blob",
+        "2079169420/blobs/00005_00000.blob",
+        "2079169420/meta/",
+        "2079169420/meta/00001_00000.json",
+        "2079169420/meta/00002_00000.json",
+        "2079169420/meta/00003_00000.json",
+        "2079169420/meta/00004_00000.json",
+        "2079169420/meta/00005_00000.json"
       ],
       "notes": [
         "Relative directory resolved against the saved .blend location (work/s5/).",
@@ -6821,7 +6821,7 @@
       "observations": {
         "after_bake": {
           "bake_count": 1,
-          "bake_id": 1431327766,
+          "bake_id": 629608035,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -6837,23 +6837,23 @@
         "walk_blend_dir_after_bake": [
           "blendcache_s6_default/",
           "blendcache_s6_default/Cube_Nodes/",
-          "blendcache_s6_default/Cube_Nodes/1431327766/",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00001_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00002_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00003_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00004_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00005_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00001_00000.json",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00002_00000.json",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00003_00000.json",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00004_00000.json",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00005_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00001_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00002_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00003_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00004_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00005_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00001_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00002_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00003_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00004_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00005_00000.json",
           "s6_default.blend"
         ],
         "meta_example": {
-          "path": "blendcache_s6_default/Cube_Nodes/1431327766/meta/00001_00000.json",
+          "path": "blendcache_s6_default/Cube_Nodes/629608035/meta/00001_00000.json",
           "head_300": "{\"version\":3,\"items\":{\"0\":{\"value_name\":\"Geometry\",\"type\":\"GEOMETRY\",\"data\":{\"mesh\":{\"num_vertices\":8,\"num_edges\":12,\"num_polygons\":6,\"num_corners\":24,\"poly_offsets\":{\"name\":\"00001_00000.blob\",\"start\":0,\"size\":28},\"materials\":[],\"default_uv_map_name\":\"UVMap\",\"attributes\":[{\"name\":\"UVMap\",\"domain\":\"C",
           "top_level_keys": [
             "items",
@@ -6861,10 +6861,10 @@
           ]
         },
         "default_root_absolute": "/private/tmp/pr18n/oracle/work/s6/blendcache_s6_default",
-        "default_bake_absolute": "/private/tmp/pr18n/oracle/work/s6/blendcache_s6_default/Cube_Nodes/1431327766",
+        "default_bake_absolute": "/private/tmp/pr18n/oracle/work/s6/blendcache_s6_default/Cube_Nodes/629608035",
         "after_reopen_bake": {
           "bake_count": 1,
-          "bake_id": 1431327766,
+          "bake_id": 629608035,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -6880,19 +6880,19 @@
         "walk_blend_dir_after_save": [
           "blendcache_s6_default/",
           "blendcache_s6_default/Cube_Nodes/",
-          "blendcache_s6_default/Cube_Nodes/1431327766/",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00001_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00002_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00003_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00004_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00005_00000.blob",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00001_00000.json",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00002_00000.json",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00003_00000.json",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00004_00000.json",
-          "blendcache_s6_default/Cube_Nodes/1431327766/meta/00005_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00001_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00002_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00003_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00004_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/blobs/00005_00000.blob",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00001_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00002_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00003_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00004_00000.json",
+          "blendcache_s6_default/Cube_Nodes/629608035/meta/00005_00000.json",
           "s6_default.blend",
           "s6_default.blend1"
         ]
@@ -6901,19 +6901,19 @@
         "/tmp/pr18n/oracle/work/s6/s6_default.blend",
         "blendcache_s6_default/",
         "blendcache_s6_default/Cube_Nodes/",
-        "blendcache_s6_default/Cube_Nodes/1431327766/",
-        "blendcache_s6_default/Cube_Nodes/1431327766/blobs/",
-        "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00001_00000.blob",
-        "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00002_00000.blob",
-        "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00003_00000.blob",
-        "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00004_00000.blob",
-        "blendcache_s6_default/Cube_Nodes/1431327766/blobs/00005_00000.blob",
-        "blendcache_s6_default/Cube_Nodes/1431327766/meta/",
-        "blendcache_s6_default/Cube_Nodes/1431327766/meta/00001_00000.json",
-        "blendcache_s6_default/Cube_Nodes/1431327766/meta/00002_00000.json",
-        "blendcache_s6_default/Cube_Nodes/1431327766/meta/00003_00000.json",
-        "blendcache_s6_default/Cube_Nodes/1431327766/meta/00004_00000.json",
-        "blendcache_s6_default/Cube_Nodes/1431327766/meta/00005_00000.json",
+        "blendcache_s6_default/Cube_Nodes/629608035/",
+        "blendcache_s6_default/Cube_Nodes/629608035/blobs/",
+        "blendcache_s6_default/Cube_Nodes/629608035/blobs/00001_00000.blob",
+        "blendcache_s6_default/Cube_Nodes/629608035/blobs/00002_00000.blob",
+        "blendcache_s6_default/Cube_Nodes/629608035/blobs/00003_00000.blob",
+        "blendcache_s6_default/Cube_Nodes/629608035/blobs/00004_00000.blob",
+        "blendcache_s6_default/Cube_Nodes/629608035/blobs/00005_00000.blob",
+        "blendcache_s6_default/Cube_Nodes/629608035/meta/",
+        "blendcache_s6_default/Cube_Nodes/629608035/meta/00001_00000.json",
+        "blendcache_s6_default/Cube_Nodes/629608035/meta/00002_00000.json",
+        "blendcache_s6_default/Cube_Nodes/629608035/meta/00003_00000.json",
+        "blendcache_s6_default/Cube_Nodes/629608035/meta/00004_00000.json",
+        "blendcache_s6_default/Cube_Nodes/629608035/meta/00005_00000.json",
         "s6_default.blend",
         "s6_default.blend1"
       ],
@@ -8177,7 +8177,7 @@
       "observations": {
         "after_bake": {
           "bake_count": 1,
-          "bake_id": 1824758675,
+          "bake_id": 2057835662,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -8192,7 +8192,7 @@
         },
         "after_dir_change_snapshot": {
           "bake_count": 1,
-          "bake_id": 1824758675,
+          "bake_id": 2057835662,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -8207,7 +8207,7 @@
         },
         "after_reopen_bake": {
           "bake_count": 1,
-          "bake_id": 1824758675,
+          "bake_id": 2057835662,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -8221,19 +8221,19 @@
           "modifier_bake_directory": "//empty_dir"
         },
         "s7_disk_tree": [
-          "1824758675/",
-          "1824758675/blobs/",
-          "1824758675/blobs/00001_00000.blob",
-          "1824758675/blobs/00002_00000.blob",
-          "1824758675/blobs/00003_00000.blob",
-          "1824758675/blobs/00004_00000.blob",
-          "1824758675/blobs/00005_00000.blob",
-          "1824758675/meta/",
-          "1824758675/meta/00001_00000.json",
-          "1824758675/meta/00002_00000.json",
-          "1824758675/meta/00003_00000.json",
-          "1824758675/meta/00004_00000.json",
-          "1824758675/meta/00005_00000.json"
+          "2057835662/",
+          "2057835662/blobs/",
+          "2057835662/blobs/00001_00000.blob",
+          "2057835662/blobs/00002_00000.blob",
+          "2057835662/blobs/00003_00000.blob",
+          "2057835662/blobs/00004_00000.blob",
+          "2057835662/blobs/00005_00000.blob",
+          "2057835662/meta/",
+          "2057835662/meta/00001_00000.json",
+          "2057835662/meta/00002_00000.json",
+          "2057835662/meta/00003_00000.json",
+          "2057835662/meta/00004_00000.json",
+          "2057835662/meta/00005_00000.json"
         ],
         "empty_dir_tree": [],
         "same_session_equals_after_bake": {
@@ -8259,19 +8259,19 @@
       },
       "files": [
         "/tmp/pr18n/oracle/work/s7/s7.blend",
-        "1824758675/",
-        "1824758675/blobs/",
-        "1824758675/blobs/00001_00000.blob",
-        "1824758675/blobs/00002_00000.blob",
-        "1824758675/blobs/00003_00000.blob",
-        "1824758675/blobs/00004_00000.blob",
-        "1824758675/blobs/00005_00000.blob",
-        "1824758675/meta/",
-        "1824758675/meta/00001_00000.json",
-        "1824758675/meta/00002_00000.json",
-        "1824758675/meta/00003_00000.json",
-        "1824758675/meta/00004_00000.json",
-        "1824758675/meta/00005_00000.json"
+        "2057835662/",
+        "2057835662/blobs/",
+        "2057835662/blobs/00001_00000.blob",
+        "2057835662/blobs/00002_00000.blob",
+        "2057835662/blobs/00003_00000.blob",
+        "2057835662/blobs/00004_00000.blob",
+        "2057835662/blobs/00005_00000.blob",
+        "2057835662/meta/",
+        "2057835662/meta/00001_00000.json",
+        "2057835662/meta/00002_00000.json",
+        "2057835662/meta/00003_00000.json",
+        "2057835662/meta/00004_00000.json",
+        "2057835662/meta/00005_00000.json"
       ],
       "notes": [
         "//empty_dir was created empty before the change; //s7_disk holds the bake files.",
@@ -8754,7 +8754,7 @@
       "observations": {
         "after_bake": {
           "bake_count": 1,
-          "bake_id": 771453935,
+          "bake_id": 1711393012,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -9659,7 +9659,7 @@
         ],
         "after_bake": {
           "bake_count": 1,
-          "bake_id": 89476176,
+          "bake_id": 425189901,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -11128,7 +11128,7 @@
       "observations": {
         "after_bake": {
           "bake_count": 1,
-          "bake_id": 1610664188,
+          "bake_id": 267770580,
           "node": "Bake",
           "bake_mode": "ANIMATION",
           "bake_target": "INHERIT",
@@ -11205,6 +11205,7496 @@
       "files": [],
       "notes": [
         "Shift > 1.25 selects a 42-vertex IcoSphere; otherwise an 8-vertex Cube. Frame 2 (Shift 1.0) is Cube, frame 3 (Shift 1.5) is IcoSphere."
+      ]
+    },
+    {
+      "scenario": "S11_disk_missing_frame",
+      "title": "DISK bake with one missing frame after input change and reopen",
+      "samples": [
+        {
+          "phase": "after_missing_frame",
+          "frame": 0,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_missing_frame",
+          "frame": 1,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_missing_frame",
+          "frame": 2,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_missing_frame",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_missing_frame",
+          "frame": 3,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_missing_frame",
+          "frame": 3,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.75,
+          "max_x": 2.75,
+          "mean_x": 1.75,
+          "positions": [
+            [
+              0.75,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.75,
+              -1.0,
+              1.0
+            ],
+            [
+              0.75,
+              1.0,
+              -1.0
+            ],
+            [
+              0.75,
+              1.0,
+              1.0
+            ],
+            [
+              2.75,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.75,
+              -1.0,
+              1.0
+            ],
+            [
+              2.75,
+              1.0,
+              -1.0
+            ],
+            [
+              2.75,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_missing_frame",
+          "frame": 4,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_missing_frame",
+          "frame": 5,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_missing_frame",
+          "frame": 6,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        }
+      ],
+      "observations": {
+        "after_reopen_bake": {
+          "bake_count": 1,
+          "bake_id": 1156366892,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "INHERIT",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s11_disk"
+        },
+        "cache_files_after_missing_frame": [
+          "blobs/",
+          "blobs/00001_00000.blob",
+          "blobs/00002_00000.blob",
+          "blobs/00004_00000.blob",
+          "blobs/00005_00000.blob",
+          "meta/",
+          "meta/00001_00000.json",
+          "meta/00002_00000.json",
+          "meta/00004_00000.json",
+          "meta/00005_00000.json"
+        ],
+        "vertex_count_by_frame": {
+          "0.0": 8,
+          "1.0": 8,
+          "2.0": 8,
+          "2.5": 8,
+          "3.0": 8,
+          "3.5": 8,
+          "4.0": 8,
+          "5.0": 8,
+          "6.0": 8
+        },
+        "min_x_by_frame": {
+          "0.0": -0.5,
+          "1.0": -0.5,
+          "2.0": 0.0,
+          "2.5": 0.25,
+          "3.0": 0.5,
+          "3.5": 0.75,
+          "4.0": 1.0,
+          "5.0": 1.5,
+          "6.0": 1.5
+        }
+      },
+      "files": [
+        "/tmp/pr18n/oracle/work/s11/s11.blend",
+        "blobs/",
+        "blobs/00001_00000.blob",
+        "blobs/00002_00000.blob",
+        "blobs/00004_00000.blob",
+        "blobs/00005_00000.blob",
+        "meta/",
+        "meta/00001_00000.json",
+        "meta/00002_00000.json",
+        "meta/00004_00000.json",
+        "meta/00005_00000.json"
+      ],
+      "notes": [
+        "The ANIMATION bake is saved to disk, then the live mesh is replaced with a 42-vertex IcoSphere and Shift=100.",
+        "The frame-3 metadata and blob files are deleted before reopening the .blend in a fresh Blender process."
+      ]
+    },
+    {
+      "scenario": "S12_point_field_item",
+      "title": "Bake a POINT-domain FLOAT field derived from Position",
+      "samples": [
+        {
+          "phase": "after_bake",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 0.5,
+          "vertex_count": 8,
+          "min_x": -1.5,
+          "max_x": 2.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -1.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -1.5,
+          "max_x": 2.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -1.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 98.0,
+          "max_x": 102.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              98.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              98.0,
+              -1.0,
+              1.0
+            ],
+            [
+              98.0,
+              1.0,
+              -1.0
+            ],
+            [
+              98.0,
+              1.0,
+              1.0
+            ],
+            [
+              102.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              102.0,
+              -1.0,
+              1.0
+            ],
+            [
+              102.0,
+              1.0,
+              -1.0
+            ],
+            [
+              102.0,
+              1.0,
+              1.0
+            ]
+          ]
+        }
+      ],
+      "observations": {
+        "bake_items": [
+          [
+            "Geometry",
+            "GEOMETRY",
+            "POINT"
+          ],
+          [
+            "X",
+            "FLOAT",
+            "POINT"
+          ]
+        ],
+        "after_bake": {
+          "bake_count": 1,
+          "bake_id": 787474183,
+          "node": "Bake",
+          "bake_mode": "STILL",
+          "bake_target": "INHERIT",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "PACKED",
+          "modifier_bake_directory": ""
+        },
+        "input_change_keeps_bake": true,
+        "after_delete": {
+          "bake_count": 1,
+          "bake_id": 787474183,
+          "node": "Bake",
+          "bake_mode": "STILL",
+          "bake_target": "INHERIT",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "PACKED",
+          "modifier_bake_directory": ""
+        }
+      },
+      "files": [],
+      "notes": [
+        "The Bake node captures Geometry and a POINT-domain FLOAT field (Position.x + Shift).",
+        "Changing Shift from 0.5 to 100 leaves the cached field and geometry intact; delete resumes live field evaluation."
+      ]
+    },
+    {
+      "scenario": "S13_node_custom_disk_settings",
+      "title": "Bake-node DISK target, custom path, and frame range",
+      "samples": [
+        {
+          "phase": "after_bake",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 0.5,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_bake",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 1.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_bake",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 1.5,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_bake",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 2.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_bake",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 2.5,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_reopen",
+          "frame": 1,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_reopen",
+          "frame": 2,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_reopen",
+          "frame": 3,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_reopen",
+          "frame": 4,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_reopen",
+          "frame": 5,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        }
+      ],
+      "observations": {
+        "after_bake": {
+          "bake_count": 1,
+          "bake_id": 221929990,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 2,
+          "frame_end": 4,
+          "use_custom_simulation_frame_range": true,
+          "use_custom_path": true,
+          "directory": "//node_cache",
+          "data_blocks": 0,
+          "modifier_bake_target": "PACKED",
+          "modifier_bake_directory": "//modifier_cache"
+        },
+        "node_cache_tree": [
+          "blobs/",
+          "blobs/00002_00000.blob",
+          "blobs/00003_00000.blob",
+          "blobs/00004_00000.blob",
+          "meta/",
+          "meta/00002_00000.json",
+          "meta/00003_00000.json",
+          "meta/00004_00000.json"
+        ],
+        "modifier_cache_tree": null,
+        "after_reopen_bake": {
+          "bake_count": 1,
+          "bake_id": 221929990,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 2,
+          "frame_end": 4,
+          "use_custom_simulation_frame_range": true,
+          "use_custom_path": true,
+          "directory": "//node_cache",
+          "data_blocks": 0,
+          "modifier_bake_target": "PACKED",
+          "modifier_bake_directory": "//modifier_cache"
+        },
+        "after_reopen_equals_after_input_change": {
+          "1": true,
+          "2": true,
+          "3": true,
+          "4": true,
+          "5": true
+        },
+        "after_delete": {
+          "bake_count": 1,
+          "bake_id": 221929990,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 2,
+          "frame_end": 4,
+          "use_custom_simulation_frame_range": true,
+          "use_custom_path": true,
+          "directory": "//node_cache",
+          "data_blocks": 0,
+          "modifier_bake_target": "PACKED",
+          "modifier_bake_directory": "//modifier_cache"
+        },
+        "node_cache_tree_after_delete": null,
+        "modifier_cache_tree_after_delete": null
+      },
+      "files": [
+        "/tmp/pr18n/oracle/work/s13/s13.blend",
+        "s13.blend",
+        "s13.blend1"
+      ],
+      "notes": [
+        "The Bake node overrides modifier PACKED with DISK and uses its //node_cache path, not modifier //modifier_cache.",
+        "The custom 2..4 frame range clamps at its endpoints and cached values survive input changes and reopen."
+      ]
+    },
+    {
+      "scenario": "S14_point_attribute_item",
+      "title": "Bake attribute-field output from a POINT-domain FLOAT item",
+      "samples": [
+        {
+          "phase": "after_bake",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 0.5,
+          "vertex_count": 8,
+          "min_x": -1.5,
+          "max_x": 2.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -1.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -1.5,
+          "max_x": 2.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -1.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 98.0,
+          "max_x": 102.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              98.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              98.0,
+              -1.0,
+              1.0
+            ],
+            [
+              98.0,
+              1.0,
+              -1.0
+            ],
+            [
+              98.0,
+              1.0,
+              1.0
+            ],
+            [
+              102.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              102.0,
+              -1.0,
+              1.0
+            ],
+            [
+              102.0,
+              1.0,
+              -1.0
+            ],
+            [
+              102.0,
+              1.0,
+              1.0
+            ]
+          ]
+        }
+      ],
+      "observations": {
+        "bake_item": {
+          "name": "X",
+          "socket_type": "FLOAT",
+          "is_attribute": true,
+          "attribute_domain": "POINT"
+        },
+        "after_bake": {
+          "bake_count": 1,
+          "bake_id": 1819928684,
+          "node": "Bake",
+          "bake_mode": "STILL",
+          "bake_target": "INHERIT",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "PACKED",
+          "modifier_bake_directory": ""
+        },
+        "attribute_after_bake": {
+          "domain": "POINT",
+          "data_type": "FLOAT",
+          "values": [
+            -0.5,
+            -0.5,
+            -0.5,
+            -0.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5
+          ]
+        },
+        "attribute_after_input_change": {
+          "domain": "POINT",
+          "data_type": "FLOAT",
+          "values": [
+            -0.5,
+            -0.5,
+            -0.5,
+            -0.5,
+            1.5,
+            1.5,
+            1.5,
+            1.5
+          ]
+        },
+        "after_delete": {
+          "bake_count": 1,
+          "bake_id": 1819928684,
+          "node": "Bake",
+          "bake_mode": "STILL",
+          "bake_target": "INHERIT",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "PACKED",
+          "modifier_bake_directory": ""
+        },
+        "attribute_after_delete": {
+          "domain": "POINT",
+          "data_type": "FLOAT",
+          "values": [
+            99.0,
+            99.0,
+            99.0,
+            99.0,
+            101.0,
+            101.0,
+            101.0,
+            101.0
+          ]
+        }
+      },
+      "files": [],
+      "notes": [
+        "The Bake item is marked as an attribute and is stored on the baked geometry.",
+        "The named attribute is sampled through Store Named Attribute downstream before and after delete."
+      ]
+    },
+    {
+      "scenario": "S15_disk_pack_unpack_original",
+      "title": "Pack a disk Bake-node cache, reopen it, then unpack to its original path",
+      "samples": [
+        {
+          "phase": "after_disk_bake",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 0.5,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 0.5,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 1.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 1.25,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 1.5,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 2.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 2.5,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 2.5,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_input_change",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_reopen",
+          "frame": 0,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_reopen",
+          "frame": 1,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_reopen",
+          "frame": 2,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_reopen",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_reopen",
+          "frame": 3,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_reopen",
+          "frame": 4,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_reopen",
+          "frame": 5,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_reopen",
+          "frame": 6,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_original",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_original",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_original",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_original",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_original",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_original",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_original",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_original",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_reopen",
+          "frame": 0,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_reopen",
+          "frame": 1,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_reopen",
+          "frame": 2,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_reopen",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_reopen",
+          "frame": 3,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_reopen",
+          "frame": 4,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_reopen",
+          "frame": 5,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_reopen",
+          "frame": 6,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        }
+      ],
+      "observations": {
+        "after_disk_bake": {
+          "bake_count": 1,
+          "bake_id": 1339865357,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "INHERIT",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s15_disk"
+        },
+        "disk_tree_before_pack": [
+          "1339865357/",
+          "1339865357/blobs/",
+          "1339865357/blobs/00001_00000.blob",
+          "1339865357/blobs/00002_00000.blob",
+          "1339865357/blobs/00003_00000.blob",
+          "1339865357/blobs/00004_00000.blob",
+          "1339865357/blobs/00005_00000.blob",
+          "1339865357/meta/",
+          "1339865357/meta/00001_00000.json",
+          "1339865357/meta/00002_00000.json",
+          "1339865357/meta/00003_00000.json",
+          "1339865357/meta/00004_00000.json",
+          "1339865357/meta/00005_00000.json"
+        ],
+        "after_pack": {
+          "bake_count": 1,
+          "bake_id": 1339865357,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "PACKED",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s15_disk"
+        },
+        "disk_tree_after_pack": [
+          "1339865357/",
+          "1339865357/blobs/",
+          "1339865357/blobs/00001_00000.blob",
+          "1339865357/blobs/00002_00000.blob",
+          "1339865357/blobs/00003_00000.blob",
+          "1339865357/blobs/00004_00000.blob",
+          "1339865357/blobs/00005_00000.blob",
+          "1339865357/meta/",
+          "1339865357/meta/00001_00000.json",
+          "1339865357/meta/00002_00000.json",
+          "1339865357/meta/00003_00000.json",
+          "1339865357/meta/00004_00000.json",
+          "1339865357/meta/00005_00000.json"
+        ],
+        "input_change_equals_pack": {
+          "0": true,
+          "1": true,
+          "2": true,
+          "2.5": true,
+          "3": true,
+          "4": true,
+          "5": true,
+          "6": true
+        },
+        "after_pack_reopen": {
+          "bake_count": 1,
+          "bake_id": 1339865357,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "PACKED",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s15_disk"
+        },
+        "pack_reopen_equals_pack": {
+          "0": true,
+          "1": true,
+          "2": true,
+          "2.5": true,
+          "3": true,
+          "4": true,
+          "5": true,
+          "6": true
+        },
+        "after_unpack_original": {
+          "bake_count": 1,
+          "bake_id": 1339865357,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s15_disk"
+        },
+        "disk_tree_after_unpack": [
+          "1339865357/",
+          "1339865357/blobs/",
+          "1339865357/blobs/00001_00000.blob",
+          "1339865357/blobs/00002_00000.blob",
+          "1339865357/blobs/00003_00000.blob",
+          "1339865357/blobs/00004_00000.blob",
+          "1339865357/blobs/00005_00000.blob",
+          "1339865357/meta/",
+          "1339865357/meta/00001_00000.json",
+          "1339865357/meta/00002_00000.json",
+          "1339865357/meta/00003_00000.json",
+          "1339865357/meta/00004_00000.json",
+          "1339865357/meta/00005_00000.json"
+        ],
+        "unpack_equals_pack": {
+          "0": true,
+          "1": true,
+          "2": true,
+          "2.5": true,
+          "3": true,
+          "4": true,
+          "5": true,
+          "6": true
+        },
+        "after_unpack_reopen": {
+          "bake_count": 1,
+          "bake_id": 1339865357,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s15_disk"
+        },
+        "unpack_reopen_equals_pack": {
+          "0": true,
+          "1": true,
+          "2": true,
+          "2.5": true,
+          "3": true,
+          "4": true,
+          "5": true,
+          "6": true
+        },
+        "after_delete": {
+          "bake_count": 1,
+          "bake_id": 1339865357,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s15_disk"
+        }
+      },
+      "files": [
+        "/tmp/pr18n/oracle/work/s15/s15.blend",
+        "s15.blend",
+        "s15.blend1"
+      ],
+      "notes": [
+        "Pack keeps the existing disk files and sets the node target to PACKED.",
+        "The packed state survives a fresh process and USE_ORIGINAL returns it to the original disk cache."
+      ]
+    },
+    {
+      "scenario": "S16_packed_unpack_write_local",
+      "title": "Unpack a packed Bake-node cache to the current blend directory",
+      "samples": [
+        {
+          "phase": "after_disk_bake",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 0.5,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 0.5,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 1.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 1.25,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 1.5,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 2.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 2.5,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_disk_bake",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 2.5,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_input_change",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_input_change",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_input_change",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_input_change",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_input_change",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_input_change",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_input_change",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_pack_input_change",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local_reopen",
+          "frame": 0,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local_reopen",
+          "frame": 1,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": -0.5,
+          "max_x": 1.5,
+          "mean_x": 0.5,
+          "positions": [
+            [
+              -0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              -0.5,
+              1.0,
+              1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local_reopen",
+          "frame": 2,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.0,
+          "max_x": 2.0,
+          "mean_x": 1.0,
+          "positions": [
+            [
+              0.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              -1.0,
+              1.0
+            ],
+            [
+              0.0,
+              1.0,
+              -1.0
+            ],
+            [
+              0.0,
+              1.0,
+              1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              -1.0,
+              1.0
+            ],
+            [
+              2.0,
+              1.0,
+              -1.0
+            ],
+            [
+              2.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local_reopen",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.25,
+          "max_x": 2.25,
+          "mean_x": 1.25,
+          "positions": [
+            [
+              0.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              -1.0,
+              1.0
+            ],
+            [
+              0.25,
+              1.0,
+              -1.0
+            ],
+            [
+              0.25,
+              1.0,
+              1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              -1.0,
+              1.0
+            ],
+            [
+              2.25,
+              1.0,
+              -1.0
+            ],
+            [
+              2.25,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local_reopen",
+          "frame": 3,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 0.5,
+          "max_x": 2.5,
+          "mean_x": 1.5,
+          "positions": [
+            [
+              0.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              -1.0,
+              1.0
+            ],
+            [
+              0.5,
+              1.0,
+              -1.0
+            ],
+            [
+              0.5,
+              1.0,
+              1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              -1.0,
+              1.0
+            ],
+            [
+              2.5,
+              1.0,
+              -1.0
+            ],
+            [
+              2.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local_reopen",
+          "frame": 4,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.0,
+          "max_x": 3.0,
+          "mean_x": 2.0,
+          "positions": [
+            [
+              1.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              -1.0,
+              1.0
+            ],
+            [
+              1.0,
+              1.0,
+              -1.0
+            ],
+            [
+              1.0,
+              1.0,
+              1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              -1.0,
+              1.0
+            ],
+            [
+              3.0,
+              1.0,
+              -1.0
+            ],
+            [
+              3.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local_reopen",
+          "frame": 5,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_unpack_local_reopen",
+          "frame": 6,
+          "subframe": 0.0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 1.5,
+          "max_x": 3.5,
+          "mean_x": 2.5,
+          "positions": [
+            [
+              1.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              -1.0,
+              1.0
+            ],
+            [
+              1.5,
+              1.0,
+              -1.0
+            ],
+            [
+              1.5,
+              1.0,
+              1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              -1.0,
+              1.0
+            ],
+            [
+              3.5,
+              1.0,
+              -1.0
+            ],
+            [
+              3.5,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 0,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 1,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 2,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 2,
+          "subframe": 0.5,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 3,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 4,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 5,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        },
+        {
+          "phase": "after_delete",
+          "frame": 6,
+          "subframe": 0,
+          "shift_input": 100.0,
+          "vertex_count": 8,
+          "min_x": 99.0,
+          "max_x": 101.0,
+          "mean_x": 100.0,
+          "positions": [
+            [
+              99.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              -1.0,
+              1.0
+            ],
+            [
+              99.0,
+              1.0,
+              -1.0
+            ],
+            [
+              99.0,
+              1.0,
+              1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              -1.0,
+              1.0
+            ],
+            [
+              101.0,
+              1.0,
+              -1.0
+            ],
+            [
+              101.0,
+              1.0,
+              1.0
+            ]
+          ]
+        }
+      ],
+      "observations": {
+        "after_disk_bake": {
+          "bake_count": 1,
+          "bake_id": 1030736737,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "INHERIT",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s16_original"
+        },
+        "after_pack": {
+          "bake_count": 1,
+          "bake_id": 1030736737,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "PACKED",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": false,
+          "directory": "",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s16_original"
+        },
+        "original_tree_after_pack": [
+          "1030736737/",
+          "1030736737/blobs/",
+          "1030736737/blobs/00001_00000.blob",
+          "1030736737/blobs/00002_00000.blob",
+          "1030736737/blobs/00003_00000.blob",
+          "1030736737/blobs/00004_00000.blob",
+          "1030736737/blobs/00005_00000.blob",
+          "1030736737/meta/",
+          "1030736737/meta/00001_00000.json",
+          "1030736737/meta/00002_00000.json",
+          "1030736737/meta/00003_00000.json",
+          "1030736737/meta/00004_00000.json",
+          "1030736737/meta/00005_00000.json"
+        ],
+        "input_change_equals_disk_bake": {
+          "0": true,
+          "1": true,
+          "2": true,
+          "2.5": true,
+          "3": true,
+          "4": true,
+          "5": true,
+          "6": true
+        },
+        "after_unpack_local": {
+          "bake_count": 1,
+          "bake_id": 1030736737,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": true,
+          "directory": "//blendcache_s16/Cube_Nodes/1030736737",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s16_original"
+        },
+        "local_tree_after_unpack": [
+          "blobs/",
+          "blobs/00001_00000.blob",
+          "blobs/00002_00000.blob",
+          "blobs/00003_00000.blob",
+          "blobs/00004_00000.blob",
+          "blobs/00005_00000.blob",
+          "meta/",
+          "meta/00001_00000.json",
+          "meta/00002_00000.json",
+          "meta/00003_00000.json",
+          "meta/00004_00000.json",
+          "meta/00005_00000.json"
+        ],
+        "original_tree_after_unpack": [
+          "1030736737/",
+          "1030736737/blobs/",
+          "1030736737/blobs/00001_00000.blob",
+          "1030736737/blobs/00002_00000.blob",
+          "1030736737/blobs/00003_00000.blob",
+          "1030736737/blobs/00004_00000.blob",
+          "1030736737/blobs/00005_00000.blob",
+          "1030736737/meta/",
+          "1030736737/meta/00001_00000.json",
+          "1030736737/meta/00002_00000.json",
+          "1030736737/meta/00003_00000.json",
+          "1030736737/meta/00004_00000.json",
+          "1030736737/meta/00005_00000.json"
+        ],
+        "unpack_local_equals_disk_bake": {
+          "0": true,
+          "1": true,
+          "2": true,
+          "2.5": true,
+          "3": true,
+          "4": true,
+          "5": true,
+          "6": true
+        },
+        "write_local_removed_stale_meta": true,
+        "after_unpack_local_reopen": {
+          "bake_count": 1,
+          "bake_id": 1030736737,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": true,
+          "directory": "//blendcache_s16/Cube_Nodes/1030736737",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s16_original"
+        },
+        "unpack_local_reopen_equals_before": {
+          "0": true,
+          "1": true,
+          "2": true,
+          "2.5": true,
+          "3": true,
+          "4": true,
+          "5": true,
+          "6": true
+        },
+        "after_delete": {
+          "bake_count": 1,
+          "bake_id": 1030736737,
+          "node": "Bake",
+          "bake_mode": "ANIMATION",
+          "bake_target": "DISK",
+          "frame_start": 1,
+          "frame_end": 100,
+          "use_custom_simulation_frame_range": false,
+          "use_custom_path": true,
+          "directory": "//blendcache_s16/Cube_Nodes/1030736737",
+          "data_blocks": 0,
+          "modifier_bake_target": "DISK",
+          "modifier_bake_directory": "//s16_original"
+        }
+      },
+      "files": [
+        "/tmp/pr18n/oracle/work/s16/s16.blend",
+        "blendcache_s16/",
+        "blendcache_s16/Cube_Nodes/",
+        "s16.blend",
+        "s16.blend1",
+        "s16_original/",
+        "s16_original/1030736737/",
+        "s16_original/1030736737/blobs/",
+        "s16_original/1030736737/blobs/00001_00000.blob",
+        "s16_original/1030736737/blobs/00002_00000.blob",
+        "s16_original/1030736737/blobs/00003_00000.blob",
+        "s16_original/1030736737/blobs/00004_00000.blob",
+        "s16_original/1030736737/blobs/00005_00000.blob",
+        "s16_original/1030736737/meta/",
+        "s16_original/1030736737/meta/00001_00000.json",
+        "s16_original/1030736737/meta/00002_00000.json",
+        "s16_original/1030736737/meta/00003_00000.json",
+        "s16_original/1030736737/meta/00004_00000.json",
+        "s16_original/1030736737/meta/00005_00000.json"
+      ],
+      "notes": [
+        "WRITE_LOCAL removes old metadata/blob cache directories, writes packed data to the current blend directory, and sets the node's custom path.",
+        "The unpacked disk cache survives save/reopen after the animated input is removed."
       ]
     }
   ]

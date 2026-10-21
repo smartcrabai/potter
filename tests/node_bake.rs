@@ -1223,7 +1223,7 @@ fn disk_node_bake_pack_unpack_and_delete_preserve_baked_geometry() -> Result<(),
     )?;
     assert_eq!(write_local["result"]["storage"], "disk");
     assert_project_disk_payload(&project, &local_cache_directory)?;
-    assert_dimensions(&inspect(&project, 1.0)?, [2.0, 2.0, 2.0]);
+    assert_dimensions(&inspect(&project, 1.0)?, [2.0, 2.0, 2.0])?;
 
     let deleted = bake(&project, None, None, BakeAction::Delete)?;
     assert_eq!(deleted["result"]["scene_modified"], true);
@@ -1337,7 +1337,7 @@ fn failed_node_bake_unpack_preserves_scene_and_conflicting_payload() -> Result<(
         Some("write-original"),
     )?;
     assert_eq!(unpacked["result"]["storage"], "disk");
-    assert_dimensions(&inspect(&project, 1.0)?, [2.0, 2.0, 2.0]);
+    assert_dimensions(&inspect(&project, 1.0)?, [2.0, 2.0, 2.0])?;
     assert!(
         files_below(&cache_directory)?
             .iter()
@@ -1542,7 +1542,7 @@ fn packed_bake_feeds_preview_render_and_gltf_after_input_change() -> Result<(), 
         &batch_file,
         json!([
             {"op":"camera.create","id":"camera_main","transform":{"translation":[1.5,0.0,5.0]},"projection":"orthographic","ortho_scale":4.0},
-            {"op":"light.create","id":"key_light","light_type":"area","energy":12.0,"radius":0.8,"transform":{"translation":[-1.0,-1.0,3.0]}},
+            {"op":"light.create","id":"key_light","light_type":"point","energy":12.0,"radius":0.8,"transform":{"translation":[-1.0,-1.0,3.0]}},
             {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
             {"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":64,"resolution_y":64,"samples":1,"seed":0,"max_bounces":1}}
         ]),

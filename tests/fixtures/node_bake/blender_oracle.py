@@ -79,6 +79,8 @@ def find_socket(sockets, name, socket_type=None):
 
 def build_group(variant):
     """variant: geo, float, field, field_attribute or topo Geometry Nodes Bake graph."""
+    ng = bpy.data.node_groups.new("BakeOracle", "GeometryNodeTree")
+    ng.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
     ng.interface.new_socket(name="Shift", in_out="INPUT", socket_type="NodeSocketFloat").default_value = 0.0
     ng.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
 
@@ -861,7 +863,7 @@ def s13_node_custom_disk_settings():
 @scenario("S14_point_attribute_item", "Bake attribute-field output from a POINT-domain FLOAT item")
 def s14_point_attribute_item():
     ob, mod, ident = setup("field_attribute")
-    bake_item = the_bake(mod).bake_items[1]
+    bake_item = the_bake(mod).node.bake_items[1]
     run_bake("geometry_node_bake_single", ob, mod)
     obs = {
         "bake_item": {
