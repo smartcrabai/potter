@@ -214,7 +214,14 @@ fn child_index(parent: usize, k: usize, tree_type: usize) -> usize {
 }
 
 /// Blender `bvh_medianof3`: the median of three leaves by their key on `axis`.
-fn median_of3(a: &[usize], lo: usize, mid: usize, hi: usize, axis: usize, leaves: &[Bounds]) -> usize {
+fn median_of3(
+    a: &[usize],
+    lo: usize,
+    mid: usize,
+    hi: usize,
+    axis: usize,
+    leaves: &[Bounds],
+) -> usize {
     let key = |id: usize| leaves[id][axis];
     if key(a[mid]) < key(a[lo]) {
         if key(a[hi]) < key(a[mid]) {
@@ -235,7 +242,14 @@ fn median_of3(a: &[usize], lo: usize, mid: usize, hi: usize, axis: usize, leaves
 }
 
 /// Blender `bvh_partition`: Hoare partition of `a[lo..hi]` around the pivot key.
-fn partition(a: &mut [usize], lo: usize, hi: usize, pivot_key: f32, axis: usize, leaves: &[Bounds]) -> usize {
+fn partition(
+    a: &mut [usize],
+    lo: usize,
+    hi: usize,
+    pivot_key: f32,
+    axis: usize,
+    leaves: &[Bounds],
+) -> usize {
     let key = |id: usize| leaves[id][axis];
     let mut i = lo;
     let mut j = hi;
@@ -269,7 +283,14 @@ fn insertion_sort(a: &mut [usize], lo: usize, hi: usize, axis: usize, leaves: &[
 }
 
 /// Blender `partition_nth_element`: after it, every leaf left of `n` is at most the leaf at `n`.
-fn partition_nth_element(a: &mut [usize], mut begin: usize, mut end: usize, n: usize, axis: usize, leaves: &[Bounds]) {
+fn partition_nth_element(
+    a: &mut [usize],
+    mut begin: usize,
+    mut end: usize,
+    n: usize,
+    axis: usize,
+    leaves: &[Bounds],
+) {
     while end - begin > 3 {
         let pivot = median_of3(a, begin, usize::midpoint(begin, end), end - 1, axis, leaves);
         let cut = partition(a, begin, end, leaves[pivot][axis], axis, leaves);
@@ -283,7 +304,13 @@ fn partition_nth_element(a: &mut [usize], mut begin: usize, mut end: usize, n: u
 }
 
 /// Blender `split_leafs`: each child range gets the leaves it would get from a full sort on `axis`.
-fn split_leafs(order: &mut [usize], nth: &[usize], axis: usize, leaves: &[Bounds], tree_type: usize) {
+fn split_leafs(
+    order: &mut [usize],
+    nth: &[usize],
+    axis: usize,
+    leaves: &[Bounds],
+    tree_type: usize,
+) {
     for i in 0..tree_type - 1 {
         if nth[i] >= nth[tree_type] {
             break;
@@ -294,7 +321,10 @@ fn split_leafs(order: &mut [usize], nth: &[usize], axis: usize, leaves: &[Bounds
 
 /// Blender `non_recursive_bvh_div_nodes_task_cb`: fits branch `j`, splits its leaves along its largest
 /// axis, and links its children.
-#[expect(clippy::too_many_arguments, reason = "mirrors the Blender helper's state, one value each")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the Blender helper's state, one value each"
+)]
 fn divide(
     branches: &mut [Branch],
     order: &mut [usize],
@@ -365,7 +395,16 @@ fn build_branches(leaves: &[Bounds], tree_type: usize, axis: usize) -> Vec<Branc
         let stop = next.min(branches_num + 1);
         let level = Level { start, next, depth };
         for j in start..stop {
-            divide(&mut branches, &mut order, leaves, &implicit, level, j, tree_type, axis);
+            divide(
+                &mut branches,
+                &mut order,
+                leaves,
+                &implicit,
+                level,
+                j,
+                tree_type,
+                axis,
+            );
         }
         start = next;
         depth += 1;
@@ -411,7 +450,9 @@ impl KdopTree {
         while let Some(child) = stack.pop() {
             match child {
                 Child::Leaf(leaf) => out.push(leaf),
-                Child::Branch(branch) => stack.extend(self.branches[branch].children.iter().rev().copied()),
+                Child::Branch(branch) => {
+                    stack.extend(self.branches[branch].children.iter().rev().copied())
+                }
             }
         }
         out
@@ -431,7 +472,13 @@ impl KdopTree {
     ///
     /// `origin` and `dir` are as Blender passes them. `dir` must be nonzero in every component for the
     /// slab tests, which the callers ensure.
-    pub(crate) fn ray_cast<F>(&self, origin: Vec3, dir: Vec3, hit: &mut RayHit, callback: &mut F) -> isize
+    pub(crate) fn ray_cast<F>(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        hit: &mut RayHit,
+        callback: &mut F,
+    ) -> isize
     where
         F: FnMut(usize, &Ray, &mut RayHit),
     {
@@ -484,7 +531,14 @@ pub(crate) fn overlap_pairs(first: &KdopTree, second: &KdopTree) -> Vec<(usize, 
     }
     let slabs = first.axis.min(second.axis) / 2;
     let mut out = Vec::new();
-    overlap_traverse(first, Child::Branch(1), second, Child::Branch(1), slabs, &mut out);
+    overlap_traverse(
+        first,
+        Child::Branch(1),
+        second,
+        Child::Branch(1),
+        slabs,
+        &mut out,
+    );
     out.reverse();
     out
 }
@@ -694,10 +748,15 @@ mod tests {
                 while let Some(node) = stack.pop() {
                     match node {
                         super::Child::Leaf(leaf) => seen[leaf] = true,
-                        super::Child::Branch(branch) => stack.extend(tree.branches[branch].children.iter().copied()),
+                        super::Child::Branch(branch) => {
+                            stack.extend(tree.branches[branch].children.iter().copied())
+                        }
                     }
                 }
-                assert!(seen.iter().all(|&s| s), "tree_type {tree_type}, {count} leaves");
+                assert!(
+                    seen.iter().all(|&s| s),
+                    "tree_type {tree_type}, {count} leaves"
+                );
             }
         }
     }
@@ -708,19 +767,35 @@ mod tests {
         let leaves = random_leaves(&mut rng, 60, 1.0e-4, 8);
         let tree = KdopTree::new(leaves.clone(), 8, 8);
         for _ in 0..200 {
-            let origin = [rng.unit() * 2.0 - 0.5, rng.unit() * 2.0 - 0.5, rng.unit() * 2.0 - 0.5];
-            let dir = [rng.unit() * 2.0 - 1.0, rng.unit() * 2.0 - 1.0, rng.unit() * 2.0 - 1.0];
+            let origin = [
+                rng.unit() * 2.0 - 0.5,
+                rng.unit() * 2.0 - 0.5,
+                rng.unit() * 2.0 - 0.5,
+            ];
+            let dir = [
+                rng.unit() * 2.0 - 1.0,
+                rng.unit() * 2.0 - 1.0,
+                rng.unit() * 2.0 - 1.0,
+            ];
             let mut visited = Vec::new();
             let mut hit = RayHit::open();
-            tree.ray_cast(origin, dir, &mut hit, &mut |leaf: usize, _ray: &super::Ray, _hit: &mut RayHit| {
-                visited.push(leaf);
-            });
+            tree.ray_cast(
+                origin,
+                dir,
+                &mut hit,
+                &mut |leaf: usize, _ray: &super::Ray, _hit: &mut RayHit| {
+                    visited.push(leaf);
+                },
+            );
             // Every leaf whose box the ray crosses with a margin is visited, and no leaf that misses by a margin.
             for (leaf, bounds) in leaves.iter().enumerate() {
                 let crossed = |grow: f32| {
                     let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
                     for axis in 0..3 {
-                        let (min, max) = (f64::from(bounds[2 * axis]) - f64::from(grow), f64::from(bounds[2 * axis + 1]) + f64::from(grow));
+                        let (min, max) = (
+                            f64::from(bounds[2 * axis]) - f64::from(grow),
+                            f64::from(bounds[2 * axis + 1]) + f64::from(grow),
+                        );
                         let (o, d) = (f64::from(origin[axis]), f64::from(dir[axis]));
                         let (t1, t2) = ((min - o) / d, (max - o) / d);
                         lo = lo.max(t1.min(t2));
@@ -731,10 +806,16 @@ mod tests {
                 let strict = crossed(-1.0e-5);
                 let loose = crossed(1.0e-5);
                 if strict {
-                    assert!(visited.contains(&leaf), "leaf {leaf} is crossed but not visited");
+                    assert!(
+                        visited.contains(&leaf),
+                        "leaf {leaf} is crossed but not visited"
+                    );
                 }
                 if !loose {
-                    assert!(!visited.contains(&leaf), "leaf {leaf} is not crossed but visited");
+                    assert!(
+                        !visited.contains(&leaf),
+                        "leaf {leaf} is not crossed but visited"
+                    );
                 }
             }
         }
@@ -750,12 +831,16 @@ mod tests {
             let mut expected: Vec<(usize, usize)> = Vec::new();
             for (a, fa) in first.iter().enumerate() {
                 for (b, sb) in second.iter().enumerate() {
-                    if (0..slabs).all(|s| fa[2 * s] <= sb[2 * s + 1] && sb[2 * s] <= fa[2 * s + 1]) {
+                    if (0..slabs).all(|s| fa[2 * s] <= sb[2 * s + 1] && sb[2 * s] <= fa[2 * s + 1])
+                    {
                         expected.push((a, b));
                     }
                 }
             }
-            let mut got = overlap_pairs(&KdopTree::new(first, tree_type, axis), &KdopTree::new(second, tree_type, axis));
+            let mut got = overlap_pairs(
+                &KdopTree::new(first, tree_type, axis),
+                &KdopTree::new(second, tree_type, axis),
+            );
             got.sort_unstable();
             expected.sort_unstable();
             assert_eq!(got, expected, "tree_type {tree_type}, axis {axis}");

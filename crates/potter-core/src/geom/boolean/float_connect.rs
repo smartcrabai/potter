@@ -474,7 +474,11 @@ impl Islands {
 /// Blender `create_kdop_hull` and `bvhtree_node_inflate` for one edge's two points (`z = 0`), as the
 /// 8-axis leaf boxes of [`KdopTree`].
 fn leaf_bounds(a: P2, b: P2) -> Bounds {
-    kdop_bounds(&[[a[0], a[1], 0.0], [b[0], b[1], 0.0]], BVH_EPSILON, BVH_AXIS)
+    kdop_bounds(
+        &[[a[0], a[1], 0.0], [b[0], b[1], 0.0]],
+        BVH_EPSILON,
+        BVH_AXIS,
+    )
 }
 
 /// Blender `axis_pt_cmp`: lexicographic on (x, y).
@@ -627,7 +631,9 @@ fn isect_seg_seg_point(v0: P2, v1: P2, v2: P2, v3: P2, bias: f32) -> Option<P2> 
 
 #[cfg(test)]
 mod tests {
-    use super::{BVH_AXIS, BVH_TREE_TYPE, DiskNet, Island, P2, connect_islands, isect_ray_seg, leaf_bounds};
+    use super::{
+        BVH_AXIS, BVH_TREE_TYPE, DiskNet, Island, P2, connect_islands, isect_ray_seg, leaf_bounds,
+    };
     use crate::geom::bvh::{KdopTree, Ray, RayHit};
     use serde_json::Value;
 
@@ -827,7 +833,6 @@ mod tests {
         let segments = [([0.25, -0.5], [1.75, 0.5]), ([0.25, 0.5], [1.75, -0.5])];
         assert_eq!(cast(&segments, [2.0, 0.0], [-1.0, 0.0]), Some(1));
     }
-
 
     /// The implicit 8-ary tree reaches every leaf exactly once, and the nearest hit matches a brute-force
     /// scan on tie-free random rays.

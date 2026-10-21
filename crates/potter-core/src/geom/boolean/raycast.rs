@@ -101,7 +101,6 @@ fn bvh_leaves(index: &RayIndex, origin: [f32; 3], direction: [f32; 3], leaves: &
     );
 }
 
-
 fn raycast_tris_boolean(
     arena: &Arena,
     tris: &[Tri],
@@ -428,8 +427,16 @@ mod tests {
     fn box_crossed(tri: &[[f32; 3]; 3], origin: [f32; 3], direction: [f32; 3], grow: f64) -> bool {
         let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
         for axis in 0..3 {
-            let min = tri.iter().map(|v| f64::from(v[axis])).fold(f64::INFINITY, f64::min) - grow;
-            let max = tri.iter().map(|v| f64::from(v[axis])).fold(f64::NEG_INFINITY, f64::max) + grow;
+            let min = tri
+                .iter()
+                .map(|v| f64::from(v[axis]))
+                .fold(f64::INFINITY, f64::min)
+                - grow;
+            let max = tri
+                .iter()
+                .map(|v| f64::from(v[axis]))
+                .fold(f64::NEG_INFINITY, f64::max)
+                + grow;
             let (o, d) = (f64::from(origin[axis]), f64::from(direction[axis]));
             if d == 0.0 {
                 if o < min || o > max {
@@ -483,9 +490,6 @@ mod tests {
                 }
             }
         }
-        assert!(
-            crossed_checked > 1000,
-            "the fixture must cross many boxes"
-        );
+        assert!(crossed_checked > 1000, "the fixture must cross many boxes");
     }
 }

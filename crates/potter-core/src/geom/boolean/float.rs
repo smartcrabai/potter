@@ -32,12 +32,12 @@ use crate::geom::{
 };
 
 use super::dissolve::Poly;
+use super::float_connect::{BVH_AXIS, BVH_TREE_TYPE};
 use super::float_split_net::CornerSource;
 use super::imesh::NO_INDEX;
 use super::{BooleanOperand, Operation};
 use crate::geom::bvh::{Bounds, KdopTree, Ray, RayHit, kdop_bounds};
 use crate::geom::triangulate::ortho_basis;
-use super::float_connect::{BVH_AXIS, BVH_TREE_TYPE};
 
 type P3 = [f32; 3];
 type EdgeKey = (usize, usize);
