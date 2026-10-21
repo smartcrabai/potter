@@ -100,6 +100,13 @@ fn random_walk_subsurface_sphere_matches_cycles() -> TestResult {
     matches_cycles("random_walk")
 }
 
+/// The random walk with g = 0.8. The isotropic cases leave g at zero, where the similarity medium after bounce 9 and the
+/// remap's g terms change nothing, so this case is the one that exercises them.
+#[test]
+fn random_walk_anisotropic_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("random_walk_anisotropic")
+}
+
 /// Renders the sphere of `case` (a case of `subsurface_sphere.py`) in Blender and in Potter at the case's bounce
 /// budget, and compares the channel means of the seeds with the tolerance of the module docs.
 fn matches_cycles(case: &str) -> TestResult {
