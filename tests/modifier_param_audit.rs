@@ -418,9 +418,18 @@ fn f_modifier_parameter_scenarios_match_blender() {
         let modifier = scenario["modifier"].as_str().unwrap();
         let blender_baseline = scenario_signature(&blender, id, "baseline");
         let blender_case = scenario_signature(&blender, id, "case");
-        let potter_baseline =
-            potter_scenario_geometry(primitive, modifier, &scenario["baseline_params"]);
-        let potter_case = potter_scenario_geometry(primitive, modifier, &scenario["case_params"]);
+        let potter_baseline = potter_scenario_geometry(
+            primitive,
+            modifier,
+            &scenario["setup"],
+            &scenario["baseline_params"],
+        );
+        let potter_case = potter_scenario_geometry(
+            primitive,
+            modifier,
+            &scenario["setup"],
+            &scenario["case_params"],
+        );
         match scenario["expectation"].as_str().unwrap() {
             "equal_active" => {
                 assert_ne!(
