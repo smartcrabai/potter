@@ -3,7 +3,7 @@ use std::f64::consts::TAU;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
-use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WireSegment};
+use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, WireSegment};
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
 use crate::model::{CameraData, CameraProjection};
@@ -980,7 +980,7 @@ pub(crate) fn rasterize_with_lines(
 /// usual meaning; the RGBA and linear colour are the wireframe overlay's.
 pub(crate) fn rasterize_wireframe(
     edges: &[WireEdge],
-    points: &[DVec3],
+    points: &[WirePoint],
     triangles: &[Triangle],
     lines: &[Line],
     camera: &Camera,
@@ -1011,7 +1011,6 @@ pub(crate) fn rasterize_wireframe(
         0,
         None,
     )?;
-    let background = wireframe::outline_background(&surfaces.ids, width_usize, height_usize);
     let mut output = rasterize_with_lines(
         triangles,
         lines,
@@ -1109,17 +1108,50 @@ pub(crate) fn rasterize_wireframe(
             colour_b,
         });
     }
-    let mut squares = Vec::with_capacity(points.len());
+    let mut projected_points = Vec::with_capacity(points.len());
     for point in points {
-        if !is_finite_vec3(*point) {
+        if !is_finite_vec3(point.position) {
             return Err(PotError::new(
                 ErrorCode::EvaluationFailed,
                 "wireframe point contains invalid geometry",
             ));
         }
-        let Some(projected) = project_world(camera, &frame, width, height, *point) else {
+        let Some(projected) = project_world(camera, &frame, width, height, point.position) else {
             continue;
         };
+        projected_points.push((*point, projected));
+    }
+    // A point-cloud point's sphere enters the object id buffer before the outline is drawn, wherever it is not
+    // behind a surface (its view depth is at most the surface's).
+    let mut ids = surfaces.ids.clone();
+    for (point, projected) in &projected_points {
+        let Some(sphere) = point.sphere else {
+            continue;
+        };
+        let radius_px = sphere.radius * projected.pixel_scale;
+        let depth = frame_depth(&frame, camera.position, point.position);
+        let (centre_x, centre_y) = (projected.x + 0.5, projected.y + 0.5);
+        let min_x = (centre_x - radius_px).floor().max(0.0) as usize;
+        let max_x =
+            ((centre_x + radius_px).ceil().max(0.0) as usize).min(width_usize.saturating_sub(1));
+        let min_y = (centre_y - radius_px).floor().max(0.0) as usize;
+        let max_y =
+            ((centre_y + radius_px).ceil().max(0.0) as usize).min(height_usize.saturating_sub(1));
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let inside = (px as f64 + 0.5 - centre_x).abs()
+                    + (py as f64 + 0.5 - centre_y).abs()
+                    <= radius_px;
+                let index = py * width_usize + px;
+                if inside && (ids[index] == 0 || depth <= f64::from(surfaces.depths[index])) {
+                    ids[index] = sphere.object_index;
+                }
+            }
+        }
+    }
+    let background = wireframe::outline_background(&ids, width_usize, height_usize);
+    let mut squares = Vec::with_capacity(projected_points.len());
+    for (_, projected) in &projected_points {
         squares.push(PointSquare {
             centre_x: projected.x + 0.5,
             centre_y: projected.y + 0.5,

@@ -40,7 +40,7 @@ use super::{
         blend_corner_normals, blend_uv,
     },
     studio,
-    wireframe::{WireEdge, WireEdgeBuilder},
+    wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
 };
 
 /// Most color layers one object carries, and one hit can read (Blender's per-mesh limit).
@@ -92,7 +92,7 @@ pub(super) struct Geometry {
     /// Mesh edges for the wireframe preview, each once; empty outside Wire.
     pub wire_edges: Vec<WireEdge>,
     /// Loose vertices of a mesh with no edges or faces, and point-cloud points, for the wireframe preview.
-    pub wire_points: Vec<DVec3>,
+    pub wire_points: Vec<WirePoint>,
     pub materials: Vec<Material>,
     pub prepared: Vec<PreparedMaterial>,
     pub objects: Vec<ObjectRecord>,
@@ -948,8 +948,15 @@ pub(super) fn extract_geometry(
                     None => (position - extent, position + extent),
                 });
                 if matches!(mode, Mode::Wire) {
-                    // Loose vertices and point-cloud points are squares in the overlay (`wire_points`).
-                    wire_points.push(position);
+                    // Loose vertices and point-cloud points are squares in the overlay (`wire_points`); a point
+                    // cloud's points also have spheres, which the object outline sees.
+                    wire_points.push(WirePoint {
+                        position,
+                        sphere: pointcloud.then_some(PointSphere {
+                            object_index,
+                            radius,
+                        }),
+                    });
                 }
                 lines.push(Line {
                     start: position,

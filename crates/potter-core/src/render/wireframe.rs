@@ -310,6 +310,26 @@ pub(crate) fn outline_background(ids: &[u32], width: usize, height: usize) -> Ve
     out
 }
 
+/// The sphere of a point-cloud point, which Workbench's outline prepass draws as a diamond (the point's shape
+/// batch projects to the rim vertices (±r, 0) and (0, ±r) and the front pole, so its silhouette is a diamond,
+/// `overlay_outline_prepass_pointcloud_vert.glsl`, `draw_pointcloud_lib.glsl` `point_get`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PointSphere {
+    /// The point cloud's object index, which the outline compares.
+    pub(crate) object_index: u32,
+    /// The point's world radius.
+    pub(crate) radius: f64,
+}
+
+/// A point of the wireframe overlay: a square of `2 · vert` pixels (`overlay_wireframe_frag.glsl`, POINTS).
+/// A point-cloud point also has a sphere, which the outline sees (see [`PointSphere`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WirePoint {
+    pub(crate) position: DVec3,
+    /// `None` for a loose vertex, which Workbench draws no surface for.
+    pub(crate) sphere: Option<PointSphere>,
+}
+
 /// A point square on the screen: its centre (continuous pixel coordinates) and its side in pixels.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PointSquare {
@@ -758,19 +778,26 @@ mod tests {
 /// - cube line centres: 95 pixels within 0.3 px of a cube edge; one at 26 levels (a corner), the rest within 3.
 ///
 /// Not reproduced, with evidence:
-/// 1. Horizontal lines carry about 4% less ink than the capture (`0°` in the angle test): −4.2% against a
-///    quantisation bound of ±3.7%. The bound is sound (each channel of each image rounds by at most half a
-///    level), so the residual is real and its cause is not known; the 15° to 90° lines are within the bound.
-/// 2. The sphere's line centres differ by more than three levels at 144 of 1,132 pixels (up to 29 levels),
-///    and its ink is 2% below the capture; the cube's ink is 3% below (with the outline; 22% without it).
-/// 3. Point-cloud dots show a dark ring at their radius. It is Workbench's object outline around the point
-///    cloud's sphere surfaces: with `show_object_outline` off the ring is gone (capture: 308 pixels change).
-///    Modelled as object-id disks, the ring's geometry is about one pixel off, and the disk model makes the
-///    dot neighbourhood worse (mean error 1.3 against 0.9 without disks), so disks are not modelled.
-/// 4. Two coincident loose edges (a front/back pair, or an identical-depth duplicate pair) add about 7% ink in
-///    the capture, and the model adds none. Loose edges have no faces, so no object outline applies; the wire
-///    pass has no blend state, and its colour and line record come from the same fragment
-///    (`overlay_wireframe.hh:79`, `overlay_wireframe_frag.glsl:37–41`). The cause is not known.
+/// 1. Horizontal lines carry about 4% less ink than the capture (the 0° line in the angle test: −4.2% against a
+///    quantisation bound of ±3.7%). A sub-pixel sweep (horizontal and vertical lines at eight phases, one Blender
+///    capture) shows the line positions, the phase response, the axis symmetry and the record's 8-bit
+///    quantisation (`UNORM_8_8_8_8`, `overlay_wireframe_frag.glsl`) all agree with the model within one level. The
+///    residual is the coverage at the line's centre (about 0.008 coverage: capture 0.992, model 0.983) and at
+///    distances above one pixel. The overlay's smoothstep kernel is the best standard profile tested (Gaussian and
+///    box-area profiles fit worse), and its constants are about 0.03 px off. No source rule explains that shape.
+/// 2. The sphere's line centres differ by more than three levels at 144 of 1,132 pixels (up to 29 levels), and its
+///    ink is 2% below the capture. Facing is not the cause: per-corner facing gives mean error 0.036, flat faces
+///    0.039, and constant facing 0.07 to 0.13 (the corner normals are the right input). The cube's ink is 3% below
+///    (with the outline; 22% without it).
+/// 3. Point-cloud dots: the outline's dark ring is modelled as the diamond silhouette of each dot's sphere (the
+///    shape batch of `draw_pointcloud_lib.glsl`) in the object id buffer, with the outline rule. The ring's placement
+///    is within about a pixel: the dot neighbourhood's mean error is 0.65 (max 14). With the outline off the ring is
+///    gone (capture: 308 pixels change). Disks were tested and fit worse.
+/// 4. Two coincident loose edges (a front/back pair, or an identical-depth duplicate pair) add about 7% ink in the
+///    capture, and the model adds none. Loose edges have no faces, so no object outline applies. The wire pass has
+///    no blend state (`overlay_wireframe.hh:79`: write colour, write depth, `LESS_EQUAL`), so the later of two
+///    coincident fragments replaces the earlier one in both colour and line record (`overlay_wireframe_frag.glsl`
+///    37–41): source gives no added ink. The capture's extra ink is not explained by the source.
 #[cfg(test)]
 mod oracle_tests {
     use std::{
@@ -1124,10 +1151,17 @@ mod oracle_tests {
                 wd: 0.0,
             })
             .collect();
-        // Four point-cloud points at z = 3.5, drawn as squares of 2 x vert (their radii do not change the square).
-        let points: Vec<DVec3> = [-1.5, -0.5, 0.5, 1.5]
+        // Four point-cloud points at z = 3.5 with radii 0.05 to 0.2. Each is a square of 2 x vert, and its sphere
+        // (a diamond in the outline's id buffer) draws the dark ring around it.
+        let points: Vec<WirePoint> = [(-1.5, 0.05), (-0.5, 0.10), (0.5, 0.15), (1.5, 0.20)]
             .iter()
-            .map(|&x| DVec3::new(x, 0.0, 3.5))
+            .map(|&(x, radius)| WirePoint {
+                position: DVec3::new(x, 0.0, 3.5),
+                sphere: Some(PointSphere {
+                    object_index: 3,
+                    radius,
+                }),
+            })
             .collect();
         let output = rasterize_wireframe(&edges, &points, &[], &[], &camera(), WIDTH, HEIGHT)?;
         let segments: Vec<_> = edges
@@ -1135,12 +1169,22 @@ mod oracle_tests {
             .map(|edge| (project(edge.start), project(edge.end)))
             .collect();
         let line_d = line_distance(&segments);
-        let centres: Vec<[f64; 2]> = points.iter().map(|&point| project(point)).collect();
+        let centres: Vec<[f64; 2]> = points.iter().map(|point| project(point.position)).collect();
         let point_d = point_distance(&centres);
         let side = 2.0 * vertex_size();
         let interior = errors_where(&output.rgba, &capture, &FULL_FRAME, |x, y| {
             point_d[y * WIDTH as usize + x] <= 0.25 * side
         });
+        // The dots and their rings, within 14 px of each centre. Measured with the model (Python twin): mean 0.65,
+        // max 14, 242 of 2466 pixels beyond three levels. The residual sits on the ring's sub-pixel placement.
+        let dots = errors_where(&output.rgba, &capture, &FULL_FRAME, |x, y| {
+            point_d[y * WIDTH as usize + x] <= 14.0
+        });
+        let dots_mean = dots.iter().map(|&e| f64::from(e)).sum::<f64>() / dots.len() as f64;
+        assert!(
+            dots_mean <= 0.7,
+            "dot neighbourhood mean error {dots_mean:.3}"
+        );
         assert_ne!(interior.len(), 0);
         assert!(
             interior.iter().all(|&error| error <= 1),
