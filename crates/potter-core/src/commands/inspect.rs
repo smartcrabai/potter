@@ -591,6 +591,7 @@ fn material_item(doc: &SceneDoc, id: &Id, material: &Material) -> Value {
         "roughness":material.roughness,
         "double_sided":material.double_sided,
         "use_transparent_shadow":material.use_transparent_shadow,
+        "use_bump_map_correction":material.use_bump_map_correction,
         "library":linkage["library"],
         "library_name":linkage["library_name"],
         "editable":linkage["editable"],

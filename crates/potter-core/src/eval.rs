@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Aabb, CylinderParams, IcosphereParams, Mesh,
+        Aabb, CylinderParams, GeneratedVertex, IcosphereParams, Mesh, TextureSpace,
         concat::{Part, concatenate, concatenate_with_normals},
         modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
         normals::SHADING_ATTRIBUTES,
@@ -258,6 +258,10 @@ pub struct Snapshot {
     /// Ephemeral local-space adaptive surface normals, aligned with each evaluated mesh's vertices.
     #[serde(skip)]
     pub(crate) adaptive_normals: BTreeMap<Id, Vec<Option<DVec3>>>,
+    /// Ephemeral Generated coordinates of each evaluated collection instance's joined mesh, aligned with its vertices:
+    /// each member's vertices keep the texture space of their own member.
+    #[serde(skip)]
+    pub(crate) generated_vertices: BTreeMap<Id, Vec<GeneratedVertex>>,
     /// Evaluated armature bone-head matrices in world space.
     #[serde(skip)]
     pub bone_matrices: BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
@@ -638,6 +642,7 @@ impl Snapshot {
                         snapshot.instance_paths.remove(node_id);
                         snapshot.slot_bindings.remove(node_id);
                         snapshot.adaptive_normals.remove(node_id);
+                        snapshot.generated_vertices.remove(node_id);
                         snapshot.strokes.remove(node_id);
                     }
                     return Ok((snapshot, node_errors));
@@ -1079,6 +1084,7 @@ impl Snapshot {
         let mut nodes = BTreeMap::new();
         let mut meshes = BTreeMap::new();
         let mut adaptive_normals = BTreeMap::new();
+        let mut generated_vertices = BTreeMap::new();
         let mut instance_paths = BTreeMap::new();
         let mut slot_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
@@ -2057,6 +2063,7 @@ impl Snapshot {
                 paths,
                 bindings,
                 adaptive_normals: member_normals,
+                generated,
                 ..
             } = evaluate_collection_instance(
                 doc,
@@ -2071,6 +2078,7 @@ impl Snapshot {
             if !mesh.vertices.is_empty() {
                 slot_bindings.insert(id.clone(), bindings);
                 meshes.insert(id.clone(), mesh);
+                generated_vertices.insert(id.clone(), generated);
                 if let Some(normals) = member_normals {
                     adaptive_normals.insert(id.clone(), normals);
                 }
@@ -2109,6 +2117,7 @@ impl Snapshot {
             node_bake_material_refs,
             meshes,
             adaptive_normals,
+            generated_vertices,
             strokes,
             volume_data,
             bone_matrices,
@@ -5143,10 +5152,12 @@ fn instance_collection_target(node: &Node) -> Result<Option<Id>> {
 /// that instance alone.
 const INSTANCE_JOIN_FAILURE: &str = "collection_instance_join_failed";
 
-/// A collection member before joining: its mesh and member-local UV/color bindings.
+/// A collection member before joining: its mesh, its Generated per vertex (in its own texture space), and
+/// member-local UV/color bindings.
 struct CollectionMember<'a> {
     mesh: Cow<'a, Mesh>,
     matrix: DMat4,
+    generated: Vec<GeneratedVertex>,
     slots: Vec<SlotBinding>,
     adaptive_normals: Option<Cow<'a, [Option<DVec3>]>>,
     uv_names: Vec<String>,
@@ -5154,13 +5165,15 @@ struct CollectionMember<'a> {
     color_names: Vec<String>,
 }
 
-/// A joined collection instance and the source bindings/coverage to propagate through nesting.
+/// A joined collection instance and the source bindings/coverage to propagate through nesting. `generated` is
+/// aligned with `mesh.vertices`.
 struct CollectionEvaluation {
     mesh: Mesh,
     paths: Vec<Vec<Id>>,
     bindings: Vec<SlotBinding>,
     uv_coverage: Vec<u8>,
     adaptive_normals: Option<Vec<Option<DVec3>>>,
+    generated: Vec<GeneratedVertex>,
 }
 
 struct JoinedMemberBindings {
@@ -5391,6 +5404,7 @@ fn evaluate_collection_instance<'a>(
     let mut parts = Vec::with_capacity(members.len());
     let mut member_bindings = Vec::with_capacity(members.len());
     let mut slot_base = 0;
+    let mut generated = Vec::new();
     for member in members {
         let material_offset = u32::try_from(slot_base).map_err(|_| {
             PotError::new(
@@ -5399,6 +5413,14 @@ fn evaluate_collection_instance<'a>(
             )
         })?;
         let slot_count = member.slots.len();
+        if member.generated.len() != member.mesh.vertices.len() {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "collection member Generated does not match its vertices",
+            ));
+        }
+        // The join appends each member's vertices in order, so their Generated values join in the same order.
+        generated.extend(member.generated);
         parts.push(Part {
             mesh: member.mesh,
             matrix: member.matrix,
@@ -5427,6 +5449,12 @@ fn evaluate_collection_instance<'a>(
         concatenate(parts).map(|mesh| (mesh, None))
     }
     .map_err(|error| instance_join_error(error, instance_id))?;
+    if generated.len() != mesh.vertices.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "collection instance Generated does not match its vertices",
+        ));
+    }
     let joined_uv_names = uv_layers::read_layers(&mesh)
         .into_iter()
         .map(|layer| layer.name)
@@ -5476,6 +5504,7 @@ fn evaluate_collection_instance<'a>(
         bindings,
         uv_coverage,
         adaptive_normals,
+        generated,
     })
 }
 
@@ -5565,6 +5594,7 @@ fn append_collection_geometry<'a>(
                 nested.paths,
                 nested.bindings,
                 nested.adaptive_normals.map(Cow::Owned),
+                nested.generated,
                 uv_names,
                 nested.uv_coverage,
                 color_names,
@@ -5593,6 +5623,18 @@ fn append_collection_geometry<'a>(
                     |evaluated| evaluated.materials.clone(),
                 );
                 let slots = member_slot_bindings(&materials, source_mesh, &uv_store, &color_names);
+                // Blender computes a member's texture space on its undeformed mesh, before its modifiers.
+                let undeformed = source_data
+                    .and_then(|data| data.mesh.as_ref())
+                    .unwrap_or(source_mesh);
+                let texture_space = undeformed
+                    .manual_texture_space()
+                    .unwrap_or_else(|| TextureSpace::automatic(undeformed.bounds()));
+                let generated: Vec<GeneratedVertex> = source_mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| texture_space.generated_vertex(vertex.co))
+                    .collect();
                 (
                     Cow::Borrowed(source_mesh),
                     vec![vec![object_id.clone()]],
@@ -5600,6 +5642,7 @@ fn append_collection_geometry<'a>(
                     adaptive_normals
                         .get(object_id)
                         .map(|normals| Cow::Borrowed(normals.as_slice())),
+                    generated,
                     uv_names,
                     uv_coverage,
                     color_names,
@@ -5611,6 +5654,7 @@ fn append_collection_geometry<'a>(
             nested_paths,
             slots,
             member_normals,
+            generated,
             uv_names,
             uv_coverage,
             color_names,
@@ -5628,6 +5672,7 @@ fn append_collection_geometry<'a>(
             members.push(CollectionMember {
                 mesh: nested_mesh,
                 matrix: source_matrix,
+                generated,
                 slots,
                 adaptive_normals: member_normals,
                 uv_names,

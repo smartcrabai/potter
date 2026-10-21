@@ -523,6 +523,11 @@ fn merge_attributes(pieces: &[Piece], mesh: &Mesh) -> Result<Map<String, Value>>
     }
     let mut merged = Map::new();
     for name in names {
+        // Each member keeps its own texture space: the collection join carries Generated per vertex, so the member
+        // records are not merged into one mesh-level record (two members with different boxes would conflict).
+        if name == super::TEXTURE_SPACE_KEY {
+            continue;
+        }
         let members: Vec<Member<'_>> = pieces
             .iter()
             .map(|piece| (piece.attributes.get(name), piece))
