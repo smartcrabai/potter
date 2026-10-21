@@ -2536,6 +2536,7 @@ def material_dump(material):
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "use_bump_map_correction": bool(getattr(getattr(material, "cycles", None), "use_bump_map_correction", True)),
             "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
             "alpha_mode": alpha_mode,
             "alpha_threshold": cutoff if alpha_mode == "clip" and cutoff is not None else float(material.alpha_threshold),
@@ -7353,6 +7354,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
+        mat.cycles.use_bump_map_correction = bool(item.get("use_bump_map_correction", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
             item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")

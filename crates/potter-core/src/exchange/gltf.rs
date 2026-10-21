@@ -15058,7 +15058,8 @@ mod tests {
             // A texture on the render layer reads `TexCoord.UV`, which is the hit's render `uv`. The renderer
             // sets it; without it the texture samples the (0, 0) default across the REPEAT seam.
             context.uv = [u, 0.25];
-            let params = crate::shader::evaluate_surface(material, &context)?;
+            let shading = crate::shader::evaluate_surface(material, &context)?;
+            let params = shading.dominant().ok_or("material has no closure")?;
             Ok((params.roughness, params.metallic))
         };
         let close = |actual: f64, expected: f64| (actual - expected).abs() < 1e-6;
@@ -15279,7 +15280,8 @@ mod tests {
                 .with_uv_layers(layers);
             // A graph texture on the render layer reads `TexCoord.UV`, the hit's render `uv`, as the renderer sets it.
             context.uv = [u, v];
-            let params = crate::shader::evaluate_surface(material, &context)?;
+            let shading = crate::shader::evaluate_surface(material, &context)?;
+            let params = shading.dominant().ok_or("material has no closure")?;
             Ok((params.roughness, params.metallic))
         };
         let mut native_images = BTreeMap::new();
@@ -15486,7 +15488,11 @@ mod tests {
                     .with_images(&images)
                     .with_uv_layers(layers);
                 context.uv = [s_u, s_v];
-                Ok(crate::shader::evaluate_surface(material, &context)?.base_color)
+                let shading = crate::shader::evaluate_surface(material, &context)?;
+                Ok(shading
+                    .dominant()
+                    .ok_or("material has no closure")?
+                    .base_color)
             };
             for s_u in grid {
                 for s_v in grid {
@@ -15587,7 +15593,11 @@ mod tests {
                 .with_images(&images)
                 .with_uv_layers(layers);
             context.uv = storage;
-            let actual = crate::shader::evaluate_surface(material, &context)?.base_color;
+            let shading = crate::shader::evaluate_surface(material, &context)?;
+            let actual = shading
+                .dominant()
+                .ok_or("material has no closure")?
+                .base_color;
             for channel in 0..3 {
                 let expected = r[2 + channel].as_f64().ok_or("colour is not a number")?;
                 let diff = (actual[channel] - expected).abs();

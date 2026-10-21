@@ -50,10 +50,10 @@ pub(crate) fn exit_params(params: &BsdfParams) -> BsdfParams {
     }
 }
 
-/// Whether a Principled BSDF with these parameters has a subsurface closure Potter evaluates: a Subsurface Weight
-/// above zero under a method that has an evaluated closure. `Mixed` has none, and is reported and dropped.
+/// Whether a Principled BSDF with these parameters has a subsurface closure: a Subsurface Weight above zero. Every
+/// method Cycles names is evaluated, so the weight alone decides.
 pub(crate) fn subsurface_evaluated(params: &BsdfParams) -> bool {
-    params.subsurface_weight > 0.0 && params.subsurface_method.evaluated().is_some()
+    params.subsurface_weight > 0.0
 }
 
 /// The channels' radius before any method factor: `subsurface_radius × subsurface_scale`, clamped at zero
@@ -342,11 +342,6 @@ mod tests {
                 "{method:?}"
             );
         }
-        // Mixed names two methods at once, which Potter's one parameter set cannot hold.
-        assert!(!subsurface_evaluated(&principled(
-            SubsurfaceMethod::Mixed,
-            0.5
-        )));
     }
 
     #[test]
