@@ -2914,11 +2914,26 @@ fn collect_volumes<'a>(
         } else {
             DVec3::ZERO
         };
+        let interpolation = params.map_or(crate::model::VolumeInterpolation::default(), |params| {
+            params.volume_interpolation
+        });
+        // A VDB's active box is where its voxels are stored, but a sample reads the neighbours of its cell: linear reads
+        // one voxel beyond the box and cubic two. Cycles pads a VDB's mesh by one voxel for linear and two for cubic
+        // (`scene/volume.cpp`, `create_volume_mesh`). Without the pad a ray stops at the box and loses that shell.
+        let pad = if volume.decoded_vdb.is_some() {
+            voxel_size
+                * match interpolation {
+                    crate::model::VolumeInterpolation::Linear => 1.0,
+                    crate::model::VolumeInterpolation::Cubic => 2.0,
+                }
+        } else {
+            0.0
+        };
         volumes.push(VolumeInstance {
             volume,
             world_to_local: matrix.inverse(),
-            bounds_min,
-            bounds_max,
+            bounds_min: bounds_min - DVec3::splat(pad),
+            bounds_max: bounds_max + DVec3::splat(pad),
             voxel_size,
             meters_per_unit,
             density_range,

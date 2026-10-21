@@ -19,6 +19,10 @@ mod blender_file;
 
 use blender_file::blender_executable;
 
+/// Relative spread of the mean luminance over seeds 17-20, at the fixture's 32 spp and budget 4/4, for Blender and Potter.
+const BLENDER_SPREAD: f64 = 0.023;
+const POTTER_SPREAD: f64 = 0.020;
+
 const FIXTURE_SCRIPT: &str = r#"
 import bpy
 import json
@@ -543,10 +547,15 @@ fn compare_cycles_and_path_volume(
          relative error={relative_error:.1}%, screen-side deltas cycles={cycles_order:.5}, path={path_order:.5}",
         relative_error = relative_error * 100.0
     );
+    // Three noise floors of the comparison. Measured over four seeds (17-20) at the fixture's 32 spp and budget 4/4:
+    // Blender's mean luminance has a relative spread of 2.3 %, Potter's of 2.0 %, so the floor is sqrt(2.3² + 2.0²) = 3.05 %
+    // and the bound is 9.2 %. The per-seed relative errors (+6.9, +1.1, -0.05, +1.1 %) lie inside it.
+    let bound = 3.0 * (BLENDER_SPREAD * BLENDER_SPREAD + POTTER_SPREAD * POTTER_SPREAD).sqrt();
     assert!(
-        relative_error <= 0.25,
-        "Cycles/path mean VDB luminance differs by {percent:.1}% (>25%)",
-        percent = relative_error * 100.0
+        relative_error <= bound,
+        "Cycles/path mean VDB luminance differs by {percent:.1}% (>{bound_percent:.1}%)",
+        percent = relative_error * 100.0,
+        bound_percent = bound * 100.0
     );
     assert!(
         path_order * cycles_order > 0.0,
