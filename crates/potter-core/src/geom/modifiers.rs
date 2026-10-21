@@ -51,7 +51,8 @@ pub(crate) use displacement::{
 mod mirror;
 pub(crate) mod multires;
 mod ocean;
-mod remesh_modes;
+pub(crate) mod remesh_modes;
+pub(crate) mod shrinkwrap;
 pub mod simulation;
 mod skin;
 mod smoothing;
@@ -481,10 +482,12 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
         }
         let scene_operand_modifier = (matches!(
             modifier.modifier_type.as_str(),
-            "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform"
+            "boolean" | "surface_deform" | "mesh_deform"
         ) && ["object", "collection", "target"]
             .iter()
             .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)))
+            || (modifier.modifier_type == "shrinkwrap"
+                && modifier.params.get("target").is_some_and(Value::is_string))
             || (matches!(
                 modifier.modifier_type.as_str(),
                 "curve" | "hook" | "data_transfer"
@@ -691,7 +694,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                 owner_world_matrix,
                 object_world_matrices,
             )?,
-            "shrinkwrap" => advanced::shrinkwrap(&evaluated, modifier)?,
+            "shrinkwrap" => shrinkwrap::evaluate(&evaluated, modifier)?,
             "curve" => advanced::curve(&evaluated, modifier)?,
             "hook" => advanced::hook(&evaluated, modifier)?,
             "skin" => skin::skin_with_warnings(&evaluated, modifier, &mut warnings)?,
@@ -871,7 +874,7 @@ fn unsupported_modifier(modifier: &Modifier) -> PotError {
     )
 }
 
-fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> PotError {
+pub(super) fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> PotError {
     let (name, pointer) = match parameter {
         "bind_data" | "binding_data" => ("binding_data", "/binding_data".to_owned()),
         _ => (parameter, format!("/params/{parameter}")),
@@ -1122,7 +1125,7 @@ fn mesh_error(error: &MeshError) -> PotError {
     )
 }
 
-fn validated(mesh: &Mesh) -> Result<()> {
+pub(super) fn validated(mesh: &Mesh) -> Result<()> {
     mesh.validate().map_err(|error| mesh_error(&error))
 }
 
@@ -1151,7 +1154,7 @@ fn schema_value<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a Value> {
     })
 }
 
-fn string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
+pub(super) fn string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
     string_param_with_expected(modifier, name, "a string")
 }
 
@@ -1189,7 +1192,7 @@ pub(super) fn bool_param(modifier: &Modifier, name: &str) -> Result<bool> {
         .ok_or_else(|| invalid_parameter(modifier, name, "a boolean"))
 }
 
-fn uint_param(modifier: &Modifier, name: &str) -> Result<u64> {
+pub(super) fn uint_param(modifier: &Modifier, name: &str) -> Result<u64> {
     schema_value(modifier, name)?
         .as_u64()
         .ok_or_else(|| invalid_parameter(modifier, name, "a non-negative integer"))
@@ -2524,6 +2527,15 @@ fn copy_keyed_value(cap: &Mesh, source: &mut Mesh, name: &str, from: &str, to: S
     );
     if let Some(values) = target.get_mut("values").and_then(Value::as_object_mut) {
         values.insert(to, value.clone());
+    }
+    // A cap's `sharp_face` is copied with its layer (Blender's CustomData copy), so the source has it too.
+    if let Some(present) = attribute.get(crate::geom::normals::SHARP_FACE_PRESENT)
+        && let Some(fields) = target.as_object_mut()
+    {
+        fields.insert(
+            crate::geom::normals::SHARP_FACE_PRESENT.to_owned(),
+            present.clone(),
+        );
     }
 }
 
@@ -4877,6 +4889,72 @@ fn check_evaluation_memory_budget(
         ));
     }
     Ok(())
+}
+
+/// Positions of Shrinkwrap's coarse source vertices after `levels` uniform Catmull-Clark steps. Blender's
+/// `deform_coarse_vertices` writes each coarse vertex at its ptex corner, and Blender 5.2.2 gives the
+/// refined control vertex there (`project_no_axis_subsurf_level_{1,2,6}` agree to f32 precision), not
+/// the limit surface. The steps are the Subsurf level loop's refined path, with creases decaying per
+/// level; the coarse vertices stay first in every level.
+fn shrinkwrap_subdivision_positions(mesh: &Mesh, levels: u64) -> Result<Vec<DVec3>> {
+    validated(mesh)?;
+    let first_level_faces = mesh
+        .faces
+        .iter()
+        .try_fold(0_usize, |count, face| {
+            count.checked_add(face.vertices.len())
+        })
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "shrinkwrap subdivision face count overflows",
+            )
+        })?;
+    check_subdivision_budget(
+        first_level_faces,
+        mesh.vertices.len(),
+        mesh.edges.len(),
+        levels,
+        0,
+    )?;
+    let options = SubdivisionOptions {
+        preserve_corners: false,
+        use_creases: true,
+    };
+    let coarse_count = mesh.vertices.len();
+    let mut result = mesh.clone();
+    let mut source_polygons = polygons(&result)?;
+    let mut source_edges = loose_edges(&result)?;
+    let mut edge_creases =
+        subdivision_uv::Creases::from_values(edge_crease_values(&result, options.use_creases)?);
+    let mut vertex_creases = vertex_crease_sharpness(&result, options.use_creases)?;
+    for _ in 0..levels {
+        let position = subdivision_uv::Position::new(
+            &source_polygons,
+            &source_edges,
+            &edge_creases.sharpness,
+            result.vertices.len(),
+        );
+        let (next, _, next_creases) = subdivide_once(
+            &result,
+            options,
+            &position,
+            &source_polygons,
+            &source_edges,
+            &edge_creases,
+            &vertex_creases,
+            true,
+        )?;
+        edge_creases = next_creases;
+        vertex_creases = decay_vertex_creases(&vertex_creases, next.vertices.len());
+        result = next;
+        source_polygons = polygons(&result)?;
+        source_edges = loose_edges(&result)?;
+    }
+    Ok(result.vertices[..coarse_count]
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect())
 }
 
 const BLENDER_EDGE_CREASE_MAX_SHARPNESS: f64 = 10.0;

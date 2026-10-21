@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Aabb, CylinderParams, IcosphereParams, Mesh,
+        Aabb, CylinderParams, GeneratedVertex, IcosphereParams, Mesh, TextureSpace,
         concat::{Part, concatenate, concatenate_with_normals},
         modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
         normals::SHADING_ATTRIBUTES,
@@ -258,6 +258,10 @@ pub struct Snapshot {
     /// Ephemeral local-space adaptive surface normals, aligned with each evaluated mesh's vertices.
     #[serde(skip)]
     pub(crate) adaptive_normals: BTreeMap<Id, Vec<Option<DVec3>>>,
+    /// Ephemeral Generated coordinates of each evaluated collection instance's joined mesh, aligned with its vertices:
+    /// each member's vertices keep the texture space of their own member.
+    #[serde(skip)]
+    pub(crate) generated_vertices: BTreeMap<Id, Vec<GeneratedVertex>>,
     /// Evaluated armature bone-head matrices in world space.
     #[serde(skip)]
     pub bone_matrices: BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
@@ -601,6 +605,7 @@ impl Snapshot {
                         snapshot.instance_paths.remove(node_id);
                         snapshot.slot_bindings.remove(node_id);
                         snapshot.adaptive_normals.remove(node_id);
+                        snapshot.generated_vertices.remove(node_id);
                         snapshot.strokes.remove(node_id);
                     }
                     return Ok((snapshot, node_errors));
@@ -1092,6 +1097,7 @@ impl Snapshot {
         let mut nodes = BTreeMap::new();
         let mut meshes = BTreeMap::new();
         let mut adaptive_normals = BTreeMap::new();
+        let mut generated_vertices = BTreeMap::new();
         let mut instance_paths = BTreeMap::new();
         let mut slot_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
@@ -2079,6 +2085,7 @@ impl Snapshot {
                 paths,
                 bindings,
                 adaptive_normals: member_normals,
+                generated,
                 ..
             } = evaluate_collection_instance(
                 doc,
@@ -2093,6 +2100,7 @@ impl Snapshot {
             if !mesh.vertices.is_empty() {
                 slot_bindings.insert(id.clone(), bindings);
                 meshes.insert(id.clone(), mesh);
+                generated_vertices.insert(id.clone(), generated);
                 if let Some(normals) = member_normals {
                     adaptive_normals.insert(id.clone(), normals);
                 }
@@ -2129,6 +2137,7 @@ impl Snapshot {
             slot_bindings,
             meshes,
             adaptive_normals,
+            generated_vertices,
             strokes,
             volume_data,
             bone_matrices,
@@ -2693,27 +2702,20 @@ fn object_mesh_dependencies(
                 "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" | "volume_to_mesh" => {
                     &["object"]
                 }
-                "shrinkwrap" => {
-                    if modifier
-                        .params
-                        .get("target")
-                        .is_some_and(|value| !value.is_null())
-                    {
-                        &["target"]
-                    } else {
-                        &["object"]
-                    }
-                }
+                "shrinkwrap" => &["target", "auxiliary_target"],
                 "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
                 "array" => &["start_cap", "end_cap"],
                 _ => &[],
             };
             for parameter in parameters {
-                add_mesh_operand_dependency(
-                    &mut dependencies.modifiers,
-                    owner_id,
-                    modifier.params.get(*parameter),
-                );
+                let value = modifier.params.get(*parameter);
+                // Blender disables a Shrinkwrap aimed at its own object: no dependency.
+                if modifier.modifier_type == "shrinkwrap"
+                    && value.and_then(serde_json::Value::as_str) == Some(owner_id.as_str())
+                {
+                    continue;
+                }
+                add_mesh_operand_dependency(&mut dependencies.modifiers, owner_id, value);
             }
         }
         if let Some(collection_id) = instance_collection_target(node)? {
@@ -2874,7 +2876,7 @@ pub(crate) fn resolve_modifier_object_operands(
         "boolean" | "curve" | "hook" | "data_transfer" | "mesh_deform" => &["object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],
-        "shrinkwrap" => &["target", "object"],
+        "shrinkwrap" => &["target", "auxiliary_target"],
         "vertex_weight_edit" | "vertex_weight_mix" => &["mask_tex_map_object"],
         "vertex_weight_proximity" => &["target", "mask_tex_map_object"],
         "normal_edit" | "surface_deform" => &["target"],
@@ -3748,6 +3750,122 @@ fn select_particle_states(
         .collect()
 }
 
+/// Blender's Shrinkwrap projects onto a mesh target evaluated in the subject's space. A missing or
+/// self target, or a non-mesh target, leaves the subject unchanged; a self auxiliary target is
+/// ignored, and a non-mesh auxiliary target disables the modifier.
+fn apply_scene_shrinkwrap_modifier(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+) -> Result<()> {
+    let Some(target_id) = shrinkwrap_object_reference(modifier, "target")? else {
+        return Ok(());
+    };
+    if target_id == *subject_id || !is_scene_mesh_object(modifier, doc, &target_id)? {
+        return Ok(());
+    }
+    let auxiliary_id =
+        shrinkwrap_object_reference(modifier, "auxiliary_target")?.filter(|id| id != subject_id);
+    if let Some(auxiliary_id) = &auxiliary_id
+        && !is_scene_mesh_object(modifier, doc, auxiliary_id)?
+    {
+        return Ok(());
+    }
+    let mut operands = resolve_modifier_object_operands(
+        modifier,
+        subject_id,
+        doc,
+        world_matrices,
+        evaluated_meshes,
+    )?;
+    let target = operands
+        .remove("target")
+        .and_then(|mut operands| operands.pop())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "shrinkwrap target mesh was not resolved",
+                json!({"modifier_id":modifier.id,"target":target_id}),
+            )
+        })?;
+    let mut resolved = modifier.clone();
+    resolved.params.remove("target");
+    resolved.params.remove("auxiliary_target");
+    let subject_to_target = crate::geom::blender_matrix::shrinkwrap_subject_to_target(
+        doc,
+        subject_id,
+        &target_id,
+        world_matrices,
+    )
+    .unwrap_or_else(|| target.local_to_subject.inverse());
+    resolved.runtime.shrinkwrap_subject_to_target = Some(subject_to_target.to_cols_array());
+    resolved.runtime.shrinkwrap_target_mesh = Some(target.mesh);
+    if let Some(auxiliary_id) = auxiliary_id {
+        let auxiliary = operands
+            .remove("auxiliary_target")
+            .and_then(|mut operands| operands.pop())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "shrinkwrap auxiliary target mesh was not resolved",
+                    json!({"modifier_id":modifier.id,"auxiliary_target":auxiliary_id}),
+                )
+            })?;
+        let subject_to_auxiliary = crate::geom::blender_matrix::shrinkwrap_subject_to_target(
+            doc,
+            subject_id,
+            &auxiliary_id,
+            world_matrices,
+        )
+        .unwrap_or_else(|| auxiliary.local_to_subject.inverse());
+        resolved.runtime.shrinkwrap_auxiliary_subject_to_target =
+            Some(subject_to_auxiliary.to_cols_array());
+        resolved.runtime.shrinkwrap_auxiliary_target_mesh = Some(auxiliary.mesh);
+    }
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
+    Ok(())
+}
+
+/// An object-reference parameter of a Shrinkwrap: `None` when the value is null or absent.
+fn shrinkwrap_object_reference(modifier: &Modifier, parameter: &str) -> Result<Option<Id>> {
+    match modifier.params.get(parameter) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Id::new(text.to_owned()).map(Some).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                error.message,
+                json!({"modifier_id":modifier.id,"parameter":parameter,"object":text}),
+            )
+        }),
+        Some(_) => Err(PotError::invalid_argument(format!(
+            "modifier `shrinkwrap` `{parameter}` must be an object ID"
+        ))),
+    }
+}
+
+fn is_scene_mesh_object(modifier: &Modifier, doc: &SceneDoc, object_id: &Id) -> Result<bool> {
+    let object = doc.nodes.get(object_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier operand object `{object_id}` was not found"),
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    Ok(object.kind == "mesh"
+        && object
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .is_some_and(|data| data.data_type == "mesh"))
+}
+
 fn apply_generic_scene_mesh_operand_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -3763,15 +3881,9 @@ fn apply_generic_scene_mesh_operand_modifier(
         world_matrices,
         evaluated_meshes,
     )?;
-    let object_parameter =
-        if modifier.modifier_type == "shrinkwrap" && modifier.params.contains_key("target") {
-            "target"
-        } else {
-            "object"
-        };
     let mut combined = None;
     let mut curve_object_matrix = None;
-    for operand in operands.get(object_parameter).into_iter().flatten() {
+    for operand in operands.get("object").into_iter().flatten() {
         if modifier.modifier_type == "curve" && curve_object_matrix.is_none() {
             curve_object_matrix = Some(operand.local_to_subject.to_cols_array());
         }
@@ -3844,9 +3956,17 @@ pub(crate) fn apply_scene_operand_modifier(
         )?;
         return Ok(());
     }
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve")
-        && !modifier.params.contains_key("collection")
-    {
+    if modifier.modifier_type == "shrinkwrap" {
+        return apply_scene_shrinkwrap_modifier(
+            mesh,
+            modifier,
+            subject_id,
+            doc,
+            world_matrices,
+            evaluated_meshes,
+        );
+    }
+    if modifier.modifier_type == "curve" && !modifier.params.contains_key("collection") {
         return apply_generic_scene_mesh_operand_modifier(
             mesh,
             modifier,
@@ -3858,34 +3978,20 @@ pub(crate) fn apply_scene_operand_modifier(
     }
     let mut object_ids = BTreeSet::new();
     let mut collection_id = None;
-    let object_parameter = if modifier.modifier_type == "shrinkwrap" {
-        "target"
-    } else {
-        "object"
-    };
-    if let Some(value) = modifier.params.get(object_parameter) {
+    if let Some(value) = modifier.params.get("object") {
         let text = value.as_str().ok_or_else(|| {
             PotError::invalid_argument(format!(
-                "modifier `{}` `{object_parameter}` must be an object ID",
+                "modifier `{}` `object` must be an object ID",
                 modifier.modifier_type
             ))
         })?;
         let object_id = Id::new(text).map_err(|_| {
             PotError::invalid_argument(format!(
-                "modifier `{}` `{object_parameter}` must be a valid object ID",
+                "modifier `{}` `object` must be a valid object ID",
                 modifier.modifier_type
             ))
         })?;
         object_ids.insert(object_id);
-    } else if modifier.modifier_type == "shrinkwrap"
-        && let Some(value) = modifier.params.get("object")
-    {
-        let text = value.as_str().ok_or_else(|| {
-            PotError::invalid_argument("shrinkwrap `object` must be an object ID")
-        })?;
-        object_ids.insert(Id::new(text).map_err(|_| {
-            PotError::invalid_argument("shrinkwrap `object` must be a valid object ID")
-        })?);
     }
     if let Some(value) = modifier.params.get("collection") {
         let text = value.as_str().ok_or_else(|| {
@@ -3915,7 +4021,7 @@ pub(crate) fn apply_scene_operand_modifier(
                 "modifier `{}` requires an object or collection operand",
                 modifier.modifier_type
             ),
-            json!({"modifier_id":modifier.id,"pointer":format!("/params/{object_parameter}")}),
+            json!({"modifier_id":modifier.id,"pointer":"/params/object"}),
         ));
     }
     let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
@@ -5022,10 +5128,12 @@ fn instance_collection_target(node: &Node) -> Result<Option<Id>> {
 /// that instance alone.
 const INSTANCE_JOIN_FAILURE: &str = "collection_instance_join_failed";
 
-/// A collection member before joining: its mesh and member-local UV/color bindings.
+/// A collection member before joining: its mesh, its Generated per vertex (in its own texture space), and
+/// member-local UV/color bindings.
 struct CollectionMember<'a> {
     mesh: Cow<'a, Mesh>,
     matrix: DMat4,
+    generated: Vec<GeneratedVertex>,
     slots: Vec<SlotBinding>,
     adaptive_normals: Option<Cow<'a, [Option<DVec3>]>>,
     uv_names: Vec<String>,
@@ -5033,13 +5141,15 @@ struct CollectionMember<'a> {
     color_names: Vec<String>,
 }
 
-/// A joined collection instance and the source bindings/coverage to propagate through nesting.
+/// A joined collection instance and the source bindings/coverage to propagate through nesting. `generated` is
+/// aligned with `mesh.vertices`.
 struct CollectionEvaluation {
     mesh: Mesh,
     paths: Vec<Vec<Id>>,
     bindings: Vec<SlotBinding>,
     uv_coverage: Vec<u8>,
     adaptive_normals: Option<Vec<Option<DVec3>>>,
+    generated: Vec<GeneratedVertex>,
 }
 
 struct JoinedMemberBindings {
@@ -5270,6 +5380,7 @@ fn evaluate_collection_instance<'a>(
     let mut parts = Vec::with_capacity(members.len());
     let mut member_bindings = Vec::with_capacity(members.len());
     let mut slot_base = 0;
+    let mut generated = Vec::new();
     for member in members {
         let material_offset = u32::try_from(slot_base).map_err(|_| {
             PotError::new(
@@ -5278,6 +5389,14 @@ fn evaluate_collection_instance<'a>(
             )
         })?;
         let slot_count = member.slots.len();
+        if member.generated.len() != member.mesh.vertices.len() {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "collection member Generated does not match its vertices",
+            ));
+        }
+        // The join appends each member's vertices in order, so their Generated values join in the same order.
+        generated.extend(member.generated);
         parts.push(Part {
             mesh: member.mesh,
             matrix: member.matrix,
@@ -5306,6 +5425,12 @@ fn evaluate_collection_instance<'a>(
         concatenate(parts).map(|mesh| (mesh, None))
     }
     .map_err(|error| instance_join_error(error, instance_id))?;
+    if generated.len() != mesh.vertices.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "collection instance Generated does not match its vertices",
+        ));
+    }
     let joined_uv_names = uv_layers::read_layers(&mesh)
         .into_iter()
         .map(|layer| layer.name)
@@ -5355,6 +5480,7 @@ fn evaluate_collection_instance<'a>(
         bindings,
         uv_coverage,
         adaptive_normals,
+        generated,
     })
 }
 
@@ -5444,6 +5570,7 @@ fn append_collection_geometry<'a>(
                 nested.paths,
                 nested.bindings,
                 nested.adaptive_normals.map(Cow::Owned),
+                nested.generated,
                 uv_names,
                 nested.uv_coverage,
                 color_names,
@@ -5472,6 +5599,18 @@ fn append_collection_geometry<'a>(
                     |evaluated| evaluated.materials.clone(),
                 );
                 let slots = member_slot_bindings(&materials, source_mesh, &uv_store, &color_names);
+                // Blender computes a member's texture space on its undeformed mesh, before its modifiers.
+                let undeformed = source_data
+                    .and_then(|data| data.mesh.as_ref())
+                    .unwrap_or(source_mesh);
+                let texture_space = undeformed
+                    .manual_texture_space()
+                    .unwrap_or_else(|| TextureSpace::automatic(undeformed.bounds()));
+                let generated: Vec<GeneratedVertex> = source_mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| texture_space.generated_vertex(vertex.co))
+                    .collect();
                 (
                     Cow::Borrowed(source_mesh),
                     vec![vec![object_id.clone()]],
@@ -5479,6 +5618,7 @@ fn append_collection_geometry<'a>(
                     adaptive_normals
                         .get(object_id)
                         .map(|normals| Cow::Borrowed(normals.as_slice())),
+                    generated,
                     uv_names,
                     uv_coverage,
                     color_names,
@@ -5490,6 +5630,7 @@ fn append_collection_geometry<'a>(
             nested_paths,
             slots,
             member_normals,
+            generated,
             uv_names,
             uv_coverage,
             color_names,
@@ -5507,6 +5648,7 @@ fn append_collection_geometry<'a>(
             members.push(CollectionMember {
                 mesh: nested_mesh,
                 matrix: source_matrix,
+                generated,
                 slots,
                 adaptive_normals: member_normals,
                 uv_names,
