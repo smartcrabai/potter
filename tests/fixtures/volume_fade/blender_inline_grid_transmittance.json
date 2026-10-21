@@ -1,0 +1,23 @@
+{
+ "blender": "5.2.2 LTS",
+ "samples": 4096,
+ "seeds": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "density": 0.7,
+ "cases": {
+  "inline_grid_transmittance": {
+   "transmittance": 0.252344,
+   "stderr": 0.005838,
+   "per_seed": [
+    0.260938,
+    0.239063,
+    0.246094,
+    0.263281
+   ]
+  }
+ }
+}
