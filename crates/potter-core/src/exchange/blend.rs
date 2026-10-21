@@ -3988,7 +3988,7 @@ fn build_imported_graph(
                         &movie_clip_ids,
                         &action_ids,
                     )?;
-                    canonicalize_particle_texture_slots(&mut settings, &resource_ids);
+                    canonicalize_particle_texture_slots(&mut settings, &resource_ids, &image_ids);
                     if model_type == "particle_system" {
                         if !properties.contains_key(property) {
                             properties.insert(property.to_owned(), settings.clone());
@@ -8581,6 +8581,7 @@ const PARTICLE_UNSUPPORTED_CHANNELS: [(&str, &str); 10] = [
 fn canonicalize_particle_texture_slots(
     settings: &mut Value,
     resource_ids: &BTreeMap<String, String>,
+    image_ids: &BTreeMap<String, Id>,
 ) {
     let Some(slots) = settings
         .get_mut("texture_slots")
@@ -8599,7 +8600,16 @@ fn canonicalize_particle_texture_slots(
             .and_then(Value::as_str)
             .filter(|_| !noise)
             .and_then(|name| resource_ids.get(name))
-            .cloned();
+            .cloned()
+            .or_else(|| {
+                // A default image texture is exported as its image (Blender's image fast path).
+                slot.get("texture_image")
+                    .and_then(|reference| reference.get("name"))
+                    .and_then(Value::as_str)
+                    .filter(|_| !noise)
+                    .and_then(|name| image_ids.get(name))
+                    .map(|id| id.as_str().to_owned())
+            });
         slot.insert(
             "texture".to_owned(),
             resource.map_or(Value::Null, Value::String),
@@ -8667,7 +8677,12 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     ));
                     continue;
                 }
-                if slot.get("texture_exported").and_then(Value::as_bool) != Some(true) {
+                let image_fast_path = slot
+                    .get("texture_image")
+                    .is_some_and(|reference| !reference.is_null());
+                if slot.get("texture_exported").and_then(Value::as_bool) != Some(true)
+                    && !image_fast_path
+                {
                     losses.push(loss(
                         "blender.particle_system.texture_slot",
                         name,

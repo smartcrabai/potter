@@ -1,5 +1,6 @@
 //! Deterministic mesh-emitter particle simulation.
 
+use super::particle_distribution;
 use super::particle_textures::{TextureSlot, birth_values, maps_density, maps_time};
 use super::{ParticleLifeState, ParticlePathInterpolation, ParticlePathKey};
 use std::collections::HashMap;
@@ -628,13 +629,29 @@ fn simulate_with_lifecycle(
         .last()
         .map_or(0.0, |triangle| triangle.cumulative_area);
     let mut texture_rng = BlenderRng::seed_random(system_seed);
+    // Blender's `distribute_particles`: particle `p` is emitted from vertex `vertex_elements[p]`.
+    let use_emit_random = settings
+        .get("use_emit_random")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let vertex_elements = if from_vertex {
+        particle_distribution::vertex_elements(
+            mesh.vertices.len(),
+            count as usize,
+            system_seed,
+            use_emit_random,
+        )
+    } else {
+        Vec::new()
+    };
     // Index of the next particle that exists; Blender renumbers particles after removing the others.
     let mut survivors: u32 = 0;
     for event in first_event..emitted {
         let particle_index =
             u32::try_from(event).map_err(|_| limit("particle index exceeds supported range"))?;
+        // Path keys are exported per surviving particle (after `free_unexisting_particles`).
         let path = if let Some(paths) = path_values {
-            particle_path(paths, event)?
+            particle_path(paths, u64::from(survivors))?
         } else {
             Vec::new()
         };
@@ -651,8 +668,14 @@ fn simulate_with_lifecycle(
                     DVec3::Z,
                 )
             } else if from_vertex || triangles.is_empty() || total_area <= 0.0 {
-                let index = (random.unit() * mesh.vertices.len() as f64) as usize;
-                let index = index.min(mesh.vertices.len() - 1);
+                let index = if from_vertex {
+                    let particle = usize::try_from(event)
+                        .map_err(|_| limit("particle index exceeds supported range"))?;
+                    vertex_elements[particle]
+                } else {
+                    let index = (random.unit() * mesh.vertices.len() as f64) as usize;
+                    index.min(mesh.vertices.len() - 1)
+                };
                 (
                     mesh.vertices[index].co,
                     vertex_normals[index].normalize_or_zero(),

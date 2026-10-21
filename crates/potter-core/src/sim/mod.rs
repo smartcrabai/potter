@@ -4,6 +4,7 @@ mod cache;
 pub mod cloth;
 pub mod dynamic_paint;
 pub mod fluid;
+mod particle_distribution;
 mod particle_textures;
 pub mod particles;
 pub mod softbody;

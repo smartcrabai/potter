@@ -150,6 +150,33 @@ fn particle_texture_influences_and_count_schedule_match_blender() -> Result<(), 
             .find(|(_, node)| node["name"] == name.as_str())
             .map(|(id, _)| id.clone())
             .unwrap_or_else(|| panic!("{name}: node is missing from the imported scene"));
+        if let Some(explode) = case.get("explode") {
+            // Explode cases compare the evaluated mesh counts of the imported node at the scene frame.
+            let mut inspect = Command::new(env!("CARGO_BIN_EXE_pot"));
+            inspect
+                .arg("inspect")
+                .arg(&project)
+                .arg("--id")
+                .arg(&node_id)
+                .arg("--json");
+            let output = process::run_guarded(inspect)?;
+            assert!(
+                output.status.success(),
+                "{name}: inspect failed:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let envelope: Value = serde_json::from_slice(&output.stdout)?;
+            let geometry = &envelope["result"]["items"][0]["evaluated_geometry"];
+            assert_eq!(
+                geometry["vertex_count"], explode["vertex_count"],
+                "{name}: Explode vertex count"
+            );
+            assert_eq!(
+                geometry["face_count"], explode["face_count"],
+                "{name}: Explode face count"
+            );
+            continue;
+        }
         let frame_index = case["frame"].as_u64().unwrap() - 1;
         let frame: Value =
             serde_json::from_slice(&fs::read(out.join(format!("frame_{frame_index:08}.json")))?)?;

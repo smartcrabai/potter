@@ -694,6 +694,7 @@ def _particle_texture_slots(settings):
             "density_factor": float(slot.density_factor),
             "size_factor": float(slot.size_factor),
             "texture_exported": _legacy_texture_record(slot.texture) is not None,
+            "texture_image": plain(slot.texture.image) if slot.texture.type == "IMAGE" and slot.texture.image else None,
         }
         for key in PARTICLE_USE_MAP_KEYS:
             record[key] = bool(getattr(slot, key))

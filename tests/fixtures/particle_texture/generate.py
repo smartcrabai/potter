@@ -1,4 +1,4 @@
-"""Blender 5.2.2 oracle for particle emission schedule and texture influences.
+"""Blender 5.2.2 oracle for particle emission, texture influences, and explode with density.
 
 Usage (from the repo root):
 
@@ -6,12 +6,13 @@ Usage (from the repo root):
         --python tests/fixtures/particle_texture/generate.py -- <out_dir>
 
 Writes into <out_dir>:
-    particle_texture.blend   the scene Potter imports
-    blender_expected.json    Blender's per-particle values at each case's evaluation frame
+    particle_texture.blend   the scene Potter imports (the image is packed into it)
+    blender_expected.json    Blender's per-particle values and evaluated Explode counts
 
-Each case is one emitter object with one vertex, so every particle is born at the same point and
-Potter's emitter sample is deterministic. Density cases record how many particles exist: Blender's
-evaluated particle list leaves out the particles that the density texture removes.
+Particle cases use one emitter vertex, so every particle is born at the same point. Explode cases
+use a cube whose particles are emitted from its vertices through Blender's vertex distribution.
+Density removes non-existing particles from Blender's particle list (`free_unexisting_particles`),
+so the existing count is the length of that list.
 """
 
 import json
@@ -25,11 +26,30 @@ if bpy.app.version != (5, 2, 2):
 
 OUT = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 POINT = (0.3, 0.2, 0.1)
+CUBE_VERTICES = [
+    (-1.0, -1.0, -1.0), (1.0, -1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, 1.0, -1.0),
+    (-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0),
+]
+CUBE_FACES = [
+    (0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7),
+]
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
 texture = bpy.data.textures.new("PotterBlend", type="BLEND")
 texture.progression = "LINEAR"
+
+# A 4 by 4 gradient, packed into the .blend so Potter imports the same pixels.
+gradient = bpy.data.images.new("PotterGradient", width=4, height=4, alpha=False)
+gradient.pixels = [
+    value
+    for y in range(4)
+    for x in range(4)
+    for value in (x / 3.0, y / 3.0, 0.5, 1.0)
+]
+gradient.pack()
+image_texture = bpy.data.textures.new("PotterImage", type="IMAGE")
+image_texture.image = gradient
 
 
 def point_object(name, location, vertex=(0.0, 0.0, 0.0)):
@@ -62,15 +82,17 @@ def add_emitter(obj, count, frame_start, frame_end, lifetime, particle_size):
 
 
 def add_slot(settings, channel, factor, default, coords="GLOBAL", anchor=None,
-             scale=(1.0, 1.0, 1.0), offset=(0.0, 0.0, 0.0), blend="MIX"):
+             scale=(1.0, 1.0, 1.0), offset=(0.0, 0.0, 0.0), blend="MIX",
+             tex=None, mapping="FLAT"):
     slot = settings.texture_slots.add()
-    slot.texture = texture
+    slot.texture = tex if tex is not None else texture
     slot.texture_coords = coords
     if anchor is not None:
         slot.object = anchor
     slot.mapping_x = "X"
     slot.mapping_y = "Y"
     slot.mapping_z = "Z"
+    slot.mapping = mapping
     slot.scale = scale
     slot.offset = offset
     slot.default_value = default
@@ -89,14 +111,21 @@ def particle_values(obj):
     ]
 
 
+def explode_counts(obj):
+    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    mesh = evaluated.to_mesh()
+    counts = {"vertex_count": len(mesh.vertices), "face_count": len(mesh.polygons)}
+    evaluated.to_mesh_clear()
+    return counts
+
+
 # Each case names its object and the frame it is read at. Blender's particle reset on a backward
 # frame jump samples textures before the birth point is set, so the scene is stepped forward once.
-cases = {}
 reads = []
 
 
-def case(name, obj, frame, visible=False):
-    reads.append((frame, name, obj, visible))
+def case(name, obj, frame, kind="particles", visible=False):
+    reads.append((frame, name, obj, kind, visible))
 
 
 # Schedule: particle i is born at frame_start + (frame_end - frame_start) * i / count.
@@ -144,15 +173,43 @@ settings = add_emitter(obj, 8, 1, 1, 500.0, 1.0)
 add_slot(settings, "density", 1.0, 0.0)
 case("density_global", obj, 2, visible=True)
 
-frames = sorted({frame for frame, _, _, _ in reads})
+# Image: a packed gradient sampled with flat mapping, and with tube mapping.
+obj = point_object("image_flat", (0.0, 0.0, 0.0), POINT)
+settings = add_emitter(obj, 1, 1, 1, 500.0, 1.0)
+add_slot(settings, "size", 1.0, 0.0, tex=image_texture, mapping="FLAT")
+case("image_flat", obj, 2)
+
+obj = point_object("image_tube", (0.0, 0.0, 0.0), POINT)
+settings = add_emitter(obj, 1, 1, 1, 500.0, 1.0)
+add_slot(settings, "size", 1.0, 0.0, tex=image_texture, mapping="TUBE")
+case("image_tube", obj, 2)
+
+# Explode with density: the cube's vertices emit eight particles, and density removes some of them.
+for name, with_density in (("explode_plain", False), ("explode_density", True)):
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    mesh.from_pydata(CUBE_VERTICES, [], CUBE_FACES)
+    obj = bpy.data.objects.new(name, mesh)
+    scene.collection.objects.link(obj)
+    settings = add_emitter(obj, 8, 1, 1, 500.0, 1.0)
+    if with_density:
+        add_slot(settings, "density", 1.0, 0.0)
+    obj.modifiers.new("Explode", "EXPLODE")
+    # Read at frame 1, where the particles are born (birth 1), so Potter's inspect of the scene matches.
+    case(name, obj, 1, kind="explode")
+
+frames = sorted({frame for frame, _, _, _, _ in reads})
+cases = {}
 for frame in range(1, max(frames) + 1):
     scene.frame_set(frame)
-    for read_frame, name, obj, visible in reads:
+    for read_frame, name, obj, kind, visible in reads:
         if read_frame != frame:
+            continue
+        if kind == "explode":
+            cases[name] = {"frame": frame, "explode": explode_counts(obj)}
             continue
         entry = {"frame": frame, "particles": particle_values(obj)}
         if visible:
-            # Blender's evaluated particle list holds the existing particles ( removed).
+            # Blender's evaluated particle list holds the existing particles only.
             entry["existing"] = len(entry["particles"])
         cases[name] = entry
 
