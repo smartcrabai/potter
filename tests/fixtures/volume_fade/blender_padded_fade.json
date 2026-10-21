@@ -1,0 +1,34 @@
+{
+ "blender": "5.2.2 LTS",
+ "samples": 4096,
+ "seeds": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "cases": {
+  "uniform_16cubed": {
+   "transmittance": 0.493164,
+   "stderr": 0.000667,
+   "per_seed": [
+    0.494531,
+    0.492969,
+    0.49375,
+    0.491406
+   ],
+   "padded_model": 0.496585
+  },
+  "uniform_4cubed": {
+   "transmittance": 0.560742,
+   "stderr": 0.002264,
+   "per_seed": [
+    0.560938,
+    0.565625,
+    0.561719,
+    0.554688
+   ],
+   "padded_model": 0.496585
+  }
+ }
+}
