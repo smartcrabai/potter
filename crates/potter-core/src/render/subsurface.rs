@@ -14,7 +14,7 @@ use std::f64::consts::PI;
 use glam::DVec3;
 
 use super::bvh::BvhHit;
-use crate::shader::{BsdfParams, SubsurfaceMethod};
+use crate::shader::BsdfParams;
 
 /// Cycles' `BSSRDF_MIN_RADIUS`: a channel with a smaller radius has no subsurface closure and falls back to diffuse.
 pub(crate) const MIN_RADIUS: f64 = 1.0e-8;
@@ -51,30 +51,21 @@ pub(crate) fn exit_params(params: &BsdfParams) -> BsdfParams {
 }
 
 /// Whether a Principled BSDF with these parameters has a subsurface closure Potter evaluates: a Subsurface Weight
-/// above zero under the Burley or the random walk method. The skin, legacy and mixed methods are reported as
-/// unsupported and drop out here.
+/// above zero under a method that has an evaluated closure. `Mixed` has none, and is reported and dropped.
 pub(crate) fn subsurface_evaluated(params: &BsdfParams) -> bool {
-    params.subsurface_weight > 0.0
-        && matches!(
-            params.subsurface_method,
-            SubsurfaceMethod::Burley | SubsurfaceMethod::RandomWalk
-        )
+    params.subsurface_weight > 0.0 && params.subsurface_method.evaluated().is_some()
 }
 
-/// The mean free path of each channel, clamped at zero: `subsurface_radius × subsurface_scale` (`svm/closure.h`),
-/// times `0.25 / π` for Burley (`bssrdf_setup_radius`). The random walk keeps the radius unchanged.
-pub(crate) fn closure_radius(params: &BsdfParams) -> DVec3 {
-    let radius = raw_radius(params);
-    match params.subsurface_method {
-        SubsurfaceMethod::Burley => radius * (0.25 / PI),
-        _ => radius,
-    }
-}
-
-/// The radius before the Burley scaling: `subsurface_radius × subsurface_scale`, clamped at zero (`svm/closure.h`).
-/// Cycles tests the channels against `BSSRDF_MIN_RADIUS` on this radius, before `bssrdf_setup_radius` scales it.
+/// The channels' radius before any method factor: `subsurface_radius × subsurface_scale`, clamped at zero
+/// (`svm/closure.h`). Cycles tests a channel's minimum radius on this value (`bssrdf_setup`, before
+/// `bssrdf_setup_radius`), so the channel mask uses it for every method.
 pub(crate) fn raw_radius(params: &BsdfParams) -> DVec3 {
     DVec3::from_array(params.subsurface_radius).max(DVec3::ZERO) * params.subsurface_scale.max(0.0)
+}
+
+/// The Burley mean free path of each channel: the raw radius times `0.25 / π` (`bssrdf_setup_radius`).
+pub(crate) fn burley_radius(params: &BsdfParams) -> DVec3 {
+    raw_radius(params) * (0.25 / PI)
 }
 
 /// Where a subsurface path leaves the surface: the exit hit, the origin and direction of the ray that reached it, and
@@ -243,6 +234,7 @@ impl<T: Copy> ProbeHits<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shader::SubsurfaceMethod;
 
     /// Simpson's rule over `[a, b]`.
     fn simpson(a: f64, b: f64, n: usize, f: impl Fn(f64) -> f64) -> f64 {
@@ -337,28 +329,20 @@ mod tests {
     }
 
     #[test]
-    fn only_burley_and_random_walk_with_a_weight_are_evaluated() {
-        assert!(subsurface_evaluated(&principled(
+    fn the_four_named_methods_with_a_weight_are_evaluated() {
+        for method in [
             SubsurfaceMethod::Burley,
-            0.5
-        )));
-        assert!(subsurface_evaluated(&principled(
             SubsurfaceMethod::RandomWalk,
-            0.5
-        )));
-        assert!(!subsurface_evaluated(&principled(
-            SubsurfaceMethod::Burley,
-            0.0
-        )));
-        // The skin, legacy and mixed methods are not evaluated: they must not render as another method.
-        assert!(!subsurface_evaluated(&principled(
             SubsurfaceMethod::RandomWalkSkin,
-            0.5
-        )));
-        assert!(!subsurface_evaluated(&principled(
             SubsurfaceMethod::RandomWalkLegacy,
-            0.5
-        )));
+        ] {
+            assert!(subsurface_evaluated(&principled(method, 0.5)), "{method:?}");
+            assert!(
+                !subsurface_evaluated(&principled(method, 0.0)),
+                "{method:?}"
+            );
+        }
+        // Mixed names two methods at once, which Potter's one parameter set cannot hold.
         assert!(!subsurface_evaluated(&principled(
             SubsurfaceMethod::Mixed,
             0.5
@@ -366,18 +350,17 @@ mod tests {
     }
 
     #[test]
-    fn closure_radius_is_scaled_and_burley_takes_four_over_pi() {
+    fn raw_radius_is_scaled_and_burley_takes_four_over_pi() {
         // Blender's default radius (1, 0.2, 0.1) and scale 0.005 (`svm/closure.h`, `bssrdf_setup_radius`).
-        let burley = closure_radius(&principled(SubsurfaceMethod::Burley, 1.0));
-        let factor = 0.005 * 0.25 / PI;
-        assert!((burley.x - factor).abs() < 1.0e-15, "{burley:?}");
-        assert!((burley.y - 0.2 * factor).abs() < 1.0e-15, "{burley:?}");
-        assert!((burley.z - 0.1 * factor).abs() < 1.0e-15, "{burley:?}");
-        // The random walk keeps the scaled radius (`svm/closure.h`: `bssrdf->radius = radius × scale`).
-        let walk = closure_radius(&principled(SubsurfaceMethod::RandomWalk, 1.0));
-        assert!((walk.x - 0.005).abs() < 1.0e-15, "{walk:?}");
-        assert!((walk.y - 0.001).abs() < 1.0e-15, "{walk:?}");
-        assert!((walk.z - 0.0005).abs() < 1.0e-15, "{walk:?}");
+        let params = principled(SubsurfaceMethod::Burley, 1.0);
+        let raw = raw_radius(&params);
+        assert!((raw.x - 0.005).abs() < 1.0e-15, "{raw:?}");
+        assert!((raw.y - 0.001).abs() < 1.0e-15, "{raw:?}");
+        assert!((raw.z - 0.0005).abs() < 1.0e-15, "{raw:?}");
+        let burley = burley_radius(&params);
+        let factor = 0.25 / PI;
+        assert!((burley.x - 0.005 * factor).abs() < 1.0e-15, "{burley:?}");
+        assert!((burley.z - 0.0005 * factor).abs() < 1.0e-15, "{burley:?}");
     }
 
     #[test]
@@ -388,7 +371,7 @@ mod tests {
         params.subsurface_radius = [2.0e-8, 2.0e-8, 2.0e-8];
         params.subsurface_scale = 1.0;
         assert_eq!(channel_mask(raw_radius(&params)), [true; 3]);
-        assert_eq!(channel_mask(closure_radius(&params)), [false; 3]);
+        assert_eq!(channel_mask(burley_radius(&params)), [false; 3]);
     }
 
     #[test]
