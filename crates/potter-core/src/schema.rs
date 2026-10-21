@@ -315,6 +315,7 @@ fn complete_scene_schema(root: &mut Value) {
         json!(["empty", "mesh", "camera", "light", "armature"]);
     let material = &mut defs["material"];
     material["properties"]["use_transparent_shadow"] = json!({"type":"boolean"});
+    material["properties"]["use_bump_map_correction"] = json!({"type":"boolean"});
     material["required"] = json!([
         "name",
         "base_color",
@@ -998,6 +999,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "roughness",
                 "double_sided",
                 "use_transparent_shadow",
+                "use_bump_map_correction",
                 "emission_color",
                 "emission_strength",
                 "transmission",
@@ -1219,7 +1221,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec!["op", "target"],
             "mesh object and edges",
             "shared|single_user for shared data",
-            json!({"angle":std::f64::consts::FRAC_PI_4}),
+            json!({"angle":std::f64::consts::FRAC_PI_6}),
         ),
         "mesh.set_custom_normals" => (
             vec!["target", "scope", "elements", "normals"],
@@ -2681,6 +2683,7 @@ fn material_set_properties() -> Value {
         "roughness":{"type":"number","minimum":0,"maximum":1},
         "double_sided":{"type":"boolean"},
         "use_transparent_shadow":{"type":"boolean"},
+        "use_bump_map_correction":{"type":"boolean"},
         "emission_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "emission_strength":{"type":"number","minimum":0},
         "transmission":{"type":"number","minimum":0,"maximum":1},

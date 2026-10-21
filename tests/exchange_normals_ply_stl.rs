@@ -108,20 +108,6 @@ fn import_file(scene: &Path, file: &Path, format: &str, allow_lossy: bool) -> Te
     Ok(command.output()?)
 }
 
-fn mesh_attribute_names(scene: &Path) -> TestResult<Vec<String>> {
-    let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let blocks = document["data_blocks"]
-        .as_object()
-        .ok_or("scene has no data_blocks")?;
-    let mut names = Vec::new();
-    for block in blocks.values() {
-        if let Some(attributes) = block["mesh"]["attributes"].as_object() {
-            names.extend(attributes.keys().cloned());
-        }
-    }
-    Ok(names)
-}
-
 /// Decoded binary little-endian PLY vertex element. Faces are not decoded.
 struct Ply {
     has_normals: bool,
@@ -133,6 +119,21 @@ struct Vertex {
     position: [f64; 3],
     /// Zero when the file carries no normal properties.
     normal: [f64; 3],
+}
+
+/// The `shade_smooth` values of every imported mesh in the scene, one per face, from `scene.json`.
+fn shade_smooth_values(scene: &Path) -> TestResult<Vec<Value>> {
+    let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let blocks = document["data_blocks"]
+        .as_object()
+        .ok_or("scene.json has no data_blocks")?;
+    let mut values = Vec::new();
+    for block in blocks.values() {
+        if let Some(shading) = block["mesh"]["attributes"]["shade_smooth"]["values"].as_object() {
+            values.extend(shading.values().cloned());
+        }
+    }
+    Ok(values)
 }
 
 fn scalar_size(kind: &str) -> TestResult<usize> {
@@ -355,11 +356,11 @@ fn flat_only_ply_writes_no_normals_and_imports_flat() -> TestResult {
         String::from_utf8_lossy(&import.stdout)
     );
     assert_eq!(envelope(&import)?["result"]["losses"], json!([]));
+    // Blender's `ply_import_mesh.cc` calls `mesh_smooth_set(false)` without vertex normals.
+    let values = shade_smooth_values(&imported)?;
     assert!(
-        !mesh_attribute_names(&imported)?
-            .iter()
-            .any(|name| name == "shade_smooth"),
-        "a flat PLY must import as flat"
+        !values.is_empty() && values.iter().all(|value| value == &json!(false)),
+        "a flat PLY must import as flat: {values:?}"
     );
 
     // Control: a smooth box writes normals and imports smooth, so the check above can fail.
@@ -381,11 +382,11 @@ fn flat_only_ply_writes_no_normals_and_imports_flat() -> TestResult {
         "{}",
         String::from_utf8_lossy(&import.stdout)
     );
+    // Blender's `ply_import_mesh.cc` keeps every face smooth when the file has vertex normals.
+    let values = shade_smooth_values(&smooth_import)?;
     assert!(
-        mesh_attribute_names(&smooth_import)?
-            .iter()
-            .any(|name| name == "shade_smooth"),
-        "a PLY with vertex normals must import as smooth"
+        !values.is_empty() && values.iter().all(|value| value == &json!(true)),
+        "a PLY with vertex normals must import as smooth: {values:?}"
     );
     Ok(())
 }
