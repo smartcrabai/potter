@@ -1742,6 +1742,160 @@ impl<'a> Builder<'a> {
     }
 }
 
+/// Blender's `BM_FACES_OF_VERT` walk over the input BMesh (`bmesh_iterators.cc`, `bmiter__face_of_vert_*`
+/// with `bmesh_structure.cc`). A vertex's edges form a disk cycle in ascending edge index from its first
+/// edge `v->e`; each edge's loops form a radial cycle, headed by the loop of its last-created face. BMesh
+/// creates faces and edges in mesh order, so the input indices give that order. Faces are yielded per
+/// loop at the vertex, as the iterator does.
+struct FaceWalk<'a> {
+    faces: &'a [Polygon],
+    /// Per face and corner, the mesh edge index of the corner's outgoing edge.
+    loop_edges: Vec<Vec<Option<usize>>>,
+    /// Per mesh edge, its loops `(face, corner)` in ascending face order.
+    radial: Vec<Vec<(usize, usize)>>,
+    /// Per vertex, its incident mesh edges in ascending index order.
+    disk: Vec<Vec<usize>>,
+}
+
+impl<'a> FaceWalk<'a> {
+    fn new(front: &Front, faces: &'a [Polygon]) -> Self {
+        let mut loop_edges = Vec::with_capacity(faces.len());
+        let mut radial = vec![Vec::new(); front.geo.edge_order.len()];
+        for (face, (vertices, _)) in faces.iter().enumerate() {
+            let count = vertices.len();
+            let mut row = Vec::with_capacity(count);
+            for corner in 0..count {
+                let edge = front.input_edge_id(vertices[corner], vertices[(corner + 1) % count]);
+                if let Some(edge) = edge {
+                    radial[edge].push((face, corner));
+                }
+                row.push(edge);
+            }
+            loop_edges.push(row);
+        }
+        let mut disk = vec![Vec::new(); front.verts.len()];
+        for (edge, &(first, second)) in front.geo.edge_order.iter().enumerate() {
+            disk[first].push(edge);
+            if second != first {
+                disk[second].push(edge);
+            }
+        }
+        Self {
+            faces,
+            loop_edges,
+            radial,
+            disk,
+        }
+    }
+
+    fn vertex(&self, (face, corner): (usize, usize)) -> usize {
+        self.faces[face].0[corner]
+    }
+
+    /// `bmesh_radial_faceloop_find_next`: the next loop of the loop's edge at `vertex` in the radial cycle,
+    /// or the loop itself when there is none.
+    fn radial_next(&self, loop_: (usize, usize), vertex: usize) -> (usize, usize) {
+        let Some(edge) = self.loop_edges[loop_.0][loop_.1] else {
+            return loop_;
+        };
+        let cycle = &self.radial[edge];
+        let Some(position) = cycle.iter().position(|candidate| *candidate == loop_) else {
+            return loop_;
+        };
+        for step in 1..cycle.len() {
+            let candidate = cycle[(position + step) % cycle.len()];
+            if self.vertex(candidate) == vertex {
+                return candidate;
+            }
+        }
+        loop_
+    }
+
+    /// `bmesh_radial_faceloop_find_first` from the edge's radial head: its first loop at `vertex`.
+    fn radial_first(&self, edge: usize, vertex: usize) -> Option<(usize, usize)> {
+        let cycle = &self.radial[edge];
+        let head = cycle.len().checked_sub(1)?;
+        (0..cycle.len())
+            .map(|step| cycle[(head + step) % cycle.len()])
+            .find(|candidate| self.vertex(*candidate) == vertex)
+    }
+
+    fn disk_next(&self, edge: usize, vertex: usize) -> usize {
+        let disk = &self.disk[vertex];
+        let position = disk.iter().position(|candidate| *candidate == edge).unwrap_or(0);
+        disk[(position + 1) % disk.len()]
+    }
+
+    /// `bmesh_disk_faceedge_find_next`: the next edge around `vertex` with a loop at it, or `edge` itself.
+    fn disk_face_edge_next(&self, edge: usize, vertex: usize) -> usize {
+        let mut current = self.disk_next(edge, vertex);
+        while current != edge {
+            if self.radial_first(current, vertex).is_some() {
+                return current;
+            }
+            current = self.disk_next(current, vertex);
+        }
+        edge
+    }
+
+    /// `bmesh_disk_faceloop_find_first`: the first loop at `vertex` from the disk head `v->e`.
+    fn first_loop(&self, vertex: usize) -> Option<(usize, usize)> {
+        for &edge in &self.disk[vertex] {
+            if let Some(&head) = self.radial[edge].last() {
+                return Some(if self.vertex(head) == vertex {
+                    head
+                } else {
+                    let count = self.faces[head.0].0.len();
+                    (head.0, (head.1 + 1) % count)
+                });
+            }
+        }
+        None
+    }
+
+    /// The faces of `vertex` in the order `BM_FACES_OF_VERT` yields them.
+    fn faces_of_vertex(&self, vertex: usize) -> Vec<usize> {
+        let mut count: usize = self.disk[vertex]
+            .iter()
+            .map(|&edge| {
+                self.radial[edge]
+                    .iter()
+                    .filter(|loop_| self.vertex(**loop_) == vertex)
+                    .count()
+            })
+            .sum();
+        let Some(first) = self.first_loop(vertex) else {
+            return Vec::new();
+        };
+        let Some(mut edge_next) = self.loop_edges[first.0][first.1] else {
+            return Vec::new();
+        };
+        let mut loop_first = first;
+        let mut loop_next = Some(first);
+        let mut faces = Vec::with_capacity(count);
+        while let Some(current) = loop_next {
+            faces.push(current.0);
+            if count > 0 {
+                count -= 1;
+                let mut next = self.radial_next(current, vertex);
+                if next == loop_first {
+                    edge_next = self.disk_face_edge_next(edge_next, vertex);
+                    let Some(first_here) = self.radial_first(edge_next, vertex) else {
+                        break;
+                    };
+                    loop_first = first_here;
+                    next = first_here;
+                }
+                loop_next = Some(next);
+            }
+            if count == 0 {
+                loop_next = None;
+            }
+        }
+        faces
+    }
+}
+
 /// Builds the output of a bevel: vertex meshes, strips along beveled edges, and the rebuilt faces.
 pub(super) fn bevel_output(
     front: &Front,
@@ -1790,14 +1944,12 @@ pub(super) fn bevel_output(
             );
         }
     }
-    // Blender rebuilds each face once, scanning the vertices in index order and the faces around
-    // each. Its copies overwrite one another on shared rungs, so the last one applies. The faces around
-    // a vertex are taken in ascending face index here, not Blender's BM_FACES_OF_VERT walk.
+    // Blender rebuilds each face once, scanning the beveled vertices in index order and the faces
+    // around each in `BM_FACES_OF_VERT` order. Its copies overwrite one another on shared rungs, so the
+    // last copy applies.
+    let walk = FaceWalk::new(front, polygons);
     for vertex in (0..front.verts.len()).filter(|vertex| front.verts[*vertex].is_some()) {
-        for (face, (vertices, _)) in polygons.iter().enumerate() {
-            if !vertices.contains(&vertex) {
-                continue;
-            }
+        for face in walk.faces_of_vertex(vertex) {
             if let Some(states) = rebuilt_states[face].take() {
                 for ((first, second), sharp, seam, source) in states {
                     builder
