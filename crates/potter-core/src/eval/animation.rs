@@ -115,7 +115,7 @@ pub(crate) fn animated_modifier_scalar(
             )
         })?;
     if parameter.is_empty()
-        || !modifier
+        || modifier
             .params
             .get(parameter)
             .or_else(|| {
@@ -125,7 +125,8 @@ pub(crate) fn animated_modifier_scalar(
                     parameter,
                 )
             })
-            .is_some_and(|value| value.as_f64().is_some())
+            .and_then(serde_json::Value::as_f64)
+            .is_none()
     {
         return Err(PotError::with_details(
             ErrorCode::SceneInvalid,
@@ -320,7 +321,7 @@ fn validate_modifier_parameter_binding(
             )
         })?;
     if binding.parameter.is_empty()
-        || !modifier
+        || modifier
             .params
             .get(&binding.parameter)
             .or_else(|| {
@@ -330,7 +331,8 @@ fn validate_modifier_parameter_binding(
                     &binding.parameter,
                 )
             })
-            .is_some_and(|value| value.as_f64().is_some())
+            .and_then(serde_json::Value::as_f64)
+            .is_none()
     {
         return Err(PotError::with_details(
             ErrorCode::SceneInvalid,
@@ -351,7 +353,7 @@ fn validate_modifier_parameter_binding(
                 && (active_assignment
                     || nla_assignment
                     || (action.slots.len() == 1
-                        && action.active_slots.get(&binding.node).is_none()
+                        && !action.active_slots.contains_key(&binding.node)
                         && action.slots[0].node == binding.node))
         }
         None => action.slots.is_empty(),
@@ -386,8 +388,7 @@ fn sample_action_transform(
     let mut quaternion_modified = false;
     for (curve_index, curve) in action.fcurves.iter().enumerate() {
         if u32::try_from(curve_index)
-            .ok()
-            .is_some_and(|index| action.modifier_bindings.contains_key(&index))
+            .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
         {
             continue;
         }
@@ -1187,6 +1188,7 @@ mod tests {
 
     fn ocean_time_action(
         action_slot: &Id,
+        node: &Id,
         bindings: Vec<ModifierParameterBinding>,
         start_value: f64,
         end_value: f64,
@@ -1200,7 +1202,7 @@ mod tests {
             fcurves: vec![ocean_time_curve(start_value, end_value)],
             slots: vec![ActionSlot {
                 id: action_slot.clone(),
-                node: bindings.first().expect("test binding exists").node.clone(),
+                node: node.clone(),
                 blender_identifier: None,
             }],
             active_slots,
@@ -1317,6 +1319,7 @@ mod tests {
             action_id,
             ocean_time_action(
                 &slot_id,
+                &node_id,
                 vec![ocean_modifier_binding(&node_id, &modifier_id, &slot_id)],
                 0.5,
                 2.5,
@@ -1351,6 +1354,7 @@ mod tests {
             action_id,
             ocean_time_action(
                 &slot_id,
+                &node_a_id,
                 vec![
                     ocean_modifier_binding(&node_a_id, &modifier_a_id, &slot_id),
                     ocean_modifier_binding(&node_b_id, &modifier_b_id, &slot_id),
@@ -1510,6 +1514,7 @@ mod tests {
             doc.nodes.insert(node_id.clone(), subject.clone());
             let mut nla_action = ocean_time_action(
                 &slot_id,
+                &node_id,
                 vec![ocean_modifier_binding(&node_id, &modifier_id, &slot_id)],
                 1.5,
                 2.5,

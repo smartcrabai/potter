@@ -295,21 +295,26 @@ impl OceanSpectrum {
             normalization: 1.0,
             depth: settings.depth,
         };
-        // Blender's `set_height_normalize_factor`: 1 / max |disp_y| of a time-0, unit-scale simulation.
+        // Blender's `set_height_normalize_factor`: `max_h` is a float holding the largest |disp_y| of a
+        // time-0, unit-scale simulation, and `res = 1.0f / max_h`.
         let initial = spectrum.compute(0.0, 1.0, 0.0, false, false, false);
         let max_height = initial
             .displacement_y
             .iter()
             .fold(0.0_f64, |max, value| max.max(value.abs()));
         let max_height = if max_height == 0.0 {
-            1.0e-5
+            1.0e-5_f32
         } else {
-            max_height
+            max_height as f32
         };
-        spectrum.normalization = (1.0 / max_height) as f32;
+        spectrum.normalization = 1.0_f32 / max_height;
         Ok(spectrum)
     }
 
+    /// Blender's `BKE_ocean_simulate`. FFTW runs in double precision, and so do the fields. Blender
+    /// rounds to single precision where its code types a value as `float`: the phase factors, each
+    /// `mul_complex_c` product (`fftwf_complex temp`), every `init_complex` / `real_c` / `image_c` FFT
+    /// input, and the Jacobian ratios. Each of those is mirrored by `round32` below.
     fn compute(
         &self,
         time: f32,
@@ -321,41 +326,47 @@ impl OceanSpectrum {
     ) -> OceanFields {
         let n = self.n;
         let half = n / 2 + 1;
+        // `scale *= o->normalize_factor`, in float.
+        let scale = wave_scale * self.normalization;
         let mut htilda = vec![Complex::default(); n * half];
         for i in 0..n {
             for j in 0..half {
-                let k = self.k[i * half + j];
-                let phase = f64::from(omega(k, self.depth) * time);
-                let positive = Complex::from_polar(1.0, phase);
-                let negative = Complex::from_polar(1.0, -phase);
+                let index = i * half + j;
+                // `omega(k, depth) * t` is float; `expf(0) * cosf` and `sinf` are float too.
+                let phase = omega(self.k[index], self.depth) * time;
                 let h0 = self.h0[i * n + j];
                 let h0_minus = self.h0_minus[i * n + j].conj();
-                htilda[i * half + j] = h0 * positive + h0_minus * negative;
+                let positive = complex_product_f32(h0, unit_phasor(phase));
+                let negative = complex_product_f32(h0_minus, unit_phasor(-phase));
+                htilda[index] = Complex {
+                    re: positive.re + negative.re,
+                    im: positive.im + negative.im,
+                };
             }
         }
-        let scale = f64::from(wave_scale * self.normalization);
-        let scaled: Vec<Complex> = htilda.iter().map(|value| value.scale(scale)).collect();
+        let scaled: Vec<Complex> = htilda
+            .iter()
+            .map(|value| value.scale(f64::from(scale)))
+            .collect();
         let displacement_y = self.fft.run(&scaled);
         let count = n * n;
         let mut displacement_x = vec![0.0; count];
         let mut displacement_z = vec![0.0; count];
         if do_chop && choppiness > 0.0 {
-            let chop_scale = f64::from(choppiness) * scale;
             let mut chop_x = vec![Complex::default(); n * half];
             let mut chop_z = vec![Complex::default(); n * half];
             for i in 0..n {
                 for j in 0..half {
-                    let k = self.k[i * half + j];
+                    let index = i * half + j;
+                    let k = self.k[index];
+                    let base = chop_base(scale, choppiness, htilda[index]);
                     let (ratio_x, ratio_z) = if k == 0.0 {
                         (0.0, 0.0)
                     } else {
-                        (f64::from(self.kx[i] / k), f64::from(self.kz[j] / k))
+                        (self.kx[i] / k, self.kz[j] / k)
                     };
-                    let h = htilda[i * half + j];
-                    chop_x[i * half + j] =
-                        Complex::new(-h.im * chop_scale * ratio_x, h.re * chop_scale * ratio_x);
-                    chop_z[i * half + j] =
-                        Complex::new(-h.im * chop_scale * ratio_z, h.re * chop_scale * ratio_z);
+                    chop_x[index] = scale_round32(base, f64::from(ratio_x));
+                    chop_z[index] = scale_round32(base, f64::from(ratio_z));
                 }
             }
             displacement_x = self.fft.run(&chop_x);
@@ -366,15 +377,11 @@ impl OceanSpectrum {
             let mut nz = vec![Complex::default(); n * half];
             for i in 0..n {
                 for j in 0..half {
-                    let height = htilda[i * half + j];
-                    nx[i * half + j] = Complex::new(
-                        height.im * f64::from(self.kx[i]),
-                        -height.re * f64::from(self.kx[i]),
-                    );
-                    nz[i * half + j] = Complex::new(
-                        height.im * f64::from(self.kz[i]),
-                        -height.re * f64::from(self.kz[i]),
-                    );
+                    let index = i * half + j;
+                    // `init_complex(mp, 0, -1)`, `* htilda` (float), then `* kx[i]` / `* kz[i]`.
+                    let base = complex_product_f32(Complex { re: 0.0, im: -1.0 }, htilda[index]);
+                    nx[index] = scale_round32(base, f64::from(self.kx[i]));
+                    nz[index] = scale_round32(base, f64::from(self.kz[i]));
                 }
             }
             (
@@ -386,32 +393,25 @@ impl OceanSpectrum {
             (vec![0.0; count], vec![0.0; count], 0.0)
         };
         let (jacobian_xx, jacobian_zz, jacobian_xz) = if do_jacobian {
-            let chop = f64::from(choppiness);
             let mut jxx = vec![Complex::default(); n * half];
             let mut jzz = vec![Complex::default(); n * half];
             let mut jxz = vec![Complex::default(); n * half];
             for i in 0..n {
                 for j in 0..half {
-                    let k = self.k[i * half + j];
-                    let h = htilda[i * half + j];
+                    let index = i * half + j;
+                    let k = self.k[index];
+                    let kx = self.kx[i];
+                    let kz = self.kz[j];
+                    let base = jacobian_base(choppiness, htilda[index]);
+                    // Blender's float ratios: `kx*kx/k`, `kz*kz/k`, `kx*kz/k`.
                     let (xx, zz, xz) = if k == 0.0 {
                         (0.0, 0.0, 0.0)
                     } else {
-                        let kx = f64::from(self.kx[i]);
-                        let kz = f64::from(self.kz[j]);
-                        (
-                            kx * kx / f64::from(k),
-                            kz * kz / f64::from(k),
-                            kx * kz / f64::from(k),
-                        )
+                        (kx * kx / k, kz * kz / k, kx * kz / k)
                     };
-                    let multiplier = -chop;
-                    jxx[i * half + j] =
-                        Complex::new(multiplier * h.re * xx, multiplier * h.im * xx);
-                    jzz[i * half + j] =
-                        Complex::new(multiplier * h.re * zz, multiplier * h.im * zz);
-                    jxz[i * half + j] =
-                        Complex::new(multiplier * h.re * xz, multiplier * h.im * xz);
+                    jxx[index] = scale_round32(base, f64::from(xx));
+                    jzz[index] = scale_round32(base, f64::from(zz));
+                    jxz[index] = scale_round32(base, f64::from(xz));
                 }
             }
             let mut xx = self.fft.run(&jxx);
@@ -442,6 +442,57 @@ impl OceanSpectrum {
     }
 }
 
+/// Blender's `float` storage: `init_complex`, `real_c`, `image_c`, and `mul_complex_c`'s `temp`.
+fn round32(value: f64) -> f64 {
+    f64::from(value as f32)
+}
+
+/// Blender's `mul_complex_c`: the product is formed in double and stored as an `fftwf_complex`.
+fn complex_product_f32(a: Complex, b: Complex) -> Complex {
+    Complex {
+        re: round32(a.re * b.re - a.im * b.im),
+        im: round32(a.re * b.im + a.im * b.re),
+    }
+}
+
+/// `exp_complex` of the purely imaginary `(0, phase)`: `cosf(phase)` and `sinf(phase)` in float.
+fn unit_phasor(phase: f32) -> Complex {
+    Complex {
+        re: f64::from(phase.cos()),
+        im: f64::from(phase.sin()),
+    }
+}
+
+/// A `mul_complex_f` ratio applied to a float-valued base, then stored as the float FFT input.
+fn scale_round32(base: Complex, factor: f64) -> Complex {
+    Complex {
+        re: round32(base.re * factor),
+        im: round32(base.im * factor),
+    }
+}
+
+/// Blender's displacement-x/z base: `init_complex(mp, -scale, 0)`, `* chop` (double), `* (0, -1)`,
+/// and `* htilda` (float products).
+fn chop_base(scale: f32, chop: f32, h: Complex) -> Complex {
+    let mp = Complex {
+        re: -f64::from(scale) * f64::from(chop),
+        im: 0.0,
+    };
+    let mp = complex_product_f32(mp, Complex { re: 0.0, im: -1.0 });
+    complex_product_f32(mp, h)
+}
+
+/// Blender's Jacobian base: `init_complex(mp, -1, 0)`, `* chop` (double), then `* htilda` (float).
+fn jacobian_base(chop: f32, h: Complex) -> Complex {
+    complex_product_f32(
+        Complex {
+            re: -f64::from(chop),
+            im: 0.0,
+        },
+        h,
+    )
+}
+
 impl OceanFields {
     fn sample(&self, values: &[f64], u: f32, v: f32) -> f32 {
         sample_grid(values, self.n, self.n, u, v)
@@ -468,7 +519,7 @@ fn eigenstuff_from_jacobian(jxx: f32, jzz: f32, jxz: f32) -> Eigenstuff {
     let a = jxx + jzz;
     let b = ((jxx - jzz) * (jxx - jzz) + 4.0 * jxz * jxz).sqrt();
     let jminus = 0.5 * (a - b);
-    let jplus = 0.5 * (a + b);
+    let jplus = a.midpoint(b);
     let qplus = (jplus - jxx) / jxz;
     let qminus = (jminus - jxx) / jxz;
     let norm_plus = (1.0 + qplus * qplus).sqrt();
@@ -1337,7 +1388,12 @@ mod tests {
         assert_eq!(uv_store.layers.len(), 1);
         assert_eq!(uv_store.active.as_deref(), Some("UVMap"));
         assert_eq!(uv_store.render.as_deref(), Some("UVMap"));
-        assert_eq!(uv_store.layers[0].faces[0].as_ref().unwrap()[0], [0.0, 1.0]);
+        assert_eq!(
+            uv_store.layers[0].faces[0]
+                .as_ref()
+                .ok_or("UV face is missing")?[0],
+            [0.0, 1.0]
+        );
         Ok(())
     }
 
@@ -1522,21 +1578,21 @@ mod tests {
         let first = output.vertices[0].co;
         assert!((first.x + 25.0).abs() < 1.0e-6);
         assert!((first.y + 25.0).abs() < 1.0e-6);
-        assert!((first.z + 0.10027442872524261).abs() < 2.0e-6);
+        assert!((first.z + 0.100_274_428_725_242_61).abs() < 2.0e-6);
         let colors = super::color_layers::read(&output);
         let foam = colors
             .layers
             .iter()
             .find(|layer| layer.name == "Foam")
             .ok_or("foam layer is missing")?;
-        assert!((foam.values[3][0] - 0.010960093699395657).abs() < 1.0e-7);
+        assert!((foam.values[3][0] - 0.010_960_093_699_395_657).abs() < 1.0e-7);
         let spray = colors
             .layers
             .iter()
             .find(|layer| layer.name == "Spray")
             .ok_or("spray layer is missing")?;
-        assert!((spray.values[0][0] - 0.838799238204956).abs() < 1.0e-6);
-        assert!((spray.values[0][2] - 0.1119324341416359).abs() < 1.0e-6);
+        assert!((spray.values[0][0] - 0.838_799_238_204_956).abs() < 1.0e-6);
+        assert!((spray.values[0][2] - 0.111_932_434_141_635_9).abs() < 1.0e-6);
         Ok(())
     }
     // These are Blender's baked EXR pixels, not evaluated cached meshes: background baking returns
@@ -1668,7 +1724,7 @@ mod tests {
                             let rounded = exr::prelude::f16::from_f32(*actual).to_f32();
                             let half = exr::prelude::f16::from_f32(*actual);
                             let bits = half.to_bits();
-                            let ulp = if bits & 0x7fff == 0 {
+                            let ulp = if bits.trailing_zeros() >= 15 {
                                 exr::prelude::f16::from_bits(1).to_f32()
                             } else if bits & 0x8000 == 0 {
                                 (exr::prelude::f16::from_bits(bits + 1).to_f32() - rounded).abs()
@@ -1685,6 +1741,69 @@ mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+    /// `BKE_ocean_cache_eval_uv` (`ocean.cc`): `texel = (u, v) * res - 0.5`, then bilinear over the
+    /// baked texels with `imbuf::interpolate_bilinear_fl`, which clamps each texel index to the image edge
+    /// (`BLI_math_interp.hh`, "Samples outside the image are clamped to texels at image edge").
+    fn blender_cache_eval_uv(pixels: &[[f32; 4]], res: usize, u: f32, v: f32) -> [f32; 4] {
+        let texel_x = u * res as f32 - 0.5;
+        let texel_y = v * res as f32 - 0.5;
+        let (x0, y0) = (texel_x.floor(), texel_y.floor());
+        let (fx, fy) = (texel_x - x0, texel_y - y0);
+        let texel = |x: f32, y: f32| {
+            let clamp = |c: f32| c.clamp(0.0, res as f32 - 1.0) as usize;
+            pixels[clamp(y) * res + clamp(x)]
+        };
+        let mut out = [0.0_f32; 4];
+        for (channel, value) in out.iter_mut().enumerate() {
+            let top = texel(x0, y0)[channel] * (1.0 - fx) + texel(x0 + 1.0, y0)[channel] * fx;
+            let bottom =
+                texel(x0, y0 + 1.0)[channel] * (1.0 - fx) + texel(x0 + 1.0, y0 + 1.0)[channel] * fx;
+            *value = top * (1.0 - fy) + bottom * fy;
+        }
+        out
+    }
+    #[test]
+    fn cached_sampling_is_blenders_cache_eval_uv() -> Result<(), Box<dyn std::error::Error>> {
+        let modifier = modifier(json!({
+            "geometry_mode":"GENERATE","resolution":4,"viewport_resolution":4,"spatial_size":12,
+            "time":0.75,"choppiness":1.0,"use_foam":true,"use_spray":true,"use_normals":true,
+            "foam_layer_name":"foam","spray_layer_name":"spray","frame_start":1,"frame_end":2
+        }))?;
+        let mut sequence = OceanBakeSequence::new(&modifier)?;
+        let images = sequence.bake_frame(1, 0.75)?;
+        let disp = images
+            .iter()
+            .find(|image| image.filename == "disp_0001.exr")
+            .ok_or("disp image is missing")?;
+        let res = disp.resolution;
+        for (u, v) in [
+            (0.0, 0.0),
+            (0.13, 0.71),
+            (0.5, 0.5),
+            (0.999, 0.001),
+            (0.03125, 0.96875),
+        ] {
+            let expected = blender_cache_eval_uv(&disp.pixels, res, u, v);
+            let actual = sample_cache_uv(&disp.pixels, res, res, u, v, res, res);
+            for channel in 0..4 {
+                assert!(
+                    (expected[channel] - actual[channel]).abs() <= 1.0e-6,
+                    "uv ({u}, {v}) channel {channel}: {actual:?} vs Blender rule {expected:?}"
+                );
+            }
+        }
+        // At a texel centre the rule returns that texel exactly.
+        for (x, y) in [(3, 5), (0, 0), (res - 1, res - 1)] {
+            let u = (x as f32 + 0.5) / res as f32;
+            let v = (y as f32 + 0.5) / res as f32;
+            assert_eq!(
+                sample_cache_uv(&disp.pixels, res, res, u, v, res, res),
+                disp.pixels[y * res + x],
+                "texel centre ({x}, {y})"
+            );
         }
         Ok(())
     }

@@ -20,7 +20,7 @@ fn run_json(command: &mut Command, description: &str) -> Result<Value, Box<dyn E
     Ok(response)
 }
 
-fn apply(scene: &Path, operations: Value) -> Result<(), Box<dyn Error>> {
+fn apply(scene: &Path, operations: &Value) -> Result<(), Box<dyn Error>> {
     let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
     let batch_path = scene.with_extension("ocean-cache-operations.json");
     fs::write(
@@ -118,7 +118,7 @@ fn export_obj(scene: &Path, output: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(bytes)
 }
 
-fn ocean_modifier(document: &Value) -> &Value {
+fn ocean_modifier(document: &Value) -> Result<&Value, Box<dyn Error>> {
     document["nodes"]["ocean_surface"]["modifiers"]
         .as_array()
         .and_then(|modifiers| {
@@ -126,7 +126,7 @@ fn ocean_modifier(document: &Value) -> &Value {
                 .iter()
                 .find(|modifier| modifier["id"] == "ocean_wave")
         })
-        .expect("Ocean modifier is missing from persisted project")
+        .ok_or_else(|| "Ocean modifier is missing from persisted project".into())
 }
 
 fn cached_ocean_params(choppiness: f64) -> Value {
@@ -147,46 +147,6 @@ fn cached_ocean_params(choppiness: f64) -> Value {
         "filepath":"//ocean-cache"
     })
 }
-fn assert_half_ulp_positions(live: &Value, cached: &Value) -> Result<(), Box<dyn Error>> {
-    let live = live
-        .as_array()
-        .ok_or("live Ocean positions are not an array")?;
-    let cached = cached
-        .as_array()
-        .ok_or("cached Ocean positions are not an array")?;
-    assert_eq!(
-        live.len(),
-        cached.len(),
-        "Ocean vertex count changed in cache"
-    );
-    for (vertex_index, (live, cached)) in live.iter().zip(cached).enumerate() {
-        let live = live.as_array().ok_or("live Ocean vertex is not an array")?;
-        let cached = cached
-            .as_array()
-            .ok_or("cached Ocean vertex is not an array")?;
-        assert_eq!(live.len(), cached.len(), "Ocean vertex dimension changed");
-        for (axis, (live, cached)) in live.iter().zip(cached).enumerate() {
-            let live = live
-                .as_f64()
-                .ok_or("live Ocean coordinate is not numeric")?;
-            let cached = cached
-                .as_f64()
-                .ok_or("cached Ocean coordinate is not numeric")?;
-            let magnitude = live.abs();
-            let half_ulp = if magnitude < 2.0_f64.powi(-14) {
-                2.0_f64.powi(-25)
-            } else {
-                2.0_f64.powi(magnitude.log2().floor() as i32 - 11)
-            };
-            assert!(
-                (live - cached).abs() <= half_ulp,
-                "Ocean vertex {vertex_index} axis {axis} differs by more than half an f16 ULP: {live} vs {cached} (tolerance {half_ulp})"
-            );
-        }
-    }
-    Ok(())
-}
-
 #[test]
 fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(), Box<dyn Error>> {
     let temporary = tempdir()?;
@@ -198,7 +158,7 @@ fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(),
     )?;
     apply(
         &project,
-        json!([
+        &json!([
             {"op":"node.create","id":"ocean_surface","kind":"plane","params":{"size":2.0}},
             {
                 "op":"modifier.create",
@@ -262,7 +222,7 @@ fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(),
             .is_some_and(|revision| revision > previous_revision),
         "Ocean bake did not commit the project"
     );
-    let cache = &ocean_modifier(&baked_document)["baked_ocean_cache"];
+    let cache = &ocean_modifier(&baked_document)?["baked_ocean_cache"];
     assert!(cache.is_object(), "Ocean cache metadata was not persisted");
     assert_eq!(cache["frame_start"], 1);
     assert_eq!(cache["frame_end"], 2);
@@ -307,10 +267,13 @@ fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(),
     );
 
     let reopened_positions = inspect_surface(&project, "1")?;
-    assert_half_ulp_positions(&live_positions, &reopened_positions)?;
+    // Blender samples a baked cache at texel centres (`BKE_ocean_cache_eval_uv`, `texel = uv * res - 0.5`),
+    // not at the live grid corners (`BKE_ocean_eval_uv`), so cached positions are not live positions. The
+    // cached sampling rule is pinned by `cached_sampling_is_blenders_cache_eval_uv` in `geom/modifiers/ocean.rs`.
+    // Reopened cached positions are checked against later cached reads below.
     apply(
         &project,
-        json!([{
+        &json!([{
             "op":"modifier.update",
             "target":{"id":"ocean_surface"},
             "id":"ocean_wave",
@@ -333,7 +296,7 @@ fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(),
         }]),
     )?;
     let updated_document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    let updated_modifier = ocean_modifier(&updated_document);
+    let updated_modifier = ocean_modifier(&updated_document)?;
     assert_eq!(updated_modifier["params"]["time"], 9.25);
     assert_eq!(updated_modifier["baked_ocean_cache"], *cache);
 
@@ -347,7 +310,7 @@ fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(),
     export_obj(&project, &temporary.path().join("cached.obj"))?;
     apply(
         &project,
-        json!([{
+        &json!([{
             "op":"modifier.update",
             "target":{"id":"ocean_surface"},
             "id":"ocean_wave",
@@ -357,7 +320,7 @@ fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(),
     let nonzero_choppiness_document: Value =
         serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     assert_eq!(
-        ocean_modifier(&nonzero_choppiness_document)["baked_ocean_cache"],
+        ocean_modifier(&nonzero_choppiness_document)?["baked_ocean_cache"],
         *cache,
         "changing Ocean choppiness without crossing zero preserves Blender's baked cache"
     );
@@ -369,7 +332,7 @@ fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(),
 
     apply(
         &project,
-        json!([{
+        &json!([{
             "op":"modifier.update",
             "target":{"id":"ocean_surface"},
             "id":"ocean_wave",
@@ -379,7 +342,7 @@ fn ocean_bake_cache_survives_reopen_and_is_used_by_cli_consumers() -> Result<(),
     let crossed_zero_document: Value =
         serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     assert!(
-        ocean_modifier(&crossed_zero_document)["baked_ocean_cache"].is_null(),
+        ocean_modifier(&crossed_zero_document)?["baked_ocean_cache"].is_null(),
         "crossing Ocean choppiness to zero invalidates its baked cache"
     );
     assert_ne!(

@@ -718,7 +718,7 @@ fn ocean_cache_invalidated(previous: &Map<String, Value>, next: &Map<String, Val
             old_value.and_then(Value::as_f64),
             new_value.and_then(Value::as_f64),
         ) {
-            (Some(old), Some(new)) => old != new,
+            (Some(old), Some(new)) => old.partial_cmp(&new) != Some(std::cmp::Ordering::Equal),
             _ => old_value != new_value,
         }
     }) {

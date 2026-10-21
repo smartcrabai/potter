@@ -184,7 +184,7 @@ pub(super) fn omega(k: f32, depth: f32) -> f32 {
 fn jonswap_base(settings: &Settings, k2: f32) -> f32 {
     let k_mag = k2.sqrt();
     let omega = omega(k_mag, settings.depth);
-    let gamma = settings.sharpen_peak.max(1.0).min(6.0);
+    let gamma = settings.sharpen_peak.clamp(1.0, 6.0);
     let dimensionless_fetch = (GRAVITY * settings.fetch / settings.wind_velocity.sqrt()).abs();
     let alpha = (0.076 * f64::from(dimensionless_fetch).powf(-0.22)) as f32;
     let peak_omega = (std::f64::consts::TAU

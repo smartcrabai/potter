@@ -294,7 +294,7 @@ fn ocean_blender_corpus_matches_geometry_uvs_and_corner_colors() -> Result<(), B
             params: serde_json::from_value::<Map<String, Value>>(corpus_params(case, name)?)?,
             binding_data: None,
             baked_ocean_cache: None,
-            runtime: Default::default(),
+            runtime: potter_core::model::ModifierRuntime::default(),
         };
         let source = source_mesh(&case["source_mesh"])?;
         let output = evaluate_case(source, modifier, purpose, name)?;

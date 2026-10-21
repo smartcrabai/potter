@@ -1116,7 +1116,7 @@ pub enum NlaExtrapolation {
 pub struct ActionSlot {
     pub id: Id,
     pub node: Id,
-    /// Blender ActionSlot identity, kept only to map linked Blender slots back to stable IDs.
+    /// Blender `ActionSlot` identity, kept only to map linked Blender slots back to stable IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blender_identifier: Option<String>,
 }
