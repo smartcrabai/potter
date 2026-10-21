@@ -1215,7 +1215,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec!["op", "target"],
             "mesh object and edges",
             "shared|single_user for shared data",
-            json!({"angle":std::f64::consts::FRAC_PI_4}),
+            json!({"angle":std::f64::consts::FRAC_PI_6}),
         ),
         "mesh.set_custom_normals" => (
             vec!["target", "scope", "elements", "normals"],

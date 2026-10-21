@@ -133,6 +133,9 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
     } else {
         Vec::new()
     };
+    // Blender's `stl_import_mesh.cc` calls `mesh_smooth_set(false)`: every face is flat (`sharp_face`
+    // present), and facet normals are not imported unless `use_facet_normal` is set (off by default).
+    let sharp_faces = vec![true; faces.len()];
     Ok((
         vec![ExchangeMesh {
             id: "stl_mesh".to_owned(),
@@ -144,6 +147,7 @@ pub(crate) fn import(path: &Path) -> Result<(Vec<ExchangeMesh>, Vec<Loss>)> {
             singular: false,
             vertex_normals: Vec::new(),
             smooth: Vec::new(),
+            sharp_faces: Some(sharp_faces),
             uv_layers: Vec::new(),
             uv_active: None,
             uv_render: None,
