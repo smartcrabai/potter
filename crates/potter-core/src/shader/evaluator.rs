@@ -8,6 +8,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
+    geom::TextureSpace,
     graph::{GraphKind, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef},
@@ -705,7 +706,11 @@ pub struct HitContext<'a> {
     pub uv_layers: Option<HitUvLayers<'a>>,
     /// Sink for `uv.layer_missing` warnings; see [`HitContext::with_warnings`].
     pub warnings: Option<&'a RefCell<Vec<JsonValue>>>,
+    /// The Generated texture coordinate: the object's texture space applied to its local point (see
+    /// [`HitContext::with_generated`]).
     pub generated: DVec3,
+    /// How far `generated` moves per unit of object-local movement (`1 / (2 size)` per axis).
+    pub generated_per_local: DVec3,
     pub position: DVec3,
     pub object: DVec3,
     pub normal: DVec3,
@@ -741,6 +746,7 @@ impl<'a> HitContext<'a> {
             uv_layers: None,
             warnings: None,
             generated: DVec3::ZERO,
+            generated_per_local: DVec3::ONE,
             position: DVec3::ZERO,
             object: DVec3::ZERO,
             normal: DVec3::Z,
@@ -773,6 +779,15 @@ impl<'a> HitContext<'a> {
         self
     }
 
+    /// Set the Generated coordinate of the object-local point `local` through the object's texture space
+    /// (Cycles' `ATTR_STD_GENERATED`), and the Jacobian that moves it with `local` in shifted samples.
+    #[must_use]
+    pub fn with_generated(mut self, texture_space: TextureSpace, local: DVec3) -> Self {
+        self.generated = texture_space.generated(local);
+        self.generated_per_local = texture_space.generated_per_local();
+        self
+    }
+
     /// Provide the per-hit color of each color layer by name, plus the render layer's color. Missing
     /// layers use the node-specific Blender defaults: transparent black for Vertex Color and opaque
     /// black for Attribute.
@@ -798,7 +813,7 @@ impl<'a> HitContext<'a> {
     /// the moved position; without them only `uv` moves, by the step's UV change.
     fn shifted(&self, step: SurfaceStep) -> Self {
         let mut shifted = *self;
-        shifted.generated += step.world;
+        shifted.generated += step.world * self.generated_per_local;
         shifted.position += step.world;
         shifted.object += step.world;
         if let Some(layers) = self.uv_layers {

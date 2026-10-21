@@ -155,6 +155,11 @@ for obj in bpy.data.objects:
         "vertex_groups": groups,
         "materials": [material_dump(slot.material) for slot in obj.material_slots],
         "modifiers": [modifier.type for modifier in obj.modifiers],
+        "texspace": {
+            "auto": bool(mesh.use_auto_texspace),
+            "location": [float(c) for c in mesh.texspace_location],
+            "size": [float(c) for c in mesh.texspace_size],
+        },
     })
 
 result = {

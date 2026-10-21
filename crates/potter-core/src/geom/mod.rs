@@ -179,6 +179,107 @@ pub struct Mesh {
     pub next_id: IdCounters,
 }
 
+/// An object's texture space: the box that the Generated texture coordinate maps onto `[0, 1]³`.
+///
+/// Blender's automatic texture space (`BKE_mesh_texspace_calc`, `mesh.cc`) takes the bounds' midpoint as
+/// the location and the half-extent as the size, with a zero extent set to 1 and a tiny extent clamped
+/// to `1e-5`. Cycles turns that into the Generated coordinate of a local point `P` as
+/// `(P - location) / (2 size) + 0.5` (`blender/mesh.cpp`, `mesh_texture_space` and the `ATTR_STD_GENERATED`
+/// fill), so a degenerate axis maps to `0.5`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextureSpace {
+    pub location: DVec3,
+    pub size: DVec3,
+}
+
+impl TextureSpace {
+    /// The automatic texture space of `bounds` (`BKE_mesh_texspace_calc`). `None`, geometry with no
+    /// vertices, takes Blender's default bounds of `(-1, -1, -1)` to `(1, 1, 1)`.
+    #[must_use]
+    pub fn automatic(bounds: Option<Aabb>) -> Self {
+        let bounds = bounds.unwrap_or(Aabb {
+            min: DVec3::splat(-1.0),
+            max: DVec3::ONE,
+        });
+        let size = ((bounds.max - bounds.min) * 0.5)
+            .to_array()
+            .map(Self::texture_extent);
+        Self {
+            location: (bounds.min + bounds.max) * 0.5,
+            size: DVec3::from_array(size),
+        }
+    }
+
+    /// One axis of an automatic texture-space size (`BKE_mesh_texspace_calc`): a zero extent becomes 1, and a
+    /// non-zero extent smaller than `1e-5` in magnitude is clamped to `±1e-5`. A subnormal extent counts as zero.
+    fn texture_extent(extent: f64) -> f64 {
+        if extent.abs() < f64::MIN_POSITIVE {
+            1.0
+        } else if (0.0..0.000_01).contains(&extent) {
+            0.000_01
+        } else if (-0.000_01..0.0).contains(&extent) {
+            -0.000_01
+        } else {
+            extent
+        }
+    }
+
+    /// A texture space with the stored location and size of a `.blend` mesh whose texture space is not automatic
+    /// (`use_auto_texspace` off). The size is used as stored, as Cycles' `BKE_mesh_texspace_get` returns it.
+    #[must_use]
+    pub fn manual(location: DVec3, size: DVec3) -> Self {
+        Self { location, size }
+    }
+
+    /// The Generated coordinate of the object-local point `local`: `(P - location) · 0.5 / size + 0.5` per axis
+    /// (Cycles' `size_c = 0.5 / size` and `loc_c` in `blender/mesh.cpp`). A zero size gives a zero scale on
+    /// that axis, so the axis maps to `0.5`.
+    #[must_use]
+    pub fn generated(self, local: DVec3) -> DVec3 {
+        (local - self.location) * self.generated_per_local() + DVec3::splat(0.5)
+    }
+
+    /// How far the Generated coordinate moves per unit of object-local movement: `0.5 / size` per axis, and zero
+    /// on an axis of zero size. This is the Jacobian of [`TextureSpace::generated`].
+    #[must_use]
+    pub fn generated_per_local(self) -> DVec3 {
+        DVec3::from_array(self.size.to_array().map(|size| {
+            if size.abs() < f64::MIN_POSITIVE {
+                0.0
+            } else {
+                0.5 / size
+            }
+        }))
+    }
+}
+
+impl Mesh {
+    /// The mesh-level record that carries a manual texture space: `{"location": [x, y, z], "size": [x, y, z]}` under
+    /// [`TEXTURE_SPACE_KEY`]. `None` for an automatic texture space, which is the bounds of the mesh.
+    #[must_use]
+    pub fn manual_texture_space(&self) -> Option<TextureSpace> {
+        let record = self.attributes.get(TEXTURE_SPACE_KEY)?;
+        let vector = |key: &str| -> Option<DVec3> {
+            let values = record.get(key)?.as_array()?;
+            let [x, y, z] = values.as_slice() else {
+                return None;
+            };
+            Some(DVec3::new(x.as_f64()?, y.as_f64()?, z.as_f64()?))
+        };
+        Some(TextureSpace::manual(vector("location")?, vector("size")?))
+    }
+}
+
+/// The mesh attribute record that holds a manual texture space (`TextureSpace::manual`), written and read by the
+/// Blender bridge as `use_auto_texspace` off with `texspace_location` and `texspace_size`.
+pub const TEXTURE_SPACE_KEY: &str = "texture_space";
+
+impl Default for TextureSpace {
+    fn default() -> Self {
+        Self::automatic(None)
+    }
+}
+
 /// Axis-aligned bounds of mesh-local vertex positions.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

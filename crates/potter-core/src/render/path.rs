@@ -5,7 +5,10 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::volume::{VolumeData, sample_density, sample_density_checked},
+    geom::{
+        Aabb, TextureSpace,
+        volume::{VolumeData, sample_density, sample_density_checked},
+    },
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, SceneDoc},
     shader::{
@@ -3000,7 +3003,11 @@ fn collect_volumes<'a>(
                 .with_images(images)
                 .with_warnings(warnings);
             context.object = local_center;
-            context.generated = local_center;
+            let volume_space = TextureSpace::automatic(Some(Aabb {
+                min: bounds_min,
+                max: bounds_max,
+            }));
+            context = context.with_generated(volume_space, local_center);
             context.position = matrix.transform_point3(local_center);
             Some(evaluate_surface_with_workspace(
                 material,
