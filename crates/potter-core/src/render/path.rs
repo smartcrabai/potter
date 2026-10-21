@@ -16,8 +16,9 @@ use crate::{
 };
 
 use super::principled_bsdf::{
-    GlassSample, Layers, base_color, continuous_density, evaluate as evaluate_bsdf, layers,
-    lobe_probabilities, sample_glass, specular_eta, subsurface_closure_weight,
+    GlassSample, Layers, base_color, continuous_density, continuous_lobes,
+    evaluate as evaluate_bsdf, layers, lobe_probabilities, sample_glass, specular_eta,
+    subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -153,8 +154,9 @@ impl CameraFootprint {
     }
 }
 
-/// The camera footprint of the sample (`sample_x`, `sample_y`) of pixel (`x`, `y`): the compact lengths of the origin
-/// and direction changes to the rays one pixel to the right and one pixel down, as Cycles' pinhole branch takes them
+/// The camera footprint of the sample (`sample_x`, `sample_y`) of pixel (`x`, `y`), whose centre ray is `centre` (from
+/// `ray_for_sample`, so the caller's ray is not computed twice). It is the compact lengths of the origin and direction
+/// changes to the rays one pixel to the right and one pixel down, as Cycles' pinhole branch takes them
 /// (`dD = normalize(D + dx) - normalize(D)`, compacted by `differential_make_compact` at `differential_scale` 1).
 /// A perspective camera has `dP = 0` and an orthographic camera `dD = 0`. Panoramic, fisheye and depth-of-field
 /// cameras use the same finite difference rather than Cycles' per-projection formulas, and a one-pixel-wide or
@@ -167,12 +169,8 @@ fn camera_footprint(
     y: u32,
     sample_x: f64,
     sample_y: f64,
+    (origin, direction): (DVec3, DVec3),
 ) -> Result<CameraFootprint> {
-    let Some((origin, direction)) =
-        ray_for_sample(camera, width, height, x, y, sample_x, sample_y)?
-    else {
-        return Ok(CameraFootprint::default());
-    };
     let direction = direction.normalize_or_zero();
     let right = if x + 1 < width {
         x + 1
@@ -206,12 +204,36 @@ fn camera_footprint(
     })
 }
 
+/// The scene's Filter Glossy (`cycles.blur_glossy`, Blender 1.0 by default), unclamped: the glossy blur reads it as
+/// `1 / filter_glossy`, and the widening clamps it to one.
+fn filter_glossy(doc: &SceneDoc) -> f64 {
+    doc.scenes
+        .get(&doc.active_scene)
+        .map_or(0.0, |scene| scene.render.filter_glossy)
+}
+
+/// The glossy blur's `alpha` (Cycles' `blur_roughness`, `kernel/integrator/surface_shader.h`,
+/// `surface_shader_prepare_closures`): after a bounce whose sampled pdf is `min_ray_pdf`, `blur_pdf` is
+/// `filter_glossy · min_ray_pdf` and the microfacet closures are blurred to `sqrt(1 - blur_pdf) / 2` when that is
+/// below one. A Filter Glossy of zero disables the blur (Cycles stores `FLT_MAX` for it).
+fn glossy_blur_alpha(filter_glossy: f64, min_ray_pdf: f64) -> Option<f64> {
+    if filter_glossy <= 0.0 {
+        return None;
+    }
+    let blur_pdf = min_ray_pdf / filter_glossy;
+    (blur_pdf < 1.0).then(|| (1.0 - blur_pdf).sqrt() * 0.5)
+}
+
+/// A microfacet lobe's roughness after the glossy blur: Cycles' `bsdf_microfacet_blur` sets `alpha = max(blur, alpha)`
+/// with alpha the squared roughness (`kernel/closure/bsdf_microfacet.h`), so the roughness is the root of that.
+fn blurred_roughness(roughness: f64, blur_alpha: f64) -> f64 {
+    roughness.powi(2).max(blur_alpha).sqrt()
+}
+
 /// The filter glossy widening scale of the scene, Cycles' `differential_widen_scale = min(1, filter_glossy)`
 /// (`intern/cycles/scene/integrator.cpp`). Blender's Filter Glossy (`cycles.blur_glossy`) defaults to 1.0.
 fn filter_glossy_widen_scale(doc: &SceneDoc) -> f64 {
-    doc.scenes
-        .get(&doc.active_scene)
-        .map_or(0.0, |scene| scene.render.filter_glossy.clamp(0.0, 1.0))
+    filter_glossy(doc).clamp(0.0, 1.0)
 }
 
 /// Cycles' `bsdf_widen_dD` (`kernel/closure/bsdf.h`): `dD` widens to `scale · sqrt(avg roughness²)` when that is
@@ -224,37 +246,27 @@ fn widen_ray_dd(ray_dd: f64, scale: f64, average_roughness_squared: f64) -> f64 
     }
 }
 
-/// Cycles' average of the closures' squared roughness (`surface_shader_bsdf_sample`, `kernel/integrator/surface_shader.h`):
-/// a singular lobe has 0, a microfacet lobe `alpha_x · alpha_y` (roughness⁴, with alpha the squared roughness), and a
-/// diffuse or sheen lobe 1 (`bsdf_get_specular_roughness_squared`). Cycles weights the closures by their pdf; Potter
-/// weights the lobes by their sampling probabilities, which select the same pdf-weighted mixture.
-fn average_roughness_squared(params: &BsdfParams, layers: &Layers) -> f64 {
-    // The roughness below which Potter, like Cycles, treats a microfacet lobe as a delta.
-    const DELTA_ROUGHNESS: f64 = 1.0e-5;
-    let microfacet = |roughness: f64| {
-        if roughness < DELTA_ROUGHNESS {
-            0.0
-        } else {
-            roughness.powi(4)
+/// Cycles' average of the closures' squared roughness that `bsdf_widen_dD` takes (`_surface_shader_bsdf_eval_mis`,
+/// `kernel/integrator/surface_shader.h`): each closure's squared roughness (`bsdf_get_specular_roughness_squared`)
+/// weighted by `bsdf_pdf(wo) · sample_weight` at `wo`, the direction the path leaves along, so a direction that a
+/// sharp lobe carries is dominated by that lobe. `singular_weight` is the sampled singular closure's `1e6` weight,
+/// which Cycles adds to the total with zero roughness; it is zero for a continuous draw. A singular lobe has no
+/// density and no roughness, so it is left out, as Cycles' singular `bsdf_eval` is zero.
+fn average_roughness_squared(
+    params: &BsdfParams,
+    layers: &Layers,
+    wo: DVec3,
+    singular_weight: f64,
+) -> f64 {
+    let mut total = singular_weight;
+    let mut weighted = 0.0;
+    for lobe in continuous_lobes(params, layers, wo) {
+        if lobe.roughness_squared > 0.0 {
+            total += lobe.weight;
+            weighted += lobe.weight * lobe.roughness_squared;
         }
-    };
-    let probabilities = lobe_probabilities(params, layers);
-    let lobes = [
-        (probabilities.diffuse, 1.0),
-        (probabilities.sheen, 1.0),
-        (probabilities.coat, microfacet(params.coat_roughness)),
-        (probabilities.specular, microfacet(params.roughness)),
-        (probabilities.transmission, microfacet(params.roughness)),
-    ];
-    let total: f64 = lobes.iter().map(|(probability, _)| probability).sum();
-    if total <= 0.0 {
-        return 0.0;
     }
-    lobes
-        .iter()
-        .map(|(probability, roughness_squared)| probability * roughness_squared)
-        .sum::<f64>()
-        / total
+    if total > 0.0 { weighted / total } else { 0.0 }
 }
 
 #[derive(Clone, Copy)]
@@ -622,6 +634,7 @@ pub(super) fn render(
                                 y,
                                 sample_x,
                                 sample_y,
+                                (left_origin, left_direction),
                             )?,
                             environment,
                             max_bounces,
@@ -651,6 +664,7 @@ pub(super) fn render(
                                 y,
                                 sample_x,
                                 sample_y,
+                                (right_origin, right_direction),
                             )?,
                             environment,
                             max_bounces,
@@ -677,7 +691,16 @@ pub(super) fn render(
                             world_importance.as_ref(),
                             origin,
                             direction,
-                            camera_footprint(camera, width, height, x, y, sample_x, sample_y)?,
+                            camera_footprint(
+                                camera,
+                                width,
+                                height,
+                                x,
+                                y,
+                                sample_x,
+                                sample_y,
+                                (origin, direction),
+                            )?,
                             environment,
                             max_bounces,
                             transparent_max_bounces,
@@ -996,6 +1019,10 @@ fn trace_path(
     let mut ray_dp = footprint.dp;
     let mut ray_dd = footprint.dd;
     let widen_scale = filter_glossy_widen_scale(doc);
+    let blur_glossy = filter_glossy(doc);
+    // The smallest sampled pdf so far on this path (Cycles' `path.min_ray_pdf`, `FLT_MAX` at the start of a path and
+    // lowered by each BSDF and phase sample, `shade_surface.h` and `shade_volume.h`). It drives the glossy blur.
+    let mut min_ray_pdf = f64::MAX;
     // Set by the pass that reaches the cap: the next surface is shaded for emission and ends the
     // path (`PATH_RAY_TERMINATE_ON_NEXT_SURFACE`, `integrate_surface_terminate`).
     let mut terminate_on_next_surface = false;
@@ -1073,7 +1100,14 @@ fn trace_path(
             if bounce == max_bounces {
                 break;
             }
-            direction = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
+            let scattered = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
+            // The phase pdf of the drawn direction, with the incoming direction as the forward axis (Cycles'
+            // `unguided_phase_pdf`, `shade_volume.h`).
+            min_ray_pdf = min_ray_pdf.min(henyey_greenstein(
+                direction.dot(scattered),
+                event.anisotropy,
+            ));
+            direction = scattered;
             origin = event.point + direction * RAY_EPSILON;
             ray_dp = event_footprint;
             previous = Scatter::Volume;
@@ -1087,6 +1121,9 @@ fn trace_path(
             };
             radiance += throughput * light.radiance * weight;
             origin += direction * (light.distance + RAY_EPSILON);
+            // The origin moves past the light, so the footprint grows by the distance skipped: `dP + t · dD` measured
+            // from the old origin is `dP' + t' · dD` from the new one, with `dP' = dP + skipped · dD`.
+            ray_dp += (light.distance + RAY_EPSILON) * ray_dd;
             // A light is a transparent pass in Cycles (`integrate_light_forward`): it spends the
             // transparent budget, and the path ends at the cap, after the emission above.
             transparent_bounce += 1;
@@ -1120,6 +1157,15 @@ fn trace_path(
             footprint_here,
             evaluator_workspace,
         )?;
+        // Cycles' glossy blur (`surface_shader_prepare_closures`) runs before the hit is shaded, so the direct light, the
+        // bounce and the widening all see the blurred closures. A blurred closure's layers are rebuilt from its roughness:
+        // a singular glass lobe becomes rough, as Cycles' `bsdf_microfacet_blur` makes it non-singular.
+        if let Some(blur_alpha) = glossy_blur_alpha(blur_glossy, min_ray_pdf) {
+            surface.params.roughness = blurred_roughness(surface.params.roughness, blur_alpha);
+            surface.params.coat_roughness =
+                blurred_roughness(surface.params.coat_roughness, blur_alpha);
+            surface.layers = layers(&surface.params, surface.layers.normal, surface.layers.view);
+        }
         if std::mem::take(&mut exit_pending) {
             // The exit of a Burley entry is a diffuse surface (`subsurface_shader_data_setup`), not its material. Cycles
             // shades it along the exit hit's own normal: `subsurface_disk` sets the probe ray to `Ng[hit]`, flipped for a
@@ -1161,11 +1207,15 @@ fn trace_path(
                 * (4.0 * std::f64::consts::PI);
             radiance += throughput * environment * in_scatter * phase;
             throughput *= transmittance;
-            if exits_medium {
-                origin = surface.point + direction * (distance + 2.0 * RAY_EPSILON);
+            let step = if exits_medium {
+                distance + 2.0 * RAY_EPSILON
             } else {
-                origin = surface.point + direction * (distance - 2.0 * RAY_EPSILON);
-            }
+                distance - 2.0 * RAY_EPSILON
+            };
+            origin = surface.point + direction * step;
+            // The origin moves `step` beyond the surface's own hit distance, so its footprint is the surface's plus
+            // `step · dD`, as Cycles' `dP + t · dD` gives at the new origin.
+            ray_dp = surface.footprint + step * ray_dd;
             if throughput.max_element() <= 1.0e-8 {
                 break;
             }
@@ -1189,6 +1239,9 @@ fn trace_path(
             throughput *= DVec3::from_array(surface.params.transparent_tint);
             transparent_bounce += 1;
             terminate_on_next_surface |= transparent_bounce >= transparent_cap;
+            // Cycles keeps `ray.P` and `dP` through a transparent pass and lets `t` grow. Moving the origin to the
+            // surface with `dP` set to the surface's footprint gives the same footprint at every later hit.
+            ray_dp = surface.footprint;
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
@@ -1248,6 +1301,10 @@ fn trace_path(
                 _ => intrinsic_normal(geometry, exit.hit.triangle_index)
                     .is_some_and(|normal| normal.dot(exit.direction) < 0.0),
             };
+            // Cycles' `subsurface_bounce` (`kernel/integrator/subsurface.h`, lines 90-91): the exit ray carries the
+            // entry's footprint as its `dP`, and a zero `dD`, so the exit's bump is filtered at the entry's footprint.
+            ray_dp = surface.footprint;
+            ray_dd = 0.0;
             throughput = exit.throughput;
             origin = exit.origin;
             direction = exit.direction;
@@ -1259,7 +1316,7 @@ fn trace_path(
         if bounce >= max_bounces {
             break;
         }
-        let (next_direction, weight) = match sampled {
+        let (next_direction, weight, singular_weight) = match sampled {
             BsdfSample::Continuous {
                 direction,
                 weight,
@@ -1267,16 +1324,23 @@ fn trace_path(
                 diffuse,
             } => {
                 diffuse_ancestor |= diffuse;
+                min_ray_pdf = min_ray_pdf.min(pdf);
                 previous = Scatter::Surface(MisVertex {
                     bsdf_pdf: pdf,
                     normal: surface.normal,
                     point: surface.point,
                 });
-                (direction, weight)
+                (direction, weight, 0.0)
             }
-            BsdfSample::Delta { direction, weight } => {
+            BsdfSample::Delta {
+                direction,
+                weight,
+                pdf,
+                mis_weight,
+            } => {
+                min_ray_pdf = min_ray_pdf.min(pdf);
                 previous = Scatter::Delta(surface.point);
-                (direction, weight)
+                (direction, weight, mis_weight)
             }
             // Cycles' `LABEL_NONE`: a rejected draw ends the path. A subsurface draw was handled above.
             BsdfSample::Absorbed | BsdfSample::Subsurface { .. } => break,
@@ -1293,12 +1357,18 @@ fn trace_path(
             throughput /= survival;
         }
         // Cycles' `bsdf_widen_dD` after a non-transparent bounce (`kernel/closure/bsdf.h`): the next ray carries the
-        // hit's footprint as `dP`, and `dD` widens to `widen_scale · sqrt(avg roughness²)` when that is larger.
+        // hit's footprint as `dP`, and `dD` widens to `widen_scale · sqrt(avg roughness²)` when that is larger. The
+        // average is over the closures' pdfs at the direction the path leaves along (`surface_shader_bsdf_sample_closure`).
         ray_dp = surface.footprint;
         ray_dd = widen_ray_dd(
             ray_dd,
             widen_scale,
-            average_roughness_squared(&surface.params, &surface.layers),
+            average_roughness_squared(
+                &surface.params,
+                &surface.layers,
+                next_direction.normalize_or_zero(),
+                singular_weight,
+            ),
         );
         direction = next_direction.normalize_or_zero();
         origin = offset_origin(surface.point, direction, surface.geometric_normal);
@@ -1371,7 +1441,8 @@ fn write_center_passes(
                 }
                 continue;
             };
-            let footprint = camera_footprint(camera, width, height, x, y, 0.5, 0.5)?;
+            let footprint =
+                camera_footprint(camera, width, height, x, y, 0.5, 0.5, (origin, direction))?;
             let surface = make_surface(
                 doc,
                 snapshot,
@@ -1549,7 +1620,6 @@ pub(super) fn hit_params(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
-    footprint: Option<f64>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<BsdfParams> {
     with_hit_frame(
@@ -1560,7 +1630,7 @@ pub(super) fn hit_params(
         origin,
         direction,
         images,
-        footprint,
+        None,
         |frame| {
             let mut params = evaluate_surface_with_workspace(
                 frame.material,
@@ -2503,6 +2573,11 @@ enum BsdfSample {
     Delta {
         direction: DVec3,
         weight: DVec3,
+        /// The lobe mixture's pdf of the draw, Cycles' `bsdf_pdf` of a singular closure: its `1e6` weight plus the
+        /// other lobes' densities at `direction`. It lowers `min_ray_pdf`.
+        pdf: f64,
+        /// Cycles' singular pdf and sample weight for the widening average, `1e6 · branch · share`.
+        mis_weight: f64,
     },
     Subsurface {
         weight: DVec3,
@@ -2536,7 +2611,16 @@ fn sample_bsdf(
         let glass = sample_glass(params, layers, geometric, probabilities.transmission, rands);
         return match glass {
             GlassSample::Absorbed => BsdfSample::Absorbed,
-            GlassSample::Singular { direction, weight } => BsdfSample::Delta { direction, weight },
+            GlassSample::Singular {
+                direction,
+                weight,
+                mis_weight,
+            } => BsdfSample::Delta {
+                direction,
+                weight,
+                pdf: mis_weight + continuous_density(params, layers, direction),
+                mis_weight,
+            },
             GlassSample::Rough { direction } => continuous_sample(params, layers, direction, false),
         };
     }

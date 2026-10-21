@@ -3,9 +3,10 @@
 //!
 //! A metallic floor reflects a bumped emitter that light sampling does not reach, so the emitter is seen only through
 //! the floor's BSDF samples. Their non-specular bounce widens the ray differential by Filter Glossy
-//! (`bsdf_widen_dD`, `shade_surface.h`), and the emitter's sawtooth bump depends on that footprint. The test checks two
+//! (`bsdf_widen_dD`, `shade_surface.h`), and the emitter's sawtooth bump depends on that footprint. The test checks four
 //! things. Blender's Filter Glossy 1.0 and 0.0 renders differ by more than the tolerance in red and green, so the case
-//! separates the widening; and Potter's render at the imported Filter Glossy matches Blender's at 1.0.
+//! separates the widening; the imported `.blend` carries Filter Glossy 1.0; Potter's render at 1.0 matches Blender's
+//! 1.0; and Potter's render at 0.0, set through the scene, matches Blender's 0.0.
 //!
 //! The tolerance is `T · √(s_B² / n + s_P² / n)`, as in `native_subsurface_sphere.rs`.
 
@@ -67,35 +68,12 @@ fn blender_channels(expected: &Value, key: &str) -> TestResult<[Vec<f64>; 3]> {
     Ok(channels)
 }
 
-#[test]
-fn bump_filter_glossy_matches_cycles() -> TestResult {
-    let Some(blender) = blender_checked::blender_executable() else {
-        return Ok(());
-    };
-    let root = tempdir()?;
-    let script = write_script(root.path(), "bump_glossy_reflection.py", SCRIPT)?;
-    let blend = root.path().join("scene.blend");
-    let json_path = root.path().join("blender.json");
-    let arguments: [&Path; 2] = [&blend, &json_path];
-    run_blender_arguments(&blender, &script, None, &arguments)?;
-    let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
-    let wanted = blender_channels(&expected, "seed_means")?;
-    let unwidened = blender_channels(&expected, "seed_means_filter_glossy_0")?;
-
-    // The case must separate Filter Glossy 1.0 from 0.0 in Blender: a Potter that ignores the widening fails below.
-    for channel in [0, 1] {
-        let (widened_mean, widened_stderr) = mean_and_stderr(&wanted[channel]);
-        let (plain_mean, plain_stderr) = mean_and_stderr(&unwidened[channel]);
-        let tolerance = T_QUANTILE * widened_stderr.hypot(plain_stderr);
-        assert!(
-            (widened_mean - plain_mean).abs() > tolerance,
-            "channel {channel}: Blender's Filter Glossy 1.0 ({widened_mean}) and 0.0 ({plain_mean}) are within \
-             {tolerance}, so the case does not separate the widening"
-        );
-    }
-
-    let (project_path, _) = import_blend(&blender, root.path(), "project", &blend)?;
-    let project = Project::open(&project_path)?;
+/// Potter's per-seed frame means of the imported scene rendered at `filter_glossy`, as RGB channel vectors.
+fn potter_channels(
+    project: &Project,
+    root: &Path,
+    filter_glossy: f64,
+) -> TestResult<[Vec<f64>; 3]> {
     let mut doc = project.doc().clone();
     let scene_id = doc.active_scene.clone();
     let (camera, frame, film_transparent) = {
@@ -107,6 +85,7 @@ fn bump_filter_glossy_matches_cycles() -> TestResult {
         scene.render.resolution_y = RESOLUTION;
         scene.render.resolution_percentage = 100;
         scene.render.samples = SAMPLES;
+        scene.render.filter_glossy = filter_glossy;
         (
             scene.camera.clone(),
             scene.frame_current,
@@ -125,7 +104,7 @@ fn bump_filter_glossy_matches_cycles() -> TestResult {
             .ok_or("the active scene is missing")?
             .render
             .seed = seed;
-        let out = root.path().join(format!("frames_{seed}"));
+        let out = root.join(format!("frames_{filter_glossy}_{seed}"));
         render_sequence(
             &doc,
             &context,
@@ -151,15 +130,68 @@ fn bump_filter_glossy_matches_cycles() -> TestResult {
             values.push(total / count);
         }
     }
+    Ok(potter)
+}
 
-    for (channel, (wanted_values, actual_values)) in wanted.iter().zip(&potter).enumerate() {
+/// Asserts that Potter's per-seed means `actual` match Blender's `wanted` in every channel, within the t-quantile
+/// tolerance of both seed spreads.
+fn assert_matches(wanted: &[Vec<f64>; 3], actual: &[Vec<f64>; 3], setting: &str) {
+    for (channel, (wanted_values, actual_values)) in wanted.iter().zip(actual).enumerate() {
         let (wanted_mean, wanted_stderr) = mean_and_stderr(wanted_values);
         let (actual_mean, actual_stderr) = mean_and_stderr(actual_values);
         let tolerance = T_QUANTILE * wanted_stderr.hypot(actual_stderr);
         assert!(
             (actual_mean - wanted_mean).abs() <= tolerance,
-            "channel {channel}: Potter {actual_mean} differs from Cycles {wanted_mean} by more than {tolerance}"
+            "Filter Glossy {setting}, channel {channel}: Potter {actual_mean} differs from Cycles {wanted_mean} by more than {tolerance}"
         );
     }
+}
+
+#[test]
+fn bump_filter_glossy_matches_cycles() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(root.path(), "bump_glossy_reflection.py", SCRIPT)?;
+    let blend = root.path().join("scene.blend");
+    let json_path = root.path().join("blender.json");
+    let arguments: [&Path; 2] = [&blend, &json_path];
+    run_blender_arguments(&blender, &script, None, &arguments)?;
+    let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
+    let widened = blender_channels(&expected, "seed_means")?;
+    let plain = blender_channels(&expected, "seed_means_filter_glossy_0")?;
+
+    // The case must separate Filter Glossy 1.0 from 0.0 in Blender: a Potter that ignores the widening fails below.
+    for channel in [0, 1] {
+        let (widened_mean, widened_stderr) = mean_and_stderr(&widened[channel]);
+        let (plain_mean, plain_stderr) = mean_and_stderr(&plain[channel]);
+        let tolerance = T_QUANTILE * widened_stderr.hypot(plain_stderr);
+        assert!(
+            (widened_mean - plain_mean).abs() > tolerance,
+            "channel {channel}: Blender's Filter Glossy 1.0 ({widened_mean}) and 0.0 ({plain_mean}) are within \
+             {tolerance}, so the case does not separate the widening"
+        );
+    }
+
+    let (project_path, _) = import_blend(&blender, root.path(), "project", &blend)?;
+    let project = Project::open(&project_path)?;
+    let imported = project
+        .doc()
+        .scenes
+        .get(&project.doc().active_scene)
+        .ok_or("the active scene is missing")?
+        .render
+        .filter_glossy;
+    assert!(
+        (imported - 1.0).abs() < 1.0e-12,
+        "the .blend's Filter Glossy imports as {imported}, not Blender's 1.0"
+    );
+    assert_matches(
+        &widened,
+        &potter_channels(&project, root.path(), 1.0)?,
+        "1.0",
+    );
+    assert_matches(&plain, &potter_channels(&project, root.path(), 0.0)?, "0.0");
     Ok(())
 }

@@ -1,9 +1,11 @@
 """Bump node slope on a plane, rendered by Blender 5.2.2 Cycles.
 
-The plane's height is the Generated X coordinate, a ramp from 0 to 1 across its two-unit width, bumped with Distance
-0.5 and the node's default Filter Width. The material emits the bumped normal, mapped from [-1, 1] to [0, 1] (Vector
-Math multiply then add), so the frame mean measures the slope the bump draws at the footprint of each pixel. The
-camera looks straight down, and the world is black.
+The plane's height is `FRACT(6 · Generated X)`, a sawtooth of six teeth across its two-unit width, bumped with Distance
+0.5 and the node's default Filter Width. A tooth is about two pixels wide, so the bump's finite-difference step, one Filter
+Width along each pixel's footprint, sometimes straddles a tooth edge: the mean normal depends on the footprint and on the
+Filter Width, not only on the slope (a linear ramp gives the same normal at every footprint, so it would not test the
+footprint). The material emits the bumped normal, mapped from [-1, 1] to [0, 1] (Vector Math multiply then add), so the
+frame mean measures the bump at the footprint of each pixel. The camera looks straight down, and the world is black.
 
 Arguments after `--`: blend_out and json_out.
 """
@@ -59,7 +61,14 @@ add.operation = "ADD"
 add.inputs[1].default_value = (0.5, 0.5, 0.5)
 
 tree.links.new(texcoord.outputs["Generated"], separate.inputs["Vector"])
-tree.links.new(separate.outputs["X"], bump.inputs["Height"])
+teeth = tree.nodes.new("ShaderNodeMath")
+teeth.operation = "MULTIPLY"
+teeth.inputs[1].default_value = 6.0
+sawtooth = tree.nodes.new("ShaderNodeMath")
+sawtooth.operation = "FRACT"
+tree.links.new(separate.outputs["X"], teeth.inputs[0])
+tree.links.new(teeth.outputs["Value"], sawtooth.inputs[0])
+tree.links.new(sawtooth.outputs["Value"], bump.inputs["Height"])
 tree.links.new(bump.outputs["Normal"], multiply.inputs[0])
 tree.links.new(multiply.outputs["Vector"], add.inputs[0])
 tree.links.new(add.outputs["Vector"], emission.inputs["Color"])

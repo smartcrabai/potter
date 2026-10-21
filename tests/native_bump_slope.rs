@@ -1,9 +1,11 @@
 //! A bump node's slope on a plane, against Blender 5.2.2's Cycles render (`fixtures/native_oracle/bump/bump_slope.py`).
 //!
-//! The height is the Generated X ramp, bumped with Distance 0.5 and the default Filter Width 0.1, and the emission is the
-//! bumped normal mapped to [0, 1]. The bump's screen differentials come from each pixel's camera footprint, so the frame
-//! mean depends on the footprint, the one-sided height samples and the Filter Width term together. Blender renders eight
-//! seeds at 64 samples per pixel, and so does Potter.
+//! The height is the sawtooth `FRACT(6 · Generated X)`, bumped with Distance 0.5 and the default Filter Width 0.1, and
+//! the emission is the bumped normal mapped to [0, 1]. A tooth is about two pixels wide, so the bump's finite-difference
+//! step, one Filter Width along the pixel footprint, sometimes straddles a tooth edge: the frame mean depends on the
+//! footprint and the Filter Width, not only on the slope. Blender's mean at Filter Width 0.1 is 0.079 in red and at 1.0
+//! is 0.256, far beyond the seed spread, so a Potter that ignored the footprint (a fixed step) would miss.
+//! Blender renders eight seeds at 64 samples per pixel, and so does Potter.
 //!
 //! The tolerance is `T · √(s_B² / n + s_P² / n)`, with `s` the seed-to-seed sample standard deviations of each side and
 //! `T` the two-sided 99.9% t quantile at 7 degrees of freedom (5.408), as in `native_subsurface_sphere.rs`.

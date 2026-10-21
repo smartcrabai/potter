@@ -101,24 +101,79 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     }
 }
 
-/// Density of the continuous (diffuse, sheen, coat and specular) directions drawn by `path.rs`, in solid
-/// angle, with the glass lobe's density as Cycles' eval and pdf define it. Diffuse is cosine-distributed;
-/// sheen is the LTC distribution; the coat and specular lobes are the GGX half-vector distribution D·cosθh
-/// mapped to the reflected direction. The glass lobe's density is its reflection above the surface and its
-/// refraction below it.
-pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DVec3) -> f64 {
+/// One continuous lobe at a direction: its weight, the selection probability times its density there, which is
+/// Cycles' `bsdf_pdf(wo) · sample_weight` of its closure, and its squared roughness, Cycles'
+/// `bsdf_get_specular_roughness_squared` (zero for a singular lobe).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LobeDensity {
+    pub(crate) weight: f64,
+    pub(crate) roughness_squared: f64,
+}
+
+/// Roughness below which a microfacet lobe is singular (Cycles' `roughness_is_almost_specular`).
+const DELTA_ROUGHNESS: f64 = 1.0e-5;
+
+/// Cycles' `bsdf_get_specular_roughness_squared` of a microfacet lobe, `alpha_x · alpha_y` with alpha the squared
+/// roughness, so roughness⁴. A singular roughness has 0.
+fn microfacet_roughness_squared(roughness: f64) -> f64 {
+    if roughness < DELTA_ROUGHNESS {
+        0.0
+    } else {
+        roughness.powi(4)
+    }
+}
+
+/// The continuous lobes (diffuse, sheen, coat, specular and glass) at `light`, in that order. Each lobe's density
+/// is the one [`continuous_density`] sums: the diffuse lobe is cosine-distributed, the sheen lobe is the LTC
+/// distribution, the coat and specular lobes are the GGX half-vector distribution, and the glass lobe's density is
+/// its reflection above the surface and its refraction below it.
+pub(crate) fn continuous_lobes(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+) -> [LobeDensity; 5] {
     let (normal, view) = (layers.normal, layers.view);
     let probabilities = lobe_probabilities(params, layers);
-    let mut density = probabilities.diffuse * normal.dot(light).max(0.0) / PI;
-    density += probabilities.sheen * layers.sheen.density(light);
-    if let Some(coat) = layers.coat {
-        density += probabilities.coat * half_vector_pdf(coat.normal, coat.roughness, view, light);
-    }
-    density += probabilities.specular * half_vector_pdf(normal, params.roughness, view, light);
-    if let Some(glass) = &layers.glass {
-        density += probabilities.transmission * glass_eval(glass, normal, view, light).1;
-    }
-    density
+    let absent = LobeDensity {
+        weight: 0.0,
+        roughness_squared: 0.0,
+    };
+    let diffuse = LobeDensity {
+        weight: probabilities.diffuse * normal.dot(light).max(0.0) / PI,
+        roughness_squared: 1.0,
+    };
+    let sheen = LobeDensity {
+        weight: probabilities.sheen * layers.sheen.density(light),
+        roughness_squared: 1.0,
+    };
+    let coat = layers.coat.map_or(absent, |coat| LobeDensity {
+        weight: probabilities.coat * half_vector_pdf(coat.normal, coat.roughness, view, light),
+        roughness_squared: microfacet_roughness_squared(coat.roughness),
+    });
+    let specular = LobeDensity {
+        weight: probabilities.specular * half_vector_pdf(normal, params.roughness, view, light),
+        roughness_squared: microfacet_roughness_squared(params.roughness),
+    };
+    let glass = layers.glass.as_ref().map_or(absent, |glass| LobeDensity {
+        weight: probabilities.transmission * glass_eval(glass, normal, view, light).1,
+        // A singular glass lobe has no roughness, and Cycles' singular closure evaluates to zero.
+        roughness_squared: if glass.singular {
+            0.0
+        } else {
+            microfacet_roughness_squared(params.roughness)
+        },
+    });
+    [diffuse, sheen, coat, specular, glass]
+}
+
+/// Density of the continuous (diffuse, sheen, coat and specular) directions drawn by `path.rs`, in solid
+/// angle, with the glass lobe's density as Cycles' eval and pdf define it: the sum of [`continuous_lobes`]'
+/// weights.
+pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DVec3) -> f64 {
+    continuous_lobes(params, layers, light)
+        .iter()
+        .map(|lobe| lobe.weight)
+        .sum()
 }
 
 /// Density in solid angle of the reflection of `view` about the half vector drawn with
@@ -980,11 +1035,20 @@ pub(crate) fn glass_coefficient(params: &BsdfParams, layers: &Layers, light: DVe
     value / cosine * (params.reflectance.clamp(0.0, 1.0) * layers.lower)
 }
 
+/// Cycles' `1e6` for a singular draw's pdf (`bsdf_microfacet_sample`: `*pdf *= 1e6f` when `m_singular`).
+pub(crate) const SINGULAR_MIS_WEIGHT: f64 = 1.0e6;
+
 /// A draw from the glass closure, as Cycles' `bsdf_microfacet_sample` makes it.
 pub(crate) enum GlassSample {
     /// A delta reflection or refraction. `weight` is the Fresnel share over the branch probability (`branch`,
     /// the glass probability in the lobe mixture), times the energy gain, the reflectance and the layers.
-    Singular { direction: DVec3, weight: DVec3 },
+    /// `mis_weight` is the closure's weight in the widening average, `SINGULAR_MIS_WEIGHT · branch · share`: the
+    /// `pdf · sample_weight` Cycles gives a singular draw (`surface_shader_bsdf_sample_closure`).
+    Singular {
+        direction: DVec3,
+        weight: DVec3,
+        mis_weight: f64,
+    },
     /// A rough draw, which the caller weights by the lobe mixture's density.
     Rough { direction: DVec3 },
     /// A draw on the wrong side of the normal or the geometric normal: Cycles' `LABEL_NONE`.
@@ -1042,6 +1106,7 @@ pub(crate) fn sample_glass(
     GlassSample::Singular {
         direction,
         weight: value * lobe.gain * scale / (branch * share),
+        mis_weight: SINGULAR_MIS_WEIGHT * branch * share,
     }
 }
 
@@ -1473,8 +1538,9 @@ mod glass_tests {
         let mut reflected = 0_usize;
         for k in 0..draws {
             let u = (k as f64 + 0.5) / draws as f64;
-            let GlassSample::Singular { direction, weight } =
-                sample_glass(&params, &shading, DVec3::Z, 1.0, [0.5, 0.5, u])
+            let GlassSample::Singular {
+                direction, weight, ..
+            } = sample_glass(&params, &shading, DVec3::Z, 1.0, [0.5, 0.5, u])
             else {
                 panic!("a sharp glass draw is singular");
             };
@@ -1737,8 +1803,9 @@ mod glass_tests {
         let params = principled_glass(1.0, 0.5);
         let shading = layers(&params, DVec3::Z, view());
         for u in [0.1, 0.5, 0.9] {
-            let GlassSample::Singular { direction, weight } =
-                sample_glass(&params, &shading, DVec3::Z, 1.0, [0.3, 0.7, u])
+            let GlassSample::Singular {
+                direction, weight, ..
+            } = sample_glass(&params, &shading, DVec3::Z, 1.0, [0.3, 0.7, u])
             else {
                 panic!("a refraction at an IOR of 1 is a delta");
             };
