@@ -1175,6 +1175,11 @@ pub struct RenderSettings {
     pub samples: u32,
     pub seed: u32,
     pub max_bounces: u32,
+    /// Cycles' `volume_bounces`: a volume path takes `volume_bounces + 1` scatter vertices with direct light, and each
+    /// later segment only attenuates (`max_volume_bounce`, `intern/cycles/scene/integrator.cpp`). Omitted when equal to
+    /// Blender's default of 0.
+    #[serde(default, skip_serializing_if = "is_default_volume_bounces")]
+    pub volume_bounces: u32,
     /// Cycles' `transparent_max_bounces`. Omitted when equal to Blender's default of 8.
     #[serde(
         default = "default_transparent_max_bounces",
@@ -1237,6 +1242,7 @@ impl Default for RenderSettings {
             samples: 64,
             seed: 0,
             max_bounces: 4,
+            volume_bounces: 0,
             transparent_max_bounces: 8,
             film_transparent: false,
             filter_size: default_filter_size(),
@@ -1508,6 +1514,32 @@ fn white_rgb() -> [f64; 3] {
 }
 fn default_volume_color() -> [f64; 3] {
     [0.5; 3]
+}
+
+/// Blender's `cycles.volume_sampling` for a material: distance, equiangular, or multiple importance sampling of
+/// both (Blender's default). A volume's direct light is sampled along its ray in the chosen way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeSampling {
+    Distance,
+    Equiangular,
+    #[default]
+    MultipleImportance,
+}
+
+/// Skips a volume setting in serde output when it is at its default, which is then read back as the default.
+fn is_serialised_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+/// Blender's `cycles.volume_interpolation` for a material: trilinear (Blender's default) or the cubic B-spline of
+/// Cycles' `kernel_image_interp_tricubic_nanovdb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeInterpolation {
+    #[default]
+    Linear,
+    Cubic,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2180,6 +2212,14 @@ fn default_transparent_max_bounces() -> u32 {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde skip_serializing_if passes a reference"
 )]
+fn is_default_volume_bounces(value: &u32) -> bool {
+    *value == 0
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -2652,6 +2692,12 @@ pub struct Material {
     pub volume_color: [f64; 3],
     #[serde(default)]
     pub volume_anisotropy: f64,
+    /// Blender's `cycles.volume_sampling`: how a volume's direct light is sampled (Cycles' `volume_stack_sample_method`).
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
+    pub volume_sampling: VolumeSampling,
+    /// Blender's `cycles.volume_interpolation`: how a voxel volume's density is interpolated between its samples.
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
+    pub volume_interpolation: VolumeInterpolation,
     /// Blender's viewport display values, which Solid shading reads. Set by `.blend` import; omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport_display: Option<ViewportDisplay>,
@@ -2682,6 +2728,8 @@ impl Default for Material {
             volume_density: 0.0,
             volume_color: default_volume_color(),
             volume_anisotropy: 0.0,
+            volume_sampling: VolumeSampling::default(),
+            volume_interpolation: VolumeInterpolation::default(),
             viewport_display: None,
         }
     }

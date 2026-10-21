@@ -310,6 +310,7 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
     render["properties"]["filter_size"] = json!({"type":"number","minimum":0,"maximum":500});
+    render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
@@ -342,6 +343,9 @@ fn complete_scene_schema(root: &mut Value) {
     material["properties"]["alpha_mode"] = json!({"enum":["opaque","blend","clip"]});
     material["properties"]["alpha_threshold"] = json!({"type":"number","minimum":0,"maximum":1});
     material["properties"]["displacement_method"] = json!({"enum":["bump","displacement"]});
+    material["properties"]["volume_sampling"] =
+        json!({"enum":["distance","equiangular","multiple_importance"]});
+    material["properties"]["volume_interpolation"] = json!({"enum":["linear","cubic"]});
     material["properties"]["displacement_scale"] = json!({"type":"number"});
     material["properties"]["displacement_midlevel"] =
         json!({"type":"number","minimum":0,"maximum":1});
@@ -1001,6 +1005,8 @@ fn operation_contract(name: &str) -> OperationContract {
                 "volume_density",
                 "volume_color",
                 "volume_anisotropy",
+                "volume_sampling",
+                "volume_interpolation",
                 "displacement_scale",
                 "displacement_midlevel",
             ],
@@ -2186,6 +2192,8 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"type":"number","minimum":0,"maximum":1})
             }
             "displacement_method" => json!({"enum":["bump","displacement"]}),
+            "volume_sampling" => json!({"enum":["distance","equiangular","multiple_importance"]}),
+            "volume_interpolation" => json!({"enum":["linear","cubic"]}),
             "volume_density" => json!({"type":"number","minimum":0}),
             "volume_color" => {
                 json!({"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3})
@@ -2483,6 +2491,7 @@ fn set_schema(operation: &str) -> Value {
             "samples":{"type":"integer","minimum":1,"maximum":1_000_000},
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "volume_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "film_transparent":{"type":"boolean"},
             "filter_size":{"type":"number","minimum":0,"maximum":500},
@@ -2641,6 +2650,8 @@ fn material_set_properties() -> Value {
         "metallic_texture":nullable_texture_ref_schema(),
         "normal_texture":nullable_texture_ref_schema(),
         "displacement_method":{"enum":["bump","displacement"]},
+        "volume_sampling":{"enum":["distance","equiangular","multiple_importance"]},
+        "volume_interpolation":{"enum":["linear","cubic"]},
         "volume_density":{"type":"number","minimum":0},
         "volume_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "volume_anisotropy":{"type":"number","minimum":-0.999,"maximum":0.999},

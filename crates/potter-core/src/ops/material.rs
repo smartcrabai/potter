@@ -3,6 +3,8 @@ use serde_json::{Map, Value};
 use crate::{
     error::{ErrorCode, Result},
     image::{ImageExtension, ImageInterpolation},
+    model::VolumeInterpolation,
+    model::VolumeSampling,
     model::{Id, Material, TextureRef},
 };
 
@@ -53,6 +55,8 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "metallic_texture",
             "normal_texture",
             "displacement_method",
+            "volume_sampling",
+            "volume_interpolation",
             "volume_density",
             "volume_color",
             "volume_anisotropy",
@@ -98,6 +102,20 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine,
             value,
             &operation_pointer(engine.operation_index, "displacement_method"),
+        )?;
+    }
+    if let Some(value) = operation.get("volume_sampling") {
+        material.volume_sampling = parse_volume_sampling(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "volume_sampling"),
+        )?;
+    }
+    if let Some(value) = operation.get("volume_interpolation") {
+        material.volume_interpolation = parse_volume_interpolation(
+            engine,
+            value,
+            &operation_pointer(engine.operation_index, "volume_interpolation"),
         )?;
     }
     if let Some(value) = operation.get("volume_density") {
@@ -261,6 +279,8 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "metallic_texture",
             "normal_texture",
             "displacement_method",
+            "volume_sampling",
+            "volume_interpolation",
             "volume_density",
             "volume_color",
             "volume_anisotropy",
@@ -409,6 +429,26 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             )
         })
         .transpose()?;
+    let volume_sampling = set
+        .get("volume_sampling")
+        .map(|value| {
+            parse_volume_sampling(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/volume_sampling"),
+            )
+        })
+        .transpose()?;
+    let volume_interpolation = set
+        .get("volume_interpolation")
+        .map(|value| {
+            parse_volume_interpolation(
+                engine,
+                value,
+                &operation_pointer(engine.operation_index, "set/volume_interpolation"),
+            )
+        })
+        .transpose()?;
     let volume_density = set
         .get("volume_density")
         .map(|value| {
@@ -456,8 +496,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .map(|value| read_unit_interval(engine, value, "set/displacement_midlevel"))
         .transpose()?;
     let mut changed = false;
+    let mut graph_writes = Vec::new();
     for id in targets {
         let item_changed = if let Some(material) = engine.doc.materials.get_mut(&id) {
+            let before = material.clone();
             let mut item_changed = false;
             if let Some(name) = &name
                 && material.name != *name
@@ -561,6 +603,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 material.displacement_method.clone_from(value);
                 item_changed = true;
             }
+            if let Some(value) = volume_sampling
+                && material.volume_sampling != value
+            {
+                material.volume_sampling = value;
+                item_changed = true;
+            }
+            if let Some(value) = volume_interpolation
+                && material.volume_interpolation != value
+            {
+                material.volume_interpolation = value;
+                item_changed = true;
+            }
             if let Some(value) = volume_density
                 && !crate::float::equal_f64(material.volume_density, value)
             {
@@ -591,6 +645,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 material.displacement_midlevel = value;
                 item_changed = true;
             }
+            let writes = super::shader::principled_writes(&before, material);
+            if !writes.is_empty() {
+                graph_writes.push((id.clone(), writes));
+            }
             item_changed
         } else {
             false
@@ -599,6 +657,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine.mark("materials", &id, ChangeKind::Updated);
             changed = true;
         }
+    }
+    for (id, writes) in graph_writes {
+        super::shader::write_authored_inputs(engine, &id, &writes)?;
     }
     Ok(changed)
 }
@@ -1003,6 +1064,39 @@ fn parse_displacement_method(engine: &Engine<'_>, value: &Value, pointer: &str) 
         _ => Err(engine.error(
             ErrorCode::InvalidOperation,
             "displacement_method must be bump or displacement",
+            pointer,
+        )),
+    }
+}
+
+fn parse_volume_sampling(
+    engine: &Engine<'_>,
+    value: &Value,
+    pointer: &str,
+) -> Result<VolumeSampling> {
+    match value.as_str() {
+        Some("distance") => Ok(VolumeSampling::Distance),
+        Some("equiangular") => Ok(VolumeSampling::Equiangular),
+        Some("multiple_importance") => Ok(VolumeSampling::MultipleImportance),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "volume_sampling must be distance, equiangular or multiple_importance",
+            pointer,
+        )),
+    }
+}
+
+fn parse_volume_interpolation(
+    engine: &Engine<'_>,
+    value: &Value,
+    pointer: &str,
+) -> Result<VolumeInterpolation> {
+    match value.as_str() {
+        Some("linear") => Ok(VolumeInterpolation::Linear),
+        Some("cubic") => Ok(VolumeInterpolation::Cubic),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "volume_interpolation must be linear or cubic",
             pointer,
         )),
     }
