@@ -2657,9 +2657,16 @@ fn import_bytes_with_base(
                     json!({"reason":error.to_string(),"geometry_id":geometry_number}),
                 )
             })?;
-            if let Some(normals) = &geometry.normals {
-                shading::import_shading(&mut mesh, normals)?;
-            }
+            // `import_face_smoothing` sets `sharp_face = !smoothing` when the layer is read.
+            let sharp_faces = geometry
+                .smoothing
+                .as_ref()
+                .map(|smooth| smooth.iter().map(|flag| !flag).collect::<Vec<_>>());
+            shading::import_reader_shading(
+                &mut mesh,
+                geometry.normals.as_deref(),
+                sharp_faces.as_deref(),
+            )?;
             import_uv_layers(
                 &mut mesh,
                 &geometry.uv_layers,
@@ -2776,6 +2783,9 @@ struct ImportedGeometry {
     deformation: Option<Value>,
     /// Mesh-local corner normals in `faces` order, unit length; `None` when absent.
     normals: Option<Vec<DVec3>>,
+    /// Per polygon `smooth` flags from a `LayerElementSmoothing` with one value per polygon; `None` when
+    /// Blender would not read the layer.
+    smoothing: Option<Vec<bool>>,
     /// UV layers in file order; empty when the geometry has none.
     uv_layers: Vec<ExchangeUvLayer>,
     /// Index of the active UV layer; `None` when the geometry has no UV layer.
@@ -3060,14 +3070,7 @@ fn parse_geometry(
         })
         .transpose()?;
     let normals = parse_normal_layer(node, positions.len(), &faces, geometry_id, losses)?;
-    if normals.is_none() && node.child("LayerElementSmoothing").is_some() {
-        losses.push(Loss {
-            feature_id: "format.fbx.smoothing".to_owned(),
-            data_id: Some(geometry_id.to_string()),
-            reason: "FBX LayerElementSmoothing without LayerElementNormal data is not represented in the Potter mesh model".to_owned(),
-            suggestion: None,
-        });
-    }
+    let smoothing = parse_smoothing_layer(node, faces.len(), geometry_id, losses)?;
     let layers = parse_uv_layers(node, positions.len(), &faces, geometry_id, losses)?;
     // A geometry without a recorded selection, or one naming no layer, selects the first layer.
     let select = |property: &str| {
@@ -3094,11 +3097,55 @@ fn parse_geometry(
         material_indices,
         deformation,
         normals,
+        smoothing,
         uv_layers: layers,
         uv_active,
         uv_render,
         colors,
     })
+}
+
+/// `LayerElementSmoothing` as Blender reads it (`io/fbx/importer/fbx_import_mesh.cc`,
+/// `import_face_smoothing`): one value per polygon, `smooth = value != 0`. Blender uses the layer only
+/// when its count equals the face count and ignores it otherwise, so a count mismatch yields no
+/// smoothing. Other mappings and references are reported as losses.
+fn parse_smoothing_layer(
+    node: &FbxNode,
+    face_count: usize,
+    geometry_id: i64,
+    losses: &mut Vec<Loss>,
+) -> Result<Option<Vec<bool>>> {
+    let Some(layer) = node.child("LayerElementSmoothing") else {
+        return Ok(None);
+    };
+    let mapping = layer
+        .child("MappingInformationType")
+        .and_then(FbxNode::first_arg)
+        .unwrap_or("");
+    let reference = layer
+        .child("ReferenceInformationType")
+        .and_then(FbxNode::first_arg)
+        .unwrap_or("");
+    if mapping != "ByPolygon" || reference != "Direct" {
+        losses.push(Loss {
+            feature_id: "format.fbx.smoothing".to_owned(),
+            data_id: Some(geometry_id.to_string()),
+            reason: format!(
+                "FBX LayerElementSmoothing mapping `{mapping}` with reference `{reference}` is not represented in the Potter mesh model"
+            ),
+            suggestion: None,
+        });
+        return Ok(None);
+    }
+    let values = integer_array(
+        layer
+            .child("Smoothing")
+            .ok_or_else(|| import_error("FBX LayerElementSmoothing has no Smoothing array"))?,
+    )?;
+    if values.len() != face_count {
+        return Ok(None);
+    }
+    Ok(Some(values.iter().map(|value| *value != 0).collect()))
 }
 
 /// Reads `LayerElementNormal` as mesh-local corner normals in `faces` order.
@@ -5408,7 +5455,11 @@ mod tests {
         let hit = crate::shader::HitContext::new(&doc.node_groups)
             .with_images(&images)
             .with_uv_layers(hit_uvs);
-        Ok(crate::shader::evaluate_surface(material, &hit)?.base_color)
+        let shading = crate::shader::evaluate_surface(material, &hit)?;
+        Ok(shading
+            .dominant()
+            .ok_or("FBX test material has no closure")?
+            .base_color)
     }
 
     fn assert_pixel(actual: [f64; 4], expected: [f64; 4]) {
