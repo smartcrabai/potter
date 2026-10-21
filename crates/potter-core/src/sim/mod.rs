@@ -438,7 +438,7 @@ pub(crate) fn evaluate_stack_modifier(
             }
         }
         "dynamic_paint" if setting_string(settings, "role").unwrap_or("canvas") == "canvas" => {
-            let colors = paint_canvas(&context, &mesh, matrix, settings)?;
+            let colors = paint_canvas(&context, node_id, &mesh, settings)?;
             let values = mesh
                 .vertices
                 .iter()
@@ -795,7 +795,7 @@ fn evaluate_physics(
             && active_modifier(id, node, "dynamic_paint", gate).is_some()
         {
             let canvas = mesh_for_node(doc, node, id)?;
-            let colors = paint_canvas(&context, canvas, matrix, settings)?;
+            let colors = paint_canvas(&context, id, canvas, settings)?;
             if colors.len() != canvas.vertices.len()
                 || colors.iter().flatten().any(|value| !value.is_finite())
             {
@@ -1800,20 +1800,20 @@ fn dynamic_paint_brush_settings(
     Ok(brushes)
 }
 
-/// Whether a canvas paints at `frame`. Blender's dynamic paint does not evaluate a surface before its
-/// `frame_start` (`dynamicPaint_frameUpdate` reads the cache there), so the canvas keeps its geometry
-/// and is unpainted. After `frame_end` Blender holds the surface's last state, which Potter does not
-/// keep, so such a frame is refused with `physics.dynamic_paint_surface.frame_end`. A canvas paints
-/// when any of its surfaces has started.
-fn canvas_paints_at(canvas: &Value, frame: f64) -> Result<bool> {
+/// The frame a canvas paints at, or `None` before it paints. Blender's dynamic paint does not evaluate
+/// a surface before its `frame_start` (`dynamicPaint_frameUpdate` reads the cache there), so the canvas
+/// keeps its geometry and is unpainted. After `frame_end` Blender holds the surface's end state, which
+/// Potter reproduces by evaluating the brushes at `frame_end`. A canvas paints when any of its surfaces
+/// has started; the first started surface in order sets the frame.
+fn canvas_paint_frame(canvas: &Value, frame: f64) -> Result<Option<f64>> {
     let Some(surfaces) = canvas.get("canvas_surfaces") else {
-        return Ok(true);
+        return Ok(Some(frame));
     };
     let surfaces = surfaces.as_array().ok_or_else(|| {
         PotError::invalid_argument("dynamic-paint canvas_surfaces must be an array")
     })?;
     if surfaces.is_empty() {
-        return Ok(true);
+        return Ok(Some(frame));
     }
     for surface in surfaces {
         let start = setting_number(
@@ -1830,28 +1830,21 @@ fn canvas_paints_at(canvas: &Value, frame: f64) -> Result<bool> {
             "dynamic-paint surface",
             "a finite number",
         )?;
-        if frame > end {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                "dynamic-paint frame is after the surface's frame_end, which Potter does not hold",
-                json!({
-                    "feature_id": "physics.dynamic_paint_surface.frame_end",
-                    "property": "frame_end",
-                    "status": "not_supported",
-                }),
-            ));
-        }
         if frame >= start {
-            return Ok(true);
+            return Ok(Some(frame.min(end)));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
-/// Rejects Blender canvas surfaces that Potter does not paint.
-///
-/// Potter paints one vertex-colour layer, so only PAINT surfaces in VERTEX format evaluate. Other
-/// surface and point-cache properties go through the honoured-property check.
+/// World matrices of the scene at `frame`, with the drivers evaluated there (as `ops/node.rs` does).
+/// Brush transforms are evaluated without evaluated meshes, so a brush whose constraint depends on a
+/// mesh uses its transform without that mesh.
+fn scene_world_matrices_at(doc: &SceneDoc, frame: f64) -> Result<BTreeMap<Id, DMat4>> {
+    let drivers = crate::eval::rig::evaluate_drivers(doc, frame)?;
+    crate::eval::rig::evaluate_world_matrices_with_drivers(doc, frame, &drivers)
+}
+
 fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
     let Some(surfaces) = canvas.get("canvas_surfaces") else {
         return Ok(());
@@ -1882,17 +1875,41 @@ fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Per-vertex RGBA colours that the canvas's dynamic-paint settings produce at the context frame.
+/// Per-vertex RGBA colours that the canvas's dynamic-paint settings produce at the context frame, or at
+/// the surface's `frame_end` once the context frame has passed it.
 fn paint_canvas(
     context: &FrameContext<'_>,
+    canvas_id: &Id,
     canvas: &Mesh,
-    matrix: DMat4,
     settings: &Value,
 ) -> Result<Vec<[f64; 4]>> {
     validate_dynamic_paint_canvas(settings)?;
-    if !canvas_paints_at(settings, context.frame)? {
+    let Some(paint_frame) = canvas_paint_frame(settings, context.frame)? else {
         return Ok(vec![[0.0; 4]; canvas.vertices.len()]);
-    }
+    };
+    let paint_matrices;
+    let paint_context = if paint_frame >= context.frame {
+        *context
+    } else {
+        paint_matrices = scene_world_matrices_at(context.doc, paint_frame)?;
+        FrameContext {
+            frame: paint_frame,
+            matrices: &paint_matrices,
+            ..*context
+        }
+    };
+    let matrix = paint_context
+        .matrices
+        .get(canvas_id)
+        .copied()
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint canvas transform is missing at its paint frame",
+                json!({"node_id":canvas_id}),
+            )
+        })?;
+    let context = &paint_context;
     let brushes = dynamic_paint_brush_settings(context, settings)?;
     if brushes.is_empty() {
         return dynamic_paint::paint(
@@ -1927,20 +1944,29 @@ fn paint_canvas(
 mod dynamic_paint_frame_tests {
     use serde_json::json;
 
-    use super::canvas_paints_at;
+    use super::canvas_paint_frame;
+    use crate::error::Result;
 
-    #[test]
-    fn canvas_is_unpainted_before_frame_start_and_paints_inside_the_range() {
-        let canvas = json!({"canvas_surfaces": [{"frame_start": 5, "frame_end": 20}]});
-        assert!(!canvas_paints_at(&canvas, 4.0).unwrap());
-        assert!(canvas_paints_at(&canvas, 5.0).unwrap());
-        assert!(canvas_paints_at(&canvas, 20.0).unwrap());
+    /// The paint frame, as an exact integer-valued frame, for comparisons without float equality.
+    fn paint_frame_in_tenths(canvas: &serde_json::Value, frame: f64) -> Result<Option<i64>> {
+        Ok(canvas_paint_frame(canvas, frame)?.map(|paint| (paint * 10.0).round() as i64))
     }
 
     #[test]
-    fn frame_after_frame_end_is_refused_not_painted_from_live_brushes() {
+    fn canvas_is_unpainted_before_frame_start_and_paints_at_the_frame_inside_the_range()
+    -> Result<()> {
+        let canvas = json!({"canvas_surfaces": [{"frame_start": 5, "frame_end": 20}]});
+        assert_eq!(paint_frame_in_tenths(&canvas, 4.0)?, None);
+        assert_eq!(paint_frame_in_tenths(&canvas, 5.0)?, Some(50));
+        assert_eq!(paint_frame_in_tenths(&canvas, 20.0)?, Some(200));
+        Ok(())
+    }
+
+    #[test]
+    fn frame_after_frame_end_paints_at_frame_end_as_blender_holds_its_end_state() -> Result<()> {
         let canvas = json!({"canvas_surfaces": [{"frame_start": 1, "frame_end": 20}]});
-        let error = canvas_paints_at(&canvas, 21.0).unwrap_err();
-        assert!(error.to_string().contains("frame_end"), "{error}");
+        assert_eq!(paint_frame_in_tenths(&canvas, 21.0)?, Some(200));
+        assert_eq!(paint_frame_in_tenths(&canvas, 300.0)?, Some(200));
+        Ok(())
     }
 }

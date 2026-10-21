@@ -1809,17 +1809,10 @@ pub fn feature_catalog() -> Value {
         ),
         unsupported(
             "physics.dynamic_paint_surface.frame_start",
-            "Dynamic paint surfaces before their frame range",
+            "Dynamic paint surfaces outside their frame range",
             "DynamicPaintSurface",
             &[],
-            "A frame before a surface's frame_start leaves the canvas unpainted, as Blender does; Blender does not evaluate the surface there.",
-        ),
-        unsupported(
-            "physics.dynamic_paint_surface.frame_end",
-            "Dynamic paint surfaces after their frame range",
-            "DynamicPaintSurface",
-            &[],
-            "A frame after a surface's frame_end is refused with physics.dynamic_paint_surface.frame_end. Blender holds the surface's last state there, which Potter does not keep.",
+            "A frame before a surface's frame_start leaves the canvas unpainted, as Blender does; a frame after frame_end paints with the brushes at frame_end, which is Blender's held end state.",
         ),
         unsupported(
             "physics.point_cache.is_baked",

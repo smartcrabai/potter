@@ -11,7 +11,7 @@ use crate::{
     geom::{
         Edge, Face, Mesh, Vertex, edge_key,
         vdb::{VdbGrid, VdbValue, VdbVolume},
-        volume::{VolumeData, VolumeGrid, VolumeSource},
+        volume::{VolumeData, VolumeGeneratedSource, VolumeGrid, VolumeSource},
     },
     sim::ParticleState,
 };
@@ -537,16 +537,25 @@ pub(crate) fn displace_volume(
     };
     let mut texture = VolumeDisplacement::new(params, texture, rng, strength, texture_mapping)?;
     match &volume.source {
-        VolumeSource::Generated(_) => {
+        VolumeSource::Generated(source) => {
             let mut displaced = volume.clone();
             if displaced.grids.is_empty() {
                 return Err(invalid(
                     "volume displacement requires at least one scalar grid",
                 ));
             }
-            for grid in &mut displaced.grids {
-                displace_inline_grid(grid, &mut texture)?;
+            // The output's active bounds are those of its first grid, which Volume to Mesh reads.
+            let mut active_bounds = None;
+            for (index, grid) in displaced.grids.iter_mut().enumerate() {
+                let bounds = displace_inline_grid(grid, &mut texture, source.active_bounds)?;
+                if index == 0 {
+                    active_bounds = bounds;
+                }
             }
+            displaced.source = VolumeSource::Generated(VolumeGeneratedSource {
+                algorithm: source.algorithm.clone(),
+                active_bounds,
+            });
             Ok(displaced)
         }
         VolumeSource::File(source) if source.format == "vdb" => {
@@ -658,7 +667,13 @@ impl<'a> VolumeDisplacement<'a> {
     }
 }
 
-fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<'_>) -> Result<()> {
+/// Displaces one inline grid. `source_active` is the inclusive index box of the grid's active voxels
+/// (`None`: all voxels). Returns the output's active box, inclusive.
+fn displace_inline_grid(
+    grid: &mut VolumeGrid,
+    texture: &mut VolumeDisplacement<'_>,
+    source_active: Option<([i64; 3], [i64; 3])>,
+) -> Result<Option<([i64; 3], [i64; 3])>> {
     if let Some(blob) = &grid.blob_f32 {
         if grid.values.is_some() {
             return Err(invalid(
@@ -786,6 +801,17 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<
             }
         }
     }
+    // Blender dilates the active voxels by the same rounds as the padding (`dilateActiveValues` with
+    // `NN_FACE_EDGE`, `rounds` = the dilation radius), so the dilated box grows by one padding on the low
+    // side and two on the high side, once the output's padding offset is added to the source indices.
+    let output_active = source_active.map(|(low, high)| {
+        let pad = padding as i64;
+        let last = output_dims.map(|dimension| dimension as i64 - 1);
+        (
+            std::array::from_fn(|axis| low[axis].clamp(0, last[axis])),
+            std::array::from_fn(|axis| (high[axis] + 2 * pad).clamp(0, last[axis])),
+        )
+    });
     grid.dims = [
         u32::try_from(output_dims[0]).map_err(|_| limit("volume grid dimension exceeds limits"))?,
         u32::try_from(output_dims[1]).map_err(|_| limit("volume grid dimension exceeds limits"))?,
@@ -795,7 +821,7 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<
     grid.index_to_local = output_transform.map(|matrix| matrix.to_cols_array());
     grid.values = Some(output);
     grid.blob_f32 = None;
-    Ok(())
+    Ok(output_active)
 }
 
 /// Blender's `MOD_volume_displace.cc` displaces every grid of the volume with the same texture

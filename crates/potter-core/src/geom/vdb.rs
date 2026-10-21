@@ -2087,6 +2087,7 @@ mod blosc_tests {
 }
 #[cfg(test)]
 mod sampling_tests {
+    #![expect(clippy::unwrap_used, reason = "small deterministic sampling fixtures")]
     use super::*;
 
     #[test]
