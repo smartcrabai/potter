@@ -25,6 +25,7 @@ sha2.workspace = true
 uuid.workspace = true
 
 [build-dependencies]
+cc = "=1.8.0"
 sha2.workspace = true
 
 [dev-dependencies]

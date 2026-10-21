@@ -15,6 +15,7 @@ use potter_core::{
 use serde_json::{Map, Value, json};
 
 const WELD_FIXTURE: &str = include_str!("fixtures/construction_p/weld/weld.json");
+const SUBJECT_NAME: &str = "ConstructionSubject";
 
 fn color_row(value: &Value) -> Vec<f64> {
     value.as_array().unwrap().iter().map(number).collect()
@@ -547,6 +548,7 @@ fn weld_matches_blender_522_selection_topology_and_attributes() {
                 &[modifier],
                 &Registry::<NodeGroup>::new(),
                 1.0,
+                SUBJECT_NAME,
                 Some(variant["material_slots"].as_u64().expect("material slots") as usize),
             )
             .expect("Weld evaluation succeeds");

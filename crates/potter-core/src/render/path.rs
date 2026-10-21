@@ -3048,6 +3048,24 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
         .collect()
 }
 
+/// The bounds of the index box `[low, high]` through an affine index-to-local matrix: the box of its eight corners. An
+/// affine transform of an axis-aligned box is a box only up to its corners, so the bounds take the extremes of all eight.
+fn index_box_bounds(index_to_local: DMat4, low: DVec3, high: DVec3) -> (DVec3, DVec3) {
+    let mut minimum = DVec3::splat(f64::INFINITY);
+    let mut maximum = DVec3::splat(f64::NEG_INFINITY);
+    for corner in 0..8 {
+        let index = DVec3::new(
+            if corner & 1 == 0 { low.x } else { high.x },
+            if corner & 2 == 0 { low.y } else { high.y },
+            if corner & 4 == 0 { low.z } else { high.z },
+        );
+        let point = index_to_local.transform_point3(index);
+        minimum = minimum.min(point);
+        maximum = maximum.max(point);
+    }
+    (minimum, maximum)
+}
+
 fn collect_volumes<'a>(
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
@@ -3096,10 +3114,12 @@ fn collect_volumes<'a>(
                 let Some(grid) = volume.grids.first() else {
                     continue;
                 };
-                let bounds_max = DVec3::from_array(
+                let index_to_local = grid.checked_index_to_local_matrix()?;
+                let last = DVec3::from_array(
                     grid.dims
-                        .map(|dimension| f64::from(dimension.saturating_sub(1)) * grid.voxel_size),
-                ) + grid.origin;
+                        .map(|dimension| f64::from(dimension.saturating_sub(1))),
+                );
+                let (bounds_min, bounds_max) = index_box_bounds(index_to_local, DVec3::ZERO, last);
                 let density_range = grid.values.as_ref().and_then(|values| {
                     let mut values = values.iter().copied();
                     let first = values.next()?;
@@ -3117,7 +3137,7 @@ fn collect_volumes<'a>(
                     }
                     Some((f64::from(minimum), f64::from(maximum)))
                 });
-                (grid.origin, bounds_max, grid.voxel_size, density_range)
+                (bounds_min, bounds_max, grid.voxel_size, density_range)
             };
         let material = snapshot
             .slot_material(node_id, node, Some(data_block), 0)
@@ -3222,8 +3242,20 @@ fn collect_volumes<'a>(
             };
             bounds
         } else {
-            let pad = DVec3::splat(pad_voxels * voxel_size);
-            (bounds_min - pad, bounds_max + pad)
+            let Some(grid) = volume.grids.first() else {
+                continue;
+            };
+            // The index box, padded per axis, then transformed by the grid's index-to-local matrix (affine grids
+            // included), as the sampler reads it.
+            let last = DVec3::from_array(
+                grid.dims
+                    .map(|dimension| f64::from(dimension.saturating_sub(1))),
+            );
+            index_box_bounds(
+                grid.checked_index_to_local_matrix()?,
+                DVec3::splat(-pad_voxels),
+                last + DVec3::splat(pad_voxels),
+            )
         };
         volumes.push(VolumeInstance {
             volume,

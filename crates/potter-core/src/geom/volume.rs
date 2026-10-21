@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use glam::DVec3;
+use glam::{DMat4, DVec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -84,10 +84,14 @@ impl Default for VolumeSource {
 pub struct VolumeGrid {
     /// Sample dimensions along x, y, and z.
     pub dims: [u32; 3],
-    /// Uniform spacing between neighboring samples.
+    /// Legacy uniform spacing; affine grids store their maximum voxel side here.
     pub voxel_size: f64,
-    /// Volume-local position of sample `[0, 0, 0]`.
+    /// Volume-local position of sample `[0, 0, 0]`, used when `index_to_local` is absent.
     pub origin: DVec3,
+    /// Optional column-major 4x4 matrix mapping grid index coordinates to volume-local space.
+    /// When absent, the legacy `origin + voxel_size * index` transform is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_to_local: Option<[f64; 16]>,
     /// Optional inline f32 samples, laid out with x as the fastest-changing axis.
     pub values: Option<Vec<f32>>,
     /// Optional little-endian f32 byte blob with the same sample layout.
@@ -97,12 +101,87 @@ pub struct VolumeGrid {
     pub content_ref: Option<String>,
 }
 
+impl VolumeGrid {
+    pub(crate) fn checked_index_to_local_matrix(&self) -> Result<DMat4> {
+        let Some(columns) = self.index_to_local else {
+            return Ok(DMat4::from_translation(self.origin)
+                * DMat4::from_scale(DVec3::splat(self.voxel_size)));
+        };
+        let matrix = DMat4::from_cols_array(&columns);
+        #[expect(
+            clippy::float_cmp,
+            reason = "affine matrices carry an exact 1.0 homogeneous corner"
+        )]
+        let is_affine = matrix.x_axis.w == 0.0
+            && matrix.y_axis.w == 0.0
+            && matrix.z_axis.w == 0.0
+            && matrix.w_axis.w == 1.0;
+        let determinant = matrix.determinant();
+        if !matrix.is_finite()
+            || !is_affine
+            || !determinant.is_finite()
+            || determinant == 0.0
+            || !matrix.inverse().is_finite()
+        {
+            return Err(invalid_volume(
+                "volume grid index_to_local must be a finite, invertible affine matrix",
+            ));
+        }
+        Ok(matrix)
+    }
+
+    pub(crate) fn local_bounds(
+        &self,
+        minimum_index: DVec3,
+        maximum_index: DVec3,
+    ) -> Result<(DVec3, DVec3)> {
+        if !minimum_index.is_finite()
+            || !maximum_index.is_finite()
+            || minimum_index.cmpgt(maximum_index).any()
+        {
+            return Err(invalid_volume("volume grid index bounds are invalid"));
+        }
+        let index_to_local = self.checked_index_to_local_matrix()?;
+        let mut minimum = DVec3::splat(f64::INFINITY);
+        let mut maximum = DVec3::splat(f64::NEG_INFINITY);
+        for corner in 0..8 {
+            let index = DVec3::new(
+                if corner & 1 == 0 {
+                    minimum_index.x
+                } else {
+                    maximum_index.x
+                },
+                if corner & 2 == 0 {
+                    minimum_index.y
+                } else {
+                    maximum_index.y
+                },
+                if corner & 4 == 0 {
+                    minimum_index.z
+                } else {
+                    maximum_index.z
+                },
+            );
+            let local = index_to_local.transform_point3(index);
+            if !local.is_finite() {
+                return Err(invalid_volume(
+                    "volume grid transform produces non-finite positions",
+                ));
+            }
+            minimum = minimum.min(local);
+            maximum = maximum.max(local);
+        }
+        Ok((minimum, maximum))
+    }
+}
+
 impl Default for VolumeGrid {
     fn default() -> Self {
         Self {
             dims: [1, 1, 1],
             voxel_size: 1.0,
             origin: DVec3::ZERO,
+            index_to_local: None,
             values: Some(vec![0.0]),
             blob_f32: None,
             content_ref: None,
@@ -180,9 +259,9 @@ pub fn validate_data(volume: &VolumeData) -> Result<()> {
 
 /// Sample the first grid using deterministic trilinear interpolation.
 ///
-/// Positions are volume-local world coordinates. Inline grids use their stored origin and
-/// voxel size; decoded VDB grids apply their own index-to-world transform. Since this
-/// convenience API cannot return an error, malformed data or unresolved resources return `NaN`;
+/// Positions are volume-local world coordinates. Inline grids use `index_to_local` when present,
+/// otherwise their stored origin and voxel size; decoded VDB grids apply their own index transform.
+/// This convenience API cannot return an error, so malformed data or unresolved resources return `NaN`;
 /// use [`sample_density_checked`] when the caller needs a typed error.
 #[must_use]
 pub fn sample_density(position: DVec3, volume: &VolumeData) -> f64 {
@@ -226,7 +305,10 @@ pub fn sample_density_checked_with(
     let grid = first_grid(volume)?;
     let values = validate_grid(grid)?;
 
-    let coordinate = (position - grid.origin) / grid.voxel_size;
+    let coordinate = grid
+        .checked_index_to_local_matrix()?
+        .inverse()
+        .transform_point3(position);
     if !coordinate.is_finite() {
         return Ok(0.0);
     }
@@ -366,13 +448,7 @@ pub fn volume_to_mesh(volume: &VolumeData, iso_level: f64) -> Result<Mesh> {
     if cell_count > MAX_GRID_CELLS {
         return Err(resource_error());
     }
-    let last_position = grid.origin
-        + grid.voxel_size * DVec3::new((nx - 1) as f64, (ny - 1) as f64, (nz - 1) as f64);
-    if !last_position.is_finite() {
-        return Err(invalid_volume(
-            "grid transform produces non-finite positions",
-        ));
-    }
+    let index_to_local = grid.checked_index_to_local_matrix()?;
 
     let mut positions = Vec::new();
     let mut faces: Vec<[usize; 3]> = Vec::new();
@@ -381,8 +457,8 @@ pub fn volume_to_mesh(volume: &VolumeData, iso_level: f64) -> Result<Mesh> {
         for y in 0..ny - 1 {
             for x in 0..nx - 1 {
                 let cube_nodes = cube_nodes(x, y, z, nx, ny);
-                let cube_positions = cube_nodes
-                    .map(|node| node_position(node, nx, ny, grid.origin, grid.voxel_size));
+                let cube_positions =
+                    cube_nodes.map(|node| node_position(node, nx, ny, grid, index_to_local));
                 let mut cube_values = [0.0_f32; 8];
                 for (corner, node) in cube_nodes.iter().copied().enumerate() {
                     cube_values[corner] = values
@@ -786,6 +862,7 @@ pub fn mesh_to_volume(mesh: &Mesh, voxel_size: f64, padding: u32) -> Result<Volu
             ],
             voxel_size,
             origin,
+            index_to_local: None,
             values: Some(values),
             blob_f32: None,
             content_ref: None,
@@ -888,6 +965,7 @@ pub fn mesh_to_fog_volume(
             ],
             voxel_size,
             origin,
+            index_to_local: None,
             values: Some(values),
             blob_f32: None,
             content_ref: None,
@@ -931,6 +1009,17 @@ fn first_grid(volume: &VolumeData) -> Result<&VolumeGrid> {
 }
 
 fn validate_grid(grid: &VolumeGrid) -> Result<GridSamples<'_>> {
+    let samples = validate_grid_samples(grid)?;
+    let maximum_index = DVec3::new(
+        f64::from(grid.dims[0] - 1),
+        f64::from(grid.dims[1] - 1),
+        f64::from(grid.dims[2] - 1),
+    );
+    grid.local_bounds(DVec3::ZERO, maximum_index)?;
+    Ok(samples)
+}
+
+fn validate_grid_samples(grid: &VolumeGrid) -> Result<GridSamples<'_>> {
     if grid.dims.contains(&0) {
         return Err(invalid_volume("volume grid dimensions must be positive"));
     }
@@ -999,18 +1088,6 @@ fn validate_grid(grid: &VolumeGrid) -> Result<GridSamples<'_>> {
             return Err(invalid_volume("volume samples must be finite"));
         }
     }
-    let maximum = grid.origin
-        + grid.voxel_size
-            * DVec3::new(
-                f64::from(grid.dims[0] - 1),
-                f64::from(grid.dims[1] - 1),
-                f64::from(grid.dims[2] - 1),
-            );
-    if !maximum.is_finite() {
-        return Err(invalid_volume(
-            "volume grid transform produces non-finite positions",
-        ));
-    }
     Ok(samples)
 }
 
@@ -1030,11 +1107,22 @@ fn cube_nodes(x: usize, y: usize, z: usize, nx: usize, ny: usize) -> [usize; 8] 
     ]
 }
 
-fn node_position(node: usize, nx: usize, ny: usize, origin: DVec3, voxel_size: f64) -> DVec3 {
+fn node_position(
+    node: usize,
+    nx: usize,
+    ny: usize,
+    grid: &VolumeGrid,
+    index_to_local: DMat4,
+) -> DVec3 {
     let x = node % nx;
     let y = (node / nx) % ny;
     let z = node / (nx * ny);
-    origin + voxel_size * DVec3::new(x as f64, y as f64, z as f64)
+    let index = DVec3::new(x as f64, y as f64, z as f64);
+    if grid.index_to_local.is_some() {
+        index_to_local.transform_point3(index)
+    } else {
+        grid.origin + grid.voxel_size * index
+    }
 }
 
 fn crossing_vertex(
@@ -1257,6 +1345,7 @@ mod tests {
                 dims: [2, 2, 2],
                 voxel_size: 1.0,
                 origin: DVec3::ZERO,
+                index_to_local: None,
                 values: Some(vec![0.0, 1.0, 2.0, 3.0, 3.0, 4.0, 5.0, 6.0]),
                 blob_f32: None,
                 content_ref: None,
@@ -1318,6 +1407,7 @@ mod tests {
                     dims: [2, 2, 2],
                     voxel_size: 1.0,
                     origin: DVec3::ZERO,
+                    index_to_local: None,
                     values: Some(vec![0.0, 1.0, 2.0, 3.0, 3.0, 4.0, 5.0, 6.0]),
                     blob_f32: None,
                     content_ref: None,
@@ -1394,6 +1484,7 @@ mod tests {
                 dims,
                 voxel_size: 1.0,
                 origin: DVec3::ZERO,
+                index_to_local: None,
                 values: Some(values),
                 blob_f32: None,
                 content_ref: None,
@@ -1425,6 +1516,7 @@ mod tests {
                 dims,
                 voxel_size: 1.0,
                 origin: DVec3::ZERO,
+                index_to_local: None,
                 values: Some(vec![1.0; 512]),
                 blob_f32: None,
                 content_ref: None,
@@ -1455,6 +1547,7 @@ mod tests {
                 dims: [8, 8, 8],
                 voxel_size: 1.0,
                 origin: DVec3::ZERO,
+                index_to_local: None,
                 values: Some(vec![1.0; 512]),
                 blob_f32: None,
                 content_ref: None,
