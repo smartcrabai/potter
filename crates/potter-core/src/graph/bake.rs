@@ -1056,7 +1056,27 @@ fn open_directory_at(parent: &File, name: &std::ffi::OsStr) -> std::io::Result<F
             "node-bake path component is a symlink or non-directory",
         ));
     }
-    cap_fs::open_dir_nofollow(&parent.try_clone()?, relative)
+    // cap-primitives opens directories with O_PATH on Linux when no read or write is requested,
+    // and fsync on an O_PATH descriptor fails with EBADF. Open a real O_RDONLY|O_DIRECTORY
+    // descriptor so the directory sync after each publish works; O_NOFOLLOW keeps the open
+    // symlink-safe, as cap-std's nofollow open did.
+    #[cfg(unix)]
+    {
+        let descriptor = rustix::fs::openat(
+            parent,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        Ok(File::from(descriptor))
+    }
+    #[cfg(not(unix))]
+    {
+        cap_fs::open_dir_nofollow(&parent.try_clone()?, relative)
+    }
 }
 
 fn directory_open_error(error: std::io::Error) -> PotError {

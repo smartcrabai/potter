@@ -219,6 +219,33 @@ fn blender_still_bake_positions() -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
     position_values(&sample["positions"])
 }
 
+/// A baked Field item stores its values as a hidden attribute on the baked Geometry item
+/// (`.bake_<node>_<item>`), so the domain and per-element data come from that attribute.
+fn baked_field_attribute(
+    doc: &Value,
+    resource_id: &str,
+    item: &str,
+) -> Result<(String, Vec<Value>), Box<dyn Error>> {
+    let frame = &doc["resources"][resource_id]["frames"][0]["values"];
+    let field = &frame[item];
+    if field["type"] != "field" {
+        return Err(std::io::Error::other("baked item is not a field").into());
+    }
+    let attribute_name = field["attribute_name"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("baked field attribute name is missing"))?;
+    let attribute = &frame["Item_0"]["mesh"]["attributes"][attribute_name];
+    let domain = attribute["domain"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("baked field domain is missing"))?
+        .to_owned();
+    let values = attribute["data"]
+        .as_array()
+        .ok_or_else(|| std::io::Error::other("baked field data is missing"))?
+        .clone();
+    Ok((domain, values))
+}
+
 fn blender_point_field_positions(phase: &str) -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
     let oracle: Value = serde_json::from_str(include_str!("fixtures/node_bake/expected.json"))?;
     let scenario = oracle["scenarios"]
@@ -1014,13 +1041,9 @@ fn point_field_bake_matches_blender_and_survives_modifier_input_changes()
         doc["nodes"]["body"]["modifiers"][0]["params"]["bakes"]["bake"]["resource_id"]
             .as_str()
             .ok_or_else(|| std::io::Error::other("point-field cache resource ID is missing"))?;
-    let field = &doc["resources"][resource_id]["frames"][0]["values"]["Item_1"];
-    assert_eq!(field["type"], "field");
-    assert_eq!(field["domain"], "POINT");
-    assert_eq!(
-        field["values"].as_array().map(|values| values.len()),
-        Some(8)
-    );
+    let (domain, values) = baked_field_attribute(&doc, resource_id, "Item_1")?;
+    assert_eq!(domain, "POINT");
+    assert_eq!(values.len(), 8);
 
     set_modifier_shift(&project, &batch_file, 100.0)?;
     let reopened = inspect(&project, 1.0)?;
@@ -1061,9 +1084,8 @@ fn baked_attribute_field_matches_blender_and_survives_input_changes() -> Result<
         doc["nodes"]["body"]["modifiers"][0]["params"]["bakes"]["bake"]["resource_id"]
             .as_str()
             .ok_or_else(|| std::io::Error::other("attribute-field cache resource ID is missing"))?;
-    let values = doc["resources"][resource_id]["frames"][0]["values"]["Item_1"]["values"]
-        .as_array()
-        .ok_or_else(|| std::io::Error::other("attribute-field cache values are missing"))?;
+    let (domain, values) = baked_field_attribute(&doc, resource_id, "Item_1")?;
+    assert_eq!(domain, "POINT");
     let mut actual_values = values
         .iter()
         .map(|value| {
