@@ -1551,10 +1551,11 @@ impl<'a> Builder<'a> {
                 if first == second || !created.insert(output_key) {
                     continue;
                 }
+                // Blender's `BM_edge_create(bm, vclosest, votherclosest, e, ...)` (bmesh_bevel.cc:7389)
+                // copies the wire edge's attributes and flags onto the new edge.
                 let (sharp, seam) = self.front.input_edge_flags_between(a, b);
-                if sharp || seam {
-                    self.emission.record_edge_flags(first, second, sharp, seam);
-                }
+                let source = self.front.input_edge_id(a, b);
+                self.emission.set_edge_state(first, second, sharp, seam, source);
                 self.loose.push([first, second]);
             }
         }
