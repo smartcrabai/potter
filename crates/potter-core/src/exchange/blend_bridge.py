@@ -5217,17 +5217,6 @@ def _canonical_nla(doc, node, source_tracks):
     return result
 
 
-def _is_simple_principled_tree(tree_source):
-    nodes = (tree_source or {}).get("nodes", []) or []
-    types = [item.get("type") for item in nodes]
-    links = (tree_source or {}).get("links", []) or []
-    has_principled = "ShaderNodeBsdfPrincipled" in types
-    has_output = any(kind in ("OutputMaterial", "ShaderNodeOutputMaterial")
-                     for kind in types)
-    return (has_principled and has_output and links
-            and all(link.get("from_socket") == "BSDF"
-                    and link.get("to_socket") == "Surface" for link in links))
-
 
 def _set_object_solver_inverse(owner, constraint, owner_type, pose_bone=None,
                                inverse_frame=None):
@@ -6515,8 +6504,15 @@ def _clip_cutoff(material):
 
 
 def _set_principled_values(material, item):
+    """Writes the Material's values into the Principled BSDF that Potter generated, and no other node.
+
+    The exporter marks the generated Principled node (`_mark_generated_field_graph`). A tree without that marker is
+    an authored graph, whose Principled inputs are its own, so nothing is written to it.
+    """
+    if material.node_tree is None:
+        return
     shader = next((node for node in material.node_tree.nodes
-                   if node.type == "BSDF_PRINCIPLED"), None)
+                   if node.type == "BSDF_PRINCIPLED" and node.get("potter_simple_material") is True), None)
     if shader is None:
         return
     shader.inputs["Base Color"].default_value = item["base_color"]
@@ -7563,10 +7559,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         if tree_source:
             _restore_node_tree(material.node_tree, tree_source, id_lookup,
                                "Material shader tree %s" % material.name)
-            if (_is_simple_principled_tree(tree_source)
-                    or any(node.get("properties", {}).get("potter_simple_material") is True
-                           for node in tree_source.get("nodes", []))):
-                _set_principled_values(material, item)
+            _set_principled_values(material, item)
         if item.get("owns_shader_graph") is True:
             _restore_material_field_nodes(material, item)
     for world_id, item in doc.get("worlds", {}).items():
