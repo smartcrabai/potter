@@ -614,7 +614,14 @@ impl<'a> VolumeDisplacement<'a> {
         })
     }
 
-    fn displacement_at(&mut self, local_position: DVec3) -> Result<DVec3> {
+    /// Blender's `DisplaceOp::compute_displace_vector` (`MOD_volume_displace.cc`): the texture is
+    /// evaluated at the single-precision position, and the displacement `(texture - mid) * scale`,
+    /// with `scale = strength / max_voxel_side` as a float, is in index units.
+    fn index_displacement_at(
+        &mut self,
+        local_position: DVec3,
+        max_voxel_side: f64,
+    ) -> Result<DVec3> {
         let texture_position = match self.mapping_mode {
             VolumeTextureMapMode::Local => local_position,
             VolumeTextureMapMode::Global => self.mapping.global_coordinate(local_position),
@@ -623,8 +630,10 @@ impl<'a> VolumeDisplacement<'a> {
         if !texture_position.is_finite() {
             return Err(invalid("volume texture coordinates are not finite"));
         }
+        let texture_position = texture_position.map(|component| f64::from(component as f32));
         let sample = crate::geom::legacy_texture::sample(self.texture, texture_position, self.rng)?;
-        Ok((DVec3::from_array(sample.rgb) - DVec3::from_array(self.mid_level)) * self.strength)
+        let scale = f64::from((self.strength as f32) / (max_voxel_side as f32));
+        Ok((DVec3::from_array(sample.rgb) - DVec3::from_array(self.mid_level)) * scale)
     }
 }
 
@@ -723,22 +732,17 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<
                     || output_origin + voxel_size * output_index,
                     |matrix| matrix.transform_point3(output_index),
                 );
-                let source_coordinate = if output_transform.is_some() {
-                    let displacement = texture.displacement_at(local_position)?;
-                    (output_index - DVec3::splat(padding as f64) - displacement / grid.voxel_size)
-                        .to_array()
-                } else {
-                    let displacement = texture.displacement_at(local_position)?;
-                    let source_position = local_position - displacement;
-                    (source_position - original_origin)
-                        .to_array()
-                        .map(|value| value / grid.voxel_size)
-                };
+                // The output keeps the source grid shifted by the padding in both branches, so the
+                // source index is the output index minus the padding, less the index displacement.
+                let index_displacement =
+                    texture.index_displacement_at(local_position, grid.voxel_size)?;
+                let source_coordinate =
+                    output_index - DVec3::splat(padding as f64) - index_displacement;
                 let value = sample_volume_grid(&original, source_dims, source_coordinate);
-                if !value.is_finite() || value > f64::from(f32::MAX) {
+                if !value.is_finite() {
                     return Err(invalid("volume displacement produced a non-finite sample"));
                 }
-                output.push(value.max(0.0) as f32);
+                output.push(value);
             }
         }
     }
@@ -821,13 +825,13 @@ fn displace_vdb_grid(grid: &VdbGrid, texture: &mut VolumeDisplacement<'_>) -> Re
     for point in domain {
         let index = DVec3::new(f64::from(point.x), f64::from(point.y), f64::from(point.z));
         let object_position = grid.transform.index_to_world.transform_point3(index);
-        let source = index - texture.displacement_at(object_position)? / max_voxel_side;
+        let source = index - texture.index_displacement_at(object_position, max_voxel_side)?;
         let value = if vector {
             VdbValue::Vec3(std::array::from_fn(|component| {
-                grid.sample_index_component_trilinear(source, component) as f32
+                grid.sample_index_component_box(source, component)
             }))
         } else {
-            VdbValue::Float(grid.sample_index_component_trilinear(source, 0) as f32)
+            VdbValue::Float(grid.sample_index_component_box(source, 0))
         };
         values.insert(point, value);
     }
@@ -947,77 +951,30 @@ fn append_instances(mesh: &Mesh, transforms: &[(DMat4, DVec3)]) -> Result<Mesh> 
     Ok(output)
 }
 
-fn sample_volume_grid(samples: &[f32], dims: [usize; 3], coordinate: [f64; 3]) -> f64 {
-    if coordinate.iter().any(|value| !value.is_finite())
-        || (0..3).any(|axis| {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "volume grid dimensions are bounded to 512 samples per axis"
-            )]
-            let maximum = dims[axis] as f64;
-            coordinate[axis] < -1.0 || coordinate[axis] > maximum
-        })
-    {
+/// Box-samples a dense inline grid at an index-space position, as Blender's `BoxSampler` does on the
+/// grid (`openvdb/tools/Interpolation.h`), with the background 0 outside the samples.
+fn sample_volume_grid(samples: &[f32], dims: [usize; 3], coordinate: DVec3) -> f32 {
+    if !coordinate.is_finite() {
         return 0.0;
     }
-    let lower: [i64; 3] = coordinate.map(|value| {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "bounded finite coordinates are floored to integer voxel indices"
-        )]
-        {
-            value.floor() as i64
-        }
-    });
-    let fraction = std::array::from_fn::<_, 3, _>(|axis| {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "voxel indices are bounded to the 512-sample grid limit"
-        )]
-        let lower = lower[axis] as f64;
-        coordinate[axis] - lower
-    });
-    let sample = |point: [i64; 3]| {
-        if (0..3).any(|axis| {
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "volume dimensions originate as u32 and fit in i64"
-            )]
-            let dimension = dims[axis] as i64;
-            point[axis] < 0 || point[axis] >= dimension
-        }) {
-            return 0.0;
-        }
-        let [Ok(x), Ok(y), Ok(z)] = point.map(usize::try_from) else {
-            return 0.0;
-        };
-        f64::from(samples[(z * dims[1] + y) * dims[0] + x])
-    };
-    let lerp = |first: f64, second: f64, amount: f64| first + (second - first) * amount;
-    let x00 = lerp(
-        sample(lower),
-        sample([lower[0] + 1, lower[1], lower[2]]),
-        fraction[0],
-    );
-    let x10 = lerp(
-        sample([lower[0], lower[1] + 1, lower[2]]),
-        sample([lower[0] + 1, lower[1] + 1, lower[2]]),
-        fraction[0],
-    );
-    let x01 = lerp(
-        sample([lower[0], lower[1], lower[2] + 1]),
-        sample([lower[0] + 1, lower[1], lower[2] + 1]),
-        fraction[0],
-    );
-    let x11 = lerp(
-        sample([lower[0], lower[1] + 1, lower[2] + 1]),
-        sample([lower[0] + 1, lower[1] + 1, lower[2] + 1]),
-        fraction[0],
-    );
-    lerp(
-        lerp(x00, x10, fraction[1]),
-        lerp(x01, x11, fraction[1]),
-        fraction[2],
+    crate::geom::vdb::box_sample_trilinear(
+        |point| {
+            if (0..3).any(|axis| {
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "volume dimensions originate as u32 and fit in i64"
+                )]
+                let dimension = dims[axis] as i64;
+                point[axis] < 0 || point[axis] >= dimension
+            }) {
+                return 0.0;
+            }
+            let [Ok(x), Ok(y), Ok(z)] = point.map(usize::try_from) else {
+                return 0.0;
+            };
+            samples[(z * dims[1] + y) * dims[0] + x]
+        },
+        coordinate,
     )
 }
 

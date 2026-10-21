@@ -427,7 +427,7 @@ fn volume_to_mesh_for_grid(
         ));
     }
     // Blender passes the threshold as a `float` (`volumeToMesh(..., const float threshold, ...)`), so
-    // OpenVDB's double isovalue is the single-precision value; the edge fractions use that value.
+    // `OpenVDB`'s double isovalue is the single-precision value; the edge fractions use that value.
     let iso_level = f64::from(iso_level as f32);
     let adaptivity = adaptivity as f32;
     if matches!(&volume.source, VolumeSource::File(_)) {
@@ -654,7 +654,7 @@ const CUBE_FACES: [([usize; 4], [usize; 4]); 6] = [
     ([0, 3, 7, 4], [3, 11, 7, 8]),
     ([1, 2, 6, 5], [1, 10, 5, 9]),
 ];
-// OpenVDB 13.0.0 VolumeToMesh::sAdaptable (Apache-2.0 source table).
+// `OpenVDB` 13.0.0 VolumeToMesh::sAdaptable (Apache-2.0 source table).
 const OPENVDB_ADAPTABLE: [u8; 256] = [
     1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
     1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 1,
@@ -755,7 +755,7 @@ fn dual_contour_grid_to_mesh(
                         ),
                         4 => {
                             // Saddle face: the pairing keeps corner 0's side apart from the other side
-                            // (OpenVDB's VolumeToMesh resolves the face by its inside). Inside is low for a
+                            // (`OpenVDB`'s VolumeToMesh resolves the face by its inside). Inside is low for a
                             // level set and high for a density grid, so a fog's high-density corners are
                             // separated, as Blender's 5.2.2 mesh does (`rotated_nonuniform` at 0.35: 112 points).
                             let corner_inside = if inside_is_low {
@@ -920,7 +920,7 @@ fn dual_contour_grid_to_mesh(
             }
         }
     }
-    // OpenVDB's volumeToMesh yields no faces for a field that does not cross the iso-level, and
+    // `OpenVDB`'s volumeToMesh yields no faces for a field that does not cross the iso-level, and
     // Blender's Volume to Mesh keeps that empty result rather than reporting an error.
     if faces.is_empty() {
         return Ok(Mesh::default());
@@ -1768,6 +1768,25 @@ pub fn mesh_to_fog_volume(
     interior_band_width: f64,
     density: f64,
 ) -> Result<VolumeData> {
+    let identity: [[f32; 4]; 4] = std::array::from_fn(|column| {
+        std::array::from_fn(|row| if column == row { 1.0 } else { 0.0 })
+    });
+    mesh_to_fog_volume_with_transform(mesh, &identity, voxel_size, interior_band_width, density)
+}
+
+/// Mesh to Volume fog for a mesh whose vertices are in object space, transformed into the volume
+/// space by `mesh_to_volume` (a column-major `float4x4` of Blender's operand-to-owner transform).
+///
+/// Blender builds the index-space transform as `from_scale(1 / voxel) * mesh_to_volume` and
+/// transforms each vertex with it in single precision (`mesh_to_volume.cc` `OpenVDBMeshAdapter`,
+/// `mesh_to_density_grid_impl`), so the vertices and every distance below use the same `f32` values.
+pub fn mesh_to_fog_volume_with_transform(
+    mesh: &Mesh,
+    mesh_to_volume: &[[f32; 4]; 4],
+    voxel_size: f64,
+    interior_band_width: f64,
+    density: f64,
+) -> Result<VolumeData> {
     if !voxel_size.is_finite()
         || !interior_band_width.is_finite()
         || interior_band_width < 0.0
@@ -1779,7 +1798,7 @@ pub fn mesh_to_fog_volume(
         ));
     }
     let voxel_size = voxel_size as f32;
-    // Blender creates no grid when the voxel cube is below OpenVDB's determinant tolerance
+    // Blender creates no grid when the voxel cube is below `OpenVDB`'s determinant tolerance
     // (`BKE_volume_voxel_size_valid`), leaving the empty volume.
     if !voxel_size.is_finite() || voxel_size <= 0.0 || f64::from(voxel_size).powi(3) < 3.0e-15 {
         return Ok(empty_fog_volume());
@@ -1789,12 +1808,11 @@ pub fn mesh_to_fog_volume(
     }
     let interior_band_width = interior_band_width as f32;
     let density = density as f32;
-    let (bounds_min, bounds_max, triangles) = fog_mesh_geometry(mesh, voxel_size)?;
-    let voxel_size_f64 = f64::from(voxel_size);
-    // Blender's grid is the union of OpenVDB leaves (8 voxels per axis) that hold active voxels, so
+    let (bounds_min, bounds_max, triangles) = fog_mesh_geometry(mesh, mesh_to_volume, voxel_size)?;
+    // Blender's grid is the union of `OpenVDB` leaves (8 voxels per axis) that hold active voxels, so
     // the index box is rounded out to whole leaves (`BKE_volume_grid_bounds`, evalLeafBoundingBox).
-    let band_minimum = (bounds_min / voxel_size_f64).floor() - DVec3::ONE;
-    let band_maximum = (bounds_max / voxel_size_f64).ceil() + DVec3::ONE;
+    let band_minimum = bounds_min.floor() - DVec3::ONE;
+    let band_maximum = bounds_max.ceil() + DVec3::ONE;
     let minimum_index = (band_minimum / 8.0).floor() * 8.0;
     let maximum_index = (band_maximum / 8.0).floor() * 8.0 + DVec3::splat(7.0);
     let dimensions_f64 = [
@@ -1851,14 +1869,14 @@ pub fn mesh_to_fog_volume(
                 let squared = band[linear_index];
                 primitives.push(band_primitives[linear_index]);
                 let signed = if squared.is_finite() {
-                    let unsigned = (squared as f32).sqrt() * voxel_size;
+                    let unsigned = squared.sqrt() * voxel_size;
                     if !unsigned.is_finite() {
                         return Err(resource_error());
                     }
                     active.push(true);
                     if inside { -unsigned } else { unsigned }
                 } else {
-                    // Voxels outside the narrow band keep OpenVDB's background: the exterior width
+                    // Voxels outside the narrow band keep `OpenVDB`'s background: the exterior width
                     // outside, and the interior width inside (`signedFloodFillWithValues`).
                     active.push(false);
                     if inside {
@@ -1871,7 +1889,7 @@ pub fn mesh_to_fog_volume(
             }
         }
     }
-    // OpenVDB expands the band only when the interior band is wider than two voxels
+    // `OpenVDB` expands the band only when the interior band is wider than two voxels
     // (`minBandWidth = 2 * voxelSize`; the exterior band is one voxel).
     if interior_distance > 2.0 * voxel_size {
         NarrowBand {
@@ -1965,8 +1983,8 @@ fn narrow_band_squared_distances(
     triangles: &TriangleBvh,
     origin: DVec3,
     dims: [usize; 3],
-) -> Result<(Vec<f64>, Vec<u32>)> {
-    const SPREAD_LIMIT_SQUARED: f64 = 0.75;
+) -> Result<(Vec<f32>, Vec<u32>)> {
+    const SPREAD_LIMIT_SQUARED: f32 = 0.75;
     let [nx, ny, _] = dims;
     let origin_coord = [origin.x as i64, origin.y as i64, origin.z as i64];
     let linear = |coord: [i64; 3]| -> Option<usize> {
@@ -1981,15 +1999,19 @@ fn narrow_band_squared_distances(
         Some((local[2] * ny + local[1]) * nx + local[0])
     };
     let sample_count = dims[0] * dims[1] * dims[2];
-    let mut squared = vec![f64::INFINITY; sample_count];
+    let mut squared = vec![f32::INFINITY; sample_count];
     let mut primitive = vec![u32::MAX; sample_count];
     let mut visited = vec![0_u32; sample_count];
     for (triangle_index, triangle) in triangles.triangles.iter().enumerate() {
         let mark = u32::try_from(triangle_index + 1).map_err(|_| resource_error())?;
         let prim = u32::try_from(triangle_index).map_err(|_| resource_error())?;
+        // Blender measures against `closestPointOnTriangleToPoint(prim.a, prim.c, prim.b, ...)`
+        // (`updateDistance`, MeshToVolume.h), and stores the squared distance as a `float`.
+        let [first, second, third] = triangle.points;
+        let triangle_order = [first, third, second];
         // Keeps the nearer triangle, and the smaller triangle index on an exact tie (`updateDistance`).
-        let record = |index: usize, distance: f64, squared: &mut [f64], primitive: &mut [u32]| {
-            // OpenVDB compares exactly (`isExactlyEqual`), so the tie test is on the bit pattern.
+        let record = |index: usize, distance: f32, squared: &mut [f32], primitive: &mut [u32]| {
+            // `OpenVDB` compares exactly (`isExactlyEqual`), so the tie test is on the bit pattern.
             if distance < squared[index]
                 || (distance.to_bits() == squared[index].to_bits() && prim < primitive[index])
             {
@@ -1999,13 +2021,13 @@ fn narrow_band_squared_distances(
         };
         let corner = triangle.points[0].floor();
         let seed = [corner.x as i64, corner.y as i64, corner.z as i64];
-        // OpenVDB stores the seed's distance and expands it whatever that distance is.
+        // `OpenVDB` stores the seed's distance and expands it whatever that distance is.
         if let Some(index) = linear(seed) {
             visited[index] = mark;
             let distance = point_triangle_distance_squared(
                 DVec3::new(seed[0] as f64, seed[1] as f64, seed[2] as f64),
-                triangle.points,
-            );
+                triangle_order,
+            ) as f32;
             record(index, distance, &mut squared, &mut primitive);
         }
         let mut pending = vec![seed];
@@ -2030,8 +2052,8 @@ fn narrow_band_squared_distances(
                                 neighbour[1] as f64,
                                 neighbour[2] as f64,
                             ),
-                            triangle.points,
-                        );
+                            triangle_order,
+                        ) as f32;
                         record(index, distance, &mut squared, &mut primitive);
                         if distance <= SPREAD_LIMIT_SQUARED {
                             pending.push(neighbour);
@@ -2275,6 +2297,8 @@ fn renormalize_signed_distances(
     }
     // A voxel on the grid boundary has no neighbours to step from, so it keeps its offset value.
     let mut renormalized = offset_values.clone();
+    // Blender's `invDx = ValueType(1.0) / mVoxelSize` (`Renormalize`, MeshToVolume.h).
+    let inverse_voxel = 1.0_f32 / voxel_size;
     for z in 1..nz - 1 {
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
@@ -2294,8 +2318,8 @@ fn renormalize_signed_distances(
                     phi - offset_values[index - plane_stride],
                 ];
                 let norm_squared = godunov_norm_squared(phi > 0.0, down, up);
-                let norm = norm_squared.sqrt();
-                let difference = norm / voxel_size - 1.0;
+                // `math::Sqrt(normSqGradPhi) * invDx - ValueType(1.0)`, then `S = phi0 / sqrt(phi0^2 + norm)`.
+                let difference = norm_squared.sqrt() * inverse_voxel - 1.0;
                 let sign = phi / (phi * phi + norm_squared).sqrt();
                 renormalized[index] = phi - voxel_size * sign * difference;
             }
@@ -2305,8 +2329,10 @@ fn renormalize_signed_distances(
         if !active[index] {
             continue;
         }
+        // `MinCombine`, then `OffsetValues(offset - epsilon)`: the offset is formed first, as Blender does.
         let shifted = *value - offset;
-        *value = shifted.min(renormalized[index]) + offset - epsilon;
+        let restore = offset - epsilon;
+        *value = shifted.min(renormalized[index]) + restore;
         // InactivateValues: a band value past either width is background.
         if *value < 0.0 {
             if *value <= -interior_distance {
@@ -2459,7 +2485,13 @@ fn ray_intersects_bounds(origin: DVec3, direction: DVec3, minimum: DVec3, maximu
     far > 0.0
 }
 
-fn fog_mesh_geometry(mesh: &Mesh, voxel_size: f32) -> Result<(DVec3, DVec3, TriangleBvh)> {
+/// The index-space triangles of a fog mesh and their index-space bounds. Each vertex goes through
+/// Blender's single-precision index transform `from_scale(1 / voxel) * mesh_to_volume`.
+fn fog_mesh_geometry(
+    mesh: &Mesh,
+    mesh_to_volume: &[[f32; 4]; 4],
+    voxel_size: f32,
+) -> Result<(DVec3, DVec3, TriangleBvh)> {
     if mesh.vertices.len() > MAX_INPUT_VERTICES
         || mesh.faces.len() > MAX_INPUT_TRIANGLES
         || mesh.edges.len() > MAX_INPUT_TRIANGLES * 3
@@ -2468,9 +2500,11 @@ fn fog_mesh_geometry(mesh: &Mesh, voxel_size: f32) -> Result<(DVec3, DVec3, Tria
     }
     mesh.validate()
         .map_err(|error| invalid_mesh_input(&error))?;
-    let bounds = mesh
-        .bounds()
-        .ok_or_else(|| invalid_volume("mesh-to-volume requires non-empty mesh geometry"))?;
+    if mesh.bounds().is_none() {
+        return Err(invalid_volume(
+            "mesh-to-volume requires non-empty mesh geometry",
+        ));
+    }
     let corner_count = mesh
         .faces
         .iter()
@@ -2488,17 +2522,27 @@ fn fog_mesh_geometry(mesh: &Mesh, voxel_size: f32) -> Result<(DVec3, DVec3, Tria
     if triangles.is_empty() || triangles.len() > MAX_INPUT_TRIANGLES {
         return Err(resource_error());
     }
+    // Blender's `from_scale<float4x4>(float3(1.0f / voxel_size))` times the operand transform.
     let reciprocal = 1.0_f32 / voxel_size;
+    let scale: [[f32; 4]; 4] = std::array::from_fn(|column| {
+        std::array::from_fn(|row| match (column, row) {
+            (0..=2, _) if column == row => reciprocal,
+            (3, 3) => 1.0,
+            _ => 0.0,
+        })
+    });
+    let index_transform = crate::geom::blender_matrix::blender_mul_m4(&scale, mesh_to_volume);
+    let flat: [f32; 16] = std::array::from_fn(|index| index_transform[index / 4][index % 4]);
     let vertex_positions: HashMap<_, _> = mesh
         .vertices
         .iter()
         .map(|vertex| {
-            let index = DVec3::new(
-                f64::from(vertex.co.x as f32 * reciprocal),
-                f64::from(vertex.co.y as f32 * reciprocal),
-                f64::from(vertex.co.z as f32 * reciprocal),
-            );
-            (vertex.id, index)
+            let co = glam::Vec3::new(vertex.co.x as f32, vertex.co.y as f32, vertex.co.z as f32);
+            let index = crate::geom::blender_matrix::blender_transform_point_f32(&flat, co);
+            (
+                vertex.id,
+                DVec3::new(f64::from(index.x), f64::from(index.y), f64::from(index.z)),
+            )
         })
         .collect();
     let mut surface = Vec::with_capacity(triangles.len());
@@ -2515,8 +2559,12 @@ fn fog_mesh_geometry(mesh: &Mesh, voxel_size: f32) -> Result<(DVec3, DVec3, Tria
                 .ok_or_else(|| invalid_volume("mesh triangle references a missing vertex"))?,
         ]));
     }
-    let bounds_min = bounds.min.map(|component| f64::from(component as f32));
-    let bounds_max = bounds.max.map(|component| f64::from(component as f32));
+    let mut bounds_min = DVec3::splat(f64::INFINITY);
+    let mut bounds_max = DVec3::splat(f64::NEG_INFINITY);
+    for position in vertex_positions.values() {
+        bounds_min = bounds_min.min(*position);
+        bounds_max = bounds_max.max(*position);
+    }
     Ok((bounds_min, bounds_max, TriangleBvh::new(surface)?))
 }
 

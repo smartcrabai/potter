@@ -40,6 +40,28 @@ const BLOSC_MIN_ZSTD_WINDOW_BYTES: u64 = 1 << 20;
 static VDB_CACHE: LazyLock<Mutex<HashMap<String, Arc<VdbVolume>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// One lerp of `OpenVDB`'s `BoxSampler::trilinearInterpolation` (`openvdb/tools/Interpolation.h`):
+/// the `float` difference is multiplied by the `double` weight, the product is rounded to `float`,
+/// and it is added to the first value in `float`.
+pub(crate) fn box_sample_lerp(first: f32, second: f32, weight: f64) -> f32 {
+    let difference = second - first;
+    let step = (f64::from(difference) * weight) as f32;
+    first + step
+}
+
+/// `BoxSampler::sample` on a float grid: the eight voxels around `coordinate` are interpolated along
+/// z, then y, then x, in the order Blender's `OpenVDB` build uses. `value_at` gives each voxel's value.
+pub(crate) fn box_sample_trilinear(value_at: impl Fn([i64; 3]) -> f32, coordinate: DVec3) -> f32 {
+    let lower = coordinate.floor();
+    let fraction = coordinate - lower;
+    let base = lower.to_array().map(|value| value as i64);
+    let value = |dx: i64, dy: i64, dz: i64| value_at([base[0] + dx, base[1] + dy, base[2] + dz]);
+    let along_z =
+        |dx: i64, dy: i64| box_sample_lerp(value(dx, dy, 0), value(dx, dy, 1), fraction.z);
+    let along_y = |dx: i64| box_sample_lerp(along_z(dx, 0), along_z(dx, 1), fraction.y);
+    box_sample_lerp(along_y(0), along_y(1), fraction.x)
+}
+
 /// Scalar or three-component values stored by a VDB tree.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VdbValue {
@@ -215,29 +237,17 @@ impl VdbGrid {
             .component(component)
     }
 
-    /// Trilinearly sample one component at a fractional index position (`BoxSampler`), with the
-    /// background outside active data.
-    pub(crate) fn sample_index_component_trilinear(&self, index: DVec3, component: usize) -> f64 {
-        let lower = index.floor();
-        let fraction = index - lower;
-        let base = lower.to_array().map(|value| value as i32);
-        let mut result = 0.0_f64;
-        for z in 0..=1 {
-            for y in 0..=1 {
-                for x in 0..=1 {
-                    let weight = (if x == 0 { 1.0 - fraction.x } else { fraction.x })
-                        * (if y == 0 { 1.0 - fraction.y } else { fraction.y })
-                        * (if z == 0 { 1.0 - fraction.z } else { fraction.z });
-                    let point = IVec3::new(base[0] + x, base[1] + y, base[2] + z);
-                    let value = self
-                        .sample_value(point)
-                        .component(component)
-                        .map_or(0.0, f64::from);
-                    result += weight * value;
-                }
-            }
-        }
-        result
+    /// Box-sample one component of the grid at a fractional index position, with the background
+    /// outside active data, as Blender's `BoxSampler::sample` does on a float grid.
+    pub(crate) fn sample_index_component_box(&self, index: DVec3, component: usize) -> f32 {
+        box_sample_trilinear(
+            |point| {
+                self.sample_value(IVec3::from_array(point.map(|value| value as i32)))
+                    .component(component)
+                    .unwrap_or(0.0)
+            },
+            index,
+        )
     }
 
     /// Trilinearly sample the grid in world coordinates.
@@ -530,7 +540,7 @@ impl<'a> Parser<'a> {
                 active_bbox: parent.active_bbox,
             });
         }
-        // OpenVDB keeps grid descriptors in a name-keyed map, so `readAllGridMetadata` (which Blender
+        // `OpenVDB` keeps grid descriptors in a name-keyed map, so `readAllGridMetadata` (which Blender
         // loads through) yields grids in name order, not file order. Stable, so duplicate names keep
         // their file order.
         grids.sort_by(|first, second| first.name.cmp(&second.name));
@@ -605,7 +615,7 @@ impl<'a> Parser<'a> {
                 block_pos,
                 end_pos,
             });
-            // OpenVDB stores each descriptor adjacent to its grid data; the next
+            // `OpenVDB` stores each descriptor adjacent to its grid data; the next
             // descriptor begins at this grid's end offset.
             self.cursor.position = end_pos;
         }

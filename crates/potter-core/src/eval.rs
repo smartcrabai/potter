@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use glam::{DMat4, DQuat, DVec3, Mat4};
+use glam::{DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -1768,19 +1768,23 @@ impl Snapshot {
                                     json!({"modifier_id":modifier.id,"object":object_id}),
                                 )
                             })?;
-                        let owner_inverse = matrix.inverse();
-                        if !owner_inverse.is_finite() {
+                        // Blender's `ctx->object->world_to_object() * object_to_convert->object_to_world()`
+                        // in single precision (`MOD_mesh_to_volume.cc`).
+                        let owner_f32 =
+                            crate::geom::blender_matrix::blender_matrix_from_f64(matrix);
+                        let Some(owner_inverse_f32) =
+                            crate::geom::blender_matrix::blender_invert_m4(&owner_f32)
+                        else {
                             return Err(PotError::with_details(
                                 ErrorCode::InvalidArgument,
                                 "mesh-to-volume owner transform is singular",
                                 json!({"modifier_id":modifier.id,"owner":id}),
                             ));
-                        }
-                        let operand_to_owner = owner_inverse * operand_matrix;
-                        let mut transformed = (*operand_mesh).clone();
-                        for vertex in &mut transformed.vertices {
-                            vertex.co = operand_to_owner.transform_point3(vertex.co);
-                        }
+                        };
+                        let mesh_to_owner = crate::geom::blender_matrix::blender_mul_m4(
+                            &owner_inverse_f32,
+                            &crate::geom::blender_matrix::blender_matrix_from_f64(operand_matrix),
+                        );
                         // A parameter the modifier does not store takes its Blender default from the schema table.
                         let number = |parameter: &str| -> Result<f64> {
                             match modifier.params.get(parameter).and_then(Value::as_f64) {
@@ -1837,11 +1841,19 @@ impl Snapshot {
                                 // voxel size in single precision (`volume_compute_voxel_size`, float4x4 and
                                 // float3), then divides by max(1, amount) in single precision.
                                 (amount >= 1.0).then(|| {
-                                    let to_owner = Mat4::from_cols_array(
-                                        &operand_to_owner.to_cols_array().map(|value| value as f32),
-                                    );
-                                    let minimum = to_owner.transform_point3(bounds.min.as_vec3());
-                                    let maximum = to_owner.transform_point3(bounds.max.as_vec3());
+                                    let flat: [f32; 16] = std::array::from_fn(|index| {
+                                        mesh_to_owner[index / 4][index % 4]
+                                    });
+                                    let minimum =
+                                        crate::geom::blender_matrix::blender_transform_point_f32(
+                                            &flat,
+                                            bounds.min.as_vec3(),
+                                        );
+                                    let maximum =
+                                        crate::geom::blender_matrix::blender_transform_point_f32(
+                                            &flat,
+                                            bounds.max.as_vec3(),
+                                        );
                                     let diagonal = (maximum - minimum).length();
                                     f64::from(diagonal / (amount as f32).max(1.0))
                                 })
@@ -1855,12 +1867,14 @@ impl Snapshot {
                             }
                         };
                         if let Some(voxel_size) = voxel_size {
-                            generated = Some(crate::geom::volume::mesh_to_fog_volume(
-                                &transformed,
-                                voxel_size as f32 as f64,
-                                number("interior_band_width")?,
-                                number("density")?,
-                            )?);
+                            generated =
+                                Some(crate::geom::volume::mesh_to_fog_volume_with_transform(
+                                    operand_mesh,
+                                    &mesh_to_owner,
+                                    voxel_size as f32 as f64,
+                                    number("interior_band_width")?,
+                                    number("density")?,
+                                )?);
                         }
                     }
                     if let Some(generated) = generated {
