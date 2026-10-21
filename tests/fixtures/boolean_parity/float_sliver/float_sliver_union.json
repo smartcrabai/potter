@@ -1,0 +1,438 @@
+{
+  "cases": [
+    {
+      "name": "failing_sliver",
+      "x": -0.2875819305642165,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "control_no_gap",
+      "x": -0.2875819305642165,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.3
+    },
+    {
+      "name": "control_offset",
+      "x": -0.25,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_1e-07",
+      "x": -0.2875791845237571,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_5e-07",
+      "x": -0.2875795845237571,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_1e-06",
+      "x": -0.28758008452375694,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_2e-06",
+      "x": -0.2875810845237571,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_2.846e-06",
+      "x": -0.2875819305237569,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_5e-06",
+      "x": -0.28758408452375706,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_2e-05",
+      "x": -0.28759908452375693,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_0.0001",
+      "x": -0.287679084523757,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_-1e-07",
+      "x": -0.2875789845237571,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_-1e-06",
+      "x": -0.287578084523757,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_-2.846e-06",
+      "x": -0.287576238523757,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_-2e-05",
+      "x": -0.287559084523757,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    },
+    {
+      "name": "gap_-0.0001",
+      "x": -0.28747908452375703,
+      "y": 0.0,
+      "z": 0.0,
+      "size": 1.424841830952486
+    }
+  ],
+  "results": [
+    {
+      "volume": 2.892677489466624,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "failing_sliver",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000005777958037,
+      "error": -5.107328288491413
+    },
+    {
+      "volume": 8.000005808375505,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "failing_sliver",
+      "threshold": 0.0,
+      "analytic_volume": 8.000005777958037,
+      "error": 3.041746765575226e-08
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "control_no_gap",
+      "threshold": 1e-06,
+      "analytic_volume": 7.999999999999998,
+      "error": 1.7763568394002505e-15
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "control_no_gap",
+      "threshold": 0.0,
+      "analytic_volume": 7.999999999999998,
+      "error": 1.7763568394002505e-15
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "control_offset",
+      "threshold": 1e-06,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "control_offset",
+      "threshold": 0.0,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 8.676725228618059,
+      "faces": 10,
+      "vertices": 12,
+      "edges_not_two_faces": 4,
+      "case": "gap_1e-07",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000000203017425,
+      "error": 0.6767250256006339
+    },
+    {
+      "volume": 8.000000214306093,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_1e-07",
+      "threshold": 0.0,
+      "analytic_volume": 8.000000203017425,
+      "error": 1.1288667778330819e-08
+    },
+    {
+      "volume": 8.676726529195289,
+      "faces": 10,
+      "vertices": 12,
+      "edges_not_two_faces": 4,
+      "case": "gap_5e-07",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000001015087122,
+      "error": 0.676725514108167
+    },
+    {
+      "volume": 8.000000968062583,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_5e-07",
+      "threshold": 0.0,
+      "analytic_volume": 8.000001015087122,
+      "error": -4.702453892946323e-08
+    },
+    {
+      "volume": 8.676728263298255,
+      "faces": 10,
+      "vertices": 12,
+      "edges_not_two_faces": 4,
+      "case": "gap_1e-06",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000002030174244,
+      "error": 0.6767262331240111
+    },
+    {
+      "volume": 8.000001908415616,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_1e-06",
+      "threshold": 0.0,
+      "analytic_volume": 8.000002030174244,
+      "error": -1.2175862806884652e-07
+    },
+    {
+      "volume": 2.8926774894666236,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_2e-06",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000004060348488,
+      "error": -5.107326570881864
+    },
+    {
+      "volume": 8.000004114265984,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_2e-06",
+      "threshold": 0.0,
+      "analytic_volume": 8.000004060348488,
+      "error": 5.391749624550357e-08
+    },
+    {
+      "volume": 2.892677489466624,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_2.846e-06",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000005777875897,
+      "error": -5.107328288409272
+    },
+    {
+      "volume": 8.000005808375505,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_2.846e-06",
+      "threshold": 0.0,
+      "analytic_volume": 8.000005777875897,
+      "error": 3.049960817236297e-08
+    },
+    {
+      "volume": 2.8926774289627124,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_5e-06",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000010150871217,
+      "error": -5.107332721908505
+    },
+    {
+      "volume": 8.000010136947589,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_5e-06",
+      "threshold": 0.0,
+      "analytic_volume": 8.000010150871217,
+      "error": -1.392362847241202e-08
+    },
+    {
+      "volume": 2.892677489466624,
+      "faces": 6,
+      "vertices": 12,
+      "edges_not_two_faces": 0,
+      "case": "gap_2e-05",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000040603484866,
+      "error": -5.107363114018241
+    },
+    {
+      "volume": 8.000040658628551,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_2e-05",
+      "threshold": 0.0,
+      "analytic_volume": 8.000040603484866,
+      "error": 5.5143685173675294e-08
+    },
+    {
+      "volume": 8.000203051127105,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_0.0001",
+      "threshold": 1e-06,
+      "analytic_volume": 8.000203017424324,
+      "error": 3.3702781010447325e-08
+    },
+    {
+      "volume": 8.000203051127105,
+      "faces": 12,
+      "vertices": 16,
+      "edges_not_two_faces": 0,
+      "case": "gap_0.0001",
+      "threshold": 0.0,
+      "analytic_volume": 8.000203017424324,
+      "error": 3.3702781010447325e-08
+    },
+    {
+      "volume": 7.323274932725706,
+      "faces": 7,
+      "vertices": 12,
+      "edges_not_two_faces": 4,
+      "case": "gap_-1e-07",
+      "threshold": 1e-06,
+      "analytic_volume": 8.0,
+      "error": -0.6767250672742939
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_-1e-07",
+      "threshold": 0.0,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 7.999997177169119,
+      "faces": 9,
+      "vertices": 12,
+      "edges_not_two_faces": 0,
+      "case": "gap_-1e-06",
+      "threshold": 1e-06,
+      "analytic_volume": 8.0,
+      "error": -2.8228308810440694e-06
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_-1e-06",
+      "threshold": 0.0,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_-2.846e-06",
+      "threshold": 1e-06,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_-2.846e-06",
+      "threshold": 0.0,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_-2e-05",
+      "threshold": 1e-06,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_-2e-05",
+      "threshold": 0.0,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_-0.0001",
+      "threshold": 1e-06,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    },
+    {
+      "volume": 8.0,
+      "faces": 6,
+      "vertices": 8,
+      "edges_not_two_faces": 0,
+      "case": "gap_-0.0001",
+      "threshold": 0.0,
+      "analytic_volume": 8.0,
+      "error": 0.0
+    }
+  ]
+}
