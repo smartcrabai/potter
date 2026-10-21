@@ -399,8 +399,8 @@ fn group_weight(group: Option<&HashMap<u32, f64>>, vertex_id: u32, invert: bool)
     if invert { 1.0 - weight } else { weight }
 }
 
-/// Limit-surface positions of the source vertices at `levels` subdivisions, for
-/// `OVER_NORMAL` projection (Blender's `shrinkwrap_calc_subdivided_positions`).
+/// Uniformly refined positions of the source vertices at `levels` subdivisions, for `OVER_NORMAL`
+/// projection (Blender's `shrinkwrap_calc_subdivided_positions`).
 fn source_subdivision_positions(mesh: &Mesh, levels: u64) -> Result<Vec<Vec3>> {
     super::shrinkwrap_subdivision_positions(mesh, levels)
         .map(|positions| positions.into_iter().map(DVec3::as_vec3).collect())

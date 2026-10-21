@@ -4860,12 +4860,13 @@ fn check_evaluation_memory_budget(
     Ok(())
 }
 
-/// Limit positions of Shrinkwrap's coarse source vertices at its requested subsurf isolation.
-/// Blender calls `deform_coarse_vertices` on the source mesh, so use the same base samples and
-/// limit-surface evaluator as subdivision rather than refined control points.
+/// Positions of Shrinkwrap's coarse source vertices after `levels` uniform Catmull-Clark steps. Blender's
+/// `deform_coarse_vertices` writes each coarse vertex at its ptex corner, and Blender 5.2.2 gives the
+/// refined control vertex there (`project_no_axis_subsurf_level_{1,2,6}` agree to f32 precision), not
+/// the limit surface. The steps are the Subsurf level loop's refined path, with creases decaying per
+/// level; the coarse vertices stay first in every level.
 fn shrinkwrap_subdivision_positions(mesh: &Mesh, levels: u64) -> Result<Vec<DVec3>> {
     validated(mesh)?;
-    let source = polygons(mesh)?;
     let first_level_faces = mesh
         .faces
         .iter()
@@ -4885,37 +4886,43 @@ fn shrinkwrap_subdivision_positions(mesh: &Mesh, levels: u64) -> Result<Vec<DVec
         levels,
         0,
     )?;
-
-    let points = positions(mesh);
-    let creases = subdivision_uv::Creases::from_values(edge_crease_values(mesh, true)?);
-    let non_manifold =
-        NonManifold::new(points.len(), source.iter().map(|(face, _)| face.as_slice()));
-    let edge_sharpness = non_manifold.sharpened(&creases.sharpness);
-    let non_manifold_vertices: Vec<bool> = (0..points.len())
-        .map(|vertex| non_manifold.corner(vertex))
-        .collect();
-    let vertex_creases = vertex_crease_sharpness(mesh, true)?;
-    let loose = loose_edges(mesh)?;
-    let sharpness = subdivision_limit::BaseSharpness::Creases {
-        edges: &edge_sharpness,
-        vertices: &vertex_creases,
-        non_manifold: &non_manifold_vertices,
-        loose_edges: &loose,
+    let options = SubdivisionOptions {
         preserve_corners: false,
+        use_creases: true,
     };
-    let isolation = usize::try_from(levels).map_err(|_| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "shrinkwrap subdivision level overflows",
-        )
-    })?;
-    let limit = subdivision_limit::LimitSurface::build(&source, &points, &sharpness, isolation);
-    let samples = subdivision_limit::Samples::base(&source, mesh.vertices.len());
-    let evaluated = limit.evaluate(&samples.vertices);
-    Ok(evaluated
-        .into_iter()
-        .enumerate()
-        .map(|(index, point)| point.unwrap_or(points[index]))
+    let coarse_count = mesh.vertices.len();
+    let mut result = mesh.clone();
+    let mut source_polygons = polygons(&result)?;
+    let mut source_edges = loose_edges(&result)?;
+    let mut edge_creases =
+        subdivision_uv::Creases::from_values(edge_crease_values(&result, options.use_creases)?);
+    let mut vertex_creases = vertex_crease_sharpness(&result, options.use_creases)?;
+    for _ in 0..levels {
+        let position = subdivision_uv::Position::new(
+            &source_polygons,
+            &source_edges,
+            &edge_creases.sharpness,
+            result.vertices.len(),
+        );
+        let (next, _, next_creases) = subdivide_once(
+            &result,
+            options,
+            &position,
+            &source_polygons,
+            &source_edges,
+            &edge_creases,
+            &vertex_creases,
+            true,
+        )?;
+        edge_creases = next_creases;
+        vertex_creases = decay_vertex_creases(&vertex_creases, next.vertices.len());
+        result = next;
+        source_polygons = polygons(&result)?;
+        source_edges = loose_edges(&result)?;
+    }
+    Ok(result.vertices[..coarse_count]
+        .iter()
+        .map(|vertex| vertex.co)
         .collect())
 }
 
