@@ -744,7 +744,7 @@ fn evaluate_geometry_case(case: &NodeCase) -> potter_core::error::Result<Value> 
     link(&mut group, "operation", case.output, "store", "Value");
     link(&mut group, "store", "Geometry", "output", "Geometry");
 
-    let evaluation = graph::evaluate(&group, None, &Map::new())?;
+    let evaluation = graph::evaluate(&group, None, &Map::new(), "Math parity")?;
     Ok(evaluation.mesh.attributes[&case.id]["data"][0].clone())
 }
 

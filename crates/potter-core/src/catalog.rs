@@ -76,11 +76,11 @@ pub fn feature_catalog() -> Value {
             [true, false, true, true, false, false, true],
         ),
         unsupported(
-            "shader.principled.subsurface",
-            "Principled subsurface scattering",
+            "shader.principled.subsurface_method.mixed",
+            "Principled subsurface method mixed by Mix or Add",
             "ShaderNodeBsdfPrincipled",
             &["material.create", "material.update"],
-            "Potter's lobe model does not evaluate subsurface scattering; a render with Subsurface Weight above zero reports UNSUPPORTED_FEATURE.",
+            "A Mix or Add of two Principled arms with subsurface scattering under different methods reports UNSUPPORTED_FEATURE; Potter's single parameter set cannot hold both methods.",
         ),
         unsupported(
             "shader.principled.anisotropic",
@@ -718,12 +718,12 @@ pub fn feature_catalog() -> Value {
             &["modifier.create", "modifier.apply"],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "modifier.skin.branch_hull",
-            "Skin modifier branch-hull generation",
+            "Branch hull generation for the Skin modifier",
             "SKIN",
             &["modifier.create", "modifier.apply"],
-            "Branch-node Skin geometry does not yet match Blender's BMesh hull and cleanup behavior.",
+            [true, true, true, true, true, false, false],
         ),
         supported(
             "modifier.vertex_weight_edit",
@@ -1613,10 +1613,10 @@ pub fn feature_catalog() -> Value {
         ),
         unsupported(
             "rig.bbone.segments",
-            "Armature deformation through B-Bone segments",
+            "Armature constraints weighted through B-Bone segments",
             "Armature",
             &[],
-            "Armature modifiers and Armature constraints deform vertices along curved B-Bone segments, which are not evaluated.",
+            "Armature constraints targeting multi-segment B-Bones still require evaluated per-segment target matrices.",
         ),
         supported(
             "physics.world",

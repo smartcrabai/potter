@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Blender's random-number generators, ported from `BLI_rand.hh`, `rand.cc`, `BLI_noise` and
-//! `BKE_particle.h` (`psys_frand`). Particle modifiers depend on these exact sequences.
-
-use std::sync::OnceLock;
+//! Blender's random-number generators, ported from `BLI_rand.hh`, `rand.cc` and `BLI_noise`.
+//! Texture consumers depend on these exact sequences.
 
 /// Blender's `BLI_noise_hash_uchar_512` table (`intern/noise_c.cc`).
-const HASH_UCHAR_512: [u8; 512] = [
+pub(crate) const HASH_UCHAR_512: [u8; 512] = [
     0xA2, 0xA0, 0x19, 0x3B, 0xF8, 0xEB, 0xAA, 0xEE, 0xF3, 0x1C, 0x67, 0x28, 0x1D, 0xED, 0x0, 0xDE,
     0x95, 0x2E, 0xDC, 0x3F, 0x3A, 0x82, 0x35, 0x4D, 0x6C, 0xBA, 0x36, 0xD0, 0xF6, 0xC, 0x79, 0x32,
     0xD1, 0x59, 0xF4, 0x8, 0x8B, 0x63, 0x89, 0x2F, 0xB8, 0xB4, 0x97, 0x83, 0xF2, 0x8F, 0x18, 0xC7,
@@ -83,95 +81,16 @@ impl BlenderRng {
         self.step();
         (self.state >> 17) as i32
     }
-
-    /// `BLI_rng_get_float`: `float(int32) / 2^31`, never 1.0.
-    pub(crate) fn get_float(&mut self) -> f32 {
-        self.get_int32() as f32 / 2_147_483_648.0_f32
-    }
-
-    /// Blender's scalar `gaussRand`: accepted polar x, with y discarded each call.
-    pub(crate) fn gaussian(&mut self) -> f32 {
-        loop {
-            let x = 1.0 - 2.0 * self.get_float();
-            let y = 1.0 - 2.0 * self.get_float();
-            let length_squared = x * x + y * y;
-            if length_squared > 0.0 && length_squared < 1.0 {
-                return x * (-2.0 * length_squared.ln() / length_squared).sqrt();
-            }
-        }
-    }
-}
-
-/// `BLI_hash_frand`: a float hash of one integer.
-pub(crate) fn hash_frand(seed: u32) -> f32 {
-    BlenderRng::seed_random(seed).get_float()
-}
-
-/// Particle-system random table from `BKE_particle_init_rng` (`PSYS_FRAND_COUNT` = 1024).
-struct PsysFrandTable {
-    base: [f32; PSYS_FRAND_COUNT],
-    offset: [u32; PSYS_FRAND_COUNT],
-    multiplier: [u32; PSYS_FRAND_COUNT],
-}
-
-const PSYS_FRAND_COUNT: usize = 1024;
-
-fn psys_frand_table() -> &'static PsysFrandTable {
-    static TABLE: OnceLock<PsysFrandTable> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut rng = BlenderRng::seed_random(5831);
-        let mut table = PsysFrandTable {
-            base: [0.0; PSYS_FRAND_COUNT],
-            offset: [0; PSYS_FRAND_COUNT],
-            multiplier: [0; PSYS_FRAND_COUNT],
-        };
-        for index in 0..PSYS_FRAND_COUNT {
-            table.base[index] = rng.get_float();
-            table.offset[index] = rng.get_int32() as u32;
-            table.multiplier[index] = rng.get_int32() as u32;
-        }
-        table
-    })
-}
-
-/// `psys_frand(psys, seed)` for a particle system whose `ParticleSystem.seed` is `system_seed`.
-pub(crate) fn psys_frand(system_seed: u32, seed: u32) -> f32 {
-    let table = psys_frand_table();
-    let slot = usize::try_from(system_seed % PSYS_FRAND_COUNT as u32).unwrap_or(0);
-    let index = table.offset[slot].wrapping_add(seed.wrapping_mul(table.multiplier[slot]));
-    table.base[(index % PSYS_FRAND_COUNT as u32) as usize]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlenderRng, hash_frand, psys_frand};
+    use super::BlenderRng;
 
     #[test]
     fn direct_seed_matches_blender_rng_sequence() {
         let mut rng = BlenderRng::seed(1);
         assert_eq!(rng.get_uint32(), 89_400_484);
         assert_eq!(rng.get_int32(), 976_015_093);
-
-        let mut rng = BlenderRng::seed(1);
-        assert_eq!(rng.get_float(), 0.041_630_343);
-        assert_eq!(rng.get_float(), 0.454_492_45);
-    }
-
-    #[test]
-    fn gaussian_matches_blender_gauss_rand_sequence() {
-        let mut rng = BlenderRng::seed(1);
-        assert!((rng.gaussian() - 0.570_007_74).abs() < 1.0e-6);
-        assert!((rng.gaussian() + 0.973_007_74).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn psys_frand_matches_blender_particle_instance_oracle() {
-        assert_eq!(psys_frand(7, 3578), 0.226_094_66);
-        assert_eq!(psys_frand(7, 3579), 0.494_628_64);
-        assert_eq!(psys_frand(7, 3580), 0.585_033_4);
-        assert_eq!(psys_frand(7, 77374), 0.802_313_7);
-        assert_eq!(psys_frand(7, 77657), 0.544_631_6);
-        assert_ne!(psys_frand(7, 3578), psys_frand(8, 3578));
-        assert!((0.0..1.0).contains(&hash_frand(77091)));
     }
 }

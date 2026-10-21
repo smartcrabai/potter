@@ -1180,8 +1180,6 @@ fn validate_physics_settings(
             "seed",
             "child_seed",
             "count",
-            "rate",
-            "emission_rate",
             "lifetime",
             "lifetime_random",
             "speed",
@@ -1292,9 +1290,6 @@ fn validate_physics_settings(
             "child_percent" | "rendered_child_count" => {
                 value.as_u64().is_some_and(|count| count <= 100_000)
             }
-            "rate" | "emission_rate" => value
-                .as_f64()
-                .is_some_and(|rate| rate.is_finite() && (0.0..=1_000_000.0).contains(&rate)),
             "lifetime" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && number > 0.0 && number <= 1_000_000.0),

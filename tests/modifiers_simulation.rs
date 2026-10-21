@@ -13,6 +13,22 @@ mod blender_file;
 
 use blender_file::blender_executable;
 
+fn evaluated_volume<'a>(
+    document: &potter_core::model::SceneDoc,
+    snapshot: &'a potter_core::eval::Snapshot,
+    node_name: &str,
+) -> Result<&'a potter_core::geom::volume::VolumeData, Box<dyn Error>> {
+    let node = document
+        .nodes
+        .get(&potter_core::model::Id::new(node_name.to_owned())?)
+        .ok_or_else(|| format!("volume object `{node_name}` is missing"))?;
+    let data_id = node.data.as_ref().ok_or("volume Data-Block is missing")?;
+    snapshot
+        .volume_data
+        .get(data_id)
+        .ok_or_else(|| format!("evaluated volume `{node_name}` is missing").into())
+}
+
 const MODIFIER_POSITION_TOLERANCE: f64 = 1.0e-4;
 const FACE_DISTRIBUTION_TOLERANCE: f64 = 0.03;
 const VELOCITY_STATISTIC_TOLERANCE: f64 = 0.25;
@@ -5082,62 +5098,6 @@ baseline_evaluated.to_mesh_clear()
         "VDB density fixture generation",
     )?;
     let blender_expected: Value = serde_json::from_slice(&fs::read(&blender_expected_path)?)?;
-    let decoded = potter_core::geom::vdb::VdbVolume::read(&fs::read(&vdb_path)?)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let volume = potter_core::geom::volume::VolumeData {
-        source: potter_core::geom::volume::VolumeSource::File(
-            potter_core::geom::volume::VolumeFileSource {
-                format: "vdb".to_owned(),
-                content_ref: Some("asset://density".to_owned()),
-                grid_names: vec!["density".to_owned()],
-                bounds_min: None,
-                bounds_max: None,
-            },
-        ),
-        decoded_vdb: Some(std::sync::Arc::new(decoded)),
-        ..potter_core::geom::volume::VolumeData::default()
-    };
-    let pixels = (0_u32..3)
-        .flat_map(|y| {
-            (0_u32..4).map(move |x| {
-                [
-                    f64::from(x) / 3.0,
-                    f64::from(y) / 2.0,
-                    f64::from((2 * x + y) % 4) / 3.0,
-                    1.0,
-                ]
-            })
-        })
-        .collect::<Vec<_>>();
-    let image = potter_core::image::ImageData {
-        colour: potter_core::image::ColourCache::default(),
-        storage: potter_core::image::ImageStorage::default(),
-        width: 4,
-        height: 3,
-        pixels,
-        tiles: std::collections::BTreeMap::new(),
-        interpolation: potter_core::image::ImageInterpolation::Linear,
-        srgb: false,
-        udim: false,
-    };
-    let mapping_columns: [f64; 16] =
-        serde_json::from_value(blender_expected["mapping_world"].clone())?;
-    let mapping_world = DMat4::from_cols_array(&mapping_columns);
-    let volume_params = Map::from_iter([
-        ("texture_map_mode".into(), json!("OBJECT")),
-        ("texture_map_object".into(), json!("mapping_object")),
-        ("strength".into(), json!(3.0)),
-        ("texture_mid_level".into(), json!([0.5, 0.5, 0.5])),
-        ("texture_sample_radius".into(), json!(1.0)),
-    ]);
-    let displaced = potter_core::geom::modifiers::simulation::displace_volume(
-        &volume,
-        &volume_params,
-        "IMAGE",
-        Some(&image),
-        DMat4::IDENTITY,
-        Some(mapping_world),
-    )?;
     let expected_samples: Vec<f64> =
         serde_json::from_value(blender_expected["vdb_samples"].clone())?;
     let evaluated_grid_names: Vec<String> =
@@ -5167,6 +5127,86 @@ baseline_evaluated.to_mesh_clear()
             "{name} per-voxel density error {maximum_error} at sample {maximum_index} (Potter={maximum_actual}, Blender={maximum_expected}) exceeds {DENSITY_SAMPLE_TOLERANCE}",
         );
     };
+
+    // The Potter side enters through the scene path: the VDB is packed as a resource, the volume
+    // references it as File source, and the displacement modifier resolves the image texture and
+    // object mapping from the scene. The mapping object uses Blender's XYZ Euler transform.
+    let scene = root.join("volume-displacement-vdb");
+    let batch = root.join("operations.json");
+    initialize(&scene)?;
+    // Blender's image rows run bottom-up (the oracle's `image.pixels` row 0 is the bottom row), while Potter's
+    // storage, which `image.set_pixels` writes, runs top-down. The same visual image is therefore the Blender
+    // rows in reverse order, so the Potter side passes its rows top-down.
+    let texture_pixels = (0_u32..3)
+        .rev()
+        .flat_map(|y| {
+            (0_u32..4).map(move |x| {
+                [
+                    f64::from(x) / 3.0,
+                    f64::from(y) / 2.0,
+                    f64::from((2 * x + y) % 4) / 3.0,
+                    1.0,
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut inline_values = Vec::with_capacity(36);
+    for z in 0_u8..3 {
+        for y in 0_u8..3 {
+            for x in 0_u8..4 {
+                let x = f32::from(x);
+                let y = f32::from(y);
+                let z = f32::from(z);
+                inline_values.push(
+                    0.15_f32 + 0.16_f32 * x + 0.09_f32 * y + 0.07_f32 * z + 0.045_f32 * x * y
+                        - 0.025_f32 * x * z,
+                );
+            }
+        }
+    }
+    let vdb_file_source = json!({
+        "kind":"file",
+        "metadata":{
+            "format":"vdb",
+            "content_ref":"asset://density_vdb",
+            "grid_names":["density"],
+        },
+    });
+    let displacement_params = json!({
+        "texture":"displace_texture",
+        "texture_map_mode":"OBJECT",
+        "texture_map_object":"mapping_object",
+        "strength":3.0,
+        "texture_mid_level":[0.5,0.5,0.5],
+        "texture_sample_radius":1.0,
+    });
+    apply(
+        &scene,
+        &batch,
+        &json!([
+            {"op":"resource.pack","id":"density_vdb","uri":vdb_path.to_string_lossy(),"kind":"vdb"},
+            {"op":"image.create","id":"displace_texture","name":"Displacement","width":4,"height":3,"colorspace":"linear","fill_color":[0.0,0.0,0.0,1.0]},
+            {"op":"image.set_pixels","id":"displace_texture","x":0,"y":0,"width":4,"height":3,"pixels":texture_pixels},
+            {"op":"node.create","id":"mapping_object","kind":"plane","params":{},"transform":{"translation":[-0.25,0.2,-0.1],"rotation_deg":[0.2_f64.to_degrees(),0.35_f64.to_degrees(),(-0.15_f64).to_degrees()],"scale":[1.3,0.8,1.1]}},
+            {"op":"volume.create","id":"density","source":vdb_file_source},
+            {"op":"volume.create","id":"baseline_volume","source":vdb_file_source},
+            {"op":"volume.create","id":"inline_density","grids":[{"dims":[4,3,3],"voxel_size":1.0,"origin":[0.0,0.0,0.0],"values":inline_values}]},
+            {"op":"modifier.create","target":{"id":"density"},"id":"displace","type":"volume_displace","params":displacement_params},
+            {"op":"modifier.create","target":{"id":"inline_density"},"id":"displace","type":"volume_displace","params":displacement_params}
+        ]),
+        0,
+    )?;
+    let document: potter_core::model::SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
+        &document,
+        &potter_core::eval::EvaluationContext::default(),
+        Some(&scene),
+        Some(&scene.join(".potter/cache")),
+    )?;
+    let displaced = evaluated_volume(&document, &snapshot, "density")?;
+    let baseline = evaluated_volume(&document, &snapshot, "baseline_volume")?;
+    let inline_displaced = evaluated_volume(&document, &snapshot, "inline_density")?;
     assert_eq!(
         displaced.source,
         potter_core::geom::volume::VolumeSource::Generated(
@@ -5187,43 +5227,6 @@ baseline_evaluated.to_mesh_clear()
             .as_deref()
             .ok_or("displaced VDB samples are missing")?,
     );
-    let mut inline_values = Vec::with_capacity(36);
-    for z in 0_u8..3 {
-        for y in 0_u8..3 {
-            for x in 0_u8..4 {
-                let x = f32::from(x);
-                let y = f32::from(y);
-                let z = f32::from(z);
-                inline_values.push(
-                    0.15_f32 + 0.16_f32 * x + 0.09_f32 * y + 0.07_f32 * z + 0.045_f32 * x * y
-                        - 0.025_f32 * x * z,
-                );
-            }
-        }
-    }
-    let inline_volume = potter_core::geom::volume::VolumeData {
-        source: potter_core::geom::volume::VolumeSource::Generated(
-            potter_core::geom::volume::VolumeGeneratedSource {
-                algorithm: "inline_fixture".to_owned(),
-            },
-        ),
-        grids: vec![potter_core::geom::volume::VolumeGrid {
-            dims: [4, 3, 3],
-            voxel_size: 1.0,
-            origin: DVec3::ZERO,
-            values: Some(inline_values),
-            ..potter_core::geom::volume::VolumeGrid::default()
-        }],
-        ..potter_core::geom::volume::VolumeData::default()
-    };
-    let inline_displaced = potter_core::geom::modifiers::simulation::displace_volume(
-        &inline_volume,
-        &volume_params,
-        "IMAGE",
-        Some(&image),
-        DMat4::IDENTITY,
-        Some(mapping_world),
-    )?;
     let inline_grid = inline_displaced
         .grids
         .first()
@@ -5236,9 +5239,9 @@ baseline_evaluated.to_mesh_clear()
             .as_deref()
             .ok_or("displaced inline samples are missing")?,
     );
-    let potter_mesh = potter_core::geom::volume::volume_to_mesh(&displaced, 0.25)
+    let potter_mesh = potter_core::geom::volume::volume_to_mesh(displaced, 0.25)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let baseline_mesh = potter_core::geom::volume::volume_to_mesh(&volume, 0.25)
+    let baseline_mesh = potter_core::geom::volume::volume_to_mesh(baseline, 0.25)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let potter_points = potter_mesh
         .vertices
@@ -5263,6 +5266,163 @@ baseline_evaluated.to_mesh_clear()
     assert!(
         potter_displacement > MINIMUM_SURFACE_DISPLACEMENT,
         "Potter VDB surface must differ from its unmodified baseline by more than one voxel, observed {potter_displacement}",
+    );
+    Ok(())
+}
+
+#[test]
+fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
+-> Result<(), Box<dyn Error>> {
+    let index_to_local = DMat4::from_cols_array(&[
+        0.0, 0.5, 0.0, 0.0, -2.0, 0.3, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 4.0, -2.0, 3.0, 1.0,
+    ]);
+    let volume = potter_core::geom::volume::VolumeData {
+        grids: vec![potter_core::geom::volume::VolumeGrid {
+            dims: [2, 2, 2],
+            voxel_size: index_to_local
+                .transform_vector3(DVec3::X)
+                .length()
+                .max(index_to_local.transform_vector3(DVec3::Y).length())
+                .max(index_to_local.transform_vector3(DVec3::Z).length()),
+            origin: index_to_local.transform_point3(DVec3::ZERO),
+            index_to_local: Some(index_to_local.to_cols_array()),
+            values: Some(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]),
+            ..potter_core::geom::volume::VolumeGrid::default()
+        }],
+        ..potter_core::geom::volume::VolumeData::default()
+    };
+    let affine_roundtrip: potter_core::geom::volume::VolumeData =
+        serde_json::from_value(serde_json::to_value(&volume)?)?;
+    assert_eq!(affine_roundtrip, volume);
+    let legacy_json = serde_json::to_value(potter_core::geom::volume::VolumeGrid::default())?;
+    assert!(legacy_json.get("index_to_local").is_none());
+    let legacy_grid: potter_core::geom::volume::VolumeGrid = serde_json::from_value(legacy_json)?;
+    assert_eq!(legacy_grid.index_to_local, None);
+    let mut invalid_matrices = vec![DMat4::from_scale(DVec3::new(1.0, 0.0, 1.0)).to_cols_array()];
+    let mut nonfinite_matrix = DMat4::IDENTITY.to_cols_array();
+    nonfinite_matrix[0] = f64::NAN;
+    invalid_matrices.push(nonfinite_matrix);
+    for matrix in invalid_matrices {
+        let mut invalid_volume = volume.clone();
+        invalid_volume.grids[0].index_to_local = Some(matrix);
+        assert!(potter_core::geom::volume::validate_data(&invalid_volume).is_err());
+    }
+    let sample_index = DVec3::new(0.25, 0.5, 0.75);
+    // The density is recovered through the matrix inverse, so it carries f64 rounding (about 4e-16 here).
+    let sampled = potter_core::geom::volume::sample_density_checked(
+        index_to_local.transform_point3(sample_index),
+        &volume,
+    )?;
+    assert!(
+        (sampled - sample_index.x).abs() <= 1.0e-12,
+        "affine density round trip {sampled} differs from {}",
+        sample_index.x
+    );
+
+    let parameters = Map::from_iter([
+        ("texture".into(), json!("affine_texture")),
+        ("texture_map_mode".into(), json!("LOCAL")),
+        ("strength".into(), json!(1.0)),
+        ("texture_mid_level".into(), json!([0.5, 0.5, 0.5])),
+        ("texture_sample_radius".into(), json!(1.0)),
+    ]);
+    let grids = serde_json::to_value(&volume.grids)?;
+    let directory = tempdir()?;
+    let scene = directory.path().join("affine-volume-displacement");
+    let batch = directory.path().join("operations.json");
+    initialize(&scene)?;
+    apply(
+        &scene,
+        &batch,
+        &json!([
+            {"op":"image.create","id":"affine_texture","name":"Affine displacement","width":1,"height":1,"colorspace":"linear","fill_color":[1.0,0.5,0.5,1.0]},
+            {"op":"volume.create","id":"affine_density","grids":grids},
+            {"op":"modifier.create","target":{"id":"affine_density"},"id":"displace","type":"volume_displace","params":parameters},
+            {"op":"volume.create","id":"affine_repeated","grids":grids},
+            {"op":"modifier.create","target":{"id":"affine_repeated"},"id":"first","type":"volume_displace","params":parameters},
+            {"op":"modifier.create","target":{"id":"affine_repeated"},"id":"second","type":"volume_displace","params":parameters}
+        ]),
+        0,
+    )?;
+    let document: potter_core::model::SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let snapshot = potter_core::eval::Snapshot::evaluate_with_cache(
+        &document,
+        &potter_core::eval::EvaluationContext::default(),
+        Some(&scene),
+        Some(&scene.join(".potter/cache")),
+    )?;
+    let displaced = evaluated_volume(&document, &snapshot, "affine_density")?;
+    let grid = displaced
+        .grids
+        .first()
+        .ok_or("affine displaced grid is missing")?;
+    assert_eq!(grid.dims, [4, 4, 4]);
+    let expected_index_to_local = index_to_local * DMat4::from_translation(-DVec3::ONE);
+    assert_eq!(
+        grid.index_to_local,
+        Some(expected_index_to_local.to_cols_array())
+    );
+    assert_eq!(
+        grid.origin,
+        expected_index_to_local.transform_point3(DVec3::ZERO),
+    );
+    let sample_position = expected_index_to_local.transform_point3(DVec3::new(2.0, 1.0, 1.0));
+    // Blender's Volume Displace subtracts `(texture - mid) * strength / max_voxel_side_length` in index space
+    // (MOD_volume_displace.cc DisplaceOp). The texture displacement is (0.5, 0, 0) in object space, and OpenVDB's
+    // voxelSize() of this affine map is [0.5, 2.0223748, 1.5] (queried in Blender's bundled OpenVDB), so the
+    // density at index 1 - 0.5 / 2.0223748 is the linear ramp value 1 - 0.5 / max voxel.
+    let max_voxel_side_length = index_to_local
+        .transform_vector3(DVec3::X)
+        .length()
+        .max(index_to_local.transform_vector3(DVec3::Y).length())
+        .max(index_to_local.transform_vector3(DVec3::Z).length());
+    let expected_sample = 1.0 - 0.5 / max_voxel_side_length;
+    let sampled = potter_core::geom::volume::sample_density_checked(sample_position, displaced)?;
+    assert!(
+        // The displaced density is stored as f32 (Blender's grid is float too), so the bound is one f32 epsilon.
+        (sampled - expected_sample).abs() <= f64::from(f32::EPSILON),
+        "affine displaced density {sampled} differs from Blender's index-space value {expected_sample}",
+    );
+    let repeated = evaluated_volume(&document, &snapshot, "affine_repeated")?;
+    let repeated_grid = repeated
+        .grids
+        .first()
+        .ok_or("repeated affine displaced grid is missing")?;
+    assert_eq!(repeated_grid.dims, [6, 6, 6]);
+    let expected_repeated_transform =
+        expected_index_to_local * DMat4::from_translation(-DVec3::ONE);
+    assert_eq!(
+        repeated_grid.index_to_local,
+        Some(expected_repeated_transform.to_cols_array()),
+    );
+
+    let affine_mesh = potter_core::geom::volume::volume_to_mesh(displaced, 0.25)?;
+    let index_space_volume = potter_core::geom::volume::VolumeData {
+        grids: vec![potter_core::geom::volume::VolumeGrid {
+            dims: grid.dims,
+            voxel_size: 1.0,
+            origin: DVec3::ZERO,
+            values: grid.values.clone(),
+            ..potter_core::geom::volume::VolumeGrid::default()
+        }],
+        ..potter_core::geom::volume::VolumeData::default()
+    };
+    let index_mesh = potter_core::geom::volume::volume_to_mesh(&index_space_volume, 0.25)?;
+    let affine_points = affine_mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let expected_points = index_mesh
+        .vertices
+        .iter()
+        .map(|vertex| expected_index_to_local.transform_point3(vertex.co))
+        .collect::<Vec<_>>();
+    assert!(
+        max_surface_correspondence_error(&affine_points, &expected_points)?
+            <= MODIFIER_POSITION_TOLERANCE,
+        "volume mesh vertices must use the full affine index-to-local transform",
     );
     Ok(())
 }

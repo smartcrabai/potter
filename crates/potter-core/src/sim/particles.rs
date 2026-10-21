@@ -131,7 +131,8 @@ impl Random {
 }
 
 /// Emit and evaluate particles born no later than `frame`.
-/// `rate` is particles per frame, `lifetime` is measured in frames, and `speed`,
+/// Particle `i` of `count` is born at `frame_start + (frame_end - frame_start) * i / count` (Blender's
+/// `init_particle`), `lifetime` is measured in frames, and `speed`,
 /// `velocity`, and `random_velocity` are emitter-local velocities in meters per second.
 /// `force_fields` use world-space origins and radial falloff (zero means unlimited range);
 /// `colliders` are static world-space triangles.
@@ -307,36 +308,25 @@ fn simulate_with_lifecycle(
                 .get("emit_unborn")
                 .and_then(Value::as_bool)
                 .unwrap_or(false));
-    let has_frame_start =
-        settings.get("frame_start").is_some() || settings.get("start_frame").is_some();
-    // Blender's `ParticleSettings.sta` default is 1 (`DNA_particle_types.h:600`).
-    let frame_start = setting_alias_number(settings, &["frame_start", "start_frame"], 1.0)?;
-    let count = settings.get("count").and_then(Value::as_f64);
-    let frame_end = setting_alias_number(
-        settings,
-        &["frame_end", "end_frame"],
-        if let Some(count) = count {
-            frame_start + count.max(1.0)
-        } else if include_unborn {
-            frame + 1.0
-        } else {
-            frame
-        },
-    )?;
-    if !frame_start.is_finite() || !frame_end.is_finite() || frame_end < frame_start {
-        return Err(invalid("particle emission frame range is invalid"));
-    }
-    let frame_span = (frame_end - frame_start).max(0.0);
-    let rate = if let Some(count) = count {
-        count / frame_span.max(1.0)
-    } else {
-        setting_alias_number(settings, &["rate", "emission_rate"], 1.0)?
-    };
-    if rate < 0.0 || !rate.is_finite() {
-        return Err(invalid(
-            "particle emission rate must be finite and non-negative",
+    if settings.get("rate").is_some() || settings.get("emission_rate").is_some() {
+        return Err(unsupported(
+            "physics.particle_emitter.rate",
+            "Blender has no emission rate: particle i is born at frame_start + (frame_end - frame_start) * i / count",
         ));
     }
+    // Blender's `ParticleSettings` defaults: `sta` 1, `end` 200 (`DNA_particle_types.h:600`), `totpart` 1000 (`:603`).
+    let frame_start = setting_alias_number(settings, &["frame_start", "start_frame"], 1.0)?;
+    let count = setting_alias_number(settings, &["count"], 1000.0)?;
+    let frame_end = setting_alias_number(settings, &["frame_end", "end_frame"], 200.0)?;
+    if !frame_start.is_finite()
+        || !frame_end.is_finite()
+        || frame_end < frame_start
+        || count < 0.0
+        || count.fract() != 0.0
+    {
+        return Err(invalid("particle emission frame range is invalid"));
+    }
+    let frame_span = frame_end - frame_start;
     let source_value = settings.get("source").or_else(|| settings.get("emit_from"));
     let source = source_value
         .map(|value| {
@@ -377,20 +367,13 @@ fn simulate_with_lifecycle(
     };
     let emission_frame = requested_frame.min(frame_end);
     let duration = (emission_frame - frame_start).max(0.0);
-    let emitted_float = if let Some(count) = count {
-        if emission_frame < frame_start {
-            0.0
-        } else if frame_span == 0.0 {
-            count
-        } else {
-            ((duration / frame_span * (count - 1.0)).floor() + 1.0).min(count.max(0.0))
-        }
-    } else if emission_frame < frame_start {
+    // Particle i is born at frame_start + frame_span * i / count (`init_particle`, `pa->time`).
+    let emitted_float = if emission_frame < frame_start {
         0.0
-    } else if has_frame_start {
-        rate * (duration + 1.0)
+    } else if frame_span == 0.0 {
+        count
     } else {
-        rate * emission_frame.max(0.0)
+        ((duration * count / frame_span).floor() + 1.0).min(count)
     };
     if !emitted_float.is_finite() || emitted_float >= u64::MAX as f64 {
         return Err(limit("particle emission count exceeds the supported range"));
@@ -409,12 +392,18 @@ fn simulate_with_lifecycle(
     let first_event = if include_lifecycle {
         0
     } else {
-        let first_birth_time = (frame - maximum_lifetime - frame_start).max(0.0);
-        let first_event_value = (first_birth_time * rate).ceil();
-        if !first_event_value.is_finite() || first_event_value >= u64::MAX as f64 {
+        // Births before `frame - maximum_lifetime` are dead by `frame`; keep one earlier event as margin.
+        let births_before = if frame_span > 0.0 {
+            ((frame - maximum_lifetime - frame_start).max(0.0) * count / frame_span).ceil()
+        } else if frame - maximum_lifetime > frame_start {
+            count
+        } else {
+            0.0
+        };
+        if !births_before.is_finite() || births_before >= u64::MAX as f64 {
             return Err(limit("particle emission count exceeds the supported range"));
         }
-        (first_event_value as u64).saturating_sub(1).min(emitted)
+        (births_before as u64).saturating_sub(1).min(emitted)
     };
     let output_count = emitted.saturating_sub(first_event);
     if output_count > MAX_PARTICLES {
@@ -527,16 +516,8 @@ fn simulate_with_lifecycle(
     for event in first_event..emitted {
         let birth_frame = if is_hair {
             0.0
-        } else if let Some(count) = count {
-            if count <= 1.0 || frame_span == 0.0 {
-                frame_start
-            } else {
-                frame_start + event as f64 * frame_span / (count - 1.0)
-            }
-        } else if has_frame_start {
-            frame_start + event as f64 / rate.max(f64::MIN_POSITIVE)
         } else {
-            frame_start + (event + 1) as f64 / rate.max(f64::MIN_POSITIVE)
+            frame_start + frame_span * event as f64 / count
         };
         let raw_age = frame - birth_frame;
         if raw_age < 0.0 {
@@ -583,16 +564,8 @@ fn simulate_with_lifecycle(
     for event in first_event..emitted {
         let birth_frame = if is_hair {
             0.0
-        } else if let Some(count) = count {
-            if count <= 1.0 || frame_span == 0.0 {
-                frame_start
-            } else {
-                frame_start + event as f64 * frame_span / (count - 1.0)
-            }
-        } else if has_frame_start {
-            frame_start + event as f64 / rate.max(f64::MIN_POSITIVE)
         } else {
-            frame_start + (event + 1) as f64 / rate.max(f64::MIN_POSITIVE)
+            frame_start + frame_span * event as f64 / count
         };
         let particle_index =
             u32::try_from(event).map_err(|_| limit("particle index exceeds supported range"))?;
@@ -2146,7 +2119,7 @@ mod tests {
             },
             ..Mesh::default()
         };
-        let settings = json!({"rate": 2.0, "lifetime": 20.0, "speed": 1.0});
+        let settings = json!({"count": 6, "frame_start": 1.0, "frame_end": 1.0, "lifetime": 20.0, "speed": 1.0});
         let first = simulate(
             &mesh,
             &settings,
@@ -2219,7 +2192,7 @@ mod tests {
             },
             ..Mesh::default()
         };
-        let settings = json!({"rate": 1.0, "lifetime": 5.0, "speed": 0.0});
+        let settings = json!({"count": 2, "frame_start": 1.0, "frame_end": 3.0, "lifetime": 5.0, "speed": 0.0});
         let colliders = [[
             DVec3::new(0.0, 0.0, 0.5),
             DVec3::new(1.0, 0.0, 0.5),
@@ -2289,7 +2262,9 @@ mod tests {
         let particles = simulate(
             &mesh,
             &json!({
-                "rate": 1.0,
+                "count": 2,
+                "frame_start": 1.0,
+                "frame_end": 3.0,
                 "lifetime": 5.0,
                 "normal_velocity": 0.5,
                 "velocity": [1.0, 2.0, 3.0],

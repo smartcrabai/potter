@@ -7,6 +7,7 @@ file bytes as an immutable compatibility blob.
 """
 import base64
 import bpy
+import ctypes
 import json
 import math
 import os
@@ -20,6 +21,31 @@ DEFERRED_HAIR_KEY_RESTORATIONS = []
 CACHE_FILES_BY_IDENTITY = {}
 ALPHA_MODE_PROPERTY = "potter.alpha_mode"
 ALPHA_MODES = ("opaque", "clip", "blend")
+
+LEGACY_TEXTURE_SETTINGS = {
+    "CLOUDS": ("noise_scale", "noise_depth", "noise_basis", "noise_type", "cloud_type"),
+    "MARBLE": ("noise_scale", "turbulence", "noise_depth", "noise_type", "marble_type",
+               "noise_basis", "noise_basis_2"),
+    "WOOD": ("noise_scale", "turbulence", "noise_basis", "noise_type", "wood_type",
+             "noise_basis_2"),
+    "MAGIC": ("turbulence", "noise_depth"),
+    "BLEND": ("progression", "use_flip_axis"),
+    "STUCCI": ("turbulence", "noise_basis", "noise_scale", "noise_type", "stucci_type"),
+    "NOISE": ("noise_scale", "noise_basis", "noise_type"),
+    "DISTORTED_NOISE": ("distortion", "noise_scale", "noise_basis", "noise_distortion"),
+    "VORONOI": ("weight_1", "weight_2", "weight_3", "weight_4", "minkovsky_exponent",
+                "distance_metric", "color_mode", "noise_intensity", "noise_scale"),
+    "MUSGRAVE": ("musgrave_type", "dimension_max", "lacunarity", "offset", "gain",
+                 "noise_intensity", "noise_scale", "noise_basis"),
+    "IMAGE": (
+        "use_interpolation", "filter_size", "use_flip_axis", "use_alpha",
+        "use_calculate_alpha", "invert_alpha", "extension", "repeat_x", "repeat_y",
+        "use_mirror_x", "use_mirror_y", "use_checker_odd", "use_checker_even",
+        "checker_distance", "crop_min_x", "crop_min_y", "crop_max_x", "crop_max_y",
+        "use_normal_map", "use_clamp", "use_color_ramp", "intensity", "contrast",
+        "saturation", "factor_red", "factor_green", "factor_blue", "use_preview_alpha",
+    ),
+}
 DEFERRED_MDISPS_FILEPATHS = {}
 RESTORED_MDISPS_MESHES = {}
 MULTIRES_MASK_LEVEL_BY_MESH = {}
@@ -653,6 +679,116 @@ def _particle_texture_slots(modifier):
             slots.append({"slot": index, "texture": slot.texture.name, "maps": maps})
     return slots
 
+def _color_ramp_settings(ramp):
+    return {
+        "color_mode": ramp.color_mode,
+        "hue_interpolation": ramp.hue_interpolation,
+        "interpolation": ramp.interpolation,
+        "elements": [
+            {"position": float(element.position), "color": plain(element.color)}
+            for element in ramp.elements
+        ],
+    }
+
+
+def _restore_color_ramp(ramp, values, owner):
+    if not isinstance(values, dict) or not isinstance(values.get("elements"), list):
+        raise ValueError("%s has invalid ColorRamp settings" % owner)
+    elements = values["elements"]
+    if len(elements) < 2:
+        raise ValueError("%s ColorRamp must contain at least two elements" % owner)
+    ramp_values = {key: value for key, value in values.items() if key != "elements"}
+    set_rna(ramp, ramp_values, strict=True, owner=owner)
+    while len(ramp.elements) > 2:
+        ramp.elements.remove(ramp.elements[-1])
+    first, last = ramp.elements[0], ramp.elements[1]
+    first.color = elements[0]["color"]
+    first.position = float(elements[0]["position"])
+    last.color = elements[-1]["color"]
+    last.position = float(elements[-1]["position"])
+    for source in elements[1:-1]:
+        element = ramp.elements.new(float(source["position"]))
+        element.color = source["color"]
+
+
+# Settings of a freshly created Image Texture. Blender's DNA values need not equal the RNA
+# declared defaults (ImageUser frame values, for one), so "default" is measured against a probe.
+IMAGE_TEXTURE_DEFAULTS = {}
+
+
+def _image_texture_defaults():
+    if not IMAGE_TEXTURE_DEFAULTS:
+        probe = bpy.data.textures.new("potter.image_texture_defaults", type="IMAGE")
+        try:
+            IMAGE_TEXTURE_DEFAULTS.update(_legacy_texture_settings(probe))
+        finally:
+            bpy.data.textures.remove(probe)
+    return IMAGE_TEXTURE_DEFAULTS
+
+
+def _image_texture_uses_image_fastpath(texture):
+    image = texture.image
+    if image is None or sum(
+            item.type == "IMAGE" and item.image == image
+            for item in getattr(bpy.data, "textures", ())) != 1:
+        return False
+    defaults = _image_texture_defaults()
+    settings = _legacy_texture_settings(texture)
+    image_user_settings = settings.pop("image_user", {})
+    color_ramp = settings.pop("color_ramp", None)
+    return (all(settings[key] == defaults[key] for key in settings)
+            and all(image_user_settings[key] == defaults["image_user"][key]
+                    for key in image_user_settings)
+            and (color_ramp is None or color_ramp == defaults["color_ramp"]))
+
+
+def _rna_scalar_settings(block, omit=()):
+    return {
+        key: plain(value)
+        for prop, key, value in _walk_rna_properties(
+            block, omit=omit, skip_collections=True)
+        if prop.type in ("BOOLEAN", "INT", "FLOAT", "STRING", "ENUM")
+    }
+
+
+# ImageUser.layer/pass/view are read-only in RNA, so the generic walk skips them. RNA reads
+# still return the DNA values, so export reads them directly.
+IMAGE_USER_MULTILAYER_KEYS = ("multilayer_layer", "multilayer_pass", "multilayer_view")
+
+
+def _image_user_multilayer_settings(image_user):
+    return {key: plain(getattr(image_user, key)) for key in IMAGE_USER_MULTILAYER_KEYS}
+
+
+def _legacy_texture_settings(texture):
+    settings_keys = LEGACY_TEXTURE_SETTINGS.get(texture.type)
+    if settings_keys is None:
+        raise ValueError("unsupported legacy Texture type %s" % texture.type)
+    if texture.type == "IMAGE":
+        if texture.use_nodes and texture.node_tree:
+            raise ValueError("node-based image Texture %s cannot be exported" % texture.name_full)
+        settings = {key: plain(getattr(texture, key))
+                    for key in settings_keys if hasattr(texture, key)}
+        if texture.color_ramp is not None:
+            settings["color_ramp"] = _color_ramp_settings(texture.color_ramp)
+        settings["image_user"] = _rna_scalar_settings(texture.image_user)
+        settings["image_user"].update(_image_user_multilayer_settings(texture.image_user))
+        return settings
+    return {key: plain(getattr(texture, key))
+            for key in settings_keys if hasattr(texture, key)}
+
+
+def _legacy_texture_record(texture):
+    settings = _legacy_texture_settings(texture)
+    if texture.type == "IMAGE" and _image_texture_uses_image_fastpath(texture):
+        return None
+    record = {"storage": "inline", "kind": "legacy_texture",
+              "owner": texture.name_full, "texture_type": texture.type,
+              "settings": settings}
+    if texture.type == "IMAGE":
+        record["image"] = plain(texture.image)
+    return record
+
 def modifier_params(modifier):
     omitted = (
         "type", "name", "execution_time", "persistent_uid", "show_viewport", "show_render",
@@ -661,9 +797,15 @@ def modifier_params(modifier):
         omitted += ("particle_system",)
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         omitted += ("map_curve",)
+    if modifier.type in ("HOOK", "WARP"):
+        omitted += ("falloff_curve",)
     params = rna_props(modifier, omitted)
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         params["map_curve"] = _curve_mapping_points(modifier.map_curve)
+    if modifier.type in ("HOOK", "WARP"):
+        params["falloff_curve"] = _curve_mapping_points(
+            modifier.falloff_curve, include_handle_types=True)
+        params["falloff_curve_settings"] = _curve_mapping_settings(modifier.falloff_curve)
     bound_property = "is_bound" if hasattr(modifier, "is_bound") else "is_bind"
     if hasattr(modifier, bound_property):
         params["is_bound"] = bool(getattr(modifier, bound_property))
@@ -674,33 +816,97 @@ def modifier_params(modifier):
             {"object": plain(projector.object) if projector.object else None}
             for projector in modifier.projectors
         ]
+    texture = getattr(modifier, "texture", None)
+    if texture is not None:
+        if texture.type == "IMAGE" and _image_texture_uses_image_fastpath(texture):
+            params["texture"] = {"id_type": "Image", "name": texture.image.name_full}
+        else:
+            params["texture"] = {"id_type": "Texture", "name": texture.name_full}
     if modifier.type == "MULTIRES":
         params["total_levels"] = int(modifier.total_levels)
         params["is_external"] = bool(modifier.is_external)
+    if modifier.type == "HOOK":
+        params["matrix_inverse"] = matrix_column_major(modifier.matrix_inverse)
     return params
-def _curve_mapping_points(mapping):
+
+
+def matrix_column_major(matrix):
+    """Sixteen column-major numbers, the layout of Potter's matrix parameters."""
+    return [float(matrix[row][column]) for column in range(4) for row in range(4)]
+
+
+def matrix_rows_from_column_major(values):
+    """Blender rows for a matrix given as sixteen column-major numbers or as nested rows."""
+    if len(values) == 16:
+        return [[float(values[column * 4 + row]) for column in range(4)] for row in range(4)]
+    return values
+
+
+def _curve_mapping_points(mapping, include_handle_types=False):
     if mapping is None or not mapping.curves:
         return []
-    return [
-        [float(point.location[0]), float(point.location[1])]
-        for point in mapping.curves[0].points
-    ]
+    points = []
+    for point in mapping.curves[0].points:
+        value = [float(point.location[0]), float(point.location[1])]
+        if include_handle_types and point.handle_type != "AUTO":
+            value.append(point.handle_type)
+        points.append(value)
+    return points
+
+
+def _curve_mapping_settings(mapping):
+    if mapping is None:
+        return None
+    return {
+        "use_clip": bool(mapping.use_clip),
+        "clip_bounds": [
+            float(mapping.clip_min_x), float(mapping.clip_min_y),
+            float(mapping.clip_max_x), float(mapping.clip_max_y),
+        ],
+        "extend": mapping.extend,
+    }
 
 
 def _set_curve_mapping(modifier, values):
     mapping = getattr(modifier, "map_curve", None)
     if mapping is None or not mapping.curves or len(values) < 2:
         raise ValueError("modifier map_curve needs at least two control points")
-    points = [(float(point[0]), float(point[1])) for point in values]
     curve = mapping.curves[0]
     for point in list(curve.points)[1:-1]:
         curve.points.remove(point)
+    points = [(float(point[0]), float(point[1])) for point in values]
     curve.points[0].location = points[0]
     curve.points[-1].location = points[-1]
     for x, y in points[1:-1]:
         curve.points.new(x, y)
     mapping.update()
 
+def _set_falloff_curve_mapping(mapping, values, owner, settings=None):
+    if mapping is None or not mapping.curves or len(values) < 2:
+        raise ValueError("%s needs at least two control points" % owner)
+    points = [
+        (float(point[0]), float(point[1]), point[2] if len(point) > 2 else "AUTO")
+        for point in values
+    ]
+    settings = settings or {}
+    clip_bounds = tuple(float(value) for value in settings.get(
+        "clip_bounds", (0.0, 0.0, 1.0, 1.0)))
+    mapping.use_clip = bool(settings.get("use_clip", True))
+    mapping.clip_min_x = clip_bounds[0]
+    mapping.clip_min_y = clip_bounds[1]
+    mapping.clip_max_x = clip_bounds[2]
+    mapping.clip_max_y = clip_bounds[3]
+    mapping.extend = settings.get("extend", "EXTRAPOLATED")
+    curve = mapping.curves[0]
+    for point in list(curve.points)[1:-1]:
+        curve.points.remove(point)
+    curve.points[0].location = (0.0, 0.0)
+    curve.points[-1].location = (1.0, 0.0)
+    for index in range(len(points) - 2):
+        curve.points.new(float(index + 2), 0.0)
+    for point, (x, y, handle_type) in zip(curve.points, points):
+        point.location = (x, y)
+        point.handle_type = handle_type
 
 
 
@@ -843,6 +1049,7 @@ def images_dump():
     return result
 
 
+
 def _resource_record(kind, owner, path, packed_file=None):
     resolved = bpy.path.abspath(path) if path else None
     packed_data = None
@@ -974,6 +1181,10 @@ def resources_dump():
         record = _resource_record("image", image.name_full, _image_filepath(image),
                                   getattr(image, "packed_file", None))
         if record["path"] or record["packed"]:
+            result.append(record)
+    for texture in getattr(bpy.data, "textures", ()):
+        record = _legacy_texture_record(texture)
+        if record is not None:
             result.append(record)
     for curve in bpy.data.curves:
         if getattr(getattr(curve, "bl_rna", None), "identifier", "") != "TextCurve":
@@ -1257,10 +1468,12 @@ def _armature_bone_rolls(armature):
 
 def _armature_bbone_settings(bone):
     custom_handle_fields = ("bbone_custom_handle_start", "bbone_custom_handle_end")
+    deformation_fields = {"use_envelope_multiply", "use_scale_easing",
+                          "use_endroll_as_inroll"}
     settings = {}
     for prop in bone.bl_rna.properties:
         key = prop.identifier
-        if not key.startswith("bbone_"):
+        if not key.startswith("bbone_") and key not in deformation_fields:
             continue
         value = getattr(bone, key)
         if key in custom_handle_fields:
@@ -1269,10 +1482,26 @@ def _armature_bbone_settings(bone):
     return settings
 
 
+def _armature_bone_selection(armature):
+    """Return {bone name: selected} read from the armature's owner object pose.
+
+    Blender 5.2 removed ``Bone.select``. Selection is edited through ``EditBone.select``, and
+    leaving edit mode mirrors it onto ``PoseBone.select``, so the owner object's pose channels
+    are the object-mode read. Armature data with no owning object that has a pose reports no
+    selection.
+    """
+    owner = next((obj for obj in bpy.data.objects
+                  if obj.data == armature and obj.pose is not None), None)
+    if owner is None:
+        return {}
+    return {pose_bone.name: bool(pose_bone.select) for pose_bone in owner.pose.bones}
+
+
 def _armature_dump(armature):
     bones = []
     bone_ids = _id_map(armature, "potter.bone_ids_json")
     bone_rolls = _armature_bone_rolls(armature)
+    selection = _armature_bone_selection(armature)
     for bone in armature.bones:
         bones.append({"name": bone.name, "potter_id": bone_ids.get(bone.name),
                       "parent": bone.parent.name if bone.parent else None,
@@ -1280,6 +1509,11 @@ def _armature_dump(armature):
                       "roll": bone_rolls[bone.name], "deform": bool(bone.use_deform),
                       "inherit_rotation": bool(bone.use_inherit_rotation),
                       "use_connect": bool(bone.use_connect),
+                      "select": selection.get(bone.name, False),
+                      "envelope_distance": float(bone.envelope_distance),
+                      "envelope_weight": float(bone.envelope_weight),
+                      "head_radius": float(bone.head_radius),
+                      "tail_radius": float(bone.tail_radius),
                       "bbone_settings": _armature_bbone_settings(bone)})
     return {"name": armature.name_full, "potter_id": armature.get("potter.id"),
             "library": library_reference(armature),
@@ -1617,6 +1851,17 @@ def _quaternion_from_native(value):
     return (w, x, y, z)
 
 
+def _same_rotation(first, second):
+    """True when two quaternions in the same component order are bit-identical up to overall sign.
+
+    Potter's loader canonicalizes quaternion sign (q and -q are one rotation), so an imported value can
+    come back negated. Components are compared exactly; nothing is tolerated.
+    """
+    first = [float(value) for value in first]
+    second = [float(value) for value in second]
+    return first == second or first == [-value for value in second]
+
+
 def _attribute_item_value(item, data_type):
     if data_type in MESH_COLOR_TYPES:
         return plain(item.color)
@@ -1714,6 +1959,17 @@ def _vertex_groups_dump(obj):
     return result
 
 
+def _rotation_quaternion(source):
+    """A bone's or object's rotation as a Quaternion, read from the field its rotation mode uses."""
+    mode = source.rotation_mode
+    if mode == "QUATERNION":
+        return source.rotation_quaternion.copy()
+    if mode == "AXIS_ANGLE":
+        angle, *axis = source.rotation_axis_angle
+        return Quaternion(axis, angle)
+    return source.rotation_euler.to_quaternion()
+
+
 def _pose_dump(obj):
     result = []
     if obj.type != "ARMATURE" or obj.pose is None:
@@ -1723,12 +1979,9 @@ def _pose_dump(obj):
         constraints = inverse_map.get(bone.name, {})
         result.append({"bone": bone.name, "location": plain(bone.location),
                        "rotation_mode": bone.rotation_mode,
-                       "rotation_quaternion": [
-                           bone.rotation_quaternion.w,
-                           bone.rotation_quaternion.x,
-                           bone.rotation_quaternion.y,
-                           bone.rotation_quaternion.z,
-                       ],
+                       "rotation_quaternion": list(_rotation_quaternion(bone)),
+                       "rotation_euler": plain(bone.rotation_euler),
+                       "rotation_axis_angle": plain(bone.rotation_axis_angle),
                        "scale": plain(bone.scale),
                        "lock_ik": [bool(bone.lock_ik_x), bool(bone.lock_ik_y),
                                   bool(bone.lock_ik_z)],
@@ -1743,6 +1996,16 @@ def _pose_dump(obj):
                                         float(bone.ik_stiffness_y),
                                         float(bone.ik_stiffness_z)],
                        "ik_stretch": float(bone.ik_stretch),
+                       "bbone_curveinx": float(bone.bbone_curveinx),
+                       "bbone_curveinz": float(bone.bbone_curveinz),
+                       "bbone_curveoutx": float(bone.bbone_curveoutx),
+                       "bbone_curveoutz": float(bone.bbone_curveoutz),
+                       "bbone_rollin": float(bone.bbone_rollin),
+                       "bbone_rollout": float(bone.bbone_rollout),
+                       "bbone_scalein": plain(bone.bbone_scalein),
+                       "bbone_scaleout": plain(bone.bbone_scaleout),
+                       "bbone_easein": float(bone.bbone_easein),
+                       "bbone_easeout": float(bone.bbone_easeout),
                        "constraints": [
                            _constraint_dump(constraint, constraints.get(constraint.name))
                            for constraint in bone.constraints
@@ -1790,7 +2053,10 @@ def _override_dump(obj):
             mapped = path_map.get(path)
             if mapped is None:
                 continue
-            value = getattr(obj, mapped[1])
+            if path in ("rotation_euler", "rotation_quaternion"):
+                value = plain(_rotation_quaternion(obj))
+            else:
+                value = getattr(obj, mapped[1])
             for operation in property_override.operations:
                 name = operation.operation.lower()
                 if name == "replace":
@@ -2460,7 +2726,8 @@ def _startup_metadata_datablock(collection_name, block):
 def other_datablocks_dump():
     known = {"actions", "armatures", "cache_files", "cameras", "collections", "curves", "fonts",
              "grease_pencils", "images", "libraries", "lights", "materials", "meshes",
-             "movieclips", "node_groups", "objects", "scenes", "texts", "volumes", "worlds"}
+             "movieclips", "node_groups", "objects", "scenes", "texts", "textures", "volumes",
+             "worlds"}
     result = []
     for collection_name in dir(bpy.data):
         if collection_name.startswith("_") or collection_name in known:
@@ -2486,19 +2753,25 @@ def _alpha_mode_of(material):
     """Potter alpha mode of a Blender material.
 
     The `potter.alpha_mode` marker is used while it agrees with `surface_render_method` (`blend` is
-    BLENDED; `opaque` and `clip` are DITHERED). Without a usable marker, BLENDED is `blend`, and DITHERED is
-    `opaque`: Blender 5.2 never thresholds alpha (`alpha_threshold` is read only by the 4.2 versioning,
-    `versioning_420.cc`), so a DITHERED material's transparency is its graph's, which `opaque` leaves to the graph.
+    BLENDED; `opaque` and `clip` are DITHERED). Without a usable marker, BLENDED is `blend`. A DITHERED material is
+    `clip` when its Principled Alpha is Blender's glTF MASK clip (`_clip_cutoff`), else `opaque`: Blender 5.2 never
+    thresholds alpha (`alpha_threshold` is read only by the 4.2 versioning, `versioning_420.cc`), so a DITHERED
+    material's transparency is its graph's, and only the clip graph reads back as a threshold.
     """
     blended = material.surface_render_method == "BLENDED"
     marker = material.get(ALPHA_MODE_PROPERTY)
     if marker in ALPHA_MODES and (marker == "blend") == blended:
         return marker
-    return "blend" if blended else "opaque"
+    if blended:
+        return "blend"
+    # A DITHERED material whose Alpha is Blender's glTF MASK clip is clip, as the glTF importer makes it.
+    return "clip" if _clip_cutoff(material) is not None else "opaque"
 
 
 def material_dump(material):
     base_color = plain(material.diffuse_color)
+    alpha_mode = _alpha_mode_of(material)
+    cutoff = _clip_cutoff(material)
     metallic = float(getattr(material, "metallic", 0.0))
     roughness = float(getattr(material, "roughness", 0.8))
     emission_color = [0.0, 0.0, 0.0]
@@ -2541,8 +2814,8 @@ def material_dump(material):
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
             "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
-            "alpha_mode": _alpha_mode_of(material),
-            "alpha_threshold": float(material.alpha_threshold),
+            "alpha_mode": alpha_mode,
+            "alpha_threshold": cutoff if alpha_mode == "clip" and cutoff is not None else float(material.alpha_threshold),
             "nodes": tree_dump(material.node_tree),
             "custom_properties": {key: value for key, value in custom_props(material).items()
                                   if key != ALPHA_MODE_PROPERTY},
@@ -2552,6 +2825,8 @@ def material_dump(material):
 
 
 def dump_all():
+    # The probe texture is created and removed here, before any loop iterates bpy.data.textures.
+    _image_texture_defaults()
     for volume in getattr(bpy.data, "volumes", ()):
         try:
             volume.grids.load()
@@ -2716,7 +2991,8 @@ def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
                 continue
             if strict:
                 if isinstance(current, Matrix) and isinstance(value, (list, tuple)):
-                    _set_required(block, key, Matrix(value), owner)
+                    _set_required(
+                        block, key, Matrix(matrix_rows_from_column_major(value)), owner)
                     continue
                 if hasattr(current, "bl_rna"):
                     if value not in (None, {"rna_type": current.bl_rna.identifier}):
@@ -2734,6 +3010,8 @@ def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
             if (getattr(property_definition, "is_enum_flag", False)
                     and isinstance(value, (list, tuple))):
                 value = set(value)
+            if isinstance(current, Matrix) and isinstance(value, (list, tuple)):
+                value = Matrix(matrix_rows_from_column_major(value))
             if isinstance(current, (int, float, bool, str)) or hasattr(current, "__len__"):
                 setattr(block, key, value)
         except Exception:
@@ -2741,23 +3019,130 @@ def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
                 raise
             continue
 
-def _restore_modifier_id_references(modifier, params, id_lookup):
+def _id_matches_pointer_type(candidate, pointer_type):
+    # Typed textures report type-specific RNA identifiers (CloudsTexture, ImageTexture), so a
+    # Texture pointer matches by Python type.
+    if pointer_type == "Texture":
+        return isinstance(candidate, bpy.types.Texture)
+    return candidate.bl_rna.identifier == pointer_type
+
+
+def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup,
+                                    lost_texture_ids=frozenset()):
     for key, value in params.items():
         if not hasattr(modifier, key):
             continue
         pointer_type = _blender_id_pointer_type(modifier, key, getattr(modifier, key))
-        if pointer_type not in ("Object", "Collection") or value is None:
+        if pointer_type not in ("Object", "Collection", "Texture") or value is None:
             continue
         name = value.get("name") if isinstance(value, dict) else value
-        candidate = id_lookup.get(name) if isinstance(name, str) else None
+        lookup = texture_lookup if pointer_type == "Texture" else id_lookup
+        candidate = lookup.get(name) if isinstance(name, str) else None
+        if candidate is None and pointer_type == "Texture" and name in lost_texture_ids:
+            # Rust reports a native Value Noise texture as a loss; the modifier keeps no texture.
+            continue
         if (candidate is None
-                or candidate.bl_rna.identifier != pointer_type
+                or not _id_matches_pointer_type(candidate, pointer_type)
                 or (isinstance(value, dict)
                     and value.get("id_type") != pointer_type)):
             raise ValueError(
-                "modifier %s references unavailable %s ID %s"
-                % (modifier.name, pointer_type, name))
+                "modifier %s property %s references unavailable %s ID %s"
+                % (modifier.name, key, pointer_type, name))
         setattr(modifier, key, candidate)
+
+
+# ImageUser.layer/pass/view are DNA shorts that RNA exposes read-only (rna_image.cc:877-890),
+# so RNA writes are refused. Blender 5.2.2 source/blender/makesdna/DNA_image_types.h, struct
+# ImageUser (sizeof 40 on 64-bit): scene 0, framenr 8, frames 12, offset 16, sfra 20, cycl 24,
+# multiview_eye 25, pass 26, tile 28, multi_index 32, view 34, layer 36, flag 38.
+IMAGE_USER_MULTILAYER_DNA_OFFSETS = {
+    "multilayer_pass": 26,
+    "multilayer_view": 34,
+    "multilayer_layer": 36,
+}
+
+
+def _restore_image_user_multilayer(image_user, values, owner):
+    if not values:
+        return
+    if bpy.app.version[:2] != (5, 2):
+        raise ValueError("%s cannot restore multilayer selection on Blender %s; "
+                         "the ImageUser DNA offsets are pinned to 5.2"
+                         % (owner, bpy.app.version_string))
+    address = image_user.as_pointer()
+    for key, value in values.items():
+        if not isinstance(value, int) or not 0 <= value <= 32767:
+            raise ValueError("%s has invalid %s" % (owner, key))
+        offset = address + IMAGE_USER_MULTILAYER_DNA_OFFSETS[key]
+        ctypes.c_short.from_address(offset).value = value
+        if getattr(image_user, key) != value:
+            raise ValueError("%s cannot restore %s" % (owner, key))
+
+
+def _legacy_textures_from_doc(doc, image_map):
+    textures = {}
+    adapter = doc.get("compatibility", {}).get("blender_adapter", {})
+    texture_names = adapter.get("legacy_texture_names", {})
+    for texture_id, record in doc.get("resources", {}).items():
+        if (record.get("storage") != "inline"
+                or record.get("kind") != "legacy_texture"):
+            continue
+        texture_type = record.get("texture_type")
+        if texture_type == "NATIVE_VALUE_NOISE":
+            continue
+        if texture_type not in LEGACY_TEXTURE_SETTINGS:
+            raise ValueError("unsupported inline legacy Texture type %s" % texture_type)
+        texture = bpy.data.textures.new(
+            texture_names.get(texture_id, texture_id), type=texture_type)
+        set_id(texture, texture_id)
+        settings = dict(record.get("settings", {}))
+        color_ramp_settings = settings.pop("color_ramp", None)
+        image_user_settings = settings.pop("image_user", {})
+        if texture_type == "IMAGE":
+            image_id = record.get("image")
+            if image_id is not None:
+                image = image_map.get(image_id)
+                if image is None:
+                    raise ValueError("legacy Image Texture references unavailable Image %s"
+                                     % image_id)
+                texture.image = image
+            image_user_owner = "legacy Image Texture %s image_user" % texture_id
+            multilayer_settings = {key: image_user_settings[key]
+                                   for key in IMAGE_USER_MULTILAYER_KEYS
+                                   if key in image_user_settings}
+            set_rna(texture.image_user,
+                    {key: value for key, value in image_user_settings.items()
+                     if key not in IMAGE_USER_MULTILAYER_KEYS},
+                    strict=True, owner=image_user_owner)
+            _restore_image_user_multilayer(texture.image_user, multilayer_settings,
+                                           image_user_owner)
+        elif image_user_settings:
+            raise ValueError("non-IMAGE legacy Texture has image_user settings")
+        if color_ramp_settings is not None:
+            if texture_type != "IMAGE" or not hasattr(texture, "color_ramp"):
+                raise ValueError("legacy Texture %s cannot restore its ColorRamp"
+                                 % texture_id)
+            # Blender allocates a texture's ColorRamp only while use_color_ramp is set.
+            if texture.color_ramp is None:
+                texture.use_color_ramp = True
+            _restore_color_ramp(
+                texture.color_ramp, color_ramp_settings,
+                "legacy Image Texture %s ColorRamp" % texture_id)
+        set_rna(texture, settings, strict=True,
+                owner="legacy Texture %s" % texture_id)
+        textures[texture_id] = texture
+    for node in doc.get("nodes", {}).values():
+        for modifier in node.get("modifiers", []):
+            image_id = modifier.get("params", {}).get("texture")
+            if image_id not in doc.get("images", {}) or image_id in textures:
+                continue
+            image = image_map.get(image_id)
+            if image is None:
+                raise ValueError("modifier references unavailable Image %s" % image_id)
+            texture = bpy.data.textures.new(image.name_full, type="IMAGE")
+            texture.image = image
+            textures[image_id] = texture
+    return textures
 
 
 def _create_modifier(obj, name, modifier_type):
@@ -3086,7 +3471,6 @@ def _restore_modifier_stack(obj, modifier_items):
     return modifiers_by_id
 
 
-
 def _ensure_dynamic_paint_role(modifier, obj, role):
     settings_name = "brush_settings" if role == "brush" else "canvas_settings"
     settings = getattr(modifier, settings_name, None)
@@ -3283,7 +3667,7 @@ def _restore_multires_displacement(modifier, obj, doc, target, node_id, pack):
             os.unlink(seed_path)
 
 
-def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pack):
+def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, node_id, obj, pack):
     params = item.get("params", {})
     kind = item.get("type")
     physics_property = {
@@ -3308,15 +3692,36 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pa
         dynamic_paint_temporary_link = _ensure_dynamic_paint_role(
             modifier, obj, settings["role"])
     rna_params = dict(params)
-    for parameter in ("projectors", "resource", "is_bound", "cache_filepath", "map_curve"):
+    for parameter in (
+        "projectors",
+        "resource",
+        "is_bound",
+        "cache_filepath",
+        "map_curve",
+        "falloff_curve",
+        "falloff_curve_settings",
+    ):
         rna_params.pop(parameter, None)
+    texture_id = params.get("texture")
+    texture_record = doc.get("resources", {}).get(texture_id, {})
+    if (texture_record.get("storage") == "inline"
+            and texture_record.get("kind") == "legacy_texture"
+            and texture_record.get("texture_type") == "NATIVE_VALUE_NOISE"):
+        rna_params.pop("texture", None)
+        modifier.texture = None
     if kind == "multires":
         for parameter in (
             "total_levels", "is_external", "levels", "sculpt_levels", "render_levels", "filepath",
         ):
             rna_params.pop(parameter, None)
     set_rna(modifier, rna_params, id_lookup)
-    _restore_modifier_id_references(modifier, rna_params, id_lookup)
+    lost_texture_ids = {
+        texture_id
+        for texture_id, record in doc.get("resources", {}).items()
+        if record.get("texture_type") == "NATIVE_VALUE_NOISE"
+    }
+    _restore_modifier_id_references(modifier, rna_params, id_lookup, texture_lookup,
+                                    lost_texture_ids)
     if kind == "multires":
         total_levels = int(params.get("total_levels", modifier.total_levels))
         if not 0 <= total_levels <= 13:
@@ -3338,6 +3743,10 @@ def set_modifier_params(modifier, item, id_lookup, doc, target, node_id, obj, pa
                 modifier.filepath = params["filepath"]
     if kind in ("vertex_weight_edit", "vertex_weight_proximity") and "map_curve" in params:
         _set_curve_mapping(modifier, params["map_curve"])
+    if kind in ("hook", "warp") and "falloff_curve" in params:
+        _set_falloff_curve_mapping(
+            modifier.falloff_curve, params["falloff_curve"], "modifier falloff_curve",
+            params.get("falloff_curve_settings"))
     if kind == "mesh_cache" and params.get("resource"):
         filepath = _resource_path(doc, params["resource"])
         if not filepath or not os.path.isfile(filepath):
@@ -3478,6 +3887,13 @@ def _same_mesh_topology(left, right):
     )
 
 
+# Bind formats whose bound modifiers a source .blend can reproduce natively, keyed by bind format.
+NATIVE_BIND_KINDS = {
+    "blender_native_bind_v1": ("surface_deform", "mesh_deform", "laplacian_deform"),
+    "blender_corrective_bind_v1": ("corrective_smooth",),
+}
+
+
 def _source_modifier_object_copies(doc, mesh_map):
     source_path = doc.get("blender_original_blend_path")
     if not source_path or not os.path.isfile(source_path):
@@ -3485,10 +3901,8 @@ def _source_modifier_object_copies(doc, mesh_map):
     source_names = set()
     for node_id, node in doc.get("nodes", {}).items():
         if not any(
-            ((modifier.get("binding_data") or {}).get("format")
-             == "blender_native_bind_v1"
-             and modifier.get("type") in (
-                 "surface_deform", "mesh_deform", "laplacian_deform"))
+            modifier.get("type") in NATIVE_BIND_KINDS.get(
+                (modifier.get("binding_data") or {}).get("format"), ())
             or modifier.get("type") in ("boolean", "decimate", "solidify")
             for modifier in node.get("modifiers", [])
         ):
@@ -3537,8 +3951,7 @@ def _source_modifier_object_copies(doc, mesh_map):
             if not source_topology_matches:
                 continue
             kind = item.get("type")
-            if (binding_data.get("format") != "blender_native_bind_v1"
-                    or kind not in ("surface_deform", "mesh_deform", "laplacian_deform")):
+            if kind not in NATIVE_BIND_KINDS.get(binding_data.get("format"), ()):
                 continue
             native = source_obj.modifiers.get(item.get("name"))
             if (native is None or native.type != blender_modifier_type(kind)
@@ -3570,7 +3983,7 @@ def _source_modifier_object_copies(doc, mesh_map):
             copied.vertex_groups.remove(group)
         for modifier in list(copied.modifiers):
             if (modifier.type in (
-                    "SURFACE_DEFORM", "MESH_DEFORM", "LAPLACIANDEFORM")
+                    "SURFACE_DEFORM", "MESH_DEFORM", "LAPLACIANDEFORM", "CORRECTIVE_SMOOTH")
                     and modifier.name not in native_names):
                 copied.modifiers.remove(modifier)
         copies[node_id] = copied
@@ -3597,11 +4010,77 @@ def _source_modifier_object_copies(doc, mesh_map):
     return copies, preserved
 
 
+def _bind_corrective_smooth(obj, modifier, binding_data, operator):
+    """Bind a Corrective Smooth modifier to its serialized bind-input coordinates.
+
+    Blender captures the bind from the modifier input: the evaluated stack before the modifier.
+    The bind is reproduced on a copy of that evaluated input, with the serialized coordinates as
+    its vertex positions, so a geometry-changing prefix such as Subdivision binds correctly.
+    Preceding modifiers stay hidden only while the operator runs, so their output is not applied to
+    the coordinates a second time. Every visibility flag and the object's mesh are restored on error.
+    """
+    if binding_data.get("format") != "blender_corrective_bind_v1":
+        raise ValueError("corrective smooth %s has an unsupported bind format" % modifier.name)
+    coords = binding_data.get("coords")
+    if not isinstance(coords, list) or any(
+            not isinstance(coord, (list, tuple)) or len(coord) != 3 for coord in coords):
+        raise ValueError("corrective smooth %s has malformed bind coordinates" % modifier.name)
+    view_layer = bpy.context.view_layer
+    stack = list(obj.modifiers)
+    index = [item.name for item in stack].index(modifier.name)
+    visibility = [(item, item.show_viewport, item.show_render) for item in stack]
+
+    def restore_visibility():
+        for item, show_viewport, show_render in visibility:
+            item.show_viewport = show_viewport
+            item.show_render = show_render
+
+    original_mesh = obj.data
+    bind_mesh = None
+    try:
+        # Capture the bind input with this modifier and every later one hidden.
+        for item in stack[index:]:
+            item.show_viewport = False
+        view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated = obj.evaluated_get(depsgraph)
+        # preserve_all_data_layers=True needs the depsgraph; without it Blender returns None.
+        input_mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+        if input_mesh is None:
+            raise RuntimeError("corrective smooth %s on %s has no input mesh"
+                               % (modifier.name, obj.name))
+        try:
+            if len(input_mesh.vertices) != len(coords):
+                raise ValueError(
+                    "corrective smooth %s on %s has %d input vertices but %d bind coordinates"
+                    % (modifier.name, obj.name, len(input_mesh.vertices), len(coords)))
+            bind_mesh = input_mesh.copy()
+        finally:
+            evaluated.to_mesh_clear()
+        restore_visibility()
+        for item in stack[:index]:
+            item.show_viewport = False
+            item.show_render = False
+        obj.data = bind_mesh
+        _set_mesh_coordinates(obj, coords)
+        view_layer.update()
+        result = operator(modifier=modifier.name)
+        if "FINISHED" not in result:
+            raise ValueError("Blender did not bind modifier %s" % modifier.name)
+    finally:
+        restore_visibility()
+        obj.data = original_mesh
+        view_layer.update()
+        if bind_mesh is not None:
+            bpy.data.meshes.remove(bind_mesh)
+
+
 def _bind_blender_modifiers(doc, object_map, preserved_native_binds):
     operators = {
         "surface_deform": bpy.ops.object.surfacedeform_bind,
         "mesh_deform": bpy.ops.object.meshdeform_bind,
         "laplacian_deform": bpy.ops.object.laplaciandeform_bind,
+        "corrective_smooth": bpy.ops.object.correctivesmooth_bind,
     }
     view_layer = bpy.context.view_layer
     for node_id, node in doc.get("nodes", {}).items():
@@ -3635,6 +4114,9 @@ def _bind_blender_modifiers(doc, object_map, preserved_native_binds):
                     bpy.ops.object.mode_set(mode="OBJECT")
                 obj.select_set(True)
                 view_layer.objects.active = obj
+                if item.get("type") == "corrective_smooth":
+                    _bind_corrective_smooth(obj, modifier, binding_data, operator)
+                    continue
                 seen_meshes = set()
                 for bind_node_id, bind_obj in bind_objects:
                     if bind_obj.type != "MESH":
@@ -4782,7 +5264,6 @@ def _restore_vertex_groups(obj, groups):
     if group_ids:
         obj["potter.vertex_group_ids_json"] = json.dumps(group_ids, sort_keys=True)
 
-
 def _restore_grease_pencil(data, raw, materials):
     for layer_raw in raw.get("layers", []):
         layer = data.layers.new(layer_raw["name"], set_active=True)
@@ -4905,6 +5386,11 @@ def _restore_armature(obj, source, scene):
                 bone.use_deform = bool(item.get("deform", True))
                 bone.use_inherit_rotation = bool(item.get("inherit_rotation", True))
                 bone.use_connect = bool(item.get("use_connect", False))
+                bone.select = bool(item.get("select", False))
+                bone.envelope_distance = float(item.get("envelope_distance", 0.25))
+                bone.envelope_weight = float(item.get("envelope_weight", 1.0))
+                bone.head_radius = float(item.get("head_radius", 0.1))
+                bone.tail_radius = float(item.get("tail_radius", 0.1))
                 if item.get("potter_id"):
                     bone_ids[bone.name] = item["potter_id"]
                 edit_bones[item["name"]] = bone
@@ -4981,10 +5467,15 @@ def _canonical_pose(doc, node, source_pose):
         source = by_bone.get(bone) or {}
         merged = dict(source)
         merged["bone"] = bone
+        # The imported Blender rotation, kept beside the model rotation so _restore_pose can compare exactly.
+        merged["source_rotation_quaternion"] = source.get("rotation_quaternion")
         merged.update({key: model_item[key] for key in
                        ("location", "rotation_quaternion", "scale", "lock_ik",
                         "use_ik_limit", "ik_min", "ik_max", "ik_stiffness",
-                        "ik_stretch")})
+                        "ik_stretch", "bbone_curveinx", "bbone_curveinz",
+                        "bbone_curveoutx", "bbone_curveoutz", "bbone_rollin",
+                        "bbone_rollout", "bbone_scalein", "bbone_scaleout",
+                        "bbone_easein", "bbone_easeout")})
         source_constraints = {item.get("name"): item
                               for item in source.get("constraints", [])}
         constraints = []
@@ -5138,18 +5629,43 @@ def _restore_pose(obj, pose, id_lookup, doc, target):
         bone = obj.pose.bones.get(item.get("bone"))
         if bone is None:
             raise ValueError("pose references missing armature bone %s" % item.get("bone"))
+        # Source mode and new mode are the same payload field: the pose path has no separate model mode.
         bone.rotation_mode = item.get("rotation_mode", "QUATERNION")
         rotation = item.get("rotation_quaternion", (1.0, 0.0, 0.0, 0.0))
+        quaternion = Quaternion(rotation)
+        # The imported rotation (source_rotation_quaternion, set by _canonical_pose) is compared exactly; the
+        # stored Euler or axis-angle values are written back only while the rotation is still identical to it.
+        stored_rotation = item.get("source_rotation_quaternion")
+        source_rotation_unchanged = (
+            isinstance(stored_rotation, (list, tuple)) and len(stored_rotation) == 4
+            and _same_rotation(stored_rotation, rotation)
+        )
+        axis_angle = item.get("rotation_axis_angle")
+        euler = item.get("rotation_euler")
         if bone.rotation_mode == "QUATERNION":
             bone.rotation_quaternion = rotation
         elif bone.rotation_mode == "AXIS_ANGLE":
-            angle, axis = Quaternion((rotation[0], rotation[1], rotation[2], rotation[3])).to_axis_angle()
-            bone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+            if source_rotation_unchanged and isinstance(axis_angle, (list, tuple)) and len(axis_angle) == 4:
+                bone.rotation_axis_angle = axis_angle
+            else:
+                axis, angle = quaternion.to_axis_angle()
+                bone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+        elif source_rotation_unchanged and isinstance(euler, (list, tuple)) and len(euler) == 3:
+            bone.rotation_euler = euler
         else:
-            bone.rotation_euler = Quaternion(
-                (rotation[0], rotation[1], rotation[2], rotation[3])).to_euler(
-                    bone.rotation_mode)
+            bone.rotation_euler = quaternion.to_euler(bone.rotation_mode)
+        bone.location = item.get("location", (0.0, 0.0, 0.0))
         bone.scale = item.get("scale", (1.0, 1.0, 1.0))
+        bone.bbone_curveinx = item.get("bbone_curveinx", 0.0)
+        bone.bbone_curveinz = item.get("bbone_curveinz", 0.0)
+        bone.bbone_curveoutx = item.get("bbone_curveoutx", 0.0)
+        bone.bbone_curveoutz = item.get("bbone_curveoutz", 0.0)
+        bone.bbone_rollin = item.get("bbone_rollin", 0.0)
+        bone.bbone_rollout = item.get("bbone_rollout", 0.0)
+        bone.bbone_scalein = item.get("bbone_scalein", (1.0, 1.0, 1.0))
+        bone.bbone_scaleout = item.get("bbone_scaleout", (1.0, 1.0, 1.0))
+        bone.bbone_easein = item.get("bbone_easein", 0.0)
+        bone.bbone_easeout = item.get("bbone_easeout", 0.0)
         bone.lock_ik_x, bone.lock_ik_y, bone.lock_ik_z = item.get(
             "lock_ik", (False, False, False))
         bone.use_ik_limit_x, bone.use_ik_limit_y, bone.use_ik_limit_z = item.get(
@@ -5193,7 +5709,12 @@ def _armature_from_model(doc, data_id, source):
     armature = doc.get("data_blocks", {}).get(data_id, {}).get("armature", {})
     bones = armature.get("bones", {})
     model_bones = {}
-    for identifier, bone in bones.items():
+    ordered_bones = dict.fromkeys(
+        [identifier for identifier in armature.get("bone_order", []) if identifier in bones]
+        + list(bones)
+    )
+    for identifier in ordered_bones:
+        bone = bones[identifier]
         parent = bones.get(bone.get("parent"), {})
         model_bones[bone.get("name", identifier)] = {
             "name": bone.get("name", identifier),
@@ -5205,6 +5726,11 @@ def _armature_from_model(doc, data_id, source):
             "deform": bone.get("deform", True),
             "inherit_rotation": bone.get("inherit_rotation", True),
             "use_connect": bone.get("use_connect", False),
+            "select": bone.get("select", False),
+            "envelope_distance": bone.get("envelope_distance", 0.25),
+            "envelope_weight": bone.get("envelope_weight", 1.0),
+            "head_radius": bone.get("head_radius", 0.1),
+            "tail_radius": bone.get("tail_radius", 0.1),
             "bbone_settings": bone.get("bbone_settings", {}),
         }
     result = dict(source)
@@ -5253,7 +5779,7 @@ def _pose_from_model(doc, node):
         result.append({
             "bone": bone.get("name", bone_id),
             "location": pose.get("translation", [0.0, 0.0, 0.0]),
-            "rotation_quaternion": [rotation[3], rotation[0], rotation[1], rotation[2]],
+            "rotation_quaternion": list(_quaternion_from_native(rotation)),
             "scale": pose.get("scale", [1.0, 1.0, 1.0]),
             "lock_ik": pose.get("lock_ik", [False, False, False]),
             "use_ik_limit": pose.get("use_ik_limit", [False, False, False]),
@@ -5261,6 +5787,16 @@ def _pose_from_model(doc, node):
             "ik_max": pose.get("ik_max", [math.pi, math.pi, math.pi]),
             "ik_stiffness": pose.get("ik_stiffness", [0.0, 0.0, 0.0]),
             "ik_stretch": pose.get("ik_stretch", 0.0),
+            "bbone_curveinx": pose.get("bbone_curveinx", 0.0),
+            "bbone_curveinz": pose.get("bbone_curveinz", 0.0),
+            "bbone_curveoutx": pose.get("bbone_curveoutx", 0.0),
+            "bbone_curveoutz": pose.get("bbone_curveoutz", 0.0),
+            "bbone_rollin": pose.get("bbone_rollin", 0.0),
+            "bbone_rollout": pose.get("bbone_rollout", 0.0),
+            "bbone_scalein": pose.get("bbone_scalein", [1.0, 1.0, 1.0]),
+            "bbone_scaleout": pose.get("bbone_scaleout", [1.0, 1.0, 1.0]),
+            "bbone_easein": pose.get("bbone_easein", 0.0),
+            "bbone_easeout": pose.get("bbone_easeout", 0.0),
             "constraints": constraints,
         })
     return result
@@ -5446,7 +5982,6 @@ def _resource_record_for_reference(doc, reference):
             return resource
     return None
 
-
 def _resource_path(doc, reference):
     resource = _resource_record_for_reference(doc, reference)
     path = (resource.get("export_path") if resource else None)
@@ -5494,7 +6029,6 @@ def _cache_file_for_resource(doc, reference, target, params=None):
             cache_file.name = identity
         set_rna(cache_file, resource.get("cache_file", {}), {}, strict=True,
                 owner="Alembic CacheFile")
-    params = params or {}
     if "frame_offset" in params:
         cache_file.frame_offset = float(params["frame_offset"])
     if "scale" in params:
@@ -6284,6 +6818,55 @@ def _nla_from_model(doc, node):
         tracks.append(track)
     return tracks
 
+def _constant_alpha(item):
+    """The Principled Alpha of a material whose alpha is not linked.
+
+    Clip is Blender's binary MASK: 1 where the base alpha reaches the cutoff, else 0, as the glTF importer sets a
+    factor-only MASK (`pbrMetallicRoughness.py` 630-640). Blend keeps the base alpha; opaque ignores it.
+    """
+    mode = item.get("alpha_mode", "opaque")
+    if mode == "opaque":
+        return 1.0
+    base_alpha = float(item["base_color"][3])
+    if mode == "clip":
+        return 1.0 if base_alpha >= float(item.get("alpha_threshold", 0.5)) else 0.0
+    return base_alpha
+
+
+def _clip_cutoff(material):
+    """The cutoff of Blender's glTF MASK clip in a material's surface, or None when there is none.
+
+    The surface is the active output's Surface input, which must come straight from a Principled BSDF's BSDF output:
+    a Mix Shader or any other node in between keeps the clip out of the surface, so it is not a clip. That Principled
+    Alpha must be the importer's `Alpha = SUBTRACT(1, LESS_THAN(x, cutoff))` (`pbrMetallicRoughness.py` 668-700):
+    LESS_THAN compares the alpha source `x` (a texture alpha, times the factor) with the cutoff, and SUBTRACT inverts
+    it. Any other shape is not a clip.
+    """
+    if material.node_tree is None:
+        return None
+    output = _material_output(material.node_tree)
+    surface = output.inputs.get("Surface") if output is not None else None
+    if surface is None or not surface.is_linked:
+        return None
+    link = surface.links[0]
+    shader = link.from_node
+    if shader.type != "BSDF_PRINCIPLED" or link.from_socket.name != "BSDF":
+        return None
+    alpha = shader.inputs.get("Alpha")
+    if alpha is None or not alpha.is_linked:
+        return None
+    subtract = alpha.links[0].from_node
+    if subtract.type != "MATH" or subtract.operation != "SUBTRACT" or not subtract.inputs[1].is_linked:
+        return None
+    first = subtract.inputs[0]
+    if first.is_linked or float(first.default_value) != 1.0:
+        return None
+    compare = subtract.inputs[1].links[0].from_node
+    if compare.type != "MATH" or compare.operation != "LESS_THAN" or compare.inputs[1].is_linked:
+        return None
+    return float(compare.inputs[1].default_value)
+
+
 def _set_principled_values(material, item):
     shader = next((node for node in material.node_tree.nodes
                    if node.type == "BSDF_PRINCIPLED"), None)
@@ -6293,9 +6876,9 @@ def _set_principled_values(material, item):
     shader.inputs["Metallic"].default_value = item["metallic"]
     alpha = shader.inputs.get("Alpha")
     if alpha is not None:
-        # Opaque ignores alpha, as Potter's renderer does; clip and blend keep the base color alpha.
-        alpha.default_value = (1.0 if item.get("alpha_mode", "opaque") == "opaque"
-                               else float(item["base_color"][3]))
+        # Opaque ignores alpha, as Potter's renderer does. Clip is binary, as Blender's glTF importer builds a
+        # factor-only MASK (`pbrMetallicRoughness.py` 630-640); blend keeps the base colour alpha.
+        alpha.default_value = _constant_alpha(item)
     shader.inputs["Roughness"].default_value = item["roughness"]
     emission = shader.inputs.get("Emission Color")
     if emission is None:
@@ -6735,7 +7318,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             bpy.data.collections.remove(collection)
     for collection_name in (
         "actions", "armatures", "cameras", "curves", "grease_pencils",
-        "images", "lights", "materials", "meshes", "node_groups", "volumes", "worlds",
+        "images", "lights", "materials", "meshes", "node_groups", "textures", "volumes", "worlds",
     ):
         collection = getattr(bpy.data, collection_name, None)
         if collection is None:
@@ -7214,57 +7797,32 @@ def export_doc(doc, target, pack, scene_hash, context):
             x, y, z, w = transform["rotation"]
             quaternion = Quaternion((w, x, y, z))
             source_rotation_mode = source_object.get("rotation_mode", "XYZ").upper()
-            source_rotation_values = source_object.get("rotation_quaternion")
             source_euler_values = source_object.get("rotation_euler")
             source_axis_angle = source_object.get("rotation_axis_angle")
-            if source_rotation_mode == "QUATERNION":
-                source_quaternion = (
-                    Quaternion(source_rotation_values)
-                    if isinstance(source_rotation_values, (list, tuple))
-                    and len(source_rotation_values) == 4
-                    else None
-                )
-            elif source_rotation_mode == "AXIS_ANGLE":
-                source_quaternion = (
-                    Quaternion(
-                        source_axis_angle[1:4], source_axis_angle[0])
-                    if isinstance(source_axis_angle, (list, tuple))
-                    and len(source_axis_angle) == 4
-                    else None
-                )
-            else:
-                source_quaternion = (
-                    Euler(source_euler_values, source_rotation_mode).to_quaternion()
-                    if isinstance(source_euler_values, (list, tuple))
-                    and len(source_euler_values) == 3
-                    else None
-                )
+            # The imported Potter rotation, stored at import. Source Euler and axis-angle values are reused only
+            # while the current rotation is bit-identical to it and the modes match; no tolerance.
+            stored_rotation = (item.get("properties", {}).get("blender_object_metadata") or {}).get(
+                "source_rotation")
             source_rotation_unchanged = (
-                source_quaternion is not None
+                isinstance(stored_rotation, (list, tuple)) and len(stored_rotation) == 4
+                and _same_rotation(stored_rotation, transform["rotation"])
                 and source_rotation_mode == obj.rotation_mode
-                and abs(abs(source_quaternion.dot(quaternion)) - 1.0) <= 1.0e-14
             )
+            axis_angle_source = isinstance(source_axis_angle, (list, tuple)) and len(source_axis_angle) == 4
+            euler_source = isinstance(source_euler_values, (list, tuple)) and len(source_euler_values) == 3
             if source_rotation_unchanged:
                 exact_rotation_nodes.add(node_id)
             if source_rotation_unchanged and obj.rotation_mode == "QUATERNION":
-                obj.rotation_quaternion = source_rotation_values
-            elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE":
-                source_axis_angle = source_object.get("rotation_axis_angle")
-                if isinstance(source_axis_angle, (list, tuple)) and len(source_axis_angle) == 4:
-                    obj.rotation_axis_angle = source_axis_angle
-                else:
-                    angle, axis = quaternion.to_axis_angle()
-                    obj.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
-            elif source_rotation_unchanged:
-                source_euler = source_object.get("rotation_euler")
-                if isinstance(source_euler, (list, tuple)) and len(source_euler) == 3:
-                    obj.rotation_euler = source_euler
-                else:
-                    obj.rotation_euler = quaternion.to_euler(obj.rotation_mode)
+                obj.rotation_quaternion = _quaternion_from_native(stored_rotation)
+            elif source_rotation_unchanged and obj.rotation_mode == "AXIS_ANGLE" and axis_angle_source:
+                obj.rotation_axis_angle = source_axis_angle
+            elif source_rotation_unchanged and obj.rotation_mode not in ("QUATERNION", "AXIS_ANGLE") \
+                    and euler_source:
+                obj.rotation_euler = source_euler_values
             elif obj.rotation_mode == "QUATERNION":
                 obj.rotation_quaternion = quaternion
             elif obj.rotation_mode == "AXIS_ANGLE":
-                angle, axis = quaternion.to_axis_angle()
+                axis, angle = quaternion.to_axis_angle()
                 obj.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
             else:
                 obj.rotation_euler = quaternion.to_euler(obj.rotation_mode)
@@ -7284,7 +7842,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         delta_rotation_quaternion = metadata.get("delta_rotation_quaternion")
         if (isinstance(delta_rotation_quaternion, (list, tuple))
                 and len(delta_rotation_quaternion) == 4):
-            obj.delta_rotation_quaternion = [float(value) for value in delta_rotation_quaternion]
+            obj.delta_rotation_quaternion = _quaternion_from_native(delta_rotation_quaternion)
         obj.hide_viewport = not item.get("visible", True)
         obj.hide_render = not item.get("render_visible", True)
         obj.hide_select = not item.get("selectable", True)
@@ -7342,6 +7900,7 @@ def export_doc(doc, target, pack, scene_hash, context):
     id_lookup.update({image.name_full: image for image in image_map.values()})
     id_lookup.update(image_map)
     id_lookup.update({image.name_full: image for image in linked_maps["resources"].values()})
+    texture_map = _legacy_textures_from_doc(doc, image_map)
     socket_maps = _populate_geometry_groups(group_map, group_sources, id_lookup)
     for material_id, item in doc.get("materials", {}).items():
         material = material_map.get(material_id)
@@ -7438,12 +7997,15 @@ def export_doc(doc, target, pack, scene_hash, context):
                 rna_item = dict(modifier_item, params={
                     key: value for key, value in params.items() if key != "use_pin_to_last"})
                 set_modifier_params(
-                    modifier, rna_item, id_lookup, doc, target, node_id, obj, pack)
+                    modifier, rna_item, id_lookup, texture_map, doc, target, node_id, obj, pack)
                 if modifier_item.get("type") == "mesh_sequence_cache":
-                    cache_file = _cache_file_for_resource(
-                        doc, params["resource"], target, params)
+                    resource_id = params.get("resource")
+                    cache_file = (
+                        _cache_file_for_resource(doc, resource_id, target, params)
+                        if resource_id else None
+                    )
                     modifier.cache_file = cache_file
-                    modifier.object_path = params["object_path"]
+                    modifier.object_path = params.get("object_path", "")
                 source_modifier = (
                     source_modifiers.get(modifier_item.get("id"))
                     or source_modifiers_by_rna_name.get(modifier_item.get("name"))
