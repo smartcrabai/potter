@@ -11,8 +11,8 @@ error.
 Cases: every subsurface method (burley, random_walk, random_walk_skin, random_walk_legacy) with Subsurface Weight
 1.0, and random_walk with Subsurface Weight 0.0 (no subsurface: the reference for the subsurface effect).
 
-Arguments after `--`: blend_out, json_out, and optionally a case name (burley, random_walk, random_walk_skin,
-random_walk_legacy, no_subsurface).
+Arguments after `--`: blend_out, json_out, and optionally a case name (burley, burley_bounce0, burley_floor_bounce1,
+random_walk, random_walk_anisotropic, random_walk_skin, random_walk_legacy, no_subsurface).
 """
 
 import json
@@ -37,19 +37,22 @@ POINT_POWER = 120.0
 DISK_LOCATION = Vector((2.5, -2.5, 3.5))
 DISK_SIZE = 1.5
 DISK_POWER = 300.0
-# (name, subsurface method, subsurface weight, max_bounces, floor). `burley_bounce0` is the Burley sphere with a zero
-# budget: Cycles still enters the surface and shades its exit, so the result is not black. `burley_floor_bounce1` shows
-# the floor below the sphere with a budget of one: the entry takes no bounce, the exit is the first scatter, and the
-# light leaving the exit reaches the floor and bounces off it to the camera. A bounce counted at the entry loses that
-# light, so this case tests the bounce count after a subsurface entry.
+# Each case is (name, subsurface method, subsurface weight, max_bounces, floor, subsurface anisotropy). `burley_bounce0` is
+# the Burley sphere with a zero budget: Cycles still enters the surface and shades its exit, so the result is not black.
+# `burley_floor_bounce1` shows the floor below the sphere with a budget of one: the entry takes no bounce, the exit is the
+# first scatter, and the light leaving the exit reaches the floor and bounces off it to the camera. A bounce counted at the
+# entry loses that light, so this case tests the bounce count after a subsurface entry. `random_walk_anisotropic` is the
+# random walk with g = 0.8: its phase function, the similarity medium after bounce 9 and the guided fractions use g, which
+# the isotropic cases leave at zero.
 CASES = [
-    ("burley", "BURLEY", 1.0, MAX_BOUNCES, False),
-    ("burley_bounce0", "BURLEY", 1.0, 0, False),
-    ("burley_floor_bounce1", "BURLEY", 1.0, 1, True),
-    ("random_walk", "RANDOM_WALK", 1.0, MAX_BOUNCES, False),
-    ("random_walk_skin", "RANDOM_WALK_SKIN", 1.0, MAX_BOUNCES, False),
-    ("random_walk_legacy", "RANDOM_WALK_LEGACY", 1.0, MAX_BOUNCES, False),
-    ("no_subsurface", "RANDOM_WALK", 0.0, MAX_BOUNCES, False),
+    ("burley", "BURLEY", 1.0, MAX_BOUNCES, False, 0.0),
+    ("burley_bounce0", "BURLEY", 1.0, 0, False, 0.0),
+    ("burley_floor_bounce1", "BURLEY", 1.0, 1, True, 0.0),
+    ("random_walk", "RANDOM_WALK", 1.0, MAX_BOUNCES, False, 0.0),
+    ("random_walk_anisotropic", "RANDOM_WALK", 1.0, MAX_BOUNCES, False, 0.8),
+    ("random_walk_skin", "RANDOM_WALK_SKIN", 1.0, MAX_BOUNCES, False, 0.0),
+    ("random_walk_legacy", "RANDOM_WALK_LEGACY", 1.0, MAX_BOUNCES, False, 0.0),
+    ("no_subsurface", "RANDOM_WALK", 0.0, MAX_BOUNCES, False, 0.0),
 ]
 
 
@@ -97,7 +100,6 @@ shader.inputs["Roughness"].default_value = 0.5
 shader.inputs["IOR"].default_value = 1.4
 shader.inputs["Subsurface Radius"].default_value = (1.0, 0.2, 0.1)
 shader.inputs["Subsurface Scale"].default_value = 6.0
-shader.inputs["Subsurface Anisotropy"].default_value = 0.0
 sphere.data.materials.append(material)
 # A floor 0.5 below the sphere, seen by no camera ray (the ortho frame spans z in [-1.3, 1.3]), lit only through the sphere.
 bpy.ops.mesh.primitive_plane_add(size=20.0, location=(0.0, 0.0, -1.5))
@@ -132,9 +134,10 @@ camera.location = CAMERA
 aim(camera, (0.0, 0.0, 0.0))
 scene.camera = camera
 
-# The saved file carries the first selected case's method, weight and floor, so an import reproduces that case.
+# The saved file carries the first selected case's method, weight, anisotropy and floor, so an import reproduces that case.
 shader.subsurface_method = CASES[0][1]
 shader.inputs["Subsurface Weight"].default_value = CASES[0][2]
+shader.inputs["Subsurface Anisotropy"].default_value = CASES[0][5]
 floor.hide_render = not CASES[0][4]
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
 
@@ -154,9 +157,10 @@ def frame_mean(path):
 
 
 results = {}
-for name, method, weight, budget, floor_on in CASES:
+for name, method, weight, budget, floor_on, anisotropy in CASES:
     shader.subsurface_method = method
     shader.inputs["Subsurface Weight"].default_value = weight
+    shader.inputs["Subsurface Anisotropy"].default_value = anisotropy
     scene.cycles.max_bounces = budget
     floor.hide_render = not floor_on
     seed_means = []
@@ -168,6 +172,7 @@ for name, method, weight, budget, floor_on in CASES:
     results[name] = {
         "method": method,
         "subsurface_weight": weight,
+        "subsurface_anisotropy": anisotropy,
         "max_bounces": budget,
         "floor": floor_on,
         "seed_means": seed_means,

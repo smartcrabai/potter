@@ -1653,7 +1653,7 @@ def _uv_layer_index(layers, attribute):
 MESH_HANDLED_KEYS = frozenset((
     "alembic_normals", "alembic_time_samples", "alembic_velocity", "blender_attributes", "blender_metadata", "blender_skin_vertices",
     "color_layers", "crease_edge", "custom_normal", "seam", "sharp", "shade_smooth", "skin_radii", "skin_roots",
-    "multires_displacement",
+    "multires_displacement", "subdivision_optimal_edges",
     "uv_layers",
     "vertex_groups",
 ))
@@ -2485,7 +2485,9 @@ def dump_scene(scene):
                 "samples": samples,
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
+                "volume_bounces": int(getattr(getattr(scene, "cycles", None), "volume_bounces", 0)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
+                "volume_biased": bool(getattr(getattr(scene, "cycles", None), "volume_biased", False)),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
@@ -6701,6 +6703,12 @@ def _material_field_values(material):
         "volume_density": 0.0,
         "volume_color": [0.5, 0.5, 0.5],
         "volume_anisotropy": 0.0,
+        "volume_sampling": {"DISTANCE": "distance", "EQUIANGULAR": "equiangular",
+                            "MULTIPLE_IMPORTANCE": "multiple_importance"}.get(
+            getattr(getattr(material, "cycles", None), "volume_sampling", "MULTIPLE_IMPORTANCE"),
+            "multiple_importance"),
+        "volume_interpolation": {"LINEAR": "linear", "CUBIC": "cubic"}.get(
+            getattr(getattr(material, "cycles", None), "volume_interpolation", "LINEAR"), "linear"),
     }
     output = _material_output(material.node_tree) if material.node_tree is not None else None
     if output is None:
@@ -7137,6 +7145,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
+            scene.cycles.volume_bounces = int(render.get("volume_bounces", 0))
             if "transparent_max_bounces" in render:
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine
@@ -7466,6 +7475,10 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
+        mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
+            item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")
+        mat.cycles.volume_interpolation = {"linear": "LINEAR", "cubic": "CUBIC"}.get(
+            item.get("volume_interpolation"), "LINEAR")
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
         set_props(mat, source.get("custom_properties", {}))

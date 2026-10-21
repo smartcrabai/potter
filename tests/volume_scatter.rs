@@ -88,7 +88,7 @@ fn make_scattering_scene(root: &Path) -> Result<std::path::PathBuf, Box<dyn Erro
             {"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,6.0]},"projection":"orthographic","ortho_scale":5.0},
             {"op":"light.create","id":"sun_main","light_type":"sun","energy":20.0,"transform":{"rotation":[0.0,FRAC_1_SQRT_2,0.0,FRAC_1_SQRT_2]}},
             {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}},
-            {"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":32,"resolution_y":32,"samples":32,"seed":712,"max_bounces":4}}
+            {"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":32,"resolution_y":32,"samples":32,"seed":712,"max_bounces":4,"volume_bounces":4}}
         ]
     });
     let operations_path = root.join("operations.json");

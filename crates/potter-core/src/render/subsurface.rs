@@ -5,15 +5,16 @@
 //! The profile is a radial density in the mean free path `d`. Cycles normalises it over the truncation radius
 //! `16 d`, and its mass there is `BURLEY_TRUNCATE_CDF`.
 //!
-//! Cycles 5.2.2 does not call `bssrdf_burley_setup` (the fitting term of the older Burley model), so the radius is
-//! the scaled Principled radius alone. Only the methods Potter evaluates are here; the random walk methods are
-//! reported as unsupported.
+//! Cycles 5.2.2 does not call `bssrdf_burley_setup` (the fitting term of the older Burley model), so the Burley radius
+//! is the scaled Principled radius times `0.25 / π` alone. The random walk method lives in `subsurface_walk.rs`; its
+//! radius is the scaled Principled radius unchanged. The skin, legacy and mixed methods are reported as unsupported.
 
 use std::f64::consts::PI;
 
 use glam::DVec3;
 
-use crate::shader::{BsdfParams, SubsurfaceMethod};
+use super::bvh::BvhHit;
+use crate::shader::BsdfParams;
 
 /// Cycles' `BSSRDF_MIN_RADIUS`: a channel with a smaller radius has no subsurface closure and falls back to diffuse.
 pub(crate) const MIN_RADIUS: f64 = 1.0e-8;
@@ -50,23 +51,30 @@ pub(crate) fn exit_params(params: &BsdfParams) -> BsdfParams {
 }
 
 /// Whether a Principled BSDF with these parameters has a subsurface closure Potter evaluates: a Subsurface Weight
-/// above zero under the Burley method, and not Thin Wall. Thin Wall takes Cycles' thin-subsurface closure and creates
-/// no BSSRDF (`svm/closure.h`, `bsdf_thin_subsurface_setup`). The random walk methods are reported as unsupported.
-pub(crate) fn burley_active(params: &BsdfParams) -> bool {
-    params.subsurface_weight > 0.0
-        && !params.thin_wall
-        && params.subsurface_method == SubsurfaceMethod::Burley
+/// above zero under a method that has an evaluated closure. `Mixed` has none, and is reported and dropped.
+pub(crate) fn subsurface_evaluated(params: &BsdfParams) -> bool {
+    params.subsurface_weight > 0.0 && params.subsurface_method.evaluated().is_some()
 }
 
-/// The radius before the Burley scaling: `subsurface_radius × subsurface_scale`, clamped at zero (`svm/closure.h`).
-/// Cycles tests the channels against `BSSRDF_MIN_RADIUS` on this radius, before `bssrdf_setup_radius` scales it.
+/// The channels' radius before any method factor: `subsurface_radius × subsurface_scale`, clamped at zero
+/// (`svm/closure.h`). Cycles tests a channel's minimum radius on this value (`bssrdf_setup`, before
+/// `bssrdf_setup_radius`), so the channel mask uses it for every method.
 pub(crate) fn raw_radius(params: &BsdfParams) -> DVec3 {
     DVec3::from_array(params.subsurface_radius).max(DVec3::ZERO) * params.subsurface_scale.max(0.0)
 }
 
-/// The Burley mean free path of each channel: the raw radius × `0.25 / π` (`bssrdf_setup_radius`).
+/// The Burley mean free path of each channel: the raw radius times `0.25 / π` (`bssrdf_setup_radius`).
 pub(crate) fn burley_radius(params: &BsdfParams) -> DVec3 {
     raw_radius(params) * (0.25 / PI)
+}
+
+/// Where a subsurface path leaves the surface: the exit hit, the origin and direction of the ray that reached it, and
+/// the path throughput after the entry and the probe or walk (Cycles writes the throughput back the same way).
+pub(crate) struct SubsurfaceExit {
+    pub(crate) hit: BvhHit,
+    pub(crate) origin: DVec3,
+    pub(crate) direction: DVec3,
+    pub(crate) throughput: DVec3,
 }
 
 /// The channels that take part in the profile: those whose raw radius is at least [`MIN_RADIUS`]. A channel below it
@@ -226,6 +234,7 @@ impl<T: Copy> ProbeHits<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shader::SubsurfaceMethod;
 
     /// Simpson's rule over `[a, b]`.
     fn simpson(a: f64, b: f64, n: usize, f: impl Fn(f64) -> f64) -> f64 {
@@ -320,33 +329,38 @@ mod tests {
     }
 
     #[test]
-    fn only_burley_with_a_weight_is_evaluated() {
-        assert!(burley_active(&principled(SubsurfaceMethod::Burley, 0.5)));
-        assert!(!burley_active(&principled(SubsurfaceMethod::Burley, 0.0)));
-        // The random walk methods are not evaluated: they must not render as Burley.
-        assert!(!burley_active(&principled(
+    fn the_four_named_methods_with_a_weight_are_evaluated() {
+        for method in [
+            SubsurfaceMethod::Burley,
             SubsurfaceMethod::RandomWalk,
-            0.5
-        )));
-        assert!(!burley_active(&principled(
             SubsurfaceMethod::RandomWalkSkin,
-            0.5
-        )));
-        assert!(!burley_active(&principled(
             SubsurfaceMethod::RandomWalkLegacy,
+        ] {
+            assert!(subsurface_evaluated(&principled(method, 0.5)), "{method:?}");
+            assert!(
+                !subsurface_evaluated(&principled(method, 0.0)),
+                "{method:?}"
+            );
+        }
+        // Mixed names two methods at once, which Potter's one parameter set cannot hold.
+        assert!(!subsurface_evaluated(&principled(
+            SubsurfaceMethod::Mixed,
             0.5
         )));
-        assert!(!burley_active(&principled(SubsurfaceMethod::Mixed, 0.5)));
     }
 
     #[test]
-    fn burley_radius_is_the_principled_radius_times_scale_over_four_pi() {
+    fn raw_radius_is_scaled_and_burley_takes_four_over_pi() {
         // Blender's default radius (1, 0.2, 0.1) and scale 0.005 (`svm/closure.h`, `bssrdf_setup_radius`).
-        let radius = burley_radius(&principled(SubsurfaceMethod::Burley, 1.0));
-        let factor = 0.005 * 0.25 / PI;
-        assert!((radius.x - factor).abs() < 1.0e-15, "{radius:?}");
-        assert!((radius.y - 0.2 * factor).abs() < 1.0e-15, "{radius:?}");
-        assert!((radius.z - 0.1 * factor).abs() < 1.0e-15, "{radius:?}");
+        let params = principled(SubsurfaceMethod::Burley, 1.0);
+        let raw = raw_radius(&params);
+        assert!((raw.x - 0.005).abs() < 1.0e-15, "{raw:?}");
+        assert!((raw.y - 0.001).abs() < 1.0e-15, "{raw:?}");
+        assert!((raw.z - 0.0005).abs() < 1.0e-15, "{raw:?}");
+        let burley = burley_radius(&params);
+        let factor = 0.25 / PI;
+        assert!((burley.x - 0.005 * factor).abs() < 1.0e-15, "{burley:?}");
+        assert!((burley.z - 0.0005 * factor).abs() < 1.0e-15, "{burley:?}");
     }
 
     #[test]
