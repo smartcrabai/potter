@@ -253,6 +253,16 @@ fn multires_deformed_base(
     Ok(Some(deformed))
 }
 
+/// Whether `mesh` stores per-face-corner data (a UV layer, or a corner-domain attribute such as a
+/// corner colour), which dynamic topology cannot keep.
+fn has_face_corner_data(mesh: &Mesh) -> bool {
+    !crate::geom::uv_layers::read(mesh).layers.is_empty()
+        || mesh.attributes.iter().any(|(name, attribute)| {
+            name != crate::geom::uv_layers::ATTRIBUTE
+                && attribute.get("domain").and_then(Value::as_str) == Some("corner")
+        })
+}
+
 fn apply_dyntopo(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     check_fields(
         engine,
@@ -320,6 +330,20 @@ fn apply_dyntopo(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 ErrorCode::InvalidOperation,
                 "dynamic topology is unavailable on a mesh with Multires detail",
                 "/dyntopo",
+            ));
+        }
+        if has_face_corner_data(&before) {
+            // Blender's dynamic topology warns this at enable time (`check_attribute_warning`,
+            // `sculpt_dyntopo.cc`): its rebuilt faces take default loop data.
+            engine.warnings.push(PotError::with_details(
+                ErrorCode::UnrepresentableFeature,
+                "Dyntopo will not preserve face sets, colors, UVs, or other attributes",
+                json!({
+                    "feature_id": "sculpt.dyntopo.face_data_lost",
+                    "operation_index": engine.operation_index,
+                    "pointer": "/dyntopo",
+                    "data_id": data_id.as_str(),
+                }),
             ));
         }
         let mut world_mesh = before;

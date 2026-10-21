@@ -91,12 +91,12 @@ fn albedo_from_colour(color: f64, g: f64) -> f64 {
         + 4.09712)
         .powi(2);
     let denominator = 1.0 - g * s_sq;
-    let alpha = if denominator != 0.0 {
-        (1.0 - s_sq) / denominator
+    let alpha = (1.0 - s_sq) / denominator;
+    if alpha.is_finite() {
+        alpha.clamp(0.0, 0.999_999)
     } else {
         0.0
-    };
-    alpha.clamp(0.0, 0.999_999)
+    }
 }
 
 /// A polynomial in the anisotropy with the given coefficients, lowest power first.
@@ -132,9 +132,9 @@ fn legacy_alpha(albedo: f64, g: f64) -> f64 {
                     31.149_158_143_3,
                     -201.847_017_512,
                     841.576_016_723,
-                    -2018.092_885_05,
-                    2731.715_602_86,
-                    -1935.414_242_44,
+                    -2_018.092_885_050,
+                    2_731.715_602_860,
+                    -1_935.414_242_440,
                     559.009_054_474,
                 ],
                 g,
@@ -173,11 +173,11 @@ fn legacy_alpha(albedo: f64, g: f64) -> f64 {
                     0.0,
                     76.731_625_395_2,
                     -594.356_773_233,
-                    2448.883_420_3,
-                    -5576.685_289_98,
-                    7116.601_719_12,
-                    -4763.544_678_87,
-                    1303.531_805_5,
+                    2_448.883_420_300,
+                    -5_576.685_289_980,
+                    7_116.601_719_120,
+                    -4_763.544_678_870,
+                    1_303.531_805_500,
                 ],
                 g,
             )
@@ -335,7 +335,7 @@ fn dipole_alpha_prime(rd: f64, fourth_third_a: f64) -> f64 {
     let (mut x0, mut x1) = (0.0, 1.0);
     let mut xmid = 0.0;
     for _ in 0..12 {
-        xmid = 0.5 * (x0 + x1);
+        xmid = f64::midpoint(x0, x1);
         if dipole_rd(xmid, fourth_third_a) < rd {
             x0 = xmid;
         } else {
@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn dwivedi_sampling_spans_the_cosine_range() {
-        let diffusion = 3.0;
+        let diffusion: f64 = 3.0;
         let phase_log = ((diffusion + 1.0) / (diffusion - 1.0)).ln();
         assert!((sample_phase_dwivedi(diffusion, phase_log, 0.0) + 1.0).abs() < 1e-12);
         assert!((sample_phase_dwivedi(diffusion, phase_log, 1.0) - 1.0).abs() < 1e-12);
@@ -795,7 +795,8 @@ mod tests {
     #[test]
     fn skin_entry_takes_the_diffuse_lobe_into_the_surface_half_the_time() {
         // Below one half the entry is a cosine lobe about −N: it points into the object.
-        let direction = skin_entry_direction(DVec3::Z, DVec3::Z, 1.4, 0.25, 0.3).expect("entry");
+        let direction =
+            skin_entry_direction(DVec3::Z, DVec3::Z, 1.4, 0.25, 0.3).unwrap_or(DVec3::ZERO);
         assert!(direction.dot(DVec3::Z) <= 0.0, "{direction:?}");
         assert!((direction.length() - 1.0).abs() < 1.0e-12);
     }

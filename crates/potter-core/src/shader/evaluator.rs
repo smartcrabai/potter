@@ -237,7 +237,7 @@ pub struct BsdfParams {
     pub subsurface_method: SubsurfaceMethod,
     /// The Principled Subsurface IOR, used by the random walk skin method's refractive entry.
     pub subsurface_ior: f64,
-    /// The Principled Subsurface Anisotropy, the phase function's g of the random walk.
+    /// The Principled Subsurface Anisotropy: the thin branch's reflection and transmission split (`bsdf_thin_subsurface_setup`), and the random walk's phase function g.
     pub subsurface_anisotropy: f64,
     pub coat_weight: f64,
     pub coat_roughness: f64,
@@ -259,8 +259,9 @@ pub struct BsdfParams {
     /// Oren-Nayar roughness of the diffuse lobe. Potter's diffuse lobe is Lambert, so a value above
     /// zero is reported as unevaluated (Cycles `bsdf_oren_nayar_setup`).
     pub diffuse_roughness: f64,
-    /// Thin Wall (Cycles' `thin_wall`): transmission through a thin sheet. Potter does not evaluate
-    /// it; it is reported as unevaluated.
+    /// Thin Wall (Cycles' `thin_wall`, `svm/closure.h`): the thin branch replaces the BSSRDF with the thin-subsurface
+    /// closure. Potter evaluates that closure's diffuse reflection (`subsurface_share`), but not its translucent
+    /// transmission (`bsdf_thin_subsurface_setup`), so the input is reported as unevaluated.
     pub thin_wall: bool,
     /// Cycles' scattering coefficient σs per channel, absolute: each closure's scatter weight times
     /// its Density. Add Shader sums it and Mix Shader mixes it per closure, as Cycles weights closures.
@@ -338,8 +339,8 @@ impl BsdfParams {
             subsurface_radius: [1.0, 0.2, 0.1],
             subsurface_scale: 0.005,
             subsurface_method: SubsurfaceMethod::default(),
-            subsurface_ior: 1.4,
             subsurface_anisotropy: 0.0,
+            subsurface_ior: 1.4,
             coat_weight: 0.0,
             coat_roughness: 0.03,
             coat_ior: 1.5,
@@ -1488,6 +1489,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
 
     fn principled(&mut self, id: &Id) -> Result<BsdfParams> {
         let node = self.node(id)?;
+        // Blender's default is random walk; a node without the property (an authored graph) is that default.
+        let method_token = node
+            .properties
+            .get("subsurface_method")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("RANDOM_WALK")
+            .to_owned();
         if node
             .properties
             .get("potter_simple_material")
@@ -1531,12 +1539,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .vector_input(id, &["Subsurface Radius"], DVec3::new(1.0, 0.2, 0.1))?
             .to_array();
         params.subsurface_scale = self.scalar_input(id, &["Subsurface Scale"], 0.005)?;
-        // Blender's default is random walk; a node without the property (an authored graph) is that default.
-        let method = node
-            .properties
-            .get("subsurface_method")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("RANDOM_WALK");
+        let method = method_token.as_str();
         params.subsurface_method = SubsurfaceMethod::parse(method)
             .ok_or_else(|| invalid(format!("unknown Principled subsurface method `{method}`")))?;
         params.subsurface_ior = self.scalar_input(id, &["Subsurface IOR"], 1.4)?;
@@ -3484,15 +3487,15 @@ mod tests {
         evaluate_surface(&native, &context).unwrap();
         evaluate_surface(&native, &context).unwrap();
 
-        // A graph material sets subsurface and rough transmission on its Principled node. Subsurface is not
-        // evaluated and warns; rough transmission and coat are evaluated, so they must not warn.
+        // A graph material sets subsurface (the default random walk, which is evaluated) and Thin Wall (which is not)
+        // on its Principled node, with rough transmission. Thin Wall warns; subsurface, rough transmission and coat do not.
         let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
             &mut graph,
             "principled",
             "ShaderNodeBsdfPrincipled",
-            json!({"Subsurface Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
+            json!({"Subsurface Weight":0.5,"Thin Wall":1.0,"Transmission Weight":0.5,"Roughness":0.3}),
         );
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         let graph_id = Id::new("graph_shader".to_owned()).unwrap();
@@ -3518,14 +3521,12 @@ mod tests {
                 .count()
         };
         assert_eq!(count("Native", "Transmission Weight"), 0);
-        assert_eq!(count("Graph", "Subsurface Weight"), 1);
+        assert_eq!(count("Graph", "Subsurface Weight"), 0);
+        assert_eq!(count("Graph", "Thin Wall"), 1);
         assert_eq!(count("Graph", "Coat Weight"), 0);
         assert_eq!(count("Graph", "Transmission Weight"), 0);
-        let subsurface_warning = warnings
-            .iter()
-            .find(|w| w["input"] == "Subsurface Weight")
-            .unwrap();
-        assert_eq!(subsurface_warning["node_id"], "principled");
+        let thin_wall_warning = warnings.iter().find(|w| w["input"] == "Thin Wall").unwrap();
+        assert_eq!(thin_wall_warning["node_id"], "principled");
     }
 
     #[test]
@@ -3969,4 +3970,47 @@ fn kani_bounded_mix_factor_stays_unit_interval() {
     kani::assume(factor.is_finite());
     let bounded = bounded_factor(factor);
     assert!(bounded >= 0.0 && bounded <= 1.0);
+}
+
+#[cfg(test)]
+mod subsurface_method_tests {
+    use super::SubsurfaceMethod;
+
+    #[test]
+    fn subsurface_method_parses_the_blender_identifiers() {
+        assert_eq!(
+            SubsurfaceMethod::parse("BURLEY"),
+            Some(SubsurfaceMethod::Burley)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK"),
+            Some(SubsurfaceMethod::RandomWalk)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK_SKIN"),
+            Some(SubsurfaceMethod::RandomWalkSkin)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK_LEGACY"),
+            Some(SubsurfaceMethod::RandomWalkLegacy)
+        );
+        assert_eq!(SubsurfaceMethod::parse("random_walk"), None);
+    }
+
+    #[test]
+    fn only_the_unevaluated_methods_report_a_feature() {
+        // Burley and the three random walk methods are evaluated; a Mix or Add of two different methods is the one
+        // reported case, never rendered as another method.
+        assert_eq!(SubsurfaceMethod::Burley.unsupported_feature(), None);
+        assert_eq!(SubsurfaceMethod::RandomWalk.unsupported_feature(), None);
+        assert_eq!(SubsurfaceMethod::RandomWalkSkin.unsupported_feature(), None);
+        assert_eq!(
+            SubsurfaceMethod::RandomWalkLegacy.unsupported_feature(),
+            None
+        );
+        assert_eq!(
+            SubsurfaceMethod::Mixed.unsupported_feature(),
+            Some("shader.principled.subsurface_method.mixed")
+        );
+    }
 }

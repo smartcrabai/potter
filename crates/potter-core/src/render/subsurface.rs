@@ -25,7 +25,7 @@ const TRUNCATE_CDF: f64 = 0.996_379_009_370_832_8;
 
 /// The closure a Burley exit is shaded with (`subsurface_shader_data_setup`): a Lambert lobe of weight one, with no
 /// other closure, emission or transparency. The exit keeps the entry's normal and geometry only.
-pub(crate) fn exit_params(params: BsdfParams) -> BsdfParams {
+pub(crate) fn exit_params(params: &BsdfParams) -> BsdfParams {
     BsdfParams {
         base_color: [1.0; 4],
         metallic: 0.0,
@@ -46,7 +46,7 @@ pub(crate) fn exit_params(params: BsdfParams) -> BsdfParams {
         volume_scatter: [0.0; 3],
         volume_absorption: [0.0; 3],
         volume_emission: [0.0; 3],
-        ..params
+        ..*params
     }
 }
 
@@ -77,7 +77,8 @@ pub(crate) struct SubsurfaceExit {
     pub(crate) throughput: DVec3,
 }
 
-/// The channels that take part in the profile: those with a radius of at least [`MIN_RADIUS`].
+/// The channels that take part in the profile: those whose raw radius is at least [`MIN_RADIUS`]. A channel below it
+/// falls back to diffuse (`bssrdf_setup`, `kernel/closure/bssrdf.h`), so the mask takes a radius from [`raw_radius`].
 pub(crate) fn channel_mask(radius: DVec3) -> [bool; 3] {
     radius.to_array().map(|value| value >= MIN_RADIUS)
 }
@@ -101,7 +102,7 @@ pub(crate) fn pdf(d: f64, r: f64) -> f64 {
 }
 
 /// `bssrdf_burley_root_find`: the scaled radius `x` with `1 - ¼e^{-x} - ¾e^{-x/3} = xi`, by Newton's method from a
-/// fit to the curve (Cycles' twelve-step bound is kept: the iteration stops at its tolerance first).
+/// fit to the curve (Cycles' ten-iteration bound is kept: the iteration stops at its tolerance first).
 pub(crate) fn root_find(xi: f64) -> f64 {
     const TOLERANCE: f64 = 1.0e-6;
     const MAX_ITERATIONS: usize = 10;
@@ -186,16 +187,16 @@ pub(crate) fn lcg_step(state: &mut u32) -> u32 {
 /// is skipped; the first `MAX_HITS` are stored; a later hit replaces the stored hit at slot `lcg_step % seen` when
 /// that slot is below `MAX_HITS`, so each hit is kept with probability `MAX_HITS / seen`. `seen` counts every hit.
 pub(crate) struct ProbeHits<T> {
-    hits: Vec<(f64, T)>,
+    hits: [Option<(f64, T)>; MAX_HITS],
     seen: usize,
     lcg: u32,
 }
 
-impl<T> ProbeHits<T> {
+impl<T: Copy> ProbeHits<T> {
     /// A probe whose reservoir generator starts from `seed`.
     pub(crate) fn new(seed: u32) -> Self {
         Self {
-            hits: Vec::with_capacity(MAX_HITS),
+            hits: [None; MAX_HITS],
             seen: 0,
             lcg: seed,
         }
@@ -203,22 +204,29 @@ impl<T> ProbeHits<T> {
 
     /// Records a hit at distance `t` along the probe.
     pub(crate) fn record(&mut self, t: f64, item: T) {
-        if self.hits.iter().any(|(stored, _)| *stored == t) {
+        // Cycles' duplicate test is exact equality of the distance (`local_intersect_get_record_index`); bit equality is that test.
+        if self
+            .hits
+            .iter()
+            .flatten()
+            .any(|(stored, _)| stored.to_bits() == t.to_bits())
+        {
             return;
         }
         self.seen += 1;
         if self.seen <= MAX_HITS {
-            self.hits.push((t, item));
+            self.hits[self.seen - 1] = Some((t, item));
             return;
         }
         let slot = lcg_step(&mut self.lcg) % self.seen as u32;
         if (slot as usize) < MAX_HITS {
-            self.hits[slot as usize] = (t, item);
+            self.hits[slot as usize] = Some((t, item));
         }
     }
 
-    /// The number of hits seen and the stored hits, in the order they were stored.
-    pub(crate) fn finish(self) -> (usize, Vec<(f64, T)>) {
+    /// The number of hits seen, and the stored hits: slots `0..min(seen, MAX_HITS)` are filled, in the order they were
+    /// stored, and the rest are `None`.
+    pub(crate) fn finish(self) -> (usize, [Option<(f64, T)>; MAX_HITS]) {
         (self.seen, self.hits)
     }
 }
@@ -274,7 +282,7 @@ mod tests {
         let d = 0.25;
         let n = 4_000;
         let sampled: f64 = (0..n)
-            .map(|i| sample_radius(d, (f64::from(i) + 0.5) / f64::from(n) * TRUNCATE_CDF).0)
+            .map(|i| sample_radius(d, (f64::from(i) + 0.5) / f64::from(n)).0)
             .sum::<f64>()
             / f64::from(n);
         let moment = simpson(0.0, TRUNCATE * d, 20_000, |r| r * pdf(d, r));
@@ -302,7 +310,7 @@ mod tests {
         assert_eq!(channel, Some(2));
         assert_eq!(eval(radius, mask, 0.1).y, 0.0);
         assert!(
-            (pdf_mean(radius, mask, 0.1) - (pdf(0.5, 0.1) + pdf(0.25, 0.1)) / 2.0).abs() < 1.0e-12
+            (pdf_mean(radius, mask, 0.1) - pdf(0.5, 0.1).midpoint(pdf(0.25, 0.1))).abs() < 1.0e-12
         );
         assert_eq!(pick_channel([false; 3], 0.5), None);
     }
@@ -356,6 +364,17 @@ mod tests {
     }
 
     #[test]
+    fn channel_mask_tests_the_raw_radius_before_burley_scaling() {
+        // `bssrdf_setup` (`kernel/closure/bssrdf.h`) tests `BSSRDF_MIN_RADIUS` before `bssrdf_setup_radius` scales the
+        // radius. A raw radius of 2e-8 is covered; its Burley mean free path, 2e-8 × 0.25 / π, is below the minimum.
+        let mut params = principled(SubsurfaceMethod::Burley, 1.0);
+        params.subsurface_radius = [2.0e-8, 2.0e-8, 2.0e-8];
+        params.subsurface_scale = 1.0;
+        assert_eq!(channel_mask(raw_radius(&params)), [true; 3]);
+        assert_eq!(channel_mask(burley_radius(&params)), [false; 3]);
+    }
+
+    #[test]
     fn lcg_step_is_the_linear_congruence_of_cycles() {
         // `kernel/sample/lcg.h`: state = 1103515245 · state + 12345 (mod 2³²), and the new state is returned.
         let mut state = 1;
@@ -364,44 +383,58 @@ mod tests {
     }
 
     #[test]
-    fn probe_keeps_four_hits_and_skips_a_repeated_distance() {
+    fn probe_keeps_four_hits_of_ten() {
         let mut probe = ProbeHits::new(7);
         for index in 0..10 {
             probe.record(f64::from(index), index);
         }
-        // A repeated distance is skipped and not counted, as Cycles' `local_intersect_get_record_index` does.
-        probe.record(3.0, 99);
         let (seen, hits) = probe.finish();
         assert_eq!(seen, 10);
-        assert_eq!(hits.len(), MAX_HITS);
+        assert_eq!(hits.iter().flatten().count(), MAX_HITS);
         assert!(
             hits.iter()
-                .all(|(t, index)| *t == *index as f64 && *index != 99)
+                .flatten()
+                .all(|(t, index)| (*t - *index as f64).abs() < 1.0e-12)
         );
     }
 
     #[test]
-    fn probe_reservoir_keeps_each_hit_with_probability_four_in_n() {
-        // The reservoir is uniform: each of N hits is kept with probability 4/N, over many seeds.
-        let n = 12;
-        let trials: u32 = 20_000;
-        let mut kept = vec![0usize; n];
-        for seed in 0..trials {
-            let mut probe = ProbeHits::new(seed.wrapping_mul(2_654_435_761).wrapping_add(1));
-            for index in 0..n {
+    fn probe_skips_a_distance_already_stored() {
+        // Cycles compares a new hit with the stored hits only (`min(max_hits, num_hits)` of them), and a repeat is not
+        // counted (`local_intersect_get_record_index`).
+        let mut probe = ProbeHits::new(7);
+        probe.record(0.0, 0);
+        probe.record(1.0, 1);
+        probe.record(0.0, 9);
+        let (seen, hits) = probe.finish();
+        assert_eq!(seen, 2);
+        assert_eq!(hits.iter().flatten().count(), 2);
+    }
+
+    #[test]
+    fn probe_reservoir_outcomes_are_pinned() {
+        // A regression pin, not an external reference: the outcomes for twelve hits at distances 0..12 were produced by
+        // a Python transcription of Cycles' reservoir (`lcg_step_uint`, `local_intersect_get_record_index`) that is not
+        // in the repository. The slot is `lcg % seen`, which reads the generator's low bits, so the kept hits are not
+        // uniform over the hits. Cycles has that bias too, and the port keeps it, so the outcomes are pinned.
+        for (seed, expected) in [
+            (1u32, vec![1usize, 3, 4, 10]),
+            (7, vec![0, 1, 10, 11]),
+            (12345, vec![0, 2, 3, 5]),
+        ] {
+            let mut probe = ProbeHits::new(seed);
+            for index in 0..12 {
                 probe.record(index as f64, index);
             }
-            for (_, index) in probe.finish().1 {
-                kept[index] += 1;
-            }
-        }
-        let expected = f64::from(trials) * MAX_HITS as f64 / n as f64;
-        for (index, count) in kept.iter().enumerate() {
-            let deviation = (*count as f64 - expected).abs() / expected;
-            assert!(
-                deviation < 0.05,
-                "hit {index}: kept {count}, expected {expected}"
-            );
+            let mut kept: Vec<usize> = probe
+                .finish()
+                .1
+                .into_iter()
+                .flatten()
+                .map(|(_, index)| index)
+                .collect();
+            kept.sort_unstable();
+            assert_eq!(kept, expected, "seed {seed}");
         }
     }
 }

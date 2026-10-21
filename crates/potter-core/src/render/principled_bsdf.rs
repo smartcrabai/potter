@@ -34,6 +34,7 @@ use super::principled_tables::{
     sheen_ltc,
 };
 use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
+use crate::shader::{BsdfParams, dielectric_f0};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
@@ -53,15 +54,10 @@ pub(crate) struct LobeProbabilities {
 pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobeProbabilities {
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
-    // The subsurface closure takes its Subsurface Weight from the diffuse share (Cycles' diffuse weight is
-    // `base × (1 - subsurface weight) × weight`, `svm/closure.h`).
-    let subsurface_share = if subsurface_evaluated(params) {
-        params.subsurface_weight.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let diffuse_weight =
-        ((1.0 - metallic) * (1.0 - transmission) * (1.0 - subsurface_share)).max(0.0);
+    // The diffuse lobe keeps `base × subsurface_share` per channel (`diffuse_lobe`): a channel with no radius keeps its
+    // full diffuse. The diffuse branch is chosen with the channel average of that share, so it is never starved.
+    let diffuse_share = subsurface_share(params).element_sum() / 3.0;
+    let diffuse_weight = ((1.0 - metallic) * (1.0 - transmission) * diffuse_share).max(0.0);
     // The subsurface closure's sample weight is its mean channel weight times the channels it covers
     // (`bssrdf_setup`, `sample_weight = |average(weight)| * channels`).
     let covered_channels = channel_mask(raw_radius(params))
@@ -174,13 +170,23 @@ fn diffuse_layer_weight(params: &BsdfParams, normal: DVec3, view: DVec3) -> f64 
     }
 }
 
-/// The per-channel share of the diffuse base that the subsurface closure leaves to diffuse: `1 - Subsurface Weight` on
-/// the channels with a radius, and `1` on the others, which fall back to diffuse (`bssrdf_setup`).
+/// The share of the diffuse base that the subsurface closures leave to diffuse, as Cycles' `closure` setup does
+/// (`svm/closure.h`). The diffuse closure keeps `1 - Subsurface Weight` for every method. A Thin Wall adds its thin
+/// reflection (`bsdf_thin_subsurface_setup`), a Lambert of weight `sat(0.5 (1 - anisotropy)) × subsurface weight`, to
+/// the same diffuse. Otherwise `bssrdf_setup` moves a channel whose raw radius is below `BSSRDF_MIN_RADIUS` into a
+/// diffuse BSDF of its closure weight, so that channel keeps its full diffuse; the other channels keep `1 - Subsurface
+/// Weight`. Every method takes this share.
 fn subsurface_share(params: &BsdfParams) -> DVec3 {
+    let sss = params.subsurface_weight.clamp(0.0, 1.0);
+    if params.thin_wall {
+        let reflection = (0.5 * (1.0 - params.subsurface_anisotropy)).clamp(0.0, 1.0);
+        return DVec3::splat(1.0 - sss + sss * reflection);
+    }
     if !subsurface_evaluated(params) {
         return DVec3::ONE;
     }
     let sss = params.subsurface_weight.clamp(0.0, 1.0);
+    // Every method keeps its diffuse on a channel below `BSSRDF_MIN_RADIUS` (the raw radius, `bssrdf_setup`).
     let mask = channel_mask(raw_radius(params));
     DVec3::from_array(std::array::from_fn(|channel| {
         if mask[channel] { 1.0 - sss } else { 1.0 }
@@ -196,7 +202,7 @@ pub(crate) fn subsurface_closure_weight(
     view: DVec3,
     lower: DVec3,
 ) -> DVec3 {
-    if !subsurface_evaluated(params) || normal.dot(view) <= 0.0 {
+    if !subsurface_evaluated(params) || params.thin_wall || normal.dot(view) <= 0.0 {
         return DVec3::ZERO;
     }
     let mask = channel_mask(raw_radius(params));
@@ -382,7 +388,7 @@ pub(crate) struct Layers {
     pub(crate) view: DVec3,
     coat: Option<CoatLayer>,
     sheen: SheenLobe,
-    lower: DVec3,
+    pub(crate) lower: DVec3,
     glass: Option<GlassLobe>,
 }
 
@@ -2046,6 +2052,77 @@ mod single_bounce_tests {
             // 4.8e-5 off and FINE 5.0e-5. The test sums the diffuse and specular lobes too, which the
             // quadrature checks did not cover, so this is an assumption checked by the run.
             COARSE,
+        );
+    }
+}
+
+#[cfg(test)]
+mod subsurface_tests {
+    use super::*;
+    use crate::model::Material;
+    use crate::shader::SubsurfaceMethod;
+
+    fn principled(method: SubsurfaceMethod, weight: f64) -> BsdfParams {
+        let material = Material {
+            base_color: [0.8, 0.5, 0.3, 1.0],
+            roughness: 0.5,
+            ..Material::default()
+        };
+        BsdfParams {
+            subsurface_weight: weight,
+            subsurface_method: method,
+            subsurface_scale: 6.0,
+            ..BsdfParams::from_material(&material, DVec3::Z)
+        }
+    }
+
+    #[test]
+    fn lobe_probabilities_sum_to_one_with_a_burley_subsurface_share() {
+        let params = principled(SubsurfaceMethod::Burley, 0.5);
+        let layers = layers(&params, DVec3::Z, DVec3::Z);
+        let probabilities = lobe_probabilities(&params, &layers);
+        let total = probabilities.diffuse
+            + probabilities.subsurface
+            + probabilities.sheen
+            + probabilities.coat
+            + probabilities.specular
+            + probabilities.transmission;
+        assert!((total - 1.0).abs() < 1.0e-12, "{total}");
+        assert!(probabilities.subsurface > 0.0);
+    }
+
+    #[test]
+    fn thin_wall_share_is_the_thin_branch_of_closure_setup() {
+        // `svm/closure.h`: the diffuse keeps `1 - sw`, and `bsdf_thin_subsurface_setup` adds a reflection of weight
+        // `sat(0.5 (1 - a)) × sw`. Both are Lambert, so one share. Anisotropy 0.5 gives a reflection of 0.25.
+        let mut params = principled(SubsurfaceMethod::Burley, 0.5);
+        params.thin_wall = true;
+        params.subsurface_anisotropy = 0.5;
+        let expected = 1.0 - 0.5 + 0.5 * 0.25;
+        for channel in subsurface_share(&params).to_array() {
+            assert!((channel - expected).abs() < 1e-12, "{channel}");
+        }
+    }
+
+    #[test]
+    fn an_unevaluated_method_has_no_subsurface_lobe() {
+        // A method Potter does not evaluate must not take probability mass from the diffuse lobe.
+        let params = principled(SubsurfaceMethod::Mixed, 0.5);
+        let layers = layers(&params, DVec3::Z, DVec3::Z);
+        assert_eq!(lobe_probabilities(&params, &layers).subsurface, 0.0);
+        assert_eq!(
+            subsurface_closure_weight(&params, DVec3::Z, DVec3::Z, layers.lower),
+            DVec3::ZERO
+        );
+    }
+
+    #[test]
+    fn the_subsurface_closure_is_zero_below_the_surface() {
+        let params = principled(SubsurfaceMethod::Burley, 0.5);
+        let layers = layers(&params, DVec3::Z, -DVec3::Z);
+        assert_eq!(
+            subsurface_closure_weight(&params, DVec3::Z, -DVec3::Z, layers.lower),
+            DVec3::ZERO
         );
     }
 }
