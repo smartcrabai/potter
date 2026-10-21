@@ -2250,16 +2250,6 @@ fn interpolated_child_path(
     Ok(path)
 }
 
-fn particle_life_state(frame: f64, birth_frame: f64, death_frame: f64) -> ParticleLifeState {
-    if frame < birth_frame {
-        ParticleLifeState::Unborn
-    } else if frame >= death_frame {
-        ParticleLifeState::Dead
-    } else {
-        ParticleLifeState::Alive
-    }
-}
-
 fn particle_path_time(frame: f64, birth_frame: f64, death_frame: f64) -> f64 {
     if frame < birth_frame {
         0.0

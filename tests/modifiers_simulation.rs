@@ -1340,6 +1340,10 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
                 .fold(f64::INFINITY, f64::min)
         })
         .fold(0.0, f64::max);
+    assert!(
+        nontrivial_instance_displacement > 1.0e-6,
+        "particle instance fixture must move instances off the source, observed {nontrivial_instance_displacement}",
+    );
     let mut explode_source = instance_source.clone();
     let protect_weights = instance_source
         .vertices

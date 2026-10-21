@@ -600,7 +600,11 @@ def _physics_modifier_settings(obj, modifier):
         settings = getattr(particle_system, "settings", None) if particle_system else None
         result = _physics_rna_values(settings)
         if settings is not None:
-            result["type"] = str(settings.type)
+            # Fluid particle systems carry FLIP/SPRAY/FOAM/BUBBLE/TRACER, which Blender's fluid modifier sets, not
+            # the ParticleSettings.type enum (EMITTER/HAIR). Only the enum is part of the particle system.
+            particle_type = str(settings.type)
+            if particle_type in settings.bl_rna.properties["type"].enum_items.keys():
+                result["type"] = particle_type
             result["texture_slots"] = _particle_texture_slots(settings)
         if particle_system:
             result["seed"] = int(particle_system.seed)
@@ -3826,6 +3830,8 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
             particle_system = getattr(modifier, "particle_system", None)
             settings_block = getattr(particle_system, "settings", None) if particle_system else None
         if settings_block is not None and particle_type is not None:
+            if particle_type not in settings_block.bl_rna.properties["type"].enum_items.keys():
+                raise ValueError("particle settings type %r is not a ParticleSettings type" % particle_type)
             settings_block.type = particle_type
         if settings_block is not None:
             set_rna(settings_block, settings, id_lookup)
