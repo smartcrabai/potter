@@ -686,10 +686,15 @@ pub(crate) const SHARP_FACE_PRESENT: &str = "sharp_face_present";
 pub(crate) fn sharp_face_flags(mesh: &Mesh) -> Result<Option<Vec<bool>>> {
     let smooth = smooth_face_flags(mesh)?;
     if smooth.iter().all(|smooth| *smooth) {
-        let present =
-            attribute_values(mesh, "shade_smooth", "face", "bool")?.is_some_and(|fields| {
-                fields.get(SHARP_FACE_PRESENT).and_then(Value::as_bool) == Some(true)
-            });
+        // The presence flag is a field of the `shade_smooth` attribute object, beside `values`
+        // (`record_sharp_face`), not a key inside its per-face values.
+        let present = mesh
+            .attributes
+            .get("shade_smooth")
+            .and_then(Value::as_object)
+            .and_then(|fields| fields.get(SHARP_FACE_PRESENT))
+            .and_then(Value::as_bool)
+            == Some(true);
         return Ok(present.then(|| vec![false; smooth.len()]));
     }
     Ok(Some(smooth.iter().map(|smooth| !smooth).collect()))
