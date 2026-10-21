@@ -396,16 +396,32 @@ fn scenario_geometry<'a>(results: &'a BTreeMap<String, Value>, id: &str, state: 
         .expect("Blender scenario result is missing")
 }
 
-/// Largest per-coordinate distance accepted between Potter (f64) and Blender (f32) positions.
-/// Measured on the particle audit: the largest Potter-Blender difference is 4.2e-7 (amount_half),
-/// so 1e-5 leaves a 24x margin. Rounding positions to a fixed decimal instead split values that
-/// sit on a rounding boundary (0.3072950 vs 0.3072949), which made equal geometry compare unequal.
-const GEOMETRY_TOLERANCE: f64 = 1.0e-5;
+/// Blender stores positions as f32 and evaluates the particle instance transform in f32, while
+/// Potter computes in f64 and is compared after rounding to f32. Each f32 rounding in that chain
+/// (vertex rotation, scale, translation to the particle location, object transform) is at most
+/// half an ulp at the magnitude of the largest coordinate. The bound is four ulps: [INFERENCE] the
+/// chain has about four such roundings, estimated from the operations rather than counted, and the
+/// largest measured difference is 2.0 ulp (4.8e-7 after rounding Potter to f32, amount_half, where
+/// one ulp at magnitude 2-4 is 2^-22), so four ulps leaves a 2x margin over it.
+const F32_ULPS: f64 = 4.0;
 
-/// Compares evaluated geometry with Potter and Blender's float precision: vertices match by
-/// position within `GEOMETRY_TOLERANCE` (each used once), and faces compare as vertex sets under
-/// that matching, so storage order is ignored. Returns `None` when they match, otherwise a dump of
-/// both sides in storage order for the CI log.
+/// `value` rounded to f32, by parsing its shortest decimal form. This avoids an `as` cast, which the
+/// workspace's pedantic clippy rejects. It equals the nearest f32 except in rare double-rounding
+/// cases, which lie far inside the tolerance.
+fn f32_of(value: f64) -> f32 {
+    value.to_string().parse().unwrap()
+}
+
+/// Size of one f32 ulp at `value`: the spacing between adjacent f32 values there.
+fn f32_ulp(value: f32) -> f64 {
+    let magnitude = value.abs();
+    f64::from(f32::from_bits(magnitude.to_bits() + 1) - magnitude)
+}
+
+/// Compares evaluated geometry at f32 precision: vertices match by position within `F32_ULPS`
+/// ulps of the largest coordinate (each used once), and faces compare as vertex sets under that
+/// matching, so storage order is ignored. Returns `None` when they match, otherwise a dump of both
+/// sides in storage order for the CI log.
 fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
     let counts = |geometry: &Value| {
         ["vertex_count", "edge_count", "face_count"].map(|key| geometry[key].as_u64())
@@ -439,8 +455,17 @@ fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
             })
             .collect()
     };
-    let potter_points = points(potter);
+    // Potter computes in f64; Blender's positions are f32, so Potter's are rounded to f32 first.
+    let potter_points: Vec<[f64; 3]> = points(potter)
+        .into_iter()
+        .map(|point| point.map(|c| f64::from(f32_of(c))))
+        .collect();
     let blender_points = points(blender);
+    let scale = blender_points
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |max, c| max.max(c.abs()));
+    let tolerance = F32_ULPS * f32_ulp(f32_of(scale));
     let mut matches =
         counts(potter) == counts(blender) && potter_points.len() == blender_points.len();
     let mut matched = vec![None; potter_points.len()];
@@ -452,8 +477,7 @@ fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
                 .enumerate()
                 .find(|(other, candidate)| {
                     !used[*other]
-                        && (0..3)
-                            .all(|axis| (point[axis] - candidate[axis]).abs() <= GEOMETRY_TOLERANCE)
+                        && (0..3).all(|axis| (point[axis] - candidate[axis]).abs() <= tolerance)
                 });
             match found {
                 Some((other, _)) => {
