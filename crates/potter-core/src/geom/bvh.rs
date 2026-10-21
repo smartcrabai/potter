@@ -13,6 +13,8 @@
 //!
 //! The Watertight ray ([`Ray::watertight`]) is `isect_ray_tri_watertight_v3`, used by the cage ray cast.
 
+use std::cmp::Ordering;
+
 /// A point or direction in `f32`, as Blender stores them.
 pub(crate) type Vec3 = [f32; 3];
 
@@ -356,12 +358,10 @@ fn divide(
         let child_level_index = index - level.next;
         let first = implicit.leafs_index(level.depth + 1, child_level_index);
         let last = implicit.leafs_index(level.depth + 1, child_level_index + 1);
-        if last > first + 1 {
-            children.push(Child::Branch(index));
-        } else if last == first + 1 {
-            children.push(Child::Leaf(order[first]));
-        } else {
-            break;
+        match last.cmp(&(first + 1)) {
+            Ordering::Greater => children.push(Child::Branch(index)),
+            Ordering::Equal => children.push(Child::Leaf(order[first])),
+            Ordering::Less => break,
         }
     }
     branches[j] = Branch {
@@ -451,7 +451,7 @@ impl KdopTree {
             match child {
                 Child::Leaf(leaf) => out.push(leaf),
                 Child::Branch(branch) => {
-                    stack.extend(self.branches[branch].children.iter().rev().copied())
+                    stack.extend(self.branches[branch].children.iter().rev().copied());
                 }
             }
         }
@@ -749,7 +749,7 @@ mod tests {
                     match node {
                         super::Child::Leaf(leaf) => seen[leaf] = true,
                         super::Child::Branch(branch) => {
-                            stack.extend(tree.branches[branch].children.iter().copied())
+                            stack.extend(tree.branches[branch].children.iter().copied());
                         }
                     }
                 }
