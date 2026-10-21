@@ -717,6 +717,55 @@ fn uv_layer_summary(mesh: &potter_core::geom::Mesh) -> String {
     )
 }
 
+/// Every stored UV row of an evaluated mesh, one line per layer face, as `[u, v]` pairs in corner order.
+fn uv_rows_dump(mesh: &potter_core::geom::Mesh) -> String {
+    let Some(store) = mesh.attributes.get("uv_layers") else {
+        return "no UV store".to_owned();
+    };
+    store["layers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|layer| {
+            let rows = layer["faces"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|entry| format!("    face {}: {}", entry["face_id"], entry["uv"]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("  layer {}:\n{rows}", layer["name"])
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The Blender oracle UVs of one frame, per face, converted to the stored form `[u, 1 - v]` once.
+fn oracle_uv_rows(frame: &Value) -> String {
+    let faces: Vec<Vec<usize>> = serde_json::from_value(frame["faces"].clone()).unwrap_or_default();
+    let values = frame["attributes"]["UVMap"]["values"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut corner_offset = 0;
+    faces
+        .iter()
+        .enumerate()
+        .map(|(index, face)| {
+            let row = values
+                .get(corner_offset..corner_offset + face.len())
+                .unwrap_or_default()
+                .iter()
+                .map(|uv| format!("[{}, {}]", uv[0], 1.0 - uv[1].as_f64().unwrap_or(f64::NAN)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            corner_offset += face.len();
+            format!("    face {index}: {row}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The UV layers of the cache file that the oracle case reads, with the layer a read without polygons
 /// leaves unwritten. Reports the reason instead of failing, since it only annotates another failure.
 fn uv_cache_summary(fixture_dir: &Path, oracle_case: &Value) -> String {
@@ -1504,7 +1553,11 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
             case_id == "sequence_same_size_reordered_connectivity"
                 || case_id == "nonsequence_animated_same_size_reordered_connectivity",
         )?;
-        let receiver_uv = uv_layer_summary(&evaluated_mesh(&target, 0.0)?);
+        let receiver_uv = format!(
+            "{}\n{}",
+            uv_layer_summary(&evaluated_mesh(&target, 0.0)?),
+            uv_rows_dump(&evaluated_mesh(&target, 0.0)?)
+        );
         add_oracle_cache(&target, &fixture_dir, oracle_case)?;
         let frames = oracle_case["frames"]
             .as_array()
@@ -1545,9 +1598,11 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
             )?;
             assert_oracle_mesh(&actual, expected).map_err(|error| {
                 format!(
-                    "{case_id} frame {}: {error}\n  receiver before modifier: {receiver_uv}\n  evaluated: {}\n  {}",
+                    "{case_id} frame {}: {error}\n  receiver before modifier (Potter seed: stored [20 + face, 10 + corner]): {receiver_uv}\n  evaluated: {}\n{}\n  Blender oracle frame, stored [u, 1 - v] per face:\n{}\n  {}",
                     expected["frame"],
                     uv_layer_summary(&actual),
+                    uv_rows_dump(&actual),
+                    oracle_uv_rows(expected),
                     uv_cache_summary(&fixture_dir, oracle_case),
                 )
             })?;
