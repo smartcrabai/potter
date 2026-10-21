@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::BTreeMap, path::Path};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    ops::{Deref, Range},
+    path::Path,
+};
 
 use glam::{DMat4, DVec3};
 
@@ -34,10 +39,13 @@ use super::{
         point_intensity, spot_attenuation, spread_attenuation, spread_region,
     },
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals, camera_eye,
-        rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
+        Camera, CameraFrame, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals,
+        camera_eye, camera_frame, rasterize_with_lines, ray_for_sample, ray_for_sample_in_frame,
+        smooth_shadow_origin,
     },
-    scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
+    scene::{
+        ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space,
+    },
 };
 
 const RAY_EPSILON: f64 = 1.0e-5;
@@ -355,6 +363,258 @@ impl WorldImportanceSampler {
     }
 }
 
+/// Stack size of a render worker, so recursive shader evaluation has the headroom of the main thread.
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// The read-only geometry a path trace reads. It has no interior mutability, so every worker shares it.
+#[derive(Clone, Copy)]
+struct SharedGeometry<'a> {
+    triangles: &'a [Triangle],
+    materials: &'a [Material],
+    prepared: &'a [PreparedMaterial],
+    objects: &'a [ObjectRecord],
+    elements: &'a [ElementRecord],
+}
+
+impl<'a> SharedGeometry<'a> {
+    fn of(geometry: &'a Geometry) -> Self {
+        Self {
+            triangles: geometry.triangles.as_slice(),
+            materials: geometry.materials.as_slice(),
+            prepared: geometry.prepared.as_slice(),
+            objects: geometry.objects.as_slice(),
+            elements: geometry.elements.as_slice(),
+        }
+    }
+}
+
+/// A trace's view of the geometry: the shared part, and the sink its shading warnings are recorded in. Each worker
+/// records into its own sink, and the sinks are merged in pixel order once the workers finish.
+#[derive(Clone, Copy)]
+struct TraceGeometry<'a> {
+    shared: SharedGeometry<'a>,
+    warnings: &'a RefCell<Vec<serde_json::Value>>,
+}
+
+impl<'a> TraceGeometry<'a> {
+    fn of(geometry: &'a Geometry) -> Self {
+        Self {
+            shared: SharedGeometry::of(geometry),
+            warnings: &geometry.shader_warnings,
+        }
+    }
+}
+
+impl<'a> Deref for TraceGeometry<'a> {
+    type Target = SharedGeometry<'a>;
+
+    fn deref(&self) -> &SharedGeometry<'a> {
+        &self.shared
+    }
+}
+
+/// What the workers of one render share. Every field is read-only, so the job is shared by reference.
+struct RenderJob<'a> {
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    geometry: SharedGeometry<'a>,
+    bvh: &'a Bvh,
+    lights: &'a [PointLight],
+    volumes: &'a [VolumeInstance<'a>],
+    images: &'a BTreeMap<String, ImageData>,
+    importance: Option<&'a WorldImportanceSampler>,
+    /// The camera and its frame for each eye: one for a mono camera, the left then the right eye for anaglyph.
+    eyes: &'a [(Camera, CameraFrame)],
+    anaglyph: bool,
+    width: u32,
+    height: u32,
+    width_usize: usize,
+    samples: u32,
+    seed: u32,
+    max_bounces: u32,
+    transparent_max_bounces: u32,
+    film_transparent: bool,
+    environment: DVec3,
+}
+
+/// Renders the rows `rows` of the frame into `linear` and `rgba`, the bands of the output this worker owns. Its
+/// shading warnings are recorded in `warnings`.
+fn render_rows(
+    job: &RenderJob<'_>,
+    rows: Range<usize>,
+    linear: &mut [[f32; 4]],
+    rgba: &mut [u8],
+    warnings: &RefCell<Vec<serde_json::Value>>,
+) -> Result<()> {
+    let geometry = TraceGeometry {
+        shared: job.geometry,
+        warnings,
+    };
+    let mut evaluator_workspace = EvaluatorWorkspace::default();
+    for (row_index, row) in rows.enumerate() {
+        let y = u32::try_from(row).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "image height exceeds platform limits",
+            )
+        })?;
+        for x in 0..job.width {
+            let column = usize::try_from(x).map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "image width exceeds platform limits",
+                )
+            })?;
+            let index = row_index * job.width_usize + column;
+            let mut sum = DVec3::ZERO;
+            let mut alpha_sum = 0.0;
+            for sample_index in 0..job.samples {
+                let mut rng = Pcg32::for_sample(job.seed, x, y, sample_index);
+                let sample_x = rng.next_f64();
+                let sample_y = rng.next_f64();
+                let (radiance, alpha) = if job.anaglyph {
+                    let (left_camera, left_frame) = &job.eyes[0];
+                    let (right_camera, right_frame) = &job.eyes[1];
+                    let left_ray = ray_for_sample_in_frame(
+                        left_frame,
+                        left_camera,
+                        job.width,
+                        job.height,
+                        x,
+                        y,
+                        sample_x,
+                        sample_y,
+                    )?;
+                    let right_ray = ray_for_sample_in_frame(
+                        right_frame,
+                        right_camera,
+                        job.width,
+                        job.height,
+                        x,
+                        y,
+                        sample_x,
+                        sample_y,
+                    )?;
+                    let mut left_rng = rng.clone();
+                    let mut right_rng = rng.clone();
+                    // A sample with no ray (outside a fisheye's circle, or past its field of view) is opaque black: Blender's
+                    // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
+                    let (left, left_alpha) = match left_ray {
+                        Some((left_origin, left_direction)) => trace_path(
+                            job.doc,
+                            job.snapshot,
+                            &geometry,
+                            job.bvh,
+                            job.lights,
+                            job.volumes,
+                            job.images,
+                            job.importance,
+                            left_origin,
+                            left_direction,
+                            job.environment,
+                            job.max_bounces,
+                            job.transparent_max_bounces,
+                            &mut left_rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    };
+                    let (right, right_alpha) = match right_ray {
+                        Some((right_origin, right_direction)) => trace_path(
+                            job.doc,
+                            job.snapshot,
+                            &geometry,
+                            job.bvh,
+                            job.lights,
+                            job.volumes,
+                            job.images,
+                            job.importance,
+                            right_origin,
+                            right_direction,
+                            job.environment,
+                            job.max_bounces,
+                            job.transparent_max_bounces,
+                            &mut right_rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    };
+                    (
+                        DVec3::new(left.x, right.y, right.z),
+                        f64::midpoint(left_alpha, right_alpha),
+                    )
+                } else {
+                    let (camera, frame) = &job.eyes[0];
+                    match ray_for_sample_in_frame(
+                        frame, camera, job.width, job.height, x, y, sample_x, sample_y,
+                    )? {
+                        Some((origin, direction)) => trace_path(
+                            job.doc,
+                            job.snapshot,
+                            &geometry,
+                            job.bvh,
+                            job.lights,
+                            job.volumes,
+                            job.images,
+                            job.importance,
+                            origin,
+                            direction,
+                            job.environment,
+                            job.max_bounces,
+                            job.transparent_max_bounces,
+                            &mut rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    }
+                };
+                sum += radiance;
+                alpha_sum += alpha;
+            }
+            let sample_scale = 1.0 / f64::from(job.samples);
+            let color = sum * sample_scale;
+            let alpha = if job.film_transparent {
+                alpha_sum * sample_scale
+            } else {
+                1.0
+            };
+            linear[index] = [
+                finite_f32(color.x),
+                finite_f32(color.y),
+                finite_f32(color.z),
+                finite_f32(alpha),
+            ];
+            rgba[index * 4..index * 4 + 4].copy_from_slice(&[
+                to_srgb_byte(color.x),
+                to_srgb_byte(color.y),
+                to_srgb_byte(color.z),
+                (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]);
+        }
+    }
+    Ok(())
+}
+
+/// Appends one worker's shading warnings to `sink`, dropping those the serial render would not have recorded. A
+/// Principled input is recorded once per (material, input) (`record_unevaluated_inputs`); the layer warnings once per
+/// equal warning (`layer_index`, `color_layer_missing`). Workers record into their own sinks, so a duplicate across
+/// workers is caught here, against the workers that came before in pixel order.
+fn merge_shader_warnings(sink: &RefCell<Vec<serde_json::Value>>, warnings: Vec<serde_json::Value>) {
+    let mut recorded = sink.borrow_mut();
+    for warning in warnings {
+        let duplicate = match warning["input"].as_str() {
+            Some(input) => recorded.iter().any(|existing| {
+                existing["material"] == warning["material"]
+                    && existing["input"].as_str() == Some(input)
+            }),
+            None => recorded.contains(&warning),
+        };
+        if !duplicate {
+            recorded.push(warning);
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "camera and sampling configuration are explicit at the render boundary"
@@ -449,131 +709,103 @@ pub(super) fn render(
         )
     })?;
     let environment = world.max(DVec3::ZERO);
-
-    for y in 0..height {
-        for x in 0..width {
-            let index = usize::try_from(y)
-                .ok()
-                .and_then(|row| row.checked_mul(width_usize))
-                .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "pixel index exceeds platform limits",
-                    )
-                })?;
-            let mut sum = DVec3::ZERO;
-            let mut alpha_sum = 0.0;
-            for sample_index in 0..samples {
-                let mut rng = Pcg32::for_sample(seed, x, y, sample_index);
-                let sample_x = rng.next_f64();
-                let sample_y = rng.next_f64();
-                let (radiance, alpha) = if camera.stereo_mode == StereoMode::Anaglyph {
-                    let left_camera = camera_eye(camera, -1.0);
-                    let right_camera = camera_eye(camera, 1.0);
-                    let left_ray =
-                        ray_for_sample(&left_camera, width, height, x, y, sample_x, sample_y)?;
-                    let right_ray =
-                        ray_for_sample(&right_camera, width, height, x, y, sample_x, sample_y)?;
-                    let mut left_rng = rng.clone();
-                    let mut right_rng = rng.clone();
-                    // A sample with no ray (outside a fisheye's circle, or past its field of view) is opaque black: Blender's
-                    // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
-                    let (left, left_alpha) = match left_ray {
-                        Some((left_origin, left_direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
-                            left_origin,
-                            left_direction,
-                            environment,
-                            max_bounces,
-                            transparent_max_bounces,
-                            &mut left_rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
-                    };
-                    let (right, right_alpha) = match right_ray {
-                        Some((right_origin, right_direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
-                            right_origin,
-                            right_direction,
-                            environment,
-                            max_bounces,
-                            transparent_max_bounces,
-                            &mut right_rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
-                    };
-                    (
-                        DVec3::new(left.x, right.y, right.z),
-                        f64::midpoint(left_alpha, right_alpha),
-                    )
-                } else {
-                    match ray_for_sample(camera, width, height, x, y, sample_x, sample_y)? {
-                        Some((origin, direction)) => trace_path(
-                            doc,
-                            snapshot,
-                            geometry,
-                            &bvh,
-                            &lights,
-                            &volumes,
-                            images,
-                            world_importance.as_ref(),
-                            origin,
-                            direction,
-                            environment,
-                            max_bounces,
-                            transparent_max_bounces,
-                            &mut rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
-                    }
-                };
-                sum += radiance;
-                alpha_sum += alpha;
+    if pixel_count > 0 {
+        let anaglyph = camera.stereo_mode == StereoMode::Anaglyph;
+        let eyes = if anaglyph {
+            let left_camera = camera_eye(camera, -1.0);
+            let right_camera = camera_eye(camera, 1.0);
+            vec![
+                (left_camera, camera_frame(&left_camera, width, height)?),
+                (right_camera, camera_frame(&right_camera, width, height)?),
+            ]
+        } else {
+            vec![(*camera, camera_frame(camera, width, height)?)]
+        };
+        let height_usize = usize::try_from(height).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "image height exceeds platform limits",
+            )
+        })?;
+        let job = RenderJob {
+            doc,
+            snapshot,
+            geometry: SharedGeometry::of(geometry),
+            bvh: &bvh,
+            lights: &lights,
+            volumes: &volumes,
+            images,
+            importance: world_importance.as_ref(),
+            eyes: &eyes,
+            anaglyph,
+            width,
+            height,
+            width_usize,
+            samples,
+            seed,
+            max_bounces,
+            transparent_max_bounces,
+            film_transparent,
+            environment,
+        };
+        let worker_count = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(height_usize);
+        let rows_per_band = height_usize.div_ceil(worker_count);
+        let band_pixels = rows_per_band * width_usize;
+        let outcomes = std::thread::scope(|scope| {
+            let job = &job;
+            let mut workers = Vec::with_capacity(worker_count);
+            for (band, (linear, rgba)) in output
+                .linear_rgba
+                .chunks_mut(band_pixels)
+                .zip(output.rgba.chunks_mut(band_pixels * 4))
+                .enumerate()
+            {
+                let first_row = band * rows_per_band;
+                let end_row = first_row + linear.len() / width_usize;
+                workers.push(
+                    std::thread::Builder::new()
+                        .stack_size(WORKER_STACK_BYTES)
+                        .spawn_scoped(scope, move || {
+                            let warnings = RefCell::new(Vec::new());
+                            let result =
+                                render_rows(job, first_row..end_row, linear, rgba, &warnings);
+                            (result, warnings.into_inner())
+                        }),
+                );
             }
-            let sample_scale = 1.0 / f64::from(samples);
-            let color = sum * sample_scale;
-            let alpha = if film_transparent {
-                alpha_sum * sample_scale
-            } else {
-                1.0
-            };
-            output.linear_rgba[index] = [
-                finite_f32(color.x),
-                finite_f32(color.y),
-                finite_f32(color.z),
-                finite_f32(alpha),
-            ];
-            output.rgba[index * 4..index * 4 + 4].copy_from_slice(&[
-                to_srgb_byte(color.x),
-                to_srgb_byte(color.y),
-                to_srgb_byte(color.z),
-                (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-            ]);
+            workers
+                .into_iter()
+                .map(|worker| match worker {
+                    Ok(handle) => handle.join().unwrap_or_else(|_| {
+                        (
+                            Err(PotError::new(
+                                ErrorCode::InternalError,
+                                "render worker panicked",
+                            )),
+                            Vec::new(),
+                        )
+                    }),
+                    Err(error) => (
+                        Err(PotError::new(
+                            ErrorCode::InternalError,
+                            format!("cannot start a render worker: {error}"),
+                        )),
+                        Vec::new(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        });
+        for (result, warnings) in outcomes {
+            merge_shader_warnings(&geometry.shader_warnings, warnings);
+            result?;
         }
     }
 
     write_center_passes(
         doc,
-        snapshot,
-        geometry,
+        &TraceGeometry::of(geometry),
         &bvh,
         &volumes,
         images,
@@ -823,7 +1055,7 @@ fn world_radiance(
 fn trace_path(
     doc: &SceneDoc,
     snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     lights: &[PointLight],
     volumes: &[VolumeInstance<'_>],
@@ -957,7 +1189,6 @@ fn trace_path(
         };
         let mut surface = make_surface(
             doc,
-            snapshot,
             geometry,
             hit,
             origin,
@@ -1164,8 +1395,7 @@ fn trace_path(
 )]
 fn write_center_passes(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     volumes: &[VolumeInstance<'_>],
     images: &BTreeMap<String, ImageData>,
@@ -1210,7 +1440,6 @@ fn write_center_passes(
             };
             let surface = make_surface(
                 doc,
-                snapshot,
                 geometry,
                 hit,
                 origin,
@@ -1363,7 +1592,7 @@ fn overlay_rasterized_lines(
 }
 
 fn closest_hit(
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     origin: DVec3,
     direction: DVec3,
@@ -1378,7 +1607,6 @@ fn closest_hit(
 /// neither the displacement gradient nor the coat layers, so only the material evaluation runs.
 pub(super) fn hit_params(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
     geometry: &Geometry,
     hit: BvhHit,
     origin: DVec3,
@@ -1388,8 +1616,7 @@ pub(super) fn hit_params(
 ) -> Result<BsdfParams> {
     with_hit_frame(
         doc,
-        snapshot,
-        geometry,
+        &TraceGeometry::of(geometry),
         hit,
         origin,
         direction,
@@ -1425,8 +1652,7 @@ struct HitFrame<'a> {
 /// Builds the frame of `hit` and calls `body` with it: the one place a hit's geometry, UVs and context are set up.
 fn with_hit_frame<T>(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     hit: BvhHit,
     origin: DVec3,
     direction: DVec3,
@@ -1503,12 +1729,12 @@ fn with_hit_frame<T>(
     let context = layered_context(
         doc,
         images,
-        &geometry.shader_warnings,
+        geometry.warnings,
         object,
         triangle,
         HitPose {
             point,
-            object: object_space(snapshot, object, point),
+            object: object_space(object, point),
             normal,
             view: -direction,
             barycentric: hit.barycentric,
@@ -1548,8 +1774,7 @@ fn apply_hit_alpha(material: &Material, params: &mut BsdfParams) {
 
 fn make_surface(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     hit: BvhHit,
     origin: DVec3,
     direction: DVec3,
@@ -1557,60 +1782,50 @@ fn make_surface(
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
     let triangle_index = hit.triangle_index;
-    with_hit_frame(
-        doc,
-        snapshot,
-        geometry,
-        hit,
-        origin,
-        direction,
-        images,
-        |frame| {
-            let mut params = evaluate_surface_with_workspace(
-                frame.material,
-                frame.prepared,
-                &frame.context,
-                evaluator_workspace,
-            )?;
-            apply_hit_alpha(frame.material, &mut params);
-            params.back_facing = frame.back_facing;
-            let normal = frame.normal;
-            if params.displacement_height != 0.0
-                && frame.material.displacement_method != "displacement"
-            {
-                let gradient = height_gradient(&frame.context, normal, |sample| {
-                    evaluate_surface_with_workspace(
-                        frame.material,
-                        frame.prepared,
-                        sample,
-                        evaluator_workspace,
-                    )
-                    .map(|surface| surface.displacement_height)
-                })?;
-                params.normal = normal - gradient;
-            }
-            params.normal = if params.normal.is_finite() {
-                params.normal.normalize_or_zero()
-            } else {
-                normal
-            };
-            if params.normal.dot(-direction) < 0.0 {
-                params.normal = -params.normal;
-            }
-            let hit_layers = layers(&params, params.normal, -direction);
-            Ok(Surface {
-                point: frame.point,
-                normal: params.normal,
-                geometric_normal: frame.geometric_normal,
-                shadow_point: frame.shadow_point,
-                params,
-                layers: hit_layers,
-                object_index: frame.triangle.object_index,
-                element_index: frame.triangle.element_index,
-                triangle_index,
-            })
-        },
-    )
+    with_hit_frame(doc, geometry, hit, origin, direction, images, |frame| {
+        let mut params = evaluate_surface_with_workspace(
+            frame.material,
+            frame.prepared,
+            &frame.context,
+            evaluator_workspace,
+        )?;
+        apply_hit_alpha(frame.material, &mut params);
+        params.back_facing = frame.back_facing;
+        let normal = frame.normal;
+        if params.displacement_height != 0.0 && frame.material.displacement_method != "displacement"
+        {
+            let gradient = height_gradient(&frame.context, normal, |sample| {
+                evaluate_surface_with_workspace(
+                    frame.material,
+                    frame.prepared,
+                    sample,
+                    evaluator_workspace,
+                )
+                .map(|surface| surface.displacement_height)
+            })?;
+            params.normal = normal - gradient;
+        }
+        params.normal = if params.normal.is_finite() {
+            params.normal.normalize_or_zero()
+        } else {
+            normal
+        };
+        if params.normal.dot(-direction) < 0.0 {
+            params.normal = -params.normal;
+        }
+        let hit_layers = layers(&params, params.normal, -direction);
+        Ok(Surface {
+            point: frame.point,
+            normal: params.normal,
+            geometric_normal: frame.geometric_normal,
+            shadow_point: frame.shadow_point,
+            params,
+            layers: hit_layers,
+            object_index: frame.triangle.object_index,
+            element_index: frame.triangle.element_index,
+            triangle_index,
+        })
+    })
 }
 
 pub(super) fn object_for_index(
@@ -1630,7 +1845,7 @@ pub(super) fn object_for_index(
 fn direct_lighting(
     doc: &SceneDoc,
     snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     lights: &[PointLight],
     volumes: &[VolumeInstance<'_>],
@@ -1663,7 +1878,6 @@ fn direct_lighting(
         }
         let visibility = shadow_transmittance(
             doc,
-            snapshot,
             geometry,
             bvh,
             volumes,
@@ -1706,7 +1920,6 @@ fn direct_lighting(
             world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let visibility = shadow_transmittance(
             doc,
-            snapshot,
             geometry,
             bvh,
             volumes,
@@ -1739,7 +1952,7 @@ fn direct_lighting(
 fn direct_volume_lighting(
     doc: &SceneDoc,
     snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     lights: &[PointLight],
     volumes: &[VolumeInstance<'_>],
@@ -1762,7 +1975,6 @@ fn direct_volume_lighting(
         }
         let visibility = shadow_transmittance(
             doc,
-            snapshot,
             geometry,
             bvh,
             volumes,
@@ -1787,7 +1999,6 @@ fn direct_volume_lighting(
         let incoming = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         let visibility = shadow_transmittance(
             doc,
-            snapshot,
             geometry,
             bvh,
             volumes,
@@ -1828,8 +2039,7 @@ fn power_heuristic(first_pdf: f64, second_pdf: f64) -> f64 {
 )]
 fn shadow_transmittance(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     volumes: &[VolumeInstance<'_>],
     images: &BTreeMap<String, ImageData>,
@@ -1859,7 +2069,6 @@ fn shadow_transmittance(
         |hit, origin| {
             let surface = match make_surface(
                 doc,
-                snapshot,
                 geometry,
                 hit,
                 origin,
@@ -2400,7 +2609,7 @@ fn continuous_sample(
 /// The exit of a subsurface entry, by the method the entry sampled (Cycles' `subsurface_bounce` and
 /// `subsurface_scatter`). `throughput` is the path throughput before the entry and `entry` the entry weight.
 fn subsurface_exit(
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     surface: &Surface,
     method: EvaluatedSubsurfaceMethod,
@@ -2434,7 +2643,7 @@ fn subsurface_exit(
 /// entry is the refraction through an interface of the surface's roughness squared, or for the skin a diffuse lobe
 /// or a refraction through a rough interface (`skin_entry_direction`).
 fn random_walk_exit(
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     surface: &Surface,
     method: WalkMethod,
@@ -2498,7 +2707,7 @@ fn random_walk_exit(
 
 /// The geometric normal of a triangle from its winding, as Cycles' `Ng` is: the cross product of its edges, outward
 /// for a mesh wound outward. It is not flipped towards any ray, so a subsurface exit can tell its side of the surface.
-fn intrinsic_normal(geometry: &Geometry, triangle_index: usize) -> Option<DVec3> {
+fn intrinsic_normal(geometry: &TraceGeometry<'_>, triangle_index: usize) -> Option<DVec3> {
     let triangle = geometry.triangles.get(triangle_index)?;
     Some(
         (triangle.positions[1] - triangle.positions[0])
@@ -2513,7 +2722,7 @@ fn intrinsic_normal(geometry: &Geometry, triangle_index: usize) -> Option<DVec3>
 /// reservoir (`subsurface_disk.h`, `scene_intersect_local` with `max_hits`), and the weight of a probe that saw more
 /// is scaled by `num_hits / max_hits`. `throughput` includes the entry weight.
 fn burley_exit(
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     surface: &Surface,
     throughput: DVec3,
