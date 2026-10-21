@@ -1,0 +1,3 @@
+[submodule "crates/potter-core/vendor/eigen"]
+	path = crates/potter-core/vendor/eigen
+	url = https://github.com/eigen-mirror/eigen.git

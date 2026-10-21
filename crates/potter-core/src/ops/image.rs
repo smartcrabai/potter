@@ -6,7 +6,10 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     hash,
     image::{ImageInterpolation, encode_pixels},
-    model::{Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile},
+    model::{
+        Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
+        migrate::inline_resource_kind,
+    },
 };
 
 use super::{
@@ -323,8 +326,8 @@ fn set_pixels(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result
         (width, height)
     };
     let pixels = parse_pixels(engine, operation.get("pixels"))?;
-    let x = optional_dimension(engine, operation, "x", 0)?;
-    let y = optional_dimension(engine, operation, "y", 0)?;
+    let x = optional_offset(engine, operation, "x")?;
+    let y = optional_offset(engine, operation, "y")?;
     let width = operation
         .get("width")
         .map(|value| read_dimension_value(engine, value, "width"))
@@ -570,14 +573,21 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 .map(|_| group_id.to_string())
         })
         .collect::<Vec<_>>();
-    let resource_references = engine
-        .doc
-        .resources
-        .iter()
-        .filter_map(|(resource_id, resource)| {
-            contains_image_reference(resource, id.as_str()).then_some(resource_id.to_string())
-        })
-        .collect::<Vec<_>>();
+    let mut resource_references = Vec::new();
+    for (resource_id, resource) in &engine.doc.resources {
+        if inline_resource_kind(resource)? != Some("legacy_texture")
+            || resource.get("texture_type").and_then(Value::as_str) != Some("IMAGE")
+            || resource
+                .get("settings")
+                .and_then(Value::as_object)
+                .is_none()
+        {
+            continue;
+        }
+        if resource.get("image").and_then(Value::as_str) == Some(id.as_str()) {
+            resource_references.push(resource_id.to_string());
+        }
+    }
     if !material_references.is_empty()
         || !graph_references.is_empty()
         || !resource_references.is_empty()
@@ -782,17 +792,21 @@ fn read_dimension_value(engine: &Engine<'_>, value: &Value, field: &str) -> Resu
         })
 }
 
-fn optional_dimension(
-    engine: &Engine<'_>,
-    operation: &Map<String, Value>,
-    key: &str,
-    default: u32,
-) -> Result<u32> {
-    operation
-        .get(key)
-        .map(|value| read_dimension_value(engine, value, key))
-        .transpose()
-        .map(|value| value.unwrap_or(default))
+/// An optional pixel offset: absent means the origin, and zero is a valid origin.
+fn optional_offset(engine: &Engine<'_>, operation: &Map<String, Value>, key: &str) -> Result<u32> {
+    let Some(value) = operation.get(key) else {
+        return Ok(0);
+    };
+    value
+        .as_u64()
+        .and_then(|number| u32::try_from(number).ok())
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "image offsets must be non-negative u32 integers",
+                &operation_pointer(engine.operation_index, key),
+            )
+        })
 }
 
 fn read_positive_integer(engine: &Engine<'_>, value: &Value, field: &str) -> Result<usize> {

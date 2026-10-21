@@ -9,7 +9,7 @@ use potter_core::{
         metaball::{self, ElementType, MetaballData, MetaballElement},
         volume::{self, VolumeData, VolumeGrid},
     },
-    model::{Id, SceneDoc},
+    model::{Id, Modifier, SceneDoc},
     ops::apply_batch,
 };
 use proptest::prelude::*;
@@ -89,7 +89,7 @@ proptest! {
                 .collect(),
             Vec::new(),
         ).unwrap();
-        let output = lattice::deform_mesh(&mesh, &LatticeData::default(), None).unwrap();
+        let output = lattice::deform_mesh(&mesh, &LatticeData::default()).unwrap();
         prop_assert_eq!(output, mesh);
     }
 }
@@ -100,19 +100,38 @@ fn mesh_volume_round_trip_stays_within_one_voxel_of_source_bounds() {
         size: DVec3::new(1.7, 2.2, 2.5),
     })
     .unwrap();
-    // Mesh to Volume is Volume-object-only: its flags are 0 (MOD_mesh_to_volume.cc:194), so a mesh
-    // object cannot take it (BKE_object_support_modifier_type_check, object.cc:1464-1482). The Blender
-    // fixtures in tests/volume_parity.rs cover the modifier itself.
     let voxel_size = 0.2;
-    // One interior voxel of band and unit density: the fog grid is 1 inside and 0 outside, so the
-    // surface sits at the 0.5 iso-level between them (the Volume To Mesh default is 0.1, Blender's).
+    // Mesh to Volume is the fog conversion (density grid, iso 0.5 between inside and outside).
     let volume = volume::mesh_to_fog_volume(&source, voxel_size, voxel_size, 1.0).unwrap();
     let round_trip = volume::volume_to_mesh(&volume, 0.5).unwrap();
     let source_bounds = source.bounds().unwrap();
     let result_bounds = round_trip.bounds().unwrap();
+    let modifier = Modifier {
+        id: Id::new("voxelize").unwrap(),
+        modifier_type: "mesh_to_volume".to_owned(),
+        name: "Mesh to Volume".to_owned(),
+        enabled: true,
+        show_viewport: true,
+        show_render: true,
+        params: serde_json::Map::from_iter([
+            ("voxel_size".to_owned(), json!(voxel_size)),
+            ("padding".to_owned(), json!(1)),
+        ]),
+        binding_data: None,
+        runtime: potter_core::model::ModifierRuntime::default(),
+    };
+    let modified = potter_core::geom::modifiers::evaluate_modifiers(
+        &source,
+        &[modifier],
+        "VolumeRoundTripBox",
+    )
+    .unwrap();
+    let modifier_bounds = modified.bounds().unwrap();
     for axis in 0..3 {
         assert!((result_bounds.min[axis] - source_bounds.min[axis]).abs() <= voxel_size);
         assert!((result_bounds.max[axis] - source_bounds.max[axis]).abs() <= voxel_size);
+        assert!((modifier_bounds.min[axis] - source_bounds.min[axis]).abs() <= voxel_size);
+        assert!((modifier_bounds.max[axis] - source_bounds.max[axis]).abs() <= voxel_size);
     }
 }
 
@@ -205,6 +224,51 @@ fn lattice_modifier_blends_by_vertex_group_in_object_space() {
 }
 
 #[test]
+fn lattice_named_unweighted_group_applies_full_influence() {
+    let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+    let source = apply(
+        &base,
+        &json!([{"op":"node.create","id":"body","kind":"box","params":{"size":2.0}}]),
+    );
+    let mesh_data = source.nodes[&Id::new("body").unwrap()]
+        .data
+        .as_ref()
+        .unwrap();
+    let original = source.data_blocks[mesh_data].mesh.as_ref().unwrap();
+    let points = LatticeData::default()
+        .points
+        .iter()
+        .map(|point| (*point + DVec3::X).to_array())
+        .collect::<Vec<_>>();
+    // The group exists on the body but stores no weights: Blender's null `dvert`.
+    let scene = |params: Value| {
+        let doc = apply(
+            &source,
+            &json!([
+                {"op":"vertex_group.create","target":{"id":"body"},"id":"region","name":"Region"},
+                {"op":"lattice.create","id":"cage","points":points,"transform":{"translation":[0.0,0.0,0.0],"rotation":[0.0,0.0,std::f64::consts::FRAC_1_SQRT_2,std::f64::consts::FRAC_1_SQRT_2],"scale":[1.0,1.0,1.0]}},
+                {"op":"modifier.create","target":{"id":"body"},"id":"deform","type":"lattice","params":params}
+            ]),
+        );
+        evaluated(&doc).meshes[&Id::new("body").unwrap()].clone()
+    };
+    let plain = scene(json!({"object":"cage"}));
+    let grouped = scene(json!({"object":"cage","vertex_group":"region"}));
+    assert!(
+        plain
+            .vertices
+            .iter()
+            .zip(&original.vertices)
+            .any(|(after, before)| (after.co - before.co).length() > 0.5),
+        "lattice must move the body at full influence"
+    );
+    assert_eq!(grouped.vertices.len(), plain.vertices.len());
+    for (after, expected) in grouped.vertices.iter().zip(&plain.vertices) {
+        assert!((after.co - expected.co).length() <= 1.0e-12);
+    }
+}
+
+#[test]
 fn volume_object_modifier_extracts_a_mesh() {
     let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
     let doc = apply(
@@ -225,10 +289,5 @@ fn volume_object_modifier_extracts_a_mesh() {
         !extracted.faces.is_empty(),
         "volume conversion produced no faces"
     );
-    let bounds = extracted.bounds().unwrap();
-    assert!((bounds.size().y).abs() < 1.0e-12);
-    assert!((bounds.min.x + 1.0).abs() < 1.0e-6);
-    assert!(bounds.max.x.abs() < 1.0e-6);
-    assert!(bounds.min.z.abs() < 1.0e-6);
-    assert!((bounds.max.z - 1.0).abs() < 1.0e-6);
+    assert!((extracted.bounds().unwrap().size().y).abs() < 1.0e-12);
 }

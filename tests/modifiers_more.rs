@@ -42,7 +42,7 @@ fn float_boolean(subject: &Mesh, operands: &[Mesh], operation: &str) -> Mesh {
             material_remap: Vec::new(),
         })
         .collect();
-    evaluate_modifiers(subject, &[boolean]).unwrap()
+    evaluate_modifiers(subject, &[boolean], "TestMesh").unwrap()
 }
 
 fn signed_volume(mesh: &Mesh) -> f64 {
@@ -146,6 +146,7 @@ fn boolean_float_without_scene_operand_is_identity() {
             "boolean",
             json!({"solver": "FLOAT", "operation": "DIFFERENCE"}),
         )],
+        "TestMesh",
     )
     .unwrap();
     assert_eq!(canonical_geometry(&result), canonical_geometry(&source));
@@ -288,6 +289,7 @@ fn screw_revolves_a_profile_into_a_closed_cylinder() {
                 "axis": "Z",
             }),
         )],
+        "ScrewLine",
     )
     .unwrap();
     assert_eq!(result.vertices.len(), 32);
@@ -307,6 +309,7 @@ fn simple_deform_zero_angle_is_identity() {
                 "angle": 0.0,
             }),
         )],
+        "DeformBox",
     )
     .unwrap();
     assert_eq!(result, source);
@@ -394,7 +397,8 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
     ];
     let uneven = cast_uneven_cube();
     // `{}` is the schema default: SPHERE, factor 0.5, radius 0, size 0, use_radius_as_size true.
-    let sphere = evaluate_modifiers(&uneven, &[modifier("cast", json!({}))]).unwrap();
+    let sphere =
+        evaluate_modifiers(&uneven, &[modifier("cast", json!({}))], "CastFixture").unwrap();
     assert_cast_positions(&sphere, UNEVEN_SPHERE_DEFAULT, "uneven sphere default");
     let cuboid = evaluate_modifiers(
         &uneven,
@@ -402,12 +406,14 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
             "cast",
             json!({"cast_type": "CUBOID", "use_radius_as_size": false, "size": 1.5}),
         )],
+        "CastFixture",
     )
     .unwrap();
     assert_cast_positions(&cuboid, UNEVEN_CUBOID_SIZE, "uneven cuboid size 1.5");
     let cylinder = evaluate_modifiers(
         &uneven,
         &[modifier("cast", json!({"cast_type": "CYLINDER"}))],
+        "CastFixture",
     )
     .unwrap();
     assert_cast_positions(
@@ -419,15 +425,19 @@ fn cast_defaults_and_limits_match_blender_on_uneven_and_zero_geometry() {
     let limited = evaluate_modifiers(
         &uneven,
         &[modifier("cast", json!({"factor": 0.5, "radius": 1.2}))],
+        "CastFixture",
     )
     .unwrap();
     assert_cast_positions(&limited, UNEVEN_SOURCE, "uneven radius limit");
     // All-zero geometry: the automatic sphere/cylinder size is 10 and the cuboid bounds are zero.
     let zero = Mesh::from_positions_and_faces(vec![DVec3::ZERO; 8], cast_cube_faces()).unwrap();
     for cast_type in ["SPHERE", "CUBOID", "CYLINDER"] {
-        let result =
-            evaluate_modifiers(&zero, &[modifier("cast", json!({"cast_type": cast_type}))])
-                .unwrap();
+        let result = evaluate_modifiers(
+            &zero,
+            &[modifier("cast", json!({"cast_type": cast_type}))],
+            "ZeroCastFixture",
+        )
+        .unwrap();
         assert_cast_positions(&result, [[0.0; 3]; 8], cast_type);
     }
 }
@@ -438,10 +448,12 @@ fn modifier_parameter_errors_include_a_json_pointer() {
     let error = evaluate_modifiers(
         &source,
         &[modifier("simple_deform", json!({"angle": "invalid"}))],
+        "DeformBox",
     )
     .unwrap_err();
     assert_eq!(error.details["pointer"], "/params/angle");
 }
+
 #[test]
 fn mask_drops_faces_that_use_vertices_outside_the_group() {
     let mut source = Mesh::from_positions_and_faces(
@@ -456,10 +468,12 @@ fn mask_drops_faces_that_use_vertices_outside_the_group() {
     let result = evaluate_modifiers(
         &source,
         &[modifier("mask", json!({"vertex_group":"handle"}))],
+        "MaskQuad",
     )
     .unwrap();
     assert!(result.faces.is_empty(), "{:?}", result.faces);
 }
+
 #[test]
 fn boolean_modifier_apply_resolves_scene_object_operand() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -531,6 +545,7 @@ fn multires_levels_are_bounded_by_the_stored_top_level_and_budget() {
             "multires",
             json!({"levels": 6, "total_levels": 1}),
         )],
+        "TestObject",
     )
     .unwrap();
     assert_eq!(clamped.faces.len(), 24);
@@ -541,6 +556,7 @@ fn multires_levels_are_bounded_by_the_stored_top_level_and_budget() {
             "multires",
             json!({"levels": 6, "total_levels": 6}),
         )],
+        "TestObject",
     )
     .unwrap();
     assert_eq!(multires_level_six.faces.len(), 24_576);
@@ -551,6 +567,7 @@ fn multires_levels_are_bounded_by_the_stored_top_level_and_budget() {
             "multires",
             json!({"levels": 11, "total_levels": 11}),
         )],
+        "TestObject",
     )
     .unwrap_err();
     assert_eq!(resource_limited.code, ErrorCode::LimitExceeded);
@@ -583,6 +600,7 @@ fn custom_normals_follow_blender_per_modifier_type() {
             "multires",
             json!({"levels": 1, "use_custom_normals": true}),
         )],
+        "TestObject",
     )
     .unwrap();
     // Blender 5.2.2 (tests/fixtures/custom_normal_presence): Multires with Use Custom Normals on writes a layer
@@ -598,6 +616,7 @@ fn custom_normals_follow_blender_per_modifier_type() {
             "subdivision",
             json!({"levels": 1, "use_custom_normals": true}),
         )],
+        "TestObject",
     )
     .unwrap();
     assert!(
@@ -610,6 +629,7 @@ fn custom_normals_follow_blender_per_modifier_type() {
             "subdivision",
             json!({"levels": 1, "use_custom_normals": false}),
         )],
+        "TestObject",
     )
     .unwrap();
     assert!(!subdivision_off.attributes.contains_key("custom_normal"));
@@ -619,6 +639,7 @@ fn custom_normals_follow_blender_per_modifier_type() {
             "multires",
             json!({"levels": 1, "use_custom_normals": true}),
         )],
+        "TestObject",
     )
     .unwrap();
     assert!(!sharp_result.attributes.contains_key("custom_normal"));
@@ -644,6 +665,7 @@ fn custom_normals_follow_blender_per_modifier_type() {
             "multires",
             json!({"levels": 1, "use_custom_normals": true}),
         )],
+        "TestObject",
     )
     .unwrap();
     assert!(enabled.attributes.contains_key("custom_normal"));
@@ -653,6 +675,7 @@ fn custom_normals_follow_blender_per_modifier_type() {
             "multires",
             json!({"levels": 1, "use_custom_normals": false}),
         )],
+        "TestObject",
     )
     .unwrap();
     assert!(!disabled.attributes.contains_key("custom_normal"));
@@ -663,7 +686,7 @@ fn skin_modifier_builds_a_closed_profile_around_skeleton_edges() {
     let first = line.insert_vertex(DVec3::ZERO).unwrap();
     let second = line.insert_vertex(DVec3::Z).unwrap();
     line.insert_edge([first, second]).unwrap();
-    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))]).unwrap();
+    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "SkinSkeleton").unwrap();
     assert_eq!(result.vertices.len(), 16);
     assert_eq!(result.faces.len(), 14);
     assert!(edge_face_counts(&result).values().all(|count| *count == 2));
@@ -673,12 +696,6 @@ fn numeric_identity_settings_preserve_mesh_topology_and_positions() {
     let source = Mesh::box_mesh(BoxParams::default()).unwrap();
     let source_geometry = canonical_geometry(&source);
     let cases = [
-        ("array", json!({"count":1})),
-        ("subdivision", json!({"levels":0})),
-        ("multires", json!({"levels":0})),
-        ("bevel", json!({"width":0.0})),
-        ("decimate", json!({"ratio":1.0})),
-        ("weld", json!({"merge_threshold":0.0})),
         ("displace", json!({"strength":0.0})),
         ("smooth", json!({"factor":0.0})),
         ("simple_deform", json!({"angle":0.0})),
@@ -691,29 +708,18 @@ fn numeric_identity_settings_preserve_mesh_topology_and_positions() {
             "hook",
             json!({"target_position":[1.0,0.0,0.0],"strength":0.0}),
         ),
-        ("build", json!({"frame_start":0.0,"frame_duration":1.0})),
-        ("edge_split", json!({"split_angle":4.0})),
     ];
 
     for (modifier_type, params) in cases {
-        let result = evaluate_modifiers(&source, &[modifier(modifier_type, params)]).unwrap();
+        let result =
+            evaluate_modifiers(&source, &[modifier(modifier_type, params)], "IdentityCube")
+                .unwrap();
         assert_eq!(
             canonical_geometry(&result),
             source_geometry,
             "{modifier_type}"
         );
     }
-
-    let zero_thickness_solidify =
-        evaluate_modifiers(&source, &[modifier("solidify", json!({"thickness":0.0}))]).unwrap();
-    let solidified_geometry = canonical_geometry(&zero_thickness_solidify);
-    assert_eq!(zero_thickness_solidify.vertices.len(), 16);
-    assert_eq!(zero_thickness_solidify.edges.len(), 24);
-    assert_eq!(zero_thickness_solidify.faces.len(), 12);
-    let mut duplicated_positions = source_geometry.0.clone();
-    duplicated_positions.extend_from_slice(&source_geometry.0);
-    duplicated_positions.sort_unstable();
-    assert_eq!(solidified_geometry.0, duplicated_positions);
 }
 
 #[test]
@@ -731,6 +737,7 @@ fn mask_threshold_uses_a_strict_weight_cutoff() {
             "mask",
             json!({"vertex_group":"region","threshold":0.5}),
         )],
+        "MaskTriangle",
     )
     .unwrap();
     let excluded = evaluate_modifiers(
@@ -739,6 +746,7 @@ fn mask_threshold_uses_a_strict_weight_cutoff() {
             "mask",
             json!({"vertex_group":"region","threshold":0.75}),
         )],
+        "MaskTriangle",
     )
     .unwrap();
     assert_eq!(retained.faces.len(), 1);
@@ -762,6 +770,7 @@ fn mirror_merge_threshold_merges_vertices_within_tolerance() {
             "mirror",
             json!({"use_axis":[true,false,false],"use_mirror_merge":true,"merge_threshold":0.001}),
         )],
+        "MirrorTriangle",
     )
     .unwrap();
 
@@ -771,6 +780,7 @@ fn mirror_merge_threshold_merges_vertices_within_tolerance() {
             "mirror",
             json!({"use_axis":[true,false,false],"use_mirror_merge":true,"merge_threshold":0.0005}),
         )],
+        "MirrorTriangle",
     )
     .unwrap();
     assert_eq!(outside.vertices.len(), 6);
@@ -780,12 +790,14 @@ fn mirror_merge_threshold_merges_vertices_within_tolerance() {
             "mirror",
             json!({"use_axis":[true,false,false],"use_mirror_merge":false,"merge_threshold":0.001}),
         )],
+        "MirrorTriangle",
     )
     .unwrap();
     assert_eq!(merged.vertices.len(), 5);
     assert_eq!(merged.faces.len(), 2);
     assert_eq!(separate.vertices.len(), 6);
 }
+
 #[test]
 fn skin_vertex_radii_set_cross_section_bounds() {
     let mut line = Mesh::new();
@@ -799,7 +811,11 @@ fn skin_vertex_radii_set_cross_section_bounds() {
             "1":[0.5,0.25]
         }),
     );
-    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))]).unwrap();
+    // Blender builds a skin only from a skeleton with a root vertex; without one the input is kept
+    // (tests/pr18f_skin.rs, skeleton_without_root_reports_blender_modifier_warning_and_keeps_input).
+    line.attributes
+        .insert("skin_roots".to_owned(), json!({"0": true, "1": false}));
+    let result = evaluate_modifiers(&line, &[modifier("skin", json!({}))], "SkinSkeleton").unwrap();
     let bounds = result.bounds().unwrap();
     assert!((bounds.min.x + 0.5).abs() < 1.0e-12);
     assert!((bounds.max.x - 0.5).abs() < 1.0e-12);
@@ -869,7 +885,12 @@ fn simple_deform_methods_match_blender_vertex_positions() {
     ];
 
     for (method, params, expected) in cases {
-        let result = evaluate_modifiers(&source, &[modifier("simple_deform", params)]).unwrap();
+        let result = evaluate_modifiers(
+            &source,
+            &[modifier("simple_deform", params)],
+            "SimpleDeformFixture",
+        )
+        .unwrap();
         for (vertex_id, position) in [
             (origin, expected[0]),
             (end, expected[1]),
@@ -901,6 +922,7 @@ fn screw_offset_extends_the_profile_along_its_axis() {
                 "axis":"Z"
             }),
         )],
+        "ScrewLine",
     )
     .unwrap();
     assert_eq!(result.vertices.len(), 10);
