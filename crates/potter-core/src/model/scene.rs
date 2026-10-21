@@ -2666,6 +2666,11 @@ pub struct Material {
     /// partly transparent shadow, as EEVEE's shadow pass does (`eevee_surf_shadow.bsl.hh`). Off, it casts an opaque one.
     #[serde(default = "default_true")]
     pub use_transparent_shadow: bool,
+    /// Blender's `cycles.use_bump_map_correction` (on by default, `intern/cycles/blender/addon/properties.py`): the shader
+    /// flag `SD_USE_BUMP_MAP_CORRECTION` (`scene/shader.cpp`) that enables the terminator corrections for bump-mapped
+    /// normals: the grazing diffuse smoothing and the lifted specular reflection (`kernel/closure/bsdf_util.h`).
+    #[serde(default = "default_true")]
+    pub use_bump_map_correction: bool,
     #[serde(default)]
     pub node_tree: Option<Id>,
     #[serde(default)]
@@ -2713,6 +2718,7 @@ impl Default for Material {
             ior: default_ior(),
             double_sided: default_true(),
             use_transparent_shadow: default_true(),
+            use_bump_map_correction: default_true(),
             node_tree: None,
             base_color_texture: None,
             roughness_texture: None,

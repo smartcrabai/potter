@@ -189,7 +189,11 @@ fn texture_material(uv_layer: Option<&str>) -> (Material, BTreeMap<String, Image
 
 fn surface_normal(material: &Material, groups: &Registry<NodeGroup>, layers: &Layers) -> DVec3 {
     let context = HitContext::new(groups).with_uv_layers(layers.hit());
-    evaluate_surface(material, &context).unwrap().normal
+    evaluate_surface(material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap()
+        .normal
 }
 
 #[test]
@@ -252,7 +256,11 @@ fn empty_layer_name_is_the_render_layer_and_a_missing_name_warns() {
         .with_uv_layers(layers.hit())
         .with_warnings(&warnings);
     assert_close(
-        evaluate_surface(&material, &context).unwrap().normal,
+        evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .normal,
         expected,
     );
     assert!(warnings.borrow().is_empty());
@@ -262,7 +270,11 @@ fn empty_layer_name_is_the_render_layer_and_a_missing_name_warns() {
         .with_uv_layers(layers.hit())
         .with_warnings(&warnings);
     assert_close(
-        evaluate_surface(&material, &context).unwrap().normal,
+        evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .normal,
         expected,
     );
     assert_eq!(warnings.borrow().len(), 1);
@@ -296,7 +308,11 @@ fn normal_texture_uses_the_frame_of_its_own_layer() {
             .with_images(&images)
             .with_uv_layers(layers.hit());
         assert_close(
-            evaluate_surface(&material, &context).unwrap().normal,
+            evaluate_surface(&material, &context)
+                .unwrap()
+                .dominant()
+                .unwrap()
+                .normal,
             expected,
         );
     }
@@ -315,7 +331,11 @@ fn normal_texture_empty_layer_is_render_and_missing_layer_warns() {
             .with_uv_layers(layers.hit())
             .with_warnings(&warnings);
         assert_close(
-            evaluate_surface(&material, &context).unwrap().normal,
+            evaluate_surface(&material, &context)
+                .unwrap()
+                .dominant()
+                .unwrap()
+                .normal,
             render,
         );
     }
@@ -327,7 +347,11 @@ fn normal_texture_empty_layer_is_render_and_missing_layer_warns() {
         .with_uv_layers(layers.hit())
         .with_warnings(&warnings);
     assert_close(
-        evaluate_surface(&material, &context).unwrap().normal,
+        evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .normal,
         render,
     );
     assert_eq!(warnings.borrow().len(), 1);
@@ -348,7 +372,11 @@ fn normal_map_node_frame_comes_from_its_uv_map_property() {
         let context = HitContext::new(&groups)
             .with_uv_layers(layers.hit())
             .with_warnings(&warnings);
-        let actual = evaluate_surface(&material, &context).unwrap().normal;
+        let actual = evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .normal;
         assert_close(actual, expected);
         if uv_map == Some("UVMap.001") {
             // Blender 5.2.2 bake: canonical UV values converted to Blender V-up, with the selected
@@ -372,6 +400,8 @@ fn imported_normal_map_matches_direct_texture_with_unrelated_graph_nodes() {
         .with_images(&images)
         .with_uv_layers(layers.hit());
     let expected = evaluate_surface(&direct_material, &direct_context)
+        .unwrap()
+        .dominant()
         .unwrap()
         .normal;
 
@@ -423,7 +453,11 @@ fn imported_normal_map_matches_direct_texture_with_unrelated_graph_nodes() {
         .with_images(&images)
         .with_uv_layers(layers.hit());
     assert_close(
-        evaluate_surface(&material, &context).unwrap().normal,
+        evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .normal,
         expected,
     );
 }

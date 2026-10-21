@@ -3379,6 +3379,10 @@ fn build_imported_graph(
                     .get("use_transparent_shadow")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                use_bump_map_correction: item
+                    .get("use_bump_map_correction")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),
@@ -13379,13 +13383,16 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .materials
             .get(&material_id)
             .ok_or_else(|| invalid_intermediate("source material is missing"))?;
-        let source_normal = crate::shader::evaluate_surface(
+        let source_shading = crate::shader::evaluate_surface(
             source_material,
             &crate::shader::HitContext::new(&doc.node_groups)
                 .with_images(&image_data)
                 .with_uv_layers(hit_layers),
-        )?
-        .normal;
+        )?;
+        let source_normal = source_shading
+            .dominant()
+            .ok_or_else(|| invalid_intermediate("source material has no closure"))?
+            .normal;
 
         let project = Project::init(directory.path().join("project"))?;
         let output = directory.path().join("normal-handedness.blend");
@@ -13529,13 +13536,16 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 .any(|node| node.node_type == "ShaderNodeVectorMath"),
             "Blender-only green conversion nodes should collapse to the canonical glTF marker"
         );
-        let roundtrip_normal = crate::shader::evaluate_surface(
+        let roundtrip_shading = crate::shader::evaluate_surface(
             imported_material,
             &crate::shader::HitContext::new(&imported.doc.node_groups)
                 .with_images(&image_data)
                 .with_uv_layers(hit_layers),
-        )?
-        .normal;
+        )?;
+        let roundtrip_normal = roundtrip_shading
+            .dominant()
+            .ok_or_else(|| invalid_intermediate("round-trip material has no closure"))?
+            .normal;
         assert!(
             source_normal.distance(roundtrip_normal) <= 1.0e-12,
             "normal direction changed across .blend round-trip: {source_normal:?} != {roundtrip_normal:?}"
@@ -14041,18 +14051,24 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     render: Some(0),
                     available_mask: None,
                 };
-                let source = crate::shader::evaluate_surface(
+                let source_shading = crate::shader::evaluate_surface(
                     source_material,
                     &crate::shader::HitContext::new(&doc.node_groups)
                         .with_images(&image_data)
                         .with_uv_layers(layers),
                 )?;
-                let reopened = crate::shader::evaluate_surface(
+                let source = source_shading
+                    .dominant()
+                    .ok_or_else(|| invalid_intermediate("source material has no closure"))?;
+                let reopened_shading = crate::shader::evaluate_surface(
                     reopened_material,
                     &crate::shader::HitContext::new(&imported.doc.node_groups)
                         .with_images(&reopened_image_data)
                         .with_uv_layers(layers),
                 )?;
+                let reopened = reopened_shading
+                    .dominant()
+                    .ok_or_else(|| invalid_intermediate("round-trip material has no closure"))?;
                 for (channel, expected) in base[index].into_iter().enumerate() {
                     assert!(
                         close(source.base_color[channel], expected),
@@ -18102,8 +18118,18 @@ print("UNSUPPORTED_POSE " + json.dumps({
             .ok_or_else(|| invalid_intermediate("roundtrip material is missing"))?;
         let source_hit = crate::shader::HitContext::new(&doc.node_groups);
         let reopened_hit = crate::shader::HitContext::new(&imported.doc.node_groups);
-        let source_params = crate::shader::evaluate_surface(source, &source_hit)?;
-        let reopened_params = crate::shader::evaluate_surface(reopened, &reopened_hit)?;
+        let source_shading = crate::shader::evaluate_surface(source, &source_hit)?;
+        let reopened_shading = crate::shader::evaluate_surface(reopened, &reopened_hit)?;
+        let source_params = source_shading
+            .volume
+            .first()
+            .ok_or_else(|| invalid_intermediate("source material has no volume closure"))?
+            .params;
+        let reopened_params = reopened_shading
+            .volume
+            .first()
+            .ok_or_else(|| invalid_intermediate("round-trip material has no volume closure"))?
+            .params;
         assert!(close(
             reopened_params.volume_anisotropy,
             source_params.volume_anisotropy
