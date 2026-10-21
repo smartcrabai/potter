@@ -1009,7 +1009,12 @@ fn assert_oracle_mesh(
         .collect::<Vec<_>>();
     let expected_smooth_faces: Vec<bool> =
         serde_json::from_value(expected["smooth_faces"].clone())?;
-    assert_eq!(actual_smooth_faces, expected_smooth_faces);
+    if actual_smooth_faces != expected_smooth_faces {
+        return Err(format!(
+            "smooth faces: Potter {actual_smooth_faces:?}, Blender {expected_smooth_faces:?}"
+        )
+        .into());
+    }
     let has_custom_normals = expected["has_custom_normals"]
         .as_bool()
         .ok_or("Blender oracle custom-normal flag is missing")?;

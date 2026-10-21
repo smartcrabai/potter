@@ -210,8 +210,16 @@ pub(crate) fn evaluate(
             })?;
         let ranks = blender_edge_ranks(&evaluated.faces);
         sort_edges_by_rank(&mut evaluated, &ranks);
-        // Blender's Alembic reader assumes polygons are smooth; flat shading is encoded in the custom
-        // normals, so the replaced mesh keeps the default smooth faces and the setter marks the sharp edges.
+        // Blender builds a replacement from the receiver as a template: when the face and vertex counts
+        // match it keeps the receiver's shading; otherwise its polygons are smooth, as the Alembic reader
+        // assumes (abc_reader_mesh.cc: "Polygons are always assumed to be smooth-shaded").
+        if mesh.faces.len() == evaluated.faces.len()
+            && mesh.vertices.len() == evaluated.vertices.len()
+        {
+            carry_shading(mesh, &mut evaluated)?;
+        } else {
+            set_all_faces_smooth(&mut evaluated);
+        }
         apply_cache_attributes(
             &mut evaluated,
             sample.sample,
@@ -504,6 +512,19 @@ fn sort_edges_by_rank(mesh: &mut Mesh, ranks: &HashMap<[u32; 2], usize>) {
 
 fn sorted_pair(vertices: [u32; 2]) -> [u32; 2] {
     [vertices[0].min(vertices[1]), vertices[0].max(vertices[1])]
+}
+
+/// Marks every face of a replacement smooth, the Alembic reader's default for polygons.
+fn set_all_faces_smooth(mesh: &mut Mesh) {
+    let values: serde_json::Map<String, Value> = mesh
+        .faces
+        .iter()
+        .map(|face| (format!("f{}", face.id), json!(true)))
+        .collect();
+    mesh.attributes.insert(
+        "shade_smooth".to_owned(),
+        json!({"domain": "face", "type": "bool", "values": values}),
+    );
 }
 
 /// Carries the receiver's shading onto a replacement with the same faces. Blender keeps a receiver's
