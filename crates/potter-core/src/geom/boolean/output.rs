@@ -643,6 +643,21 @@ fn join_attributes(
         "shade_smooth",
         joined_face_attribute(operands, &face_ids, layout, "shade_smooth"),
     );
+    // The joined `sharp_face` exists when any operand's does: attribute joins are unions of the operands'.
+    let mut sharp_face_present = false;
+    for operand in operands {
+        sharp_face_present |= crate::geom::normals::sharp_face_flags(operand.mesh)?.is_some();
+    }
+    if sharp_face_present
+        && let Some(fields) = attributes
+            .get_mut("shade_smooth")
+            .and_then(Value::as_object_mut)
+    {
+        fields.insert(
+            crate::geom::normals::SHARP_FACE_PRESENT.to_owned(),
+            json!(true),
+        );
+    }
     insert_if(
         &mut attributes,
         "blender_polygon_smooth",
