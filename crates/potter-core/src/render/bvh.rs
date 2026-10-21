@@ -14,14 +14,15 @@ pub(crate) struct BvhHit {
 }
 
 /// The ray a [`Bvh::walk_hits`] walk follows: where it starts, its direction, the offset it restarts past each
-/// hit, the distance left along it, and its kind (which decides the triangles it passes through).
+/// hit, the distance left along it, and its kind: the triangles whose object hides that kind are passed through. A
+/// `None` kind is a local probe of the objects themselves (Cycles' `scene_intersect_local`), which takes every triangle.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WalkRay {
     pub origin: DVec3,
     pub direction: DVec3,
     pub epsilon: f64,
     pub remaining: f64,
-    pub kind: crate::model::RayKind,
+    pub kind: Option<crate::model::RayKind>,
 }
 
 #[derive(Debug)]
@@ -151,7 +152,7 @@ impl Bvh {
             direction,
             epsilon,
             remaining,
-            &|triangle| triangle.ray_mask & kind.bit() != 0,
+            &|triangle| kind.is_none_or(|kind| triangle.ray_mask & kind.bit() != 0),
         ) {
             if !visit(hit, origin) {
                 break;
