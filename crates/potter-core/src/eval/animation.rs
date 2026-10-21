@@ -134,13 +134,55 @@ pub(crate) fn animated_modifier_scalar(
             json!({"node":node_id,"modifier":modifier_id,"parameter":parameter}),
         ));
     }
-
+    // Blender's NLA domain: a channel exists whenever an enabled track has a strip whose Action binds
+    // it, whatever the frame (`nla_eval_domain_strips`, anim_sys.cc:3229). Such a channel starts from its
+    // default and is written back even when no strip covers the frame (`nladata_flush_channels`).
     let has_solo = node
         .nla_tracks
         .iter()
         .any(|track| track.solo && !track.mute);
-    let mut value = base_value;
-    let mut animated = false;
+    let mut in_nla_domain = false;
+    for track in node
+        .nla_tracks
+        .iter()
+        .filter(|track| !track.mute && (!has_solo || track.solo))
+    {
+        for strip in &track.strips {
+            let action = doc.actions.get(&strip.action).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "NLA strip action reference does not exist",
+                    json!({"action":strip.action,"strip":strip.id}),
+                )
+            })?;
+            if action.modifier_bindings.values().flatten().any(|binding| {
+                &binding.node == node_id
+                    && &binding.modifier == modifier_id
+                    && binding.parameter == parameter
+            }) {
+                in_nla_domain = true;
+            }
+        }
+    }
+    let nla_default = if in_nla_domain {
+        crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            &modifier.modifier_type,
+            parameter,
+        )
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "NLA-animated modifier parameter has no Blender default",
+                json!({"node":node_id,"modifier":modifier_id,"parameter":parameter}),
+            )
+        })?
+    } else {
+        base_value
+    };
+    let mut value = nla_default;
+    let mut animated = in_nla_domain;
     for track in &node.nla_tracks {
         if track.mute || (has_solo && !track.solo) {
             continue;
@@ -177,7 +219,7 @@ pub(crate) fn animated_modifier_scalar(
                 continue;
             };
             let influence = strip_influence(strip, frame)?;
-            value = blend_translation_scalar(value, sampled, strip.blend_type, influence);
+            value = blend_scalar(value, sampled, nla_default, strip.blend_type, influence);
             if !value.is_finite() {
                 return Err(PotError::with_details(
                     ErrorCode::SceneInvalid,
@@ -562,10 +604,20 @@ fn strip_influence(strip: &NlaStrip, frame: f64) -> Result<f64> {
     }
 }
 
-fn blend_translation_scalar(current: f64, target: f64, blend: NlaBlendType, influence: f64) -> f64 {
+/// Blender's `nla_blend_value` and `nla_combine_value` for one scalar channel (`NEC_MIX_ADD`).
+/// Replace and Add blend against the lower value. Combine adds the strip's offset from the channel's
+/// default, so an NLA stack over a channel at its default leaves the default untouched (anim_sys.cc:1866, 1890).
+fn blend_scalar(
+    current: f64,
+    target: f64,
+    default: f64,
+    blend: NlaBlendType,
+    influence: f64,
+) -> f64 {
     match blend {
         NlaBlendType::Replace => current * (1.0 - influence) + target * influence,
-        NlaBlendType::Add | NlaBlendType::Combine => current + target * influence,
+        NlaBlendType::Add => current + target * influence,
+        NlaBlendType::Combine => current + (target - default) * influence,
     }
 }
 
@@ -578,9 +630,11 @@ fn blend_transform(
 ) -> Result<()> {
     for component in 0..3 {
         if channels.translation[component] {
-            current.translation[component] = blend_translation_scalar(
+            current.translation[component] = blend_scalar(
                 current.translation[component],
                 sampled.translation[component],
+                // Location's Blender default is 0, so COMBINE adds the strip's value unchanged.
+                0.0,
                 blend,
                 influence,
             );
@@ -1479,8 +1533,10 @@ mod tests {
     #[test]
     fn modifier_scalar_nla_reuses_native_frame_influence_and_blend_rules() {
         for (blend_type, expected) in [
-            (NlaBlendType::Replace, 1.25),
-            (NlaBlendType::Add, 1.5),
+            // Blender's default for Ocean time is 1.0 (DNA_modifier_types.h:1480), so the NLA stack starts there,
+            // not at the stored 0.5. The strip value at frame 2 is 2.0 and its influence 0.5.
+            (NlaBlendType::Replace, 1.5),
+            (NlaBlendType::Add, 2.0),
             (NlaBlendType::Combine, 1.5),
         ] {
             let node_id = Id::new("ocean_nla_node").unwrap();
@@ -1528,6 +1584,124 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    /// The NLA value of Ocean `time` at each frame, as Blender 5.2.2 writes it. The committed generator
+    /// (`tests/fixtures/ocean_parity/generate_nla_time.py`) runs the scene in Blender and records the value
+    /// the modifier holds after `frame_set`. Each case rebuilds the same node, strip and Action, and checks
+    /// `animated_modifier_scalar` at every frame. A case with no NLA strip keeps the stored `time`.
+    #[test]
+    fn ocean_time_nla_matches_blender_522_oracle() -> Result<(), Box<dyn std::error::Error>> {
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/ocean_parity/nla_time_oracle.json"
+        ))?;
+        assert_eq!(oracle["format"], "potter-ocean-nla-time-oracle");
+        assert_eq!(oracle["default_time"].as_f64(), Some(1.0));
+        let cases = oracle["cases"]
+            .as_array()
+            .ok_or("oracle cases are missing")?;
+        assert!(!cases.is_empty(), "the Blender oracle has no cases");
+        for case in cases {
+            let name = case["name"].as_str().ok_or("oracle case has no name")?;
+            let stored = case["stored_time"]
+                .as_f64()
+                .ok_or("stored time is missing")?;
+            // `ocean_node` stores time 0.5, so the oracle's stored time must be that value.
+            assert_eq!(stored, 0.5, "{name}: stored time");
+            let node_id = Id::new(format!("oracle_{name}"))?;
+            let modifier_id = Id::new("oracle_ocean")?;
+            let action_id = Id::new(format!("oracle_action_{name}"))?;
+            let slot_id = Id::new(format!("oracle_slot_{name}"))?;
+            let mut subject = ocean_node(None, &modifier_id);
+            let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+            if let Some(strip) = case["strip"].as_object() {
+                let keys = case["keys"].as_array().ok_or("oracle keys are missing")?;
+                assert_eq!(keys.len(), 2, "{name}: two keys");
+                assert_eq!(
+                    keys[0]["frame"].as_f64(),
+                    Some(1.0),
+                    "{name}: first key frame"
+                );
+                assert_eq!(
+                    keys[1]["frame"].as_f64(),
+                    Some(3.0),
+                    "{name}: second key frame"
+                );
+                let first_value = keys[0]["value"]
+                    .as_f64()
+                    .ok_or("first key value is missing")?;
+                let second_value = keys[1]["value"]
+                    .as_f64()
+                    .ok_or("second key value is missing")?;
+                let number = |field: &str| {
+                    strip[field]
+                        .as_f64()
+                        .ok_or_else(|| format!("{name}: strip {field} is missing"))
+                };
+                assert_eq!(strip["extrapolation"], "NOTHING", "{name}: extrapolation");
+                let blend_type = match strip["blend_type"].as_str() {
+                    Some("REPLACE") => NlaBlendType::Replace,
+                    Some("ADD") => NlaBlendType::Add,
+                    Some("COMBINE") => NlaBlendType::Combine,
+                    other => return Err(format!("{name}: unknown blend type {other:?}").into()),
+                };
+                subject.nla_tracks.push(NlaTrack {
+                    id: Id::new(format!("oracle_track_{name}"))?,
+                    name: "Ocean Time".to_owned(),
+                    mute: false,
+                    solo: false,
+                    strips: vec![NlaStrip {
+                        id: Id::new(format!("oracle_strip_{name}"))?,
+                        action: action_id.clone(),
+                        action_slot: Some(slot_id.clone()),
+                        frame_start: number("frame_start")?,
+                        frame_end: number("frame_end")?,
+                        action_frame_start: number("action_frame_start")?,
+                        action_frame_end: number("action_frame_end")?,
+                        scale: 1.0,
+                        repeat: 1.0,
+                        blend_type,
+                        influence: number("influence")?,
+                        extrapolation: NlaExtrapolation::Nothing,
+                        blend_in: 0.0,
+                        blend_out: 0.0,
+                    }],
+                });
+                let mut action = ocean_time_action(
+                    &slot_id,
+                    &node_id,
+                    vec![ocean_modifier_binding(&node_id, &modifier_id, &slot_id)],
+                    first_value,
+                    second_value,
+                );
+                action.active_slots.clear();
+                doc.actions.insert(action_id, action);
+            }
+            doc.nodes.insert(node_id.clone(), subject.clone());
+            let expected = case["expected_by_frame"]
+                .as_object()
+                .ok_or("expected values are missing")?;
+            assert_eq!(expected.len(), 7, "{name}: frames 0 to 6");
+            for (frame_text, value) in expected {
+                let frame: f64 = frame_text.parse()?;
+                let expected = value.as_f64().ok_or("expected value is not numeric")?;
+                let actual = animated_modifier_scalar(
+                    &node_id,
+                    &subject,
+                    &doc,
+                    &modifier_id,
+                    "time",
+                    stored,
+                    frame,
+                )?
+                .unwrap_or(stored);
+                assert!(
+                    (actual - expected).abs() <= 1.0e-6,
+                    "{name} frame {frame}: Potter {actual} vs Blender 5.2.2 {expected}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

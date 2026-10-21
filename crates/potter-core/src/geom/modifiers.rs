@@ -51,7 +51,7 @@ pub(crate) use displacement::{
 mod mirror;
 pub(crate) mod multires;
 mod ocean;
-pub(crate) use ocean::{OceanBakeImage, OceanBakeSequence};
+pub(crate) use ocean::{OceanBakeImage, OceanBakeSequence, ocean_cache_directory};
 pub(crate) mod remesh_modes;
 pub(crate) mod shrinkwrap;
 pub mod simulation;

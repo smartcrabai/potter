@@ -171,18 +171,7 @@ impl OceanParams {
     }
 
     fn spectrum_settings(&self) -> SpectrumSettings {
-        SpectrumSettings::new(
-            self.spectrum,
-            self.spatial_size,
-            self.wind_velocity,
-            self.wave_scale_min,
-            self.wave_direction,
-            self.damping,
-            self.wave_alignment,
-            self.depth,
-            self.fetch,
-            self.sharpen_peak,
-        )
+        SpectrumSettings::new(self)
     }
 }
 
@@ -785,7 +774,8 @@ pub(super) fn ocean_with_parameter_evaluator(
             params.choppiness,
             params.use_foam,
             params.choppiness > 0.0,
-            params.use_normals,
+            // Live evaluation reads no normal field (the bake writes them), so the normal FFTs are skipped.
+            false,
         ))
     } else {
         None
@@ -1074,7 +1064,11 @@ fn sample_cache_uv(
     })
 }
 
-fn ocean_cache_directory(
+/// The directory of an Ocean bake cache, resolved the same way by `bake` and by every later read.
+/// `//` is relative to the project root, a relative path is joined onto the project root, and an
+/// absolute path is used as is. A relative path without a project root is an error, so a cache never
+/// lands in the working directory.
+pub(crate) fn ocean_cache_directory(
     filepath: &str,
     project_root: Option<&Path>,
 ) -> Result<std::path::PathBuf> {
@@ -1082,6 +1076,11 @@ fn ocean_cache_directory(
         return Err(PotError::invalid_argument("Ocean cache filepath is empty"));
     }
     if let Some(relative) = filepath.strip_prefix("//") {
+        if relative.is_empty() || relative.starts_with('/') {
+            return Err(PotError::invalid_argument(
+                "Ocean `//` filepath must name a relative directory",
+            ));
+        }
         return project_root.map(|root| root.join(relative)).ok_or_else(|| {
             PotError::invalid_argument("project root is required for a // Ocean cache filepath")
         });
@@ -1143,8 +1142,20 @@ fn load_ocean_cache_image(
             json!({"path":path,"expected":[expected_dimension,expected_dimension],"actual":[width,height]}),
         ));
     }
+    // A Blender EXR lists the image's top row first, while the ImBuf buffer's row 0 is the bottom
+    // (`openexr_api.cpp`, `ibuf->y - 1 - y`). Reverse the file's rows into the bottom-up order that
+    // `sample_cache_uv` reads.
+    let row_width = expected_dimension;
+    if row_width == 0 || pixels.len() != row_width * row_width {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "Ocean cache image has no complete rows",
+        ));
+    }
     Ok(pixels
-        .into_iter()
+        .chunks_exact(row_width)
+        .rev()
+        .flatten()
         .map(|pixel| pixel.map(|value| value as f32))
         .collect())
 }
@@ -1210,7 +1221,6 @@ fn load_ocean_cache_frame(
     let spray_enabled = params.use_foam && params.use_spray;
     let spray = load_channel("spray", spray_enabled)?;
     let spray_inverse = load_channel("spray_inverse", spray_enabled)?;
-    let _normal = load_channel("normal", params.use_normals)?;
     Ok(OceanCacheFrame {
         width: image_resolution,
         height: image_resolution,

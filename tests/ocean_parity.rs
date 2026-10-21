@@ -272,6 +272,7 @@ fn ocean_blender_corpus_matches_geometry_uvs_and_corner_colors() -> Result<(), B
     let cases = corpus["cases"]
         .as_array()
         .ok_or("Ocean corpus cases are missing")?;
+    assert!(!cases.is_empty(), "the Ocean corpus has no cases");
     for case in cases {
         let name = case["name"]
             .as_str()
@@ -326,26 +327,27 @@ fn ocean_blender_corpus_matches_geometry_uvs_and_corner_colors() -> Result<(), B
             "{name}: polygon topology"
         );
 
-        if let Some(expected_uvs) = expected["uv"].as_array() {
-            let actual_uvs = output_uvs(&output)?;
-            assert_eq!(
-                actual_uvs.len(),
-                expected_uvs.len(),
-                "{name}: UV corner count"
-            );
-            for (corner, (actual, expected)) in actual_uvs.iter().zip(expected_uvs).enumerate() {
-                let expected = expected.as_array().ok_or("expected UV is not an array")?;
-                for axis in 0..2 {
-                    let error = (actual[axis]
-                        - expected[axis]
-                            .as_f64()
-                            .ok_or("expected UV is not numeric")?)
-                    .abs();
-                    assert!(
-                        error <= 1.0e-6,
-                        "{name}: UV corner {corner} axis {axis} differs by {error}"
-                    );
-                }
+        let expected_uvs = expected["uv"]
+            .as_array()
+            .ok_or_else(|| format!("{name}: expected Blender UVs are missing"))?;
+        let actual_uvs = output_uvs(&output)?;
+        assert_eq!(
+            actual_uvs.len(),
+            expected_uvs.len(),
+            "{name}: UV corner count"
+        );
+        for (corner, (actual, expected)) in actual_uvs.iter().zip(expected_uvs).enumerate() {
+            let expected = expected.as_array().ok_or("expected UV is not an array")?;
+            for axis in 0..2 {
+                let error = (actual[axis]
+                    - expected[axis]
+                        .as_f64()
+                        .ok_or("expected UV is not numeric")?)
+                .abs();
+                assert!(
+                    error <= 1.0e-6,
+                    "{name}: UV corner {corner} axis {axis} differs by {error}"
+                );
             }
         }
         let expected_layers = expected["color_layers"]

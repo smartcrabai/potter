@@ -59,35 +59,23 @@ pub(super) struct Settings {
 }
 
 impl Settings {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "mirrors the BKE_ocean_init property set"
-    )]
-    pub(super) fn new(
-        spectrum: Spectrum,
-        length: f32,
-        wind_velocity: f32,
-        smallest_wave: f32,
-        direction: f32,
-        damping: f32,
-        alignment: f32,
-        depth: f32,
-        fetch: f32,
-        sharpen_peak: f32,
-    ) -> Self {
+    /// Blender's `BKE_ocean_init` values, read from the modifier's parameters. `length` is `spatial_size`
+    /// and `smallest_wave` is `wave_scale_min`; the wind direction, damping, alignment and sharpen peak are
+    /// converted as Blender's `ocean_spectrum.cc` uses them.
+    pub(super) fn new(params: &super::OceanParams) -> Self {
         Self {
-            spectrum,
-            length,
-            wind_velocity,
-            smallest_wave,
-            wind_x: direction.cos(),
-            wind_z: -direction.sin(),
-            largest_wave: wind_velocity * wind_velocity / GRAVITY,
-            damp_reflections: 1.0 - damping,
-            wind_alignment: alignment * 10.0,
-            depth,
-            fetch,
-            sharpen_peak: sharpen_peak * 10.0,
+            spectrum: params.spectrum,
+            length: params.spatial_size,
+            wind_velocity: params.wind_velocity,
+            smallest_wave: params.wave_scale_min,
+            wind_x: params.wave_direction.cos(),
+            wind_z: -params.wave_direction.sin(),
+            largest_wave: params.wind_velocity * params.wind_velocity / GRAVITY,
+            damp_reflections: 1.0 - params.damping,
+            wind_alignment: params.wave_alignment * 10.0,
+            depth: params.depth,
+            fetch: params.fetch,
+            sharpen_peak: params.sharpen_peak * 10.0,
         }
     }
 }
@@ -187,7 +175,8 @@ fn jonswap_base(settings: &Settings, k2: f32) -> f32 {
     let gamma = settings.sharpen_peak.clamp(1.0, 6.0);
     let dimensionless_fetch = (GRAVITY * settings.fetch / settings.wind_velocity.sqrt()).abs();
     let alpha = (0.076 * f64::from(dimensionless_fetch).powf(-0.22)) as f32;
-    let peak_omega = (std::f64::consts::TAU
+    // Blender: `const float m_tau = M_PI * 2`, which is float(2π) before the double multiplication.
+    let peak_omega = (f64::from(std::f32::consts::TAU)
         * 3.5
         * f64::from((GRAVITY / settings.wind_velocity).abs())
         * f64::from(dimensionless_fetch).powf(-0.33)) as f32;
@@ -222,7 +211,8 @@ fn texel_marsen_arsloe(settings: &Settings, kx: f32, kz: f32) -> f32 {
     let value = wind_and_damp(settings, kx, kz, jonswap_base(settings, k2));
     let gain = (settings.depth / GRAVITY).sqrt();
     let omega = omega(k2.sqrt(), settings.depth);
-    let kitaigorodskii = (0.5 + 0.5 * (1.8 * f64::from(omega * gain - 1.125)).tanh()) as f32;
+    // Blender: `kitaigorodskiiDepth_wh` is float, and `- 1.125` is evaluated in double.
+    let kitaigorodskii = (0.5 + 0.5 * (1.8 * (f64::from(omega * gain) - 1.125)).tanh()) as f32;
     wind_and_damp(settings, kx, kz, value * kitaigorodskii)
 }
 

@@ -310,7 +310,16 @@ fn run_ocean(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         ));
     }
     let base_time = ocean_time_parameter(&modifier)?;
-    let cache_path = ocean_cache_directory(&modifier, project.path())?;
+    let filepath = ocean_parameter(&modifier, "filepath")?
+        .as_str()
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidOperation,
+                "Ocean `filepath` must be a directory path",
+                json!({"modifier_id":modifier.id,"parameter":"filepath"}),
+            )
+        })?;
+    let cache_path = crate::geom::modifiers::ocean_cache_directory(filepath, Some(project.path()))?;
     if cache_path.exists() && !args.overwrite {
         return Err(PotError::new(
             ErrorCode::OutputExists,
@@ -503,29 +512,6 @@ fn ocean_time_parameter(modifier: &Modifier) -> Result<f64> {
     Ok(time)
 }
 
-fn ocean_cache_directory(modifier: &Modifier, project_root: &Path) -> Result<PathBuf> {
-    let filepath = ocean_parameter(modifier, "filepath")?
-        .as_str()
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::InvalidOperation,
-                "Ocean `filepath` must be a non-empty directory path",
-                json!({"modifier_id":modifier.id,"parameter":"filepath"}),
-            )
-        })?;
-    if let Some(relative) = filepath.strip_prefix("//") {
-        if relative.is_empty() || relative.starts_with('/') {
-            return Err(PotError::invalid_argument(
-                "Ocean `//` filepath must name a relative directory",
-            ));
-        }
-        Ok(project_root.join(relative))
-    } else {
-        Ok(PathBuf::from(filepath))
-    }
-}
-
 fn canonical_destination(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         return fs::canonicalize(path).map_err(|error| PotError::io(&error));
@@ -567,7 +553,8 @@ fn write_ocean_exr(path: &Path, image: &crate::geom::modifiers::OceanBakeImage) 
         ));
     }
     exr::prelude::write_rgba_file(path, resolution, resolution, |x, y| {
-        let pixel = image.pixels[y * resolution + x];
+        // Blender writes the image's top row first, so file row `y` is buffer row `height - 1 - y`.
+        let pixel = image.pixels[(resolution - 1 - y) * resolution + x];
         (
             exr::prelude::f16::from_f32(pixel[0]),
             exr::prelude::f16::from_f32(pixel[1]),
@@ -820,5 +807,84 @@ fn remove_path(path: &Path) -> Result<()> {
         fs::remove_dir_all(path).map_err(|error| PotError::io(&error))
     } else {
         fs::remove_file(path).map_err(|error| PotError::io(&error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use serde_json::{Value, json};
+
+    use super::write_ocean_exr;
+    use crate::{
+        geom::modifiers::OceanBakeSequence,
+        model::{Id, Modifier, ModifierRuntime},
+    };
+
+    /// A Blender EXR lists the image's top row first, and the buffer's row 0 is the bottom
+    /// (`openexr_api.cpp`, `ibuf->y - 1 - y`). The corpus holds Blender's bottom-up buffer, so a file
+    /// Potter writes must hold the corpus rows in reverse: file row `r` is corpus row `n - 1 - r`.
+    #[test]
+    fn written_ocean_exr_rows_follow_blenders_top_down_layout() -> Result<(), Box<dyn Error>> {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/ocean_parity/corpus.json"
+        ))?;
+        let case = corpus["cases"]
+            .as_array()
+            .and_then(|cases| {
+                cases
+                    .iter()
+                    .find(|case| case["name"] == "B1_cache_behaviour")
+            })
+            .ok_or("B1 corpus case is missing")?;
+        let modifier = Modifier {
+            id: Id::new("ocean_exr_layout")?,
+            modifier_type: "ocean".to_owned(),
+            name: "Ocean".to_owned(),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params: serde_json::from_value(case["params"].clone())?,
+            binding_data: None,
+            baked_ocean_cache: None,
+            runtime: ModifierRuntime::default(),
+        };
+        let time = case["params"]["time"]
+            .as_f64()
+            .ok_or("B1 time is missing")? as f32;
+        let mut sequence = OceanBakeSequence::new(&modifier)?;
+        let images = sequence.bake_frame(1, time)?;
+        let disp = images
+            .iter()
+            .find(|image| image.filename == "disp_0001.exr")
+            .ok_or("disp image is missing")?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("disp_0001.exr");
+        write_ocean_exr(&path, disp)?;
+        let bytes = std::fs::read(&path)?;
+        let (width, height, file_pixels) = crate::image::storage::decode_ocean_cache_exr(&bytes)?;
+        let n = disp.resolution;
+        assert_eq!((width as usize, height as usize), (n, n));
+        let expected = case["exr_files"]["disp_0001.exr"]["pixel_values_rgba_row_major"]
+            .as_array()
+            .ok_or("corpus disp pixels are missing")?;
+        for row in 0..n {
+            for x in 0..n {
+                let corpus_row = n - 1 - row;
+                for channel in 0..4 {
+                    let want = expected[(corpus_row * n + x) * 4 + channel]
+                        .as_f64()
+                        .ok_or("corpus value is not numeric")?;
+                    let got = file_pixels[row * n + x][channel];
+                    // Half-float rounding of an f32 value: one half ULP is below 2e-3 of the value.
+                    assert!(
+                        (got - want).abs() <= 2.0e-3 * want.abs().max(6.2e-5),
+                        "file row {row} column {x} channel {channel}: {got} vs Blender row {corpus_row} {want}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
