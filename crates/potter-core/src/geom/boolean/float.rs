@@ -36,7 +36,7 @@ use super::float_connect::{BVH_AXIS, BVH_TREE_TYPE};
 use super::float_split_net::CornerSource;
 use super::imesh::NO_INDEX;
 use super::{BooleanOperand, Operation};
-use crate::geom::bvh::{Bounds, KdopTree, Ray, RayHit, kdop_bounds};
+use crate::geom::bvh::{Bounds, KdopTree, Ray, RayHit, kdop_bounds, overlap_pairs};
 use crate::geom::triangulate::ortho_basis;
 
 type P3 = [f32; 3];
@@ -2450,7 +2450,7 @@ fn tri_leaf_bounds(state: &State, side: u8, pad: f32) -> (Vec<usize>, Vec<Bounds
 /// Triangle candidate pairs `(side-1 triangle, side-0 triangle)` in the order of Blender's
 /// `BLI_bvhtree_overlap_ex(tree_b, tree_a)`.
 fn blender_overlap_pairs(tree_b: &SideTree, tree_a: &SideTree) -> Vec<(usize, usize)> {
-    KdopTree::overlap_pairs(&tree_b.tree, &tree_a.tree)
+    overlap_pairs(&tree_b.tree, &tree_a.tree)
         .into_iter()
         .map(|(b, a)| (tree_b.entries[b], tree_a.entries[a]))
         .collect()

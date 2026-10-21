@@ -257,7 +257,7 @@ fn test_tri_inside_shapes(
     let origin_exact = to_dvec3(origin);
     inside.fill(0.0);
 
-    for (ray_index, &direction) in RAYS.iter().enumerate() {
+    for &direction in &RAYS {
         let ray = TestRay {
             origin,
             origin_exact,
