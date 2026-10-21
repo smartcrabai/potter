@@ -2245,6 +2245,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             "TANGENT" => first.tan(),
             "SQRT" => first.max(0.0).sqrt(),
             "ABSOLUTE" => first.abs(),
+            // Cycles' `NODE_MATH_FRACTION` (`intern/cycles/kernel/svm/math_util.h`): `a - floorf(a)`.
+            "FRACT" => first - first.floor(),
             "MINIMUM" => first.min(second),
             "MAXIMUM" => first.max(second),
             "LESS_THAN" => f64::from(first < second),

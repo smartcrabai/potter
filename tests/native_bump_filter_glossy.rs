@@ -1,14 +1,11 @@
-//! A bump node at a secondary hit with Filter Glossy on (Blender's default 1.0), against Blender 5.2.2's Cycles render
-//! (`fixtures/native_oracle/bump/bump_filter_glossy.py`).
+//! Filter Glossy widens the bump footprint at a glossy bounce, against Blender 5.2.2's Cycles render
+//! (`fixtures/native_oracle/bump/bump_glossy_reflection.py`).
 //!
-//! A diffuse floor is lit in one bounce by a bumped emitter outside the frame. The emitter's height is the squared
-//! Generated X ramp, so its bump depends on the footprint of the ray that reaches it, and the footprint of that
-//! secondary hit is the floor's footprint widened by Filter Glossy (`bsdf_widen_dD`). A linear height ramp would not
-//! show the widening: its normal does not depend on the footprint's size.
-//!
-//! The case does not, on its own, prove the widening: Blender's Filter Glossy 1.0 and 0.0 differ by about 1e-4 in this
-//! scene, because the emitter is mostly reached by light sampling, which keeps the floor's footprint. The case checks
-//! Potter's secondary-hit footprint at the default setting, against the same render.
+//! A metallic floor reflects a bumped emitter that light sampling does not reach, so the emitter is seen only through
+//! the floor's BSDF samples. Their non-specular bounce widens the ray differential by Filter Glossy
+//! (`bsdf_widen_dD`, `shade_surface.h`), and the emitter's sawtooth bump depends on that footprint. The test checks two
+//! things. Blender's Filter Glossy 1.0 and 0.0 renders differ by more than the tolerance in red and green, so the case
+//! separates the widening; and Potter's render at the imported Filter Glossy matches Blender's at 1.0.
 //!
 //! The tolerance is `T · √(s_B² / n + s_P² / n)`, as in `native_subsurface_sphere.rs`.
 
@@ -34,11 +31,11 @@ use potter_core::store::Project;
 use serde_json::Value;
 use tempfile::tempdir;
 
-const SCRIPT: &str = include_str!("fixtures/native_oracle/bump/bump_filter_glossy.py");
+const SCRIPT: &str = include_str!("fixtures/native_oracle/bump/bump_glossy_reflection.py");
 /// Seeds of both renders.
 const SEEDS: u32 = 8;
 const RESOLUTION: u32 = 16;
-/// Samples per pixel on both sides (`bump_filter_glossy.py` renders at 64).
+/// Samples per pixel on both sides (`bump_glossy_reflection.py` renders at 64).
 const SAMPLES: u32 = 64;
 /// The two-sided 99.9% Student t quantile at 7 degrees of freedom (see the module docs).
 const T_QUANTILE: f64 = 5.408;
@@ -51,10 +48,10 @@ fn mean_and_stderr(values: &[f64]) -> (f64, f64) {
     (mean, (variance / count).sqrt())
 }
 
-/// The per-seed frame means of the Blender render, as RGB channel vectors.
-fn blender_channels(expected: &Value) -> TestResult<[Vec<f64>; 3]> {
+/// The per-seed frame means of a Blender render under `key`, as RGB channel vectors.
+fn blender_channels(expected: &Value, key: &str) -> TestResult<[Vec<f64>; 3]> {
     let mut channels = [Vec::new(), Vec::new(), Vec::new()];
-    for seed in expected["seed_means"]
+    for seed in expected[key]
         .as_array()
         .ok_or("the Blender seed means are missing")?
     {
@@ -76,13 +73,26 @@ fn bump_filter_glossy_matches_cycles() -> TestResult {
         return Ok(());
     };
     let root = tempdir()?;
-    let script = write_script(root.path(), "bump_filter_glossy.py", SCRIPT)?;
+    let script = write_script(root.path(), "bump_glossy_reflection.py", SCRIPT)?;
     let blend = root.path().join("scene.blend");
     let json_path = root.path().join("blender.json");
     let arguments: [&Path; 2] = [&blend, &json_path];
     run_blender_arguments(&blender, &script, None, &arguments)?;
     let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
-    let wanted = blender_channels(&expected)?;
+    let wanted = blender_channels(&expected, "seed_means")?;
+    let unwidened = blender_channels(&expected, "seed_means_filter_glossy_0")?;
+
+    // The case must separate Filter Glossy 1.0 from 0.0 in Blender: a Potter that ignores the widening fails below.
+    for channel in [0, 1] {
+        let (widened_mean, widened_stderr) = mean_and_stderr(&wanted[channel]);
+        let (plain_mean, plain_stderr) = mean_and_stderr(&unwidened[channel]);
+        let tolerance = T_QUANTILE * widened_stderr.hypot(plain_stderr);
+        assert!(
+            (widened_mean - plain_mean).abs() > tolerance,
+            "channel {channel}: Blender's Filter Glossy 1.0 ({widened_mean}) and 0.0 ({plain_mean}) are within \
+             {tolerance}, so the case does not separate the widening"
+        );
+    }
 
     let (project_path, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let project = Project::open(&project_path)?;
