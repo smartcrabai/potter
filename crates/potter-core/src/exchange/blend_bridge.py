@@ -5700,6 +5700,9 @@ def _cache_file_for_resource(doc, reference, target, params=None):
     if resource and resource.get("kind") == "usd_cache":
         return None
     filepath = _resource_path(doc, reference)
+    print("CACHE_DEBUG reference=%r resource=%r export_path_exists=%r filepath=%r"
+          % (reference, _resource_record_for_reference(doc, reference),
+             os.path.isfile(filepath) if filepath else None, filepath), file=sys.stderr)
     if not filepath or not os.path.isfile(filepath):
         raise ValueError("Alembic cache resource is missing: %s" % reference)
     params = params or {}
