@@ -19,8 +19,8 @@ use crate::{
 use super::{
     Mesh,
     clnor::{self, NormalCodeOptions, SetterInput},
-    normals::{sharp_edge_flags, smooth_face_flags},
     color_layers::{self, ColorDomain, ColorLayer},
+    normals::{sharp_edge_flags, smooth_face_flags},
     uv_layers::{self, UvLayer},
 };
 
