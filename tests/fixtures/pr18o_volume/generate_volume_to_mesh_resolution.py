@@ -67,8 +67,12 @@ def main():
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.mesh.primitive_cube_add(size=2.0, location=(1.0, 0.0, 0.0))
     source = bpy.context.object
+    # The volume stays at the origin, so its space is the world space the oracle is written in; the
+    # operand's vertices are therefore taken through its object matrix (the cube is at x = 1).
     source_mesh = {
-        "vertices": [[float(c) for c in vertex.co] for vertex in source.data.vertices],
+        "vertices": [
+            [float(c) for c in source.matrix_world @ vertex.co] for vertex in source.data.vertices
+        ],
         "faces": [list(polygon.vertices) for polygon in source.data.polygons],
     }
     volume_data = bpy.data.volumes.new("volume_data")
