@@ -482,6 +482,13 @@ fn eigenstuff_from_jacobian(jxx: f32, jzz: f32, jxz: f32) -> Eigenstuff {
     }
 }
 
+/// Field index for EXR pixel `pixel` of an `n`-by-`n` bake. The spectrum fields are stored as `i * n + j` with
+/// `i` along u, but a bake row is v-major (`row * n + col`, the layout `sample_cache_uv` reads), so
+/// `col = i` and `row = j`. Blender writes its bake in this row-major order.
+fn image_field_index(pixel: usize, n: usize) -> usize {
+    (pixel % n) * n + pixel / n
+}
+
 impl OceanBakeSequence {
     pub(crate) fn new(modifier: &Modifier) -> Result<Self> {
         let params = OceanParams::read(modifier)?;
@@ -529,7 +536,8 @@ impl OceanBakeSequence {
         let count = fields.n * fields.n;
         let mut images = Vec::with_capacity(5);
         let mut displacement = Vec::with_capacity(count);
-        for index in 0..count {
+        for pixel in 0..count {
+            let index = image_field_index(pixel, fields.n);
             displacement.push([
                 fields.displacement_x[index] as f32,
                 fields.displacement_y[index] as f32,
@@ -547,7 +555,8 @@ impl OceanBakeSequence {
             let mut foam = Vec::with_capacity(count);
             let mut spray = params.use_spray.then(|| Vec::with_capacity(count));
             let mut spray_inverse = params.use_spray.then(|| Vec::with_capacity(count));
-            for index in 0..count {
+            for pixel in 0..count {
+                let index = image_field_index(pixel, fields.n);
                 let eigen = fields.eigenstuff_at(index);
                 let fresh = (eigen.jminus * -0.005 + params.foam_coverage).clamp(0.0, 1.0);
                 let previous = &mut self.previous_foam[index];
@@ -591,7 +600,8 @@ impl OceanBakeSequence {
         }
         if params.use_normals {
             let mut normals = Vec::with_capacity(count);
-            for index in 0..count {
+            for pixel in 0..count {
+                let index = image_field_index(pixel, fields.n);
                 let mut normal = [
                     fields.normal_x[index] as f32,
                     fields.normal_y,
@@ -1322,7 +1332,7 @@ mod tests {
             ModifierEvaluationContext::default(),
         )?;
         assert_eq!(out.vertices.len(), 10 * 10);
-        assert_eq!(out.faces.len(), 81 * 81);
+        assert_eq!(out.faces.len(), 9 * 9);
         let uv_store = super::uv_layers::read(&out);
         assert_eq!(uv_store.layers.len(), 1);
         assert_eq!(uv_store.active.as_deref(), Some("UVMap"));

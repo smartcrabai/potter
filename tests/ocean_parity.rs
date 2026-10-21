@@ -211,8 +211,8 @@ fn evaluate_case(
     name: &str,
 ) -> Result<Mesh, Box<dyn Error>> {
     let node_id = modifier.id.clone();
-    let data_id = Id::new(format!("mesh_{name}"))?;
-    let mut doc = SceneDoc::new(format!("ocean_parity_{name}"));
+    let data_id = Id::new(format!("mesh_{}", name.to_ascii_lowercase()))?;
+    let mut doc = SceneDoc::new("6f1c2a4e-3b5d-4c8e-9a7f-1d2e3f4a5b6c".to_owned());
     doc.nodes.insert(
         node_id.clone(),
         Node {
@@ -285,7 +285,7 @@ fn ocean_blender_corpus_matches_geometry_uvs_and_corner_colors() -> Result<(), B
             None => return Err(format!("{name}: evaluation purpose is missing").into()),
         };
         let modifier = Modifier {
-            id: Id::new(format!("ocean_{name}"))?,
+            id: Id::new(format!("ocean_{}", name.to_ascii_lowercase()))?,
             modifier_type: "ocean".to_owned(),
             name: "Ocean".to_owned(),
             enabled: true,
