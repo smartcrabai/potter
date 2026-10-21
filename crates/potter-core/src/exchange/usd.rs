@@ -2101,7 +2101,7 @@ fn import_node_tree(
         })?;
         import_uv_layers(&mut mesh, &uv_layers, uv_active, uv_render);
         import_color_layers(mesh_prim, &mut mesh, losses, inherited_color_space)?;
-        shading::import_smooth_shading(&mut mesh, normals.as_deref())?;
+        shading::import_reader_shading(&mut mesh, normals.as_deref(), None)?;
         let mesh_id = import_id(None, &format!("{}_mesh", id.as_str()), used_data)?;
         let (shape_keys, vertex_groups, vertex_weights) = import_deformation(mesh_prim, &mesh)?;
         doc.data_blocks.insert(

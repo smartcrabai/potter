@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 
 use crate::geom::modifiers::multires::{self, MultiresGridData};
 use crate::{
-    error::{PotError, Result},
+    error::{ErrorCode, PotError, Result},
     geom::{
         Face, Mesh, MeshError,
         attribute_keys::storage_key,
@@ -6939,6 +6939,16 @@ fn apply_remesh(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges>
     if voxel_size <= 0.0 {
         return Err(invalid("remesh voxel_size must be positive"));
     }
+    // Blender reprojects `sharp_face` from the nearest input triangle (`mesh_remesh_reproject_attributes`,
+    // on by default). Potter does not sample attributes, so an input that carries `sharp_face` is refused
+    // rather than remeshed with the wrong shading.
+    if crate::geom::normals::sharp_face_flags(mesh)?.is_some() {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "voxel remesh of a mesh with sharp_face needs attribute reprojection, which is not implemented",
+            json!({ "feature_id": "mesh.remesh.sharp_face" }),
+        ));
+    }
     let remeshed = crate::geom::remesh::remesh(mesh, voxel_size)?;
     let mut replacement = Mesh {
         next_id: mesh.next_id,
@@ -6979,6 +6989,13 @@ fn apply_remesh(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges>
     }
     // Voxel remesh replaces the mesh and drops loop-domain multires data.
     *mesh = replacement;
+    // Blender's `object.voxel_remesh` gives every new face `!sharp_face[0]` (`object_remesh.cc`), and the
+    // guard above means the input has no `sharp_face`, so every new face is smooth.
+    let all_faces = Selection {
+        domain: Domain::Face,
+        ids: mesh.faces.iter().map(|face| face.id).collect(),
+    };
+    apply_shade(mesh, &all_faces, true)?;
     Ok(changes)
 }
 

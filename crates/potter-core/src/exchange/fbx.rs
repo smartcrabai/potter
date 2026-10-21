@@ -2657,10 +2657,15 @@ fn import_bytes_with_base(
                     json!({"reason":error.to_string(),"geometry_id":geometry_number}),
                 )
             })?;
-            shading::import_fbx_shading(
+            // `import_face_smoothing` sets `sharp_face = !smoothing` when the layer is read.
+            let sharp_faces = geometry
+                .smoothing
+                .as_ref()
+                .map(|smooth| smooth.iter().map(|flag| !flag).collect::<Vec<_>>());
+            shading::import_reader_shading(
                 &mut mesh,
                 geometry.normals.as_deref(),
-                geometry.smoothing.as_deref(),
+                sharp_faces.as_deref(),
             )?;
             import_uv_layers(
                 &mut mesh,

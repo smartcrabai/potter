@@ -5,7 +5,8 @@
 //! is singular. World-space writers (OBJ, PLY, STL) take `baked_faces`, which reverses mirrored
 //! faces so winding agrees with the normals. Object-local writers (USD, FBX, Alembic) keep local winding and normals and
 //! let the transform carry the placement, as Blender does. Import: each importer hands per-corner
-//! normals to `import_shading`, which derives `shade_smooth` and `custom_normal` the way glTF does.
+//! normals to `import_reader_shading`, which applies the format's Blender reader rule for `sharp_face`
+//! and custom normals; glTF derives `shade_smooth` and `custom_normal` through `import_shading_flags`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -99,37 +100,28 @@ pub(super) struct ExactShading {
     pub(super) sharp: Vec<[usize; 2]>,
 }
 
-/// Derives `shade_smooth` and `custom_normal` on `mesh` from per-corner normals.
-///
-/// `normals` holds one value per face corner in `mesh.faces` order. A face is smooth when any
-/// corner differs from its flat normal. A corner whose normal differs from what the derived
-/// shading computes gets a `custom_normal` entry.
-pub(super) fn import_shading(mesh: &mut Mesh, normals: &[DVec3]) -> Result<()> {
-    import_shading_flags(mesh, normals, None)
-}
-
-/// Imports shading the way Blender's readers do when they keep every polygon smooth: USD
-/// (`io/usd/intern/usd_reader_mesh.cc`, "Polygons are always assumed to be smooth-shaded") and Alembic
-/// (`io/alembic/intern/abc_reader_mesh.cc`, `process_no_normals`). Corner normals become custom loop
-/// normals, flat shading is never derived from them, and no `sharp_face` attribute is created.
-pub(super) fn import_smooth_shading(mesh: &mut Mesh, normals: Option<&[DVec3]>) -> Result<()> {
-    let smooth = vec![true; mesh.faces.len()];
-    import_exact_shading(mesh, normals, smooth)?;
-    crate::geom::normals::settle_sharp_face(mesh)
-}
-
-/// Imports shading the way Blender's FBX importer does (`io/fbx/importer/fbx_import_mesh.cc`,
-/// `import_face_smoothing`): a `LayerElementSmoothing` with one value per polygon sets
-/// `sharp_face = !smoothing` through `lookup_or_add`, so `sharp_face` is recorded. Without one the
-/// polygons stay smooth and `sharp_face` is absent. `normals` become custom loop normals.
-pub(super) fn import_fbx_shading(
+/// Imports shading the way the format's Blender reader does. `sharp_faces` is the `sharp_face` attribute
+/// the reader creates: `None` when it creates none, so every polygon stays smooth, and `Some(flags)` when
+/// it writes `sharp_face`, which records its presence. `normals` become custom loop normals and never
+/// decide flat faces (Blender's readers do not derive shading from them).
+pub(super) fn import_reader_shading(
     mesh: &mut Mesh,
     normals: Option<&[DVec3]>,
-    smoothing: Option<&[bool]>,
+    sharp_faces: Option<&[bool]>,
 ) -> Result<()> {
-    match smoothing {
-        Some(smooth) => import_exact_shading(mesh, normals, smooth.to_vec()),
-        None => import_smooth_shading(mesh, normals),
+    match sharp_faces {
+        Some(sharp) => {
+            if sharp.len() != mesh.faces.len() {
+                return Err(import_error(
+                    "imported sharp_face flags do not match the face count",
+                ));
+            }
+            import_exact_shading(mesh, normals, sharp.iter().map(|flag| !flag).collect())
+        }
+        None => {
+            import_exact_shading(mesh, normals, vec![true; mesh.faces.len()])?;
+            crate::geom::normals::settle_sharp_face(mesh)
+        }
     }
 }
 
@@ -165,7 +157,7 @@ fn import_exact_shading(
     Ok(())
 }
 
-/// [`import_shading`] with exact flags from a Potter writer: they replace the derived smooth flags
+/// [`import_shading_flags`] with exact flags from a Potter writer: they replace the derived smooth flags
 /// and add the sharp edges the normals were computed with.
 pub(super) fn import_shading_flags(
     mesh: &mut Mesh,

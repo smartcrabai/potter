@@ -390,8 +390,20 @@ fn float_normals(
 /// Blender's `normal_calc_ngon`: Newell's method from the last vertex, normalized by `normalize_v3`,
 /// which multiplies by the reciprocal length. A zero-area face takes the unit Z normal.
 fn float_face_normal(points: &[Vec3]) -> Vec3 {
+    let normal = float_newell(points);
+    let length_squared = float_dot(normal, normal);
+    if length_squared > 1.0e-35_f32 {
+        normal * (1.0 / length_squared.sqrt())
+    } else {
+        Vec3::Z
+    }
+}
+
+/// Newell's sum over the polygon edges, starting from the last vertex, before normalisation
+/// (`add_newell_cross_v3_v3v3` in `normal_calc_ngon` and `cross_poly_v3`).
+fn float_newell(points: &[Vec3]) -> Vec3 {
     let Some(&last) = points.last() else {
-        return Vec3::Z;
+        return Vec3::ZERO;
     };
     let mut normal = Vec3::ZERO;
     let mut previous = last;
@@ -401,12 +413,7 @@ fn float_face_normal(points: &[Vec3]) -> Vec3 {
         normal.z += (previous.x - current.x) * (previous.y + current.y);
         previous = current;
     }
-    let length_squared = float_dot(normal, normal);
-    if length_squared > 1.0e-35_f32 {
-        normal * (1.0 / length_squared.sqrt())
-    } else {
-        Vec3::Z
-    }
+    normal
 }
 
 /// Blender's `math::normalize`: each component is divided by the length, and a vector at or below
@@ -764,12 +771,14 @@ pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
 }
 
 /// Blender's `BM_face_calc_normal` (`bmesh_polygon.cc`): `normal_tri_v3` and `normal_quad_v3` for
-/// triangles and quads, the polygon normal for other sizes. Edit-mode operators read these normals.
+/// triangles and quads, and `bm_face_calc_poly_normal` for other sizes. That polygon normal is the
+/// normalised Newell sum with no fallback, so a zero-area n-gon has the zero normal (unlike the mesh
+/// normal, `normal_calc_ngon`, which takes +Z). Edit-mode operators read these normals.
 pub(crate) fn bmesh_face_normal(points: &[Vec3]) -> Vec3 {
     match points {
         [v1, v2, v3] => float_normalize(float_cross(*v1 - *v2, *v2 - *v3)),
         [v1, v2, v3, v4] => float_normalize(float_cross(*v1 - *v3, *v2 - *v4)),
-        _ => float_face_normal(points),
+        _ => float_normalize(float_newell(points)),
     }
 }
 

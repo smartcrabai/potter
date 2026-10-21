@@ -2706,7 +2706,7 @@ fn import_polymesh(
                 .map(|normal| DVec3::from_array(*normal))
                 .collect::<Vec<_>>()
         });
-    super::shading::import_smooth_shading(&mut mesh, corners.as_deref())?;
+    super::shading::import_reader_shading(&mut mesh, corners.as_deref(), None)?;
     // Each UV layer takes its first sample's corners; the layer order is the file order.
     let mut layers = Vec::<ExchangeUvLayer>::new();
     for (raw_name, samples) in &uv_samples {

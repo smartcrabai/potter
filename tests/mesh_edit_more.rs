@@ -600,3 +600,46 @@ fn cli_angle_and_conformal_unwrap_preserve_planar_grid_similarity() -> Result<()
     }
     Ok(())
 }
+
+/// Blender 5.2.2 `object.voxel_remesh` on a cube whose `sharp_face` `shade_smooth` removed (probed): 150
+/// smooth faces and no `sharp_face`. Potter's output takes `!sharp_face[0]` on every face, and an input
+/// without `sharp_face` gives smooth faces.
+#[test]
+fn remesh_of_an_all_smooth_mesh_stays_smooth() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let faces = mesh
+        .faces
+        .iter()
+        .map(|face| format!("f{}", face.id))
+        .collect::<Vec<_>>();
+    edit::apply(
+        &mut mesh,
+        "shade_smooth",
+        &json!({"elements":{"domain":"face","ids":faces}}),
+    )
+    .unwrap();
+    edit::apply(&mut mesh, "remesh", &json!({"voxel_size": 0.5})).unwrap();
+    let values = mesh.attributes["shade_smooth"]["values"]
+        .as_object()
+        .unwrap();
+    assert!(!values.is_empty() && values.values().all(|value| value == &json!(true)));
+    assert!(
+        mesh.attributes["shade_smooth"]
+            .get("sharp_face_present")
+            .is_none(),
+        "all-smooth remesh output has no sharp_face"
+    );
+    mesh.validate().unwrap();
+}
+
+/// Blender reprojects `sharp_face` from the nearest input triangle on remesh; Potter does not sample
+/// attributes, so an input that carries `sharp_face` is refused with `UnsupportedFeature`.
+#[test]
+fn remesh_refuses_an_input_with_sharp_face() {
+    let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+    let error = edit::apply(&mut mesh, "remesh", &json!({"voxel_size": 0.5})).unwrap_err();
+    assert_eq!(
+        error.code,
+        potter_core::error::ErrorCode::UnsupportedFeature
+    );
+}
