@@ -611,10 +611,12 @@ mod tests {
     use glam::DVec3;
     use serde_json::json;
 
+    use std::collections::BTreeMap;
+
     use crate::geom::Mesh;
     use crate::sim::ColliderTriangle;
 
-    use super::simulate;
+    use super::{Config, goal_weights, simulate};
 
     fn tetrahedron() -> Mesh {
         Mesh::from_positions_and_faces(

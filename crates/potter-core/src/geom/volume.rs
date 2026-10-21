@@ -14,17 +14,13 @@ use crate::{
     model::VolumeInterpolation,
 };
 
-use super::{
-    edge_key,
-    vdb::{BoxScalar, box_sample_trilinear},
-};
+use super::vdb::{BoxScalar, box_sample_trilinear};
 
 const MAX_GRID_SAMPLES: usize = 1_000_000;
 const MAX_GRID_AXIS: usize = 512;
 const MAX_GRID_CELLS: usize = 250_000;
 const MAX_INPUT_VERTICES: usize = 100_000;
 const MAX_INPUT_TRIANGLES: usize = 100_000;
-const MAX_DISTANCE_TESTS: usize = 100_000_000;
 const MAX_GRID_COUNT: usize = 64;
 const MAX_OUTPUT_FACES: usize = 500_000;
 
@@ -3132,7 +3128,7 @@ mod tests {
 
     use super::{
         VolumeData, VolumeGrid, cubic_weights, mesh_to_fog_volume, sample_density,
-        sample_density_checked, sample_density_with, volume_to_mesh,
+        sample_density_checked, sample_density_with,
     };
     use crate::model::VolumeInterpolation;
 
