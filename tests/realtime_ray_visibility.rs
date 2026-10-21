@@ -2,13 +2,12 @@
 //!
 //! Blender's panel shows each object type's flags for EEVEE (`scripts/startup/bl_ui/properties_object.py`,
 //! `OBJECT_PT_visibility`): a mesh has Camera, Shadow and Raycast, and a light has Camera, Diffuse,
-//! Glossy, Transmission and Volume Scatter. A light whose camera visibility is on shows its emitter in
-//! EEVEE (`draw/engines/eevee/shaders/eevee_light_shape_display.bsl.hh`, which returns unless
-//! `visible_camera`), and realtime Beauty draws no emitters. EEVEE applies a light's transmission and
-//! volume-scatter visibility to its power (`draw/engines/eevee/eevee_light.cc`, `transmission_visibility`
-//! and `volume_visibility`), and realtime Beauty does not. So a light's camera, transmission and
-//! volume-scatter flags warn, while the mesh diffuse, glossy, transmission and volume flags, which EEVEE
-//! ignores, do not.
+//! Glossy, Transmission and Volume Scatter. A light whose camera visibility is on shows its emitter in both EEVEE
+//! (`draw/engines/eevee/shaders/eevee_light_shape_display.bsl.hh`, which returns unless `visible_camera`) and realtime
+//! Beauty (`tests/realtime_light_shapes.rs` checks the emitter against EEVEE). EEVEE applies a light's transmission and
+//! volume-scatter visibility to its power (`draw/engines/eevee/eevee_light.cc`, `transmission_visibility` and
+//! `volume_visibility`), and realtime Beauty does not. So a light's transmission and volume-scatter flags warn, while
+//! its camera flag and the mesh diffuse, glossy, transmission and volume flags, which EEVEE ignores, do not.
 
 #[path = "common/native_oracle.rs"]
 #[expect(
@@ -52,8 +51,8 @@ fn realtime_beauty_warns_for_light_flags_it_does_not_honour_only() -> TestResult
             {"op": "scene.update", "target": {"id": "scene_main"}, "set": {"camera": "camera_top"}},
             {"op": "render.update", "target": {"id": "scene_main"},
              "set": {"resolution_x": 32, "resolution_y": 32, "resolution_percentage": 100}},
-            // Light flags EEVEE honours and realtime does not (camera: EEVEE draws the emitter;
-            // transmission and volume scatter: EEVEE applies them to the light): they must warn.
+            // Light flags EEVEE honours and realtime does not (transmission and volume scatter: EEVEE applies them to
+            // the light's power): they must warn. Camera is drawn as the emitter in both, so it must not.
             {"op": "node.update", "target": {"id": "lamp"},
              "set": {"ray_visibility": {"camera": true, "transmission": false, "volume_scatter": false}}},
             // Mesh flags EEVEE does not honour (diffuse, glossy): no warning. Shadow is honoured.
@@ -81,13 +80,17 @@ fn realtime_beauty_warns_for_light_flags_it_does_not_honour_only() -> TestResult
     let render: Value = serde_json::from_slice(&checked(&mut command, "realtime render")?.stdout)?;
 
     let lamp = warnings_for(&render, "lamp");
-    for flag in ["camera", "transmission", "volume_scatter"] {
+    for flag in ["transmission", "volume_scatter"] {
         let feature = format!("object.ray_visibility.{flag}");
         assert!(
             lamp.contains(&feature),
             "a light's {flag} flag must warn in realtime Beauty, got {lamp:?}"
         );
     }
+    assert!(
+        !lamp.contains(&"object.ray_visibility.camera".to_owned()),
+        "a light's camera flag is drawn as its emitter in realtime, so it must not warn, got {lamp:?}"
+    );
     let plane = warnings_for(&render, "plane");
     assert!(
         plane.is_empty(),

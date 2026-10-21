@@ -423,6 +423,15 @@ pub(crate) fn render_camera_frame(
     };
     drop(shader);
     if engine == "realtime" && matches!(mode, Mode::Beauty) {
+        super::path::add_camera_light_shapes(
+            doc,
+            &snapshot,
+            &geometry,
+            &camera.camera,
+            width,
+            height,
+            &mut raster,
+        )?;
         super::path::composite_realtime_volumes(
             doc,
             &snapshot,
