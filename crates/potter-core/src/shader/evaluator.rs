@@ -163,8 +163,7 @@ impl SubsurfaceMethod {
     /// The feature id Potter reports for a method it does not evaluate, or `None` for a method it evaluates.
     pub(crate) fn unsupported_feature(self) -> Option<&'static str> {
         match self {
-            Self::Burley => None,
-            Self::RandomWalk => Some("shader.principled.subsurface_method.random_walk"),
+            Self::Burley | Self::RandomWalk => None,
             Self::RandomWalkSkin => Some("shader.principled.subsurface_method.random_walk_skin"),
             Self::RandomWalkLegacy => {
                 Some("shader.principled.subsurface_method.random_walk_legacy")
@@ -3459,8 +3458,8 @@ mod tests {
         evaluate_surface(&native, &context).unwrap();
         evaluate_surface(&native, &context).unwrap();
 
-        // A graph material sets subsurface and rough transmission on its Principled node. Subsurface is not
-        // evaluated and warns; rough transmission and coat are evaluated, so they must not warn.
+        // A graph material sets subsurface (the skin method, which is not evaluated) and rough transmission on its
+        // Principled node. Subsurface warns; rough transmission and coat are evaluated, so they must not warn.
         let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
@@ -3469,6 +3468,12 @@ mod tests {
             "ShaderNodeBsdfPrincipled",
             json!({"Subsurface Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
         );
+        graph
+            .nodes
+            .get_mut(&Id::new("principled".to_owned()).unwrap())
+            .unwrap()
+            .properties
+            .insert("subsurface_method".to_owned(), json!("RANDOM_WALK_SKIN"));
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         let graph_id = Id::new("graph_shader".to_owned()).unwrap();
         groups.insert(graph_id.clone(), graph);
@@ -3973,12 +3978,10 @@ mod subsurface_method_tests {
 
     #[test]
     fn only_the_unevaluated_methods_report_a_feature() {
-        // PR-a evaluates Burley only: every other method is reported, never rendered as Burley.
+        // Burley and the random walk are evaluated; the skin, legacy and mixed methods are reported, never rendered as
+        // another method.
         assert_eq!(SubsurfaceMethod::Burley.unsupported_feature(), None);
-        assert_eq!(
-            SubsurfaceMethod::RandomWalk.unsupported_feature(),
-            Some("shader.principled.subsurface_method.random_walk")
-        );
+        assert_eq!(SubsurfaceMethod::RandomWalk.unsupported_feature(), None);
         assert_eq!(
             SubsurfaceMethod::RandomWalkSkin.unsupported_feature(),
             Some("shader.principled.subsurface_method.random_walk_skin")

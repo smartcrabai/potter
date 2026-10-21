@@ -33,7 +33,7 @@ use super::principled_tables::{
     ggx_glass_energy_average, ggx_glass_inverse_energy, ggx_glass_inverse_energy_average,
     sheen_ltc,
 };
-use super::subsurface::{burley_active, channel_mask, raw_radius};
+use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
 use crate::shader::{BsdfParams, dielectric_f0};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
@@ -171,35 +171,37 @@ fn diffuse_layer_weight(params: &BsdfParams, normal: DVec3, view: DVec3) -> f64 
 }
 
 /// The share of the diffuse base that the subsurface closures leave to diffuse, as Cycles' `closure` setup does
-/// (`svm/closure.h`). The diffuse closure keeps `1 - Subsurface Weight` (its weight is `base × (1 - subsurface weight)
-/// × weight` for every method). A Thin Wall adds its thin reflection, `bsdf_thin_subsurface_setup`, a Lambert of weight
-/// `sat(0.5 (1 - anisotropy)) × subsurface weight`, to the same diffuse. Burley without Thin Wall takes the per-channel
-/// share of `bssrdf_setup`: `1 - Subsurface Weight` on the channels with a radius, and `1` on the others.
+/// (`svm/closure.h`). The diffuse closure keeps `1 - Subsurface Weight` for every method. A Thin Wall adds its thin
+/// reflection (`bsdf_thin_subsurface_setup`), a Lambert of weight `sat(0.5 (1 - anisotropy)) × subsurface weight`, to
+/// the same diffuse. Otherwise `bssrdf_setup` moves a channel whose raw radius is below `BSSRDF_MIN_RADIUS` into a
+/// diffuse BSDF of its closure weight, so that channel keeps its full diffuse; the other channels keep `1 - Subsurface
+/// Weight`. Every method takes this share.
 fn subsurface_share(params: &BsdfParams) -> DVec3 {
     let sss = params.subsurface_weight.clamp(0.0, 1.0);
     if params.thin_wall {
         let reflection = (0.5 * (1.0 - params.subsurface_anisotropy)).clamp(0.0, 1.0);
         return DVec3::splat(1.0 - sss + sss * reflection);
     }
-    if !burley_active(params) {
+    if !subsurface_evaluated(params) {
         return DVec3::ONE;
     }
+    // Every method keeps its diffuse on a channel below `BSSRDF_MIN_RADIUS` (the raw radius, `bssrdf_setup`).
     let mask = channel_mask(raw_radius(params));
     DVec3::from_array(std::array::from_fn(|channel| {
         if mask[channel] { 1.0 - sss } else { 1.0 }
     }))
 }
 
-/// The Burley subsurface closure's weight per channel, `clamped base × subsurface weight × diffuse layer weight ×
-/// reflectance × lower`, zero on channels without a radius (Cycles' `closure_weight` of the BSSRDF, `svm/closure.h`).
-/// It is the weight the path tracer divides by the branch's probability to enter the surface.
+/// The subsurface closure's weight per channel, `clamped base × subsurface weight × diffuse layer weight × reflectance
+/// × lower`, zero on channels without a radius (Cycles' `closure_weight` of the BSSRDF, `svm/closure.h`). It is the
+/// weight the path tracer divides by the branch's probability to enter the surface.
 pub(crate) fn subsurface_closure_weight(
     params: &BsdfParams,
     normal: DVec3,
     view: DVec3,
     lower: DVec3,
 ) -> DVec3 {
-    if !burley_active(params) || normal.dot(view) <= 0.0 {
+    if !subsurface_evaluated(params) || params.thin_wall || normal.dot(view) <= 0.0 {
         return DVec3::ZERO;
     }
     let mask = channel_mask(raw_radius(params));
@@ -639,7 +641,7 @@ pub(super) fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
 }
 
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).
-fn base_color(params: &BsdfParams) -> DVec3 {
+pub(super) fn base_color(params: &BsdfParams) -> DVec3 {
     diffuse_albedo(params).min(DVec3::ONE)
 }
 
@@ -691,21 +693,31 @@ struct SpecularLayer {
     f0_tinted: DVec3,
 }
 
-/// Cycles' specular setup: `f0 = F0(ior) * 2 * level`, `eta = ior` at level 0.5, otherwise
-/// `eta = ior_from_F0(f0)` (inverted for ior < 1). No specular layer when `eta == 1`.
+/// The IOR that Cycles refracts at, after the Specular IOR Level (`svm/closure.h`, `eta`): the Principled IOR at level
+/// one half, and otherwise the IOR whose F0 is the level's F0, inverted for an IOR below one. The random walk entry uses
+/// it as `bssrdf->ior`.
 #[expect(
     clippy::float_cmp,
-    reason = "Cycles compares the specular IOR level with exactly 0.5 and eta with exactly 1"
+    reason = "Cycles compares the specular IOR level with exactly 0.5"
+)]
+pub(super) fn specular_eta(params: &BsdfParams) -> f64 {
+    let level = params.specular_ior_level.max(0.0);
+    if level == 0.5 {
+        return params.ior;
+    }
+    let eta = ior_from_f0(dielectric_f0(params.ior, level));
+    if params.ior < 1.0 { 1.0 / eta } else { eta }
+}
+
+/// Cycles' specular setup: `f0 = F0(ior) * 2 * level`, `eta` from [`specular_eta`]. No specular layer when `eta == 1`.
+#[expect(
+    clippy::float_cmp,
+    reason = "Cycles compares eta with exactly 1 to drop the specular layer"
 )]
 fn specular_layer(params: &BsdfParams) -> Option<SpecularLayer> {
     let level = params.specular_ior_level.max(0.0);
     let f0_scalar = dielectric_f0(params.ior, level);
-    let eta = if level == 0.5 {
-        params.ior
-    } else {
-        let eta = ior_from_f0(f0_scalar);
-        if params.ior < 1.0 { 1.0 / eta } else { eta }
-    };
+    let eta = specular_eta(params);
     if eta == 1.0 {
         return None;
     }
@@ -1059,7 +1071,7 @@ pub(crate) fn sample_glass(
 
 /// Cycles' `microfacet_ggx_sample_vndf` (Heitz 2018): the half vector visible from the local view `wi`
 /// (`z` up) for the isotropic GGX `alpha`, from the uniform pair `(u, v)`.
-fn sample_visible_normal(wi: DVec3, alpha: f64, u: f64, v: f64) -> DVec3 {
+pub(super) fn sample_visible_normal(wi: DVec3, alpha: f64, u: f64, v: f64) -> DVec3 {
     let stretched = DVec3::new(alpha * wi.x, alpha * wi.y, wi.z).normalize_or_zero();
     let length_squared = stretched.x * stretched.x + stretched.y * stretched.y;
     let (t1, t2) = if length_squared > 1.0e-7 {
