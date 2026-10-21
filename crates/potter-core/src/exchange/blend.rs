@@ -31,9 +31,9 @@ use crate::{
         Material, MaterialLink, Modifier, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
         NlaStrip, NlaTrack, Node, ParentType, Profile, Registry, RenderSettings, RigidBody,
         RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData,
-        SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, TrackAxis, Transform,
-        UnitSettings, UpAxis, VertexGroup, ViewLayer, ViewportDisplay, VolumeInterpolation,
-        VolumeSampling, World, is_identity_matrix,
+        SurfaceData, SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings,
+        VertexGroup, ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling, World,
+        is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,

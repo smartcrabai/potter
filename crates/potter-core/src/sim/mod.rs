@@ -865,7 +865,7 @@ pub(crate) fn evaluate(
 ) -> Result<Option<SimulationResult>> {
     let cache_directory = gate.context.cache_directory;
     let key = cache::cache_key(scene_hash, scene_id, frame, base_world_matrices, gate)?;
-    let mut result = solver::evaluate(
+    let result = solver::evaluate(
         doc,
         scene_id,
         frame,

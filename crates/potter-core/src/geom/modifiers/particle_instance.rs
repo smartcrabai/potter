@@ -306,7 +306,7 @@ pub fn particle_instance(
             DQuat::IDENTITY
         };
         let mut path_frame = None;
-        let mut previous_direction = None;
+        let mut previous_direction: Option<DVec3> = None;
         let base = output.vertices.len();
         for (source, vertex) in mesh.vertices.iter().enumerate() {
             let mut oriented = orient(vertex.co, axis, track);

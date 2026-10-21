@@ -830,13 +830,12 @@ fn simulate_with_lifecycle(
         } else {
             gravity
         };
-        let (start, velocity, normal, birth_rotation, mut position, mut final_velocity) =
+        let (start, normal, birth_rotation, mut position, mut final_velocity) =
             if let (Some(birth), Some(current)) = (path.first(), current_path) {
                 let normal = (DQuat::from_array(birth.rotation) * DVec3::X).normalize_or_zero();
                 let birth_rotation = birth.rotation;
                 (
                     DVec3::from_array(birth.position),
-                    DVec3::from_array(birth.velocity),
                     normal,
                     birth_rotation,
                     DVec3::from_array(current.position),
@@ -854,14 +853,7 @@ fn simulate_with_lifecycle(
                     &fields,
                     &world_colliders,
                 )?;
-                (
-                    start,
-                    velocity,
-                    normal,
-                    birth_rotation,
-                    position,
-                    final_velocity,
-                )
+                (start, normal, birth_rotation, position, final_velocity)
             };
         if let Some(states) = hair_current_states {
             let index = usize::try_from(event)
@@ -944,10 +936,14 @@ fn simulate_with_lifecycle(
                         limit("particle child paths exceed the simulation work limit")
                     })?;
             }
-            estimated_work = estimated_work
+            if estimated_work
                 .checked_add(path_key_count)
-                .filter(|work| *work <= MAX_SIMULATION_WORK)
-                .ok_or_else(|| limit("particle simulation exceeds the 50-million work limit"))?;
+                .is_none_or(|work| work > MAX_SIMULATION_WORK)
+            {
+                return Err(limit(
+                    "particle simulation exceeds the 50-million work limit",
+                ));
+            }
             let (parents, children) = output.split_at_mut(child_start);
             for (index, child) in children.iter_mut().enumerate() {
                 let particle_index = u64::try_from(index)

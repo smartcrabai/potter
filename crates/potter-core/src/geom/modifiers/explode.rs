@@ -557,16 +557,7 @@ fn cut_edges(
                 .ok_or_else(|| invalid("explode edge-cut midpoint is missing"))
         };
         let mut add = |vertices: Vec<usize>, particle: usize| {
-            let corner_slots = (0..vertices.len()).collect();
-            let mut piece = Piece {
-                tess_face: tess_index,
-                vertices,
-                particle,
-                corner_slots,
-                uv_corners: None,
-            };
-            validate_piece(&mut piece);
-            pieces.push(piece);
+            pieces.push(build_piece(tess_index, vertices, particle, None));
         };
         if face.vertices.len() == 3 {
             let original = &face.vertices;
@@ -590,35 +581,25 @@ fn cut_edges(
                     let bc = get_edge(b, c)?;
                     let ac = get_edge(a, c)?;
                     add(vec![a, ab, bc, ac], vertex_particles[a]);
-                    add(vec![ab, b, bc], vertex_particles[b]);
                     // Blender 5.2 overwrites the second split triangle's UV row with the third's, then leaves the third row copied.
                     let source_slots = vec![
                         vec![(0, 0.5), (2, 0.5)],
                         vec![(1, 0.5), (2, 0.5)],
                         vec![(2, 1.0)],
                     ];
-                    let piece = pieces
-                        .last_mut()
-                        .ok_or_else(|| invalid("explode triangle split piece is missing"))?;
-                    piece.uv_corners = Some(
-                        piece
-                            .corner_slots
-                            .iter()
-                            .map(|slot| source_slots[*slot].clone())
-                            .collect(),
-                    );
-                    add(vec![ac, bc, c], vertex_particles[c]);
+                    pieces.push(build_piece(
+                        tess_index,
+                        vec![ab, b, bc],
+                        vertex_particles[b],
+                        Some(source_slots),
+                    ));
                     let copied_slots = vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]];
-                    let piece = pieces
-                        .last_mut()
-                        .ok_or_else(|| invalid("explode triangle split piece is missing"))?;
-                    piece.uv_corners = Some(
-                        piece
-                            .corner_slots
-                            .iter()
-                            .map(|slot| copied_slots[*slot].clone())
-                            .collect(),
-                    );
+                    pieces.push(build_piece(
+                        tess_index,
+                        vec![ac, bc, c],
+                        vertex_particles[c],
+                        Some(copied_slots),
+                    ));
                 }
                 17 | 18 | 20 => add(original.clone(), vertex_particles[original[0]]),
                 _ => {
@@ -678,6 +659,25 @@ fn cut_edges(
         }
     }
     Ok((pieces, points, split_edges))
+}
+
+/// A split piece of `tess_face` with corners in their own order, validated as Blender stores them.
+fn build_piece(
+    tess_face: usize,
+    vertices: Vec<usize>,
+    particle: usize,
+    uv_corners: Option<Vec<Vec<(usize, f64)>>>,
+) -> Piece {
+    let corner_slots = (0..vertices.len()).collect();
+    let mut piece = Piece {
+        tess_face,
+        vertices,
+        particle,
+        corner_slots,
+        uv_corners,
+    };
+    validate_piece(&mut piece);
+    piece
 }
 
 fn validate_piece(piece: &mut Piece) {
