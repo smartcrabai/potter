@@ -532,21 +532,7 @@ fn apply_remesh(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
     let targets = prepare_mesh_targets(engine, operation)?;
     let mut changed = false;
     for (_, data_id) in targets {
-        let block = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
-            PotError::new(ErrorCode::TargetNotFound, "mesh data block was not found")
-        })?;
-        let mesh = block
-            .mesh
-            .as_ref()
-            .ok_or_else(|| PotError::new(ErrorCode::InvalidOperation, "target data has no mesh"))?;
-        let remeshed = crate::geom::remesh::remesh(mesh, voxel_size)?;
-        if block.mesh.as_ref() != Some(&remeshed) {
-            block.mesh = Some(remeshed);
-            block.descriptor = None;
-            engine.mark("data_blocks", &data_id, ChangeKind::Updated);
-            super::clear_primitive_metadata(engine, &data_id);
-            changed = true;
-        }
+        changed |= super::mesh::remesh_data_block(engine, &data_id, voxel_size)?;
     }
     Ok(changed)
 }

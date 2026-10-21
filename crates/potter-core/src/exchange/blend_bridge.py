@@ -1850,7 +1850,7 @@ def _uv_layer_index(layers, attribute):
 MESH_HANDLED_KEYS = frozenset((
     "alembic_normals", "alembic_time_samples", "alembic_velocity", "blender_attributes", "blender_metadata", "blender_skin_vertices",
     "color_layers", "crease_edge", "custom_normal", "seam", "sharp", "shade_smooth", "skin_radii", "skin_roots",
-    "multires_displacement", "subdivision_optimal_edges",
+    "multires_displacement", "subdivision_optimal_edges", "texture_space",
     "uv_layers",
     "vertex_groups",
 ))
@@ -1958,6 +1958,7 @@ def mesh_dump(mesh):
     return {"name": mesh.name_full, "potter_id": mesh.get("potter.id"),
             "library": library_reference(mesh), "vertices": vertices,
             "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "uv_active": uv_active,
+            "sharp_face_present": mesh.attributes.get("sharp_face") is not None,
             "uv_render": uv_render, "materials": _material_names(mesh), "attributes": attrs,
             "color_active": _color_attribute_name(mesh, color_attributes.active_color_index),
             "color_render": _color_attribute_name(mesh, color_attributes.render_color_index),
@@ -2841,6 +2842,7 @@ def material_dump(material):
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "use_bump_map_correction": bool(getattr(getattr(material, "cycles", None), "use_bump_map_correction", True)),
             "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
             "alpha_mode": alpha_mode,
             "alpha_threshold": cutoff if alpha_mode == "clip" and cutoff is not None else float(material.alpha_threshold),
@@ -4336,6 +4338,13 @@ def _apply_native_shading(mesh, attributes, face_items, edge_items, edge_of):
     smooth = _native_values(attributes, "shade_smooth")
     for polygon, face in zip(mesh.polygons, face_items):
         polygon.use_smooth = bool(smooth.get("f%d" % face["id"], False))
+    # Setting `use_smooth` always leaves an all-false sharp_face attribute; shade_smooth() removes it, so
+    # without Potter's presence field an all-smooth mesh drops it.
+    shade = attributes.get("shade_smooth") or {}
+    if (not shade.get("sharp_face_present") and mesh.polygons
+            and all(polygon.use_smooth for polygon in mesh.polygons)
+            and mesh.attributes.get("sharp_face") is not None):
+        mesh.attributes.remove(mesh.attributes["sharp_face"])
     for field, key in (("use_edge_sharp", "sharp"), ("use_seam", "seam")):
         if attributes.get(key) is None:
             # Setting a flag creates Blender's sharp_edge / uv_seam attribute, so an absent layer stays absent.
@@ -4754,6 +4763,17 @@ def _apply_color_designation(mesh, attributes):
             raise ValueError("color layer %s is designated %s but mesh %s has no such layer"
                              % (reference, key, mesh.name))
         setattr(mesh.color_attributes, field, layer_names.index(reference))
+
+
+def _apply_texture_space(mesh, record):
+    """A mesh with a texture-space record has a manual texture space; without one it keeps the automatic bounds."""
+    if record is None:
+        return
+    mesh.use_auto_texspace = False
+    mesh.texspace_location = record["location"]
+    mesh.texspace_size = record["size"]
+
+
 def mesh_create(name, raw, block_id):
     mesh = bpy.data.meshes.new(name)
     attributes = raw.get("attributes", {})
@@ -4815,6 +4835,7 @@ def mesh_create(name, raw, block_id):
                              layer_names)
     _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of)
     _apply_multires_control_data(mesh, attributes, face_items, layout)
+    _apply_texture_space(mesh, attributes.get("texture_space"))
     _apply_color_designation(mesh, attributes)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
@@ -5716,17 +5737,6 @@ def _canonical_nla(doc, node, source_tracks):
         result.append(merged_track)
     return result
 
-
-def _is_simple_principled_tree(tree_source):
-    nodes = (tree_source or {}).get("nodes", []) or []
-    types = [item.get("type") for item in nodes]
-    links = (tree_source or {}).get("links", []) or []
-    has_principled = "ShaderNodeBsdfPrincipled" in types
-    has_output = any(kind in ("OutputMaterial", "ShaderNodeOutputMaterial")
-                     for kind in types)
-    return (has_principled and has_output and links
-            and all(link.get("from_socket") == "BSDF"
-                    and link.get("to_socket") == "Surface" for link in links))
 
 
 def _set_object_solver_inverse(owner, constraint, owner_type, pose_bone=None,
@@ -7014,11 +7024,18 @@ def _clip_cutoff(material):
     return float(compare.inputs[1].default_value)
 
 
-def _set_principled_values(material, item):
-    shader = next((node for node in material.node_tree.nodes
-                   if node.type == "BSDF_PRINCIPLED"), None)
-    if shader is None:
-        return
+def _generated_principled(tree):
+    """The Principled BSDF Potter generated in `tree`, marked by `_mark_generated_field_graph`, or None.
+
+    Only a generated Principled takes the Material's values on export. An authored graph is exported as it is: Potter
+    renders the graph's own inputs, so a Material value written into it would make the file differ from the render.
+    """
+    return next((node for node in tree.nodes
+                 if node.type == "BSDF_PRINCIPLED" and node.get("potter_simple_material") is True), None)
+
+
+def _set_principled_values(shader, item):
+    """Writes the Material's values into the Principled BSDF `shader`."""
     shader.inputs["Base Color"].default_value = item["base_color"]
     shader.inputs["Metallic"].default_value = item["metallic"]
     alpha = shader.inputs.get("Alpha")
@@ -7849,11 +7866,14 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
-        _set_principled_values(mat, item)
+        fresh = next((node for node in mat.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if fresh is not None:
+            _set_principled_values(fresh, item)
         mat.roughness = viewport["roughness"] if viewport else item["roughness"]
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
+        mat.cycles.use_bump_map_correction = bool(item.get("use_bump_map_correction", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
         mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
             item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")
@@ -8077,10 +8097,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         if tree_source:
             _restore_node_tree(material.node_tree, tree_source, id_lookup,
                                "Material shader tree %s" % material.name)
-            if (_is_simple_principled_tree(tree_source)
-                    or any(node.get("properties", {}).get("potter_simple_material") is True
-                           for node in tree_source.get("nodes", []))):
-                _set_principled_values(material, item)
+            generated = _generated_principled(material.node_tree)
+            if generated is not None:
+                _set_principled_values(generated, item)
         if item.get("owns_shader_graph") is True:
             _restore_material_field_nodes(material, item)
     for world_id, item in doc.get("worlds", {}).items():

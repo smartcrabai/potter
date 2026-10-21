@@ -126,7 +126,9 @@ fn alembic_import_restores_smooth_and_custom_shading() -> TestResult {
             custom += 1;
         }
     }
-    assert_eq!((smooth, flat, custom), (15, 3, 3));
+    // Blender's Alembic reader keeps every polygon smooth and imports loop normals as custom normals
+    // (`io/alembic/intern/abc_reader_mesh.cc`), so no face is flat and the flat faces live in custom normals.
+    assert_eq!((smooth, flat, custom), (18, 0, 3));
     Ok(())
 }
 

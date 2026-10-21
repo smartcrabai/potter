@@ -327,6 +327,15 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
             "shade_smooth".to_owned(),
             json!({"domain": "face", "type": "bool", "values": values}),
         );
+        // A copy keeps the member's `sharp_face` attribute (Blender's CustomData copy keeps every layer).
+        if source
+            .attributes
+            .get("shade_smooth")
+            .and_then(|attribute| attribute.get(crate::geom::normals::SHARP_FACE_PRESENT))
+            .is_some()
+        {
+            crate::geom::normals::record_sharp_face(mesh);
+        }
     }
     if ["sharp", "blender_edge_flags"]
         .iter()
@@ -523,6 +532,11 @@ fn merge_attributes(pieces: &[Piece], mesh: &Mesh) -> Result<Map<String, Value>>
     }
     let mut merged = Map::new();
     for name in names {
+        // Each member keeps its own texture space: the collection join carries Generated per vertex, so the member
+        // records are not merged into one mesh-level record (two members with different boxes would conflict).
+        if name == super::TEXTURE_SPACE_KEY {
+            continue;
+        }
         let members: Vec<Member<'_>> = pieces
             .iter()
             .map(|piece| (piece.attributes.get(name), piece))

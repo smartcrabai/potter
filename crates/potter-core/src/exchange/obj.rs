@@ -786,6 +786,7 @@ fn empty_mesh(id: String, name: String) -> ExchangeMesh {
         singular: false,
         vertex_normals: Vec::new(),
         smooth: Vec::new(),
+        sharp_faces: None,
         uv_layers: Vec::new(),
         uv_active: None,
         uv_render: None,
@@ -833,7 +834,12 @@ fn import(path: &Path) -> Result<ObjImport> {
     // Whether an `s` group is on at the current line, and whether any face of `current` was read
     // while one was on.
     let mut group_on = false;
-    let mut smoothed = false;
+    // Each face's `s` state in the object, and whether the file has any `vn` line (Blender's
+    // `MeshFromGeometry::has_normals` reads the whole file's normals).
+    let mut face_smooth = Vec::<bool>::new();
+    let file_has_normals = text
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("vn"));
     let mut remap = BTreeMap::<usize, usize>::new();
     // Names of every object declared by `o`. Objects without geometry are dropped from a file
     // that has geometry; a file with no geometry imports each declared object empty, so
@@ -886,7 +892,8 @@ fn import(path: &Path) -> Result<ObjImport> {
                         &corner_normals,
                         &corner_uvs,
                         &group_members,
-                        smoothed,
+                        &face_smooth,
+                        file_has_normals,
                         &mut losses,
                     );
                     finish_colors(&mut current, &local_colors, &mut losses);
@@ -911,7 +918,9 @@ fn import(path: &Path) -> Result<ObjImport> {
                     local_colors.clear();
                     group_members.clear();
                     face_materials.clear();
-                    smoothed = false;
+                    // Blender's `geom_new_object` resets the smooth state for each object.
+                    group_on = false;
+                    face_smooth.clear();
                     remap.clear();
                 } else if !name.is_empty() {
                     current.name = name;
@@ -955,9 +964,12 @@ fn import(path: &Path) -> Result<ObjImport> {
                 });
             }
             "s" => {
+                // Blender's `geom_update_smooth_group`: `0`, `off` and `null` are flat, and any other
+                // value is smooth when its integer is non-zero.
                 group_on = words
                     .next()
-                    .is_some_and(|group| group != "0" && group != "off");
+                    .and_then(|group| group.parse::<i64>().ok())
+                    .is_some_and(|group| group != 0);
             }
             "f" => {
                 let mut face = Vec::new();
@@ -1006,7 +1018,7 @@ fn import(path: &Path) -> Result<ObjImport> {
                     face_materials.push(active_material);
                     corner_normals.extend(face_normals);
                     corner_uvs.extend(face_uvs);
-                    smoothed |= group_on;
+                    face_smooth.push(group_on);
                     face_count += 1;
                 }
             }
@@ -1019,7 +1031,8 @@ fn import(path: &Path) -> Result<ObjImport> {
             &corner_normals,
             &corner_uvs,
             &group_members,
-            smoothed,
+            &face_smooth,
+            file_has_normals,
             &mut losses,
         );
         finish_colors(&mut current, &local_colors, &mut losses);
@@ -1125,13 +1138,16 @@ fn resolve_index(token: &str, count: usize, line: usize) -> Result<usize> {
 }
 
 /// Sets complete custom normals and UV layers, and imports each OBJ group as unit-weight vertex
-/// memberships. Smooth groups without any normals are reported as losses.
+/// memberships. Blender's `set_face_sharpness` (`io/wavefront_obj/importer/obj_import_mesh.cc`) fixes
+/// `sharp_face`: with no `vn` in the file it is `!shaded_smooth` from each face's `s` state, and with
+/// normals every face is smooth except zero-area faces, which stay sharp.
 fn finish_object(
     mesh: &mut ExchangeMesh,
     corner_normals: &[Option<DVec3>],
     corner_uvs: &[Option<[f64; 2]>],
     group_members: &BTreeMap<String, BTreeSet<usize>>,
-    smoothed: bool,
+    face_smooth: &[bool],
+    file_has_normals: bool,
     losses: &mut Vec<Loss>,
 ) {
     for (name, vertices) in group_members {
@@ -1140,6 +1156,15 @@ fn finish_object(
             weights: vertices.iter().map(|&vertex| (vertex, 1.0)).collect(),
         });
     }
+    let sharp_faces: Vec<bool> = if file_has_normals {
+        mesh.faces
+            .iter()
+            .map(|face| zero_area_face(&mesh.positions, face))
+            .collect()
+    } else {
+        face_smooth.iter().map(|smooth| !smooth).collect()
+    };
+    mesh.sharp_faces = Some(sharp_faces);
     let supplied = corner_normals.iter().flatten().count();
     if supplied > 0 && supplied == corner_normals.len() {
         mesh.normals = Some(
@@ -1153,15 +1178,8 @@ fn finish_object(
         losses.push(Loss {
             feature_id: "mesh.normals".to_owned(),
             data_id: Some(mesh.name.clone()),
-            reason: "some face corners have no vn normal; partial normals are ignored and shading is recomputed".to_owned(),
+            reason: "some face corners have no vn normal; partial normals are ignored and no custom normals are imported".to_owned(),
             suggestion: Some("write a vn index on every face corner (f v//vn) to keep custom normals".to_owned()),
-        });
-    } else if smoothed {
-        losses.push(Loss {
-            feature_id: "mesh.smoothing".to_owned(),
-            data_id: Some(mesh.name.clone()),
-            reason: "smooth groups without vn normals are not mapped to shading".to_owned(),
-            suggestion: Some("write vn normals (f v//vn) to keep smooth shading".to_owned()),
         });
     }
     let supplied_uvs = corner_uvs.iter().flatten().count();
@@ -1183,6 +1201,28 @@ fn finish_object(
             ),
         });
     }
+}
+
+/// Blender's `face_area_calc` below `1e-12` (`obj_import_mesh.cc`): the face's corners share a location,
+/// so its polygon has no area. The area is half the Newell sum's length.
+fn zero_area_face(positions: &[[f64; 3]], face: &[usize]) -> bool {
+    let points = face
+        .iter()
+        .filter_map(|&index| positions.get(index))
+        .map(|point| DVec3::from_array(*point))
+        .collect::<Vec<_>>();
+    let Some(&last) = points.last() else {
+        return true;
+    };
+    let mut normal = DVec3::ZERO;
+    let mut previous = last;
+    for &current in &points {
+        normal.x += (previous.y - current.y) * (previous.z + current.z);
+        normal.y += (previous.z - current.z) * (previous.x + current.x);
+        normal.z += (previous.x - current.x) * (previous.y + current.y);
+        previous = current;
+    }
+    normal.length() * 0.5 < 1.0e-12
 }
 
 /// Sets the `Color` layer from the `v` colors when every vertex has one. A partial set is a loss.
