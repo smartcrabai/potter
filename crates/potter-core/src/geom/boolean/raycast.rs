@@ -3,18 +3,16 @@
 //! Each test point casts Blender's six rays. A hit is decided by Blender's float test
 //! (`isect_ray_tri_epsilon_v3`), and each hit counts the orientation of the ray origin against the
 //! hit triangle (Blender `orient3d`, decided exactly by `robust` on the double vertex positions).
-//! Candidate triangles come from one [`bvh::TriBvh`] per classification, plus a per-ray list of
-//! triangles whose float test is too ill-conditioned to trust box culling.
-
-#[path = "raycast/bvh.rs"]
-mod bvh;
+//! Candidate triangles come from one [`KdopTree`] per classification (`geom::bvh`, Blender's k-DOP
+//! tree with the watertight leaf walk of `BLI_bvhtree_ray_cast`), plus a per-ray list of triangles
+//! whose float test is too ill-conditioned to trust box culling.
 
 use glam::DVec3;
 use robust::{Coord3D, orient3d};
 
 use super::super::imesh::{Arena, Tri};
 use super::{BoolOp, apply_bool_op, patches::find_patches, topology::Topology};
-use bvh::TriBvh;
+use crate::geom::bvh::{KdopTree, Ray, RayHit};
 
 /// Blender `FLT_EPSILON`: slack on the barycentric bounds of `isect_ray_tri_epsilon_v3`.
 const RAY_EPSILON: f32 = f32::EPSILON;
@@ -73,7 +71,7 @@ pub(super) fn raycast_boolean(
 /// The float triangles of one classification, with the BVH and conditioning data for the six rays.
 struct RayIndex {
     float_tris: Vec<[[f32; 3]; 3]>,
-    bvh: TriBvh,
+    bvh: KdopTree,
     /// Bit `r` is set when triangle `t` is ill-conditioned for `RAYS[r]`.
     ill_conditioned: Vec<u8>,
     /// Triangles that are ill-conditioned for `RAYS[r]`. They are tested for that ray directly,
@@ -86,13 +84,17 @@ impl RayIndex {
     ///
     /// Cost: O(T log T) for the BVH, O(6 T) for the conditioning test.
     fn new(float_tris: Vec<[[f32; 3]; 3]>) -> Self {
-        let bounds: Vec<(DVec3, DVec3)> = float_tris.iter().map(triangle_bounds).collect();
-        let (lo, hi) = bounds.iter().fold(
-            (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
-            |(lo, hi), &(min, max)| (lo.min(min), hi.max(max)),
-        );
-        let largest_extent = (hi - lo).max_element().max(0.0);
-        let bvh = TriBvh::new(&bounds, BOX_PAD_FRACTION * largest_extent);
+        // Padding is BOX_PAD_FRACTION of the extent, plus one f32 ulp per unit of the largest
+        // coordinate: the leaf boxes are stored as f32, and that guard keeps their corners outside
+        // the triangle however far the mesh sits from the origin. A wider box only adds candidates,
+        // and every candidate still goes through the exact float test.
+        let (extent, magnitude) = extent_and_magnitude(&float_tris);
+        let pad = BOX_PAD_FRACTION * extent + magnitude * f64::from(f32::EPSILON);
+        let leaf_bounds: Vec<[f32; 6]> = float_tris
+            .iter()
+            .map(|tri| padded_bounds(tri, pad))
+            .collect();
+        let bvh = KdopTree::from_leaf_bounds(&leaf_bounds);
 
         let mut ill_conditioned = vec![0_u8; float_tris.len()];
         let mut always_tested = vec![Vec::new(); RAYS.len()];
@@ -118,9 +120,54 @@ fn to_dvec3(v: [f32; 3]) -> DVec3 {
     DVec3::new(f64::from(v[0]), f64::from(v[1]), f64::from(v[2]))
 }
 
-fn triangle_bounds(tri: &[[f32; 3]; 3]) -> (DVec3, DVec3) {
-    let [a, b, c] = tri.map(to_dvec3);
-    (a.min(b).min(c), a.max(b).max(c))
+/// The largest extent `L` of the triangles on any axis and the largest coordinate magnitude, both
+/// in f64; zero for no triangles.
+fn extent_and_magnitude(float_tris: &[[[f32; 3]; 3]]) -> (f64, f64) {
+    if float_tris.is_empty() {
+        return (0.0, 0.0);
+    }
+    let (lo, hi) = float_tris.iter().flatten().fold(
+        (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
+        |(lo, hi), &vertex| {
+            let v = to_dvec3(vertex);
+            (lo.min(v), hi.max(v))
+        },
+    );
+    let magnitude = lo.abs().max(hi.abs()).max_element();
+    ((hi - lo).max_element().max(0.0), magnitude)
+}
+
+/// The leaf box of a triangle, grown by `pad` on every side, in the `[min, max]` per-axis layout
+/// of [`KdopTree::from_leaf_bounds`]. The box is computed in f64 and rounded to f32 once per corner.
+fn padded_bounds(tri: &[[f32; 3]; 3], pad: f64) -> [f32; 6] {
+    let mut bounds = [0.0_f32; 6];
+    for axis in 0..3 {
+        let min = tri
+            .iter()
+            .map(|v| f64::from(v[axis]))
+            .fold(f64::INFINITY, f64::min);
+        let max = tri
+            .iter()
+            .map(|v| f64::from(v[axis]))
+            .fold(f64::NEG_INFINITY, f64::max);
+        bounds[2 * axis] = (min - pad) as f32;
+        bounds[2 * axis + 1] = (max + pad) as f32;
+    }
+    bounds
+}
+
+/// Blender `BLI_bvhtree_ray_cast`'s leaf walk over the classification's tree: appends to `leaves`
+/// every triangle whose padded box the ray `origin + s * direction`, `s >= 0`, crosses. The walk is
+/// unbounded (`RayHit::open`), as Blender's `BLI_bvhtree_ray_cast_all` is, and the callback only
+/// records leaves, so no leaf is pruned by a hit found earlier.
+fn bvh_leaves(index: &RayIndex, origin: [f32; 3], direction: [f32; 3], leaves: &mut Vec<usize>) {
+    let mut hit = RayHit::open();
+    index.bvh.ray_cast(
+        origin,
+        direction,
+        &mut hit,
+        &mut |leaf: usize, _ray: &Ray, _hit: &mut RayHit| leaves.push(leaf),
+    );
 }
 
 /// Whether the float test of Blender's `isect_ray_tri_epsilon_v3` for `tri` and `direction` is too
@@ -234,10 +281,9 @@ fn raycast_test_remove(
     }
 }
 
-/// Reused buffers of one classification: the BVH query stack and candidates, and the per-shape
+/// Reused buffers of one classification: the BVH leaf list of the current ray, and the per-shape
 /// orientation parity of the current ray.
 struct RayScratch {
-    stack: Vec<usize>,
     hits: Vec<usize>,
     hit_parity: Vec<i32>,
 }
@@ -245,7 +291,6 @@ struct RayScratch {
 impl RayScratch {
     fn new(nshapes: usize) -> Self {
         Self {
-            stack: Vec::new(),
             hits: Vec::new(),
             hit_parity: vec![0; nshapes],
         }
@@ -305,12 +350,7 @@ fn test_tri_inside_shapes(
         };
         scratch.hit_parity.fill(0);
         scratch.hits.clear();
-        index.bvh.ray_candidates(
-            origin_exact,
-            to_dvec3(direction),
-            &mut scratch.stack,
-            &mut scratch.hits,
-        );
+        bvh_leaves(index, origin, direction, &mut scratch.hits);
         let ray_bit = 1_u8 << ray_index;
         let bvh_candidates = scratch
             .hits
@@ -434,7 +474,9 @@ fn flipped(tri: Tri) -> Tri {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ill_conditioned, orient3d_sign, ray_intersects_triangle};
+    use super::{
+        RAYS, RayIndex, bvh_leaves, is_ill_conditioned, orient3d_sign, ray_intersects_triangle,
+    };
     use glam::DVec3;
 
     #[test]
@@ -479,5 +521,49 @@ mod tests {
         let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
         assert!(!is_ill_conditioned(&good, direction));
         assert!(is_ill_conditioned(&flat, direction));
+    }
+
+    /// The tree walk visits every well-conditioned triangle that the float test hits, the property
+    /// the candidate culling relies on. Ill-conditioned triangles are tested directly instead.
+    #[test]
+    fn tree_walk_visits_every_triangle_the_float_test_hits() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1_u64 << 24) as f32
+        };
+        let tris: Vec<[[f32; 3]; 3]> = (0..400)
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    [next() * 4.0 - 2.0, next() * 4.0 - 2.0, next() * 4.0 - 2.0]
+                })
+            })
+            .collect();
+        let index = RayIndex::new(tris);
+        let mut leaves = Vec::new();
+        let mut hits_checked = 0_usize;
+        for _ in 0..200 {
+            let origin = [next() * 4.0 - 2.0, next() * 4.0 - 2.0, next() * 4.0 - 2.0];
+            for (ray, &direction) in RAYS.iter().enumerate() {
+                leaves.clear();
+                bvh_leaves(&index, origin, direction, &mut leaves);
+                for (t, tri) in index.float_tris.iter().enumerate() {
+                    let conditioned = (index.ill_conditioned[t] & (1_u8 << ray)) == 0;
+                    if conditioned && ray_intersects_triangle(origin, direction, tri) {
+                        hits_checked += 1;
+                        assert!(
+                            leaves.contains(&t),
+                            "triangle {t} is hit by ray {ray} but was not visited"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            hits_checked > 1000,
+            "the fixture must produce many float hits"
+        );
     }
 }
