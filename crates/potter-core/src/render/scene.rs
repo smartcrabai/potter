@@ -53,11 +53,6 @@ pub(super) struct ObjectRecord {
     pub node_id: Id,
     pub data_id: Option<Id>,
     pub instance_path: Vec<Id>,
-    /// The object's texture space (`BKE_mesh_texspace_calc` of its undeformed local bounds, or its stored manual box),
-    /// the box the Generated coordinate maps onto `[0, 1]³`. A collection instance's members keep their own, in the
-    /// joined mesh's `generated_vertices`. Not part of the output.
-    #[serde(skip)]
-    pub texture_space: TextureSpace,
     /// UV layer names in layer order, matching `Triangle::layer_uvs`. Not part of the output.
     #[serde(skip)]
     pub uv_layers: Vec<String>,
@@ -548,7 +543,6 @@ pub(super) fn extract_geometry(
             index: object_index,
             node_id: node_id.clone(),
             data_id: node.data.clone(),
-            texture_space,
             instance_path: snapshot
                 .instance_paths
                 .get(node_id)
@@ -3082,7 +3076,7 @@ mod shading_normal_tests {
     fn source_triangle(positions: [DVec3; 3], normals: [DVec3; 3]) -> Triangle {
         Triangle {
             positions,
-            generated: GeneratedCorners::default(),
+            generated: crate::geom::GeneratedCorners::default(),
             object_index: 1,
             element_index: 1,
             color: [1.0; 4],
