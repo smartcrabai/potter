@@ -1674,27 +1674,43 @@ pub fn mesh_to_fog_volume(
     if !interior_distance.is_finite() || interior_distance <= 0.0 {
         return Err(invalid_volume("mesh-to-volume interior band is invalid"));
     }
+    let band = narrow_band_squared_distances(&triangles, minimum_index, dims)?;
     let mut signed_distances = Vec::with_capacity(sample_count);
+    let mut active = Vec::with_capacity(sample_count);
     for z in 0..dims[2] {
         for y in 0..dims[1] {
             for x in 0..dims[0] {
                 let index_position = minimum_index + DVec3::new(x as f64, y as f64, z as f64);
-                let nearest_squared = triangles.nearest_squared(index_position);
-                let unsigned = (nearest_squared as f32).sqrt() * voxel_size;
-                if !unsigned.is_finite() {
-                    return Err(resource_error());
-                }
                 let inside = triangles.is_inside(index_position);
-                let signed = if inside {
-                    -unsigned.min(interior_distance)
+                let squared = band[(z * dims[1] + y) * dims[0] + x];
+                let signed = if squared.is_finite() {
+                    let unsigned = (squared as f32).sqrt() * voxel_size;
+                    if !unsigned.is_finite() {
+                        return Err(resource_error());
+                    }
+                    active.push(true);
+                    if inside { -unsigned } else { unsigned }
                 } else {
-                    unsigned.min(voxel_size)
+                    // Voxels outside the narrow band keep OpenVDB's background: the exterior width
+                    // outside, and the interior width inside (`signedFloodFillWithValues`).
+                    active.push(false);
+                    if inside {
+                        -interior_distance
+                    } else {
+                        voxel_size
+                    }
                 };
                 signed_distances.push(signed);
             }
         }
     }
-    renormalize_signed_distances(&mut signed_distances, dims, voxel_size, interior_distance);
+    renormalize_signed_distances(
+        &mut signed_distances,
+        &active,
+        dims,
+        voxel_size,
+        interior_distance,
+    );
     let minimum_distance = signed_distances
         .iter()
         .copied()
@@ -1755,8 +1771,93 @@ pub fn mesh_to_fog_volume(
     })
 }
 
+/// Squared index-space distance from each voxel to the nearest triangle, for the voxels OpenVDB's
+/// voxelizer stores (`VoxelizePolygons::voxelizeTriangle` and `updateDistance`, MeshToVolume.h
+/// 2156-2222).
+///
+/// Each triangle floods from the voxel holding its first corner through the 26-neighbourhood. A
+/// flooded voxel keeps the smaller of its stored distance and the distance to this triangle. Its
+/// neighbours are flooded further only while that distance is at most `0.75` in squared voxel units
+/// (`!(dist > 0.75)`), so the stored set is one voxel thick around the surface. Voxels no triangle
+/// reached stay `f64::INFINITY`: OpenVDB's background.
+fn narrow_band_squared_distances(
+    triangles: &TriangleBvh,
+    origin: DVec3,
+    dims: [usize; 3],
+) -> Result<Vec<f64>> {
+    const SPREAD_LIMIT_SQUARED: f64 = 0.75;
+    let [nx, ny, _] = dims;
+    let origin_coord = [origin.x as i64, origin.y as i64, origin.z as i64];
+    let linear = |coord: [i64; 3]| -> Option<usize> {
+        let mut local = [0_usize; 3];
+        for axis in 0..3 {
+            let offset = usize::try_from(coord[axis] - origin_coord[axis]).ok()?;
+            if offset >= dims[axis] {
+                return None;
+            }
+            local[axis] = offset;
+        }
+        Some((local[2] * ny + local[1]) * nx + local[0])
+    };
+    let sample_count = dims[0] * dims[1] * dims[2];
+    let mut squared = vec![f64::INFINITY; sample_count];
+    let mut visited = vec![0_u32; sample_count];
+    for (triangle_index, triangle) in triangles.triangles.iter().enumerate() {
+        let mark = u32::try_from(triangle_index + 1).map_err(|_| resource_error())?;
+        let corner = triangle.points[0].floor();
+        let seed = [corner.x as i64, corner.y as i64, corner.z as i64];
+        // OpenVDB stores the seed's distance and expands it whatever that distance is.
+        if let Some(index) = linear(seed) {
+            visited[index] = mark;
+            let distance = point_triangle_distance_squared(
+                DVec3::new(seed[0] as f64, seed[1] as f64, seed[2] as f64),
+                triangle.points,
+            );
+            squared[index] = squared[index].min(distance);
+        }
+        let mut pending = vec![seed];
+        while let Some(current) = pending.pop() {
+            for dz in -1_i64..=1 {
+                for dy in -1_i64..=1 {
+                    for dx in -1_i64..=1 {
+                        if (dx, dy, dz) == (0, 0, 0) {
+                            continue;
+                        }
+                        let neighbour = [current[0] + dx, current[1] + dy, current[2] + dz];
+                        let Some(index) = linear(neighbour) else {
+                            continue;
+                        };
+                        if visited[index] == mark {
+                            continue;
+                        }
+                        visited[index] = mark;
+                        let distance = point_triangle_distance_squared(
+                            DVec3::new(
+                                neighbour[0] as f64,
+                                neighbour[1] as f64,
+                                neighbour[2] as f64,
+                            ),
+                            triangle.points,
+                        );
+                        squared[index] = squared[index].min(distance);
+                        if distance <= SPREAD_LIMIT_SQUARED {
+                            pending.push(neighbour);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(squared)
+}
+
+/// OpenVDB's renormalisation of the narrow band (`mesh_to_volume_internal::OffsetValues`,
+/// `Renormalize`, `MinCombine`, and `InactivateValues`, MeshToVolume.h 2827-3046): every active voxel
+/// moves back by 0.8 voxels, takes one Godunov step on the offset values of its neighbours, keeps the
+/// smaller of the two, and is offset forward again. Voxels outside the band are left as background.
 fn renormalize_signed_distances(
     distances: &mut [f32],
+    active: &[bool],
     dims: [usize; 3],
     voxel_size: f32,
     interior_distance: f32,
@@ -1766,20 +1867,14 @@ fn renormalize_signed_distances(
     let epsilon = 1.0e-7_f32;
     let row_stride = nx;
     let plane_stride = nx * ny;
-    let mut active = vec![false; distances.len()];
     let mut offset_values = distances.to_vec();
-    for (index, value) in distances.iter().copied().enumerate() {
-        let is_active = if value < 0.0 {
-            -value < interior_distance
-        } else {
-            value < voxel_size
-        };
-        active[index] = is_active;
-        if is_active {
+    for (index, is_active) in active.iter().enumerate() {
+        if *is_active {
             offset_values[index] -= offset;
         }
     }
-    let mut renormalized = vec![0.0_f32; distances.len()];
+    // A voxel on the grid boundary has no neighbours to step from, so it keeps its offset value.
+    let mut renormalized = offset_values.clone();
     for z in 1..nz - 1 {
         for y in 1..ny - 1 {
             for x in 1..nx - 1 {
@@ -1812,6 +1907,7 @@ fn renormalize_signed_distances(
         }
         let shifted = *value - offset;
         *value = shifted.min(renormalized[index]) + offset - epsilon;
+        // InactivateValues: a band value past either width is background.
         if *value < 0.0 {
             if *value <= -interior_distance {
                 *value = -interior_distance;
@@ -1924,40 +2020,6 @@ impl TriangleBvh {
         Ok(node_index)
     }
 
-    fn nearest_squared(&self, point: DVec3) -> f64 {
-        self.nearest_squared_in_node(0, point, f64::INFINITY)
-    }
-
-    fn nearest_squared_in_node(&self, node_index: usize, point: DVec3, best: f64) -> f64 {
-        let node = &self.nodes[node_index];
-        if distance_to_bounds_squared(point, node.minimum, node.maximum) >= best {
-            return best;
-        }
-        if let Some((left, right)) = node.children {
-            let left_node = &self.nodes[left];
-            let right_node = &self.nodes[right];
-            let (first, second) =
-                if distance_to_bounds_squared(point, left_node.minimum, left_node.maximum)
-                    <= distance_to_bounds_squared(point, right_node.minimum, right_node.maximum)
-                {
-                    (left, right)
-                } else {
-                    (right, left)
-                };
-            let best = self.nearest_squared_in_node(first, point, best);
-            self.nearest_squared_in_node(second, point, best)
-        } else {
-            self.indices[node.start..node.end]
-                .iter()
-                .fold(best, |best, triangle| {
-                    best.min(point_triangle_distance_squared(
-                        point,
-                        self.triangles[*triangle].points,
-                    ))
-                })
-        }
-    }
-
     fn is_inside(&self, point: DVec3) -> bool {
         let direction = DVec3::new(1.0, 0.371_390_676_354_103_7, 0.529_173_248_214_697_2);
         self.ray_intersection_count(0, point, direction) % 2 == 1
@@ -1980,21 +2042,6 @@ impl TriangleBvh {
                 .count()
         }
     }
-}
-
-fn distance_to_bounds_squared(point: DVec3, minimum: DVec3, maximum: DVec3) -> f64 {
-    let mut distance = 0.0;
-    for axis in 0..3 {
-        let delta = if point[axis] < minimum[axis] {
-            minimum[axis] - point[axis]
-        } else if point[axis] > maximum[axis] {
-            point[axis] - maximum[axis]
-        } else {
-            0.0
-        };
-        distance += delta * delta;
-    }
-    distance
 }
 
 fn ray_intersects_bounds(origin: DVec3, direction: DVec3, minimum: DVec3, maximum: DVec3) -> bool {

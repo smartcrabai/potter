@@ -522,13 +522,55 @@ fn cloth_keeps_a_pinned_corner_and_bounds_spring_lengths() {
 }
 
 #[test]
-fn soft_body_sphere_stops_on_collider_without_penetrating() {
+fn soft_body_sphere_on_collider_matches_blender_contact_and_rebound() {
     use glam::DVec3;
     use potter_core::geom::{Mesh, UvSphereParams};
     use potter_core::sim::ColliderTriangle;
 
-    // Start the sphere above the collider (bottom at z = 0.5): the solver resolves crossings of the
-    // surface within a step, so a sphere that begins below it is outside what the test checks.
+    // Blender 5.2.2 oracle, world-space rows per frame (`fixtures/physics_softbody`). Blender's soft
+    // body steps once per frame, so the frame index is the only time axis.
+    let oracle: Value = serde_json::from_str(include_str!(
+        "fixtures/physics_softbody/blender_sphere_collision.json"
+    ))
+    .expect("valid Blender soft-body fixture");
+    let rows = oracle["rows"].as_array().expect("oracle rows");
+    let plane_height = oracle["plane_z"].as_f64().expect("plane height");
+    let collision = &oracle["collision"];
+    let thickness_outer = collision["thickness_outer"]
+        .as_f64()
+        .expect("thickness outer");
+    let thickness_inner = collision["thickness_inner"]
+        .as_f64()
+        .expect("thickness inner");
+    let culling = collision["use_culling"].as_bool().expect("culling");
+    let frame_of = |row: &Value| row["frame"].as_u64().expect("frame") as usize;
+    let blender_center = |frame: usize| rows[frame - 1]["center_z"].as_f64().expect("center");
+    let blender_lowest = |frame: usize| rows[frame - 1]["min_z"].as_f64().expect("min");
+    assert_eq!(frame_of(&rows[0]), 1, "oracle starts at frame 1");
+
+    // Blender's resting bottom sits `contact_band` above the plane; the band is measured over frames
+    // 17 to 60, after the sphere first lands (frame 17 is the first frame with a pinned bottom).
+    let contact_band = (17..=60)
+        .map(blender_lowest)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - plane_height;
+    // Blender's rebound is the largest rise of the centre within frames 17 to 34.
+    let rise = |values: &[f64]| {
+        let mut lowest_so_far = f64::INFINITY;
+        let mut best = 0.0_f64;
+        for &value in values {
+            best = best.max(value - lowest_so_far);
+            lowest_so_far = lowest_so_far.min(value);
+        }
+        best
+    };
+    let blender_rise = rise(&(17..=34).map(blender_center).collect::<Vec<_>>());
+    assert!(
+        blender_rise > 0.05,
+        "Blender measured a rebound of {blender_rise}"
+    );
+
+    // Start the sphere above the collider (bottom at z = 0.5), as the Blender scene does.
     let mut sphere = Mesh::uv_sphere(UvSphereParams {
         segments: 8,
         ring_count: 6,
@@ -538,62 +580,74 @@ fn soft_body_sphere_stops_on_collider_without_penetrating() {
     for vertex in &mut sphere.vertices {
         vertex.co.z += 1.5;
     }
-    let plane_height = -0.5;
-    let collider = [ColliderTriangle {
-        points: [
+    // The Blender collider is a 20 x 20 plane; two triangles with upward normals cover it.
+    let plane = |points: [DVec3; 3]| ColliderTriangle {
+        points,
+        thickness_outer,
+        thickness_inner,
+        culling,
+        friction: 0.0,
+    };
+    let collider = [
+        plane([
             DVec3::new(-10.0, -10.0, plane_height),
             DVec3::new(10.0, -10.0, plane_height),
-            DVec3::new(0.0, 10.0, plane_height),
-        ],
-        thickness_outer: 0.0,
-        thickness_inner: 0.0,
-        culling: false,
-        friction: 0.0,
-    }];
-    let settings = json!({"substeps":4,"iterations":12});
-    let frame_12 = potter_core::sim::softbody::simulate(
-        &sphere,
-        &settings,
-        12.0,
-        24.0,
-        DVec3::new(0.0, 0.0, -9.81),
-        &collider,
-    )
-    .unwrap();
-    let frame_13 = potter_core::sim::softbody::simulate(
-        &sphere,
-        &settings,
-        13.0,
-        24.0,
-        DVec3::new(0.0, 0.0, -9.81),
-        &collider,
-    )
-    .unwrap();
+            DVec3::new(10.0, 10.0, plane_height),
+        ]),
+        plane([
+            DVec3::new(-10.0, -10.0, plane_height),
+            DVec3::new(10.0, 10.0, plane_height),
+            DVec3::new(-10.0, 10.0, plane_height),
+        ]),
+    ];
+    let settings = json!({"substeps":4,"iterations":12,"use_goal":false});
+    let simulate_frame = |frame: usize| {
+        potter_core::sim::softbody::simulate(
+            &sphere,
+            &settings,
+            (frame - 1) as f64,
+            24.0,
+            DVec3::new(0.0, 0.0, -9.81),
+            &collider,
+        )
+        .unwrap()
+    };
     let lowest = |positions: &[DVec3]| {
         positions
             .iter()
             .map(|position| position.z)
             .fold(f64::INFINITY, f64::min)
     };
-    assert!(
-        lowest(&frame_12) >= plane_height - 1.0e-9,
-        "soft body penetrated the collider at frame 12: {}",
-        lowest(&frame_12)
-    );
-    assert!(
-        lowest(&frame_13) >= plane_height - 1.0e-9,
-        "soft body penetrated the collider at frame 13: {}",
-        lowest(&frame_13)
-    );
-    let center_z = |positions: &[DVec3]| {
+    let center = |positions: &[DVec3]| {
         positions.iter().map(|position| position.z).sum::<f64>()
             / f64::from(u32::try_from(positions.len()).unwrap())
     };
+
+    let potter_lowest: Vec<f64> = (1..=40)
+        .map(|frame| lowest(&simulate_frame(frame)))
+        .collect();
+    for (index, value) in potter_lowest.iter().enumerate() {
+        assert!(
+            *value >= plane_height - 1.0e-9,
+            "soft body penetrated the collider at frame {}: {value}",
+            index + 1
+        );
+    }
+    // Blender's bottom at the contact frame, within the band Blender measured.
+    let contact_frame = 20;
+    let contact_depth = potter_lowest[contact_frame - 1] - plane_height;
     assert!(
-        center_z(&frame_13) <= center_z(&frame_12) + 1.0e-9,
-        "soft-body sphere rose after contact: {} -> {}",
-        center_z(&frame_12),
-        center_z(&frame_13)
+        contact_depth <= contact_band + 1.0e-9,
+        "contact depth {contact_depth} exceeds Blender's {contact_band}"
+    );
+
+    let potter_center: Vec<f64> = (17..=34)
+        .map(|frame| center(&simulate_frame(frame)))
+        .collect();
+    let potter_rise = rise(&potter_center);
+    assert!(
+        potter_rise >= 0.5 * blender_rise,
+        "soft-body rebound {potter_rise} is below half of Blender's {blender_rise}"
     );
 }
 
