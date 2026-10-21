@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use glam::{DMat4, DVec3, Vec3};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     error::{PotError, Result},
@@ -22,7 +22,7 @@ use crate::{
         bvh::{KdopTree, NearestHit, RAYCAST_DIST_MAX, Ray, RayHit, TREE_EPSILON},
         normals,
     },
-    model::Modifier,
+    model::{Id, Modifier, ModifierRuntime},
 };
 
 use super::{bool_param, invalid_parameter, number_param, string_param, uint_param, validated};
@@ -325,6 +325,47 @@ pub(super) fn evaluate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     }
     validated(&result)?;
     Ok(result)
+}
+
+/// Blender's `BKE_shrinkwrap_remesh_target_project` (`blenkernel/intern/shrinkwrap.cc`), which the voxel
+/// remesh operator runs when `ME_REMESH_REPROJECT_VOLUME` is set (its default): every vertex of the
+/// remeshed `mesh` is projected onto the original `target` along its vertex normal, in both directions,
+/// on the surface, with `projLimit = 5 * voxel_size`, zero offset and zero `keepDist`. The projection
+/// space is the identity, because Blender uses the one object for both sides.
+pub(crate) fn remesh_target_project(mesh: &Mesh, target: &Mesh, voxel_size: f64) -> Result<Mesh> {
+    let params = json!({
+        "wrap_method": "PROJECT",
+        "wrap_mode": "ON_SURFACE",
+        "offset": 0.0,
+        "project_limit": voxel_size * 5.0,
+        "use_project_x": false,
+        "use_project_y": false,
+        "use_project_z": false,
+        "use_negative_direction": true,
+        "use_positive_direction": true,
+        "cull_face": "OFF",
+        "use_invert_cull": false,
+        "vertex_group": "",
+        "invert_vertex_group": false,
+        "auxiliary_target": null,
+        "subsurf_levels": 0,
+        "target": null
+    });
+    let mut runtime = ModifierRuntime::default();
+    runtime.shrinkwrap_subject_to_target = Some(DMat4::IDENTITY.to_cols_array());
+    runtime.shrinkwrap_target_mesh = Some(target.clone());
+    let modifier = Modifier {
+        id: Id::new("remesh_target_project")?,
+        modifier_type: "shrinkwrap".to_owned(),
+        name: "Remesh Target Project".to_owned(),
+        enabled: true,
+        show_viewport: true,
+        show_render: true,
+        params: params.as_object().cloned().unwrap_or_default(),
+        binding_data: None,
+        runtime,
+    };
+    evaluate(mesh, &modifier)
 }
 
 /// Blender's `BLI_space_transform_from_matrices` in float: `subject_to_target` is the f32
@@ -1185,7 +1226,7 @@ fn normal_tri(v1: Vec3, v2: Vec3, v3: Vec3) -> Vec3 {
 }
 
 /// Blender's `interp_weights_tri_v3`: barycentric weights of `co` in the triangle.
-fn tri_weights(v1: Vec3, v2: Vec3, v3: Vec3, co: Vec3) -> [f32; 3] {
+pub(crate) fn tri_weights(v1: Vec3, v2: Vec3, v3: Vec3, co: Vec3) -> [f32; 3] {
     let normal = normal_tri(v1, v2, v3);
     let (x, y, z) = (normal.x.abs(), normal.y.abs(), normal.z.abs());
     let (i, j): (usize, usize) = if z >= x && z >= y {

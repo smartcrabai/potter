@@ -238,7 +238,18 @@ pub(super) fn apply(
         if scope == Some("shared") && edited_data.contains(&data_id) {
             continue;
         }
-        let (data_changed, had_descriptor, mapping, dropped) = {
+        if name == "mesh.remesh" {
+            let voxel_size = args
+                .get("voxel_size")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| {
+                    PotError::new(ErrorCode::InvalidOperation, "voxel_size must be a number")
+                })?;
+            changed |= remesh_data_block(engine, &data_id, voxel_size)?;
+            edited_data.push(data_id);
+            continue;
+        }
+        let (data_changed, had_descriptor, mapping) = {
             let data = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::TargetNotFound,
@@ -254,24 +265,6 @@ pub(super) fn apply(
                 )
             })?;
             let had_descriptor = data.descriptor.is_some();
-            let dropped = if name == "mesh.remesh" {
-                // Vertex-group weights are the mesh's `vertex_groups` attribute, and the group definitions are
-                // on the data block; a remesh replaces every vertex, so both are dropped and reported.
-                let mut dropped = mesh
-                    .attributes
-                    .keys()
-                    .filter(|key| key.as_str() != "shade_smooth")
-                    .cloned()
-                    .collect::<Vec<String>>();
-                if !data.vertex_groups.is_empty()
-                    && !dropped.iter().any(|key| key == "vertex_groups")
-                {
-                    dropped.push("vertex_groups".to_owned());
-                }
-                dropped
-            } else {
-                Vec::new()
-            };
             let mut edited = mesh.clone();
             let mapping =
                 edit::apply_with_source(&mut edited, mesh, name, &Value::Object(args.clone()))?;
@@ -279,16 +272,9 @@ pub(super) fn apply(
             if changed {
                 *mesh = edited;
                 data.descriptor = None;
-                if name == "mesh.remesh" {
-                    data.vertex_groups.clear();
-                    data.vertex_weights.clear();
-                }
             }
-            (changed, had_descriptor, mapping, dropped)
+            (changed, had_descriptor, mapping)
         };
-        if !dropped.is_empty() {
-            record_remesh_loss(engine, &data_id, &dropped)?;
-        }
         if data_changed {
             engine.mark("data_blocks", &data_id, ChangeKind::Updated);
             super::clear_primitive_metadata(engine, &data_id);
@@ -348,6 +334,62 @@ fn record_remesh_loss(engine: &mut Engine<'_>, data_id: &Id, dropped: &[String])
         },
     );
     Ok(())
+}
+
+/// Blender's voxel remesh of one data block (`object.voxel_remesh`). The `mesh.remesh` operator and the
+/// sculpt `remesh_voxel` operator share it. The new mesh replaces the block's mesh; its vertex-group weights
+/// and UV layers are reprojected; the mesh attributes that are not carried are reported as a loss. The block
+/// always changes, because every element is replaced.
+pub(super) fn remesh_data_block(
+    engine: &mut Engine<'_>,
+    data_id: &Id,
+    voxel_size: f64,
+) -> Result<bool> {
+    let (had_descriptor, result) = {
+        let data = engine.doc.data_blocks.get_mut(data_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                format!("data block `{data_id}` was not found"),
+                json!({"data_id":data_id}),
+            )
+        })?;
+        let mesh = data.mesh.as_mut().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidOperation,
+                format!("data block `{data_id}` has no mesh payload"),
+                json!({"data_id":data_id}),
+            )
+        })?;
+        let groups: Vec<Id> = data
+            .vertex_groups
+            .iter()
+            .map(|group| group.id.clone())
+            .collect();
+        let had_descriptor = data.descriptor.is_some();
+        // The weights move out so the remesh can replace them; they are restored on every path.
+        let mut weights = std::mem::take(&mut data.vertex_weights);
+        let result = edit::voxel_remesh(mesh, &groups, &mut weights, voxel_size);
+        data.vertex_weights = weights;
+        let result = result?;
+        data.descriptor = None;
+        (had_descriptor, result)
+    };
+    if !result.dropped.is_empty() {
+        record_remesh_loss(engine, data_id, &result.dropped)?;
+    }
+    engine.mark("data_blocks", data_id, ChangeKind::Updated);
+    super::clear_primitive_metadata(engine, data_id);
+    if had_descriptor {
+        engine
+            .id_mappings
+            .entry("mesh_descriptor_dropped".to_owned())
+            .or_insert_with(|| json!({}))[data_id.as_str()] = Value::Bool(true);
+    }
+    engine
+        .id_mappings
+        .entry("mesh_elements".to_owned())
+        .or_insert_with(|| json!({}))[data_id.as_str()] = result.mapping;
+    Ok(true)
 }
 
 fn split_target(engine: &Engine<'_>, value: Option<&Value>) -> Result<(Value, Option<Value>)> {

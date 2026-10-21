@@ -160,6 +160,9 @@ fn corpus_transform(raw: &Value) -> TestResult<Transform> {
         translation: vector(raw, "translation")?,
         rotation,
         scale: vector(raw, "scale")?,
+        // The Blender corpus objects are XYZ Euler, so the f32 replica builds their matrix with the Euler
+        // formula as Blender does, not from the quaternion (the model's default `quaternion` mode).
+        rotation_mode: "XYZ".to_owned(),
         ..Transform::default()
     })
 }

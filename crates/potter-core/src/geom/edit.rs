@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use glam::{DQuat, DVec2, DVec3};
+use glam::{DQuat, DVec2, DVec3, Vec3};
 use serde_json::{Map, Value, json};
 
 use crate::geom::modifiers::multires::{self, MultiresGridData};
@@ -12,9 +12,11 @@ use crate::{
         clnor::{self, NormalCodeOptions, SetterInput},
         color_layers::{self, ColorDomain, ColorLayer},
         edge_key,
+        remesh::{Sample, SourceSampler, face_center, mix3},
         triangulate::{NgonMethod, QuadMethod, triangulate_mesh},
         uv_layers::{self, UvLayer, UvStore},
     },
+    model::Id,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6934,47 +6936,227 @@ fn apply_symmetrize(
     Ok(changes)
 }
 
+/// Vertex-group weights keyed by vertex ID, then group ID, as `DataBlock.vertex_weights` stores them.
+pub(crate) type VertexWeights = BTreeMap<u32, BTreeMap<Id, f64>>;
+
+/// What a voxel remesh reports beyond the new mesh: the element-ID mapping, and the mesh attributes it did
+/// not carry, which the caller reports as a loss.
+pub(crate) struct VoxelRemesh {
+    pub(crate) mapping: Value,
+    pub(crate) dropped: Vec<String>,
+}
+
+/// Blender's voxel remesh (`object_remesh.cc`, `voxel_remesh_exec`) on `mesh`: `BKE_mesh_remesh_voxel` at
+/// adaptivity 0 (the mesh default), the volume reprojection `BKE_shrinkwrap_remesh_target_project` onto the
+/// original mesh, then the attribute reprojection `mesh_remesh_reproject_attributes`. Vertex-group weights
+/// for `groups` and the UV layers are sampled at each new vertex from its nearest source triangle; the
+/// material index and `sharp_face` follow the nearest source face. `mesh` and `weights` are replaced only
+/// when the remesh succeeds.
+pub(crate) fn voxel_remesh(
+    mesh: &mut Mesh,
+    groups: &[Id],
+    weights: &mut VertexWeights,
+    voxel_size: f64,
+) -> Result<VoxelRemesh> {
+    let (changes, dropped) = remesh_in_place(mesh, groups, weights, voxel_size)?;
+    Ok(VoxelRemesh {
+        mapping: json!({"created": changes.to_json(), "deleted": changes.deleted_to_json()}),
+        dropped,
+    })
+}
+
+/// The mesh-only `remesh` operator. It has no data-block vertex groups to reproject, and its dropped
+/// attributes are not reported here; the data-block path (`voxel_remesh`) reports them.
 fn apply_remesh(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
     let voxel_size = number(args, "voxel_size", 0.0)?;
+    let (changes, _) = remesh_in_place(mesh, &[], &mut VertexWeights::new(), voxel_size)?;
+    Ok(changes)
+}
+
+fn remesh_in_place(
+    mesh: &mut Mesh,
+    groups: &[Id],
+    weights: &mut VertexWeights,
+    voxel_size: f64,
+) -> Result<(IdChanges, Vec<String>)> {
     if !voxel_size.is_finite() || voxel_size <= 0.0 {
         return Err(invalid("remesh voxel_size must be positive"));
     }
-    // The voxel-remesh operator runs `BKE_mesh_remesh_voxel` with the mesh's adaptivity, which is 0 by
-    // default (`object_remesh.cc`); the shading is set below from the reprojected `sharp_face`.
     let remeshed = crate::geom::modifiers::remesh_modes::voxel_remesh_mesh(
         mesh,
         voxel_size as f32,
         0.0,
         false,
     )?;
+    // The volume reprojection projects the remeshed vertices onto the original surface, before the
+    // attributes are sampled, as the operator does.
+    let projected =
+        crate::geom::modifiers::shrinkwrap::remesh_target_project(&remeshed, mesh, voxel_size)?;
+    let sampler = SourceSampler::new(mesh)?;
+    let index_of: HashMap<u32, usize> = projected
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let vertex_samples = projected
+        .vertices
+        .iter()
+        .map(|vertex| sampler.nearest(vertex.co.as_vec3()))
+        .collect::<Result<Vec<Sample>>>()?;
+    let face_samples = projected
+        .faces
+        .iter()
+        .map(|face| -> Result<Sample> {
+            let corners = face
+                .vertices
+                .iter()
+                .map(|id| {
+                    index_of
+                        .get(id)
+                        .and_then(|index| projected.vertices.get(*index))
+                        .map(|vertex| vertex.co.as_vec3())
+                        .ok_or_else(|| invalid("remesh output face references a missing vertex"))
+                })
+                .collect::<Result<Vec<Vec3>>>()?;
+            sampler.nearest(face_center(&corners))
+        })
+        .collect::<Result<Vec<Sample>>>()?;
+    let source_sharp = crate::geom::normals::sharp_face_flags(mesh)?;
+
     let mut replacement = Mesh {
         next_id: mesh.next_id,
         ..Mesh::default()
     };
     let mut changes = IdChanges::default();
-    let mut vertex_remap = HashMap::with_capacity(remeshed.vertices.len());
-    for vertex in &remeshed.vertices {
-        let id = insert_vertex(&mut replacement, vertex.co, &mut changes)?;
-        vertex_remap.insert(vertex.id, id);
+    let mut new_ids = Vec::with_capacity(projected.vertices.len());
+    for vertex in &projected.vertices {
+        new_ids.push(insert_vertex(&mut replacement, vertex.co, &mut changes)?);
     }
-    for face in &remeshed.faces {
+    for (face, sample) in projected.faces.iter().zip(&face_samples) {
         let vertices = face
             .vertices
             .iter()
             .map(|id| {
-                vertex_remap
+                index_of
                     .get(id)
+                    .and_then(|index| new_ids.get(*index))
                     .copied()
                     .ok_or_else(|| invalid("remesh output face references a missing vertex"))
             })
-            .collect::<Result<Vec<_>>>()?;
-        insert_face(
-            &mut replacement,
-            vertices,
-            face.material_index,
-            &mut changes,
-        )?;
+            .collect::<Result<Vec<u32>>>()?;
+        // Blender reprojects `material_index` (a face attribute) from the same nearest source face.
+        let material = mesh
+            .faces
+            .get(sample.face)
+            .map_or(face.material_index, |source| source.material_index);
+        insert_face(&mut replacement, vertices, material, &mut changes)?;
     }
+
+    // Vertex-group weights, sampled per new vertex with the nearest triangle's weights (Blender's
+    // `sample_vertex_attributes`; a source vertex outside the group has weight 0).
+    let mut sampled_weights = VertexWeights::new();
+    for group in groups {
+        let source_values: Vec<f64> = mesh
+            .vertices
+            .iter()
+            .map(|vertex| {
+                weights
+                    .get(&vertex.id)
+                    .and_then(|by_group| by_group.get(group))
+                    .copied()
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        for (index, sample) in vertex_samples.iter().enumerate() {
+            let triangle = sampler
+                .triangle(sample.triangle)
+                .ok_or_else(|| invalid("voxel remesh sampled a missing source triangle"))?;
+            let values = triangle
+                .vertices
+                .map(|vertex| source_values.get(vertex).copied().unwrap_or(0.0));
+            let value = mix3(sample.weights, values);
+            if value.abs() > 0.0
+                && let Some(id) = new_ids.get(index)
+            {
+                sampled_weights
+                    .entry(*id)
+                    .or_default()
+                    .insert(group.clone(), value);
+            }
+        }
+    }
+
+    // UV layers, sampled per new vertex from its nearest triangle's corner values and copied to every
+    // corner of that vertex (Blender's `sample_corner_attributes` samples the point domain, then adapts).
+    let mut store = uv_layers::read(mesh);
+    let mut layers = Vec::with_capacity(store.layers.len());
+    for layer in &store.layers {
+        let corner_uv = |face: usize, corner: usize| -> [f64; 2] {
+            layer
+                .faces
+                .get(face)
+                .and_then(Option::as_ref)
+                .and_then(|uv| uv.get(corner))
+                .copied()
+                .unwrap_or([0.0, 0.0])
+        };
+        let vertex_uv = vertex_samples
+            .iter()
+            .map(|sample| -> Result<[f64; 2]> {
+                let triangle = sampler
+                    .triangle(sample.triangle)
+                    .ok_or_else(|| invalid("voxel remesh sampled a missing source triangle"))?;
+                let uv = [0, 1, 2].map(|slot| corner_uv(triangle.face, triangle.corners[slot]));
+                Ok([
+                    mix3(sample.weights, uv.map(|value| value[0])),
+                    mix3(sample.weights, uv.map(|value| value[1])),
+                ])
+            })
+            .collect::<Result<Vec<[f64; 2]>>>()?;
+        let faces: Vec<Option<Vec<[f64; 2]>>> = projected
+            .faces
+            .iter()
+            .map(|face| {
+                let uv: Vec<[f64; 2]> = face
+                    .vertices
+                    .iter()
+                    .map(|id| {
+                        index_of
+                            .get(id)
+                            .and_then(|index| vertex_uv.get(*index))
+                            .copied()
+                            .unwrap_or([0.0, 0.0])
+                    })
+                    .collect();
+                Some(uv)
+            })
+            .collect();
+        layers.push(UvLayer::new(layer.name.clone(), faces));
+    }
+    store.layers = layers;
+
+    // Attributes the reprojection does not carry; `shade_smooth` carries `sharp_face`, and the UV store is
+    // reprojected above.
+    let dropped: Vec<String> = mesh
+        .attributes
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "shade_smooth" | uv_layers::ATTRIBUTE))
+        .cloned()
+        .collect();
+    // Blender keeps `sharp_face` through the reprojection, so an input that had it keeps an attribute (even
+    // all smooth), and an input without it gives smooth faces without one.
+    let sharp_present = source_sharp.is_some();
+    let smooth: Vec<bool> = face_samples
+        .iter()
+        .map(|sample| {
+            !source_sharp
+                .as_ref()
+                .and_then(|flags| flags.get(sample.face))
+                .copied()
+                .unwrap_or(false)
+        })
+        .collect();
     for vertex in &mesh.vertices {
         changes.delete(Domain::Vertex, vertex.id);
     }
@@ -6984,42 +7166,24 @@ fn apply_remesh(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges>
     for face in &mesh.faces {
         changes.delete(Domain::Face, face.id);
     }
-    // Blender reprojects `sharp_face` from the nearest source triangle (`mesh_remesh_reproject_attributes`):
-    // each new face takes the flag of the source face its center is nearest to. The source is still intact here.
-    let reprojected_sharp = match crate::geom::normals::sharp_face_flags(mesh)? {
-        Some(flags) => {
-            let sources = crate::geom::remesh::nearest_source_faces(mesh, &replacement)?;
-            Some(
-                sources
-                    .into_iter()
-                    .map(|source| flags[source])
-                    .collect::<Vec<bool>>(),
-            )
-        }
-        None => None,
-    };
     // Voxel remesh replaces the mesh and drops loop-domain multires data.
+    uv_layers::write(&mut replacement, &store);
     *mesh = replacement;
-    // Blender's `object.voxel_remesh` keeps `sharp_face` through the reprojection, so an input that had it
-    // keeps an attribute (even all smooth) and an input without it gives smooth faces without one.
-    let smooth: Vec<bool> = reprojected_sharp.as_ref().map_or_else(
-        || vec![true; mesh.faces.len()],
-        |sharp| sharp.iter().map(|flag| !flag).collect(),
-    );
     let values = mesh
         .faces
         .iter()
         .zip(&smooth)
-        .map(|(face, smooth)| (format!("f{}", face.id), Value::Bool(*smooth)))
+        .map(|(face, value)| (format!("f{}", face.id), Value::Bool(*value)))
         .collect::<Map<String, Value>>();
     mesh.attributes.insert(
         "shade_smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":values}),
     );
-    if reprojected_sharp.is_some() {
+    if sharp_present {
         crate::geom::normals::record_sharp_face(mesh);
     }
-    Ok(changes)
+    *weights = sampled_weights;
+    Ok((changes, dropped))
 }
 
 /// Apply a topology or element edit to a persistent-ID mesh.
