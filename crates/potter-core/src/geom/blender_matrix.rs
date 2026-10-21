@@ -374,7 +374,7 @@ fn eigen_preciprocal(value: f32) -> f32 {
 /// `Matrix4f::computeInverseWithCheck`, whose float kernel is `Eigen/src/LU/arch/InverseSize4.h`
 /// with NEON packets. `None` when the determinant is zero or not normal, where Blender returns a
 /// zero matrix. The x86 Blender build uses Eigen's SSE packets, whose reciprocal is not replicated.
-fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
+pub(crate) fn blender_invert_m4(matrix: &BlenderMat4) -> Option<BlenderMat4> {
     // Eigen's columns are Blender's `matrix[c]`; the 2x2 blocks are `[A B; C D]`.
     let a = movelh(matrix[0], matrix[1]);
     let b = movehl(matrix[1], matrix[0]);

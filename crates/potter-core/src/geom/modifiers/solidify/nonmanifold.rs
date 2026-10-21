@@ -2439,6 +2439,7 @@ pub(super) fn solidify_nonmanifold(
         .collect();
     let origin = Origin {
         vertices: vertex_origins,
+        source_vertices: None,
         faces: out_faces.iter().map(|face| Some(face.face)).collect(),
         corners: Some(
             corner_sources

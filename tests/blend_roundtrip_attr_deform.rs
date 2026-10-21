@@ -1,7 +1,6 @@
 #![recursion_limit = "512"]
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     reason = "Blender adapter fixtures use fixed valid paths and values"
 )]
 
@@ -14,12 +13,6 @@ use tempfile::tempdir;
 mod blender_checked;
 #[path = "common/blender_script_guarded.rs"]
 mod blender_script_guarded;
-#[path = "common/exchange_normals.rs"]
-#[expect(
-    dead_code,
-    reason = "this test binary uses only the quantized normal tolerance from the shared helper"
-)]
-mod exchange_normals;
 #[path = "common/process.rs"]
 mod process;
 
@@ -42,338 +35,6 @@ fn pot_json(arguments: &[&str]) -> Result<Value, Box<dyn Error>> {
     })
 }
 
-const ATTRIBUTE_FIXTURE: &str = r"
-import bpy, json, math, os, sys
-root = sys.argv[-1]
-bpy.ops.object.select_all(action='SELECT')
-bpy.ops.object.delete(use_global=False)
-
-def make_mesh(name, offset=0.0, uv_shift=(0.0, 0.0)):
-    points = []
-    for y in range(4):
-        for x in range(4):
-            px = float(x) - 1.5
-            py = float(y) - 1.5
-            pz = 0.12 * math.sin(px * 1.3) * math.cos(py * 0.8) + offset
-            points.append((px, py, pz))
-    faces = []
-    for y in range(3):
-        for x in range(3):
-            i = y * 4 + x
-            faces.append((i, i + 1, i + 5, i + 4))
-    mesh = bpy.data.meshes.new(name + 'Mesh')
-    mesh.from_pydata(points, [], faces)
-    mesh.update()
-    uv = mesh.uv_layers.new(name='UVMap')
-    for poly in mesh.polygons:
-        for loop_index in poly.loop_indices:
-            vertex = mesh.vertices[mesh.loops[loop_index].vertex_index]
-            uv.data[loop_index].uv = (0.15 * vertex.co.x + 0.5 + uv_shift[0],
-                                      0.15 * vertex.co.y + 0.5 + uv_shift[1])
-    return mesh
-
-def owner(name, offset=0.0, uv_shift=(0.0, 0.0)):
-    obj = bpy.data.objects.new(name, make_mesh(name, offset, uv_shift))
-    bpy.context.scene.collection.objects.link(obj)
-    return obj
-def quad_owner(name):
-    mesh = bpy.data.meshes.new(name + 'Mesh')
-    mesh.from_pydata([(0,0,0),(1,0,0),(1,1,0),(0,1,0)],[],[(0,1,2,3)])
-    mesh.update()
-    uv = mesh.uv_layers.new(name='UVMap')
-    for loop in mesh.loops:
-        uv.data[loop.index].uv = [(0,0),(1,0),(1,1),(0,1)][loop.vertex_index]
-    obj = bpy.data.objects.new(name, mesh)
-    bpy.context.scene.collection.objects.link(obj)
-    return obj
-
-def groups(obj, first='Weight', second='WeightB', bias=0.0):
-    a = obj.vertex_groups.new(name=first)
-    b = obj.vertex_groups.new(name=second)
-    for index, vertex in enumerate(obj.data.vertices):
-        a.add([index], max(0.05, min(0.95, 0.08 + index * 0.055 + bias)), 'REPLACE')
-        b.add([index], max(0.05, min(0.95, 0.85 - index * 0.04 - bias)), 'REPLACE')
-
-obj = owner('OwnerWeightEdit')
-groups(obj)
-mod = obj.modifiers.new('WeightEdit', 'VERTEX_WEIGHT_EDIT')
-mod.vertex_group = 'Weight'
-mod.mask_vertex_group = 'WeightB'
-mod.falloff_type = 'SMOOTH'
-mod.use_add = True
-mod.default_weight = 0.42
-mod.add_threshold = 0.01
-mod.use_remove = False
-mod.normalize = False
-
-obj = owner('OwnerWeightMix')
-groups(obj)
-mod = obj.modifiers.new('WeightMix', 'VERTEX_WEIGHT_MIX')
-mod.vertex_group_a = 'Weight'
-mod.vertex_group_b = 'WeightB'
-mod.mix_mode = 'MUL'
-mod.mix_set = 'ALL'
-mod.default_weight_a = 0.17
-mod.default_weight_b = 0.29
-mod.mask_vertex_group = 'WeightB'
-mod.normalize = False
-
-obj = owner('OwnerWeightProximity')
-groups(obj)
-target = bpy.data.objects.new('ProximityTarget', make_mesh('ProximityTarget', 0.75))
-bpy.context.scene.collection.objects.link(target)
-mod = obj.modifiers.new('WeightProximity', 'VERTEX_WEIGHT_PROXIMITY')
-mod.vertex_group = 'Weight'
-mod.target = target
-mod.proximity_mode = 'GEOMETRY'
-mod.proximity_geometry = {'FACE'}
-mod.min_dist = 0.15
-mod.max_dist = 2.4
-mod.falloff_type = 'LINEAR'
-mod.mask_vertex_group = 'WeightB'
-
-weighted_vertices = [(0,0,0),(4,0,0),(0,1,0),(0,0,3),(-2,0,0)]
-weighted_faces = [(0,1,2),(0,2,3),(0,3,4)]
-weighted_mesh = bpy.data.meshes.new('OwnerWeightedNormalMesh')
-weighted_mesh.from_pydata(weighted_vertices,[],weighted_faces)
-weighted_mesh.update()
-obj = bpy.data.objects.new('OwnerWeightedNormal',weighted_mesh)
-bpy.context.scene.collection.objects.link(obj)
-for index, polygon in enumerate(obj.data.polygons):
-    polygon.use_smooth = True
-    polygon.material_index = 1 if index == 2 else 0
-groups(obj)
-mod = obj.modifiers.new('WeightedNormal', 'WEIGHTED_NORMAL')
-mod.mode = 'FACE_AREA'
-mod.weight = 50
-mod.keep_sharp = False
-mod.use_face_influence = False
-
-obj = quad_owner('OwnerNormalEdit')
-groups(obj)
-target = bpy.data.objects.new('NormalTarget', None)
-bpy.context.scene.collection.objects.link(target)
-target.location = (2.0, -1.0, 0.0)
-mod = obj.modifiers.new('NormalEdit', 'NORMAL_EDIT')
-mod.mode = 'DIRECTIONAL'
-mod.target = target
-mod.offset = (0.5, 0.1, 0.0)
-mod.mix_mode = 'ADD'
-mod.mix_factor = 0.65
-mod.mix_limit = math.pi
-mod.use_direction_parallel = True
-
-obj = owner('OwnerUVProject')
-groups(obj)
-obj.location = (0.2, -0.3, 0.15)
-obj.rotation_euler = (0.03, -0.04, 0.15)
-obj.scale = (1.1, 0.9, 1.0)
-camera_data = bpy.data.cameras.new('ProjectorCameraData')
-camera = bpy.data.objects.new('ProjectorCamera', camera_data)
-bpy.context.scene.collection.objects.link(camera)
-camera.location = (0.1, -0.1, 8.0)
-camera.rotation_euler = (0.01, -0.02, 0.0)
-camera_data.type = 'ORTHO'
-camera_data.ortho_scale = 5.0
-camera_data.sensor_fit = 'VERTICAL'
-camera_data.shift_x = 0.07
-camera_data.shift_y = -0.03
-side_camera_data = bpy.data.cameras.new('ProjectorCameraSideData')
-side_camera_data.type = 'ORTHO'
-side_camera = bpy.data.objects.new('ProjectorCameraSide', side_camera_data)
-bpy.context.scene.collection.objects.link(side_camera)
-side_camera.location = (8.0, 0.0, 0.0)
-side_camera.rotation_euler = (0.0, math.pi / 2.0, 0.0)
-mod = obj.modifiers.new('UVProject', 'UV_PROJECT')
-mod.projectors[0].object = camera
-mod.projector_count = 2
-mod.projectors[1].object = side_camera
-mod.aspect_x = 1.4
-mod.aspect_y = 1.1
-mod.scale_x = 1.25
-mod.scale_y = 0.85
-mod.uv_layer = 'UVMap'
-
-obj = owner('OwnerUVWarp')
-groups(obj)
-from_obj = bpy.data.objects.new('WarpFrom', None)
-to_obj = bpy.data.objects.new('WarpTo', None)
-bpy.context.scene.collection.objects.link(from_obj)
-bpy.context.scene.collection.objects.link(to_obj)
-from_obj.location = (-0.4, 0.2, 0.1)
-to_obj.location = (0.7, -0.25, 0.35)
-mod = obj.modifiers.new('UVWarp', 'UV_WARP')
-mod.object_from = from_obj
-mod.object_to = to_obj
-mod.uv_layer = 'UVMap'
-mod.center = (0.35, 0.65)
-mod.offset = (0.12, -0.08)
-mod.scale = (1.2, 0.75)
-mod.rotation = 0.23
-mod.axis_u = 'X'
-mod.axis_v = 'Y'
-mod.vertex_group = 'Weight'
-
-obj = owner('OwnerDataTransfer')
-groups(obj)
-target = owner('DataTransferTarget', 0.2, (0.33, -0.21))
-groups(target, 'Weight', 'WeightB', 0.18)
-mod = obj.modifiers.new('DataTransfer', 'DATA_TRANSFER')
-mod.object = target
-mod.use_object_transform = False
-mod.use_vert_data = True
-mod.data_types_verts = {'VGROUP_WEIGHTS'}
-mod.use_loop_data = True
-mod.data_types_loops = {'UV'}
-mod.vert_mapping = 'TOPOLOGY'
-mod.loop_mapping = 'TOPOLOGY'
-mod.mix_mode = 'REPLACE'
-mod.mix_factor = 1.0
-mod.layers_uv_select_src = 'ALL'
-mod.layers_uv_select_dst = 'NAME'
-mod.vertex_group = 'Weight'
-
-bpy.context.view_layer.update()
-
-def plain(value):
-    if isinstance(value, bpy.types.ID):
-        return value.name_full
-    if hasattr(value, 'to_list'):
-        return value.to_list()
-    if hasattr(value, 'to_tuple'):
-        return [plain(item) for item in value.to_tuple()]
-    if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
-        try: return [plain(item) for item in value]
-        except Exception: pass
-    if isinstance(value, (bool, int, float, str)) or value is None:
-        return value
-    return str(value)
-
-PARAMS = {
-    'OwnerWeightEdit': ['vertex_group','mask_vertex_group','falloff_type','use_add','default_weight','add_threshold','use_remove','normalize'],
-    'OwnerWeightMix': ['vertex_group_a','vertex_group_b','mask_vertex_group','mix_mode','mix_set','default_weight_a','default_weight_b','normalize'],
-    'OwnerWeightProximity': ['vertex_group','mask_vertex_group','target','proximity_mode','proximity_geometry','min_dist','max_dist','falloff_type'],
-    'OwnerWeightedNormal': ['mode','weight','keep_sharp','use_face_influence','vertex_group'],
-'OwnerNormalEdit': ['mode','target','offset','mix_mode','mix_factor','mix_limit','use_direction_parallel','vertex_group'],
-    'OwnerUVProject': ['aspect_x','aspect_y','scale_x','scale_y','uv_layer'],
-'OwnerUVWarp': ['object_from','object_to','uv_layer','center','offset','scale','rotation','axis_u','axis_v','vertex_group'],
-'OwnerDataTransfer': ['object','use_object_transform','use_vert_data','data_types_verts','use_loop_data','data_types_loops','vert_mapping','loop_mapping','mix_mode','mix_factor','layers_uv_select_src','layers_uv_select_dst','vertex_group'],
-}
-
-def summarize(name):
-    obj = bpy.data.objects[name]
-    dg = bpy.context.evaluated_depsgraph_get()
-    evaluated = obj.evaluated_get(dg)
-    mesh = evaluated.to_mesh()
-    try:
-        modifier = obj.modifiers[0]
-        params = {key: plain(getattr(modifier, key)) for key in PARAMS[name]}
-        if name == 'OwnerUVProject':
-            params['projectors'] = [plain(slot.object) for slot in modifier.projectors if slot.object]
-        groups = {}
-        for group_name in ('Weight', 'WeightB'):
-            group = evaluated.vertex_groups.get(group_name)
-            if group:
-                values = []
-                for vertex in mesh.vertices:
-                    try: values.append(float(group.weight(vertex.index)))
-                    except RuntimeError: values.append(0.0)
-                groups[group_name] = values
-        uv = {}
-        for layer in mesh.uv_layers:
-            uv[layer.name] = [list(item.uv) for item in layer.data]
-        normals = [list(corner.vector) for corner in mesh.corner_normals]
-        return {'type': modifier.type, 'params': params,
-                'positions': [list(vertex.co) for vertex in mesh.vertices],
-                'faces': [list(poly.vertices) for poly in mesh.polygons],
-                'uv': uv, 'normals': normals, 'groups': groups}
-    finally:
-        evaluated.to_mesh_clear()
-
-names = list(PARAMS)
-with open(os.path.join(root, 'attribute_before.json'), 'w', encoding='utf-8') as output:
-    json.dump({name: summarize(name) for name in names}, output)
-bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'attribute_source.blend'))
-";
-
-const ATTRIBUTE_REOPEN: &str = r"
-import bpy, json, sys
-output_path = sys.argv[-1]
-PARAMS = {
-    'OwnerWeightEdit': ['vertex_group','mask_vertex_group','falloff_type','use_add','default_weight','add_threshold','use_remove','normalize'],
-    'OwnerWeightMix': ['vertex_group_a','vertex_group_b','mask_vertex_group','mix_mode','mix_set','default_weight_a','default_weight_b','normalize'],
-    'OwnerWeightProximity': ['vertex_group','mask_vertex_group','target','proximity_mode','proximity_geometry','min_dist','max_dist','falloff_type'],
-    'OwnerWeightedNormal': ['mode','weight','keep_sharp','use_face_influence','vertex_group'],
-'OwnerNormalEdit': ['mode','target','offset','mix_mode','mix_factor','mix_limit','use_direction_parallel','vertex_group'],
-    'OwnerUVProject': ['aspect_x','aspect_y','scale_x','scale_y','uv_layer'],
-'OwnerUVWarp': ['object_from','object_to','uv_layer','center','offset','scale','rotation','axis_u','axis_v','vertex_group'],
-'OwnerDataTransfer': ['object','use_object_transform','use_vert_data','data_types_verts','use_loop_data','data_types_loops','vert_mapping','loop_mapping','mix_mode','mix_factor','layers_uv_select_src','layers_uv_select_dst','vertex_group'],
-}
-def plain(value):
-    if isinstance(value, bpy.types.ID): return value.name_full
-    if hasattr(value, 'to_list'): return value.to_list()
-    if hasattr(value, 'to_tuple'): return [plain(item) for item in value.to_tuple()]
-    if hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
-        try: return [plain(item) for item in value]
-        except Exception: pass
-    if isinstance(value, (bool, int, float, str)) or value is None: return value
-    return str(value)
-def summarize(name):
-    obj = bpy.data.objects[name]
-    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
-    mesh = evaluated.to_mesh()
-    try:
-        modifier = obj.modifiers[0]
-        params = {key: plain(getattr(modifier, key)) for key in PARAMS[name]}
-        if name == 'OwnerUVProject':
-            params['projectors'] = [plain(slot.object) for slot in modifier.projectors if slot.object]
-        groups = {}
-        for group_name in ('Weight', 'WeightB'):
-            group = evaluated.vertex_groups.get(group_name)
-            if group:
-                values = []
-                for vertex in mesh.vertices:
-                    try: values.append(float(group.weight(vertex.index)))
-                    except RuntimeError: values.append(0.0)
-                groups[group_name] = values
-        uv = {layer.name:[list(item.uv) for item in layer.data] for layer in mesh.uv_layers}
-        normals = [list(corner.vector) for corner in mesh.corner_normals]
-        return {'type': modifier.type, 'params': params,
-                'positions':[list(vertex.co) for vertex in mesh.vertices],
-                'faces':[list(poly.vertices) for poly in mesh.polygons],
-                'uv':uv, 'normals':normals, 'groups':groups}
-    finally:
-        evaluated.to_mesh_clear()
-with open(output_path, 'w', encoding='utf-8') as output:
-    json.dump({name:summarize(name) for name in PARAMS}, output)
-";
-
-const NORMAL_QUANTIZATION: &str = r"
-import bpy, json, os, sys
-root = sys.argv[-1]
-with open(os.path.join(root, 'normal_quantization_input.json'), encoding='utf-8') as stream:
-    data = json.load(stream)
-mesh = bpy.data.meshes.new('NormalQuantization')
-mesh.from_pydata(data['vertices'], [], data['faces'])
-mesh.update()
-for index, polygon in enumerate(mesh.polygons):
-    polygon.use_smooth = True
-    polygon.material_index = data['materials'][index]
-sharp_edges = {tuple(sorted(edge)) for edge in data['sharp_edges']}
-for edge in mesh.edges:
-    edge.use_edge_sharp = tuple(sorted(edge.vertices)) in sharp_edges
-mesh.update()
-mesh.normals_split_custom_set(data['normals'])
-obj = bpy.data.objects.new('NormalQuantization', mesh)
-bpy.context.collection.objects.link(obj)
-evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
-evaluated_mesh = evaluated.to_mesh()
-normals = [list(loop.normal) for loop in evaluated_mesh.loops]
-evaluated.to_mesh_clear()
-with open(os.path.join(root, 'normal_quantization_output.json'), 'w', encoding='utf-8') as stream:
-    json.dump(normals, stream)
-";
-
 fn as_points(values: &[Value]) -> Vec<DVec3> {
     values
         .iter()
@@ -386,6 +47,156 @@ fn as_points(values: &[Value]) -> Vec<DVec3> {
         })
         .collect()
 }
+
+fn assert_nearest_vertices(
+    actual: &[Value],
+    expected: &[Value],
+    context: &str,
+    tolerance: f64,
+) -> f64 {
+    let actual = as_points(actual);
+    let mut unmatched = as_points(expected);
+    let bounds = |points: &[DVec3]| {
+        points.iter().fold(
+            (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
+            |(minimum, maximum), point| (minimum.min(*point), maximum.max(*point)),
+        )
+    };
+    let (actual_minimum, actual_maximum) = bounds(&actual);
+    let (expected_minimum, expected_maximum) = bounds(&unmatched);
+    let mut maximum_error = 0.0_f64;
+    let mut worst_actual = DVec3::ZERO;
+    let mut worst_expected = DVec3::ZERO;
+    for point in actual {
+        let (nearest_index, nearest_distance) = unmatched
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (index, point.distance(*candidate)))
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .unwrap();
+        let nearest = unmatched.swap_remove(nearest_index);
+        if nearest_distance > maximum_error {
+            maximum_error = nearest_distance;
+            worst_actual = point;
+            worst_expected = nearest;
+        }
+    }
+    assert!(
+        maximum_error <= tolerance,
+        "{context}: nearest-matched vertex error {maximum_error} exceeds {tolerance}; \
+         actual {worst_actual:?} in {actual_minimum:?}..{actual_maximum:?}, \
+         nearest expected {worst_expected:?} in {expected_minimum:?}..{expected_maximum:?}"
+    );
+    eprintln!("{context}: max vertex error={maximum_error:.9e}");
+    maximum_error
+}
+
+fn assert_vertex_motion(before: &[Value], after: &[Value], context: &str, minimum: f64) {
+    let before = as_points(before);
+    let after = as_points(after);
+    assert_eq!(before.len(), after.len(), "{context}: vertex count");
+    let maximum_motion = before
+        .iter()
+        .zip(&after)
+        .map(|(before, after)| before.distance(*after))
+        .fold(0.0_f64, f64::max);
+    assert!(
+        maximum_motion > minimum,
+        "{context}: maximum vertex motion {maximum_motion} did not exceed {minimum}"
+    );
+}
+
+const REMESH_OCEAN_FIXTURE: &str = r"
+import bpy, json, math, os, sys
+root = sys.argv[-1]
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete(use_global=False)
+positions = []
+polygons = []
+def append_sphere(segments, rings, radius, center, indent):
+    start = len(positions)
+    local = [(0.0, 0.0, radius)]
+    for ring in range(1, rings):
+        latitude = math.pi * ring / rings
+        radial = radius * math.sin(latitude)
+        z = radius * math.cos(latitude)
+        for segment in range(segments):
+            longitude = 2.0 * math.pi * segment / segments
+            local.append((radial * math.cos(longitude), radial * math.sin(longitude), z))
+    bottom = len(local)
+    local.append((0.0, 0.0, -radius))
+    def ring_id(ring, segment):
+        return start + 1 + ring * segments + segment % segments
+    for segment in range(segments):
+        polygons.append((start, ring_id(0, segment), ring_id(0, segment+1)))
+    for ring in range(rings-2):
+        for segment in range(segments):
+            polygons.append((ring_id(ring, segment), ring_id(ring+1, segment),
+                             ring_id(ring+1, segment+1), ring_id(ring, segment+1)))
+    for segment in range(segments):
+        polygons.append((ring_id(rings-2, segment), start+bottom,
+                         ring_id(rings-2, segment+1)))
+    for x, y, z in local:
+        if indent and x > 1.0 and abs(y) < 0.65 and abs(z) < 0.65:
+            x, y, z = 0.4*x, 0.4*y, 0.4*z
+        positions.append((x+center[0], y+center[1], z+center[2]))
+append_sphere(16, 12, 1.5, (0.0, 0.0, 0.0), True)
+append_sphere(12, 8, 0.4, (2.6, 0.1, 0.15), False)
+mesh = bpy.data.meshes.new('RemeshInput')
+mesh.from_pydata(positions, [], polygons)
+mesh.update()
+source = bpy.data.objects.new('RemeshSource', mesh)
+bpy.context.scene.collection.objects.link(source)
+def snapshot(obj):
+    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    result = evaluated.to_mesh()
+    try:
+        return {'positions':[list(vertex.co) for vertex in result.vertices],
+                'polygons':[list(poly.vertices) for poly in result.polygons],
+                'faces':len(result.polygons)}
+    finally:
+        evaluated.to_mesh_clear()
+results = {}
+for mode in ('VOXEL','BLOCKS','SMOOTH','SHARP'):
+    obj = bpy.data.objects.new('OwnerRemesh'+mode, mesh.copy())
+    bpy.context.scene.collection.objects.link(obj)
+    modifier = obj.modifiers.new('Remesh', 'REMESH')
+    modifier.mode = mode
+    modifier.use_remove_disconnected = mode != 'VOXEL'
+    modifier.threshold = 0.15
+    if mode == 'VOXEL':
+        modifier.voxel_size = 0.3
+        modifier.adaptivity = 0.0
+    else:
+        modifier.octree_depth = 4
+        modifier.scale = 0.9
+        modifier.sharpness = 1.0
+    results['Remesh'+mode] = snapshot(obj)
+# Generated Ocean geometry exercises the spectral deformation and emitted topology.
+bpy.ops.mesh.primitive_grid_add(x_subdivisions=5, y_subdivisions=5, size=4.0, location=(0,0,0))
+ocean_owner = bpy.context.object
+ocean_owner.name = 'OwnerOcean'
+ocean = ocean_owner.modifiers.new('Ocean', 'OCEAN')
+ocean.geometry_mode = 'GENERATE'
+ocean.resolution = 5
+ocean.viewport_resolution = 5
+ocean.spatial_size = 16
+ocean.wave_scale = 0.8
+ocean.wave_scale_min = 0.15
+ocean.choppiness = 1.25
+ocean.wind_velocity = 18.0
+ocean.random_seed = 17
+ocean.wave_alignment = 0.35
+ocean.wave_direction = 0.6
+ocean.time = 2.25
+ocean.use_foam = True
+ocean.foam_layer_name = 'Foam'
+bpy.context.view_layer.update()
+results['Ocean'] = snapshot(ocean_owner)
+with open(os.path.join(root,'remesh_ocean_before.json'),'w',encoding='utf-8') as output:
+    json.dump(results,output)
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root,'remesh_ocean_source.blend'))
+";
 
 fn match_vertex_positions(
     actual: &[DVec3],
@@ -485,49 +296,6 @@ fn match_vertex_positions(
     (actual_to_expected, maximum_error)
 }
 
-fn assert_nearest_vertices(
-    actual: &[Value],
-    expected: &[Value],
-    context: &str,
-    tolerance: f64,
-) -> f64 {
-    let actual = as_points(actual);
-    let mut unmatched = as_points(expected);
-    let bounds = |points: &[DVec3]| {
-        points.iter().fold(
-            (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
-            |(minimum, maximum), point| (minimum.min(*point), maximum.max(*point)),
-        )
-    };
-    let (actual_minimum, actual_maximum) = bounds(&actual);
-    let (expected_minimum, expected_maximum) = bounds(&unmatched);
-    let mut maximum_error = 0.0_f64;
-    let mut worst_actual = DVec3::ZERO;
-    let mut worst_expected = DVec3::ZERO;
-    for point in actual {
-        let (nearest_index, nearest_distance) = unmatched
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| (index, point.distance(*candidate)))
-            .min_by(|left, right| left.1.total_cmp(&right.1))
-            .unwrap();
-        let nearest = unmatched.swap_remove(nearest_index);
-        if nearest_distance > maximum_error {
-            maximum_error = nearest_distance;
-            worst_actual = point;
-            worst_expected = nearest;
-        }
-    }
-    assert!(
-        maximum_error <= tolerance,
-        "{context}: nearest-matched vertex error {maximum_error} exceeds {tolerance}; \
-         actual {worst_actual:?} in {actual_minimum:?}..{actual_maximum:?}, \
-         nearest expected {worst_expected:?} in {expected_minimum:?}..{expected_maximum:?}"
-    );
-    eprintln!("{context}: max vertex error={maximum_error:.9e}");
-    maximum_error
-}
-
 fn assert_ordered_vertices(
     actual: &[Value],
     expected: &[Value],
@@ -550,21 +318,6 @@ fn assert_ordered_vertices(
     );
     eprintln!("{context}: max vertex error={maximum_error:.9e}");
     maximum_error
-}
-
-fn assert_vertex_motion(before: &[Value], after: &[Value], context: &str, minimum: f64) {
-    let before = as_points(before);
-    let after = as_points(after);
-    assert_eq!(before.len(), after.len(), "{context}: vertex count");
-    let maximum_motion = before
-        .iter()
-        .zip(&after)
-        .map(|(before, after)| before.distance(*after))
-        .fold(0.0_f64, f64::max);
-    assert!(
-        maximum_motion > minimum,
-        "{context}: maximum vertex motion {maximum_motion} did not exceed {minimum}"
-    );
 }
 
 fn assert_values(actual: &Value, expected: &Value, context: &str, tolerance: f64) {
@@ -595,566 +348,6 @@ fn assert_values(actual: &Value, expected: &Value, context: &str, tolerance: f64
         _ => assert_eq!(actual, expected, "{context}"),
     }
 }
-
-fn assert_flat_float_arrays(actual: &[Value], expected: &[Value], context: &str, tolerance: f64) {
-    assert_eq!(actual.len(), expected.len(), "{context}: value count");
-    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-        assert_values(actual, expected, &format!("{context}[{index}]"), tolerance);
-    }
-}
-
-fn modifier_attribute(mesh: &potter_core::geom::Mesh, group: &str) -> Vec<Value> {
-    let values = mesh
-        .attributes
-        .get("vertex_groups")
-        .and_then(Value::as_object)
-        .and_then(|groups| groups.get(group))
-        .and_then(Value::as_object);
-    mesh.vertices
-        .iter()
-        .map(|vertex| {
-            values
-                .and_then(|values| values.get(&format!("v{}", vertex.id)))
-                .cloned()
-                .unwrap_or_else(|| json!(0.0))
-        })
-        .collect()
-}
-
-/// Corner UVs of `layer` in Blender convention (v up). The store holds v down, so each v is flipped.
-fn modifier_uvs(mesh: &potter_core::geom::Mesh, layer: &str) -> Vec<Value> {
-    let layers = mesh
-        .attributes
-        .get("uv_layers")
-        .and_then(|store| store["layers"].as_array());
-    let entries = layers
-        .into_iter()
-        .flatten()
-        .find(|entry| entry["name"].as_str() == Some(layer))
-        .and_then(|entry| entry["faces"].as_array());
-    let mut result = Vec::new();
-    for face in &mesh.faces {
-        let Some(uv) = entries
-            .into_iter()
-            .flatten()
-            .find(|entry| entry["face_id"].as_u64() == Some(u64::from(face.id)))
-            .and_then(|entry| entry["uv"].as_array())
-        else {
-            continue;
-        };
-        for corner in uv {
-            let v = corner[1].as_f64().expect("stored UV v is a number");
-            result.push(json!([corner[0].clone(), 1.0 - v]));
-        }
-    }
-    result
-}
-
-/// Evaluated per-corner normals as Blender vectors, through the public evaluator. Codes decode on
-/// their fans; the result is empty when the mesh has no custom-normal layer.
-fn modifier_normals(mesh: &potter_core::geom::Mesh) -> Result<Vec<Value>, Box<dyn Error>> {
-    if mesh
-        .attributes
-        .get("custom_normal")
-        .and_then(|attribute| attribute.get("values"))
-        .is_none()
-    {
-        return Ok(Vec::new());
-    }
-    Ok(potter_core::geom::corner_normal_vectors(mesh)?
-        .iter()
-        .map(|normal| json!(normal.to_array()))
-        .collect())
-}
-fn blender_quantize_loop_normals(
-    blender: &Path,
-    root: &Path,
-    mesh: &potter_core::geom::Mesh,
-    normals: &[Value],
-) -> Result<Vec<Value>, Box<dyn Error>> {
-    let vertex_indices = mesh
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect::<HashMap<_, _>>();
-    let vertices = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co.to_array())
-        .collect::<Vec<_>>();
-    let faces = mesh
-        .faces
-        .iter()
-        .map(|face| {
-            face.vertices
-                .iter()
-                .map(|vertex_id| {
-                    vertex_indices
-                        .get(vertex_id)
-                        .copied()
-                        .ok_or("normal quantization face vertex missing")
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let sharp_edges = mesh
-        .edges
-        .iter()
-        .filter(|edge| {
-            mesh.attributes
-                .get("sharp_edges")
-                .and_then(Value::as_array)
-                .is_some_and(|ids| ids.iter().any(|id| id.as_u64() == Some(u64::from(edge.id))))
-        })
-        .map(|edge| {
-            edge.vertices
-                .iter()
-                .map(|vertex_id| {
-                    vertex_indices
-                        .get(vertex_id)
-                        .copied()
-                        .ok_or("normal quantization sharp-edge vertex missing")
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let materials = mesh
-        .faces
-        .iter()
-        .map(|face| face.material_index)
-        .collect::<Vec<_>>();
-    let input = json!({
-        "vertices": vertices,
-        "faces": faces,
-        "materials": materials,
-        "sharp_edges": sharp_edges,
-        "normals": normals,
-    });
-    fs::write(
-        root.join("normal_quantization_input.json"),
-        serde_json::to_vec(&input)?,
-    )?;
-    run_blender_script(
-        blender,
-        "quantize_loop_normals.py",
-        NORMAL_QUANTIZATION,
-        root,
-        &[],
-        "Blender fixture failed",
-        run_guarded,
-    )?;
-    Ok(serde_json::from_slice(&fs::read(
-        root.join("normal_quantization_output.json"),
-    )?)?)
-}
-
-fn assert_attribute_case(
-    blender: &Path,
-    root: &Path,
-    scene: &potter_core::model::SceneDoc,
-    snapshot: &potter_core::eval::Snapshot,
-    mappings: &serde_json::Map<String, Value>,
-    expected: &Value,
-    name: &str,
-) -> Result<(), Box<dyn Error>> {
-    let owner_id = mappings[&format!("Object:{name}")]
-        .as_str()
-        .ok_or("object mapping did not contain a string ID")?;
-    let owner_key = potter_core::model::Id::new(owner_id.to_owned())?;
-    let node = &scene.nodes[&owner_key];
-    let modifier = node
-        .modifiers
-        .first()
-        .ok_or("modifier missing after import")?;
-    let expected_item = &expected[name];
-    let expected_type = expected_item["type"]
-        .as_str()
-        .ok_or("fixture modifier type missing")?;
-    assert_eq!(
-        modifier.modifier_type.to_ascii_uppercase(),
-        expected_type,
-        "{name}"
-    );
-    let evaluated = snapshot
-        .meshes
-        .get(&owner_key)
-        .ok_or("evaluated mesh missing")?;
-    assert_eq!(
-        evaluated.faces.len(),
-        expected_item["faces"].as_array().unwrap().len(),
-        "{name}: face count"
-    );
-    let eval_max_error = assert_nearest_vertices(
-        &evaluated
-            .vertices
-            .iter()
-            .map(|vertex| json!(vertex.co.to_array()))
-            .collect::<Vec<_>>(),
-        expected_item["positions"].as_array().unwrap(),
-        &format!("{name} import evaluation"),
-        1.0e-5,
-    );
-
-    match name {
-        "OwnerWeightEdit" | "OwnerWeightMix" | "OwnerWeightProximity" => {}
-        "OwnerWeightedNormal" | "OwnerNormalEdit" => {
-            let normals = modifier_normals(evaluated)?;
-            let quantized = blender_quantize_loop_normals(blender, root, evaluated, &normals)?;
-            assert_flat_float_arrays(
-                &quantized,
-                expected_item["normals"].as_array().unwrap(),
-                &format!("{name} output loop normals after Blender short2 storage"),
-                exchange_normals::normal_tolerance(true),
-            );
-        }
-        "OwnerUVProject" | "OwnerUVWarp" | "OwnerDataTransfer" => assert_flat_float_arrays(
-            &modifier_uvs(evaluated, "UVMap"),
-            expected_item["uv"]["UVMap"].as_array().unwrap(),
-            &format!("{name} output loop UVs"),
-            1.0e-5,
-        ),
-        _ => return Err(format!("unexpected attribute fixture {name}").into()),
-    }
-    for group in ["Weight", "WeightB"] {
-        assert_flat_float_arrays(
-            &modifier_attribute(evaluated, group),
-            expected_item["groups"][group].as_array().unwrap(),
-            &format!("{name} output vertex group {group}"),
-            1.0e-5,
-        );
-    }
-    let expected_params = &expected_item["params"];
-    for key in [
-        "vertex_group",
-        "vertex_group_a",
-        "vertex_group_b",
-        "mask_vertex_group",
-        "falloff_type",
-        "use_add",
-        "default_weight",
-        "add_threshold",
-        "use_remove",
-        "normalize",
-        "mix_mode",
-        "mix_set",
-        "default_weight_a",
-        "default_weight_b",
-        "proximity_mode",
-        "proximity_geometry",
-        "min_dist",
-        "max_dist",
-        "mode",
-        "weight",
-        "keep_sharp",
-        "use_face_influence",
-        "offset",
-        "mix_factor",
-        "mix_limit",
-        "use_direction_parallel",
-        "aspect_x",
-        "aspect_y",
-        "scale_x",
-        "scale_y",
-        "uv_layer",
-        "center",
-        "scale",
-        "rotation",
-        "axis_u",
-        "axis_v",
-        "use_object_transform",
-        "use_vert_data",
-        "data_types_verts",
-        "use_loop_data",
-        "data_types_loops",
-        "vert_mapping",
-        "loop_mapping",
-        "layers_uv_select_src",
-        "layers_uv_select_dst",
-    ] {
-        if let Some(value) = expected_params.get(key) {
-            if matches!(
-                key,
-                "target" | "object" | "object_from" | "object_to" | "projectors"
-            ) {
-                continue;
-            }
-            let actual = modifier
-                .params
-                .get(key)
-                .ok_or_else(|| format!("{name}.params.{key} is missing after import"))?;
-            assert_values(actual, value, &format!("{name}.params.{key}"), 1.0e-6);
-        }
-    }
-    let reference_names: &[(&str, &str)] = match name {
-        "OwnerWeightProximity" => &[("target", "ProximityTarget")],
-        "OwnerNormalEdit" => &[("target", "NormalTarget")],
-        "OwnerUVWarp" => &[("object_from", "WarpFrom"), ("object_to", "WarpTo")],
-        "OwnerDataTransfer" => &[("object", "DataTransferTarget")],
-        _ => &[],
-    };
-    for (parameter, object_name) in reference_names {
-        let id = mappings[&format!("Object:{object_name}")].as_str().unwrap();
-        assert_eq!(
-            modifier.params[*parameter],
-            json!(id),
-            "{name}.params.{parameter}"
-        );
-    }
-    if name == "OwnerUVProject" {
-        let camera_id = mappings["Object:ProjectorCamera"].as_str().unwrap();
-        let side_camera_id = mappings["Object:ProjectorCameraSide"].as_str().unwrap();
-        assert_eq!(
-            modifier.params["projectors"],
-            json!([camera_id, side_camera_id]),
-            "{name}.params.projectors",
-        );
-    }
-    eprintln!("{name}: import/loss-free params=ok eval_max_error={eval_max_error:.9e}");
-    Ok(())
-}
-
-#[test]
-fn blender_attribute_deformation_modifiers_round_trip_attributes_and_settings()
--> Result<(), Box<dyn Error>> {
-    let Some(blender) = blender_executable() else {
-        eprintln!("Skipping Blender attribute modifier parity: no Blender executable was found");
-        return Ok(());
-    };
-    let directory = tempdir()?;
-    let root = directory.path();
-    run_blender_script(
-        &blender,
-        "make_attribute_fixture.py",
-        ATTRIBUTE_FIXTURE,
-        root,
-        &[],
-        "Blender fixture failed",
-        run_guarded,
-    )?;
-    let before: Value = serde_json::from_slice(&fs::read(root.join("attribute_before.json"))?)?;
-    let project = root.join("attribute_project");
-    pot_json(&["init", project.to_str().unwrap()])?;
-    let imported = pot_json(&[
-        "import",
-        project.to_str().unwrap(),
-        "--file",
-        root.join("attribute_source.blend").to_str().unwrap(),
-        "--format",
-        "blend",
-        "--mode",
-        "replace",
-        "--base-revision",
-        "0",
-        "--blender",
-        blender.to_str().unwrap(),
-    ])?;
-    let losses = imported["result"]["losses"].as_array().unwrap();
-    assert!(
-        losses.is_empty(),
-        "attribute modifier fixture import reported losses: {losses:?}"
-    );
-    let mappings = imported["result"]["id_mappings"].as_object().unwrap();
-    let scene: potter_core::model::SceneDoc =
-        serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    let snapshot = potter_core::eval::Snapshot::evaluate(
-        &scene,
-        &potter_core::eval::EvaluationContext::default(),
-    )?;
-    for name in [
-        "OwnerWeightEdit",
-        "OwnerWeightMix",
-        "OwnerWeightProximity",
-        "OwnerWeightedNormal",
-        "OwnerNormalEdit",
-        "OwnerUVProject",
-        "OwnerUVWarp",
-        "OwnerDataTransfer",
-    ] {
-        assert_attribute_case(&blender, root, &scene, &snapshot, mappings, &before, name)?;
-    }
-
-    let exported = root.join("attribute_roundtrip.blend");
-    pot_json(&[
-        "export",
-        project.to_str().unwrap(),
-        "--format",
-        "blend",
-        "--out",
-        exported.to_str().unwrap(),
-        "--blender",
-        blender.to_str().unwrap(),
-    ])?;
-    let after_path = root.join("attribute_after.json");
-    let reopen_path = root.join("reopen_attribute.py");
-    fs::write(&reopen_path, ATTRIBUTE_REOPEN)?;
-    let mut command = Command::new(&blender);
-    command
-        .args(["--background"])
-        .arg(&exported)
-        .arg("--python")
-        .arg(&reopen_path)
-        .arg("--")
-        .arg(&after_path);
-    let output = run_guarded(command)?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success() && !stdout.contains("Traceback") && !stderr.contains("Traceback"),
-        "Blender attribute reopen failed: stdout={stdout} stderr={stderr}"
-    );
-    let after: Value = serde_json::from_slice(&fs::read(after_path)?)?;
-    for name in [
-        "OwnerWeightEdit",
-        "OwnerWeightMix",
-        "OwnerWeightProximity",
-        "OwnerWeightedNormal",
-        "OwnerNormalEdit",
-        "OwnerUVProject",
-        "OwnerUVWarp",
-        "OwnerDataTransfer",
-    ] {
-        let source = &before[name];
-        let reopened = &after[name];
-        assert_eq!(
-            reopened["type"], source["type"],
-            "{name}: modifier type after export"
-        );
-        for (key, expected) in source["params"].as_object().unwrap() {
-            assert_values(
-                &reopened["params"][key],
-                expected,
-                &format!("{name}.exported.{key}"),
-                1.0e-6,
-            );
-        }
-        assert_eq!(
-            reopened["faces"], source["faces"],
-            "{name}: evaluated face connectivity after export"
-        );
-        let reopened_error = assert_nearest_vertices(
-            reopened["positions"].as_array().unwrap(),
-            source["positions"].as_array().unwrap(),
-            &format!("{name} export/reopen"),
-            1.0e-5,
-        );
-        assert_values(
-            &reopened["uv"],
-            &source["uv"],
-            &format!("{name}: evaluated UV loops after export"),
-            1.0e-5,
-        );
-        assert_values(
-            &reopened["groups"],
-            &source["groups"],
-            &format!("{name}: evaluated weights after export"),
-            1.0e-5,
-        );
-        if matches!(name, "OwnerWeightedNormal" | "OwnerNormalEdit") {
-            assert_values(
-                &reopened["normals"],
-                &source["normals"],
-                &format!("{name}: evaluated loop normals after export"),
-                1.0e-5,
-            );
-        }
-        eprintln!("{name}: export/reopen params/attributes=ok eval_max_error={reopened_error:.9e}");
-    }
-    Ok(())
-}
-
-// Remaining fixture families share the same child-process guard and comparison helpers above.
-const REMESH_OCEAN_FIXTURE: &str = r"
-import bpy, json, math, os, sys
-root = sys.argv[-1]
-bpy.ops.object.select_all(action='SELECT')
-bpy.ops.object.delete(use_global=False)
-positions = []
-polygons = []
-def append_sphere(segments, rings, radius, center, indent):
-    start = len(positions)
-    local = [(0.0, 0.0, radius)]
-    for ring in range(1, rings):
-        latitude = math.pi * ring / rings
-        radial = radius * math.sin(latitude)
-        z = radius * math.cos(latitude)
-        for segment in range(segments):
-            longitude = 2.0 * math.pi * segment / segments
-            local.append((radial * math.cos(longitude), radial * math.sin(longitude), z))
-    bottom = len(local)
-    local.append((0.0, 0.0, -radius))
-    def ring_id(ring, segment):
-        return start + 1 + ring * segments + segment % segments
-    for segment in range(segments):
-        polygons.append((start, ring_id(0, segment), ring_id(0, segment+1)))
-    for ring in range(rings-2):
-        for segment in range(segments):
-            polygons.append((ring_id(ring, segment), ring_id(ring+1, segment),
-                             ring_id(ring+1, segment+1), ring_id(ring, segment+1)))
-    for segment in range(segments):
-        polygons.append((ring_id(rings-2, segment), start+bottom,
-                         ring_id(rings-2, segment+1)))
-    for x, y, z in local:
-        if indent and x > 1.0 and abs(y) < 0.65 and abs(z) < 0.65:
-            x, y, z = 0.4*x, 0.4*y, 0.4*z
-        positions.append((x+center[0], y+center[1], z+center[2]))
-append_sphere(16, 12, 1.5, (0.0, 0.0, 0.0), True)
-append_sphere(12, 8, 0.4, (2.6, 0.1, 0.15), False)
-mesh = bpy.data.meshes.new('RemeshInput')
-mesh.from_pydata(positions, [], polygons)
-mesh.update()
-source = bpy.data.objects.new('RemeshSource', mesh)
-bpy.context.scene.collection.objects.link(source)
-def snapshot(obj):
-    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
-    result = evaluated.to_mesh()
-    try:
-        return {'positions':[list(vertex.co) for vertex in result.vertices],
-                'polygons':[list(poly.vertices) for poly in result.polygons],
-                'faces':len(result.polygons)}
-    finally:
-        evaluated.to_mesh_clear()
-results = {}
-for mode in ('VOXEL','BLOCKS','SMOOTH','SHARP'):
-    obj = bpy.data.objects.new('OwnerRemesh'+mode, mesh.copy())
-    bpy.context.scene.collection.objects.link(obj)
-    modifier = obj.modifiers.new('Remesh', 'REMESH')
-    modifier.mode = mode
-    modifier.use_remove_disconnected = mode != 'VOXEL'
-    modifier.threshold = 0.15
-    if mode == 'VOXEL':
-        modifier.voxel_size = 0.3
-        modifier.adaptivity = 0.0
-    else:
-        modifier.octree_depth = 4
-        modifier.scale = 0.9
-        modifier.sharpness = 1.0
-    results['Remesh'+mode] = snapshot(obj)
-# Generated Ocean geometry exercises the spectral deformation and emitted topology.
-bpy.ops.mesh.primitive_grid_add(x_subdivisions=5, y_subdivisions=5, size=4.0, location=(0,0,0))
-ocean_owner = bpy.context.object
-ocean_owner.name = 'OwnerOcean'
-ocean = ocean_owner.modifiers.new('Ocean', 'OCEAN')
-ocean.geometry_mode = 'GENERATE'
-ocean.resolution = 5
-ocean.viewport_resolution = 5
-ocean.spatial_size = 16
-ocean.wave_scale = 0.8
-ocean.wave_scale_min = 0.15
-ocean.choppiness = 1.25
-ocean.wind_velocity = 18.0
-ocean.random_seed = 17
-ocean.wave_alignment = 0.35
-ocean.wave_direction = 0.6
-ocean.time = 2.25
-ocean.use_foam = True
-ocean.foam_layer_name = 'Foam'
-bpy.context.view_layer.update()
-results['Ocean'] = snapshot(ocean_owner)
-with open(os.path.join(root,'remesh_ocean_before.json'),'w',encoding='utf-8') as output:
-    json.dump(results,output)
-bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root,'remesh_ocean_source.blend'))
-";
 
 fn canonical_polygon_cycles(polygons: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let mut cycles = polygons
@@ -1482,6 +675,7 @@ fn blender_dual_contour_remesh_modes_and_ocean_round_trip_depsgraph_geometry()
     );
     Ok(())
 }
+
 const BOUND_DEFORM_FIXTURE: &str = r"
 import bpy, json, os, sys
 root = sys.argv[-1]
@@ -1929,6 +1123,300 @@ fn blender_native_bound_deform_payloads_follow_deformed_bind_targets_and_anchors
     }
     Ok(())
 }
+
+const CORRECTIVE_BIND_FIXTURE: &str = r"
+import bpy, json, os, sys
+root = sys.argv[-1]
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete(use_global=False)
+def make_grid(name):
+    points = [((x-2)*0.5, (y-2)*0.5, 0.05*x*y) for y in range(5) for x in range(5)]
+    faces = []
+    for y in range(4):
+        for x in range(4):
+            index = y*5+x
+            faces.append((index,index+1,index+6,index+5))
+    mesh = bpy.data.meshes.new(name+'Mesh')
+    mesh.from_pydata(points,[],faces)
+    mesh.update()
+    return mesh
+obj = bpy.data.objects.new('OwnerCorrectiveSmooth', make_grid('OwnerCorrectiveSmooth'))
+bpy.context.scene.collection.objects.link(obj)
+subdivision = obj.modifiers.new('Subdivision','SUBSURF')
+subdivision.levels = 1
+subdivision.render_levels = 1
+modifier = obj.modifiers.new('CorrectiveSmooth','CORRECTIVE_SMOOTH')
+modifier.rest_source = 'BIND'
+modifier.factor = 0.5
+modifier.iterations = 5
+modifier.scale = 1.0
+modifier.smooth_type = 'SIMPLE'
+bpy.ops.object.select_all(action='DESELECT')
+obj.select_set(True)
+bpy.context.view_layer.objects.active = obj
+# Blender binds the modifier input, which is the Subdivision output. Capture that input with the
+# Corrective Smooth hidden, before the bind.
+modifier.show_viewport = False
+bpy.context.view_layer.update()
+evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+input_mesh = evaluated.to_mesh()
+try:
+    bind_coords = [list(vertex.co) for vertex in input_mesh.vertices]
+finally:
+    evaluated.to_mesh_clear()
+if len(bind_coords) == len(obj.data.vertices):
+    raise RuntimeError('subdivision prefix did not change the corrective smooth bind input')
+modifier.show_viewport = True
+bpy.context.view_layer.update()
+with bpy.context.temp_override(object=obj, active_object=obj,
+                               selected_objects=[obj], selected_editable_objects=[obj]):
+    result = bpy.ops.object.correctivesmooth_bind(modifier=modifier.name)
+if 'FINISHED' not in result:
+    raise RuntimeError('corrective smooth bind failed: '+repr(result))
+bpy.context.view_layer.update()
+if not modifier.is_bind:
+    raise RuntimeError('corrective smooth modifier is not bound after the bind operator')
+# Asymmetric base-vertex moves after the bind; the bound rest positions keep the bind-time coordinates.
+moves = {0:(0.0,0.0,0.12), 6:(-0.04,0.08,-0.06), 12:(0.0,0.0,0.25), 18:(0.1,-0.03,0.0)}
+for index, (dx, dy, dz) in moves.items():
+    vertex = obj.data.vertices[index]
+    vertex.co.x += dx
+    vertex.co.y += dy
+    vertex.co.z += dz
+obj.data.update()
+bpy.context.view_layer.update()
+evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+mesh = evaluated.to_mesh()
+try:
+    moved = [list(vertex.co) for vertex in mesh.vertices]
+finally:
+    evaluated.to_mesh_clear()
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root,'corrective_bind_source.blend'))
+with open(os.path.join(root,'corrective_bind_expected.json'),'w',encoding='utf-8') as output:
+    json.dump({'bind_coords':bind_coords,'moved':moved},output)
+";
+
+const CORRECTIVE_BIND_REOPEN: &str = r"
+import bpy, json, sys
+path = sys.argv[-1]
+obj = bpy.data.objects['OwnerCorrectiveSmooth']
+modifier = next(item for item in obj.modifiers if item.type == 'CORRECTIVE_SMOOTH')
+evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+mesh = evaluated.to_mesh()
+try:
+    result = {'type':modifier.type, 'is_bind':bool(modifier.is_bind),
+              'positions':[list(vertex.co) for vertex in mesh.vertices]}
+finally:
+    evaluated.to_mesh_clear()
+with open(path,'w',encoding='utf-8') as output:
+    json.dump(result,output)
+";
+
+fn remove_original_blend_blobs(
+    scene: &potter_core::model::SceneDoc,
+    project: &Path,
+) -> Result<usize, Box<dyn Error>> {
+    let mut removed = 0;
+    for entry in scene.compatibility.values() {
+        let blobs = entry
+            .get("blobs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        for blob in blobs {
+            if blob.get("name").and_then(Value::as_str) != Some("original.blend") {
+                continue;
+            }
+            let path = blob
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("original.blend compatibility blob has no path")?;
+            fs::remove_file(project.join(path))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn export_corrective_bind(
+    blender: &Path,
+    project: &Path,
+    root: &Path,
+    label: &str,
+    moved: &[Value],
+) -> Result<(), Box<dyn Error>> {
+    let exported = root.join(format!("corrective_bind_export_{label}.blend"));
+    pot_json(&[
+        "export",
+        project.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--out",
+        exported.to_str().unwrap(),
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let after_path = root.join(format!("corrective_bind_{label}_after.json"));
+    let reopen_path = root.join("reopen_corrective_bind.py");
+    fs::write(&reopen_path, CORRECTIVE_BIND_REOPEN)?;
+    let mut command = Command::new(blender);
+    command
+        .args(["--background"])
+        .arg(&exported)
+        .arg("--python")
+        .arg(&reopen_path)
+        .arg("--")
+        .arg(&after_path);
+    let output = run_guarded(command)?;
+    assert!(
+        output.status.success(),
+        "Blender corrective smooth reopen ({label}) failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after: Value = serde_json::from_slice(&fs::read(after_path)?)?;
+    assert_eq!(
+        after["type"], "CORRECTIVE_SMOOTH",
+        "{label}: reopened modifier type"
+    );
+    assert_eq!(
+        after["is_bind"], true,
+        "{label}: exported corrective smooth binding state"
+    );
+    assert_ordered_vertices(
+        after["positions"].as_array().unwrap(),
+        moved,
+        &format!("corrective smooth {label} reopened evaluation"),
+        1.0e-4,
+    );
+    Ok(())
+}
+
+#[test]
+fn blender_corrective_smooth_bind_round_trips_bind_coords_and_evaluation()
+-> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("Skipping corrective smooth bind parity: no Blender executable was found");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    run_blender_script(
+        &blender,
+        "make_corrective_bind.py",
+        CORRECTIVE_BIND_FIXTURE,
+        root,
+        &[],
+        "Blender fixture failed",
+        run_guarded,
+    )?;
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("corrective_bind_expected.json"))?)?;
+    assert_eq!(
+        expected["bind_coords"].as_array().unwrap().len(),
+        81,
+        "Blender Subdivision-prefix corrective smooth bind input vertex count"
+    );
+    let moved = expected["moved"].as_array().unwrap();
+    let project = root.join("corrective_bind_project");
+    pot_json(&["init", project.to_str().unwrap()])?;
+    let imported = pot_json(&[
+        "import",
+        project.to_str().unwrap(),
+        "--file",
+        root.join("corrective_bind_source.blend").to_str().unwrap(),
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    assert!(
+        imported["result"]["losses"].as_array().unwrap().is_empty(),
+        "corrective smooth bind import losses: {:?}",
+        imported["result"]["losses"]
+    );
+    let mappings = imported["result"]["id_mappings"].as_object().unwrap();
+    let scene_bytes = fs::read(project.join("scene.json"))?;
+    assert!(
+        !String::from_utf8_lossy(&scene_bytes).contains("<bpy_"),
+        "corrective smooth imported project contains an unnormalized Blender RNA repr",
+    );
+    let scene: potter_core::model::SceneDoc = serde_json::from_slice(&scene_bytes)?;
+    let owner_id = potter_core::model::Id::new(
+        mappings["Object:OwnerCorrectiveSmooth"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    )?;
+    let modifier = scene.nodes[&owner_id]
+        .modifiers
+        .iter()
+        .find(|modifier| modifier.modifier_type == "corrective_smooth")
+        .ok_or("corrective smooth modifier missing")?;
+    assert_eq!(modifier.modifier_type, "corrective_smooth");
+    assert_eq!(modifier.params["rest_source"], json!("BIND"));
+    assert!(
+        modifier.params.get("is_bind").is_none(),
+        "bind state must come from binding_data, not a parameter"
+    );
+    let modifier_state = serde_json::to_value(modifier)?;
+    assert_eq!(
+        modifier_state["binding_data"]["format"], "blender_corrective_bind_v1",
+        "imported corrective smooth bind representation"
+    );
+    assert_eq!(
+        modifier_state["binding_data"]["coords"]
+            .as_array()
+            .map(Vec::len),
+        Some(81),
+        "imported corrective smooth bind coordinate count"
+    );
+    assert_values(
+        &modifier_state["binding_data"]["coords"],
+        &expected["bind_coords"],
+        "corrective smooth imported bind coords",
+        1.0e-6,
+    );
+    let baseline = potter_core::eval::Snapshot::evaluate(
+        &scene,
+        &potter_core::eval::EvaluationContext::default(),
+    )?;
+    let actual = baseline
+        .meshes
+        .get(&owner_id)
+        .ok_or("corrective smooth evaluated mesh missing")?;
+    let actual_positions = actual
+        .vertices
+        .iter()
+        .map(|vertex| json!(vertex.co.to_array()))
+        .collect::<Vec<_>>();
+    assert_vertex_motion(
+        expected["bind_coords"].as_array().unwrap(),
+        moved,
+        "corrective smooth post-bind motion",
+        1.0e-3,
+    );
+    assert_ordered_vertices(
+        &actual_positions,
+        moved,
+        "corrective smooth imported evaluation",
+        1.0e-4,
+    );
+    // The compatibility original.blend is present: the source copy keeps Blender's bind state.
+    export_corrective_bind(&blender, &project, root, "source", moved)?;
+    // Without the compatibility original.blend the bind must be rebuilt from the serialized coords.
+    let removed = remove_original_blend_blobs(&scene, &project)?;
+    assert!(
+        removed > 0,
+        "corrective smooth project has no compatibility original.blend to remove"
+    );
+    export_corrective_bind(&blender, &project, root, "fallback", moved)?;
+    Ok(())
+}
+
 const CACHE_FIXTURE: &str = r"
 import bpy, json, math, os, struct, sys
 root = sys.argv[-1]
@@ -2294,7 +1782,7 @@ fn blender_mesh_cache_pc2_mdd_and_alembic_sequence_round_trip_resources()
     fs::write(&reopen_path, CACHE_REOPEN)?;
     let mut command = Command::new(&blender);
     command
-        .args(["--background"])
+        .args(["--background", "--python-exit-code", "1"])
         .arg(&exported)
         .arg("--python")
         .arg(&reopen_path)

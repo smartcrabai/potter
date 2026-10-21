@@ -34,6 +34,7 @@ mod sculpt;
 mod sequencer;
 mod shader;
 mod text;
+mod texture;
 mod tracking;
 mod uv;
 mod volume;
@@ -249,6 +250,8 @@ pub const OP_NAMES: &[&str] = &[
     "text.update",
     "text_object.create",
     "text_object.update",
+    "texture.create",
+    "texture.update",
     "tracking.clip_create",
     "tracking.plane_track",
     "tracking.set_camera_intrinsics",
@@ -666,6 +669,7 @@ fn apply_batch_internal(
             "property.set" | "property.delete" => property::apply(&mut engine, name, object),
             "resource.pack" | "resource.unpack" => resource::apply(&mut engine, name, object),
             "text.create" | "text.update" | "text.delete" => text::apply(&mut engine, name, object),
+            "texture.create" | "texture.update" => texture::apply(&mut engine, name, object),
             "curve.create" | "curve.update" | "curve.point_add" | "curve.point_update"
             | "curve.point_delete" | "curve.convert" | "surface.create" | "text_object.create"
             | "text_object.update" => curve::apply(&mut engine, name, object),
