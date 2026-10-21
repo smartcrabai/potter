@@ -13,8 +13,9 @@ The backdrop is an emitter of strength 1 with a black base, so its radiance is e
 shadow tints it a second time. The pane is a Transparent BSDF with the Color `TINT` as its only closure, covering the
 whole frame one unit above the backdrop.
 
-Arguments after `--`: blend_out, image_out, json_out, method (BLENDED or DITHERED), and an optional render flag
-(default 1). With the render flag 0 the generator writes only the .blend, so the test needs no render for the scene.
+Arguments after `--`: blend_out, image_out, json_out, method (BLENDED or DITHERED), an optional render flag (default 1),
+and an optional shift of the whole scene along y (default 0). With the render flag 0 the generator writes only the .blend,
+so the test needs no render for the scene.
 """
 
 import json
@@ -25,8 +26,8 @@ import bpy
 ARGS = sys.argv[sys.argv.index("--") + 1:]
 blend_out, image_out, json_out, method = ARGS[:4]
 RENDER = ARGS[4] != "0" if len(ARGS) > 4 else True
-# A shift of the whole scene along y gives an independent realisation of EEVEE's dither noise (it hashes world position),
-# which `measure` uses to estimate the noise. The default is no shift.
+# A shift of the whole scene along y gives an independent realisation of EEVEE's dither noise (it hashes world position).
+# `measure_realtime_transparent_tint_spread.py` runs the shifts and writes the statistics in realtime_transparent_tint.json.
 SHIFT_Y = float(ARGS[5]) if len(ARGS) > 5 else 0.0
 
 WIDTH = 64

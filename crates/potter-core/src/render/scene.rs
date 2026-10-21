@@ -1842,6 +1842,10 @@ impl SurfaceShader for SceneShader<'_> {
 /// its tint is the channel mean. `alpha_mode` `blend` is BLENDED; `opaque` and `clip` are DITHERED
 /// (`blend_bridge.py`, `surface_render_method`).
 fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
+    // A transmittance is a fraction of the light: EEVEE clamps the Color at zero and saturates the result
+    // (`gpu_shader_material_transparent.glsl`, `eevee_surf_deferred.bsl.hh`), so a tint above one or below zero is cut to
+    // [0, 1] before it can amplify or invert the background.
+    let tint = tint.map(|channel| channel.clamp(0.0, 1.0));
     match material {
         Some(material) if material.alpha_mode != "blend" => {
             let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
@@ -3404,5 +3408,54 @@ mod transparent_shadow_tests {
             ..blend
         };
         assert!(!casts(&blend_off));
+    }
+}
+
+#[cfg(test)]
+mod beauty_tint_tests {
+    use super::beauty_tint;
+    use crate::model::Material;
+
+    fn material(alpha_mode: &str) -> Material {
+        Material {
+            alpha_mode: alpha_mode.to_owned(),
+            ..Material::default()
+        }
+    }
+
+    #[test]
+    fn blended_material_keeps_each_channel() {
+        assert_eq!(
+            beauty_tint(Some(&material("blend")), [0.2, 0.8, 0.4]),
+            [0.2, 0.8, 0.4]
+        );
+    }
+
+    /// A DITHERED material takes the mean of the Color's channels: (0.2 + 0.8 + 0.4) / 3 on every channel.
+    #[test]
+    fn dithered_material_takes_the_channel_mean() {
+        let mean = (0.2 + 0.8 + 0.4) / 3.0;
+        for alpha_mode in ["opaque", "clip"] {
+            for channel in beauty_tint(Some(&material(alpha_mode)), [0.2, 0.8, 0.4]) {
+                assert!((channel - mean).abs() < 1.0e-12, "{alpha_mode}: {channel}");
+            }
+        }
+    }
+
+    /// Tints are clamped to [0, 1] first. BLENDED clamps each channel: 2 -> 1, -1 -> 0, 0.5 stays. DITHERED takes the
+    /// mean of the clamped channels: (1 + 0 + 0.5) / 3 = 0.5.
+    #[test]
+    fn tints_are_clamped_before_use() {
+        assert_eq!(
+            beauty_tint(Some(&material("blend")), [2.0, -1.0, 0.5]),
+            [1.0, 0.0, 0.5]
+        );
+        let dithered = beauty_tint(Some(&material("clip")), [2.0, -1.0, 0.5]);
+        assert!((dithered[0] - 0.5).abs() < 1.0e-12, "{dithered:?}");
+    }
+
+    #[test]
+    fn no_material_keeps_the_tint_clamped() {
+        assert_eq!(beauty_tint(None, [0.5, 1.5, -0.2]), [0.5, 1.0, 0.0]);
     }
 }

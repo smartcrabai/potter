@@ -782,13 +782,20 @@ pub(crate) fn rasterize_with_samples(
                                 background_linear
                             }
                         })
-                    } else if let (Some(visible_hit), Some(sample_ray)) = (sample_hit, sample_ray) {
-                        let triangle = &prepared[visible_hit.triangle_index];
-                        if hit_opacity(&triangle.source, visible_hit.color) >= 1.0 {
-                            let [red, green, blue, _] = visible_hit.color;
-                            [red, green, blue, 1.0]
-                        } else {
-                            composite_sample(
+                    } else if let Some(sample_ray) = sample_ray {
+                        match sample_hit {
+                            Some(visible_hit)
+                                if hit_opacity(
+                                    &prepared[visible_hit.triangle_index].source,
+                                    visible_hit.color,
+                                ) >= 1.0 =>
+                            {
+                                let [red, green, blue, _] = visible_hit.color;
+                                [red, green, blue, 1.0]
+                            }
+                            // The composite also finds a transparent pane that tints without opacity, which the
+                            // opacity-only hit above does not see. With no layer it returns the background.
+                            _ => composite_sample(
                                 &prepared,
                                 &visibility,
                                 &mut candidates,
@@ -796,8 +803,8 @@ pub(crate) fn rasterize_with_samples(
                                 &frame,
                                 background_linear,
                                 shader,
-                                Some(visible_hit),
-                            )?
+                                sample_hit,
+                            )?,
                         }
                     } else {
                         background_linear
@@ -1881,8 +1888,9 @@ fn nearest_visible_hit(
         };
         let triangle = &triangles[triangle_index];
         let sample = hit_color(triangle, hit, ray, shader)?;
-        // A surface with no opacity still takes part when its transparent share tints what lies behind it.
-        if hit_opacity(&triangle.source, sample.color) > 0.0 || !is_white(sample.transparent_tint) {
+        // The nearest surface with opacity is the pixel's data-pass hit (ids, depth, normals, albedo, AO). A transparent
+        // pane that only tints is not, so it cannot change those passes; the Beauty composite finds it separately.
+        if hit_opacity(&triangle.source, sample.color) > 0.0 {
             return Ok(Some(VisibleHit {
                 triangle_index,
                 hit,
@@ -1982,24 +1990,31 @@ struct Layer {
 
 /// Composites `layers` (nearest first) over `background`, as a pixel's film does. A layer adds its colour weighted by
 /// the transmittance reaching it and its opacity, then passes `(1 - opacity) * tint` of the light, so a Transparent
-/// BSDF's tint reaches what lies behind it channel by channel (`path.rs`, `throughput *= tint`). The film alpha is
-/// `1 - mean transmittance` over the background's alpha, the alpha EEVEE's film stores
-/// (`eevee_surf_deferred.bsl.hh`, `out_color.a`). With white tints this is the scalar composite of the layers.
-/// Returns the un-premultiplied colour and that alpha.
+/// BSDF's tint reaches what lies behind it channel by channel (`path.rs`, `throughput *= tint`).
+///
+/// The film's alpha is EEVEE's separate alpha channel, not the colour's transmittance: each layer multiplies one scalar
+/// by the mean of its passed transmittance, `mean(tint) * (1 - opacity)` (`eevee_surf_forward.bsl.hh`, `combined_a` is
+/// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
+/// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
+/// scalar composite of the layers. Returns the un-premultiplied colour and that alpha.
 fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
     let mut transmittance = DVec3::ONE;
+    let mut alpha_transmittance = 1.0;
     let mut premultiplied = DVec3::ZERO;
     for layer in layers {
         premultiplied += DVec3::from_array(layer.rgb) * (transmittance * layer.opacity);
-        transmittance *= DVec3::from_array(layer.tint) * (1.0 - layer.opacity);
-        if transmittance.max_element() <= 1.0e-6 {
+        let passed = 1.0 - layer.opacity;
+        transmittance *= DVec3::from_array(layer.tint) * passed;
+        alpha_transmittance *= layer.tint.iter().sum::<f64>() / 3.0 * passed;
+        // A layer that passes nothing adds nothing to the colour, but the alpha still counts later layers.
+        if transmittance.max_element() <= 1.0e-6 && alpha_transmittance <= 1.0e-6 {
             break;
         }
     }
     let background_alpha = background[3].clamp(0.0, 1.0);
     premultiplied += DVec3::from_array([background[0], background[1], background[2]])
         * (transmittance * background_alpha);
-    let alpha = 1.0 - transmittance.element_sum() / 3.0 * (1.0 - background_alpha);
+    let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
     if alpha <= f64::MIN_POSITIVE {
         return background;
     }
@@ -3444,5 +3459,85 @@ mod visibility_tests {
                 assert_eq!(actual, expected, "pixel ({x}, {y})");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod composite_layer_tests {
+    use super::{Layer, composite_layers};
+
+    fn assert_close(actual: [f64; 4], expected: [f64; 4]) {
+        for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1.0e-9,
+                "channel {channel}: {actual} != {expected} (full {actual:?} vs {expected:?})"
+            );
+        }
+    }
+
+    /// Two coloured layers over a background of alpha 0.6, worked out by hand.
+    /// Layer A (rgb (1,0,0), opacity 0.5, tint (1,0.5,0)): colour += (1,0,0) * 0.5 = (0.5,0,0); transmittance becomes
+    /// (1,0.5,0) * 0.5 = (0.5,0.25,0); alpha transmittance becomes mean(1,0.5,0) * 0.5 = 0.25.
+    /// Layer B (rgb (0,1,0), opacity 0, tint (0.2,0.4,0.8)): colour += 0; transmittance becomes (0.1,0.1,0); alpha
+    /// transmittance becomes 0.25 * mean(0.2,0.4,0.8) = 0.25 * 1.4/3.
+    /// Background (0.5,0.5,0.5), alpha 0.6: colour += (0.5,0.5,0.5) * (0.1,0.1,0) * 0.6 = (0.03,0.03,0).
+    /// So the colour sums to (0.53,0.03,0) and the alpha is 1 - (0.25 * 1.4/3) * (1 - 0.6).
+    #[test]
+    fn coloured_layers_over_a_partly_transparent_background() {
+        let layers = [
+            Layer {
+                rgb: [1.0, 0.0, 0.0],
+                opacity: 0.5,
+                tint: [1.0, 0.5, 0.0],
+            },
+            Layer {
+                rgb: [0.0, 1.0, 0.0],
+                opacity: 0.0,
+                tint: [0.2, 0.4, 0.8],
+            },
+        ];
+        let alpha = 1.0 - (0.25 * 1.4 / 3.0) * (1.0 - 0.6);
+        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 0.6]);
+        assert_close(actual, [0.53 / alpha, 0.03 / alpha, 0.0, alpha]);
+    }
+
+    /// Two panes that tint different channels over a transparent film. Each mean is 1/3, so the alpha is
+    /// 1 - (1/3) * (1/3) = 8/9. A product of the colour vectors would give zero transmittance and alpha 1.
+    #[test]
+    fn overlapping_panes_multiply_their_alpha_means() {
+        let layers = [
+            Layer {
+                rgb: [0.0; 3],
+                opacity: 0.0,
+                tint: [1.0, 0.0, 0.0],
+            },
+            Layer {
+                rgb: [0.0; 3],
+                opacity: 0.0,
+                tint: [0.0, 1.0, 0.0],
+            },
+        ];
+        let actual = composite_layers(layers, [0.0; 4]);
+        assert_close(actual, [0.0, 0.0, 0.0, 8.0 / 9.0]);
+    }
+
+    /// A white layer is the scalar composite: colour (0.8,0.2,0.4) at opacity 0.25 over an opaque background of
+    /// (0.5,0.5,0.5). The colour is 0.25 * (0.8,0.2,0.4) + 0.75 * (0.5,0.5,0.5) = (0.575,0.425,0.475), alpha 1.
+    #[test]
+    fn white_layer_is_the_scalar_composite() {
+        let layers = [Layer {
+            rgb: [0.8, 0.2, 0.4],
+            opacity: 0.25,
+            tint: [1.0; 3],
+        }];
+        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 1.0]);
+        assert_close(actual, [0.575, 0.425, 0.475, 1.0]);
+    }
+
+    /// No layer over a fully transparent background is that background, as the film has nothing to show.
+    #[test]
+    fn empty_stack_over_transparent_background_is_the_background() {
+        let actual = composite_layers(std::iter::empty(), [0.3, 0.4, 0.5, 0.0]);
+        assert_close(actual, [0.3, 0.4, 0.5, 0.0]);
     }
 }
