@@ -279,7 +279,7 @@ fn blender_attribute_field_values() -> Result<Vec<f64>, Box<dyn Error>> {
         .map(|value| {
             value
                 .as_f64()
-                .ok_or_else(|| std::io::Error::other("Blender attribute value is not numeric"))
+                .ok_or_else(|| Box::<dyn Error>::from("Blender attribute value is not numeric"))
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     values.sort_by(f64::total_cmp);
@@ -1069,7 +1069,7 @@ fn baked_attribute_field_matches_blender_and_survives_input_changes() -> Result<
         .map(|value| {
             value
                 .as_f64()
-                .ok_or_else(|| std::io::Error::other("attribute-field cache value is not numeric"))
+                .ok_or_else(|| Box::<dyn Error>::from("attribute-field cache value is not numeric"))
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     actual_values.sort_by(f64::total_cmp);
@@ -1608,7 +1608,7 @@ fn packed_bake_feeds_preview_render_and_gltf_after_input_change() -> Result<(), 
         pot().arg("init").arg(&imported_project),
         "initializing GLB import project",
     )?;
-    let imported_revision = document(&imported_project)["revision"]
+    let imported_revision = document(&imported_project)?["revision"]
         .as_u64()
         .ok_or_else(|| std::io::Error::other("initialized project revision is missing"))?;
     run_json(
