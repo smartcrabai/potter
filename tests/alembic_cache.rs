@@ -391,14 +391,21 @@ fn set_receiver_mesh(
         );
     }
     if seeded_uv {
+        // The generator's receiver (tests/fixtures/alembic_cache/generate_mesh_sequence_cache_oracle.py,
+        // same_topology_with_uv, L466-471) sets raw Blender UV (20 + i, -10 - i) on face-major loop i. Stored
+        // form is [u, 1 - v], converted once (as in assert_oracle_uv_layers), so loop i is stored [20 + i, 11 + i].
+        let mut loop_index = 0;
         let rows = mesh
             .faces
             .iter()
-            .enumerate()
-            .map(|(face_index, face)| {
+            .map(|face| {
                 let uv = (0..face.vertices.len())
-                    .map(|corner| json!([20 + face_index, 10 + corner]))
+                    .map(|corner| {
+                        let index = loop_index + corner;
+                        json!([20 + index, 11 + index])
+                    })
                     .collect::<Vec<_>>();
+                loop_index += face.vertices.len();
                 json!({"face_id":face.id,"uv":uv})
             })
             .collect::<Vec<_>>();
@@ -1571,19 +1578,10 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
                 assert_eq!(uv_map["type"], "FLOAT2");
                 let values: Vec<[f64; 2]> = serde_json::from_value(uv_map["values"].clone())?;
                 assert_eq!(values.len(), 11);
-                let input_uv: Vec<[f64; 2]> = serde_json::from_value(json!([
-                    [20.0, 10.0],
-                    [20.0, 11.0],
-                    [20.0, 12.0],
-                    [20.0, 13.0],
-                    [21.0, 10.0],
-                    [21.0, 11.0],
-                    [21.0, 12.0],
-                    [22.0, 10.0],
-                    [22.0, 11.0],
-                    [22.0, 12.0],
-                    [22.0, 13.0]
-                ]))?;
+                // Raw Blender receiver of the generator: (20 + i, -10 - i) per face-major loop i (generator L466-471).
+                let input_uv: Vec<[f64; 2]> = (0_u32..11)
+                    .map(|index| [20.0 + f64::from(index), -10.0 - f64::from(index)])
+                    .collect();
                 if expected["frame"].as_i64() == Some(1) {
                     assert_eq!(values, input_uv);
                 } else {
