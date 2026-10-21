@@ -135,3 +135,91 @@ fn authored_graph_inputs_survive_blend_round_trip() -> TestResult {
     }
     Ok(())
 }
+
+/// A Blender-authored material: a Principled graph with its own Base Colour and Roughness, which the import records as
+/// the material's baseline.
+const IMPORTED_FIXTURE: &str = r#"
+import bpy
+import sys
+
+path = sys.argv[sys.argv.index("--") + 1]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+material = bpy.data.materials.new("Authored")
+material.use_nodes = True
+principled = material.node_tree.nodes["Principled BSDF"]
+principled.inputs["Base Color"].default_value = (0.2, 0.9, 0.2, 1.0)
+principled.inputs["Roughness"].default_value = 0.15
+bpy.ops.mesh.primitive_plane_add(size=2.0)
+bpy.context.object.data.materials.append(material)
+bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
+"#;
+
+/// A graph edit on an imported authored graph survives export when its Material is untouched, and the untouched fields
+/// stay as the author made them: the import's baseline shows no Material field changed, so export writes nothing.
+#[test]
+fn graph_edit_survives_export_with_untouched_material() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let fixture = root.path().join("authored.blend");
+    run_blender(
+        &blender,
+        &write_script(root.path(), "authored_fixture.py", IMPORTED_FIXTURE)?,
+        None,
+        &fixture,
+    )?;
+    let (project, report) = import_blend(&blender, root.path(), "project", &fixture)?;
+    assert!(losses(&report).is_empty(), "import lost data: {report}");
+    let scene = read_scene(&project)?;
+    let graph_id = scene["materials"]
+        .as_object()
+        .and_then(|materials| {
+            materials
+                .values()
+                .find(|material| material["name"] == "Authored")
+        })
+        .and_then(|material| material["node_tree"].as_str().map(str::to_owned))
+        .ok_or("the imported Authored material has no shader graph")?;
+    let principled_id = scene["node_groups"][&graph_id]["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(_, node)| node["type"] == "ShaderNodeBsdfPrincipled")
+        })
+        .map(|(id, _)| id.clone())
+        .ok_or("the Authored graph has no Principled node")?;
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "graph.node_update", "graph": &graph_id, "node_id": &principled_id,
+             "set": {"inputs": {"Roughness": 0.4}}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "graph edit failed: {applied}");
+    let exported = root.path().join("graph-edit.blend");
+    let export_report = export(&blender, &project, "blend", &exported)?;
+    assert!(
+        losses(&export_report).is_empty(),
+        "export lost data: {export_report}"
+    );
+    let read = blender_principled(&blender, root.path(), &exported)?;
+    let node = &read["Authored"];
+    assert_close(
+        number(&node["roughness"])?,
+        0.4,
+        FLOAT_TOLERANCE,
+        "graph edit roughness after export",
+    );
+    for (channel, expected) in [0.2, 0.9, 0.2].iter().enumerate() {
+        assert_close(
+            number(&node["base_color"][channel])?,
+            *expected,
+            FLOAT_TOLERANCE,
+            "untouched base colour after export",
+        );
+    }
+    Ok(())
+}
