@@ -5,7 +5,8 @@
 //! is singular. World-space writers (OBJ, PLY, STL) take `baked_faces`, which reverses mirrored
 //! faces so winding agrees with the normals. Object-local writers (USD, FBX, Alembic) keep local winding and normals and
 //! let the transform carry the placement, as Blender does. Import: each importer hands per-corner
-//! normals to `import_shading`, which derives `shade_smooth` and `custom_normal` the way glTF does.
+//! normals to `import_reader_shading`, which applies the format's Blender reader rule for `sharp_face`
+//! and custom normals; glTF derives `shade_smooth` and `custom_normal` through `import_shading_flags`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -99,16 +100,61 @@ pub(super) struct ExactShading {
     pub(super) sharp: Vec<[usize; 2]>,
 }
 
-/// Derives `shade_smooth` and `custom_normal` on `mesh` from per-corner normals.
-///
-/// `normals` holds one value per face corner in `mesh.faces` order. A face is smooth when any
-/// corner differs from its flat normal. A corner whose normal differs from what the derived
-/// shading computes gets a `custom_normal` entry.
-pub(super) fn import_shading(mesh: &mut Mesh, normals: &[DVec3]) -> Result<()> {
-    import_shading_flags(mesh, normals, None)
+/// Imports shading the way the format's Blender reader does. `sharp_faces` is the `sharp_face` attribute
+/// the reader creates: `None` when it creates none, so every polygon stays smooth, and `Some(flags)` when
+/// it writes `sharp_face`, which records its presence. `normals` become custom loop normals and never
+/// decide flat faces (Blender's readers do not derive shading from them).
+pub(super) fn import_reader_shading(
+    mesh: &mut Mesh,
+    normals: Option<&[DVec3]>,
+    sharp_faces: Option<&[bool]>,
+) -> Result<()> {
+    if let Some(sharp) = sharp_faces {
+        if sharp.len() != mesh.faces.len() {
+            return Err(import_error(
+                "imported sharp_face flags do not match the face count",
+            ));
+        }
+        import_exact_shading(mesh, normals, sharp.iter().map(|flag| !flag).collect())
+    } else {
+        import_exact_shading(mesh, normals, vec![true; mesh.faces.len()])?;
+        crate::geom::normals::settle_sharp_face(mesh)
+    }
 }
 
-/// [`import_shading`] with exact flags from a Potter writer: they replace the derived smooth flags
+/// Writes `smooth` as the `shade_smooth` flags and imports `normals` as custom normals when given.
+/// Presence is recorded (`lookup_or_add` on the Blender side); callers that create no `sharp_face`
+/// settle it afterwards.
+fn import_exact_shading(
+    mesh: &mut Mesh,
+    normals: Option<&[DVec3]>,
+    smooth: Vec<bool>,
+) -> Result<()> {
+    if let Some(normals) = normals {
+        return import_shading_flags(
+            mesh,
+            normals,
+            Some(&ExactShading {
+                smooth,
+                sharp: Vec::new(),
+            }),
+        );
+    }
+    let values = mesh
+        .faces
+        .iter()
+        .zip(&smooth)
+        .map(|(face, value)| (format!("f{}", face.id), json!(value)))
+        .collect::<serde_json::Map<String, Value>>();
+    mesh.attributes.insert(
+        "shade_smooth".to_owned(),
+        json!({ "domain": "face", "type": "bool", "values": values }),
+    );
+    crate::geom::normals::record_sharp_face(mesh);
+    Ok(())
+}
+
+/// [`import_shading_flags`] with exact flags from a Potter writer: they replace the derived smooth flags
 /// and add the sharp edges the normals were computed with.
 pub(super) fn import_shading_flags(
     mesh: &mut Mesh,
@@ -180,6 +226,9 @@ pub(super) fn import_shading_flags(
             json!({ "domain": "face", "type": "bool", "values": values }),
         );
     }
+    // Blender's glTF importer always ensures `sharp_face` (`io_scene_gltf2/blender/imp/mesh.py`,
+    // `set_poly_smoothing`), so the imported mesh records it even when every face is smooth.
+    crate::geom::normals::record_sharp_face(mesh);
     if let Some(flags) = flags.filter(|flags| !flags.sharp.is_empty()) {
         let edge_key = |first: u32, second: u32| (first.min(second), first.max(second));
         let mut sharp_keys = BTreeSet::new();

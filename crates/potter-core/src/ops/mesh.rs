@@ -238,6 +238,17 @@ pub(super) fn apply(
         if scope == Some("shared") && edited_data.contains(&data_id) {
             continue;
         }
+        if name == "mesh.remesh" {
+            let voxel_size = args
+                .get("voxel_size")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| {
+                    PotError::new(ErrorCode::InvalidOperation, "voxel_size must be a number")
+                })?;
+            changed |= remesh_data_block(engine, &data_id, voxel_size)?;
+            edited_data.push(data_id);
+            continue;
+        }
         let (data_changed, had_descriptor, mapping) = {
             let data = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
                 PotError::with_details(
@@ -284,6 +295,104 @@ pub(super) fn apply(
         edited_data.push(data_id);
     }
     Ok(changed)
+}
+
+/// Records in `compatibility.losses` the attributes a voxel remesh drops. Blender's remesh reprojects every
+/// attribute (`mesh_remesh_reproject_attributes`), and Potter carries only `sharp_face`, so each other
+/// attribute is reported rather than silently removed. `curve.rs` records its losses the same way.
+fn record_remesh_loss(engine: &mut Engine<'_>, data_id: &Id, dropped: &[String]) -> Result<()> {
+    let existed = engine.doc.compatibility.contains_key("losses");
+    let slot = engine
+        .doc
+        .compatibility
+        .entry("losses".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let losses = slot.as_array_mut().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "compatibility losses must be an array",
+        )
+    })?;
+    losses.push(json!({
+        "feature_id": "mesh.remesh.attributes",
+        "data_id": data_id,
+        "reason": format!(
+            "Voxel remesh reprojects attributes that Potter does not carry: {}.",
+            dropped.join(", ")
+        ),
+        "suggestion": "Reapply the attributes after remeshing, or keep the original mesh.",
+    }));
+    let compatibility_id = Id::new("losses")
+        .map_err(|error| PotError::new(ErrorCode::InternalError, error.message))?;
+    engine.mark(
+        "compatibility",
+        &compatibility_id,
+        if existed {
+            ChangeKind::Updated
+        } else {
+            ChangeKind::Created
+        },
+    );
+    Ok(())
+}
+
+/// Blender's voxel remesh of one data block (`object.voxel_remesh`). The `mesh.remesh` operator and the
+/// sculpt `remesh_voxel` operator share it. The new mesh replaces the block's mesh; its vertex-group weights
+/// and UV layers are reprojected; the mesh attributes that are not carried are reported as a loss. The block
+/// always changes, because every element is replaced.
+pub(super) fn remesh_data_block(
+    engine: &mut Engine<'_>,
+    data_id: &Id,
+    voxel_size: f64,
+) -> Result<bool> {
+    let (had_descriptor, result) = {
+        let data = engine.doc.data_blocks.get_mut(data_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                format!("data block `{data_id}` was not found"),
+                json!({"data_id":data_id}),
+            )
+        })?;
+        let mesh = data.mesh.as_mut().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidOperation,
+                format!("data block `{data_id}` has no mesh payload"),
+                json!({"data_id":data_id}),
+            )
+        })?;
+        let groups: Vec<Id> = data
+            .vertex_groups
+            .iter()
+            .map(|group| group.id.clone())
+            .collect();
+        let had_descriptor = data.descriptor.is_some();
+        // The weights move out so the remesh can replace them; they are restored on every path.
+        let mut weights = std::mem::take(&mut data.vertex_weights);
+        let result = edit::voxel_remesh(mesh, &groups, &mut weights, voxel_size);
+        data.vertex_weights = weights;
+        // A mesh without faces is cancelled by Blender without a change (`voxel_remesh_exec`).
+        let Some(result) = result? else {
+            return Ok(false);
+        };
+        data.descriptor = None;
+        (had_descriptor, result)
+    };
+    if !result.dropped.is_empty() {
+        record_remesh_loss(engine, data_id, &result.dropped)?;
+    }
+    engine.mark("data_blocks", data_id, ChangeKind::Updated);
+    super::clear_primitive_metadata(engine, data_id);
+    if had_descriptor {
+        engine
+            .id_mappings
+            .entry("mesh_descriptor_dropped".to_owned())
+            .or_insert_with(|| json!({}))[data_id.as_str()] = Value::Bool(true);
+    }
+    engine
+        .id_mappings
+        .entry("mesh_elements".to_owned())
+        .or_insert_with(|| json!({}))[data_id.as_str()] = result.mapping;
+    Ok(true)
 }
 
 fn split_target(engine: &Engine<'_>, value: Option<&Value>) -> Result<(Value, Option<Value>)> {

@@ -172,20 +172,22 @@ impl TriangleBvh {
     }
 }
 
-/// Evaluate Blender's VOXEL remesh.
+/// Evaluate Blender's VOXEL remesh (`BKE_mesh_remesh_voxel`).
 ///
-/// Adaptivity above `OpenVDB`'s 1e-7 threshold runs the adaptive `volumeToMesh` port; otherwise the
-/// uniform cell mesher runs. When the surface is empty, Blender's `BKE_mesh_remesh_voxel` returns
-/// nullptr and the modifier stack keeps its input, so the input mesh is returned unchanged.
+/// The surface is extracted at `isovalue`, in world units: a voxel is inside where its distance is below it
+/// (`volumeToMesh`'s `value < isovalue`). Adaptivity above `OpenVDB`'s 1e-7 threshold runs the adaptive
+/// `volumeToMesh` port; otherwise the uniform cell mesher runs. Returns `None` when there is no surface to
+/// extract, which Blender reports as a failure (`BKE_mesh_remesh_voxel` returns nullptr).
 pub(super) fn remesh(
     mesh: &Mesh,
     voxel_size: f32,
     adaptivity: f32,
+    isovalue: f32,
     smooth_shade: bool,
-) -> Result<Mesh> {
+) -> Result<Option<Mesh>> {
     let triangles = mesh_triangles(mesh, voxel_size)?;
     if triangles.is_empty() {
-        return Ok(mesh.clone());
+        return Ok(None);
     }
     let bvh = TriangleBvh::new(triangles.clone());
     let (min_coord, dimensions) = grid_dimensions(&triangles, voxel_size)?;
@@ -264,6 +266,11 @@ pub(super) fn remesh(
         }
     }
     renormalize_level_set(&mut distance, &active, dimensions, voxel_size, band);
+    // Extracting at `isovalue` is extracting the shifted field at zero (`volumeToMesh`'s `value < isovalue`).
+    // A zero isovalue shifts by nothing.
+    for value in &mut distance {
+        *value -= isovalue;
+    }
 
     let output = if f64::from(adaptivity) > ADAPTIVE_THRESHOLD {
         match adaptive::volume_to_mesh(
@@ -275,7 +282,7 @@ pub(super) fn remesh(
     } else {
         volume_to_mesh(&distance, dimensions, min_coord, voxel_size, smooth_shade)?
     };
-    Ok(output.unwrap_or_else(|| mesh.clone()))
+    Ok(output)
 }
 
 /// Blender's `remesh_voxel_volume_to_mesh` corner order: quads `[q0, q3, q2, q1]`, triangles

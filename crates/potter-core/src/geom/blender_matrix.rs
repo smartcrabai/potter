@@ -485,6 +485,22 @@ pub(crate) fn operand_to_subject(
     Some(dmat4_from_blender(&blender_mul_m4(&inverse, &object)))
 }
 
+/// Blender's f32 Shrinkwrap `local2target` (`BLI_space_transform_from_matrices`, `math_matrix_c.cc`):
+/// `invert(target_world) * subject_world`, the subject's object-local space mapped into the target's.
+/// `None` when either object has no exact replica or the target is not invertible; the caller then
+/// keeps its f64 path.
+pub(crate) fn shrinkwrap_subject_to_target(
+    doc: &SceneDoc,
+    subject_id: &Id,
+    target_id: &Id,
+    world_matrices: &BTreeMap<Id, DMat4>,
+) -> Option<DMat4> {
+    let subject = object_to_world(doc, subject_id, world_matrices, 0)?;
+    let target = object_to_world(doc, target_id, world_matrices, 0)?;
+    let inverse = blender_invert_m4(&target)?;
+    Some(dmat4_from_blender(&blender_mul_m4(&inverse, &subject)))
+}
+
 /// Blender `is_negative_m4`: sign of the upper 3x3 determinant after the f32 matrix boundary.
 pub(crate) fn is_negative_m4(matrix: DMat4) -> bool {
     let matrix = matrix.to_cols_array().map(|value| value as f32);
