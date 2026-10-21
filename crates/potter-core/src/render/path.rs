@@ -104,7 +104,6 @@ struct VolumeEvent {
 
 struct VolumeSegment {
     transmittance: f64,
-    emission: DVec3,
     event: Option<VolumeEvent>,
     stochastic: bool,
 }
@@ -1139,15 +1138,24 @@ fn trace_path(
         }
         if let Some((grid, medium)) = mixed {
             // The grid's stochastic free flight and the mesh's analog collision are sampled independently, and the nearer
-            // event is taken. Analog sampling is exact for the event, so the mesh's chromatic transmittance is its only extra
-            // weight (`chromatic_correction`). The grid's emission is not added when the mesh collides first, a known
-            // approximation.
+            // event is taken. The grid's emission runs up to that event, weighted by the mesh's chromatic excess, before the
+            // throughput takes any transmittance (`grid_emission_until`). Analog sampling is exact for the event, so the
+            // mesh's chromatic transmittance is its only extra weight (`chromatic_correction`).
             let voxel = trace_volume_segment(Some(grid), volumes, origin, direction, rng, true)?;
             let voxel_distance = voxel
                 .event
                 .map(|event| (event.point - origin).dot(direction));
             let limit = voxel_distance.unwrap_or(segment_limit);
-            if let Some(distance) = sample_mesh_collision(&medium, limit, rng) {
+            let collision = sample_mesh_collision(&medium, limit, rng);
+            let emission_end = collision.unwrap_or(limit);
+            radiance += throughput
+                * grid_emission_until(
+                    grid,
+                    mesh_chromatic(&medium),
+                    emission_end,
+                    voxel.stochastic,
+                );
+            if let Some(distance) = collision {
                 if !voxel.stochastic {
                     throughput *= (-grid_depth(grid, distance)).exp();
                 }
@@ -1204,7 +1212,6 @@ fn trace_path(
             // No mesh collision before `limit`: the mesh's chromatic transmittance up to there, then the grid's own event
             // or the segment's end.
             throughput *= chromatic_correction(&medium, limit);
-            radiance += throughput * voxel.emission;
             if !voxel.stochastic {
                 throughput *= voxel.transmittance;
             }
@@ -1258,7 +1265,8 @@ fn trace_path(
             if let Some(grid) = grid.as_ref() {
                 let segment =
                     trace_volume_segment(Some(grid), volumes, origin, direction, rng, false)?;
-                radiance += throughput * segment.emission;
+                radiance +=
+                    throughput * grid_emission_until(grid, DVec3::ZERO, segment_limit, false);
                 throughput *= segment.transmittance;
             }
             if let Some(medium) = stack {
@@ -1269,7 +1277,11 @@ fn trace_path(
             }
         } else if let (Some(grid), None) = (grid.as_ref(), stack) {
             let segment = trace_volume_segment(Some(grid), volumes, origin, direction, rng, true)?;
-            radiance += throughput * segment.emission;
+            let emission_end = segment
+                .event
+                .map_or(segment_limit, |event| (event.point - origin).dot(direction));
+            radiance += throughput
+                * grid_emission_until(grid, DVec3::ZERO, emission_end, segment.stochastic);
             if !segment.stochastic {
                 throughput *= segment.transmittance;
             }
@@ -3671,21 +3683,62 @@ fn grid_scatter_pdf(grid: &VoxelGrid, distance: f64) -> f64 {
     scatter * grid.meters_per_unit * (-grid_depth(grid, distance)).exp()
 }
 
-/// Trace one voxel segment's free flight on its grid, with the distance sampler's events and emission
-/// (`volume_integrate_heterogeneous`, with the grid's grey transport).
+/// The per-channel extinction above the channel mean of a mesh medium: the exponent that grey analog sampling leaves to
+/// the channels (`chromatic_correction` is its exponential).
+fn mesh_chromatic(medium: &BsdfParams) -> DVec3 {
+    let extinction =
+        DVec3::from_array(medium.volume_scatter) + DVec3::from_array(medium.volume_absorption);
+    extinction - DVec3::splat(extinction.element_sum() / 3.0)
+}
+
+/// The grid's emission from its entry to `end`, per channel, as Cycles' heterogeneous integrator adds it. Each step's
+/// emission is weighted by the transmittance of what precedes it: the grid's own extinction, unless the grid is `analog`,
+/// and the mesh's chromatic excess `chromatic` (`mesh_chromatic`). An analog grid's collisions end the emission at `end`
+/// instead of weighting it: the expectation over its first collision is the transmittance itself.
+fn grid_emission_until(grid: &VoxelGrid, chromatic: DVec3, end: f64, analog: bool) -> DVec3 {
+    let mut emitted = DVec3::ZERO;
+    let mut exponent = DVec3::ZERO;
+    for (index, extinction) in grid.extinction.iter().enumerate() {
+        let start = grid.entry + index as f64 * grid.step;
+        if end <= start {
+            break;
+        }
+        let covered = end.min(start + grid.step) - start;
+        let grid_rate = if analog {
+            0.0
+        } else {
+            extinction * grid.meters_per_unit
+        };
+        let rate = chromatic + DVec3::splat(grid_rate);
+        let source = grid.emission[index] * grid.meters_per_unit;
+        let shape = DVec3::from_array(rate.to_array().map(|rate| {
+            if rate.abs() > 1.0e-12 {
+                (1.0 - (-rate * covered).exp()) / rate
+            } else {
+                covered
+            }
+        }));
+        emitted += source * (-exponent).exp() * shape;
+        exponent += rate * covered;
+    }
+    emitted
+}
+
+/// Trace one voxel segment's free flight on its grid with the distance sampler's events, and its transmittance
+/// (`volume_integrate_heterogeneous`, with the grid's grey transport). The caller integrates the emission up to the event
+/// with `grid_emission_until`.
 fn trace_volume_segment(
     grid: Option<&VoxelGrid>,
     volumes: &[VolumeInstance<'_>],
     origin: DVec3,
     direction: DVec3,
     rng: &mut Pcg32,
-    // False for a ray that may not collide any more: its segment only attenuates and emits.
+    // False for a ray that may not collide any more: its segment only attenuates.
     events: bool,
 ) -> Result<VolumeSegment> {
     let Some(grid) = grid else {
         return Ok(VolumeSegment {
             transmittance: 1.0,
-            emission: DVec3::ZERO,
             event: None,
             stochastic: false,
         });
@@ -3697,13 +3750,11 @@ fn trace_volume_segment(
     };
     let step_in_meters = grid.step * grid.meters_per_unit;
     let mut accumulated_depth = 0.0;
-    let mut emitted = DVec3::ZERO;
     for (index, &extinction) in grid.extinction.iter().enumerate() {
         if extinction <= 0.0 {
             continue;
         }
         let start = grid.entry + index as f64 * grid.step;
-        let source = grid.emission[index];
         let step_depth = extinction * step_in_meters;
         let event_in_step = free_flight <= accumulated_depth + step_depth;
         let traveled_meters = if event_in_step {
@@ -3711,8 +3762,6 @@ fn trace_volume_segment(
         } else {
             step_in_meters
         };
-        let (_, source_distance) = homogeneous_segment_integral(extinction, traveled_meters);
-        emitted += source * (-accumulated_depth).exp() * source_distance;
         accumulated_depth += extinction * traveled_meters;
         if event_in_step {
             let event_point = origin + direction * (start + traveled_meters / grid.meters_per_unit);
@@ -3746,7 +3795,6 @@ fn trace_volume_segment(
             );
             return Ok(VolumeSegment {
                 transmittance: (-accumulated_depth).exp(),
-                emission: emitted,
                 event: Some(event),
                 stochastic: grid.stochastic,
             });
@@ -3754,7 +3802,6 @@ fn trace_volume_segment(
     }
     Ok(VolumeSegment {
         transmittance: (-accumulated_depth).exp(),
-        emission: emitted,
         event: None,
         stochastic: grid.stochastic,
     })
