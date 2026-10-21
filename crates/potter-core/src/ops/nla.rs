@@ -1,7 +1,7 @@
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::{
-    error::{ErrorCode, Result},
+    error::{ErrorCode, PotError, Result},
     model::{ActionSlot, Id, NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, TimelineMarker},
 };
 

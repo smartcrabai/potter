@@ -277,9 +277,9 @@ impl OceanSpectrum {
                     f64::from(blender_gaussian(&mut rng)),
                     f64::from(blender_gaussian(&mut rng)),
                 );
-                let energy = energy(&settings, kx[i], kz[j]);
+                let energy_value = energy(&settings, kx[i], kz[j]);
                 let reverse_energy = energy(&settings, -kx[i], -kz[j]);
-                h0[i * n + j] = gaussian.scale(f64::from((energy / 2.0).sqrt()));
+                h0[i * n + j] = gaussian.scale(f64::from((energy_value / 2.0).sqrt()));
                 h0_minus[i * n + j] = gaussian.scale(f64::from((reverse_energy / 2.0).sqrt()));
             }
         }
@@ -295,8 +295,18 @@ impl OceanSpectrum {
             normalization: 1.0,
             depth: settings.depth,
         };
+        // Blender's `set_height_normalize_factor`: 1 / max |disp_y| of a time-0, unit-scale simulation.
         let initial = spectrum.compute(0.0, 1.0, 0.0, false, false, false);
-        spectrum.normalization = (1.0 / maximum.max(1.0e-5)) as f32;
+        let max_height = initial
+            .displacement_y
+            .iter()
+            .fold(0.0_f64, |max, value| max.max(value.abs()));
+        let max_height = if max_height == 0.0 {
+            1.0e-5
+        } else {
+            max_height
+        };
+        spectrum.normalization = (1.0 / max_height) as f32;
         Ok(spectrum)
     }
 

@@ -1078,6 +1078,7 @@ pub struct NlaTrack {
 #[serde(deny_unknown_fields)]
 pub struct NlaStrip {
     pub id: Id,
+    pub action: Id,
     /// Action slot assigned to this strip; `None` only for single-slot or slotless Actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_slot: Option<Id>,
