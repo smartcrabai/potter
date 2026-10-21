@@ -1486,6 +1486,57 @@ impl<'a> Builder<'a> {
                     .set_edge_state(first, second, sharp, seam, Some(e1.edge_id));
             }
         }
+        // Blender's `bevel_build_edge_polygons` ends with `weld_cross_attrs_copy` at each end that is a weld
+        // cross (bmesh_bevel.cc:7615–7620), so the rungs along that end's vmesh edge get the crossing edge's
+        // attributes.
+        if self.is_weld_cross(a)? {
+            self.weld_cross_copy(a, i1, e1_id, nseg)?;
+        }
+        if self.is_weld_cross(b)? {
+            self.weld_cross_copy(b, i2, e2_id, nseg)?;
+        }
+        Ok(())
+    }
+    /// Blender's `bevvert_is_weld_cross`: four edges, two beveled, on opposite sides.
+    fn is_weld_cross(&self, vertex: usize) -> Result<bool> {
+        let bv = self.bev(vertex)?;
+        if bv.edges.len() != 4 || bv.selcount != 2 {
+            return Ok(false);
+        }
+        let is_bev = |k: usize| self.front.edges[bv.edges[k]].is_bev;
+        Ok((is_bev(0) && is_bev(2)) || (is_bev(1) && is_bev(3)))
+    }
+    /// Blender's `weld_cross_attrs_copy` (`bmesh_bevel.cc:7424–7455`): the `seg` rungs of `vertex`'s vmesh along
+    /// edge half `e_id` (vmesh index `index`) copy the attributes of the unbeveled crossing edge before it.
+    /// Blender clears seam where the two crossing edges disagree and sets smooth (clears sharp) likewise, so
+    /// the flags are the logical AND of both crossing edges.
+    fn weld_cross_copy(
+        &mut self,
+        vertex: usize,
+        index: usize,
+        e_id: usize,
+        seg: usize,
+    ) -> Result<()> {
+        let bv = self.bev(vertex)?;
+        let i = bv
+            .edges
+            .iter()
+            .position(|&id| id == e_id)
+            .ok_or_else(|| internal_invariant("weld cross beveled edge is a vertex edge"))?;
+        let prev = self.front.edges[bv.edges[(i + 3) % 4]].edge_id;
+        let next = self.front.edges[bv.edges[(i + 1) % 4]].edge_id;
+        let (prev_sharp, prev_seam) = self.front.input_edge_flags_by_id(prev);
+        let (next_sharp, next_seam) = self.front.input_edge_flags_by_id(next);
+        let (sharp, seam) = (prev_sharp && next_sharp, prev_seam && next_seam);
+        for k in 0..seg {
+            if let (Some(first), Some(second)) = (
+                self.id(vertex, index, 0, k)?,
+                self.id(vertex, index, 0, k + 1)?,
+            ) {
+                self.emission
+                    .set_edge_state(first, second, sharp, seam, Some(prev));
+            }
+        }
         Ok(())
     }
     /// Blender's `bevel_reattach_wires`: connect each wire to the nearest new boundary points.
@@ -1555,7 +1606,8 @@ impl<'a> Builder<'a> {
                 // copies the wire edge's attributes and flags onto the new edge.
                 let (sharp, seam) = self.front.input_edge_flags_between(a, b);
                 let source = self.front.input_edge_id(a, b);
-                self.emission.set_edge_state(first, second, sharp, seam, source);
+                self.emission
+                    .set_edge_state(first, second, sharp, seam, source);
                 self.loose.push([first, second]);
             }
         }

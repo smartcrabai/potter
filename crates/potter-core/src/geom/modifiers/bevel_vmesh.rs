@@ -2630,7 +2630,11 @@ fn zero_generated_edge_attributes(output: &mut Mesh, kept: &HashSet<(u32, u32)>)
 
 /// Output edge keys of the input `BMEdge`s Blender keeps, from the builder's explicit provenance: each
 /// emitted point pair in `kept` names an output edge by its output vertex IDs.
-fn kept_output_edges(output: &Mesh, remap: &[usize], kept: &[(usize, usize)]) -> HashSet<(u32, u32)> {
+fn kept_output_edges(
+    output: &Mesh,
+    remap: &[usize],
+    kept: &[(usize, usize)],
+) -> HashSet<(u32, u32)> {
     kept.iter()
         .map(|&(first, second)| {
             edge_key(
@@ -3245,10 +3249,16 @@ pub(super) fn finish(
     } = emission;
     // Blender's unchanged faces are copied as-is, so each of their edges is the input `BMEdge`.
     let mut kept_edges = emitted_kept_edges;
-    for polygon in emitted_polygons.iter().filter(|polygon| polygon.kind == Kind::Original) {
+    for polygon in emitted_polygons
+        .iter()
+        .filter(|polygon| polygon.kind == Kind::Original)
+    {
         let count = polygon.vertices.len();
         for corner in 0..count {
-            kept_edges.push((polygon.vertices[corner], polygon.vertices[(corner + 1) % count]));
+            kept_edges.push((
+                polygon.vertices[corner],
+                polygon.vertices[(corner + 1) % count],
+            ));
         }
     }
     let mut used = vec![false; emitted_points.len()];
