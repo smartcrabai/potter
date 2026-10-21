@@ -3280,6 +3280,7 @@ fn build_imported_graph(
                     color: vec3_field(item, "color", [1.0; 3]),
                     energy: number_field(item, "energy", 1000.0),
                     radius: number_field(item, "shadow_soft_size", 0.1),
+                    sun_angle: number_field(item, "sun_angle", 0.526_f64.to_radians()),
                     soft_falloff: item
                         .get("soft_falloff")
                         .and_then(Value::as_bool)

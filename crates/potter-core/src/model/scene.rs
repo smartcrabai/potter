@@ -1473,6 +1473,13 @@ pub struct LightData {
     /// hit is weighted against light sampling. When `false`, the light is only light-sampled.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub use_multiple_importance_sampling: bool,
+    /// Blender's sun `angle` (`light.sun_angle`, `rna_light.cc`): the sun's angular diameter, in radians. EEVEE draws the
+    /// sun's disc from it (`eevee_light.cc`, `shape_radius = tan(angle / 2)`). Omitted at Blender's default.
+    #[serde(
+        default = "default_sun_angle",
+        skip_serializing_if = "is_default_sun_angle"
+    )]
+    pub sun_angle: f64,
 }
 
 impl Default for LightData {
@@ -1490,12 +1497,22 @@ impl Default for LightData {
             area_size_y: 0.25,
             spread: std::f64::consts::PI,
             use_multiple_importance_sampling: true,
+            sun_angle: default_sun_angle(),
         }
     }
 }
 
 fn white_rgb() -> [f64; 3] {
     [1.0, 1.0, 1.0]
+}
+
+/// Blender's sun angle default, `DNA_light_types.h`: `DEG2RADF(0.526f)`.
+fn default_sun_angle() -> f64 {
+    0.526_f64.to_radians()
+}
+
+fn is_default_sun_angle(value: &f64) -> bool {
+    value.to_bits() == default_sun_angle().to_bits()
 }
 fn default_volume_color() -> [f64; 3] {
     [0.5; 3]

@@ -313,6 +313,8 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
 
+    defs["light"]["properties"]["sun_angle"] =
+        json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
     let material = &mut defs["material"];
