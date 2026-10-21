@@ -1174,9 +1174,10 @@ fn ocean_fft_is_seeded_and_choppiness_changes_the_surface() -> Result<(), Box<dy
     )?;
     assert_eq!(generated.vertices.len(), 33 * 17);
     assert_eq!(generated.faces.len(), 32 * 16);
-    assert!((generated.vertices[0].co.x + 8.0).abs() < 1.0e-9);
+    // Blender's grid origin is -(size * spatial_size) / 2 whatever the repeat (corpus L10: x starts at -20 with repeat_x 2).
+    assert!((generated.vertices[0].co.x + 4.0).abs() < 1.0e-9);
     assert!((generated.vertices[0].co.y + 4.0).abs() < 1.0e-9);
-    assert!(generated.attributes.contains_key("ocean_normal"));
+    assert!(!generated.attributes.contains_key("ocean_normal"));
     assert!(generated.attributes.contains_key("foam"));
     Ok(())
 }
