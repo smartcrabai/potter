@@ -2378,12 +2378,14 @@ fn shade(
             let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
             let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
             environment += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
+            lobes += environment * ambient;
+            // Refraction takes no occlusion: EEVEE's deferred combine multiplies no visibility into the transmission
+            // closure's probe read (`eevee_deferred_combine.bsl.hh`), so the glass environment is not attenuated.
             if let Some(glass) =
                 eevee_transmission::glass_closures(params, normal, view, lower, thickness)
             {
-                environment += glass_environment(world, &doc.node_groups, images, &glass)?;
+                lobes += glass_environment(world, &doc.node_groups, images, &glass)?;
             }
-            lobes += environment * ambient;
         }
         let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
         for (id, light_node) in &doc.nodes {
