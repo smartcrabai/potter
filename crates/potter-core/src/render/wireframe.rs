@@ -785,6 +785,13 @@ mod tests {
 ///    residual is the coverage at the line's centre (about 0.008 coverage: capture 0.992, model 0.983) and at
 ///    distances above one pixel. The overlay's smoothstep kernel is the best standard profile tested (Gaussian and
 ///    box-area profiles fit worse), and its constants are about 0.03 px off. No source rule explains that shape.
+///    Checked against `overlay_antialiasing.bsl.hh` (v5.2.2): the centre's neighbour blend takes only vertical
+///    neighbours for a horizontal line (`is_ofs_horizontal = offset.x != 0`), and only if they carry a record. The
+///    line kernel is `theme.sizes.pixel * 0.5 - 0.5` with `sizes.pixel = 1` (`overlay_instance.cc:399`), so it is 0;
+///    no line-width uniform enters. A vertical neighbour with a record would have its distance to the centre at 0
+///    (the neighbour's own offset cancels its distance), so its coverage (0.983) would blacken the centre to about
+///    0 to 2 levels, not 7. So rows above and below carry no record in Blender, and the 0.992 is not neighbour
+///    coverage.
 /// 2. The sphere's line centres differ by more than three levels at 144 of 1,132 pixels (up to 29 levels), and its
 ///    ink is 2% below the capture. Facing is not the cause: per-corner facing gives mean error 0.036, flat faces
 ///    0.039, and constant facing 0.07 to 0.13 (the corner normals are the right input). The cube's ink is 3% below
