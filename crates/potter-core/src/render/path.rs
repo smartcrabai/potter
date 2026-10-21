@@ -87,7 +87,25 @@ impl PointLight {
     }
 }
 
+/// One Volume closure of a voxel volume: its share of the volume's scatter, and its Henyey-Greenstein anisotropy. Cycles
+/// sums the closures' phases weighted by their scatter (`volume_shader_phase_eval`), so the volume's phase is `Σ share·HG`.
 #[derive(Clone, Copy)]
+struct ScatterLobe {
+    share: f64,
+    anisotropy: f64,
+}
+
+impl VolumeInstance<'_> {
+    /// The volume's phase at `cosine`: each closure's lobe weighted by its share of the scatter.
+    fn phase_density(&self, cosine: f64) -> f64 {
+        self.lobes
+            .iter()
+            .map(|lobe| lobe.share * henyey_greenstein(cosine, lobe.anisotropy))
+            .sum()
+    }
+}
+
+#[derive(Clone)]
 struct VolumeInstance<'a> {
     volume: &'a VolumeData,
     world_to_local: DMat4,
@@ -97,7 +115,8 @@ struct VolumeInstance<'a> {
     meters_per_unit: f64,
     density_range: Option<(f64, f64)>,
     albedo: DVec3,
-    anisotropy: f64,
+    /// The phase lobes of the volume's Volume closures, one per closure (`scatter_lobes`).
+    lobes: Vec<ScatterLobe>,
     emission: DVec3,
     scattering: bool,
     /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
@@ -115,7 +134,6 @@ struct VolumeInstance<'a> {
 struct VolumeEvent {
     point: DVec3,
     albedo: DVec3,
-    anisotropy: f64,
 }
 
 struct VolumeSegment {
@@ -135,8 +153,14 @@ struct HitClosure {
 }
 
 impl HitClosure {
-    fn new(weight: f64, params: &BsdfParams, view: DVec3, geometric: DVec3) -> Self {
-        let closure_layers = layers_at(params, params.normal, view, geometric);
+    fn new(
+        weight: f64,
+        params: &BsdfParams,
+        view: DVec3,
+        geometric: DVec3,
+        bump_correction: bool,
+    ) -> Self {
+        let closure_layers = layers_at(params, params.normal, view, geometric, bump_correction);
         Self {
             weight,
             params: *params,
@@ -215,6 +239,9 @@ struct Closures {
     smooth: DVec3,
     /// The geometric normal, Cycles' `sd->Ng`: the reference that bends the specular lobes (`layers_at`).
     geometric: DVec3,
+    /// Cycles' `SD_USE_BUMP_MAP_CORRECTION` (`scene/shader.cpp`), the material's `use_bump_map_correction`: it enables
+    /// the grazing diffuse smoothing and the lifted specular normal (`maybe_ensure_valid_specular_reflection`).
+    bump_correction: bool,
     /// Sum of every share's selection weight, reflective and pass-through: the selection normaliser.
     selection_total: f64,
     /// Sum of the reflective selection weights.
@@ -234,7 +261,7 @@ struct Closures {
 }
 
 impl Closures {
-    fn new(items: Vec<HitClosure>, smooth: DVec3, geometric: DVec3) -> Self {
+    fn new(items: Vec<HitClosure>, smooth: DVec3, geometric: DVec3, bump_correction: bool) -> Self {
         let mut selection_total = 0.0;
         let mut reflect_total = 0.0;
         let mut emission = DVec3::ZERO;
@@ -270,6 +297,7 @@ impl Closures {
             items,
             smooth,
             geometric,
+            bump_correction,
             selection_total,
             reflect_total,
             emission,
@@ -362,10 +390,17 @@ impl Closures {
         } else {
             DVec3::ZERO
         };
-        let diffuse_correction =
-            diffuse * (diffuse_smoothing(self.smooth, layers.normal, light) - 1.0);
-        let sheen_correction =
-            sheen * (diffuse_smoothing(self.smooth, layers.sheen_normal, light) - 1.0);
+        // Cycles' `bump_shadowing_term` leaves the diffuse lobe unsmoothed when `SD_USE_BUMP_MAP_CORRECTION` is off
+        // (`kernel/closure/bsdf.h`); the sheen lobe takes the same test, as it is a diffuse closure.
+        let smoothing = |normal: DVec3| {
+            if self.bump_correction {
+                diffuse_smoothing(self.smooth, normal, light)
+            } else {
+                1.0
+            }
+        };
+        let diffuse_correction = diffuse * (smoothing(layers.normal) - 1.0);
+        let sheen_correction = sheen * (smoothing(layers.sheen_normal) - 1.0);
         let shaded = evaluate_bsdf(params, layers, light) + diffuse_correction + sheen_correction;
         shaded * (reflect * cosine)
     }
@@ -436,10 +471,16 @@ impl Closures {
                 if params.subsurface_method == SubsurfaceMethod::Burley {
                     params.subsurface_weight = 0.0;
                 }
-                HitClosure::new(closure.weight, &params, closure.layers.view, self.geometric)
+                HitClosure::new(
+                    closure.weight,
+                    &params,
+                    closure.layers.view,
+                    self.geometric,
+                    self.bump_correction,
+                )
             })
             .collect();
-        *self = Closures::new(items, self.smooth, self.geometric);
+        *self = Closures::new(items, self.smooth, self.geometric, self.bump_correction);
     }
 }
 
@@ -1125,8 +1166,7 @@ fn realtime_volume_integral(
                         Some(rng),
                         16,
                     )?;
-                    let phase =
-                        henyey_greenstein(direction.dot(sample.direction), instance.anisotropy);
+                    let phase = instance.phase_density(direction.dot(sample.direction));
                     source += instance.albedo
                         * sample.radiance
                         * (scattering_coefficient * phase * visibility);
@@ -1535,7 +1575,6 @@ fn trace_path(
                 let event = VolumeEvent {
                     point: origin + direction * distance,
                     albedo: DVec3::ZERO,
-                    anisotropy,
                 };
                 let weights = event_weights(
                     &choices,
@@ -1588,6 +1627,9 @@ fn trace_path(
                 throughput *= event.albedo / scatter_probability;
                 let event_distance = (event.point - origin).dot(direction);
                 let phase = event_phase(&media, Some(grid), event_distance);
+                let Some(anisotropy) = phase.pick(rng) else {
+                    break;
+                };
                 let weights = event_weights(
                     &choices,
                     method,
@@ -1615,7 +1657,7 @@ fn trace_path(
                 volume_scatters += 1;
                 terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
                 let (next_direction, phase_pdf) =
-                    sample_volume_continuation(direction, event.anisotropy, &phase, rng);
+                    sample_volume_continuation(direction, anisotropy, &phase, rng);
                 direction = next_direction;
                 origin = event.point + direction * RAY_EPSILON;
                 previous = Scatter::Volume(phase_pdf);
@@ -1658,6 +1700,9 @@ fn trace_path(
                 throughput *= event.albedo / scatter_probability;
                 let event_distance = (event.point - origin).dot(direction);
                 let phase = event_phase(&media, Some(grid), event_distance);
+                let Some(anisotropy) = phase.pick(rng) else {
+                    break;
+                };
                 let weights = event_weights(
                     &choices,
                     method,
@@ -1685,7 +1730,7 @@ fn trace_path(
                 volume_scatters += 1;
                 terminal |= bounce >= max_bounces || volume_scatters >= volume_limit;
                 let (next_direction, phase_pdf) =
-                    sample_volume_continuation(direction, event.anisotropy, &phase, rng);
+                    sample_volume_continuation(direction, anisotropy, &phase, rng);
                 direction = next_direction;
                 origin = event.point + direction * RAY_EPSILON;
                 previous = Scatter::Volume(phase_pdf);
@@ -1708,7 +1753,6 @@ fn trace_path(
                     let event = VolumeEvent {
                         point: origin + direction * distance,
                         albedo: DVec3::ZERO,
-                        anisotropy,
                     };
                     let weights = event_weights(
                         &choices,
@@ -1812,9 +1856,11 @@ fn trace_path(
                     &params,
                     surface.normal,
                     surface.geometric_normal,
+                    surface.closures.bump_correction,
                 )],
                 surface.normal,
                 surface.geometric_normal,
+                surface.closures.bump_correction,
             );
             // The exit's volume is zero (`exit_params`), so the exit neither passes the path nor changes the stack.
             surface.media.clear();
@@ -2462,6 +2508,7 @@ fn make_surface(
                     &params,
                     -direction,
                     frame.geometric_normal,
+                    frame.material.use_bump_map_correction,
                 ));
             }
             // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
@@ -2472,7 +2519,12 @@ fn make_surface(
                 normal,
                 geometric_normal: frame.geometric_normal,
                 shadow_point: frame.shadow_point,
-                closures: Closures::new(items, smooth, frame.geometric_normal),
+                closures: Closures::new(
+                    items,
+                    smooth,
+                    frame.geometric_normal,
+                    frame.material.use_bump_map_correction,
+                ),
                 media: surface_media(frame.triangle.object_index, &shading.volume),
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
@@ -3808,15 +3860,42 @@ fn index_box_bounds(index_to_local: DMat4, low: DVec3, high: DVec3) -> (DVec3, D
 }
 
 /// The volume closures of a material's Volume output summed as one parameter set: Cycles sums the closures weighted by
-/// their weight (`volume_shader_eval`). The anisotropy and the sampling and interpolation settings are the heaviest
-/// closure's, which a single closure has exactly. `None` when the output has no closure.
+/// their weight (`volume_shader_eval`). The sampling and interpolation settings are the heaviest closure's, which a single
+/// closure has exactly. The phase is not summed; each closure keeps its own lobe (`scatter_lobes`). `None` when the output
+/// has no closure.
 fn volume_medium(volume: &[ShaderClosure]) -> Option<BsdfParams> {
     let dominant = heaviest(volume, |closure| closure.weight)?;
     let mut medium = dominant.params;
+    // The phase is per closure (`scatter_lobes`), so the summed medium has no anisotropy of its own.
+    medium.volume_anisotropy = 0.0;
     medium.volume_scatter = weighted_volume_channels(volume, |params| params.volume_scatter);
     medium.volume_absorption = weighted_volume_channels(volume, |params| params.volume_absorption);
     medium.volume_emission = weighted_volume_channels(volume, |params| params.volume_emission);
     Some(medium)
+}
+
+/// The phase lobes of a voxel volume's Volume closures: each closure's share of the volume's scatter, its weight times its
+/// mean scatter over the total, with its own anisotropy. A volume without closures scatters isotropically.
+fn scatter_lobes(volume: &[ShaderClosure]) -> Vec<ScatterLobe> {
+    if volume.is_empty() {
+        return vec![ScatterLobe {
+            share: 1.0,
+            anisotropy: 0.0,
+        }];
+    }
+    let scatter: Vec<f64> = volume
+        .iter()
+        .map(|closure| closure.weight * mean_scatter(&closure.params))
+        .collect();
+    let total: f64 = scatter.iter().sum();
+    volume
+        .iter()
+        .zip(scatter)
+        .map(|(closure, scatter)| ScatterLobe {
+            share: if total > 0.0 { scatter / total } else { 0.0 },
+            anisotropy: closure.params.volume_anisotropy,
+        })
+        .collect()
 }
 
 /// `Σ weight · channel` over the volume closures, per colour channel.
@@ -3945,6 +4024,10 @@ fn collect_volumes<'a>(
                 && material.volume_density.is_finite()
                 && material.volume_density > 0.0
         });
+        let lobes = match &evaluated_material {
+            Some(shading) => scatter_lobes(&shading.volume),
+            None => scatter_lobes(&[]),
+        };
         let params = evaluated_material.and_then(|shading| volume_medium(&shading.volume));
         // Cycles' absolute coefficients (`BsdfParams`): a material volume's σs and σa, or, for a
         // material without a volume output, unit grey absorption. No material is the Principled
@@ -4033,7 +4116,7 @@ fn collect_volumes<'a>(
             meters_per_unit,
             density_range,
             albedo,
-            anisotropy: params.map_or(0.0, |params| params.volume_anisotropy),
+            lobes,
             emission,
             scattering,
             extinction_scale,
@@ -4411,13 +4494,13 @@ fn voxel_grid(
         .first()
         .map_or(1.0, |instance| instance.meters_per_unit);
     let mut groups: Vec<ScatterGroup> = Vec::new();
-    for instance in volumes {
+    for lobe in volumes.iter().flat_map(|instance| instance.lobes.iter()) {
         if !groups
             .iter()
-            .any(|group| crate::float::equal_f64(group.anisotropy, instance.anisotropy))
+            .any(|group| crate::float::equal_f64(group.anisotropy, lobe.anisotropy))
         {
             groups.push(ScatterGroup {
-                anisotropy: instance.anisotropy,
+                anisotropy: lobe.anisotropy,
                 scatter: vec![DVec3::ZERO; steps],
             });
         }
@@ -4436,11 +4519,13 @@ fn voxel_grid(
             step_extinction += coefficient;
             step_emission += instance.emission;
             *step_total += step_scatter;
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|group| crate::float::equal_f64(group.anisotropy, instance.anisotropy))
-            {
-                group.scatter[index] += step_scatter;
+            for lobe in &instance.lobes {
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| crate::float::equal_f64(group.anisotropy, lobe.anisotropy))
+                {
+                    group.scatter[index] += step_scatter * lobe.share;
+                }
             }
         }
         extinction.push(step_extinction);
@@ -4660,7 +4745,6 @@ fn trace_volume_segment(
                 VolumeEvent {
                     point: event_point,
                     albedo: DVec3::ZERO,
-                    anisotropy: 0.0,
                 },
                 |instance| VolumeEvent {
                     point: event_point,
@@ -4669,7 +4753,6 @@ fn trace_volume_segment(
                     } else {
                         DVec3::ZERO
                     },
-                    anisotropy: instance.anisotropy,
                 },
             );
             return Ok(VolumeSegment {
@@ -5057,7 +5140,7 @@ mod volume_extinction_tests {
             meters_per_unit: 0.5,
             density_range: Some((1.0, 1.0)),
             albedo: DVec3::ZERO,
-            anisotropy: 0.0,
+            lobes: scatter_lobes(&[]),
             emission: DVec3::ZERO,
             scattering: false,
             extinction_scale: 1.0,
@@ -5259,6 +5342,35 @@ mod sampling_tests {
     use super::*;
     use crate::model::Material;
 
+    #[test]
+    fn a_voxel_volume_keeps_one_phase_lobe_per_closure() {
+        // Each closure's share of the scatter is its weight times its mean scatter over the total: 1 and 3 of 4.
+        let material = Material::default();
+        let mut forward = BsdfParams::from_material(&material, DVec3::Z);
+        forward.volume_scatter = [1.0; 3];
+        forward.volume_anisotropy = 0.8;
+        let mut backward = forward;
+        backward.volume_scatter = [3.0; 3];
+        backward.volume_anisotropy = -0.5;
+        let lobes = scatter_lobes(&[
+            ShaderClosure {
+                weight: 1.0,
+                params: forward,
+            },
+            ShaderClosure {
+                weight: 1.0,
+                params: backward,
+            },
+        ]);
+        assert_eq!(lobes.len(), 2);
+        assert_eq!((lobes[0].share, lobes[0].anisotropy), (0.25, 0.8));
+        assert_eq!((lobes[1].share, lobes[1].anisotropy), (0.75, -0.5));
+        // A volume without closures scatters isotropically.
+        let isotropic = scatter_lobes(&[]);
+        assert_eq!(isotropic.len(), 1);
+        assert_eq!((isotropic[0].share, isotropic[0].anisotropy), (1.0, 0.0));
+    }
+
     /// The mean of a reflective draw's weight (`f · cos / p_mix`, from `Closures::reflect`) over the sampler's own directions is the
     /// integral of `f · cos` over the hemisphere, if the mixture density the sampler reports matches
     /// how it draws the directions. At metallic 0.5 all three branches contribute, so a wrong
@@ -5290,9 +5402,11 @@ mod sampling_tests {
                         theta.cos(),
                     );
                     let cosine = light.dot(normal);
-                    total +=
-                        evaluate_bsdf(&params, &layers_at(&params, normal, view, normal), light)
-                            * (cosine * theta.sin() * d_theta * d_phi);
+                    total += evaluate_bsdf(
+                        &params,
+                        &layers_at(&params, normal, view, normal, true),
+                        light,
+                    ) * (cosine * theta.sin() * d_theta * d_phi);
                 }
             }
             total
@@ -5303,9 +5417,10 @@ mod sampling_tests {
         let samples = 400_000_usize;
         let mut rng = Pcg32::for_sample(1, 0, 0, 0);
         let closures = Closures::new(
-            vec![HitClosure::new(1.0, &params, view, normal)],
+            vec![HitClosure::new(1.0, &params, view, normal, true)],
             normal,
             normal,
+            true,
         );
         let mut sum = DVec3::ZERO;
         let mut sum_squares = DVec3::ZERO;

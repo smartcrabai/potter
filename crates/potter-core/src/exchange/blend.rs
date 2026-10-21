@@ -3373,6 +3373,10 @@ fn build_imported_graph(
                     .get("use_transparent_shadow")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                use_bump_map_correction: item
+                    .get("use_bump_map_correction")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
                 displacement_scale: number_field(item, "displacement_scale", 1.0),
                 displacement_midlevel: number_field(item, "displacement_midlevel", 0.5),

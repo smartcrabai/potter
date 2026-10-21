@@ -45,6 +45,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "roughness",
             "double_sided",
             "use_transparent_shadow",
+            "use_bump_map_correction",
             "emission_color",
             "emission_strength",
             "transmission",
@@ -172,6 +173,10 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         material.use_transparent_shadow =
             read_bool(engine, operation, "use_transparent_shadow", true)?;
     }
+    if operation.contains_key("use_bump_map_correction") {
+        material.use_bump_map_correction =
+            read_bool(engine, operation, "use_bump_map_correction", true)?;
+    }
     if let Some(value) = operation.get("emission_color") {
         material.emission_color = read_emission_color(
             engine,
@@ -270,6 +275,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "roughness",
             "double_sided",
             "use_transparent_shadow",
+            "use_bump_map_correction",
             "emission_color",
             "emission_strength",
             "transmission",
@@ -385,6 +391,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                     ErrorCode::InvalidOperation,
                     "use_transparent_shadow must be a boolean",
                     &operation_pointer(engine.operation_index, "set/use_transparent_shadow"),
+                )
+            })
+        })
+        .transpose()?;
+    let use_bump_map_correction = set
+        .get("use_bump_map_correction")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "use_bump_map_correction must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/use_bump_map_correction"),
                 )
             })
         })
@@ -569,6 +587,12 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && material.use_transparent_shadow != value
             {
                 material.use_transparent_shadow = value;
+                item_changed = true;
+            }
+            if let Some(value) = use_bump_map_correction
+                && material.use_bump_map_correction != value
+            {
+                material.use_bump_map_correction = value;
                 item_changed = true;
             }
             if let Some(value) = &base_color_texture

@@ -403,7 +403,8 @@ pub(crate) struct Layers {
 /// Sets up the sheen and coat layers of a shading point with normal `normal`, seen along `view`. The geometric normal
 /// is taken as `normal` itself, so nothing is bent. Use [`layers_at`] where the geometric normal is known.
 pub(crate) fn layers(params: &BsdfParams, normal: DVec3, view: DVec3) -> Layers {
-    layers_at(params, normal, view, normal)
+    // The normals coincide, so `use_bump_map_correction` has nothing to bend and takes its default.
+    layers_at(params, normal, view, normal, true)
 }
 
 /// `layers` at a point whose geometric normal is `geometric` (Cycles' `sd->Ng`). The specular, coat and glass
@@ -413,9 +414,15 @@ pub(crate) fn layers_at(
     normal: DVec3,
     view: DVec3,
     geometric: DVec3,
+    bump_correction: bool,
 ) -> Layers {
-    let specular = valid_specular_normal(geometric, normal, view);
-    let coat_normal = valid_specular_normal(geometric, params.coat_normal_or_shading(), view);
+    let specular = valid_specular_normal(geometric, normal, view, bump_correction);
+    let coat_normal = valid_specular_normal(
+        geometric,
+        params.coat_normal_or_shading(),
+        view,
+        bump_correction,
+    );
     let coat = coat_layer(params, coat_normal, view);
     // Cycles sets the sheen's normal to `safe_normalize(mix(N, coat normal, saturate(coat weight)))`
     // (`kernel/svm/closure.h`, `principled_bsdf_emission`), so the sheen frame and LTC follow the coat.
@@ -442,12 +449,16 @@ pub(crate) fn layers_at(
     }
 }
 
-/// Cycles' `maybe_ensure_valid_specular_reflection` (`kernel/closure/bsdf_util.h:399-409`): `normal`, unless it is the
-/// geometric normal. Cycles applies it to every closure that reflects specularly (the Principled specular, coat and
-/// glass, and the Glossy and Glass nodes), and its `SD_USE_BUMP_MAP_CORRECTION` flag is on by default
-/// (`scene/shader.cpp`), so it always applies here.
-pub(crate) fn valid_specular_normal(geometric: DVec3, normal: DVec3, view: DVec3) -> DVec3 {
-    if normal == geometric {
+/// Cycles' `maybe_ensure_valid_specular_reflection` (`kernel/closure/bsdf_util.h:399-409`): `normal`, unless the material's
+/// `use_bump_map_correction` is off or `normal` is the geometric normal. Cycles applies it to every closure that
+/// reflects specularly (the Principled specular, coat and glass, and the Glossy and Glass nodes).
+pub(crate) fn valid_specular_normal(
+    geometric: DVec3,
+    normal: DVec3,
+    view: DVec3,
+    bump_correction: bool,
+) -> DVec3 {
+    if !bump_correction || normal == geometric {
         return normal;
     }
     ensure_valid_specular_reflection(geometric, view, normal)
@@ -2189,7 +2200,7 @@ mod subsurface_tests {
         let reflect = |normal: DVec3| 2.0 * normal.dot(view) * normal - view;
         let threshold = (0.9 * view.dot(geometric)).min(0.01);
         assert!(geometric.dot(reflect(tilted)) < threshold);
-        let bent = valid_specular_normal(geometric, tilted, view);
+        let bent = valid_specular_normal(geometric, tilted, view, true);
         assert!(
             geometric.dot(reflect(bent)) >= threshold - 1.0e-9,
             "the lifted reflection {} is below the threshold {threshold}",
@@ -2200,8 +2211,16 @@ mod subsurface_tests {
             "the normal rises towards Ng"
         );
         // A normal whose reflection is already above the threshold, and the geometric normal itself, are unchanged.
-        assert_eq!(valid_specular_normal(geometric, DVec3::Z, view), DVec3::Z);
-        assert_eq!(valid_specular_normal(geometric, view, view), view);
+        assert_eq!(
+            valid_specular_normal(geometric, DVec3::Z, view, true),
+            DVec3::Z
+        );
+        assert_eq!(valid_specular_normal(geometric, view, view, true), view);
+        // With `use_bump_map_correction` off, the normal is kept as it is (`maybe_ensure_valid_specular_reflection`).
+        assert_eq!(
+            valid_specular_normal(geometric, tilted, view, false),
+            tilted
+        );
     }
 
     #[test]
