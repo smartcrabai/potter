@@ -426,8 +426,9 @@ def run_variant(v):
         objects=objects_doc,
         output=output,
     )
-    if any(t == "decimate" for t, _ in v["stack"]):
-        doc["input"]["blender_edge_order"] = [sorted(edge.vertices) for edge in ob.data.edges]
+    # Every variant: Blender's stored edge order (its edge indices), which bevel's start edge and
+    # boundary faces depend on. Potter rebuilds the input mesh in this order.
+    doc["input"]["blender_edge_order"] = [sorted(edge.vertices) for edge in ob.data.edges]
     return doc, debug
 
 
