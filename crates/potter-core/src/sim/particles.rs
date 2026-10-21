@@ -737,22 +737,7 @@ fn simulate_with_lifecycle(
             if !start.is_finite() || !velocity.is_finite() {
                 return Err(invalid("particle emission produced a non-finite value"));
             }
-            let birth_rotation = if !from_vertex && !from_volume {
-                emitter_root_frame(start.to_array(), world, &triangles).map_or_else(
-                    || {
-                        if normal.length_squared() > f64::EPSILON {
-                            DQuat::from_rotation_arc(DVec3::X, normal.normalize()).to_array()
-                        } else {
-                            DQuat::IDENTITY.to_array()
-                        }
-                    },
-                    |(rotation, _)| rotation,
-                )
-            } else if normal.length_squared() > f64::EPSILON {
-                DQuat::from_rotation_arc(DVec3::X, normal.normalize()).to_array()
-            } else {
-                DQuat::IDENTITY.to_array()
-            };
+            let birth_rotation = blender_velocity_orientation(velocity.to_array());
             Some((start, velocity, normal, birth_rotation))
         } else {
             None
@@ -1659,6 +1644,34 @@ pub(super) fn sample_path(
         rotation: rotation.to_array(),
     })
 }
+/// Blender's default `PART_ROT_VEL` particle orientation (`particle_system.cc`):
+/// `vec_to_quat(-(-velocity), OB_POSX, OB_POSZ)`, so local +X follows the velocity and the
+/// twist about X keeps local +Z as upward as possible. Zero velocity keeps the identity.
+pub(super) fn blender_velocity_orientation(velocity: [f64; 3]) -> [f64; 4] {
+    const EPSILON: f64 = 1.0e-4;
+    let tvec = DVec3::from_array(velocity);
+    let length = tvec.length();
+    if !(length.is_finite() && length > 0.0) {
+        return DQuat::IDENTITY.to_array();
+    }
+    let mut nor = DVec3::new(0.0, -tvec.z, tvec.y);
+    if tvec.y.abs() + tvec.z.abs() < EPSILON {
+        nor.y = 1.0;
+    }
+    let swing = DQuat::from_axis_angle(nor.normalize(), (tvec.x / length).clamp(-1.0, 1.0).acos());
+    // Blender reads the Z column of the swing (`mat[2]`) to pick the twist.
+    let up = swing * DVec3::Z;
+    let twist_angle = -0.5 * up.y.atan2(up.z);
+    let (sin, cos) = twist_angle.sin_cos();
+    let twist = DQuat::from_xyzw(
+        tvec.x * sin / length,
+        tvec.y * sin / length,
+        tvec.z * sin / length,
+        cos,
+    );
+    (twist * swing).to_array()
+}
+
 fn emitter_root_frame(
     root_world: [f64; 3],
     world: DMat4,

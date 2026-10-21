@@ -254,7 +254,7 @@ fn particle_orientation(normal: [f64; 3]) -> [f64; 4] {
 fn particle_state(particle: particles::Particle, system_index: u32) -> ParticleState {
     // Hair path keys carry Bishop frames, not the current Hair particle orientation.
     let rotation = if particle.path.is_empty() {
-        particle_orientation(particle.normal)
+        particles::blender_velocity_orientation(particle.velocity)
     } else {
         match particle.path_interpolation {
             ParticlePathInterpolation::HairCardinal
@@ -1560,7 +1560,7 @@ fn setting_color(settings: &Value) -> Option<[f64; 4]> {
 }
 #[cfg(test)]
 mod tests {
-    use glam::DQuat;
+    use glam::{DQuat, DVec3};
 
     use super::{
         ParticleLifeState, ParticlePathInterpolation, ParticlePathKey, ParticleState,
@@ -1658,7 +1658,17 @@ mod tests {
         );
         let normal_orientation = particle_orientation([0.0, 0.0, 1.0]);
         assert_eq!(linear.rotation, normal_orientation);
-        let no_path = particle_state(
+        let mut moving = particle_for_state(
+            ParticlePathInterpolation::HairCache,
+            Vec::new(),
+            birth_rotation,
+            current_path_rotation,
+        );
+        moving.velocity = [1.0, 2.0, 3.0];
+        let heading = DVec3::new(1.0, 2.0, 3.0).normalize();
+        let oriented = DQuat::from_array(particle_state(moving, 0).rotation);
+        assert!((oriented * DVec3::X - heading).length() < 1.0e-12);
+        let stationary = particle_state(
             particle_for_state(
                 ParticlePathInterpolation::HairCache,
                 Vec::new(),
@@ -1667,6 +1677,6 @@ mod tests {
             ),
             0,
         );
-        assert_eq!(no_path.rotation, normal_orientation);
+        assert_eq!(stationary.rotation, DQuat::IDENTITY.to_array());
     }
 }
