@@ -11,7 +11,7 @@ use crate::{
     geom::{
         Edge, Face, Mesh, Vertex, edge_key,
         vdb::{VdbGrid, VdbValue, VdbVolume},
-        volume::{VolumeData, VolumeGeneratedSource, VolumeGrid, VolumeSource},
+        volume::{VolumeData, VolumeGrid, VolumeSource},
     },
     sim::ParticleState,
 };

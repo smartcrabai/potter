@@ -426,6 +426,9 @@ fn volume_to_mesh_for_grid(
             "adaptivity must be finite and between 0 and 1",
         ));
     }
+    // Blender passes the threshold as a `float` (`volumeToMesh(..., const float threshold, ...)`), so
+    // OpenVDB's double isovalue is the single-precision value; the edge fractions use that value.
+    let iso_level = f64::from(iso_level as f32);
     let adaptivity = adaptivity as f32;
     if matches!(&volume.source, VolumeSource::File(_)) {
         let decoded = volume
@@ -1986,7 +1989,9 @@ fn narrow_band_squared_distances(
         let prim = u32::try_from(triangle_index).map_err(|_| resource_error())?;
         // Keeps the nearer triangle, and the smaller triangle index on an exact tie (`updateDistance`).
         let record = |index: usize, distance: f64, squared: &mut [f64], primitive: &mut [u32]| {
-            if distance < squared[index] || (distance == squared[index] && prim < primitive[index])
+            // OpenVDB compares exactly (`isExactlyEqual`), so the tie test is on the bit pattern.
+            if distance < squared[index]
+                || (distance.to_bits() == squared[index].to_bits() && prim < primitive[index])
             {
                 squared[index] = distance;
                 primitive[index] = prim;

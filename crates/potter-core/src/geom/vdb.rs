@@ -139,24 +139,27 @@ impl VdbTree {
 
     /// A tree with this background whose only voxels are `values`, with tight active bounds.
     pub(crate) fn with_samples(&self, values: HashMap<IVec3, VdbValue>) -> Self {
-        let active_bbox = values.keys().fold(None, |bounds, point| {
-            let point = point.to_array();
-            Some(match bounds {
-                None => (point, point),
-                Some((minimum, maximum)) => (
-                    [
-                        minimum[0].min(point[0]),
-                        minimum[1].min(point[1]),
-                        minimum[2].min(point[2]),
-                    ],
-                    [
-                        maximum[0].max(point[0]),
-                        maximum[1].max(point[1]),
-                        maximum[2].max(point[2]),
-                    ],
-                ),
-            })
-        });
+        let active_bbox =
+            values
+                .keys()
+                .fold(None, |bounds: Option<([i32; 3], [i32; 3])>, point| {
+                    let point = point.to_array();
+                    Some(match bounds {
+                        None => (point, point),
+                        Some((minimum, maximum)) => (
+                            [
+                                minimum[0].min(point[0]),
+                                minimum[1].min(point[1]),
+                                minimum[2].min(point[2]),
+                            ],
+                            [
+                                maximum[0].max(point[0]),
+                                maximum[1].max(point[1]),
+                                maximum[2].max(point[2]),
+                            ],
+                        ),
+                    })
+                });
         Self {
             background: self.background,
             background_value: self.background_value,

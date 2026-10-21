@@ -4797,7 +4797,45 @@ pub(crate) fn apply_volume_to_mesh_modifier(
         ));
     }
     let volume_to_mesh = source_inverse * volume_world;
-    let mut extracted = crate::geom::volume::volume_to_mesh(volume, threshold)?;
+    let grid_name = match modifier.params.get("grid_name") {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh grid_name must be a string",
+                    json!({"modifier_id":modifier.id,"parameter":"grid_name"}),
+                )
+            })?
+            .to_owned(),
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "grid_name",
+        )
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("density")
+        .to_owned(),
+    };
+    let adaptivity = match modifier.params.get("adaptivity") {
+        Some(value) => value.as_f64().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh adaptivity must be a number",
+                json!({"modifier_id":modifier.id,"parameter":"adaptivity"}),
+            )
+        })?,
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "adaptivity",
+        )
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0),
+    };
+    let mut extracted = crate::geom::volume::volume_to_mesh_named_adaptive(
+        volume, threshold, &grid_name, adaptivity,
+    )?;
     for vertex in &mut extracted.vertices {
         vertex.co = volume_to_mesh.transform_point3(vertex.co);
         if !vertex.co.is_finite() {

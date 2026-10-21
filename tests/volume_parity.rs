@@ -25,6 +25,23 @@ use tempfile::tempdir;
 
 const F32_POSITION_TOLERANCE_ULPS: f64 = 1.0;
 
+/// Blender's `image.pixels` lists rows bottom-up, while Potter stores image rows top-down (PNG order),
+/// so the Blender fixture's pixels are reversed row by row before encoding. Blender's float image
+/// (`float_buffer=True`) holds each component as `f32`, so the values are rounded to `f32` as well.
+fn potter_rows_from_blender(width: usize, height: usize, pixels: &[[f64; 4]]) -> Vec<[f64; 4]> {
+    assert_eq!(
+        pixels.len(),
+        width * height,
+        "fixture pixel count matches its size"
+    );
+    pixels
+        .chunks(width)
+        .rev()
+        .flatten()
+        .map(|pixel| pixel.map(|component| f64::from(component as f32)))
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct OracleFile {
     blender_version: String,
@@ -366,7 +383,7 @@ struct BandExpansionCounts {
     polygon_count: usize,
 }
 
-/// A Mesh to Volume interior band wider than two voxels takes OpenVDB's narrow-band expansion
+/// A Mesh to Volume interior band wider than two voxels takes `OpenVDB`'s narrow-band expansion
 /// (`meshToVolume`, `minBandWidth = 2 * voxelSize`). The 0.8 band at voxel 0.25 (3.2 voxels) is
 /// expanded and the 0.2 band (one voxel) is not; Blender's Volume to Mesh counts differ at 0.35
 /// (`tests/fixtures/pr18o_volume/generate_band_expansion.py`).
@@ -765,7 +782,11 @@ fn blender_volume_displace_image_mapping_modes_match_full_mesh_fixtures() {
     let pixels = encode_pixels(
         oracle.image_width,
         oracle.image_height,
-        &oracle.image_pixels,
+        &potter_rows_from_blender(
+            usize::try_from(oracle.image_width).expect("image width"),
+            usize::try_from(oracle.image_height).expect("image height"),
+            &oracle.image_pixels,
+        ),
     )
     .expect("valid Blender gradient image pixels");
     let image_blob = hash::sha256(&pixels);
@@ -843,7 +864,11 @@ fn blender_multigrid_vdb_displacement_preserves_named_grid_types_and_samples() {
     let image_bytes = encode_pixels(
         oracle.texture.width,
         oracle.texture.height,
-        &oracle.texture.pixels,
+        &potter_rows_from_blender(
+            usize::try_from(oracle.texture.width).expect("texture width"),
+            usize::try_from(oracle.texture.height).expect("texture height"),
+            &oracle.texture.pixels,
+        ),
     )
     .expect("valid gradient image pixels");
     let image_hash = hash::sha256(&image_bytes);
