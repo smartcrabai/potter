@@ -2575,14 +2575,16 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             }),
         )?;
         let texture = ResolvedTexture::from_image(image.clone());
-        let texture_mapping = TextureCoordinateMapping {
-            subject_to_world_f32: subject_world.to_cols_array().map(|value| value as f32),
-            world_to_mapping_f32: (mapping == "OBJECT").then(|| {
-                map_object_world
-                    .inverse()
-                    .to_cols_array()
-                    .map(|value| value as f32)
-            }),
+        let texture_mapping = if mapping == "OBJECT" {
+            potter_core::eval::object_texture_mapping(
+                subject_world,
+                map_object_world.to_cols_array().map(|value| value as f32),
+            )?
+        } else {
+            TextureCoordinateMapping {
+                subject_to_world_f32: subject_world.to_cols_array().map(|value| value as f32),
+                world_to_mapping_f32: None,
+            }
         };
         let masked = evaluate_attribute(
             &mask_mesh,

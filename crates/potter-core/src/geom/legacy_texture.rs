@@ -299,7 +299,10 @@ enum ResolvedTextureKind {
     Legacy(LegacyTexture),
 }
 impl ResolvedTexture {
-    /// A texture for an image already in memory, sampled with Blender's default image settings.
+    /// A texture for an image already in memory, sampled as Blender's default image Tex is: the
+    /// `DNA_texture_types.h` defaults (`extend = TEX_REPEAT`, `imaflag = TEX_INTERPOL | TEX_USEALPHA`,
+    /// `flag = TEX_CHECKER_ODD | TEX_NO_CLAMP`), read through `BKE_texture_get_value` as in
+    /// `MOD_weightvg_util.cc:166`.
     #[must_use]
     pub fn from_image(image: ImageData) -> Self {
         Self {

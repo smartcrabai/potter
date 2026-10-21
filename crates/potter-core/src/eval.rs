@@ -6430,6 +6430,27 @@ fn texture_coordinate_mapping(
     )
 }
 
+/// The OBJECT texture mapping for a mapping object whose f32 world matrix is `mapping_world`.
+/// `world_to_mapping` is Blender's f32 `invert_m4_m4` of that matrix (`blender_invert_m4`), and the
+/// subject's f32 transform is the first stage; a singular mapping transform is an error.
+pub fn object_texture_mapping(
+    subject_world: DMat4,
+    mapping_world: [f32; 16],
+) -> Result<TextureCoordinateMapping> {
+    let world_to_mapping_f32 = crate::geom::blender_matrix::blender_invert_m4(
+        &glam::Mat4::from_cols_array(&mapping_world).to_cols_array_2d(),
+    )
+    .map(|inverse| glam::Mat4::from_cols_array_2d(&inverse).to_cols_array())
+    .filter(|inverse| inverse.iter().all(|value| value.is_finite()))
+    .ok_or_else(|| {
+        PotError::invalid_argument("texture coordinate mapping transform must be invertible")
+    })?;
+    Ok(TextureCoordinateMapping {
+        subject_to_world_f32: subject_world.to_cols_array().map(|value| value as f32),
+        world_to_mapping_f32: Some(world_to_mapping_f32),
+    })
+}
+
 pub(crate) fn texture_coordinate_mapping_with_parameters(
     modifier: &Modifier,
     subject_world: DMat4,
@@ -6440,32 +6461,22 @@ pub(crate) fn texture_coordinate_mapping_with_parameters(
     object_parameter: &str,
     bone_parameter: Option<&str>,
 ) -> Result<Option<TextureCoordinateMapping>> {
-    let mut mapping = TextureCoordinateMapping::for_subject_world(subject_world);
+    let mapping = TextureCoordinateMapping::for_subject_world(subject_world);
     match modifier_str_param(modifier, mapping_parameter)? {
         "LOCAL" | "GLOBAL" => Ok(Some(mapping)),
         "OBJECT" => {
-            if let Some(object_id) = reference_object_id(modifier, object_parameter, doc)? {
-                let mapping_world = reference_world_matrix_f32_with_bone_fallback(
-                    modifier,
-                    &object_id,
-                    bone_parameter,
-                    doc,
-                    world_matrices,
-                    bone_pose_matrices,
-                )?;
-                let world_to_mapping_f32 = crate::geom::blender_matrix::blender_invert_m4(
-                    &glam::Mat4::from_cols_array(&mapping_world).to_cols_array_2d(),
-                )
-                .map(|inverse| glam::Mat4::from_cols_array_2d(&inverse).to_cols_array())
-                .filter(|inverse| inverse.iter().all(|value| value.is_finite()));
-                let Some(world_to_mapping_f32) = world_to_mapping_f32 else {
-                    return Err(PotError::invalid_argument(
-                        "texture coordinate mapping transform must be invertible",
-                    ));
-                };
-                mapping.world_to_mapping_f32 = Some(world_to_mapping_f32);
-            }
-            Ok(Some(mapping))
+            let Some(object_id) = reference_object_id(modifier, object_parameter, doc)? else {
+                return Ok(Some(mapping));
+            };
+            let mapping_world = reference_world_matrix_f32_with_bone_fallback(
+                modifier,
+                &object_id,
+                bone_parameter,
+                doc,
+                world_matrices,
+                bone_pose_matrices,
+            )?;
+            object_texture_mapping(subject_world, mapping_world).map(Some)
         }
         "UV" => Ok(None),
         _ => Err(invalid_reference(
