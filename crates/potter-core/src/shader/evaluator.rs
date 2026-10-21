@@ -40,12 +40,8 @@ pub(crate) fn principled_glass_tint(base: [f64; 4]) -> [f64; 3] {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 5] {
+) -> [Option<(&'static str, &'static str)>; 4] {
     [
-        (params.subsurface_weight > 0.0)
-            .then(|| params.subsurface_method.unsupported_feature())
-            .flatten()
-            .map(|feature_id| (feature_id, "Subsurface Weight")),
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
         (params.thin_film_thickness > 0.0)
             .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
@@ -137,24 +133,12 @@ enum VolumeClosure {
 }
 
 /// Cycles' subsurface method, the Principled node's `subsurface_method` property (`node_shader_bsdf_principled.cc`,
-/// `CLOSURE_BSSRDF_*_ID`). The default is random walk. `Mixed` marks a Mix or Add of two arms that use different
-/// methods, which Potter's single parameter set cannot hold.
+/// `CLOSURE_BSSRDF_*_ID`). The default is random walk. Each method is its own closure: a Mix or Add of two arms with
+/// different methods keeps both closures, so there is no mixed method.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SubsurfaceMethod {
     Burley,
     #[default]
-    RandomWalk,
-    RandomWalkSkin,
-    RandomWalkLegacy,
-    Mixed,
-}
-
-/// A subsurface method Potter evaluates, each with its own Cycles closure. The Principled node's `SubsurfaceMethod`
-/// names one of these, or `Mixed`, which has none. A sampled subsurface closure carries one of these, so the sampler
-/// and the exit cannot meet a method Potter does not evaluate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EvaluatedSubsurfaceMethod {
-    Burley,
     RandomWalk,
     RandomWalkSkin,
     RandomWalkLegacy,
@@ -169,39 +153,6 @@ impl SubsurfaceMethod {
             "RANDOM_WALK_SKIN" => Some(Self::RandomWalkSkin),
             "RANDOM_WALK_LEGACY" => Some(Self::RandomWalkLegacy),
             _ => None,
-        }
-    }
-
-    /// The evaluated method this one names, or `None` for `Mixed`, which Potter cannot hold in one parameter set.
-    pub(crate) fn evaluated(self) -> Option<EvaluatedSubsurfaceMethod> {
-        match self {
-            Self::Burley => Some(EvaluatedSubsurfaceMethod::Burley),
-            Self::RandomWalk => Some(EvaluatedSubsurfaceMethod::RandomWalk),
-            Self::RandomWalkSkin => Some(EvaluatedSubsurfaceMethod::RandomWalkSkin),
-            Self::RandomWalkLegacy => Some(EvaluatedSubsurfaceMethod::RandomWalkLegacy),
-            Self::Mixed => None,
-        }
-    }
-
-    /// The feature id Potter reports for a method it does not evaluate. Only `Mixed` is reported: the four named
-    /// methods are evaluated.
-    pub(crate) fn unsupported_feature(self) -> Option<&'static str> {
-        match self {
-            Self::Mixed => Some("shader.principled.subsurface_method.mixed"),
-            Self::Burley | Self::RandomWalk | Self::RandomWalkSkin | Self::RandomWalkLegacy => None,
-        }
-    }
-
-    /// The method of a Mix or Add of two arms: the one method a subsurface arm uses, or `Mixed` when both arms have
-    /// subsurface scattering with different methods. An arm without subsurface scattering takes no part.
-    fn of_arms(first: &BsdfParams, second: &BsdfParams) -> Self {
-        match (
-            first.subsurface_weight > 0.0,
-            second.subsurface_weight > 0.0,
-        ) {
-            (true, true) if first.subsurface_method != second.subsurface_method => Self::Mixed,
-            (false, true) => second.subsurface_method,
-            _ => first.subsurface_method,
         }
     }
 }
@@ -227,9 +178,9 @@ pub struct BsdfParams {
     /// pass-through multiplies by this tint and a shadow ray's transmittance is `(1 - alpha) * tint`
     /// (`render/path.rs`). Non-transparent closures keep white.
     pub transparent_tint: [f64; 3],
-    /// Weight of the reflective closures (diffuse, specular, transmission, environment). Emission
-    /// contributes no reflection, so an Emission shader sets this to 0. Mix lerps it and Add sums
-    /// it, clamped to 1.
+    /// Weight of the reflective share of this closure (diffuse, specular, transmission, environment). Emission
+    /// contributes no reflection, so an Emission closure sets this to 0. Mix and Add scale the closure's weight
+    /// instead of this value.
     pub reflectance: f64,
     pub subsurface_weight: f64,
     pub subsurface_radius: [f64; 3],
@@ -264,8 +215,8 @@ pub struct BsdfParams {
     /// closure. Potter evaluates that closure's diffuse reflection (`subsurface_share`), but not its translucent
     /// transmission (`bsdf_thin_subsurface_setup`), so the input is reported as unevaluated.
     pub thin_wall: bool,
-    /// Cycles' scattering coefficient σs per channel, absolute: each closure's scatter weight times
-    /// its Density. Add Shader sums it and Mix Shader mixes it per closure, as Cycles weights closures.
+    /// Cycles' scattering coefficient σs per channel, absolute: the volume closure's scatter weight times its
+    /// Density. The medium sums the volume closures by their weights (`SurfaceShading::volume`).
     pub volume_scatter: [f64; 3],
     /// Cycles' absorption coefficient σa per channel, with the rule of `volume_scatter`. Extinction
     /// is σt = σs + σa, and the albedo is σs / σt.
@@ -281,45 +232,47 @@ pub struct BsdfParams {
     pub normal: DVec3,
 }
 
-/// One layered closure's parameters, as Mix and Add combine them.
-#[derive(Clone, Copy)]
-struct LayerSide {
-    weight: f64,
-    tint: [f64; 3],
-    roughness: f64,
-    normal: DVec3,
+/// One closure of a surface, weighted as Cycles weights closures (`closure_alloc`): `weight` is the share of
+/// the hit the closure takes, and `params` is the closure's own parameter set, with its own normal, roughness
+/// and layers. Mix Shader and Add Shader never blend parameters: they scale and concatenate closures.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShaderClosure {
+    pub weight: f64,
+    pub params: BsdfParams,
 }
 
-/// The one rule for layered-lobe parameters under Mix and Add. Each side's layer enters with its
-/// share (`1 - f` and `f` for Mix, 1 and 1 for Add). The combined weight is the sum of the scaled
-/// weights, so `weight · tint` adds as the closures do. The tint, roughness and normal are averages
-/// weighted by the same scaled weights. With no weight on either side, the first side's values stand.
-fn combine_layers(
-    first: LayerSide,
-    first_share: f64,
-    second: LayerSide,
-    second_share: f64,
-) -> LayerSide {
-    let first_term = first_share * first.weight.max(0.0);
-    let second_term = second_share * second.weight.max(0.0);
-    let weight = first_term + second_term;
-    if weight <= 0.0 {
-        return LayerSide { weight, ..first };
+/// The shading of one hit: the surface's closures and the volume closures of its Volume output. Cycles
+/// sums volume closures, so the medium is built from their weighted coefficients.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceShading {
+    pub closures: Vec<ShaderClosure>,
+    pub volume: Vec<ShaderClosure>,
+    /// The Displacement output's height along the hit normal.
+    pub displacement_height: f64,
+}
+
+impl SurfaceShading {
+    /// The heaviest closure's parameters. A single-closure surface (any graph without Mix or Add, and every material
+    /// without a graph) has exactly its one closure here.
+    #[must_use]
+    pub fn dominant(&self) -> Option<&BsdfParams> {
+        heaviest(&self.closures, |closure| closure.weight).map(|closure| &closure.params)
     }
-    let average = |a: f64, b: f64| (first_term * a + second_term * b) / weight;
-    LayerSide {
-        weight,
-        tint: [
-            average(first.tint[0], second.tint[0]),
-            average(first.tint[1], second.tint[1]),
-            average(first.tint[2], second.tint[2]),
-        ],
-        roughness: average(first.roughness, second.roughness),
-        normal: normalize_or(
-            first.normal * first_term + second.normal * second_term,
-            first.normal,
-        ),
-    }
+}
+
+/// The heaviest item by its closure weight, the one Cycles' closure set takes its dominant normal from. `None` for no item.
+pub(crate) fn heaviest<T>(items: &[T], weight: impl Fn(&T) -> f64) -> Option<&T> {
+    items
+        .iter()
+        .max_by(|first, second| weight(first).total_cmp(&weight(second)))
+}
+
+/// The Vec form of a single node closure, for the surface and volume outputs.
+fn single_closure(params: &BsdfParams) -> Vec<ShaderClosure> {
+    vec![ShaderClosure {
+        weight: 1.0,
+        params: *params,
+    }]
 }
 
 impl BsdfParams {
@@ -380,38 +333,6 @@ impl BsdfParams {
         self.coat_normal.unwrap_or(self.normal)
     }
 
-    /// The coat as one layered closure, for `combine_layers`.
-    fn coat_layer(&self) -> LayerSide {
-        LayerSide {
-            weight: self.coat_weight,
-            tint: self.coat_tint,
-            roughness: self.coat_roughness,
-            normal: self.coat_normal_or_shading(),
-        }
-    }
-
-    /// The sheen as one layered closure, for `combine_layers`. Sheen has no normal of its own: the
-    /// combined normal is the coat's, so this normal is never read.
-    fn sheen_layer(&self) -> LayerSide {
-        LayerSide {
-            weight: self.sheen_weight,
-            tint: self.sheen_tint,
-            roughness: self.sheen_roughness,
-            normal: self.normal,
-        }
-    }
-
-    /// The glass tint as one layered closure, weighted by the arm's transmission, for `combine_layers`. A
-    /// non-glass arm has transmission 0 and so adds no tint.
-    fn glass_layer(&self, tint: [f64; 3]) -> LayerSide {
-        LayerSide {
-            weight: self.transmission,
-            tint,
-            roughness: self.roughness,
-            normal: self.normal,
-        }
-    }
-
     /// Whether the volume coefficients put a medium on the surface's path.
     pub(crate) fn has_medium(&self) -> bool {
         self.volume_scatter
@@ -419,214 +340,6 @@ impl BsdfParams {
             .chain(&self.volume_absorption)
             .any(|weight| *weight > 0.0)
     }
-
-    fn mix(first: Self, second: Self, factor: f64) -> Self {
-        let factor = bounded_factor(factor);
-        // Alpha is the share of rays that reach the surface's own shading (Cycles' Transparent closure carries only
-        // that share). The shading mixes the arms by their share of the hits, so a Transparent arm adds no colour,
-        // reflectance, or transmission.
-        let alpha = (1.0 - factor) * first.alpha + factor * second.alpha;
-        let shade = if alpha > 0.0 {
-            factor * second.alpha / alpha
-        } else {
-            factor
-        };
-        // Cycles weights each closure by its factor and its transparent weight is `(1 - alpha) * tint`, so the mixed
-        // transparency is the factor-weighted sum of the arms' transparencies (`tint_for_transparency`).
-        let transparency = std::array::from_fn(|channel| {
-            (1.0 - factor) * (1.0 - first.alpha) * first.transparent_tint[channel]
-                + factor * (1.0 - second.alpha) * second.transparent_tint[channel]
-        });
-        let transparent_tint = tint_for_transparency(alpha, transparency);
-        let mix_scalar = |a: f64, b: f64| a + (b - a) * shade;
-        let mix3 = |a: [f64; 3], b: [f64; 3]| {
-            [
-                mix_scalar(a[0], b[0]),
-                mix_scalar(a[1], b[1]),
-                mix_scalar(a[2], b[2]),
-            ]
-        };
-        let base_color = [
-            mix_scalar(first.base_color[0], second.base_color[0]),
-            mix_scalar(first.base_color[1], second.base_color[1]),
-            mix_scalar(first.base_color[2], second.base_color[2]),
-            mix_scalar(first.base_color[3], second.base_color[3]),
-        ];
-        // The coat and sheen are shading like every other field, so they take the same share of the hits
-        // (`shade`), not the raw factor: a Transparent arm then adds no coat or sheen, as it adds no colour.
-        let coat = combine_layers(first.coat_layer(), 1.0 - shade, second.coat_layer(), shade);
-        let sheen = combine_layers(
-            first.sheen_layer(),
-            1.0 - shade,
-            second.sheen_layer(),
-            shade,
-        );
-        // The glass tints take the coat's and sheen's weights: each arm's share of the hits times its transmission,
-        // so Mix(Glass, Glossy) keeps the glass tint at full strength (as Cycles' closure weights do).
-        let reflection = combine_layers(
-            first.glass_layer(first.glass_reflection_tint),
-            1.0 - shade,
-            second.glass_layer(second.glass_reflection_tint),
-            shade,
-        );
-        let refraction = combine_layers(
-            first.glass_layer(first.glass_transmission_tint),
-            1.0 - shade,
-            second.glass_layer(second.glass_transmission_tint),
-            shade,
-        );
-        Self {
-            base_color,
-            metallic: mix_scalar(first.metallic, second.metallic),
-            roughness: mix_scalar(first.roughness, second.roughness),
-            emission_color: mix3(first.emission_color, second.emission_color),
-            emission_strength: mix_scalar(first.emission_strength, second.emission_strength),
-            transmission: mix_scalar(first.transmission, second.transmission),
-            ior: mix_scalar(first.ior, second.ior),
-            glass_reflection_tint: reflection.tint,
-            glass_transmission_tint: refraction.tint,
-            back_facing: first.back_facing,
-            alpha,
-            transparent_tint,
-            reflectance: mix_scalar(first.reflectance, second.reflectance),
-            subsurface_weight: mix_scalar(first.subsurface_weight, second.subsurface_weight),
-            subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
-            subsurface_scale: mix_scalar(first.subsurface_scale, second.subsurface_scale),
-            subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
-            subsurface_ior: mix_scalar(first.subsurface_ior, second.subsurface_ior),
-            subsurface_anisotropy: mix_scalar(
-                first.subsurface_anisotropy,
-                second.subsurface_anisotropy,
-            ),
-            coat_weight: coat.weight,
-            coat_roughness: coat.roughness,
-            coat_ior: mix_scalar(first.coat_ior, second.coat_ior),
-            sheen_weight: sheen.weight,
-            sheen_roughness: sheen.roughness,
-            sheen_tint: sheen.tint,
-            specular_ior_level: mix_scalar(first.specular_ior_level, second.specular_ior_level),
-            specular_tint: mix3(first.specular_tint, second.specular_tint),
-            anisotropic_ior: mix_scalar(first.anisotropic_ior, second.anisotropic_ior),
-            anisotropic_rotation: mix_scalar(
-                first.anisotropic_rotation,
-                second.anisotropic_rotation,
-            ),
-            thin_film_thickness: mix_scalar(first.thin_film_thickness, second.thin_film_thickness),
-            thin_film_ior: mix_scalar(first.thin_film_ior, second.thin_film_ior),
-            diffuse_roughness: mix_scalar(first.diffuse_roughness, second.diffuse_roughness),
-            thin_wall: first.thin_wall || second.thin_wall,
-            volume_scatter: mix3(first.volume_scatter, second.volume_scatter),
-            volume_absorption: mix3(first.volume_absorption, second.volume_absorption),
-            volume_anisotropy: mix_scalar(first.volume_anisotropy, second.volume_anisotropy),
-            volume_emission: mix3(first.volume_emission, second.volume_emission),
-            volume_sampling: first.volume_sampling,
-            volume_interpolation: first.volume_interpolation,
-            displacement_height: mix_scalar(first.displacement_height, second.displacement_height),
-            normal: normalize_or(first.normal.lerp(second.normal, shade), first.normal),
-            coat_tint: coat.tint,
-            coat_normal: (first.coat_normal.is_some() || second.coat_normal.is_some())
-                .then_some(coat.normal),
-        }
-    }
-
-    fn add(first: Self, second: Self) -> Self {
-        let add3 = |a: [f64; 3], b: [f64; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
-        // The glass tints are summed with unit shares, weighted by transmission, as Add sums the closures' weights.
-        let reflection = combine_layers(
-            first.glass_layer(first.glass_reflection_tint),
-            1.0,
-            second.glass_layer(second.glass_reflection_tint),
-            1.0,
-        );
-        let refraction = combine_layers(
-            first.glass_layer(first.glass_transmission_tint),
-            1.0,
-            second.glass_layer(second.glass_transmission_tint),
-            1.0,
-        );
-        let coat = combine_layers(first.coat_layer(), 1.0, second.coat_layer(), 1.0);
-        let sheen = combine_layers(first.sheen_layer(), 1.0, second.sheen_layer(), 1.0);
-        Self {
-            base_color: [
-                first.base_color[0] + second.base_color[0],
-                first.base_color[1] + second.base_color[1],
-                first.base_color[2] + second.base_color[2],
-                first.base_color[3].max(second.base_color[3]),
-            ],
-            metallic: first.metallic.max(second.metallic),
-            roughness: first.roughness.min(second.roughness),
-            emission_color: add3(first.emission_color, second.emission_color),
-            emission_strength: first.emission_strength.max(second.emission_strength),
-            transmission: first.transmission.max(second.transmission),
-            ior: first.ior,
-            glass_reflection_tint: reflection.tint,
-            glass_transmission_tint: refraction.tint,
-            back_facing: first.back_facing,
-            // Add keeps alpha as the larger opacity (its shading is Potter's one-scalar blend), and sums the arms'
-            // transparent weights as Cycles sums closures. A fully opaque arm leaves no pass chance, so a transparent
-            // share beside it is dropped: the deviation the CHANGELOG records.
-            alpha: first.alpha.max(second.alpha),
-            transparent_tint: tint_for_transparency(
-                first.alpha.max(second.alpha),
-                std::array::from_fn(|channel| {
-                    (1.0 - first.alpha) * first.transparent_tint[channel]
-                        + (1.0 - second.alpha) * second.transparent_tint[channel]
-                }),
-            ),
-            reflectance: (first.reflectance + second.reflectance).min(1.0),
-            subsurface_weight: first.subsurface_weight.max(second.subsurface_weight),
-            subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
-            subsurface_scale: first.subsurface_scale.max(second.subsurface_scale),
-            subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
-            // Add has no single IOR or anisotropy for two closures: the arm with the larger subsurface weight gives them.
-            subsurface_ior: if second.subsurface_weight > first.subsurface_weight {
-                second.subsurface_ior
-            } else {
-                first.subsurface_ior
-            },
-            subsurface_anisotropy: if second.subsurface_weight > first.subsurface_weight {
-                second.subsurface_anisotropy
-            } else {
-                first.subsurface_anisotropy
-            },
-            coat_weight: coat.weight,
-            coat_roughness: coat.roughness,
-            coat_ior: first.coat_ior,
-            sheen_weight: sheen.weight,
-            sheen_roughness: sheen.roughness,
-            sheen_tint: sheen.tint,
-            specular_ior_level: first.specular_ior_level.max(second.specular_ior_level),
-            specular_tint: add3(first.specular_tint, second.specular_tint),
-            anisotropic_ior: first.anisotropic_ior.max(second.anisotropic_ior),
-            anisotropic_rotation: first.anisotropic_rotation,
-            thin_film_thickness: first.thin_film_thickness.max(second.thin_film_thickness),
-            thin_film_ior: first.thin_film_ior,
-            diffuse_roughness: first.diffuse_roughness.max(second.diffuse_roughness),
-            thin_wall: first.thin_wall || second.thin_wall,
-            volume_scatter: add3(first.volume_scatter, second.volume_scatter),
-            volume_absorption: add3(first.volume_absorption, second.volume_absorption),
-            volume_anisotropy: first.volume_anisotropy,
-            volume_sampling: first.volume_sampling,
-            volume_interpolation: first.volume_interpolation,
-            volume_emission: add3(first.volume_emission, second.volume_emission),
-            displacement_height: first.displacement_height + second.displacement_height,
-            normal: normalize_or(first.normal + second.normal, first.normal),
-            coat_tint: coat.tint,
-            coat_normal: (first.coat_normal.is_some() || second.coat_normal.is_some())
-                .then_some(coat.normal),
-        }
-    }
-}
-
-/// The transparent tint that gives a pass chance `1 - alpha` the expected throughput `transparency` (Cycles' summed
-/// transparent weight): `(1 - alpha) * tint = transparency`. A surface with no pass chance (`alpha` 1) cannot pass,
-/// so the tint is white and the transparency is dropped.
-fn tint_for_transparency(alpha: f64, transparency: [f64; 3]) -> [f64; 3] {
-    let chance = 1.0 - alpha;
-    if chance <= 0.0 {
-        return [1.0; 3];
-    }
-    transparency.map(|weight| weight / chance)
 }
 
 /// The UV layers of the triangle a hit lies on, borrowed from the render geometry.
@@ -890,7 +603,7 @@ pub fn fill_color_layers<'a, 'n>(
 /// Returns `TARGET_NOT_FOUND` for a missing shader graph or image, `INVALID_OPERATION` for an invalid graph,
 /// `EVALUATION_FAILED` for a cycle or missing material output, and `UNSUPPORTED_FEATURE` for unsupported
 /// node behavior or unresolved image pixels in the hit context.
-pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result<BsdfParams> {
+pub fn evaluate_surface(material: &Material, hit_ctx: &HitContext<'_>) -> Result<SurfaceShading> {
     let prepared = PreparedMaterial::new(material, hit_ctx.node_groups);
     let mut workspace = EvaluatorWorkspace::default();
     evaluate_surface_with_workspace(material, &prepared, hit_ctx, &mut workspace)
@@ -902,10 +615,10 @@ pub fn evaluate_surface_with_workspace(
     prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
-) -> Result<BsdfParams> {
-    workspace.active.clear();
+) -> Result<SurfaceShading> {
+    workspace.reset();
     let result = evaluate_surface_inner(material, prepared, hit_ctx, workspace);
-    workspace.active.clear();
+    workspace.reset();
     result
 }
 
@@ -914,15 +627,24 @@ fn evaluate_surface_inner(
     prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
-) -> Result<BsdfParams> {
+) -> Result<SurfaceShading> {
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
         record_unevaluated_inputs(hit_ctx.warnings, &material.name, None, &params);
         // The material is its own one arm, so its glass tint follows its textured base colour here.
         params.base_color = textured_base(material, hit_ctx, params.base_color)?;
         params.glass_transmission_tint = principled_glass_tint(params.base_color);
-        apply_material_textures(material, hit_ctx, &mut params)?;
-        return Ok(params);
+        // The material's volume coefficients are its Volume output, not a surface closure.
+        let volume = single_closure(&params);
+        let mut closures = single_closure(&without_volume(params));
+        for closure in &mut closures {
+            apply_material_textures(material, hit_ctx, &mut closure.params)?;
+        }
+        return Ok(SurfaceShading {
+            closures,
+            volume,
+            displacement_height: 0.0,
+        });
     };
     let group = hit_ctx.node_groups.get(graph_id).ok_or_else(|| {
         PotError::with_details(
@@ -978,36 +700,50 @@ fn evaluate_surface_inner(
         workspace,
         alpha_linked_images: &prepared.alpha_linked_images,
     };
-    let Value::Shader(mut params) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
+    let Value::Shader(surface) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
         return Err(eval_error("material surface output is not a shader"));
     };
-    // The volume coefficients come from the Volume output alone. The Surface's nodes carry the
-    // material's base coefficients, which Add and Mix Shader must not sum.
+    let mut closures = evaluator.workspace.closures_of(surface).to_vec();
+    // The volume closures come from the Volume output alone. Without one, the material's own
+    // coefficients stand, as they do for a material with no graph.
     let volume = if has_volume {
         let Value::Shader(volume) = evaluator.input(output, "Volume", ValueKind::Shader)? else {
             return Err(eval_error("material volume output is not a volume shader"));
         };
-        volume
+        evaluator.workspace.closures_of(volume).to_vec()
     } else {
-        BsdfParams::from_material(material, hit_ctx.normal)
+        single_closure(&BsdfParams::from_material(material, hit_ctx.normal))
     };
-    params.volume_scatter = volume.volume_scatter;
-    params.volume_absorption = volume.volume_absorption;
-    params.volume_anisotropy = volume.volume_anisotropy;
-    params.volume_emission = volume.volume_emission;
-    if has_displacement {
-        params.displacement_height =
-            match evaluator.input(output, "Displacement", ValueKind::Vector)? {
-                Value::Vector(displacement) => displacement.dot(params.normal),
-                Value::Scalar(displacement) => displacement,
-                Value::Color(displacement) => {
-                    DVec3::new(displacement[0], displacement[1], displacement[2]).dot(params.normal)
-                }
-                Value::Shader(_) => return Err(eval_error("material displacement is a shader")),
-            };
+    let displacement_height = if has_displacement {
+        let normal = hit_ctx.normal;
+        match evaluator.input(output, "Displacement", ValueKind::Vector)? {
+            Value::Vector(displacement) => displacement.dot(normal),
+            Value::Scalar(displacement) => displacement,
+            Value::Color(displacement) => {
+                DVec3::new(displacement[0], displacement[1], displacement[2]).dot(normal)
+            }
+            Value::Shader(_) => return Err(eval_error("material displacement is a shader")),
+        }
+    } else {
+        0.0
+    };
+    for closure in &mut closures {
+        apply_material_textures(material, hit_ctx, &mut closure.params)?;
     }
-    apply_material_textures(material, hit_ctx, &mut params)?;
-    Ok(params)
+    Ok(SurfaceShading {
+        closures,
+        volume,
+        displacement_height,
+    })
+}
+
+/// The surface closure's parameters without volume coefficients: those belong to the Volume output.
+fn without_volume(mut params: BsdfParams) -> BsdfParams {
+    params.volume_scatter = [0.0; 3];
+    params.volume_absorption = [0.0; 3];
+    params.volume_anisotropy = 0.0;
+    params.volume_emission = [0.0; 3];
+    params
 }
 
 /// Evaluates the connected `OutputMaterial` displacement input without evaluating surface textures.
@@ -1024,9 +760,9 @@ pub fn evaluate_displacement_with_workspace(
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
-    workspace.active.clear();
+    workspace.reset();
     let result = evaluate_displacement_inner(material, prepared, hit_ctx, workspace);
-    workspace.active.clear();
+    workspace.reset();
     result
 }
 
@@ -1219,15 +955,12 @@ fn sample_material_texture(
 }
 
 #[derive(Clone, Copy, Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Shader variant stays inline so Value remains Copy; boxing it would add a heap allocation per shader-node evaluation"
-)]
 enum Value {
     Scalar(f64),
     Vector(DVec3),
     Color([f64; 4]),
-    Shader(BsdfParams),
+    /// The closures of a shader socket, as a span of the workspace arena.
+    Shader(ClosureSpan),
 }
 
 #[derive(Clone, Copy)]
@@ -1286,6 +1019,73 @@ struct ActiveSocket {
 #[derive(Default)]
 pub struct EvaluatorWorkspace {
     active: Vec<ActiveSocket>,
+    /// The closures of the evaluation in progress. A `Value::Shader` names a span of them, so a node's value stays
+    /// `Copy` and Mix and Add append to the arena instead of allocating per node.
+    closures: Vec<ShaderClosure>,
+}
+
+/// A run of closures in the workspace arena (`EvaluatorWorkspace::closures`).
+#[derive(Clone, Copy, Debug)]
+struct ClosureSpan {
+    start: usize,
+    len: usize,
+}
+
+impl EvaluatorWorkspace {
+    /// Clears the scratch for a new evaluation. Spans from an earlier evaluation are invalid after this.
+    fn reset(&mut self) {
+        self.active.clear();
+        self.closures.clear();
+    }
+
+    /// A node's single closure at weight 1.
+    fn push_single(&mut self, params: &BsdfParams) -> ClosureSpan {
+        let start = self.closures.len();
+        self.closures.push(ShaderClosure {
+            weight: 1.0,
+            params: *params,
+        });
+        ClosureSpan { start, len: 1 }
+    }
+
+    fn closures_of(&self, span: ClosureSpan) -> &[ShaderClosure] {
+        &self.closures[span.start..span.start + span.len]
+    }
+
+    /// Appends a copy of `span` with every weight scaled by `factor`.
+    fn push_scaled(&mut self, span: ClosureSpan, factor: f64) {
+        for index in span.start..span.start + span.len {
+            let closure = self.closures[index];
+            self.closures.push(ShaderClosure {
+                weight: closure.weight * factor,
+                ..closure
+            });
+        }
+    }
+
+    /// Mix Shader: the first arm's closures at `1 - factor` and the second's at `factor`. Each closure keeps its
+    /// own normal, roughness and layers, so the arms are never averaged.
+    fn mix(&mut self, first: ClosureSpan, second: ClosureSpan, factor: f64) -> ClosureSpan {
+        let factor = bounded_factor(factor);
+        let start = self.closures.len();
+        self.push_scaled(first, 1.0 - factor);
+        self.push_scaled(second, factor);
+        ClosureSpan {
+            start,
+            len: self.closures.len() - start,
+        }
+    }
+
+    /// Add Shader: the closures of both arms. Closure weights add, as Cycles sums closures.
+    fn add(&mut self, first: ClosureSpan, second: ClosureSpan) -> ClosureSpan {
+        let start = self.closures.len();
+        self.push_scaled(first, 1.0);
+        self.push_scaled(second, 1.0);
+        ClosureSpan {
+            start,
+            len: self.closures.len() - start,
+        }
+    }
 }
 
 /// The per-material state a shader evaluation reads. A render builds it once for each material and passes it to every
@@ -1395,10 +1195,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                     color(value, [f64::NAN; 4])
                 })))
             }
-            ValueKind::Shader => match raw {
-                Some(_) => Err(invalid("a shader socket cannot use a literal value")),
-                None => Ok(Value::Shader(self.closure_params())),
-            },
+            ValueKind::Shader => {
+                if raw.is_some() {
+                    Err(invalid("a shader socket cannot use a literal value"))
+                } else {
+                    let params = self.closure_params();
+                    Ok(self.closure_value(&params))
+                }
+            }
         }
     }
 
@@ -1496,30 +1300,48 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     fn evaluate_node(&mut self, node_id: &Id, kind: NodeKind, socket: &str) -> Result<Value> {
         match kind {
             NodeKind::OutputMaterial => Err(invalid("material output has no output sockets")),
-            NodeKind::Principled => Ok(Value::Shader(self.principled(node_id)?)),
-            NodeKind::VolumePrincipled => Ok(Value::Shader(
-                self.volume(node_id, VolumeClosure::Principled)?,
-            )),
-            NodeKind::VolumeScatter => {
-                Ok(Value::Shader(self.volume(node_id, VolumeClosure::Scatter)?))
+            NodeKind::Principled => {
+                let params = self.principled(node_id)?;
+                Ok(self.closure_value(&params))
             }
-            NodeKind::VolumeAbsorption => Ok(Value::Shader(
-                self.volume(node_id, VolumeClosure::Absorption)?,
-            )),
+            NodeKind::VolumePrincipled => {
+                let params = self.volume(node_id, VolumeClosure::Principled)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::VolumeScatter => {
+                let params = self.volume(node_id, VolumeClosure::Scatter)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::VolumeAbsorption => {
+                let params = self.volume(node_id, VolumeClosure::Absorption)?;
+                Ok(self.closure_value(&params))
+            }
             NodeKind::Displacement => self.displacement(node_id, socket),
             NodeKind::ImageTexture => self.image_texture(node_id, socket),
-            NodeKind::Emission => Ok(Value::Shader(self.emission(node_id)?)),
+            NodeKind::Emission => {
+                let params = self.emission(node_id)?;
+                Ok(self.closure_value(&params))
+            }
             NodeKind::Diffuse => {
                 // Blender's Diffuse BSDF is a Lambert lobe with no specular. Its Roughness input is Oren-Nayar, which
                 // Potter does not evaluate, so the default dielectric layer must not come from it: keeping it made a
                 // roughness-0 floor under a sun a 1600x GGX spike (`source/blender/nodes/shader/nodes/node_shader_bsdf_diffuse.cc`).
                 let mut params = self.diffuse(node_id)?;
                 params.specular_ior_level = 0.0;
-                Ok(Value::Shader(params))
+                Ok(self.closure_value(&params))
             }
-            NodeKind::Glossy => Ok(Value::Shader(self.glossy(node_id)?)),
-            NodeKind::Glass => Ok(Value::Shader(self.glass(node_id)?)),
-            NodeKind::Transparent => Ok(Value::Shader(self.transparent(node_id)?)),
+            NodeKind::Glossy => {
+                let params = self.glossy(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Glass => {
+                let params = self.glass(node_id)?;
+                Ok(self.closure_value(&params))
+            }
+            NodeKind::Transparent => {
+                let params = self.transparent(node_id)?;
+                Ok(self.closure_value(&params))
+            }
             NodeKind::MixShader => Ok(Value::Shader(self.mix_shader(node_id)?)),
             NodeKind::AddShader => Ok(Value::Shader(self.add_shader(node_id)?)),
             NodeKind::Bump => self.bump(node_id, socket),
@@ -1549,13 +1371,18 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     /// alpha is not the surface's opacity (Cycles reads only Transparent BSDF, Principled Alpha and Mix through
     /// them), so only those closures set alpha. The non-graph path keeps `from_material`'s base colour alpha.
     fn closure_params(&self) -> BsdfParams {
-        BsdfParams {
+        without_volume(BsdfParams {
             alpha: 1.0,
             // A closure is not glass: only Glass and Principled set transmission. The material's own value
             // belongs to the simple material's Principled (set there).
             transmission: 0.0,
             ..BsdfParams::from_material(self.material, self.hit_ctx.normal)
-        }
+        })
+    }
+
+    /// Appends a node's single closure to the workspace arena and returns it as a socket value.
+    fn closure_value(&mut self, params: &BsdfParams) -> Value {
+        Value::Shader(self.workspace.push_single(params))
     }
 
     fn principled(&mut self, id: &Id) -> Result<BsdfParams> {
@@ -1784,27 +1611,26 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.transparent_tint = [tint[0], tint[1], tint[2]];
         Ok(params)
     }
-
-    fn mix_shader(&mut self, id: &Id) -> Result<BsdfParams> {
+    fn mix_shader(&mut self, id: &Id) -> Result<ClosureSpan> {
         let factor = self.scalar_input(id, &["Fac"], 0.5)?;
         let first = self.shader_input(id, &["Shader", "Shader 1"])?;
         let second = self.shader_input(id, &["Shader_001", "Shader 2"])?;
-        Ok(BsdfParams::mix(first, second, factor))
+        Ok(self.workspace.mix(first, second, factor))
     }
 
-    fn add_shader(&mut self, id: &Id) -> Result<BsdfParams> {
+    fn add_shader(&mut self, id: &Id) -> Result<ClosureSpan> {
         let first = self.shader_input(id, &["Shader", "Shader 1"])?;
         let second = self.shader_input(id, &["Shader_001", "Shader 2"])?;
-        Ok(BsdfParams::add(first, second))
+        Ok(self.workspace.add(first, second))
     }
 
-    fn shader_input(&mut self, id: &Id, names: &[&str]) -> Result<BsdfParams> {
+    fn shader_input(&mut self, id: &Id, names: &[&str]) -> Result<ClosureSpan> {
         match self.input(
             id,
             names.first().copied().unwrap_or("Shader"),
             ValueKind::Shader,
         )? {
-            Value::Shader(value) => Ok(value),
+            Value::Shader(span) => Ok(span),
             _ => Err(invalid("shader socket type mismatch")),
         }
     }
@@ -3179,8 +3005,8 @@ mod tests {
     };
 
     use super::{
-        BsdfParams, HitContext, HitUvLayers, PreparedMaterial, color_lerp, evaluate_displacement,
-        evaluate_surface, layer_index, layer_uv,
+        BsdfParams, HitContext, HitUvLayers, PreparedMaterial, SurfaceShading, color_lerp,
+        evaluate_displacement, evaluate_surface, layer_index, layer_uv,
     };
 
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
@@ -3274,7 +3100,11 @@ mod tests {
             },
         )]);
         context = context.with_images(&images);
-        evaluate_surface(&material, &context).unwrap().base_color
+        evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .base_color
     }
 
     /// Red at storage U `u` of a plain field (no graph) whose texture uses `extension`. Pixels are 8 columns of
@@ -3322,7 +3152,11 @@ mod tests {
             },
         )]);
         let context = context.with_images(&images);
-        evaluate_surface(&material, &context).unwrap().base_color[0]
+        evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+            .base_color[0]
     }
 
     #[test]
@@ -3367,7 +3201,10 @@ mod tests {
             },
         )]);
         let context = context.with_images(&images);
-        let params = evaluate_surface(&material, &context).unwrap();
+        let params = *evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap();
         for channel in params.glass_transmission_tint {
             assert!(
                 (channel - 0.5).abs() < 1.0e-9,
@@ -3423,6 +3260,61 @@ mod tests {
         );
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         graph
+    }
+
+    #[test]
+    fn a_mix_of_two_subsurface_methods_keeps_each_closure_its_own_method() {
+        use super::SubsurfaceMethod;
+        // Each Principled arm carries its own method. Mix Shader concatenates the arms' closures, so both methods reach
+        // the surface and neither is replaced by a mixed or first-arm method (Cycles keeps the closures separate).
+        let mut graph = NodeGroup::new("MixMethods", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "mix",
+            "ShaderNodeMixShader",
+            json!({"Fac": 0.5}),
+        );
+        insert_node(
+            &mut graph,
+            "burley",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Subsurface Weight": 1.0}),
+        );
+        insert_node(
+            &mut graph,
+            "walk",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Subsurface Weight": 1.0}),
+        );
+        for (id, method) in [("burley", "BURLEY"), ("walk", "RANDOM_WALK")] {
+            let node = graph
+                .nodes
+                .get_mut(&Id::new(id.to_owned()).unwrap())
+                .unwrap();
+            node.properties
+                .insert("subsurface_method".to_owned(), json!(method));
+        }
+        link(&mut graph, "burley", "BSDF", "mix", "Shader");
+        link(&mut graph, "walk", "BSDF", "mix", "Shader_001");
+        link(&mut graph, "mix", "Shader", "output", "Surface");
+        let id = Id::new("mix_methods".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(id.clone(), graph);
+        let material = Material {
+            node_tree: Some(id),
+            ..Material::default()
+        };
+        let shading = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+        let methods: Vec<SubsurfaceMethod> = shading
+            .closures
+            .iter()
+            .map(|closure| closure.params.subsurface_method)
+            .collect();
+        assert_eq!(
+            methods,
+            [SubsurfaceMethod::Burley, SubsurfaceMethod::RandomWalk]
+        );
     }
 
     fn is_transparent(graph: NodeGroup) -> bool {
@@ -3565,11 +3457,17 @@ mod tests {
             node_tree: Some(graph_id),
             ..Material::default()
         };
-        let params = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+        let shading = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
         // Principled Volume at Density 0.7: σs = Color · 0.7 and σa = (1 - Color) · 0.7.
-        assert!(channels_close(params.volume_scatter, [0.14, 0.28, 0.42]));
-        assert!(channels_close(params.volume_absorption, [0.56, 0.42, 0.28]));
-        assert_eq!(params.volume_anisotropy, 0.35);
+        assert!(channels_close(
+            weighted_volume(&shading, |params| params.volume_scatter),
+            [0.14, 0.28, 0.42]
+        ));
+        assert!(channels_close(
+            weighted_volume(&shading, |params| params.volume_absorption),
+            [0.56, 0.42, 0.28]
+        ));
+        assert_eq!(shading.volume[0].params.volume_anisotropy, 0.35);
     }
 
     fn channels_close(actual: [f64; 3], expected: [f64; 3]) -> bool {
@@ -3579,9 +3477,23 @@ mod tests {
             .all(|(actual, expected)| (actual - expected).abs() < 1e-12)
     }
 
+    /// The volume coefficient summed over the Volume output's closures, each scaled by its closure weight.
+    fn weighted_volume(
+        shading: &SurfaceShading,
+        coefficient: fn(&BsdfParams) -> [f64; 3],
+    ) -> [f64; 3] {
+        let mut total = [0.0; 3];
+        for closure in &shading.volume {
+            for (sum, channel) in total.iter_mut().zip(coefficient(&closure.params)) {
+                *sum += closure.weight * channel;
+            }
+        }
+        total
+    }
+
     /// Two Volume Absorption closures (σa = (1 - Color) · Density: (0.8, 0.5, 0.2) and (0.25, 0.25, 0.25))
-    /// joined by `combiner`; returns the evaluated volume coefficients.
-    fn two_absorption_closures(combiner: &str, inputs: Value) -> BsdfParams {
+    /// joined by `combiner`; returns the evaluated shading, whose volume closures carry the coefficients.
+    fn two_absorption_closures(combiner: &str, inputs: Value) -> SurfaceShading {
         let mut graph = NodeGroup::new("Volume", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
@@ -3615,10 +3527,16 @@ mod tests {
         // Cycles adds closures' extinctions (Add Shader) and weights each by its mix factor (Mix
         // Shader), so the coefficients sum or mix per closure, not as (Σ weight)(Σ density).
         let added = two_absorption_closures("ShaderNodeAddShader", json!({}));
-        assert!(channels_close(added.volume_absorption, [1.05, 0.75, 0.45]));
-        let mixed = two_absorption_closures("ShaderNodeMixShader", json!({"Fac":0.25}));
+        assert_eq!(added.volume.len(), 2);
         assert!(channels_close(
-            mixed.volume_absorption,
+            weighted_volume(&added, |params| params.volume_absorption),
+            [1.05, 0.75, 0.45]
+        ));
+        let mixed = two_absorption_closures("ShaderNodeMixShader", json!({"Fac":0.25}));
+        let weights: Vec<f64> = mixed.volume.iter().map(|closure| closure.weight).collect();
+        assert_eq!(weights, [0.75, 0.25]);
+        assert!(channels_close(
+            weighted_volume(&mixed, |params| params.volume_absorption),
             [0.6625, 0.4375, 0.2125]
         ));
     }
@@ -3682,29 +3600,73 @@ mod tests {
         assert_eq!(thin_wall_warning["node_id"], "principled");
     }
 
+    /// Two Principled BSDFs joined by `combiner` (Mix or Add Shader), evaluated as the surface's closures. The first
+    /// is red with roughness 0.1, normal +X and coat 0.5; the second is blue with roughness 0.9, normal +Z and coat
+    /// 0.2. `inputs` are the combiner's own inputs.
+    fn two_principled_surface(combiner: &str, inputs: Value) -> SurfaceShading {
+        let mut graph = NodeGroup::new("Surface", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "first",
+            "ShaderNodeBsdfPrincipled",
+            json!({
+                "Base Color":[1.0,0.0,0.0,1.0],"Roughness":0.1,
+                "Normal":[1.0,0.0,0.0],"Coat Weight":0.5
+            }),
+        );
+        insert_node(
+            &mut graph,
+            "second",
+            "ShaderNodeBsdfPrincipled",
+            json!({
+                "Base Color":[0.0,0.0,1.0,1.0],"Roughness":0.9,
+                "Normal":[0.0,0.0,1.0],"Coat Weight":0.2
+            }),
+        );
+        insert_node(&mut graph, "combine", combiner, inputs);
+        link(&mut graph, "first", "BSDF", "combine", "Shader");
+        link(&mut graph, "second", "BSDF", "combine", "Shader_001");
+        link(&mut graph, "combine", "Shader", "output", "Surface");
+        let graph_id = Id::new("surface_shader".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        evaluate_surface(&material, &HitContext::new(&groups)).unwrap()
+    }
+
     #[test]
-    fn add_of_two_coats_adds_weight_times_tint_and_averages_the_rest() {
-        let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-12);
-        let mut first = BsdfParams::from_material(&Material::default(), DVec3::Z);
-        first.coat_weight = 0.5;
-        first.coat_tint = [1.0, 0.5, 0.25];
-        first.coat_roughness = 0.1;
-        let mut second = BsdfParams::from_material(&Material::default(), DVec3::Z);
-        second.coat_weight = 0.2;
-        second.coat_tint = [0.2, 0.2, 0.2];
-        second.coat_roughness = 0.3;
-        // weight · tint adds: 0.5·[1, 0.5, 0.25] + 0.2·[0.2, 0.2, 0.2], over the summed weight 0.7.
-        let sum = BsdfParams::add(first, second);
-        assert!((sum.coat_weight - 0.7).abs() < 1e-12);
-        assert!(close(sum.coat_tint, [0.54 / 0.7, 0.29 / 0.7, 0.165 / 0.7]));
-        assert!((sum.coat_roughness - (0.05 + 0.06) / 0.7).abs() < 1e-12);
-        // Unlinked on both sides, the coat keeps following the shading normal.
-        assert_eq!(sum.coat_normal, None);
-        // A linked normal on one side enters the average with that side's weight.
-        second.coat_normal = Some(DVec3::X);
-        let sum = BsdfParams::add(first, second);
-        let expected = (DVec3::Z * 0.5 + DVec3::X * 0.2).normalize();
-        assert!((sum.coat_normal.unwrap_or(DVec3::ZERO) - expected).length() < 1e-12);
+    fn mix_shader_weights_closures_and_keeps_each_closures_parameters() {
+        // Mix Shader gives the first arm its 1 - Fac share and the second its Fac share. Nothing is averaged: each
+        // closure keeps its own normal, roughness and coat.
+        let shading = two_principled_surface("ShaderNodeMixShader", json!({"Fac":0.25}));
+        assert_eq!(shading.closures.len(), 2);
+        let (first, second) = (shading.closures[0], shading.closures[1]);
+        assert!((first.weight - 0.75).abs() < 1e-12);
+        assert!((second.weight - 0.25).abs() < 1e-12);
+        assert_eq!(first.params.normal, DVec3::X);
+        assert_eq!(second.params.normal, DVec3::Z);
+        assert_eq!(first.params.roughness, 0.1);
+        assert_eq!(second.params.roughness, 0.9);
+        assert_eq!(first.params.coat_weight, 0.5);
+        assert_eq!(second.params.coat_weight, 0.2);
+        // The heavier first arm is the dominant closure, so its normal is the one displacement is measured along.
+        assert_eq!(shading.dominant().unwrap().normal, DVec3::X);
+    }
+
+    #[test]
+    fn add_shader_concatenates_closures_with_unit_weight() {
+        // Add Shader keeps both arms' closures whole at weight 1: no coat or normal is merged across them.
+        let shading = two_principled_surface("ShaderNodeAddShader", json!({}));
+        assert_eq!(shading.closures.len(), 2);
+        assert!(shading.closures.iter().all(|closure| closure.weight == 1.0));
+        assert_eq!(shading.closures[0].params.coat_weight, 0.5);
+        assert_eq!(shading.closures[1].params.coat_weight, 0.2);
+        assert_eq!(shading.closures[0].params.coat_normal, None);
+        assert_eq!(shading.closures[1].params.normal, DVec3::Z);
     }
 
     #[test]
@@ -3733,8 +3695,8 @@ mod tests {
         };
         let mut context = HitContext::new(&groups);
         context.normal = DVec3::Z;
-        let params = evaluate_surface(&material, &context).unwrap();
-        assert!((params.displacement_height - 0.5).abs() < f64::EPSILON);
+        let shading = evaluate_surface(&material, &context).unwrap();
+        assert!((shading.displacement_height - 0.5).abs() < f64::EPSILON);
         assert!((evaluate_displacement(&material, &context).unwrap() - 0.5).abs() < f64::EPSILON);
     }
 
@@ -3776,10 +3738,12 @@ mod tests {
         };
 
         let layers = [("Col", blended)];
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&layers, None),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         for (actual, expected) in params.base_color.iter().zip([0.2, 0.3, 0.5, 0.75]) {
             assert!(
@@ -3791,12 +3755,14 @@ mod tests {
 
         // An explicitly missing Vertex Color layer is transparent black and records a warning.
         let sink = RefCell::new(Vec::new());
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups)
                 .with_color_layers(&[], Some([0.91, 0.37, 0.64, 0.22]))
                 .with_warnings(&sink),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(sink.borrow()[0]["code"], json!("mesh.color_layer_missing"));
@@ -3819,20 +3785,24 @@ mod tests {
             ..Material::default()
         };
         let render = [0.2, 0.4, 0.8, 0.35];
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&[], Some(render)),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, render);
 
         let sink = RefCell::new(Vec::new());
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups)
                 .with_color_layers(&[], None)
                 .with_warnings(&sink),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, [0.0; 4]);
         assert_eq!(sink.borrow()[0]["layer"], json!(""));
@@ -3860,17 +3830,21 @@ mod tests {
         };
         let source = [0.23, 0.71, 0.42, 0.36];
         let found = [("Ghost", source)];
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&found, None),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, [source[0], source[1], source[2], 1.0]);
 
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&[], Some([0.87, 0.54, 0.19, 0.27])),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         assert_eq!(params.base_color, [0.0, 0.0, 0.0, 1.0]);
     }
@@ -3914,10 +3888,12 @@ mod tests {
         };
 
         let layers = [("Col", [0.2, 0.6, 0.4, 1.0])];
-        let params = evaluate_surface(
+        let params = *evaluate_surface(
             &material,
             &HitContext::new(&groups).with_color_layers(&layers, None),
         )
+        .unwrap()
+        .dominant()
         .unwrap();
         // Multiply: each channel of A times the interpolated vertex color B, at factor 1.
         for (actual, expected) in params.base_color.iter().zip([0.1, 0.15, 0.4, 1.0]) {
@@ -4065,6 +4041,8 @@ mod tests {
         };
         evaluate_surface(&material, &HitContext::new(&groups))
             .unwrap()
+            .dominant()
+            .unwrap()
             .roughness
     }
 
@@ -4149,22 +4127,62 @@ mod subsurface_method_tests {
         );
         assert_eq!(SubsurfaceMethod::parse("random_walk"), None);
     }
+}
+
+#[cfg(test)]
+mod generated_corner_tests {
+    use glam::DVec3;
+
+    use crate::{geom::GeneratedCorners, geom::TextureSpace, graph::NodeGroup, model::Registry};
+
+    use super::HitContext;
+
+    /// A texture space of half-extent 2 at the origin: Generated is `local / 4 + 0.5` per axis.
+    fn texture_space() -> TextureSpace {
+        TextureSpace::manual(DVec3::ZERO, DVec3::splat(2.0))
+    }
 
     #[test]
-    fn only_the_unevaluated_methods_report_a_feature() {
-        // Burley and the three random walk methods are evaluated; a Mix or Add of two different methods is the one
-        // reported case, never rendered as another method.
-        assert_eq!(SubsurfaceMethod::Burley.unsupported_feature(), None);
-        assert_eq!(SubsurfaceMethod::RandomWalk.unsupported_feature(), None);
-        assert_eq!(SubsurfaceMethod::RandomWalkSkin.unsupported_feature(), None);
-        assert_eq!(
-            SubsurfaceMethod::RandomWalkLegacy.unsupported_feature(),
-            None
-        );
-        assert_eq!(
-            SubsurfaceMethod::Mixed.unsupported_feature(),
-            Some("shader.principled.subsurface_method.mixed")
-        );
+    fn zero_corner_generated_stays_exactly_zero_under_any_weights() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let generated = GeneratedCorners {
+            corners: [DVec3::ZERO; 3],
+            per_local: texture_space().generated_per_local(),
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, [0.2, 0.3, 0.5]);
+        assert_eq!(context.generated, DVec3::ZERO);
+    }
+
+    #[test]
+    fn corner_generated_blends_to_the_generated_of_the_interpolated_point() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let space = texture_space();
+        let local = [
+            DVec3::new(-2.0, 0.0, 0.0),
+            DVec3::new(2.0, 0.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+        ];
+        let barycentric = [0.5, 0.25, 0.25];
+        let point =
+            local[0] * barycentric[0] + local[1] * barycentric[1] + local[2] * barycentric[2];
+        let generated = GeneratedCorners {
+            corners: local.map(|corner| space.generated(corner)),
+            per_local: space.generated_per_local(),
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, barycentric);
+        assert!((context.generated - space.generated(point)).length() < 1e-12);
+    }
+
+    #[test]
+    fn corner_hit_takes_the_triangles_jacobian() {
+        let groups: Registry<NodeGroup> = Registry::new();
+        let per_local = DVec3::new(0.1, 0.2, 0.3);
+        let generated = GeneratedCorners {
+            corners: [DVec3::ZERO; 3],
+            per_local,
+        };
+        let context = HitContext::new(&groups).with_generated_corners(generated, [1.0 / 3.0; 3]);
+        assert_eq!(context.generated_per_local, per_local);
     }
 }
 

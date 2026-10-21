@@ -135,10 +135,16 @@ fn simple_pbr_material_evaluates_through_its_principled_graph() {
         "simple PBR creates a shader node tree"
     );
     let context = HitContext::new(&applied.doc.node_groups);
-    let graph_bsdf = evaluate_surface(material, &context).unwrap();
+    let graph_bsdf = *evaluate_surface(material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     let mut simple = material.clone();
     simple.node_tree = None;
-    let simple_bsdf = evaluate_surface(&simple, &context).unwrap();
+    let simple_bsdf = *evaluate_surface(&simple, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(graph_bsdf, simple_bsdf);
     assert_eq!(graph_bsdf.base_color, [0.25, 0.5, 0.75, 1.0]);
     assert_eq!(graph_bsdf.metallic, 0.4);
@@ -165,15 +171,21 @@ fn checker_texture_alternates_colors_across_uv_tiles() {
     let (material, groups) = material_with_graph(graph);
     let mut context = HitContext::new(&groups);
     context.uv = [0.1, 0.1];
-    let first = evaluate_surface(&material, &context).unwrap();
+    let first = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     context.uv = [0.6, 0.1];
-    let second = evaluate_surface(&material, &context).unwrap();
+    let second = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(first.base_color, [1.0, 0.0, 0.0, 1.0]);
     assert_eq!(second.base_color, [0.0, 0.0, 1.0, 1.0]);
 }
 
 #[test]
-fn mix_shader_at_half_factor_averages_principled_parameters() {
+fn mix_shader_at_half_factor_keeps_each_arm_as_a_closure() {
     let mut graph = NodeGroup::new("Mix", GraphKind::Shader);
     add_node(&mut graph, "out", "OutputMaterial", &[]);
     add_node(
@@ -205,13 +217,22 @@ fn mix_shader_at_half_factor_averages_principled_parameters() {
     link(&mut graph, "mix", "Shader", "out", "Surface");
     let (material, groups) = material_with_graph(graph);
     let context = HitContext::new(&groups);
-    let bsdf = evaluate_surface(&material, &context).unwrap();
-    assert_eq!(bsdf.base_color, [0.5, 0.0, 0.5, 1.0]);
-    assert!((bsdf.metallic - 0.5).abs() < 1e-12);
+    let shading = evaluate_surface(&material, &context).unwrap();
+    // Mix Shader keeps each arm as its own closure, weighted 1 - Fac and Fac. No parameter is averaged.
+    let weights: Vec<f64> = shading
+        .closures
+        .iter()
+        .map(|closure| closure.weight)
+        .collect();
+    assert_eq!(weights, [0.5, 0.5]);
+    assert_eq!(shading.closures[0].params.base_color, [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(shading.closures[0].params.metallic, 0.2);
+    assert_eq!(shading.closures[1].params.base_color, [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(shading.closures[1].params.metallic, 0.8);
 }
 
 #[test]
-fn add_shader_combines_emission_and_surface_shaders() {
+fn add_shader_keeps_surface_and_emission_as_separate_closures() {
     let mut graph = NodeGroup::new("Add", GraphKind::Shader);
     add_node(&mut graph, "out", "OutputMaterial", &[]);
     add_node(
@@ -235,13 +256,24 @@ fn add_shader_combines_emission_and_surface_shaders() {
     link(&mut graph, "add", "Shader", "out", "Surface");
     let (material, groups) = material_with_graph(graph);
     let context = HitContext::new(&groups);
-    let bsdf = evaluate_surface(&material, &context).unwrap();
-    assert_eq!(bsdf.base_color, [0.2, 0.3, 0.0, 1.0]);
-    assert_eq!(bsdf.emission_color, [0.0, 0.3, 0.0]);
-    assert_eq!(bsdf.emission_strength, 2.0);
+    let shading = evaluate_surface(&material, &context).unwrap();
+    // Add Shader concatenates its arms: the Principled reflection and the Emission, each at weight 1.
+    assert_eq!(shading.closures.len(), 2);
+    assert!(
+        shading
+            .closures
+            .iter()
+            .all(|closure| (closure.weight - 1.0).abs() < 1.0e-12)
+    );
+    let surface = shading.closures[0].params;
+    let emission = shading.closures[1].params;
+    assert_eq!(surface.base_color, [0.2, 0.0, 0.0, 1.0]);
+    assert_eq!(emission.emission_color, [0.0, 0.3, 0.0]);
+    assert_eq!(emission.emission_strength, 2.0);
     // Principled reflects with weight 1 and Emission with 0 (Cycles `EmissionNode::compile`,
-    // intern/cycles/scene/shader_nodes.cpp:3071-3098); Add sums them, clamped to 1.
-    assert_eq!(bsdf.reflectance, 1.0);
+    // intern/cycles/scene/shader_nodes.cpp:3071-3098); each closure keeps its own reflectance.
+    assert_eq!(surface.reflectance, 1.0);
+    assert_eq!(emission.reflectance, 0.0);
 }
 #[test]
 fn material_create_accepts_inline_shader_node_tree() {
@@ -278,7 +310,10 @@ fn material_create_accepts_inline_shader_node_tree() {
         .get(&Id::new("graph_mat").unwrap())
         .unwrap();
     let context = HitContext::new(&applied.doc.node_groups);
-    let bsdf = evaluate_surface(material, &context).unwrap();
+    let bsdf = *evaluate_surface(material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(bsdf.base_color, [0.1, 0.2, 0.3, 1.0]);
     assert_eq!(bsdf.metallic, 0.7);
 }
@@ -329,14 +364,23 @@ fn image_texture_samples_resolved_pixels_using_hit_uvs() {
     )]);
     let mut context = HitContext::new(&groups).with_images(&image_data);
     context.uv = [0.25, 0.5];
-    let first = evaluate_surface(&material, &context).unwrap();
+    let first = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(first.base_color, [1.0, 0.0, 0.0, 1.0]);
     context.uv = [0.75, 0.5];
-    let closest = evaluate_surface(&material, &context).unwrap();
+    let closest = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(closest.base_color, [0.0, 1.0, 0.0, 1.0]);
 
     context.uv = [1.25, 0.5];
-    let udim_tile = evaluate_surface(&material, &context).unwrap();
+    let udim_tile = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(udim_tile.base_color, [0.0, 0.0, 1.0, 1.0]);
 }
 
@@ -421,7 +465,11 @@ fn image_texture_routes_blender_v_up_udims_and_flips_local_v() {
             let (material, groups) = make_material(mapped, vector);
             let context = HitContext::new(&groups).with_images(&images);
             assert_eq!(
-                evaluate_surface(&material, &context).unwrap().base_color,
+                evaluate_surface(&material, &context)
+                    .unwrap()
+                    .dominant()
+                    .unwrap()
+                    .base_color,
                 expected,
             );
         }
@@ -467,15 +515,16 @@ fn material_volume_output_evaluates_volume_properties() {
     );
     link(&mut graph, "volume", "Volume", "out", "Volume");
     let (material, groups) = material_with_graph(graph);
-    let params = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+    let shading = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+    let volume = shading.volume[0].params;
     // Principled Volume at Density 0.7: σs = Color · 0.7 and σa = (1 - Color) · 0.7, absolute.
-    for (actual, expected) in params.volume_scatter.iter().zip([0.14, 0.28, 0.42]) {
+    for (actual, expected) in volume.volume_scatter.iter().zip([0.14, 0.28, 0.42]) {
         assert!((actual - expected).abs() < 1e-12);
     }
-    for (actual, expected) in params.volume_absorption.iter().zip([0.56, 0.42, 0.28]) {
+    for (actual, expected) in volume.volume_absorption.iter().zip([0.56, 0.42, 0.28]) {
         assert!((actual - expected).abs() < 1e-12);
     }
-    assert_eq!(params.volume_anisotropy, 0.35);
+    assert_eq!(volume.volume_anisotropy, 0.35);
 }
 #[test]
 fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
@@ -515,7 +564,10 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
         .with_images(&image_data)
         .with_uv_layers(layers);
     context.uv = [0.25, 0.5];
-    let simple = evaluate_surface(&material, &context).unwrap();
+    let simple = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     // Blender 5.2.2 (Cycles, straight texel (0, 1, 0) at alpha 0.5, Emission under the same factor): Alpha linked
     // unassociates the colour to (0, 1, 0), so the 0.25 green factor gives 0.25.
     assert_eq!(simple.base_color, [0.0, 0.25, 0.0, 1.0]);
@@ -525,7 +577,10 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     assert_eq!(simple.normal, DVec3::Z);
 
     material.node_tree = Some(graph_id);
-    let graph_backed = evaluate_surface(&material, &context).unwrap();
+    let graph_backed = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(graph_backed, simple);
     let no_images = HitContext::new(&groups).with_uv_layers(layers);
     let error = evaluate_surface(&material, &no_images).unwrap_err();
@@ -547,7 +602,10 @@ fn material_texture_refs_sample_uv_and_override_pbr_fields_for_graphs() {
     // (probed in Blender 5.2.2: an unlinked RGBA texture gives alpha 1, linked gives 0.5).
     material.alpha_mode = "opaque".to_owned();
     material.base_color_texture.as_mut().unwrap().uv_layer = Some("UVMap".to_owned());
-    let opaque = evaluate_surface(&material, &context).unwrap();
+    let opaque = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(opaque.alpha, 1.0);
     // Blender 5.2.2: Alpha unlinked keeps the premultiplied colour (0, 0.5, 0), so the factor gives 0.125.
     assert_eq!(opaque.base_color, [0.0, 0.125, 0.0, 1.0]);
@@ -597,7 +655,10 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
         .with_uv_layers(layers)
         .with_warnings(&warnings);
     context.uv = [0.25, 0.5];
-    let named = evaluate_surface(&named_material, &context).unwrap();
+    let named = *evaluate_surface(&named_material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(named.base_color, [0.0, 1.0, 0.0, 1.0]);
     assert!(warnings.borrow().is_empty());
 
@@ -606,7 +667,10 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
         .with_images(&images)
         .with_uv_layers(layers)
         .with_warnings(&warnings);
-    let fallback = evaluate_surface(&missing_material, &context).unwrap();
+    let fallback = *evaluate_surface(&missing_material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(fallback.base_color, [1.0, 0.0, 0.0, 1.0]);
     assert_eq!(warnings.borrow().len(), 1);
     assert_eq!(warnings.borrow()[0]["code"], json!("uv.layer_missing"));
@@ -642,7 +706,10 @@ fn bump_node_perturbs_principled_normal_from_height_gradient() {
     link(&mut graph, "principled", "BSDF", "out", "Surface");
     let (material, groups) = material_with_graph(graph);
     let context = HitContext::new(&groups);
-    let bsdf = evaluate_surface(&material, &context).unwrap();
+    let bsdf = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert!(bsdf.normal.x < -0.5);
     assert!(bsdf.normal.z > 0.5);
 }
@@ -675,7 +742,10 @@ fn color_ramp_interpolates_across_configured_stops() {
     link(&mut graph, "principled", "BSDF", "out", "Surface");
     let (material, groups) = material_with_graph(graph);
     let context = HitContext::new(&groups);
-    let bsdf = evaluate_surface(&material, &context).unwrap();
+    let bsdf = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert_eq!(bsdf.base_color, [0.5, 0.5, 0.0, 1.0]);
 }
 
@@ -690,7 +760,10 @@ fn tangent_normal_map_preserves_the_surface_normal() {
     let (material, groups) = material_with_graph(graph);
     let mut context = HitContext::new(&groups);
     context.normal = DVec3::X;
-    let bsdf = evaluate_surface(&material, &context).unwrap();
+    let bsdf = *evaluate_surface(&material, &context)
+        .unwrap()
+        .dominant()
+        .unwrap();
     assert!((bsdf.normal.x - 1.0).abs() < 1.0e-12);
     assert!(bsdf.normal.y.abs() < 1.0e-12);
     assert!(bsdf.normal.z.abs() < 1.0e-12);

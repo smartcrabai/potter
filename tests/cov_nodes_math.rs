@@ -793,10 +793,13 @@ fn evaluate_shader_case(case: &NodeCase) -> potter_core::error::Result<Value> {
     };
     let context = HitContext::new(&groups);
     let surface = evaluate_surface(&material, &context)?;
+    let params = surface
+        .dominant()
+        .expect("a Principled surface has one closure");
     if case.output == "Value" {
-        Ok(json!(surface.emission_strength))
+        Ok(json!(params.emission_strength))
     } else {
-        Ok(json!(surface.emission_color))
+        Ok(json!(params.emission_color))
     }
 }
 
@@ -1054,7 +1057,10 @@ fn shader_surface_with_node(
         node_tree: Some(graph_id),
         ..Material::default()
     };
-    evaluate_surface(&material, &HitContext::new(&groups))
+    let shading = evaluate_surface(&material, &HitContext::new(&groups))?;
+    Ok(*shading
+        .dominant()
+        .expect("a Principled surface has one closure"))
 }
 
 #[test]

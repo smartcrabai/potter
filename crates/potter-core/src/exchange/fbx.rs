@@ -5408,7 +5408,11 @@ mod tests {
         let hit = crate::shader::HitContext::new(&doc.node_groups)
             .with_images(&images)
             .with_uv_layers(hit_uvs);
-        Ok(crate::shader::evaluate_surface(material, &hit)?.base_color)
+        let shading = crate::shader::evaluate_surface(material, &hit)?;
+        Ok(shading
+            .dominant()
+            .ok_or("FBX test material has no closure")?
+            .base_color)
     }
 
     fn assert_pixel(actual: [f64; 4], expected: [f64; 4]) {
