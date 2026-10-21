@@ -198,6 +198,22 @@ fn transparent_tint(params: &BsdfParams) -> DVec3 {
     DVec3::from_array(params.transparent_tint).max(DVec3::ZERO)
 }
 
+/// Cycles' shadow transparency `Σ w · (1 − α) · tint` over each closure's `(weight, alpha, tint)`, one when no closure
+/// has weight (`surface_shader_transparency`). `Closures::new` and the shadow probe both take it, so they cannot drift.
+fn shadow_transparency(closures: impl Iterator<Item = (f64, f64, DVec3)>) -> DVec3 {
+    let mut transparency = DVec3::ZERO;
+    let mut weight_total = 0.0;
+    for (weight, alpha, tint) in closures {
+        transparency += tint * (weight * (1.0 - alpha));
+        weight_total += weight;
+    }
+    if weight_total > 0.0 {
+        transparency
+    } else {
+        DVec3::ONE
+    }
+}
+
 /// The share a surface event takes: a reflective draw from closure `Reflect`, or a camera pass-through whose
 /// `multiplier` is the throughput Cycles' transparent closure gives it.
 enum Pick {
@@ -239,8 +255,7 @@ fn diffuse_smoothing(smooth: DVec3, normal: DVec3, light: DVec3) -> f64 {
     1.0 / (1.0 + lambda)
 }
 
-/// The closures of one hit with the totals Cycles' closure loops compute: selection, emission, coverage, and shadow
-/// transparency.
+/// The closures of one hit with the totals Cycles' closure loops compute: selection, emission, and coverage.
 struct Closures {
     items: Vec<HitClosure>,
     /// The smooth shading normal, Cycles' `sd->N` before bump or normal mapping: the reference of the shading-side test.
@@ -261,11 +276,8 @@ struct Closures {
     emission_pass: DVec3,
     /// Weight-averaged base colour: the albedo pass.
     albedo: [f64; 4],
-    /// Camera coverage, one minus the mean of the transparency below; zero for a hit without closures.
+    /// Camera coverage, one minus the mean shadow transparency of the closures; zero for a hit without closures.
     coverage: f64,
-    /// Shadow transparency, `Σ w · (1 − α) · tint` (Cycles' `surface_shader_transparency`); one for a hit without
-    /// closures.
-    transparency: DVec3,
 }
 
 impl Closures {
@@ -276,7 +288,6 @@ impl Closures {
         let mut emission_pass = DVec3::ZERO;
         let mut albedo = [0.0; 4];
         let mut weight_total = 0.0;
-        let mut transparency = DVec3::ZERO;
         for closure in &items {
             let (weight, params) = (closure.weight, &closure.params);
             let reflect = closure.reflect_weight();
@@ -291,13 +302,17 @@ impl Closures {
                 *channel += weight * value;
             }
             weight_total += weight;
-            transparency += transparent_tint(params) * (weight * (1.0 - params.alpha));
         }
         if weight_total > 0.0 {
             albedo = albedo.map(|channel| channel / weight_total);
-        } else {
-            transparency = DVec3::ONE;
         }
+        let transparency = shadow_transparency(items.iter().map(|closure| {
+            (
+                closure.weight,
+                closure.params.alpha,
+                transparent_tint(&closure.params),
+            )
+        }));
         // Cycles' film alpha is one minus the mean transparent weight (`surface_shader_transparency`), tinted. An Add with a
         // Transparent arm therefore covers the pixel by its other arms only, and a hit without closures covers nothing.
         let coverage = (1.0 - transparency.element_sum() / 3.0).clamp(0.0, 1.0);
@@ -312,7 +327,6 @@ impl Closures {
             emission_pass,
             albedo,
             coverage,
-            transparency,
         }
     }
 
@@ -2777,9 +2791,9 @@ fn make_surface(
     })
 }
 
-/// The media and shadow transparency of one hit, which is all a shadow ray reads from it. Both are the values
-/// `make_surface` builds, since neither depends on the normal, so the displacement gradient is not evaluated for a
-/// shadow hit. A warning that only the gradient's samples record is therefore not recorded from a shadow ray.
+/// The media and shadow transparency of one hit, which is all a shadow ray or the camera's medium probe reads from it.
+/// Neither depends on the normal, so the displacement gradient is not evaluated here. Consequently a warning, or an error,
+/// that only the gradient's samples produce is not raised from a shadow ray; path and camera hits still raise it.
 fn shadow_hit(
     doc: &SceneDoc,
     geometry: &TraceGeometry<'_>,
@@ -2796,22 +2810,19 @@ fn shadow_hit(
             &frame.context,
             evaluator_workspace,
         )?;
-        // The same sum `Closures::new` takes for the shadow transparency, over the same closures in the same order.
-        let mut transparency = DVec3::ZERO;
-        let mut weight_total = 0.0;
-        for closure in shading
-            .closures
-            .iter()
-            .filter(|closure| closure.weight > 0.0)
-        {
-            let mut params = closure.params;
-            apply_hit_alpha(frame.material, &mut params);
-            transparency += transparent_tint(&params) * (closure.weight * (1.0 - params.alpha));
-            weight_total += closure.weight;
-        }
-        if weight_total <= 0.0 {
-            transparency = DVec3::ONE;
-        }
+        // The closures `make_surface` keeps (weight above zero), with alpha after the material's alpha mode, as `Closures::new`
+        // reads them.
+        let transparency = shadow_transparency(
+            shading
+                .closures
+                .iter()
+                .filter(|closure| closure.weight > 0.0)
+                .map(|closure| {
+                    let mut params = closure.params;
+                    apply_hit_alpha(frame.material, &mut params);
+                    (closure.weight, params.alpha, transparent_tint(&params))
+                }),
+        );
         Ok((
             surface_media(frame.triangle.object_index, &shading.volume),
             transparency,
