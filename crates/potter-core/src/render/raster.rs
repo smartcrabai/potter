@@ -736,7 +736,7 @@ pub(crate) fn rasterize_with_samples(
                     // Without a film the pixel keeps its own pattern, whose first sample is the centre. A film sample is
                     // jittered over its pixel, the first included, as EEVEE jitters every sample (`pixel_jitter_get`).
                     let (sample_x, sample_y) = match film.as_ref() {
-                        Some(film) => film.jitter(film_sample_offset(seed, x, y, sample_index)),
+                        Some(film) => film.jitter(film_sample_offset(sample_index)),
                         None => sample_offset(seed, x, y, sample_index),
                     };
                     let (sample_ray, sample_hit) = if sample_index == 0 && film.is_none() {
@@ -1833,24 +1833,15 @@ struct FilmFilter {
 
 impl FilmFilter {
     /// The sub-pixel position of a film sample from its offset in the pixel. Below `FRAC_1_SQRT_2` px EEVEE confines
-    /// the jitter to a disk of half the radius about the centre (`eevee_film.cc`, `pixel_jitter_get`, bias 0.5), and
-    /// otherwise it is uniform over the pixel. The square maps onto the disk by Shirley-Chiu's concentric mapping.
+    /// the jitter to a disk of half the radius about the centre, bias 0.5, mapped by `Sampling::sample_disk` as
+    /// `sqrt(u)` and `2*pi*v` (`eevee_film.cc`, `pixel_jitter_get`; `eevee_sampling.cc`, `sample_disk`). Otherwise the
+    /// offset is uniform over the pixel.
     fn jitter(&self, offset: (f64, f64)) -> (f64, f64) {
         if self.radius >= std::f64::consts::FRAC_1_SQRT_2 {
             return offset;
         }
-        let (u, v) = (2.0 * offset.0 - 1.0, 2.0 * offset.1 - 1.0);
-        let (r, theta) = if u.abs() > v.abs() {
-            (u, std::f64::consts::FRAC_PI_4 * (v / u))
-        } else if v.abs() > 0.0 {
-            (
-                v,
-                std::f64::consts::FRAC_PI_2 - std::f64::consts::FRAC_PI_4 * (u / v),
-            )
-        } else {
-            (0.0, 0.0)
-        };
-        let scale = 0.5 * self.radius * r;
+        let scale = 0.5 * self.radius * offset.0.sqrt();
+        let theta = std::f64::consts::TAU * offset.1;
         (0.5 + scale * theta.cos(), 0.5 + scale * theta.sin())
     }
 
@@ -1924,17 +1915,27 @@ fn film_radius(mode: Mode, samples: u32, filter_size: f64) -> Option<f64> {
     Some(filter_size.clamp(0.0, 100.0).max(1.0e-4))
 }
 
-/// A film sample's offset inside its pixel, uniform over the pixel and the same for every sample index, the first
-/// included: EEVEE jitters every sample (`pixel_jitter_get`), where the pixel's own pattern keeps the centre.
-fn film_sample_offset(seed: u32, x: u32, y: u32, sample_index: u32) -> (f64, f64) {
-    let key = seed
-        ^ x.wrapping_mul(0x9e37_79b9)
-        ^ y.wrapping_mul(0x85eb_ca6b)
-        ^ sample_index.wrapping_mul(0xc2b2_ae35)
-        ^ 0x5bd1_e995;
-    let x_offset = f64::from(mix_sample_hash(key)) / 4_294_967_296.0;
-    let y_offset = f64::from(mix_sample_hash(key ^ 0xa511_e9b3)) / 4_294_967_296.0;
+/// A film sample's offset inside its pixel: EEVEE's Halton (2, 3) sequence at index `sample_index + 1`, each dimension
+/// rotated by a fixed offset, `fract(halton + 1/2)` and `fract(halton + 2/3)` (`eevee_sampling.cc`, `Sampling::step`,
+/// with `BLI_halton_2d` from `blenlib/intern/rand.cc`). The pattern is the same for every pixel and needs no seed.
+fn film_sample_offset(sample_index: u32) -> (f64, f64) {
+    let index = u64::from(sample_index) + 1;
+    let x_offset = (halton_radical_inverse(2, index) + 0.5).fract();
+    let y_offset = (halton_radical_inverse(3, index) + 2.0 / 3.0).fract();
     (x_offset, y_offset)
+}
+
+/// The radical inverse of `index` in `base`: its digits reversed about the radix point.
+fn halton_radical_inverse(base: u64, mut index: u64) -> f64 {
+    let inverse_base = 1.0 / base as f64;
+    let mut scale = 1.0;
+    let mut value = 0.0;
+    while index > 0 {
+        scale *= inverse_base;
+        value += scale * (index % base) as f64;
+        index /= base;
+    }
+    value
 }
 
 /// EEVEE's `film_filter_weight`: a Gaussian fitted to Blackman-Harris, with a standard deviation of 0.284 radii

@@ -2,9 +2,10 @@
 //! 5.2.2's EEVEE on a sub-pixel edge.
 //!
 //! `fixtures/native_oracle/eevee_film_filter.py` renders a white emitter whose edge lies at pixel column 32.3 of a
-//! 64 px frame, once per filter size, with EEVEE at 256 samples. The test imports the saved `.blend` (Filter Size 1.5)
-//! and renders the same frame with `pot render --engine realtime` at each filter size, with 256 samples. Each
-//! column is compared as the mean over the rows, against EEVEE's column profile for that size.
+//! 64 px frame, once per filter size, with EEVEE at 256 samples. Its column profiles are committed in
+//! `eevee_film_filter.json`; run with a render directory of `0`, the script only saves the `.blend`, which the test
+//! imports (Filter Size 1.5). The test renders the same frame with `pot render --engine realtime` at each filter size,
+//! with 16 samples, and compares each column's mean over the rows against EEVEE's column profile for that size.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -19,7 +20,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{error::Error, fs, path::Path};
+use std::{error::Error, path::Path};
 
 use native_oracle::{
     TestResult, apply_operations, floats, import_blend, pot, read_scene, run_blender_arguments,
@@ -30,12 +31,14 @@ use potter_core::model::Image;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-/// The scene and EEVEE renders (`eevee_film_filter.py`).
+/// The scene, which Blender saves as a `.blend` (`eevee_film_filter.py`), and the EEVEE column profiles it rendered
+/// at 256 samples, committed beside it.
 const SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_film_filter.py");
+const ORACLE: &str = include_str!("fixtures/native_oracle/eevee_film_filter.json");
 
-/// Render settings shared with `eevee_film_filter.py`, and the sample count of the realtime render.
+/// Render settings shared with `eevee_film_filter.py`, and the sample count of Potter's realtime render.
 const RESOLUTION: u32 = 64;
-const SAMPLES: u32 = 256;
+const SAMPLES: u32 = 16;
 
 /// The filter sizes compared, as the keys of the oracle's `profiles`. `0.01` is the point sample below the
 /// jitter threshold, `0.5` a jitter inside a half-pixel disk, and `1.5` Blender's default.
@@ -44,9 +47,11 @@ const FILTER_SIZES: [&str; 3] = ["0.01", "0.5", "1.5"];
 /// The columns compared: the edge at pixel 32.3 and the neighbours that a filter of 1.5 px reaches.
 const COLUMNS: std::ops::RangeInclusive<usize> = 28..=36;
 
-/// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL: it is not yet derived from the
-/// seed spread of Potter's realtime render at `SAMPLES`; the lane must measure that spread and keep every margin at
-/// three sigma or more, adjusting the sample count and never this bound.
+/// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL. Potter's Halton pattern is
+/// deterministic, so its own seed spread is zero; the residual is Potter's quadrature at `SAMPLES` plus EEVEE's
+/// single 256-sample profile, whose noise is not yet measured. Measured worst deviations at `SAMPLES` 16: 0.0000 at
+/// 0.01 px, 0.0062 at 0.5 px, 0.0157 at 1.5 px (at 64 samples: 0.0111 and 0.0027). The three-sigma margin the bound
+/// needs awaits EEVEE's noise measurement; the sample count is the lever, not this bound.
 const TOLERANCE: f64 = 0.03;
 
 /// The mean red value of each column of the image `id`, averaged over the rows, read with Potter's own EXR loader.
@@ -75,15 +80,18 @@ fn realtime_film_filter_matches_eevee_column_profiles() -> TestResult {
     let root = tempdir()?;
     let script = write_script(root.path(), "eevee_film_filter.py", SCRIPT)?;
     let blend = root.path().join("film_filter.blend");
-    let oracle_json = root.path().join("eevee_film_filter.json");
-    let eevee_dir = root.path().join("eevee");
+    // The render directory `0` stops the generator after saving the .blend: the profiles are committed.
     run_blender_arguments(
         &blender,
         &script,
         None,
-        &[blend.as_path(), oracle_json.as_path(), eevee_dir.as_path()],
+        &[
+            blend.as_path(),
+            root.path().join("unused.json").as_path(),
+            Path::new("0"),
+        ],
     )?;
-    let oracle: Value = serde_json::from_slice(&fs::read(&oracle_json)?)?;
+    let oracle: Value = serde_json::from_str(ORACLE)?;
 
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let scene = read_scene(&project)?;

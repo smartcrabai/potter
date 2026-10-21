@@ -9,7 +9,8 @@ size, the red channel averaged over the rows of the frame (the edge is vertical,
 noise): one value per column.
 
 Arguments after `--`: blend_out, json_out, render_dir. `blend_out` is the scene with the default Filter Size, for
-Potter to import; the EEVEE renders go to `render_dir`.
+Potter to import; the EEVEE renders go to `render_dir`. With `render_dir` set to `0` the generator only saves the
+.blend: the test reads the committed profiles in `eevee_film_filter.json`, which this script wrote with the renders.
 """
 
 import json
@@ -27,7 +28,8 @@ SAMPLES = 256
 FILTER_SIZES = [0.01, 0.5, 1.5, 2.5]
 
 blend_out, json_out, render_dir = sys.argv[sys.argv.index("--") + 1:][:3]
-os.makedirs(render_dir, exist_ok=True)
+if render_dir != "0":
+    os.makedirs(render_dir, exist_ok=True)
 
 for obj in list(bpy.data.objects):
     bpy.data.objects.remove(obj, do_unlink=True)
@@ -81,6 +83,8 @@ plane.data.materials.append(material)
 # The scene the test imports keeps Blender's default Filter Size.
 scene.render.filter_size = 1.5
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
+if render_dir == "0":
+    sys.exit(0)
 
 
 def row_profile(path):

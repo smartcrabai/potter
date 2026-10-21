@@ -119,8 +119,6 @@ pub fn render_sequence(
             "render samples must be between 1 and 1000000",
         ));
     }
-    let samples = if engine == "realtime" { 1 } else { samples };
-    let seed = if engine == "realtime" { 0 } else { seed };
     let scene_id = context.scene_id.as_ref().unwrap_or(&doc.active_scene);
     let scene = doc
         .scenes
