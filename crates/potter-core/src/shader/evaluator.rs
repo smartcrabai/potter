@@ -148,6 +148,17 @@ pub enum SubsurfaceMethod {
     Mixed,
 }
 
+/// A subsurface method Potter evaluates, each with its own Cycles closure. The Principled node's `SubsurfaceMethod`
+/// names one of these, or `Mixed`, which has none. A sampled subsurface closure carries one of these, so the sampler
+/// and the exit cannot meet a method Potter does not evaluate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluatedSubsurfaceMethod {
+    Burley,
+    RandomWalk,
+    RandomWalkSkin,
+    RandomWalkLegacy,
+}
+
 impl SubsurfaceMethod {
     /// The Blender enum identifier of a method, as the node property stores it.
     pub(crate) fn parse(token: &str) -> Option<Self> {
@@ -160,16 +171,23 @@ impl SubsurfaceMethod {
         }
     }
 
-    /// The feature id Potter reports for a method it does not evaluate, or `None` for a method it evaluates.
+    /// The evaluated method this one names, or `None` for `Mixed`, which Potter cannot hold in one parameter set.
+    pub(crate) fn evaluated(self) -> Option<EvaluatedSubsurfaceMethod> {
+        match self {
+            Self::Burley => Some(EvaluatedSubsurfaceMethod::Burley),
+            Self::RandomWalk => Some(EvaluatedSubsurfaceMethod::RandomWalk),
+            Self::RandomWalkSkin => Some(EvaluatedSubsurfaceMethod::RandomWalkSkin),
+            Self::RandomWalkLegacy => Some(EvaluatedSubsurfaceMethod::RandomWalkLegacy),
+            Self::Mixed => None,
+        }
+    }
+
+    /// The feature id Potter reports for a method it does not evaluate. Only `Mixed` is reported: the four named
+    /// methods are evaluated.
     pub(crate) fn unsupported_feature(self) -> Option<&'static str> {
         match self {
-            Self::Burley => None,
-            Self::RandomWalk => Some("shader.principled.subsurface_method.random_walk"),
-            Self::RandomWalkSkin => Some("shader.principled.subsurface_method.random_walk_skin"),
-            Self::RandomWalkLegacy => {
-                Some("shader.principled.subsurface_method.random_walk_legacy")
-            }
             Self::Mixed => Some("shader.principled.subsurface_method.mixed"),
+            Self::Burley | Self::RandomWalk | Self::RandomWalkSkin | Self::RandomWalkLegacy => None,
         }
     }
 
@@ -217,6 +235,8 @@ pub struct BsdfParams {
     pub subsurface_scale: f64,
     /// Cycles' subsurface method (`SubsurfaceMethod`), read from the Principled node's `subsurface_method` property.
     pub subsurface_method: SubsurfaceMethod,
+    /// The Principled Subsurface IOR, used by the random walk skin method's refractive entry.
+    pub subsurface_ior: f64,
     /// The Principled Subsurface Anisotropy: the thin branch's reflection and transmission split (`bsdf_thin_subsurface_setup`), and the random walk's phase function g.
     pub subsurface_anisotropy: f64,
     pub coat_weight: f64,
@@ -320,6 +340,7 @@ impl BsdfParams {
             subsurface_scale: 0.005,
             subsurface_method: SubsurfaceMethod::default(),
             subsurface_anisotropy: 0.0,
+            subsurface_ior: 1.4,
             coat_weight: 0.0,
             coat_roughness: 0.03,
             coat_ior: 1.5,
@@ -465,6 +486,7 @@ impl BsdfParams {
             subsurface_radius: mix3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: mix_scalar(first.subsurface_scale, second.subsurface_scale),
             subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
+            subsurface_ior: mix_scalar(first.subsurface_ior, second.subsurface_ior),
             subsurface_anisotropy: mix_scalar(
                 first.subsurface_anisotropy,
                 second.subsurface_anisotropy,
@@ -547,7 +569,12 @@ impl BsdfParams {
             subsurface_radius: add3(first.subsurface_radius, second.subsurface_radius),
             subsurface_scale: first.subsurface_scale.max(second.subsurface_scale),
             subsurface_method: SubsurfaceMethod::of_arms(&first, &second),
-            // Add has no single anisotropy for two closures: the arm with the larger subsurface weight gives it.
+            // Add has no single IOR or anisotropy for two closures: the arm with the larger subsurface weight gives them.
+            subsurface_ior: if second.subsurface_weight > first.subsurface_weight {
+                second.subsurface_ior
+            } else {
+                first.subsurface_ior
+            },
             subsurface_anisotropy: if second.subsurface_weight > first.subsurface_weight {
                 second.subsurface_anisotropy
             } else {
@@ -1515,6 +1542,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let method = method_token.as_str();
         params.subsurface_method = SubsurfaceMethod::parse(method)
             .ok_or_else(|| invalid(format!("unknown Principled subsurface method `{method}`")))?;
+        params.subsurface_ior = self.scalar_input(id, &["Subsurface IOR"], 1.4)?;
         params.subsurface_anisotropy = self.scalar_input(id, &["Subsurface Anisotropy"], 0.0)?;
         params.coat_weight = self.scalar_input(id, &["Coat Weight", "Clearcoat"], 0.0)?;
         params.coat_roughness =
@@ -3459,15 +3487,15 @@ mod tests {
         evaluate_surface(&native, &context).unwrap();
         evaluate_surface(&native, &context).unwrap();
 
-        // A graph material sets subsurface and rough transmission on its Principled node. Subsurface is not
-        // evaluated and warns; rough transmission and coat are evaluated, so they must not warn.
+        // A graph material sets subsurface (the default random walk, which is evaluated) and Thin Wall (which is not)
+        // on its Principled node, with rough transmission. Thin Wall warns; subsurface, rough transmission and coat do not.
         let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
             &mut graph,
             "principled",
             "ShaderNodeBsdfPrincipled",
-            json!({"Subsurface Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
+            json!({"Subsurface Weight":0.5,"Thin Wall":1.0,"Transmission Weight":0.5,"Roughness":0.3}),
         );
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         let graph_id = Id::new("graph_shader".to_owned()).unwrap();
@@ -3493,14 +3521,12 @@ mod tests {
                 .count()
         };
         assert_eq!(count("Native", "Transmission Weight"), 0);
-        assert_eq!(count("Graph", "Subsurface Weight"), 1);
+        assert_eq!(count("Graph", "Subsurface Weight"), 0);
+        assert_eq!(count("Graph", "Thin Wall"), 1);
         assert_eq!(count("Graph", "Coat Weight"), 0);
         assert_eq!(count("Graph", "Transmission Weight"), 0);
-        let subsurface_warning = warnings
-            .iter()
-            .find(|w| w["input"] == "Subsurface Weight")
-            .unwrap();
-        assert_eq!(subsurface_warning["node_id"], "principled");
+        let thin_wall_warning = warnings.iter().find(|w| w["input"] == "Thin Wall").unwrap();
+        assert_eq!(thin_wall_warning["node_id"], "principled");
     }
 
     #[test]
@@ -3973,19 +3999,14 @@ mod subsurface_method_tests {
 
     #[test]
     fn only_the_unevaluated_methods_report_a_feature() {
-        // PR-a evaluates Burley only: every other method is reported, never rendered as Burley.
+        // Burley and the three random walk methods are evaluated; a Mix or Add of two different methods is the one
+        // reported case, never rendered as another method.
         assert_eq!(SubsurfaceMethod::Burley.unsupported_feature(), None);
-        assert_eq!(
-            SubsurfaceMethod::RandomWalk.unsupported_feature(),
-            Some("shader.principled.subsurface_method.random_walk")
-        );
-        assert_eq!(
-            SubsurfaceMethod::RandomWalkSkin.unsupported_feature(),
-            Some("shader.principled.subsurface_method.random_walk_skin")
-        );
+        assert_eq!(SubsurfaceMethod::RandomWalk.unsupported_feature(), None);
+        assert_eq!(SubsurfaceMethod::RandomWalkSkin.unsupported_feature(), None);
         assert_eq!(
             SubsurfaceMethod::RandomWalkLegacy.unsupported_feature(),
-            Some("shader.principled.subsurface_method.random_walk_legacy")
+            None
         );
         assert_eq!(
             SubsurfaceMethod::Mixed.unsupported_feature(),

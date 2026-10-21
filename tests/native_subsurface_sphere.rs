@@ -1,5 +1,5 @@
-//! A sphere with Burley subsurface scattering under a point and a disk light, against Blender 5.2.2's Cycles render
-//! (`fixtures/native_oracle/subsurface/subsurface_sphere.py`, case `burley`).
+//! A sphere with each evaluated subsurface method (Burley, random walk, random walk skin, random walk legacy) under a
+//! point and a disk light, against Blender 5.2.2's Cycles render (`fixtures/native_oracle/subsurface/subsurface_sphere.py`).
 //!
 //! Blender renders the sphere at 256 samples per pixel, eight seeds. Potter imports the same scene and renders eight
 //! seeds on a 16 × 16 frame at `SAMPLES` samples per pixel, in-process with the scene's seed set in memory. Each side's
@@ -8,12 +8,16 @@
 //! The tolerance is `T · √(s_B² / n + s_P² / n)`, with `s` the seed-to-seed sample standard deviations of each side and
 //! `T` the two-sided 99.9% t quantile at 7 degrees of freedom (5.408).
 //!
-//! What the test detects. The oracle's subsurface scale is 6.0, so the Burley profile spreads light across the sphere.
+//! What the test detects. The oracle's subsurface scale is 6.0, so every profile spreads light across the sphere.
 //! Blender's frame means (red) are: Burley 0.15974, no subsurface 0.19963, random walk 0.04077, random walk skin 0.19571,
-//! random walk legacy 0.17539. Burley against no subsurface differs by 0.0399 in red, and against random walk by 0.119.
-//! So a Burley lobe that is absent or wrongly scaled is detected at any noise this test can reach. The random walk
-//! methods are not evaluated yet: their cases report `UNSUPPORTED_FEATURE` and render without subsurface scattering, and
-//! they are not tested here.
+//! random walk legacy 0.17539. Burley against no subsurface differs by 0.0399 in red, and random walk against Burley by
+//! 0.119. So an absent or wrongly scaled closure of any of the four methods is detected at any noise this test can reach.
+//! The skin method is the one a dropped closure could pass in red alone: skin minus no subsurface is 0.0039 in red, about
+//! 1.6 times the red floor `T` × 0.00046 = 0.0025. Measured headless with the committed generator (eight seeds, 256
+//! samples per pixel, Blender 5.2.2), the seed standard error of the mean is 0.00046, 0.00041, 0.00023 for skin and
+//! 0.00006, 0.00002, 0.00002 for no subsurface (red, green, blue). Skin minus no subsurface is 0.0423 in green and 0.0310
+//! in blue: about 19 and 25 times the floors `T` × 0.00041 = 0.0022 and `T` × 0.00023 = 0.0012, before Potter's own noise
+//! is added. A skin closure dropped to diffuse therefore fails the green and blue channels.
 //!
 //! Cost: each case runs in about 12–17 s of test time on the lane (Blender's renders included), at `SAMPLES` = 32
 //! samples per pixel on eight seeds, so each case stays well inside the 40 s budget.
@@ -96,6 +100,27 @@ fn burley_floor_bounce1_subsurface_sphere_matches_cycles() -> TestResult {
     matches_cycles("burley_floor_bounce1")
 }
 
+#[test]
+fn random_walk_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("random_walk")
+}
+
+#[test]
+fn random_walk_skin_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("random_walk_skin")
+}
+
+#[test]
+fn random_walk_legacy_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("random_walk_legacy")
+}
+
+/// The random walk with g = 0.8. The isotropic cases leave g at zero, where the similarity medium after bounce 9 and the
+/// remap's g terms change nothing, so this case is the one that exercises them.
+#[test]
+fn random_walk_anisotropic_subsurface_sphere_matches_cycles() -> TestResult {
+    matches_cycles("random_walk_anisotropic")
+}
 /// Renders the sphere of `case` (a case of `subsurface_sphere.py`) in Blender and in Potter at the case's bounce
 /// budget, and compares the channel means of the seeds with the tolerance of the module docs.
 fn matches_cycles(case: &str) -> TestResult {
