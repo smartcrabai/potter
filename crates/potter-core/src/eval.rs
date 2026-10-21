@@ -1781,10 +1781,21 @@ impl Snapshot {
                                 json!({"modifier_id":modifier.id,"owner":id}),
                             ));
                         };
-                        let mesh_to_owner = crate::geom::blender_matrix::blender_mul_m4(
-                            &owner_inverse_f32,
-                            &crate::geom::blender_matrix::blender_matrix_from_f64(operand_matrix),
-                        );
+                        // `world_to_object(owner) * object_to_world(operand)` in float (`MOD_mesh_to_volume.cc`);
+                        // the exact replay of the operand's composition is used when it applies.
+                        let mesh_to_owner = match crate::geom::blender_matrix::operand_to_subject(
+                            doc, id, &object_id, matrices,
+                        ) {
+                            Some(replayed) => {
+                                crate::geom::blender_matrix::blender_matrix_from_f64(replayed)
+                            }
+                            None => crate::geom::blender_matrix::blender_mul_m4(
+                                &owner_inverse_f32,
+                                &crate::geom::blender_matrix::blender_matrix_from_f64(
+                                    operand_matrix,
+                                ),
+                            ),
+                        };
                         // A parameter the modifier does not store takes its Blender default from the schema table.
                         let number = |parameter: &str| -> Result<f64> {
                             match modifier.params.get(parameter).and_then(Value::as_f64) {
@@ -6356,6 +6367,13 @@ fn apply_volume_displace_modifier(
             json!({"node_id":volume_id}),
         )
     })?;
+    // Blender's `ctx->object->object_to_world()` is composed in float (`object.cc`); the exact
+    // replay is used when it applies, else the f64 world matrix is rounded.
+    let subject_world =
+        crate::geom::blender_matrix::object_to_world(doc, volume_id, world_matrices, 0)
+            .map_or(volume_world, |matrix| {
+                crate::geom::blender_matrix::dmat4_from_blender(&matrix)
+            });
     let texture_mapping = if texture_source.is_some()
         && params
             .get("strength")
@@ -6364,7 +6382,7 @@ fn apply_volume_displace_modifier(
     {
         texture_coordinate_mapping_with_parameters(
             modifier,
-            volume_world,
+            subject_world,
             doc,
             world_matrices,
             bone_pose_matrices,

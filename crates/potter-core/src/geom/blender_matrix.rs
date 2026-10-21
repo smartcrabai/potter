@@ -240,7 +240,7 @@ fn blender_transform_matrix(transform: &Transform) -> Option<BlenderMat4> {
 /// matrix in f32, in that order. The replica is used only where the evaluated world matrix is the
 /// f64 composition of the same parts (no animation, drivers, constraints or bone parents) and the
 /// f32 replica agrees with the f64 transform. Otherwise `None`.
-fn object_to_world(
+pub(crate) fn object_to_world(
     doc: &SceneDoc,
     node_id: &Id,
     world_matrices: &BTreeMap<Id, DMat4>,

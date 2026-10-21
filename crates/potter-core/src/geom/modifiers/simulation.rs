@@ -614,23 +614,44 @@ impl<'a> VolumeDisplacement<'a> {
         })
     }
 
+    /// Blender's `index_to_texture` (`MOD_volume_displace.cc`, `get_index_to_texture_transform`) as
+    /// OpenVDB multiplies it: `index_to_object` for `LOCAL`, `index_to_object * object_to_world` for
+    /// `GLOBAL`, and `index_to_object * object_to_world * world_to_texture` for `OBJECT`.
+    fn texture_matrix(&self, index_to_object: &[f32; 16]) -> [f32; 16] {
+        match self.mapping_mode {
+            VolumeTextureMapMode::Local => *index_to_object,
+            VolumeTextureMapMode::Global => {
+                openvdb_mat4_mul(index_to_object, &self.mapping.subject_to_world_f32)
+            }
+            VolumeTextureMapMode::Object => match &self.mapping.world_to_mapping_f32 {
+                Some(world_to_mapping) => openvdb_mat4_mul(
+                    &openvdb_mat4_mul(index_to_object, &self.mapping.subject_to_world_f32),
+                    world_to_mapping,
+                ),
+                None => *index_to_object,
+            },
+        }
+    }
+
     /// Blender's `DisplaceOp::compute_displace_vector` (`MOD_volume_displace.cc`): the texture is
-    /// evaluated at the single-precision position, and the displacement `(texture - mid) * scale`,
-    /// with `scale = strength / max_voxel_side` as a float, is in index units.
+    /// evaluated at `index * texture_matrix` in single precision, and the displacement
+    /// `(texture - mid) * scale`, with `scale = strength / max_voxel_side` as a float, is in index units.
     fn index_displacement_at(
         &mut self,
-        local_position: DVec3,
+        texture_matrix: &[f32; 16],
+        index: DVec3,
         max_voxel_side: f64,
     ) -> Result<DVec3> {
-        let texture_position = match self.mapping_mode {
-            VolumeTextureMapMode::Local => local_position,
-            VolumeTextureMapMode::Global => self.mapping.global_coordinate(local_position),
-            VolumeTextureMapMode::Object => self.mapping.object_coordinate(local_position),
-        };
+        let texture_position =
+            crate::geom::modifiers::blender_transform_point_f32(texture_matrix, index.as_vec3());
+        let texture_position = DVec3::new(
+            f64::from(texture_position.x),
+            f64::from(texture_position.y),
+            f64::from(texture_position.z),
+        );
         if !texture_position.is_finite() {
             return Err(invalid("volume texture coordinates are not finite"));
         }
-        let texture_position = texture_position.map(|component| f64::from(component as f32));
         let sample = crate::geom::legacy_texture::sample(self.texture, texture_position, self.rng)?;
         let scale = f64::from((self.strength as f32) / (max_voxel_side as f32));
         Ok((DVec3::from_array(sample.rgb) - DVec3::from_array(self.mid_level)) * scale)
@@ -723,21 +744,40 @@ fn displace_inline_grid(grid: &mut VolumeGrid, texture: &mut VolumeDisplacement<
         || original_origin - voxel_size * padding as f64,
         |matrix| matrix.transform_point3(DVec3::ZERO),
     );
+    // Blender's texture position is `index * index_to_texture` with the grid's absolute index: an
+    // affine grid carries its own transform and its sample index is the index; otherwise the grid's
+    // transform is the voxel scale, and the absolute index is the sample index plus the origin's index.
+    let (index_to_object, index_offset) = if grid.index_to_local.is_some() {
+        (
+            grid.checked_index_to_local_matrix()?
+                .to_cols_array()
+                .map(|value| value as f32),
+            DVec3::ZERO,
+        )
+    } else {
+        let voxel = grid.voxel_size as f32;
+        let mut scale = [0.0_f32; 16];
+        scale[0] = voxel;
+        scale[5] = voxel;
+        scale[10] = voxel;
+        scale[15] = 1.0;
+        (scale, (original_origin / grid.voxel_size).round())
+    };
+    let texture_matrix = texture.texture_matrix(&index_to_object);
     let mut output = Vec::with_capacity(output_count);
     for z in 0..output_dims[2] {
         for y in 0..output_dims[1] {
             for x in 0..output_dims[0] {
-                let output_index = DVec3::new(x as f64, y as f64, z as f64);
-                let local_position = output_transform.map_or_else(
-                    || output_origin + voxel_size * output_index,
-                    |matrix| matrix.transform_point3(output_index),
-                );
-                // The output keeps the source grid shifted by the padding in both branches, so the
-                // source index is the output index minus the padding, less the index displacement.
-                let index_displacement =
-                    texture.index_displacement_at(local_position, grid.voxel_size)?;
-                let source_coordinate =
-                    output_index - DVec3::splat(padding as f64) - index_displacement;
+                // The output keeps the source grid shifted by the padding, so the source index is the
+                // output index minus the padding.
+                let source_index =
+                    DVec3::new(x as f64, y as f64, z as f64) - DVec3::splat(padding as f64);
+                let index_displacement = texture.index_displacement_at(
+                    &texture_matrix,
+                    source_index + index_offset,
+                    grid.voxel_size,
+                )?;
+                let source_coordinate = source_index - index_displacement;
                 let value = sample_volume_grid(&original, source_dims, source_coordinate);
                 if !value.is_finite() {
                     return Err(invalid("volume displacement produced a non-finite sample"));
@@ -821,11 +861,18 @@ fn displace_vdb_grid(grid: &VdbGrid, texture: &mut VolumeDisplacement<'_>) -> Re
     )]
     let rounds = dilation_radius as i32;
     let domain = dilate_face_edge(grid.tree.active_seeds(MAX_DISPLACED_SAMPLES)?, rounds)?;
+    // The grid's own transform is Blender's `index_to_object`; the index is absolute.
+    let index_to_world = grid
+        .transform
+        .index_to_world
+        .to_cols_array()
+        .map(|value| value as f32);
+    let texture_matrix = texture.texture_matrix(&index_to_world);
     let mut values = HashMap::with_capacity(domain.len());
     for point in domain {
         let index = DVec3::new(f64::from(point.x), f64::from(point.y), f64::from(point.z));
-        let object_position = grid.transform.index_to_world.transform_point3(index);
-        let source = index - texture.index_displacement_at(object_position, max_voxel_side)?;
+        let source =
+            index - texture.index_displacement_at(&texture_matrix, index, max_voxel_side)?;
         let value = if vector {
             VdbValue::Vec3(std::array::from_fn(|component| {
                 grid.sample_index_component_box(source, component)
@@ -949,6 +996,20 @@ fn append_instances(mesh: &Mesh, transforms: &[(DMat4, DVec3)]) -> Result<Mesh> 
         ))
     })?;
     Ok(output)
+}
+
+/// OpenVDB's `Mat4 * Mat4` (`openvdb/math/Mat4.h`, `operator*=`) on the memory of two float
+/// matrices: `result(i, j) = a(i, 0) b(0, j) + a(i, 1) b(1, j) + a(i, 2) b(2, j) + a(i, 3) b(3, j)`,
+/// summed left to right in `float`. Blender's `float[4][4]` has the same memory layout.
+pub(crate) fn openvdb_mat4_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    std::array::from_fn(|index| {
+        let (row, column) = (index / 4, index % 4);
+        let mut sum = a[4 * row] * b[column];
+        for inner in 1..4 {
+            sum += a[4 * row + inner] * b[4 * inner + column];
+        }
+        sum
+    })
 }
 
 /// Box-samples a dense inline grid at an index-space position, as Blender's `BoxSampler` does on the
