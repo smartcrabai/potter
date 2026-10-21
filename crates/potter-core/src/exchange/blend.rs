@@ -7057,7 +7057,7 @@ fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bo
 }
 
 /// Mesh-level keys that the `.blend` writer recreates or restores itself.
-const BLENDER_HANDLED_MESH_KEYS: [&str; 13] = [
+const BLENDER_HANDLED_MESH_KEYS: [&str; 14] = [
     "texture_space",
     "uv_layers",
     "color_layers",
@@ -7071,6 +7071,7 @@ const BLENDER_HANDLED_MESH_KEYS: [&str; 13] = [
     "blender_skin_vertices",
     "skin_radii",
     "skin_roots",
+    crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES,
 ];
 
 /// Blender selection and hide state. It is Blender-only data, kept in `blender_attributes`.
