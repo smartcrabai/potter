@@ -1608,6 +1608,9 @@ pub(super) struct Emission {
     /// (`bev_rebuild_polygon`, which runs last): these overwrite the marks above. The source edge
     /// index is `None` for an edge that is not an input edge.
     edge_states: Vec<EdgeState>,
+    /// Emitted point pairs that Blender keeps as the same `BMEdge` as an input edge (a copied face edge
+    /// or a rebuilt face's unchanged loop segment). Every other output edge is a new `BMEdge`.
+    kept_edges: Vec<(usize, usize)>,
 }
 
 /// An output polygon: per corner, the output point, its UV query and source face. `face` is the
@@ -1659,6 +1662,11 @@ impl Emission {
             .push(((first, second), sharp, seam, source));
     }
 
+    /// Records an emitted edge that Blender keeps as the same `BMEdge` as an input edge.
+    pub(super) fn record_kept_edge(&mut self, first: usize, second: usize) {
+        self.kept_edges.push((first, second));
+    }
+
     /// Starts a rebuild with copied source points and identity point origins.
     pub(super) fn new(source_points: &[DVec3]) -> Self {
         Self {
@@ -1669,6 +1677,7 @@ impl Emission {
             sharp_edges: Vec::new(),
             edge_flag_suppressions: Vec::new(),
             edge_states: Vec::new(),
+            kept_edges: Vec::new(),
         }
     }
 
@@ -2619,60 +2628,16 @@ fn zero_generated_edge_attributes(output: &mut Mesh, kept: &HashSet<(u32, u32)>)
     }
 }
 
-/// Output edges that are Blender's surviving input `BMEdge`s, keyed by output vertex IDs. An output edge
-/// survives when both endpoints are input vertices still at their input positions (Blender never moves a
-/// vertex whose edge survives) and the two input vertices form an input edge. Strip and rung edges have a
-/// moved endpoint, so they are generated.
-fn surviving_input_edges(mesh: &Mesh, output: &Mesh, identities: &[usize]) -> HashSet<(u32, u32)> {
-    let input_index: HashMap<u32, usize> = mesh
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect();
-    let pair = |a: usize, b: usize| (a.min(b), a.max(b));
-    let input_edges: HashSet<(usize, usize)> = mesh
-        .edges
-        .iter()
-        .filter_map(|edge| {
-            let first = *input_index.get(&edge.vertices[0])?;
-            let second = *input_index.get(&edge.vertices[1])?;
-            Some(pair(first, second))
+/// Output edge keys of the input `BMEdge`s Blender keeps, from the builder's explicit provenance: each
+/// emitted point pair in `kept` names an output edge by its output vertex IDs.
+fn kept_output_edges(output: &Mesh, remap: &[usize], kept: &[(usize, usize)]) -> HashSet<(u32, u32)> {
+    kept.iter()
+        .map(|&(first, second)| {
+            edge_key(
+                output.vertices[remap[first]].id,
+                output.vertices[remap[second]].id,
+            )
         })
-        .collect();
-    let unmoved: Vec<Option<usize>> = output
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| {
-            let source = *identities.get(index)?;
-            let input = mesh.vertices.get(source)?;
-            input.co.abs_diff_eq(vertex.co, 0.0).then_some(source)
-        })
-        .collect();
-    let output_index: HashMap<u32, usize> = output
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect();
-    output
-        .edges
-        .iter()
-        .filter(|edge| {
-            let (Some(first), Some(second)) = (
-                output_index
-                    .get(&edge.vertices[0])
-                    .and_then(|i| unmoved[*i]),
-                output_index
-                    .get(&edge.vertices[1])
-                    .and_then(|i| unmoved[*i]),
-            ) else {
-                return false;
-            };
-            input_edges.contains(&pair(first, second))
-        })
-        .map(|edge| edge_key(edge.vertices[0], edge.vertices[1]))
         .collect()
 }
 
@@ -3276,7 +3241,16 @@ pub(super) fn finish(
         sharp_edges: emitted_sharp_edges,
         edge_flag_suppressions: emitted_edge_flag_suppressions,
         edge_states: emitted_edge_states,
+        kept_edges: emitted_kept_edges,
     } = emission;
+    // Blender's unchanged faces are copied as-is, so each of their edges is the input `BMEdge`.
+    let mut kept_edges = emitted_kept_edges;
+    for polygon in emitted_polygons.iter().filter(|polygon| polygon.kind == Kind::Original) {
+        let count = polygon.vertices.len();
+        for corner in 0..count {
+            kept_edges.push((polygon.vertices[corner], polygon.vertices[(corner + 1) % count]));
+        }
+    }
     let mut used = vec![false; emitted_points.len()];
     for polygon in &emitted_polygons {
         for vertex in &polygon.vertices {
@@ -3545,7 +3519,7 @@ pub(super) fn finish(
         build_mesh_with_edge_identity(points, polygons, loose, &origin, Some(&identities), mesh)?;
     clear_origindex(&mut result);
     fill_generated_uv_faces(&mut result);
-    let kept = surviving_input_edges(mesh, &result, &identities);
+    let kept = kept_output_edges(&result, &remap, &kept_edges);
     zero_generated_edge_attributes(&mut result, &kept);
     if !emitted_edge_flag_suppressions.is_empty()
         || !emitted_seam_edges.is_empty()

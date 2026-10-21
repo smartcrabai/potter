@@ -1599,7 +1599,7 @@ impl<'a> Builder<'a> {
     /// corner's run the copy keeps a seam or sharp mark only where the previous source edge also has
     /// it (`bmesh_bevel.cc` 7258–7285).
     fn copy_rebuilt_edge_flags(
-        &self,
+        &mut self,
         out: &[usize],
         sources: &[usize],
         vertices: &[usize],
@@ -1616,6 +1616,8 @@ impl<'a> Builder<'a> {
             let (first, second) = (out[k], out[(k + 1) % n]);
             let (source_first, source_second) = edge_of(sources[k]);
             if edge_key(first, second) == edge_key(source_first, source_second) {
+                // The rebuilt loop keeps this input `BMEdge`, so Blender copies nothing onto it.
+                self.emission.record_kept_edge(first, second);
                 continue;
             }
             let (mut sharp, mut seam) = self
