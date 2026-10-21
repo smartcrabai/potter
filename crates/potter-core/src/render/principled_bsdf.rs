@@ -64,10 +64,16 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
         .iter()
         .filter(|&&on| on)
         .count() as f64;
-    let subsurface_weight =
-        subsurface_closure_weight(params, layers.normal, layers.view, layers.lower).element_sum()
-            / 3.0
-            * covered_channels;
+    let subsurface_weight = subsurface_closure_weight(
+        params,
+        layers.energy_roughness,
+        layers.normal,
+        layers.view,
+        layers.lower,
+    )
+    .element_sum()
+        / 3.0
+        * covered_channels;
     // Each layer's selection weight is its layering albedo: Cycles' sample weight of the closure.
     let sheen_weight = layers.sheen.selection_weight();
     let coat_weight = layers.coat.map_or(0.0, |coat| coat.albedo);
@@ -200,6 +206,7 @@ pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers) -> DVec3
     };
     diffuse_lobe(
         &without_subsurface,
+        layers.energy_roughness,
         layers.normal,
         layers.view,
         layers.lower,
@@ -207,9 +214,14 @@ pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers) -> DVec3
 }
 
 /// The Lambert weight of the dielectric-layered diffuse lobe, before the 1/π and the albedo (Cycles' diffuse weight).
-fn diffuse_layer_weight(params: &BsdfParams, normal: DVec3, view: DVec3) -> f64 {
+fn diffuse_layer_weight(
+    params: &BsdfParams,
+    energy_roughness: f64,
+    normal: DVec3,
+    view: DVec3,
+) -> f64 {
     let n_dot_v = normal.dot(view).max(0.0);
-    let roughness = params.roughness.clamp(MIN_ROUGHNESS, 1.0);
+    let roughness = energy_roughness.clamp(MIN_ROUGHNESS, 1.0);
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
     let dielectric_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
@@ -253,6 +265,7 @@ fn subsurface_share(params: &BsdfParams) -> DVec3 {
 /// weight the path tracer divides by the branch's probability to enter the surface.
 pub(crate) fn subsurface_closure_weight(
     params: &BsdfParams,
+    energy_roughness: f64,
     normal: DVec3,
     view: DVec3,
     lower: DVec3,
@@ -265,18 +278,24 @@ pub(crate) fn subsurface_closure_weight(
     base_color(params)
         * covered
         * (params.subsurface_weight.clamp(0.0, 1.0)
-            * diffuse_layer_weight(params, normal, view)
+            * diffuse_layer_weight(params, energy_roughness, normal, view)
             * params.reflectance.clamp(0.0, 1.0))
         * lower
 }
 
 /// The diffuse lobe, given the coat's lower-layer factor (set up once by the caller).
-fn diffuse_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> DVec3 {
+fn diffuse_lobe(
+    params: &BsdfParams,
+    energy_roughness: f64,
+    normal: DVec3,
+    view: DVec3,
+    lower: DVec3,
+) -> DVec3 {
     let n_dot_v = normal.dot(view).max(0.0);
     if n_dot_v <= 0.0 {
         return DVec3::ZERO;
     }
-    let weight = diffuse_layer_weight(params, normal, view);
+    let weight = diffuse_layer_weight(params, energy_roughness, normal, view);
     diffuse_albedo(params)
         * subsurface_share(params)
         * (weight / PI)
@@ -287,12 +306,20 @@ fn diffuse_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -
 /// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the
 /// light or view is below the surface.
 pub(crate) fn specular_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
-    specular_lobe(params, layers.specular, layers.view, light, layers.lower)
+    specular_lobe(
+        params,
+        layers.energy_roughness,
+        layers.specular,
+        layers.view,
+        light,
+        layers.lower,
+    )
 }
 
 /// The specular lobe, given the coat's lower-layer factor (set up once by the caller).
 fn specular_lobe(
     params: &BsdfParams,
+    energy_roughness: f64,
     normal: DVec3,
     view: DVec3,
     light: DVec3,
@@ -314,8 +341,10 @@ fn specular_lobe(
 
     // Energy preservation: E is looked up at the view direction, as Cycles does at setup
     // (`microfacet_ggx_preserve_energy(kg, bsdf, sd->wi, ...)`), so it is constant per shading point.
-    let energy = ggx_energy(roughness, n_dot_v).max(1.0e-6);
-    let energy_average = ggx_energy_average(roughness);
+    // The compensation is Cycles' setup value (`energy_scale`), which the glossy blur leaves at the original roughness.
+    let energy_roughness = energy_roughness.clamp(MIN_ROUGHNESS, 1.0);
+    let energy = ggx_energy(energy_roughness, n_dot_v).max(1.0e-6);
+    let energy_average = ggx_energy_average(energy_roughness);
     let missing = (1.0 - energy) / energy;
 
     let common = ggx_distribution(alpha_squared, n_dot_h)
@@ -363,14 +392,26 @@ pub(crate) fn evaluate(params: &BsdfParams, layers: &Layers, light: DVec3) -> DV
     // The diffuse, sheen and coat lobes sit above the shading normal. The specular lobe checks its own, bent normal, so
     // it is not gated by the shading normal, and the glass lobe takes both sides.
     let above_shading = if layers.normal.dot(light) > 0.0 {
-        diffuse_lobe(params, layers.normal, layers.view, layers.lower)
-            + sheen_coefficient(params, layers, light)
+        diffuse_lobe(
+            params,
+            layers.energy_roughness,
+            layers.normal,
+            layers.view,
+            layers.lower,
+        ) + sheen_coefficient(params, layers, light)
             + coat_coefficient(params, layers, light)
     } else {
         DVec3::ZERO
     };
     above_shading
-        + specular_lobe(params, layers.specular, layers.view, light, layers.lower)
+        + specular_lobe(
+            params,
+            layers.energy_roughness,
+            layers.specular,
+            layers.view,
+            light,
+            layers.lower,
+        )
         + glass_coefficient(params, layers, light)
 }
 
@@ -440,6 +481,10 @@ fn coat_layer(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<CoatLay
 /// as Cycles layers them (`principled_bsdf_emission`, `kernel/svm/closure.h`).
 #[derive(Clone, Copy)]
 pub(crate) struct Layers {
+    /// The roughness Cycles' setup computed the multiscatter energy from (`microfacet_ggx_preserve_energy`, once per
+    /// closure). It is kept through the glossy blur, which raises only the sampling alpha (`bsdf_microfacet_blur`),
+    /// so a blurred closure keeps the compensation of its original roughness, as Cycles' `energy_scale` does.
+    pub(crate) energy_roughness: f64,
     /// The shading normal, which the diffuse and sheen lobes use.
     pub(crate) normal: DVec3,
     /// The sheen's normal: the shading normal mixed towards the coat normal by the coat weight (`principled_bsdf_emission`).
@@ -492,6 +537,7 @@ pub(crate) fn layers_at(
     let lower = coat_lower_factor_of(params, coat.as_ref()) * sheen.layer_weight();
     let glass = glass_lobe(params, specular, view);
     Layers {
+        energy_roughness: params.roughness,
         normal,
         sheen_normal,
         specular,
@@ -2271,7 +2317,13 @@ mod subsurface_tests {
         let params = principled(SubsurfaceMethod::Burley, 0.5);
         let layers = layers(&params, DVec3::Z, -DVec3::Z);
         assert_eq!(
-            subsurface_closure_weight(&params, DVec3::Z, -DVec3::Z, layers.lower),
+            subsurface_closure_weight(
+                &params,
+                layers.energy_roughness,
+                DVec3::Z,
+                -DVec3::Z,
+                layers.lower
+            ),
             DVec3::ZERO
         );
     }

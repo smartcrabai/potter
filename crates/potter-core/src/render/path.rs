@@ -461,9 +461,10 @@ impl Closures {
         }
     }
 
-    /// The closures after Cycles' glossy blur (`bsdf_microfacet_blur`, `kernel/closure/bsdf_microfacet.h`): every microfacet
-    /// roughness, specular and coat, becomes `sqrt(max(roughness², blur_alpha))`. Each closure is rebuilt from its params, so
-    /// its layers follow its roughness.
+    /// The closures after Cycles' glossy blur (`bsdf_microfacet_blur`, `kernel/closure/bsdf_microfacet.h`). The blur raises
+    /// only the microfacet alpha: each specular and coat roughness becomes `sqrt(max(roughness², blur_alpha))`, which
+    /// drives the sampling distribution. The closure keeps its setup layers, so its multiscatter energy stays at the
+    /// original roughness (Cycles' `energy_scale` is computed once at setup and the blur does not recompute it).
     fn blurred(&self, blur_alpha: f64) -> Self {
         let items = self
             .items
@@ -472,13 +473,11 @@ impl Closures {
                 let mut params = closure.params;
                 params.roughness = blurred_roughness(params.roughness, blur_alpha);
                 params.coat_roughness = blurred_roughness(params.coat_roughness, blur_alpha);
-                HitClosure::new(
-                    closure.weight,
-                    &params,
-                    closure.layers.view,
-                    self.geometric,
-                    self.bump_correction,
-                )
+                HitClosure {
+                    weight: closure.weight,
+                    params,
+                    layers: closure.layers,
+                }
             })
             .collect();
         Self::new(items, self.smooth, self.geometric, self.bump_correction)
@@ -3748,8 +3747,9 @@ fn sample_lobes(
     // branch without one. Every method is evaluated, so the branch needs no method check.
     if choice < probabilities.subsurface {
         let method = params.subsurface_method;
-        let weight = subsurface_closure_weight(params, normal, view, layers.lower)
-            / probabilities.subsurface.max(1.0e-8);
+        let weight =
+            subsurface_closure_weight(params, layers.energy_roughness, normal, view, layers.lower)
+                / probabilities.subsurface.max(1.0e-8);
         return LobeDraw::Subsurface { weight, method };
     }
     let transmission_end = probabilities.subsurface + probabilities.transmission;
