@@ -86,18 +86,6 @@ impl BlenderRng {
     pub(crate) fn get_float(&mut self) -> f32 {
         self.get_int32() as f32 / 2_147_483_648.0_f32
     }
-
-    /// `BLI_rng_get_double`: `double(int32) / 2^31`, never 1.0.
-    pub(crate) fn get_double(&mut self) -> f64 {
-        f64::from(self.get_int32()) / 2_147_483_648.0
-    }
-
-    /// `BLI_rng_skip`: advances the generator by `count` draws, discarding them.
-    pub(crate) fn skip(&mut self, count: usize) {
-        for _ in 0..count {
-            self.step();
-        }
-    }
 }
 
 #[cfg(test)]
