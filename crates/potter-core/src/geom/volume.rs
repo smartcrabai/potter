@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{Mesh, MeshError},
+    model::VolumeInterpolation,
 };
 
 use super::edge_key;
@@ -267,6 +268,16 @@ pub fn sample_density(position: DVec3, volume: &VolumeData) -> f64 {
 /// Returns `UnsupportedFeature` for preserve-only file inputs and `InvalidArgument`
 /// for malformed grids or sample positions.
 pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f64> {
+    sample_density_checked_with(position, volume, VolumeInterpolation::Linear)
+}
+
+/// The density at `position` with the material's interpolation, as [`sample_density_checked`] samples it with the
+/// trilinear default.
+pub fn sample_density_checked_with(
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<f64> {
     ensure_evaluable_source(volume)?;
     if !position.is_finite() {
         return Err(invalid_volume("sample position must be finite"));
@@ -279,82 +290,155 @@ pub fn sample_density_checked(position: DVec3, volume: &VolumeData) -> Result<f6
         let grid = decoded
             .density_grid()
             .ok_or_else(|| invalid_volume("VDB archive contains no density grid"))?;
-        return Ok(grid.sample_world(position));
+        return Ok(match interpolation {
+            VolumeInterpolation::Linear => grid.sample_world(position),
+            VolumeInterpolation::Cubic => grid.sample_world_cubic(position),
+        });
     }
     let grid = first_grid(volume)?;
     let values = validate_grid(grid)?;
+    let coordinate = grid
+        .checked_index_to_local_matrix()?
+        .inverse()
+        .transform_point3(position);
+    sample_index_checked(coordinate, grid, &values, interpolation)
+}
 
-    let coordinate = if grid.index_to_local.is_some() {
-        grid.checked_index_to_local_matrix()?
-            .inverse()
-            .transform_point3(position)
-    } else {
-        (position - grid.origin) / grid.voxel_size
-    };
-    if !coordinate.is_finite() || coordinate.cmplt(DVec3::ZERO).any() {
+/// The inverse of the first inline grid's index-to-local matrix: volume-local positions to index coordinates. The renderer
+/// builds it once per volume, so sampling does not invert the matrix at every sample.
+pub fn local_to_index_matrix(volume: &VolumeData) -> Result<DMat4> {
+    let grid = first_grid(volume)?;
+    validate_grid(grid)?;
+    Ok(grid.checked_index_to_local_matrix()?.inverse())
+}
+
+/// The density at an index-space coordinate of the first inline grid, with the material's interpolation.
+/// `local_to_index_matrix` maps volume-local positions to these coordinates.
+pub fn sample_index_density_checked_with(
+    coordinate: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<f64> {
+    let grid = first_grid(volume)?;
+    let values = validate_grid(grid)?;
+    sample_index_checked(coordinate, grid, &values, interpolation)
+}
+
+/// `sample_index_density_checked_with` as a NaN where it errors.
+#[must_use]
+pub fn sample_index_density_with(
+    coordinate: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> f64 {
+    sample_index_density_checked_with(coordinate, volume, interpolation).unwrap_or(f64::NAN)
+}
+
+/// The interpolated density of an inline grid at an index-space coordinate; a non-finite coordinate samples as zero.
+fn sample_index_checked(
+    coordinate: DVec3,
+    grid: &VolumeGrid,
+    values: &GridSamples<'_>,
+    interpolation: VolumeInterpolation,
+) -> Result<f64> {
+    if !coordinate.is_finite() {
         return Ok(0.0);
     }
-    let maximum = DVec3::new(
-        f64::from(grid.dims[0] - 1),
-        f64::from(grid.dims[1] - 1),
-        f64::from(grid.dims[2] - 1),
-    );
-    if coordinate.cmpgt(maximum).any() {
-        return Ok(0.0);
-    }
+    // The nodes past the grid are background, zero, and the interpolation reads them up to one node (linear) or two
+    // (cubic) beyond the cell, as Cycles' sampling reads past a volume's active voxels (`scene/volume.cpp`).
+    let fraction = coordinate - coordinate.floor();
+    Ok(match interpolation {
+        VolumeInterpolation::Linear => sample_inline_nodes(
+            coordinate,
+            grid,
+            values,
+            [
+                [1.0 - fraction.x, fraction.x],
+                [1.0 - fraction.y, fraction.y],
+                [1.0 - fraction.z, fraction.z],
+            ],
+            0,
+        )?,
+        VolumeInterpolation::Cubic => sample_inline_nodes(
+            coordinate,
+            grid,
+            values,
+            [
+                cubic_weights(fraction.x),
+                cubic_weights(fraction.y),
+                cubic_weights(fraction.z),
+            ],
+            -1,
+        )?,
+    })
+}
 
-    let lower = [
-        coordinate.x.floor() as usize,
-        coordinate.y.floor() as usize,
-        coordinate.z.floor() as usize,
-    ];
-    let upper = [
-        (lower[0] + 1).min(grid.dims[0] as usize - 1),
-        (lower[1] + 1).min(grid.dims[1] as usize - 1),
-        (lower[2] + 1).min(grid.dims[2] as usize - 1),
-    ];
-    let fraction = [
-        coordinate.x - lower[0] as f64,
-        coordinate.y - lower[1] as f64,
-        coordinate.z - lower[2] as f64,
-    ];
+/// Cycles' cubic B-spline weights for the fraction `t` of a cell, for the samples at offsets -1, 0, 1, 2
+/// (`fill_cubic_weights`, `intern/cycles/kernel/util/image_3d.h`). The weights are non-negative and sum to one.
+#[must_use]
+pub fn cubic_weights(t: f64) -> [f64; 4] {
+    [
+        ((-t / 6.0 + 0.5) * t - 0.5) * t + 1.0 / 6.0,
+        ((0.5 * t - 1.0) * t) * t + 2.0 / 3.0,
+        ((-0.5 * t + 0.5) * t + 0.5) * t + 1.0 / 6.0,
+        t * t * t / 6.0,
+    ]
+}
 
+/// The inline grid's interpolation at `coordinate` from the nodes around its cell: `weights[axis][i]` is the weight of
+/// the node at offset `first + i` from the cell's lower node along that axis, zero beyond the grid
+/// (`kernel_image_interp_tricubic_nanovdb` reads its inactive voxels as background).
+fn sample_inline_nodes<const N: usize>(
+    coordinate: DVec3,
+    grid: &VolumeGrid,
+    values: &GridSamples<'_>,
+    weights: [[f64; N]; 3],
+    first: i64,
+) -> Result<f64> {
+    let lower = coordinate.floor();
+    let base = [lower.x as i64, lower.y as i64, lower.z as i64];
     let mut result = 0.0;
-    for z_corner in 0..2 {
-        for y_corner in 0..2 {
-            for x_corner in 0..2 {
-                let x = if x_corner == 0 { lower[0] } else { upper[0] };
-                let y = if y_corner == 0 { lower[1] } else { upper[1] };
-                let z = if z_corner == 0 { lower[2] } else { upper[2] };
-                let wx = if x_corner == 0 {
-                    1.0 - fraction[0]
-                } else {
-                    fraction[0]
-                };
-                let wy = if y_corner == 0 {
-                    1.0 - fraction[1]
-                } else {
-                    fraction[1]
-                };
-                let wz = if z_corner == 0 {
-                    1.0 - fraction[2]
-                } else {
-                    fraction[2]
-                };
-                let index = z
-                    .checked_mul(grid.dims[1] as usize)
-                    .and_then(|row| row.checked_add(y))
-                    .and_then(|row| row.checked_mul(grid.dims[0] as usize))
-                    .and_then(|row| row.checked_add(x))
-                    .ok_or_else(|| invalid_volume("volume sample index overflow"))?;
-                let sample = values
-                    .get(index)
-                    .ok_or_else(|| invalid_volume("volume sample index is out of range"))?;
-                result += sample * wx * wy * wz;
+    for (k, wz) in weights[2].iter().enumerate() {
+        for (j, wy) in weights[1].iter().enumerate() {
+            for (i, wx) in weights[0].iter().enumerate() {
+                let node = [
+                    base[0] + first + i as i64,
+                    base[1] + first + j as i64,
+                    base[2] + first + k as i64,
+                ];
+                result += inline_node(grid, values, node)? * wx * wy * wz;
             }
         }
     }
     Ok(result)
+}
+
+/// One node's value, zero outside the grid: the background beyond a volume's active voxels.
+fn inline_node(grid: &VolumeGrid, values: &GridSamples<'_>, node: [i64; 3]) -> Result<f64> {
+    if node
+        .iter()
+        .zip(grid.dims)
+        .any(|(&index, dim)| index < 0 || index >= i64::from(dim))
+    {
+        return Ok(0.0);
+    }
+    let index = (node[2] as usize * grid.dims[1] as usize + node[1] as usize)
+        * grid.dims[0] as usize
+        + node[0] as usize;
+    let sample = values
+        .get(index)
+        .ok_or_else(|| invalid_volume("volume sample index is out of range"))?;
+    Ok(f64::from(sample))
+}
+
+/// The density with the material's interpolation, as a `NaN` where [`sample_density_checked_with`] errors.
+#[must_use]
+pub fn sample_density_with(
+    position: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> f64 {
+    sample_density_checked_with(position, volume, interpolation).unwrap_or(f64::NAN)
 }
 
 /// Extract an iso-surface of the first scalar grid using `OpenVDB`-style dual contouring.
@@ -2840,9 +2924,10 @@ mod tests {
     };
 
     use super::{
-        VolumeData, VolumeGrid, mesh_to_fog_volume, mesh_to_volume, sample_density,
-        sample_density_checked, volume_to_mesh,
+        VolumeData, VolumeGrid, cubic_weights, mesh_to_fog_volume, mesh_to_volume, sample_density,
+        sample_density_checked, sample_density_with, volume_to_mesh,
     };
+    use crate::model::VolumeInterpolation;
 
     #[test]
     fn density_sampling_is_trilinear_and_zero_outside() {
@@ -2963,5 +3048,148 @@ mod tests {
         let point = DVec3::new(0.25, 0.5, 0.75);
         let local = index_to_local.transform_point3(point);
         assert!((sample_density(local, &volume) - 3.5).abs() < 1.0e-12);
+    }
+
+    /// The uniform cubic B-spline `B3(u)` from its truncated-power definition, `(1/6) Σ_j (-1)^j C(4, j) (u + 2 - j)_+^3`,
+    /// which is not the Horner form `cubic_weights` evaluates.
+    fn truncated_power_cubic(u: f64) -> f64 {
+        let positive = |x: f64| x.max(0.0).powi(3);
+        (positive(u + 2.0) - 4.0 * positive(u + 1.0) + 6.0 * positive(u) - 4.0 * positive(u - 1.0)
+            + positive(u - 2.0))
+            / 6.0
+    }
+
+    #[test]
+    fn cubic_weights_are_the_truncated_power_b_spline_at_each_offset() {
+        for t in [0.0, 0.125, 0.25, 0.5, 0.75, 0.9375] {
+            let weights = cubic_weights(t);
+            // The sample at offset k from the floor gets B3(t - k), for k = -1, 0, 1, 2.
+            for (index, offset) in [-1.0, 0.0, 1.0, 2.0].into_iter().enumerate() {
+                let expected = truncated_power_cubic(t - offset);
+                assert!(
+                    (weights[index] - expected).abs() <= 1.0e-12,
+                    "t {t}, offset {offset}: {} vs {expected}",
+                    weights[index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cubic_weights_sum_to_one_and_put_the_centroid_at_the_fraction() {
+        for t in [0.0, 0.125, 0.25, 0.5, 0.75, 0.9375] {
+            let weights = cubic_weights(t);
+            let total: f64 = weights.iter().sum();
+            let centroid: f64 = weights
+                .iter()
+                .zip([-1.0, 0.0, 1.0, 2.0])
+                .map(|(weight, offset)| weight * offset)
+                .sum();
+            assert!((total - 1.0).abs() <= 1.0e-12, "t {t}: sum {total}");
+            assert!(
+                (centroid - t).abs() <= 1.0e-12,
+                "t {t}: centroid {centroid}"
+            );
+        }
+    }
+
+    /// A cubic B-spline with the grid values as its coefficients reproduces any linear function of the index
+    /// coordinate (its centroid is the coordinate), so the cubic sample of `1 + 0.1 x + 0.2 y + 0.05 z` is that function.
+    #[test]
+    fn cubic_sampling_reproduces_a_linear_field_in_the_interior() {
+        let dims = [8_u32, 8, 8];
+        let mut values = Vec::new();
+        for z in 0..dims[2] {
+            for y in 0..dims[1] {
+                for x in 0..dims[0] {
+                    values.push(
+                        (1.0 + 0.1 * f64::from(x) + 0.2 * f64::from(y) + 0.05 * f64::from(z))
+                            as f32,
+                    );
+                }
+            }
+        }
+        let volume = VolumeData {
+            grids: vec![VolumeGrid {
+                dims,
+                voxel_size: 1.0,
+                origin: DVec3::ZERO,
+                index_to_local: None,
+                values: Some(values),
+                blob_f32: None,
+                content_ref: None,
+            }],
+            ..VolumeData::default()
+        };
+        for coordinate in [
+            DVec3::new(3.25, 4.5, 2.75),
+            DVec3::new(2.5, 2.5, 5.9),
+            DVec3::new(4.0, 3.0, 3.0),
+        ] {
+            let expected = 1.0 + 0.1 * coordinate.x + 0.2 * coordinate.y + 0.05 * coordinate.z;
+            let actual = sample_density_with(coordinate, &volume, VolumeInterpolation::Cubic);
+            // f32 storage of the samples bounds the error at about 1e-7 relative.
+            assert!(
+                (actual - expected).abs() <= 1.0e-6,
+                "{coordinate:?}: {actual} vs {expected}"
+            );
+        }
+    }
+
+    /// Outside the grid's neighbours the background is zero: at x = 0.5 the node at x = -1 has weight
+    /// B3(1.5) = 1/48, so a constant grid of ones samples to 1 - 1/48 there and to 1 in the interior.
+    #[test]
+    fn cubic_sampling_of_a_constant_grid_loses_the_outside_neighbour_weight() {
+        let dims = [8_u32, 8, 8];
+        let volume = VolumeData {
+            grids: vec![VolumeGrid {
+                dims,
+                voxel_size: 1.0,
+                origin: DVec3::ZERO,
+                index_to_local: None,
+                values: Some(vec![1.0; 512]),
+                blob_f32: None,
+                content_ref: None,
+            }],
+            ..VolumeData::default()
+        };
+        let edge = sample_density_with(
+            DVec3::new(0.5, 3.5, 3.5),
+            &volume,
+            VolumeInterpolation::Cubic,
+        );
+        let interior = sample_density_with(
+            DVec3::new(3.5, 3.5, 3.5),
+            &volume,
+            VolumeInterpolation::Cubic,
+        );
+        assert!((edge - (1.0 - 1.0 / 48.0)).abs() <= 1.0e-6, "edge {edge}");
+        assert!((interior - 1.0).abs() <= 1.0e-6, "interior {interior}");
+    }
+
+    /// Past the last node the background is zero, and linear reads one node beyond the cell while cubic reads two. A
+    /// constant grid of ones therefore samples to 1/2 at x = 7.5 for both (cubic's offsets 6 and 7 carry 1/48 + 23/48),
+    /// and to 5/6 for cubic at the last node (1/6 + 2/3), while linear at the last node is exactly 1.
+    #[test]
+    fn inline_sampling_reads_zero_background_past_the_last_node() {
+        let volume = VolumeData {
+            grids: vec![VolumeGrid {
+                dims: [8, 8, 8],
+                voxel_size: 1.0,
+                origin: DVec3::ZERO,
+                index_to_local: None,
+                values: Some(vec![1.0; 512]),
+                blob_f32: None,
+                content_ref: None,
+            }],
+            ..VolumeData::default()
+        };
+        let at = |x: f64, interpolation: VolumeInterpolation| {
+            sample_density_with(DVec3::new(x, 3.5, 3.5), &volume, interpolation)
+        };
+        assert!((at(7.5, VolumeInterpolation::Linear) - 0.5).abs() <= 1.0e-12);
+        assert!((at(7.5, VolumeInterpolation::Cubic) - 0.5).abs() <= 1.0e-12);
+        assert!((at(7.0, VolumeInterpolation::Cubic) - 5.0 / 6.0).abs() <= 1.0e-12);
+        assert!((at(7.0, VolumeInterpolation::Linear) - 1.0).abs() <= 1.0e-12);
     }
 }
