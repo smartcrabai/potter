@@ -6503,18 +6503,17 @@ def _clip_cutoff(material):
     return float(compare.inputs[1].default_value)
 
 
-def _set_principled_values(material, item):
-    """Writes the Material's values into the Principled BSDF that Potter generated, and no other node.
+def _generated_principled(tree):
+    """The Principled BSDF Potter generated in `tree`, marked by `_mark_generated_field_graph`, or None.
 
-    The exporter marks the generated Principled node (`_mark_generated_field_graph`). A tree without that marker is
-    an authored graph, whose Principled inputs are its own, so nothing is written to it.
+    A tree without that marker is an authored graph, whose Principled inputs are its own.
     """
-    if material.node_tree is None:
-        return
-    shader = next((node for node in material.node_tree.nodes
-                   if node.type == "BSDF_PRINCIPLED" and node.get("potter_simple_material") is True), None)
-    if shader is None:
-        return
+    return next((node for node in tree.nodes
+                 if node.type == "BSDF_PRINCIPLED" and node.get("potter_simple_material") is True), None)
+
+
+def _set_principled_values(shader, item):
+    """Writes the Material's values into the Principled BSDF `shader`."""
     shader.inputs["Base Color"].default_value = item["base_color"]
     shader.inputs["Metallic"].default_value = item["metallic"]
     alpha = shader.inputs.get("Alpha")
@@ -7337,7 +7336,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
-        _set_principled_values(mat, item)
+        fresh = next((node for node in mat.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if fresh is not None:
+            _set_principled_values(fresh, item)
         mat.roughness = viewport["roughness"] if viewport else item["roughness"]
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
@@ -7559,7 +7560,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         if tree_source:
             _restore_node_tree(material.node_tree, tree_source, id_lookup,
                                "Material shader tree %s" % material.name)
-            _set_principled_values(material, item)
+            generated = _generated_principled(material.node_tree)
+            if generated is not None:
+                _set_principled_values(generated, item)
         if item.get("owns_shader_graph") is True:
             _restore_material_field_nodes(material, item)
     for world_id, item in doc.get("worlds", {}).items():
