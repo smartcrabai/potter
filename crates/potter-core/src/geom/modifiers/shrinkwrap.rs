@@ -351,9 +351,11 @@ pub(crate) fn remesh_target_project(mesh: &Mesh, target: &Mesh, voxel_size: f64)
         "subsurf_levels": 0,
         "target": null
     });
-    let mut runtime = ModifierRuntime::default();
-    runtime.shrinkwrap_subject_to_target = Some(DMat4::IDENTITY.to_cols_array());
-    runtime.shrinkwrap_target_mesh = Some(target.clone());
+    let runtime = ModifierRuntime {
+        shrinkwrap_subject_to_target: Some(DMat4::IDENTITY.to_cols_array()),
+        shrinkwrap_target_mesh: Some(target.clone()),
+        ..ModifierRuntime::default()
+    };
     let modifier = Modifier {
         id: Id::new("remesh_target_project")?,
         modifier_type: "shrinkwrap".to_owned(),

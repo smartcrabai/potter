@@ -498,12 +498,6 @@ impl KdopTree {
         triangle_bounds(tri, TREE_EPSILON)
     }
 
-    /// The leaf box of one triangle with no inflation, as `BLI_bvhtree_new(elems, 0.0, ...)` builds the
-    /// mesh corner-triangle tree that the voxel remesh attribute reprojection searches.
-    pub(crate) fn leaf_bounds_for_triangle_exact(tri: [Vec3; 3]) -> [f32; 6] {
-        triangle_bounds(tri, 0.0)
-    }
-
     /// The leaf box of one vertex: the point inflated by the tree epsilon, as Blender's vertex tree.
     pub(crate) fn leaf_bounds_for_point(point: Vec3) -> [f32; 6] {
         triangle_bounds([point; 3], TREE_EPSILON)
