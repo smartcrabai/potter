@@ -279,6 +279,7 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["offscreen_dicing_scale"] =
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
+    render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
@@ -2388,6 +2389,7 @@ fn set_schema(operation: &str) -> Value {
             "samples":{"type":"integer","minimum":1,"maximum":1_000_000},
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "volume_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "film_transparent":{"type":"boolean"},
             "engine":{"enum":["path","realtime"]},

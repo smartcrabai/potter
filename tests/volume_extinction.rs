@@ -141,6 +141,17 @@ fn render_slab_at(
     samples: u32,
     max_bounces: u32,
 ) -> Result<[f64; 3], Box<dyn Error>> {
+    render_slab_seeded(nodes, links, samples, max_bounces, 0)
+}
+
+/// `render_slab_at` with an explicit seed, for estimating Potter's own noise across seeds.
+fn render_slab_seeded(
+    nodes: Vec<Value>,
+    links: Vec<Value>,
+    samples: u32,
+    max_bounces: u32,
+    seed: u32,
+) -> Result<[f64; 3], Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
     let mut operations = graph_operations(nodes, links);
@@ -150,7 +161,7 @@ fn render_slab_at(
         json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
         json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
-        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":samples,"seed":0,"max_bounces":max_bounces}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":samples,"seed":seed,"max_bounces":max_bounces,"volume_bounces":max_bounces}}),
     ]);
     make_scene(&scene, &operations)?;
     render_center_block(&scene, &directory.path().join("render"))
@@ -168,6 +179,61 @@ fn render_single_volume(node_type: &str, inputs: Value) -> Result<[f64; 3], Box<
         vec![node("volume", node_type, inputs)],
         vec![link("volume", "Volume", "output", "Volume")],
     )
+}
+
+/// Potter's samples per pixel and seeds for the zero-budget single-scatter case: four seeds give Potter's own spread.
+const SINGLE_SCATTER_SAMPLES: u32 = 1024;
+const SINGLE_SCATTER_SEEDS: u32 = 4;
+
+/// Blender 5.2.2's single-scatter radiance of a white-world scatterer at `max_bounces = volume_bounces = 0`
+/// (`fixtures/volume_single_scatter`). Such a path takes one scatter vertex, and its environment light arrives both as
+/// direct light and as the phase-sampled ray traced on past the vertex (Cycles' MIS pair). A Potter renderer that
+/// drops that ray biases the mean low. Potter's centre block is compared against Blender's mean within three noise
+/// floors: Blender's seed standard error combined with Potter's standard error across seeds.
+#[test]
+fn volume_scatter_single_scatter_at_zero_budget_matches_blender() -> Result<(), Box<dyn Error>> {
+    let oracle: Value = serde_json::from_slice(&fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/volume_single_scatter/blender_volume_single_scatter.json"),
+    )?)?;
+    let case = &oracle["cases"]["volume_scatter_white_max0"];
+    let blender: [f64; 3] = serde_json::from_value(case["mean"].clone())?;
+    let blender_error: [f64; 3] = serde_json::from_value(case["stderr"].clone())?;
+    let nodes = vec![node(
+        "volume",
+        "ShaderNodeVolumeScatter",
+        json!({"Color":[1.0,1.0,1.0,1.0],"Density":1.0}),
+    )];
+    let links = vec![link("volume", "Volume", "output", "Volume")];
+    let mut renders = Vec::new();
+    for seed in 0..SINGLE_SCATTER_SEEDS {
+        renders.push(render_slab_seeded(
+            nodes.clone(),
+            links.clone(),
+            SINGLE_SCATTER_SAMPLES,
+            0,
+            seed,
+        )?);
+    }
+    let seeds = f64::from(SINGLE_SCATTER_SEEDS);
+    for channel in 0..3 {
+        let values: Vec<f64> = renders.iter().map(|render| render[channel]).collect();
+        let mean = values.iter().sum::<f64>() / seeds;
+        let variance = values
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / (seeds - 1.0);
+        let potter_error = (variance / seeds).sqrt();
+        let floor = (blender_error[channel].powi(2) + potter_error.powi(2)).sqrt();
+        assert!(
+            (mean - blender[channel]).abs() <= 3.0 * floor,
+            "channel {channel}: Potter {mean:.5} vs Blender {:.5} outside three floors ({:.5})",
+            blender[channel],
+            3.0 * floor
+        );
+    }
+    Ok(())
 }
 
 /// The Blender oracle's mean and standard error of one case, per channel.
@@ -337,7 +403,7 @@ fn voxel_spectral_warnings(absorption_inputs: Value) -> Result<Vec<Value>, Box<d
         json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
         json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
-        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":8,"resolution_y":8,"samples":1,"seed":0,"max_bounces":2}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":8,"resolution_y":8,"samples":1,"seed":0,"max_bounces":2,"volume_bounces":2}}),
     ]);
     make_scene(&scene, &operations)?;
     let output = pot()

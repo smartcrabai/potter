@@ -120,12 +120,11 @@ scene.render.engine = "CYCLES"
 scene.cycles.device = "CPU"
 scene.cycles.samples = 32
 scene.cycles.seed = 17
-# Potter renders with one budget of 4 bounces (`RenderSettings::max_bounces`, crates/potter-core/src/model/scene.rs), and
-# its volume events count against it. Cycles limits volume scatter by `volume_bounces` (intern/cycles/blender/sync.cpp:373,
-# scene/integrator.cpp:227, kernel/integrator/path_state.h:162). At the Blender default of volume_bounces 0 this cloud is
-# extinction only, so the reference uses the same 4 and 4 as Potter.
+# Potter's surface budget is `max_bounces` (`RenderSettings::max_bounces`, crates/potter-core/src/model/scene.rs), set to 4
+# here. Volume scatter takes Cycles' own limit, `volume_bounces`, left at Blender's default of 0, which Potter's default
+# matches (`RenderSettings::volume_bounces`; intern/cycles/blender/sync.cpp:373, scene/integrator.cpp:227,
+# kernel/integrator/path_state.h:162). The reference therefore uses Blender's default scatter budget.
 scene.cycles.max_bounces = 4
-scene.cycles.volume_bounces = 4
 scene.view_settings.view_transform = "Standard"
 bpy.ops.wm.save_as_mainfile(
     filepath=os.path.join(root, "volume_no_material.blend"), relative_remap=True

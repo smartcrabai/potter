@@ -2111,6 +2111,7 @@ def dump_scene(scene):
                 "samples": samples,
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
+                "volume_bounces": int(getattr(getattr(scene, "cycles", None), "volume_bounces", 0)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
                 "volume_biased": bool(getattr(getattr(scene, "cycles", None), "volume_biased", False)),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
@@ -6496,6 +6497,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
+            scene.cycles.volume_bounces = int(render.get("volume_bounces", 0))
             if "transparent_max_bounces" in render:
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine

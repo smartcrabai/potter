@@ -1160,6 +1160,11 @@ pub struct RenderSettings {
     pub samples: u32,
     pub seed: u32,
     pub max_bounces: u32,
+    /// Cycles' `volume_bounces`: a volume path takes `volume_bounces + 1` scatter vertices with direct light, and each
+    /// later segment only attenuates (`max_volume_bounce`, `intern/cycles/scene/integrator.cpp`). Omitted when equal to
+    /// Blender's default of 0.
+    #[serde(default, skip_serializing_if = "is_default_volume_bounces")]
+    pub volume_bounces: u32,
     /// Cycles' `transparent_max_bounces`. Omitted when equal to Blender's default of 8.
     #[serde(
         default = "default_transparent_max_bounces",
@@ -1218,6 +1223,7 @@ impl Default for RenderSettings {
             samples: 64,
             seed: 0,
             max_bounces: 4,
+            volume_bounces: 0,
             transparent_max_bounces: 8,
             film_transparent: false,
             engine: "path".to_owned(),
@@ -2161,6 +2167,14 @@ fn is_default_transparent_max_bounces(value: &u32) -> bool {
 
 fn default_transparent_max_bounces() -> u32 {
     8
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_volume_bounces(value: &u32) -> bool {
+    *value == 0
 }
 
 #[expect(

@@ -23,12 +23,12 @@ sigma_blender = sigma / sqrt(K). For LINEAR against CUBIC, delta = rms(linear - 
 means. The signal, the part of delta that is not noise, is
 signal = sqrt(max(0, delta^2 - sigma_blender_linear^2 - sigma_blender_cubic^2)).
 
-The test derives its thresholds from these. Potter's own noise is measured by the test from two seeds per mode:
-sigma_potter = sigma_single_potter / sqrt(2). The noise floor of a comparison is sqrt(sigma_potter^2 + sigma_blender^2).
-A Potter render matches Blender's when its error is within MATCH_BANDS = 3 noise floors (three RMS deviations of
-noise alone). The discriminating check is that LINEAR against CUBIC exceeds the midpoint between the cross noise
-floor and sqrt(cross floor^2 + signal^2), so it separates the modes halfway between the noise and the expected
-signal.
+The test derives its tolerances from these. Each parity tolerance is three noise floors: Potter's single-render frame-mean
+spread (the test's POTTER_SD constants, measured over four seeds at its sample count) combined with Blender's seed standard
+error (sigma_blender above, for the mean of K seeds). A Potter render matches Blender's when its frame mean is within that
+tolerance, for LINEAR and for CUBIC separately. The test does not compare the difference between the two modes against
+Blender's: at Potter's render budget that difference sits inside the noise, so the deterministic cubic and edge checks in
+`geom/volume.rs` carry that discrimination.
 
 Regenerate from this directory with Blender 5.2.2 (openvdb must be importable), one thread:
 

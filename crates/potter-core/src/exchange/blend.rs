@@ -2965,6 +2965,8 @@ fn build_imported_graph(
                 .map_err(|_| invalid_intermediate("render seed is out of range"))?,
             max_bounces: u32::try_from(integer_field(&render, "max_bounces", 4))
                 .map_err(|_| invalid_intermediate("render max_bounces is out of range"))?,
+            volume_bounces: u32::try_from(integer_field(&render, "volume_bounces", 0))
+                .map_err(|_| invalid_intermediate("render volume_bounces is out of range"))?,
             transparent_max_bounces: u32::try_from(integer_field(
                 &render,
                 "transparent_max_bounces",
