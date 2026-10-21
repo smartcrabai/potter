@@ -292,6 +292,13 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
     } else {
         None
     };
+    // Blender's `ply_import_mesh.cc`: vertex normals keep every face smooth (no `sharp_face`) and become
+    // custom normals; without them `mesh_smooth_set(false)` makes every face flat (`sharp_face` present).
+    let sharp_faces = if normals.is_some() || faces.is_empty() {
+        None
+    } else {
+        Some(vec![true; faces.len()])
+    };
     let (uv_layers, uv_active, uv_render) = if parsed.has_uv {
         single_uv_set(
             faces
@@ -339,6 +346,7 @@ pub(crate) fn import(path: &Path) -> Result<Vec<ExchangeMesh>> {
         singular: false,
         vertex_normals: Vec::new(),
         smooth: Vec::new(),
+        sharp_faces,
         uv_layers,
         uv_active,
         uv_render,
@@ -704,6 +712,7 @@ mod tests {
             singular: false,
             vertex_normals: Vec::new(),
             smooth: vec![false, false],
+            sharp_faces: None,
             uv_layers: vec![ExchangeUvLayer {
                 name: "UVMap".to_owned(),
                 corners: vec![

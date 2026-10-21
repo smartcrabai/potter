@@ -18,7 +18,7 @@ use exchange_normals::{
     NORMAL_TOLERANCE, ObservedCorner, TestResult, assert_matches_reference, export, export_strict,
     init, near, obj_to_potter, observed_corners, pot, write_fixture_scene,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 /// One `o` object of a parsed OBJ file, with face indices and corner normals as written.
@@ -405,39 +405,42 @@ fn obj_import_partial_vertex_normals_reports_mesh_normals_loss() -> TestResult {
     Ok(())
 }
 
+/// The `shade_smooth` values of the imported mesh, one per face, from the scene file.
+fn shade_smooth_values(scene: &Path) -> TestResult<Vec<Value>> {
+    let document: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let blocks = document["data_blocks"]
+        .as_object()
+        .ok_or("scene.json has no data_blocks")?;
+    let mut values = Vec::new();
+    for block in blocks.values() {
+        if let Some(shading) = block["mesh"]["attributes"]["shade_smooth"]["values"].as_object() {
+            values.extend(shading.values().cloned());
+        }
+    }
+    Ok(values)
+}
+
+/// Blender's `set_face_sharpness` (`obj_import_mesh.cc`) without `vn`: `sharp_face = !shaded_smooth`, so
+/// the `s 1` face is smooth and the `s off` face is flat, with no loss. Probed in Blender 5.2.2, which
+/// gives `use_smooth` [true, false] and `sharp_face` [false, true].
 #[test]
-fn obj_import_smooth_groups_without_normals_reports_mesh_smoothing_loss() -> TestResult {
+fn obj_import_smooth_groups_without_normals_sets_sharp_face_per_face() -> TestResult {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
     init(&scene)?;
     let source = write_obj(
         directory.path(),
         "smooth.obj",
-        "o Smooth\nv 0 0 0\nv 1 0 0\nv 0 1 0\ns 1\nf 1 2 3\n",
+        "o Smooth\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\ns 1\nf 1 2 3\ns off\nf 2 4 3\n",
     )?;
-
-    let rejected = import_obj(&scene, &source, false)?;
+    let imported = import_obj(&scene, &source, false)?;
     assert!(
-        !rejected.status.success(),
-        "smooth groups imported without --allow-lossy"
-    );
-    let rejection = output_json(&rejected)?;
-    assert_eq!(rejection["error"]["code"], "UNREPRESENTABLE_FEATURE");
-    assert!(
-        loss_features(&rejection["error"]["details"]["result"]).contains(&"mesh.smoothing"),
-        "{rejection}"
-    );
-
-    let accepted = import_obj(&scene, &source, true)?;
-    assert!(
-        accepted.status.success(),
+        imported.status.success(),
         "{}",
-        String::from_utf8_lossy(&accepted.stdout)
+        String::from_utf8_lossy(&imported.stdout)
     );
-    let result = output_json(&accepted)?["result"].clone();
-    assert!(
-        loss_features(&result).contains(&"mesh.smoothing"),
-        "{result}"
-    );
+    let result = output_json(&imported)?["result"].clone();
+    assert_eq!(loss_features(&result), Vec::<&str>::new(), "{result}");
+    assert_eq!(shade_smooth_values(&scene)?, [json!(true), json!(false)]);
     Ok(())
 }
