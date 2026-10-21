@@ -542,7 +542,7 @@ pub(super) fn extract_geometry(
             data_id: node.data.clone(),
             texture_space: mesh
                 .and_then(Mesh::manual_texture_space)
-                .unwrap_or_else(|| TextureSpace::automatic(mesh.and_then(|mesh| mesh.bounds()))),
+                .unwrap_or_else(|| TextureSpace::automatic(mesh.and_then(Mesh::bounds))),
             instance_path: snapshot
                 .instance_paths
                 .get(node_id)

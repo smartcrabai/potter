@@ -180,21 +180,21 @@ fn manual_texture_space_round_trips_through_blend() -> TestResult {
         "blend export must not lose the manual texture space: {exported}"
     );
     let dump = dump_blend(&blender, root.path(), &exported_blend, "roundtrip")?;
-    let manual = dump["meshes"]
+    let manual = dump["objects"]
         .as_array()
-        .ok_or("the exported dump has no meshes")?
+        .ok_or("the exported dump has no objects")?
         .iter()
-        .find(|mesh| mesh["rna_properties"]["use_auto_texspace"] == json!(false))
+        .map(|object| &object["texspace"])
+        .find(|texspace| texspace["auto"] == json!(false))
         .ok_or("the exported mesh has no manual texture space")?;
-    let properties = &manual["rna_properties"];
     assert_floats(
-        &vec3(&properties["texspace_location"])?,
+        &vec3(&manual["location"])?,
         &STORED_LOCATION,
         1.0e-6,
         "texspace_location",
     );
     assert_floats(
-        &vec3(&properties["texspace_size"])?,
+        &vec3(&manual["size"])?,
         &STORED_SIZE,
         1.0e-6,
         "texspace_size",
