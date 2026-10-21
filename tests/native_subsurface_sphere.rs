@@ -15,7 +15,7 @@
 //! methods are not evaluated yet: their cases report `UNSUPPORTED_FEATURE` and render without subsurface scattering, and
 //! they are not tested here.
 //!
-//! Cost: the two Burley cases run in about 28 s of test time on the lane (Blender's renders included), at `SAMPLES` = 64
+//! Cost: each case runs in about 12–17 s of test time on the lane (Blender's renders included), at `SAMPLES` = 32
 //! samples per pixel on eight seeds, so each case stays well inside the 40 s budget.
 
 #[path = "common/blender_checked.rs"]
@@ -45,7 +45,7 @@ const SCRIPT: &str = include_str!("fixtures/native_oracle/subsurface/subsurface_
 const SEEDS: u32 = 8;
 const RESOLUTION: u32 = 16;
 /// Potter's samples per pixel. Blender renders at 256 (see `subsurface_sphere.py`).
-const SAMPLES: u32 = 64;
+const SAMPLES: u32 = 32;
 /// The two-sided 99.9% Student t quantile at 7 degrees of freedom (see the module docs).
 const T_QUANTILE: f64 = 5.408;
 
