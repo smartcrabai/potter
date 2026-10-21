@@ -92,6 +92,7 @@ fn realtime_film_filter_matches_eevee_column_profiles() -> TestResult {
         .ok_or("active scene is missing")?
         .to_owned();
 
+    let mut report: Vec<String> = Vec::new();
     for (index, size) in FILTER_SIZES.iter().enumerate() {
         let filter_size: f64 = size.parse()?;
         let applied = apply_operations(
@@ -126,15 +127,32 @@ fn realtime_film_filter_matches_eevee_column_profiles() -> TestResult {
 
         let actual = column_profile(&project, &id)?;
         let expected = floats(&oracle["profiles"][*size])?;
+        let mut failures = Vec::new();
         for column in COLUMNS {
             let deviation = (actual[column] - expected[column]).abs();
-            assert!(
-                deviation <= TOLERANCE,
-                "filter {size}: column {column} is {}, EEVEE {}",
-                actual[column],
-                expected[column]
-            );
+            if deviation > TOLERANCE {
+                failures.push(format!(
+                    "column {column}: Potter {:.5} vs EEVEE {:.5} (deviation {deviation:.5})",
+                    actual[column], expected[column]
+                ));
+            }
+        }
+        let table: Vec<String> = COLUMNS
+            .map(|column| {
+                format!(
+                    "  column {column}: Potter {:.5} EEVEE {:.5}",
+                    actual[column], expected[column]
+                )
+            })
+            .collect();
+        if !failures.is_empty() {
+            report.push(format!(
+                "filter {size}, tolerance {TOLERANCE}:\n{}\nwindow:\n{}",
+                failures.join("\n"),
+                table.join("\n")
+            ));
         }
     }
+    assert!(report.is_empty(), "{}", report.join("\n\n"));
     Ok(())
 }

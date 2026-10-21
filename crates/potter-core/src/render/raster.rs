@@ -1053,6 +1053,8 @@ pub(crate) fn rasterize_wireframe(
         [0; 4],
         1,
         0,
+        // Wire is never a film Beauty render, so no film filter applies.
+        0.0,
         None,
     )?;
     let mut output = rasterize_with_lines(
@@ -1065,6 +1067,7 @@ pub(crate) fn rasterize_wireframe(
         wireframe::background_rgba(),
         1,
         0,
+        0.0,
         None,
     )?;
     let frame = camera_frame(camera, width, height)?;

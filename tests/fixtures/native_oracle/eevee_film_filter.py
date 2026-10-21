@@ -36,6 +36,9 @@ scene = bpy.context.scene
 world = bpy.data.worlds.new("Black")
 world.node_tree.nodes["Background"].inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
 scene.world = world
+# Potter's realtime Beauty background reads `World.color` (`render/preview.rs` `background_color`), not the Background node
+# that EEVEE renders. Both are black, so the oracle's world is black on either reading.
+world.color = (0.0, 0.0, 0.0)
 
 scene.render.engine = "BLENDER_EEVEE"
 scene.eevee.taa_render_samples = SAMPLES

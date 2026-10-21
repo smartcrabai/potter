@@ -660,6 +660,7 @@ fn rasterize_view(
     background: [u8; 4],
     samples: u32,
     seed: u32,
+    filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<RasterOutput> {
     if !matches!(mode, Mode::Wire) {
@@ -673,6 +674,7 @@ fn rasterize_view(
             background,
             samples,
             seed,
+            filter_size,
             shader,
         );
     }
