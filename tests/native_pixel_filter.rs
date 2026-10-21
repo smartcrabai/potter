@@ -2,7 +2,7 @@
 //!
 //! A thin-line checker on a white floor is rendered by Blender with each filter, 32 seeds of 256
 //! samples per pixel. The same `.blend` (with `pixel_filter_type` and `filter_width` set, so the
-//! import path is exercised too) is rendered by Potter at 256 samples per pixel.
+//! import path is exercised too) is rendered by Potter at 64 samples per pixel.
 //!
 //! The per-pixel values differ between filters, while the frame mean barely does, so the check is
 //! per pixel. Potter's image is fitted as `own + alpha * (alternative - own)`, where `own` is
@@ -13,10 +13,12 @@
 //! The standard error of `alpha` is computed from the measured noise of both images:
 //! `sqrt(sum (sigma_p^2 + sigma_b^2) d^2) / sum d^2`, where `d` is the difference of the two
 //! references, `sigma_b` is Blender's per-pixel standard error, and `sigma_p` is Potter's
-//! per-pixel noise, scaled from Blender's measured per-seed deviation to 256 samples. At these
-//! settings the standard error is 0.02 to 0.06 (1024 samples gave 0.01 to 0.03; it scales with the
-//! inverse square root of the sample count), so the threshold 0.5 is about 9 or more standard errors
-//! from either hypothesis. The threshold is not loosened to pass.
+//! per-pixel noise, scaled from Blender's measured per-seed deviation to 64 samples. Monte Carlo
+//! over the same noise model (300 draws) puts the standard error of `alpha` at 0.045 for
+//! Blackman-Harris against Box and 0.009 for Gaussian 2.5 against Gaussian 1.5 or Box. The
+//! wrong-filter alpha is at least 0.88 in every draw, and the correct one at most 0.15, so the
+//! threshold 0.5 is at least 11 standard errors from either hypothesis at the worst case. The
+//! threshold is not loosened to pass.
 //!
 //! Alternatives: the Potter box filter (what Potter did before this filter existed) is an
 //! alternative for every kind; the Blackman-Harris filter is one for the Gaussian; the default-width
@@ -54,9 +56,10 @@ const RESOLUTION: u32 = 32;
 const BLENDER_SEEDS: u32 = 32;
 /// Blender samples per pixel per seed (`pixel_filter.py` `SAMPLES`).
 const BLENDER_SAMPLES: f64 = 256.0;
-/// Potter samples per pixel. Potter's noise is scaled from Blender's to this count. 1024 would
-/// take about 100 s per Potter render in a debug build, past the per-test budget.
-const POTTER_SAMPLES: u32 = 256;
+/// Potter samples per pixel. Potter's noise is scaled from Blender's to this count. Monte Carlo over
+/// the noise model gives margins of 11 or more standard errors at 64 samples; the 256 samples used
+/// before cost about 40 s of render alone in a debug build.
+const POTTER_SAMPLES: u32 = 64;
 /// The threshold on `alpha`: the midpoint between the correct filter (0) and an alternative (1).
 const ALPHA_LIMIT: f64 = 0.5;
 /// A sanity bound: the standard error must leave the threshold far from either hypothesis.
