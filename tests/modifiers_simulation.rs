@@ -2580,7 +2580,8 @@ bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_hair_lifecycle
 
     let project = root.join("particle-hair-lifecycle-project");
     initialize(&project)?;
-    let mut import = pot()
+    let mut import = pot();
+    import
         .arg("import")
         .arg(&project)
         .arg("--file")
@@ -3341,7 +3342,8 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
         .ok_or("Blender B-spline preserve case is missing")?;
     let project = root.join("particle-hair-path-project");
     initialize(&project)?;
-    let mut import = pot()
+    let mut import = pot();
+    import
         .arg("import")
         .arg(&project)
         .arg("--file")
@@ -3494,7 +3496,8 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
     let inspected = inspect(&project, &instancer_id, "1")?;
     assert_cli_mesh(&inspected, &cli_case["mesh"], "Hair path CLI frame 1");
     let live_exported = root.join("particle_hair_path_live.blend");
-    let mut live_export = pot()
+    let mut live_export = pot();
+    live_export
         .arg("export")
         .arg(&project)
         .args(["--format", "blend", "--out"])
@@ -3505,7 +3508,8 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
     run(&mut live_export, "exporting live Hair path modifier")?;
     let live_project = root.join("particle-hair-path-live-reimport");
     initialize(&live_project)?;
-    let mut live_import = pot()
+    let mut live_import = pot();
+    live_import
         .arg("import")
         .arg(&live_project)
         .arg("--file")
@@ -3620,7 +3624,8 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
     assert_cli_mesh(&applied, &cli_case["mesh"], "applied Hair path mesh");
 
     let exported = root.join("particle_hair_path_applied.blend");
-    let mut export = pot()
+    let mut export = pot();
+    export
         .arg("export")
         .arg(&project)
         .args(["--format", "blend", "--out"])
@@ -3760,7 +3765,8 @@ with open(output, 'w', encoding='utf-8') as handle:
     }
     let reimport_project = root.join("particle-hair-path-reimport");
     initialize(&reimport_project)?;
-    let mut reimport = pot()
+    let mut reimport = pot();
+    reimport
         .arg("import")
         .arg(&reimport_project)
         .arg("--file")
