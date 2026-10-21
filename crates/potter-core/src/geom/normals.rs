@@ -710,7 +710,7 @@ pub(crate) fn record_sharp_face(mesh: &mut Mesh) {
     }
 }
 
-/// Settles the presence of `sharp_face` after an edit operator rebuilt the mesh through BMesh. Blender's
+/// Settles the presence of `sharp_face` after an edit operator rebuilt the mesh through `BMesh`. Blender's
 /// `BM_mesh_bm_to_me` writes `sharp_face` only when some face is not smooth (`bmesh_mesh_convert.cc`,
 /// `need_sharp_face |= !smooth`), so an all-smooth result has no record of it.
 pub(crate) fn settle_sharp_face(mesh: &mut Mesh) -> Result<()> {
@@ -977,7 +977,7 @@ pub(crate) fn sharp_edges_from_angle(
 
 /// Blender's `mesh.set_sharpness_by_angle` (`editmesh_set_sharpness_by_angle.cc`, edit mode) with
 /// `extend` off (its RNA default). A selected edge with exactly two faces (`BM_edge_loop_pair`) is sharp
-/// when its BMesh face normals (`BM_face_calc_normal`) have a dot at most `cos(angle)`. Returns the new
+/// when its `BMesh` face normals (`BM_face_calc_normal`) have a dot at most `cos(angle)`. Returns the new
 /// flag per edge, or `None` when the edge keeps its flag.
 pub(crate) fn sharp_edges_by_face_angle(
     mesh: &Mesh,

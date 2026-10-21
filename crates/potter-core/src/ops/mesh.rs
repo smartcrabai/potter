@@ -255,11 +255,20 @@ pub(super) fn apply(
             })?;
             let had_descriptor = data.descriptor.is_some();
             let dropped = if name == "mesh.remesh" {
-                mesh.attributes
+                // Vertex-group weights are the mesh's `vertex_groups` attribute, and the group definitions are
+                // on the data block; a remesh replaces every vertex, so both are dropped and reported.
+                let mut dropped = mesh
+                    .attributes
                     .keys()
                     .filter(|key| key.as_str() != "shade_smooth")
                     .cloned()
-                    .collect::<Vec<String>>()
+                    .collect::<Vec<String>>();
+                if !data.vertex_groups.is_empty()
+                    && !dropped.iter().any(|key| key == "vertex_groups")
+                {
+                    dropped.push("vertex_groups".to_owned());
+                }
+                dropped
             } else {
                 Vec::new()
             };
@@ -270,6 +279,10 @@ pub(super) fn apply(
             if changed {
                 *mesh = edited;
                 data.descriptor = None;
+                if name == "mesh.remesh" {
+                    data.vertex_groups.clear();
+                    data.vertex_weights.clear();
+                }
             }
             (changed, had_descriptor, mapping, dropped)
         };

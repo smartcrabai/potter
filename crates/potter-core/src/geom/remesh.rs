@@ -421,7 +421,9 @@ pub(crate) fn nearest_source_faces(source: &Mesh, destination: &Mesh) -> Result<
     }
     let bounds: Vec<[f32; 6]> = triangles
         .iter()
-        .map(|(points, _)| KdopTree::leaf_bounds_for_triangle_exact(*points))
+        .map(|(points, _)| {
+            KdopTree::leaf_bounds_for_triangle_exact((*points).map(|point| point.to_array()))
+        })
         .collect();
     let tree = KdopTree::from_leaf_bounds(&bounds);
     let destination_index: HashMap<u32, usize> = destination
@@ -452,20 +454,21 @@ pub(crate) fn nearest_source_faces(source: &Mesh, destination: &Mesh) -> Result<
         let center = face_center(&corners);
         let mut nearest = NearestHit {
             index: -1,
-            co: Vec3::ZERO,
+            co: [0.0; 3],
             dist_sq: f32::MAX,
         };
         tree.find_nearest(
-            center,
+            center.to_array(),
             &mut nearest,
-            &mut |index: usize, point: Vec3, hit: &mut NearestHit| {
+            &mut |index: usize, point: [f32; 3], hit: &mut NearestHit| {
+                let point = Vec3::from(point);
                 let [a, b, c] = triangles[index].0;
                 let closest = closest_on_triangle(point, a, b, c);
                 let dist_sq = (point - closest).length_squared();
                 if dist_sq < hit.dist_sq {
                     hit.index = index as isize;
                     hit.dist_sq = dist_sq;
-                    hit.co = closest;
+                    hit.co = closest.to_array();
                 }
             },
             false,

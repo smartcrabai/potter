@@ -109,19 +109,16 @@ pub(super) fn import_reader_shading(
     normals: Option<&[DVec3]>,
     sharp_faces: Option<&[bool]>,
 ) -> Result<()> {
-    match sharp_faces {
-        Some(sharp) => {
-            if sharp.len() != mesh.faces.len() {
-                return Err(import_error(
-                    "imported sharp_face flags do not match the face count",
-                ));
-            }
-            import_exact_shading(mesh, normals, sharp.iter().map(|flag| !flag).collect())
+    if let Some(sharp) = sharp_faces {
+        if sharp.len() != mesh.faces.len() {
+            return Err(import_error(
+                "imported sharp_face flags do not match the face count",
+            ));
         }
-        None => {
-            import_exact_shading(mesh, normals, vec![true; mesh.faces.len()])?;
-            crate::geom::normals::settle_sharp_face(mesh)
-        }
+        import_exact_shading(mesh, normals, sharp.iter().map(|flag| !flag).collect())
+    } else {
+        import_exact_shading(mesh, normals, vec![true; mesh.faces.len()])?;
+        crate::geom::normals::settle_sharp_face(mesh)
     }
 }
 

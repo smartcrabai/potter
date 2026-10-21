@@ -33,6 +33,18 @@ pub(super) fn remesh_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
     }
 }
 
+/// Blender's `BKE_mesh_remesh_voxel` (`blenkernel/intern/mesh_remesh_voxel.cc`) for the voxel-remesh
+/// operator (`object_remesh.cc`), which the Remesh modifier's VOXEL mode also runs. The operator's shading
+/// and attribute reprojection are applied by the caller.
+pub(crate) fn voxel_remesh_mesh(
+    mesh: &Mesh,
+    voxel_size: f32,
+    adaptivity: f32,
+    smooth_shade: bool,
+) -> Result<Mesh> {
+    voxel::remesh(mesh, voxel_size, adaptivity, smooth_shade)
+}
+
 fn voxel_remesh(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let voxel_size = number_param(modifier, "voxel_size")?;
     if voxel_size <= 0.0 {

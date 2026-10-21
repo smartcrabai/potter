@@ -6936,10 +6936,17 @@ fn apply_symmetrize(
 
 fn apply_remesh(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdChanges> {
     let voxel_size = number(args, "voxel_size", 0.0)?;
-    if voxel_size <= 0.0 {
+    if !voxel_size.is_finite() || voxel_size <= 0.0 {
         return Err(invalid("remesh voxel_size must be positive"));
     }
-    let remeshed = crate::geom::remesh::remesh(mesh, voxel_size)?;
+    // The voxel-remesh operator runs `BKE_mesh_remesh_voxel` with the mesh's adaptivity, which is 0 by
+    // default (`object_remesh.cc`); the shading is set below from the reprojected `sharp_face`.
+    let remeshed = crate::geom::modifiers::remesh_modes::voxel_remesh_mesh(
+        mesh,
+        voxel_size as f32,
+        0.0,
+        false,
+    )?;
     let mut replacement = Mesh {
         next_id: mesh.next_id,
         ..Mesh::default()
@@ -7051,7 +7058,7 @@ pub(crate) fn apply_with_source(
 /// `rna_MeshPolygon_use_smooth_set` and the attribute API (`lookup_or_add`), and
 /// `Mesh.normals_split_custom_set`, which only touches custom normals. Voxel remesh reprojects the
 /// `sharp_face` of its source (`mesh_remesh_reproject_attributes`), so it sets presence from that source.
-/// Every other operator is an edit-mode operator (or a rebuild) that goes through BMesh and settles
+/// Every other operator is an edit-mode operator (or a rebuild) that goes through `BMesh` and settles
 /// presence on exit (`BM_mesh_bm_to_me`, `normals::settle_sharp_face`).
 const ATTRIBUTE_WRITE_OPERATIONS: [&str; 6] = [
     "set_attribute",

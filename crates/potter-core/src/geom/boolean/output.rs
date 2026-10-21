@@ -645,7 +645,7 @@ fn join_attributes(
     // The joined `sharp_face` exists when any operand's does: attribute joins are unions of the operands'.
     let mut sharp_face_present = false;
     for operand in operands {
-        sharp_face_present |= crate::geom::normals::sharp_face_flags(&operand.mesh)?.is_some();
+        sharp_face_present |= crate::geom::normals::sharp_face_flags(operand.mesh)?.is_some();
     }
     if sharp_face_present
         && let Some(fields) = attributes

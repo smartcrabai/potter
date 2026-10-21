@@ -51,7 +51,7 @@ pub(crate) use displacement::{
 mod mirror;
 pub(crate) mod multires;
 mod ocean;
-mod remesh_modes;
+pub(crate) mod remesh_modes;
 pub(crate) mod shrinkwrap;
 pub mod simulation;
 mod skin;

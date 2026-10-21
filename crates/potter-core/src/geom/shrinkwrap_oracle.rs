@@ -33,6 +33,8 @@ const BLENDER_VERSION: &str = "5.2.2 LTS";
 const SCENE_ID: &str = "3d8b1c0e-9f7a-4b2d-8e61-5c4a2b1f0e9d";
 /// The subject object that carries the Shrinkwrap stack; every other corpus input is a target.
 const SUBJECT: &str = "source";
+/// Vertex-group weights keyed by vertex ID, then group ID, as `DataBlock.vertex_weights` stores them.
+type VertexWeights = BTreeMap<u32, BTreeMap<Id, f64>>;
 
 #[test]
 fn shrinkwrap_matches_blender_522_differential_corpus() -> TestResult {
@@ -105,10 +107,12 @@ fn evaluate(inputs: &Value, stack: Vec<Modifier>) -> TestResult<(SceneDoc, Snaps
         let node_id = Id::new(name)?;
         let data_id = Id::new(format!("data_{name}"))?;
         let mesh = corpus_mesh(raw, is_subject)?;
-        let vertex_groups = if is_subject {
-            corpus_vertex_groups(raw)?
+        // The subject's vertex groups are stored on the data block (`DataBlock.vertex_groups` and
+        // `vertex_weights`, the canonical store that evaluation attaches to each mesh).
+        let (vertex_groups, vertex_weights) = if is_subject {
+            corpus_vertex_groups(raw, &mesh)?
         } else {
-            Vec::new()
+            (Vec::new(), BTreeMap::new())
         };
         let modifiers = if is_subject {
             stack.take().unwrap_or_default()
@@ -121,6 +125,7 @@ fn evaluate(inputs: &Value, stack: Vec<Modifier>) -> TestResult<(SceneDoc, Snaps
                 data_type: "mesh".to_owned(),
                 mesh: Some(mesh),
                 vertex_groups,
+                vertex_weights,
                 ..DataBlock::default()
             },
         );
@@ -233,7 +238,6 @@ fn corpus_mesh(raw: &Value, subject: bool) -> TestResult<Mesh> {
     if subject {
         set_uv_layers(&mut mesh, raw)?;
         set_color_layers(&mut mesh, raw)?;
-        set_vertex_group(&mut mesh, raw)?;
     }
     Ok(mesh)
 }
@@ -322,12 +326,12 @@ fn set_uv_layers(mesh: &mut Mesh, raw: &Value) -> TestResult {
                 Ok([u, 1.0 - v])
             })
             .collect::<TestResult<Vec<_>>>()?;
-        let index = match layers.iter().position(|candidate| candidate.name == name) {
-            Some(index) => index,
-            None => {
-                layers.push(UvLayer::new(name, vec![None; mesh.faces.len()]));
-                layers.len() - 1
-            }
+        let index = if let Some(index) = layers.iter().position(|candidate| candidate.name == name)
+        {
+            index
+        } else {
+            layers.push(UvLayer::new(name, vec![None; mesh.faces.len()]));
+            layers.len() - 1
         };
         let slot = layers[index]
             .faces
@@ -407,39 +411,31 @@ fn set_color_layers(mesh: &mut Mesh, raw: &Value) -> TestResult {
     Ok(())
 }
 
-fn set_vertex_group(mesh: &mut Mesh, raw: &Value) -> TestResult {
+/// The subject's vertex group from the corpus: its definition and each vertex's non-zero weight, keyed by
+/// vertex ID as `DataBlock.vertex_weights` stores them.
+fn corpus_vertex_groups(raw: &Value, mesh: &Mesh) -> TestResult<(Vec<VertexGroup>, VertexWeights)> {
     let Some(group) = raw.get("vertex_group") else {
-        return Ok(());
+        return Ok((Vec::new(), BTreeMap::new()));
     };
     let name = group["name"].as_str().ok_or("vertex group name")?;
     let weights = group["weights"].as_array().ok_or("vertex group weights")?;
-    let values: Map<String, Value> = mesh
-        .vertices
-        .iter()
-        .zip(weights)
-        .filter_map(|(vertex, amount)| {
-            amount
-                .as_f64()
-                .filter(|amount| *amount != 0.0)
-                .map(|amount| (format!("v{}", vertex.id), json!(amount)))
-        })
-        .collect();
-    let mut groups = Map::new();
-    groups.insert(name.to_owned(), Value::Object(values));
-    mesh.attributes
-        .insert("vertex_groups".to_owned(), Value::Object(groups));
-    Ok(())
-}
-
-fn corpus_vertex_groups(raw: &Value) -> TestResult<Vec<VertexGroup>> {
-    let Some(group) = raw.get("vertex_group") else {
-        return Ok(Vec::new());
-    };
-    let name = group["name"].as_str().ok_or("vertex group name")?;
-    Ok(vec![VertexGroup {
-        id: Id::new(format!("group_{}", name.to_ascii_lowercase()))?,
-        name: name.to_owned(),
-    }])
+    let id = Id::new(format!("group_{}", name.to_ascii_lowercase()))?;
+    let mut by_vertex = BTreeMap::<u32, BTreeMap<Id, f64>>::new();
+    for (vertex, amount) in mesh.vertices.iter().zip(weights) {
+        if let Some(amount) = amount.as_f64().filter(|amount| *amount != 0.0) {
+            by_vertex
+                .entry(vertex.id)
+                .or_default()
+                .insert(id.clone(), amount);
+        }
+    }
+    Ok((
+        vec![VertexGroup {
+            id,
+            name: name.to_owned(),
+        }],
+        by_vertex,
+    ))
 }
 
 /// The evaluated subject's summary in the corpus's fields. Its vertex, edge and face IDs must match the
