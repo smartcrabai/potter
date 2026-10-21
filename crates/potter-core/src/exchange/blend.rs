@@ -11326,6 +11326,69 @@ mod tests {
         Ok(())
     }
 
+    /// Blender keeps `sharp_face` after `use_smooth` on every face (an all-false attribute) and removes it
+    /// after `shade_smooth()`. Both states are all smooth; only Potter's `sharp_face_present` tells them
+    /// apart, so the exporter must write each state and the importer must read it back.
+    #[test]
+    fn blender_roundtrip_keeps_use_smooth_and_shade_smooth_states_apart() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        for (index, present) in [true, false].into_iter().enumerate() {
+            let mut mesh = box_with_attributes(Vec::new())?;
+            let values: Map<String, Value> = mesh
+                .faces
+                .iter()
+                .map(|face| (format!("f{}", face.id), json!(true)))
+                .collect();
+            let mut shading = json!({"domain": "face", "type": "bool", "values": values});
+            if present {
+                shading[crate::geom::normals::SHARP_FACE_PRESENT] = json!(true);
+            }
+            mesh.attributes.insert("shade_smooth".to_owned(), shading);
+            let mut doc = roundtrip_scene()?;
+            doc.data_blocks
+                .get_mut(&Id::new("mesh_box")?)
+                .ok_or_else(|| invalid_intermediate("fixture mesh is missing"))?
+                .mesh = Some(mesh);
+            let output = directory.path().join(format!("smooth-{index}.blend"));
+            let context = crate::eval::EvaluationContext::default();
+            let options = ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            };
+            export_blend(&doc, &project, &output, &options)?;
+            let imported = import_blend(&output, Some(&blender))?;
+            let imported_mesh = imported
+                .doc
+                .data_blocks
+                .values()
+                .filter_map(|data| data.mesh.as_ref())
+                .find(|mesh| mesh.attributes.contains_key("shade_smooth"))
+                .ok_or_else(|| invalid_intermediate("imported smooth flags are missing"))?;
+            let shade = &imported_mesh.attributes["shade_smooth"];
+            assert!(
+                shade["values"]
+                    .as_object()
+                    .is_some_and(|values| values.values().all(|value| *value == json!(true))),
+                "every face stays smooth"
+            );
+            let reopened = shade
+                .get(crate::geom::normals::SHARP_FACE_PRESENT)
+                .and_then(Value::as_bool)
+                == Some(true);
+            assert_eq!(
+                reopened, present,
+                "sharp_face presence after a .blend round trip"
+            );
+        }
+        Ok(())
+    }
+
     fn roundtrip_scene() -> Result<SceneDoc> {
         let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
         doc.worlds.insert(

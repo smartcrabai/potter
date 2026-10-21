@@ -688,6 +688,36 @@ pub(crate) fn sharp_face_flags(mesh: &Mesh) -> Result<Option<Vec<bool>>> {
     Ok(Some(smooth.iter().map(|smooth| !smooth).collect()))
 }
 
+/// Records that Blender's `sharp_face` attribute exists on `mesh` after a write that creates or updates
+/// it through the attribute API: `rna_MeshPolygon_use_smooth_set` (`lookup_or_add_for_write`), an
+/// attribute write, and a generator that always calls `lookup_or_add` (`MOD_screw.cc` `sharp_faces`).
+/// The flag lives on the `shade_smooth` attribute, so a mesh without that attribute is all flat and
+/// already has the Blender attribute through its flat faces.
+pub(crate) fn record_sharp_face(mesh: &mut Mesh) {
+    if let Some(fields) = mesh
+        .attributes
+        .get_mut("shade_smooth")
+        .and_then(Value::as_object_mut)
+    {
+        fields.insert(SHARP_FACE_PRESENT.to_owned(), json!(true));
+    }
+}
+
+/// Settles the presence of `sharp_face` after an edit operator rebuilt the mesh through BMesh. Blender's
+/// `BM_mesh_bm_to_me` writes `sharp_face` only when some face is not smooth (`bmesh_mesh_convert.cc`,
+/// `need_sharp_face |= !smooth`), so an all-smooth result has no record of it.
+pub(crate) fn settle_sharp_face(mesh: &mut Mesh) -> Result<()> {
+    if smooth_face_flags(mesh)?.iter().all(|smooth| *smooth)
+        && let Some(fields) = mesh
+            .attributes
+            .get_mut("shade_smooth")
+            .and_then(Value::as_object_mut)
+    {
+        fields.remove(SHARP_FACE_PRESENT);
+    }
+    Ok(())
+}
+
 /// Blender's `Mesh::normals_domain` (`mesh_normals.cc`): which elements carry the corner normals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NormalDomain {
@@ -759,7 +789,8 @@ fn mesh_error(error: &MeshError) -> PotError {
 /// remap them by element.
 pub(crate) const SHADING_ATTRIBUTES: [&str; 4] = ["shade_smooth", "sharp", "seam", "custom_normal"];
 
-/// Marks every face smooth, as a generator's `use_smooth_shade` does for the faces it creates.
+/// Marks every face smooth as `Mesh.shade_smooth()` does (`mesh_smooth_set(true)`, `mesh.cc`): the
+/// `sharp_face` attribute is removed, so no presence is recorded.
 pub(crate) fn shade_faces_smooth(mesh: &mut Mesh) {
     let values: Map<String, Value> = mesh
         .faces

@@ -787,6 +787,8 @@ pub(super) fn screw(
             serde_json::json!({"domain": "face", "type": "bool", "values": values}),
         );
     }
+    // MOD_screw.cc always calls `lookup_or_add_for_write_span("sharp_face")`, so its output has the attribute.
+    crate::geom::normals::record_sharp_face(&mut result);
     if has_uv_layers {
         // A generated face has no source UV entry, so it starts from zero before its U and V are set.
         let mut layers = uv_layers::read_layers(&result);

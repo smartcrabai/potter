@@ -327,6 +327,15 @@ fn canonical_shading(source: &Mesh, mesh: &mut Mesh) -> Result<()> {
             "shade_smooth".to_owned(),
             json!({"domain": "face", "type": "bool", "values": values}),
         );
+        // A copy keeps the member's `sharp_face` attribute (Blender's CustomData copy keeps every layer).
+        if source
+            .attributes
+            .get("shade_smooth")
+            .and_then(|attribute| attribute.get(crate::geom::normals::SHARP_FACE_PRESENT))
+            .is_some()
+        {
+            crate::geom::normals::record_sharp_face(mesh);
+        }
     }
     if ["sharp", "blender_edge_flags"]
         .iter()

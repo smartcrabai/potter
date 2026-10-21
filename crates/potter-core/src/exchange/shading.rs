@@ -180,6 +180,9 @@ pub(super) fn import_shading_flags(
             json!({ "domain": "face", "type": "bool", "values": values }),
         );
     }
+    // Blender's glTF importer always ensures `sharp_face` (`io_scene_gltf2/blender/imp/mesh.py`,
+    // `set_poly_smoothing`), so the imported mesh records it even when every face is smooth.
+    crate::geom::normals::record_sharp_face(mesh);
     if let Some(flags) = flags.filter(|flags| !flags.sharp.is_empty()) {
         let edge_key = |first: u32, second: u32| (first.min(second), first.max(second));
         let mut sharp_keys = BTreeSet::new();

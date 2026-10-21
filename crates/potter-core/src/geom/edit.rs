@@ -5411,14 +5411,6 @@ fn apply_shade(mesh: &mut Mesh, selected: &Selection, smooth: bool) -> Result<Id
     for id in &selected.ids {
         values.insert(format!("f{id}"), Value::Bool(smooth));
     }
-    // Blender's shade_smooth() removes `sharp_face` once every face is smooth; the presence field goes too.
-    let all_smooth = mesh
-        .faces
-        .iter()
-        .all(|face| values.get(&format!("f{}", face.id)) == Some(&Value::Bool(true)));
-    if smooth && all_smooth {
-        fields.remove(crate::geom::normals::SHARP_FACE_PRESENT);
-    }
     Ok(IdChanges::default())
 }
 
@@ -5663,6 +5655,10 @@ fn apply_set_attribute(mesh: &mut Mesh, args: &Map<String, Value>) -> Result<IdC
         .as_object_mut()
         .ok_or_else(|| invalid("mesh attribute values must be an object"))?;
     existing_values.extend(values);
+    if name == "shade_smooth" {
+        // Writing the attribute creates Blender's `sharp_face` (`rna_MeshPolygon_use_smooth_set`).
+        crate::geom::normals::record_sharp_face(mesh);
+    }
     Ok(IdChanges::default())
 }
 
@@ -6998,7 +6994,30 @@ pub(crate) fn apply_with_source(
     apply_inner(mesh, operation, args, Some(source))
 }
 
+/// Operators that write attributes directly keep Blender's `sharp_face` presence; every other operator
+/// rebuilds the mesh through BMesh, which settles it (`normals::settle_sharp_face`).
+const ATTRIBUTE_WRITE_OPERATIONS: [&str; 4] = [
+    "set_attribute",
+    "attribute_create",
+    "attribute_update",
+    "set_custom_normals",
+];
+
 fn apply_inner(
+    mesh: &mut Mesh,
+    operation: &str,
+    args: &Value,
+    source_mesh: Option<&Mesh>,
+) -> Result<Value> {
+    let result = apply_operation(mesh, operation, args, source_mesh)?;
+    let name = operation.strip_prefix("mesh.").unwrap_or(operation);
+    if !ATTRIBUTE_WRITE_OPERATIONS.contains(&name) {
+        crate::geom::normals::settle_sharp_face(mesh)?;
+    }
+    Ok(result)
+}
+
+fn apply_operation(
     mesh: &mut Mesh,
     operation: &str,
     args: &Value,

@@ -2513,6 +2513,15 @@ fn copy_keyed_value(cap: &Mesh, source: &mut Mesh, name: &str, from: &str, to: S
     if let Some(values) = target.get_mut("values").and_then(Value::as_object_mut) {
         values.insert(to, value.clone());
     }
+    // A cap's `sharp_face` is copied with its layer (Blender's CustomData copy), so the source has it too.
+    if let Some(present) = attribute.get(crate::geom::normals::SHARP_FACE_PRESENT)
+        && let Some(fields) = target.as_object_mut()
+    {
+        fields.insert(
+            crate::geom::normals::SHARP_FACE_PRESENT.to_owned(),
+            present.clone(),
+        );
+    }
 }
 
 /// The input mesh with its cap meshes appended: the provenance source of an array with caps.
