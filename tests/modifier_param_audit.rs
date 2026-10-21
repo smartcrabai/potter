@@ -220,7 +220,7 @@ for case in cases:
 print("POTTER_PARAM_AUDIT=" + json.dumps({"results": results}, sort_keys=True))
 "#;
 
-fn blender_scenario_results(scenarios: &Value) -> Option<BTreeMap<String, String>> {
+fn blender_scenario_results(scenarios: &Value) -> Option<BTreeMap<String, Value>> {
     let Some(blender) = blender_checked::blender_executable() else {
         eprintln!("skipping modifier parameter Blender scenarios: Blender is unavailable");
         return None;
@@ -283,7 +283,7 @@ fn blender_scenario_results(scenarios: &Value) -> Option<BTreeMap<String, String
             item["id"].as_str().unwrap(),
             item["state"].as_str().unwrap()
         );
-        results.insert(key, geometry_signature(&item["geometry"]));
+        results.insert(key, item["geometry"].clone());
     }
     Some(results)
 }
@@ -343,7 +343,7 @@ fn potter_scenario_geometry(
     modifier: &str,
     setup: &Value,
     params: &Value,
-) -> String {
+) -> Value {
     let directory = tempdir().unwrap();
     let scene = directory.path().join("scene");
     init_scene(&scene);
@@ -387,14 +387,31 @@ fn potter_scenario_geometry(
         String::from_utf8_lossy(&inspected.stdout)
     );
     let envelope: Value = serde_json::from_slice(&inspected.stdout).unwrap();
-    geometry_signature(&envelope["result"]["items"][0]["evaluated_geometry"])
+    envelope["result"]["items"][0]["evaluated_geometry"].clone()
 }
 
-fn scenario_signature<'a>(results: &'a BTreeMap<String, String>, id: &str, state: &str) -> &'a str {
+fn scenario_geometry<'a>(results: &'a BTreeMap<String, Value>, id: &str, state: &str) -> &'a Value {
     results
         .get(&format!("{id}:{state}"))
-        .map(String::as_str)
         .expect("Blender scenario result is missing")
+}
+
+/// Compares evaluated geometry by canonical signature. On mismatch the message carries both
+/// sides' positions and faces in storage order, so the per-vertex difference shows in CI.
+fn assert_scenario_matches(id: &str, potter: &Value, blender: &Value) {
+    let potter_signature = geometry_signature(potter);
+    let blender_signature = geometry_signature(blender);
+    assert_eq!(
+        potter_signature,
+        blender_signature,
+        "{id}: Potter differs from Blender\nPotter: {}\nBlender: {}",
+        geometry_dump(potter),
+        geometry_dump(blender)
+    );
+}
+
+fn geometry_dump(geometry: &Value) -> String {
+    json!({"positions": geometry["positions"], "faces": geometry["faces"]}).to_string()
 }
 
 #[test]
@@ -416,8 +433,8 @@ fn f_modifier_parameter_scenarios_match_blender() {
         let id = scenario["id"].as_str().unwrap();
         let primitive = scenario["primitive"].as_str().unwrap();
         let modifier = scenario["modifier"].as_str().unwrap();
-        let blender_baseline = scenario_signature(&blender, id, "baseline");
-        let blender_case = scenario_signature(&blender, id, "case");
+        let blender_baseline = scenario_geometry(&blender, id, "baseline");
+        let blender_case = scenario_geometry(&blender, id, "case");
         let potter_baseline = potter_scenario_geometry(
             primitive,
             modifier,
@@ -433,26 +450,31 @@ fn f_modifier_parameter_scenarios_match_blender() {
         match scenario["expectation"].as_str().unwrap() {
             "equal_active" => {
                 assert_ne!(
-                    blender_baseline, blender_case,
+                    geometry_signature(blender_baseline),
+                    geometry_signature(blender_case),
                     "{id}: Blender fixture is inactive"
                 );
                 assert_ne!(
-                    potter_baseline, potter_case,
+                    geometry_signature(&potter_baseline),
+                    geometry_signature(&potter_case),
                     "{id}: Potter fixture is inactive"
                 );
-                assert_eq!(
-                    potter_case, blender_case,
-                    "{id}: Potter differs from Blender"
-                );
+                assert_scenario_matches(id, &potter_case, blender_case);
             }
             "inert" => {
                 assert_eq!(
-                    blender_baseline, blender_case,
+                    geometry_signature(blender_baseline),
+                    geometry_signature(blender_case),
                     "{id}: expected Blender no-op"
                 );
-                assert_eq!(potter_baseline, potter_case, "{id}: expected Potter no-op");
                 assert_eq!(
-                    potter_baseline, blender_baseline,
+                    geometry_signature(&potter_baseline),
+                    geometry_signature(&potter_case),
+                    "{id}: expected Potter no-op"
+                );
+                assert_eq!(
+                    geometry_signature(&potter_baseline),
+                    geometry_signature(blender_baseline),
                     "{id}: no-op baseline differs"
                 );
             }
@@ -471,8 +493,8 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
         let id = scenario["id"].as_str().unwrap();
         let primitive = scenario["primitive"].as_str().unwrap();
         let modifier = scenario["modifier"].as_str().unwrap();
-        let blender_baseline = scenario_signature(&blender, id, "baseline");
-        let blender_case = scenario_signature(&blender, id, "case");
+        let blender_baseline = scenario_geometry(&blender, id, "baseline");
+        let blender_case = scenario_geometry(&blender, id, "case");
         let potter_baseline = potter_scenario_geometry(
             primitive,
             modifier,
@@ -488,26 +510,31 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
         match scenario["expectation"].as_str().unwrap() {
             "equal_active" => {
                 assert_ne!(
-                    blender_baseline, blender_case,
+                    geometry_signature(blender_baseline),
+                    geometry_signature(blender_case),
                     "{id}: Blender fixture is inactive"
                 );
                 assert_ne!(
-                    potter_baseline, potter_case,
+                    geometry_signature(&potter_baseline),
+                    geometry_signature(&potter_case),
                     "{id}: Potter fixture is inactive"
                 );
-                assert_eq!(
-                    potter_case, blender_case,
-                    "{id}: Potter differs from Blender"
-                );
+                assert_scenario_matches(id, &potter_case, blender_case);
             }
             "inert" => {
                 assert_eq!(
-                    blender_baseline, blender_case,
+                    geometry_signature(blender_baseline),
+                    geometry_signature(blender_case),
                     "{id}: expected Blender no-op"
                 );
-                assert_eq!(potter_baseline, potter_case, "{id}: expected Potter no-op");
                 assert_eq!(
-                    potter_baseline, blender_baseline,
+                    geometry_signature(&potter_baseline),
+                    geometry_signature(&potter_case),
+                    "{id}: expected Potter no-op"
+                );
+                assert_eq!(
+                    geometry_signature(&potter_baseline),
+                    geometry_signature(blender_baseline),
                     "{id}: no-op baseline differs"
                 );
             }
@@ -520,15 +547,17 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
                     "{id}: unknown parity-gap owner {owner}"
                 );
                 assert_ne!(
-                    blender_baseline, blender_case,
+                    geometry_signature(blender_baseline),
+                    geometry_signature(blender_case),
                     "{id}: the tested Blender parameter is inactive"
                 );
                 assert_ne!(
-                    potter_case, blender_case,
+                    geometry_signature(&potter_case),
+                    geometry_signature(blender_case),
                     "{id}: recorded parity gap has been fixed; update the scenario inventory"
                 );
                 assert_eq!(
-                    potter_baseline != potter_case,
+                    geometry_signature(&potter_baseline) != geometry_signature(&potter_case),
                     scenario["potter_changes"].as_bool().unwrap(),
                     "{id}: Potter behavior changed; update the scenario inventory"
                 );
