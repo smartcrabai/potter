@@ -6,7 +6,7 @@
 //! transparent, except the pixels next to the cutoff edge.
 //!
 //! Blender (`fixtures/native_oracle/blend_clip_mask_render.py`) saves the scene, then renders eight seeds at 16
-//! samples per pixel. Each seed gives the fractions of a 32 × 32 window of the 64 × 64 frame that are opaque (alpha
+//! samples per pixel. Each seed gives the fractions of a 16 × 16 window of the 32 × 32 frame that are opaque (alpha
 //! at least 0.99), transparent (at most 0.01), or in between. Potter imports the same `.blend`, renders the same
 //! eight seeds in process at 16 samples, and reads the same window from the alpha channel.
 //!
@@ -46,11 +46,12 @@ use tempfile::tempdir;
 const SCRIPT: &str = include_str!("fixtures/native_oracle/blend_clip_mask_render.py");
 /// Seeds of both renders. Eight seeds give 7 degrees of freedom for the Student quantile.
 const SEEDS: u32 = 8;
-const RESOLUTION: u32 = 64;
+/// Frame edge in pixels. At 32 the window statistics are as deterministic as at 64 (see the script).
+const RESOLUTION: u32 = 32;
 /// Blender's samples per pixel, set in the script; Potter renders the same count.
 const SAMPLES: u32 = 16;
-/// The centred window that the script and this test measure: pixels 16 to 47 on both axes.
-const WINDOW: std::ops::Range<usize> = 16..48;
+/// The centred window that the script and this test measure: pixels 8 to 23 on both axes.
+const WINDOW: std::ops::Range<usize> = 8..24;
 /// The two-sided 99.9% Student t quantile at 7 degrees of freedom.
 const T_QUANTILE: f64 = 5.408;
 /// The cutoff of the oracle's MASK graph (`blend_clip_mask_render.py`, `CUTOFF`).

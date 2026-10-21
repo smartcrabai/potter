@@ -46,8 +46,16 @@ const PATCH: [f64; 9] = [
 const EXPECTED: [f64; 3] = [0.25, 0.375, 0.125];
 /// The viewport case: a diffuse of albedo 0.8 under a unit uniform world, opaque.
 const VIEWPORT_OPAQUE: f64 = 0.8;
-/// Linear render tolerance. Both estimators average 81 patch pixels, so this covers the sampling noise of 64
-/// samples per pixel with margin, and it is far below the 0.25 a missing graph transparency causes.
+/// Samples per pixel of the path-traced DITHERED case, and of its script argument (the same number). The red
+/// channel's patch-mean noise per seed is 0.00039 at 64 samples (measured on eight seeds); square-root scaling
+/// predicts 0.00055 at 32, a margin of about 13 standard errors, and 16 samples measured 0.00214 (margin 3).
+/// The other cases keep 64.
+const CYCLES_DITHERED_SAMPLES: u32 = 32;
+const CYCLES_DITHERED_SAMPLES_ARG: &str = "32";
+/// Samples per pixel of the other cases.
+const DEFAULT_SAMPLES: u32 = 64;
+/// Linear render tolerance. Both estimators average 81 patch pixels, so this covers the sampling noise of the
+/// sample counts with margin, and it is far below the 0.25 a missing graph transparency causes.
 const PIXEL_TOLERANCE: f64 = 0.01;
 
 /// Writes `source` as `script_name` in `root/label`, runs it in Blender with `arguments` after the scene, EXR and
@@ -83,8 +91,13 @@ fn blender_render(
     Ok((blend, mean))
 }
 
-/// Imports the Blender scene, sets its render size and samples, and returns the project and its active scene.
-fn import_scene(blender: &Path, root: &Path, blend: &Path) -> TestResult<(PathBuf, String)> {
+/// Imports the Blender scene, sets its render size and `samples`, and returns the project and its active scene.
+fn import_scene(
+    blender: &Path,
+    root: &Path,
+    blend: &Path,
+    samples: u32,
+) -> TestResult<(PathBuf, String)> {
     let (project, _) = import_blend(blender, root, "project", blend)?;
     let scene = read_scene(&project)?;
     let active = scene["active_scene"]
@@ -95,7 +108,7 @@ fn import_scene(blender: &Path, root: &Path, blend: &Path) -> TestResult<(PathBu
         &project,
         root,
         json!([
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": 64, "resolution_y": 64, "samples": 64, "seed": 0, "max_bounces": 4}}
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": 64, "resolution_y": 64, "samples": samples, "seed": 0, "max_bounces": 4}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
@@ -171,11 +184,11 @@ fn dithered_graph_transparency_matches_cycles_in_the_path_tracer() -> TestResult
         "CYCLES",
         "graph_transparent.py",
         SCRIPT,
-        &["CYCLES"],
+        &["CYCLES", CYCLES_DITHERED_SAMPLES_ARG],
     )?;
     assert_patch_matches(&wanted, &EXPECTED, "the analytic Cycles mean");
 
-    let (project, _) = import_scene(&blender, root.path(), &blend)?;
+    let (project, _) = import_scene(&blender, root.path(), &blend, CYCLES_DITHERED_SAMPLES)?;
     let frame = potter_frame(&project, root.path(), "path", &[])?;
     assert_patch_matches(&patch_mean(&frame), &wanted, "Cycles");
     Ok(())
@@ -200,7 +213,7 @@ fn dithered_graph_transparency_matches_eevee_in_realtime() -> TestResult {
     )?;
     assert_patch_matches(&wanted, &EXPECTED, "the analytic EEVEE mean");
 
-    let (project, _) = import_scene(&blender, root.path(), &blend)?;
+    let (project, _) = import_scene(&blender, root.path(), &blend, DEFAULT_SAMPLES)?;
     let frame = potter_frame(&project, root.path(), "realtime", &["--engine", "realtime"])?;
     assert_patch_matches(&patch_mean(&frame), &wanted, "EEVEE");
     Ok(())
@@ -223,7 +236,7 @@ fn a_graph_without_transparency_ignores_the_viewport_alpha_as_cycles_does() -> T
     )?;
     assert_patch_matches(&wanted, &[VIEWPORT_OPAQUE; 3], "the analytic Cycles mean");
 
-    let (project, _) = import_scene(&blender, root.path(), &blend)?;
+    let (project, _) = import_scene(&blender, root.path(), &blend, DEFAULT_SAMPLES)?;
     let frame = potter_frame(&project, root.path(), "path", &[])?;
     assert_patch_matches(&patch_mean(&frame), &wanted, "Cycles");
     Ok(())
@@ -250,7 +263,7 @@ fn a_tinted_transparent_bsdf_tints_camera_and_shadow_rays_as_cycles_does() -> Te
     let expected = [0.9 * 0.9 * lit, 0.4 * 0.4 * lit, 0.2 * 0.2 * lit];
     assert_patch_matches(&wanted, &expected, "the analytic Cycles mean");
 
-    let (project, _) = import_scene(&blender, root.path(), &blend)?;
+    let (project, _) = import_scene(&blender, root.path(), &blend, DEFAULT_SAMPLES)?;
     let frame = potter_frame(&project, root.path(), "path", &[])?;
     assert_patch_matches(&patch_mean(&frame), &wanted, "Cycles");
     Ok(())

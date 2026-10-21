@@ -21,8 +21,11 @@ import bpy
 
 blend_out, json_out = sys.argv[sys.argv.index("--") + 1:][:2]
 
-RESOLUTION = 64
-WINDOW = range(16, 48)
+# A 32 x 32 frame with a central 16 x 16 window: at 64 x 64 the cost was 4x for no change in the statistics.
+# Blender's fractions are exactly deterministic across the eight seeds at this size (measured headless: 0.5
+# opaque, 0.5 transparent, 0 in between, zero spread), so the frame size changes only Potter's render time.
+RESOLUTION = 32
+WINDOW = range(8, 24)
 CUTOFF = 0.5
 SAMPLES = 16
 SEEDS = range(8)

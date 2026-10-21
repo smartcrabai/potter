@@ -19,6 +19,9 @@ import sys
 import bpy
 
 blend_out, image_out, json_out, engine = sys.argv[sys.argv.index("--") + 1:][:4]
+# An optional fifth argument sets the Cycles samples per pixel (default 64); EEVEE keeps 64.
+extra = sys.argv[sys.argv.index("--") + 1:][4:]
+CYCLES_SAMPLES = int(extra[0]) if extra else 64
 
 WIDTH = 64
 HEIGHT = 64
@@ -35,7 +38,7 @@ scene = bpy.context.scene
 scene.render.engine = engine
 if engine == "CYCLES":
     scene.cycles.device = "CPU"
-    scene.cycles.samples = SAMPLES
+    scene.cycles.samples = CYCLES_SAMPLES
     scene.cycles.use_denoising = False
     scene.cycles.max_bounces = 4
 else:
