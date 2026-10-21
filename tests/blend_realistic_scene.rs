@@ -540,6 +540,12 @@ bpy.ops.wm.save_as_mainfile(filepath=str(Path(__file__).resolve().parent / "defa
     Ok(())
 }
 
+/// Over the ~40 s debug budget by design (about 181 s measured). The scene is one fixture built once, then
+/// three imports of it: a dry run (asserted uncommitted, no losses), a committing import (asserted no
+/// losses, then rendered) and an `--allow-lossy` import (asserted no losses). Each is an assertion of its
+/// own, so none can be dropped or merged. Export and Blender reopen run once. The dominant cost is the
+/// three Potter imports of the whole scene, which cannot be shared across separate CLI invocations
+/// without changing what those imports prove.
 #[test]
 fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluation()
 -> Result<(), Box<dyn Error>> {

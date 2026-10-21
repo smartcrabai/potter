@@ -771,6 +771,11 @@ fn check_base_edit(blender: &Path, fixture: &Path) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+/// Over the ~40 s debug budget by design (about 159 s measured). Each check is a distinct UDIM error or
+/// success scenario with its own Blender fixture state, project and expected diagnostic, so no launch can
+/// be shared without changing what a check proves. The two success variants (`external`, `uvtile`) each
+/// cost one init, one Blender import, one Potter export, and one Blender reopen; the rest are error paths
+/// that each run their own import or export. Cutting it means dropping a scenario, which is not allowed.
 #[test]
 fn blender_udim_tiles_import_sample_and_round_trip() -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender_executable() else {

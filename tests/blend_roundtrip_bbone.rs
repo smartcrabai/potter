@@ -35,162 +35,170 @@ import sys
 arguments = sys.argv[sys.argv.index("--") + 1:]
 root = os.path.realpath(arguments[0])
 case = arguments[1]
-mode = arguments[2] if len(arguments) > 2 else ""
+units = arguments[2:] or [case]
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
+geometry = {}
 
-armature = bpy.data.armatures.new("BboneRigData")
-rig = bpy.data.objects.new("Rig", armature)
-scene.collection.objects.link(rig)
-rig.select_set(True)
-bpy.context.view_layer.objects.active = rig
-bpy.ops.object.mode_set(mode="EDIT")
-root_bone = armature.edit_bones.new("Root")
-root_bone.head = (0.0, -1.0, 0.0)
-root_bone.tail = (0.0, 0.0, 0.0)
-bendy = armature.edit_bones.new("Bendy")
-bendy.head = (0.0, 0.0, 0.0)
-bendy.tail = (0.0, 2.0, 0.0)
-bendy.parent = root_bone
-start_handle = armature.edit_bones.new("StartHandle")
-start_handle.head = (-0.6, 0.2, 0.0)
-start_handle.tail = (-0.6, 0.7, 0.0)
-end_handle = armature.edit_bones.new("EndHandle")
-end_handle.head = (0.6, 1.3, 0.0)
-end_handle.tail = (0.6, 1.8, 0.0)
-bpy.ops.object.mode_set(mode="OBJECT")
-rig.select_set(False)
+for unit in units:
+    # One rig and one owner per unit. A single-case unit keeps the plain names; a mode unit gets a suffix.
+    suffix = "" if unit == case else "_" + unit
+    mode = unit
+    armature = bpy.data.armatures.new("BboneRigData" + suffix)
+    rig = bpy.data.objects.new("Rig" + suffix, armature)
+    scene.collection.objects.link(rig)
+    rig.select_set(True)
+    bpy.context.view_layer.objects.active = rig
+    bpy.ops.object.mode_set(mode="EDIT")
+    root_bone = armature.edit_bones.new("Root")
+    root_bone.head = (0.0, -1.0, 0.0)
+    root_bone.tail = (0.0, 0.0, 0.0)
+    bendy = armature.edit_bones.new("Bendy")
+    bendy.head = (0.0, 0.0, 0.0)
+    bendy.tail = (0.0, 2.0, 0.0)
+    bendy.parent = root_bone
+    start_handle = armature.edit_bones.new("StartHandle")
+    start_handle.head = (-0.6, 0.2, 0.0)
+    start_handle.tail = (-0.6, 0.7, 0.0)
+    end_handle = armature.edit_bones.new("EndHandle")
+    end_handle.head = (0.6, 1.3, 0.0)
+    end_handle.tail = (0.6, 1.8, 0.0)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    rig.select_set(False)
 
-bone = armature.bones["Bendy"]
-bone.bbone_segments = 5
-bone.bbone_mapping_mode = "CURVED"
-bone.bbone_x = 0.17
-bone.bbone_z = 0.23
-bone.bbone_handle_type_start = "TANGENT"
-bone.bbone_custom_handle_start = armature.bones["StartHandle"]
-bone.bbone_handle_use_scale_start = (True, False, True)
-bone.bbone_handle_use_ease_start = True
-bone.bbone_handle_type_end = "ABSOLUTE"
-bone.bbone_custom_handle_end = armature.bones["EndHandle"]
-bone.bbone_handle_use_scale_end = (False, True, False)
-bone.bbone_handle_use_ease_end = False
-bone.bbone_rollin = 0.13
-bone.bbone_rollout = -0.21
-bone.bbone_curveinx = 0.11
-bone.bbone_curveinz = 0.24
-bone.bbone_curveoutx = -0.14
-bone.bbone_curveoutz = -0.27
-bone.bbone_easein = 0.31
-bone.bbone_easeout = 0.42
-bone.bbone_scalein = (1.1, 0.8, 1.2)
-bone.bbone_scaleout = (0.9, 1.3, 0.7)
+    bone = armature.bones["Bendy"]
+    bone.bbone_segments = 5
+    bone.bbone_mapping_mode = "CURVED"
+    bone.bbone_x = 0.17
+    bone.bbone_z = 0.23
+    bone.bbone_handle_type_start = "TANGENT"
+    bone.bbone_custom_handle_start = armature.bones["StartHandle"]
+    bone.bbone_handle_use_scale_start = (True, False, True)
+    bone.bbone_handle_use_ease_start = True
+    bone.bbone_handle_type_end = "ABSOLUTE"
+    bone.bbone_custom_handle_end = armature.bones["EndHandle"]
+    bone.bbone_handle_use_scale_end = (False, True, False)
+    bone.bbone_handle_use_ease_end = False
+    bone.bbone_rollin = 0.13
+    bone.bbone_rollout = -0.21
+    bone.bbone_curveinx = 0.11
+    bone.bbone_curveinz = 0.24
+    bone.bbone_curveoutx = -0.14
+    bone.bbone_curveoutz = -0.27
+    bone.bbone_easein = 0.31
+    bone.bbone_easeout = 0.42
+    bone.bbone_scalein = (1.1, 0.8, 1.2)
+    bone.bbone_scaleout = (0.9, 1.3, 0.7)
 
-if case == "target_shape":
-    owner = bpy.data.objects.new("CaseOwner", None)
-    scene.collection.objects.link(owner)
-    constraint = owner.constraints.new("COPY_LOCATION")
-    constraint.name = "BboneShapeTarget"
-    constraint.target = rig
-    constraint.subtarget = "Bendy"
-    constraint.head_tail = 0.35
-    constraint.use_bbone_shape = True
-elif case == "armature_modifier":
-    if mode not in (
-        "curved_linear", "curved_preserve_volume", "straight_linear", "curved_envelopes",
-        "straight_preserve_volume",
-        "curved_envelope_multiply", "curved_zyx", "curved_axis_angle",
-    ):
-        raise ValueError("unknown B-Bone deformation mode: " + mode)
-    bone.bbone_mapping_mode = (
-        "STRAIGHT" if mode in ("straight_linear", "straight_preserve_volume") else "CURVED"
-    )
-    if mode == "curved_envelopes":
-        bone.head_radius = 0.5
-        bone.tail_radius = 0.5
-        bone.envelope_distance = 0.75
-        bone.envelope_weight = 1.0
-    elif mode == "curved_envelope_multiply":
-        bone.head_radius = 0.24
-        bone.tail_radius = 0.36
-        bone.envelope_distance = 1.05
-        bone.envelope_weight = 0.73
-        bone.use_envelope_multiply = True
-    rig.location = (0.31, -0.22, 0.18)
-    rig.rotation_euler = (0.11, -0.16, 0.09)
-    bendy_pose = rig.pose.bones["Bendy"]
-    bendy_pose.rotation_mode = "XYZ"
-    bendy_pose.rotation_euler = (0.19, -0.23, 0.14)
-    bendy_pose.location = (0.07, 0.11, -0.05)
-    bendy_pose.scale = (1.08, 0.93, 1.12)
-    bendy_pose.bbone_rollin = 0.27
-    if mode == "curved_zyx":
-        bendy_pose.rotation_mode = "ZYX"
-    elif mode == "curved_axis_angle":
-        from mathutils import Euler
-        bendy_pose.rotation_mode = "AXIS_ANGLE"
-        axis, angle = Euler((0.19, -0.23, 0.14), "XYZ").to_quaternion().to_axis_angle()
-        bendy_pose.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
-    start_handle_pose = rig.pose.bones["StartHandle"]
-    start_handle_pose.rotation_mode = "XYZ"
-    start_handle_pose.rotation_euler = (0.12, -0.18, 4.0)
-    end_handle_pose = rig.pose.bones["EndHandle"]
-    end_handle_pose.rotation_mode = "XYZ"
-    end_handle_pose.rotation_euler = (-0.14, 0.1, -0.12)
-    vertices = [
-        (-0.31, 0.08, 0.18), (0.43, 0.12, -0.11),
-        (-0.18, 0.37, -0.27), (0.33, 0.43, 0.24),
-        (-0.45, 0.78, 0.13), (0.16, 0.82, -0.31),
-        (-0.09, 1.18, 0.33), (0.39, 1.22, 0.04),
-        (-0.29, 1.58, -0.22), (0.25, 1.62, 0.29),
-        (-0.13, 1.9, 0.12), (0.36, 1.88, -0.17),
-    ]
-    faces = [(0, 1, 3, 2), (2, 3, 5, 4), (4, 5, 7, 6),
-             (6, 7, 9, 8), (8, 9, 11, 10)]
-    mesh = bpy.data.meshes.new("CaseOwnerData")
-    mesh.from_pydata(vertices, [], faces)
-    mesh.update()
-    owner = bpy.data.objects.new("CaseOwner", mesh)
-    scene.collection.objects.link(owner)
-    owner.location = (-0.27, 0.13, 0.24)
-    owner.rotation_euler = (0.09, -0.12, 0.17)
-    group = owner.vertex_groups.new(name="Bendy")
-    if mode == "curved_envelopes":
-        group.add([0], 0.0, "REPLACE")
+    if case == "target_shape":
+        owner = bpy.data.objects.new("CaseOwner" + suffix, None)
+        scene.collection.objects.link(owner)
+        constraint = owner.constraints.new("COPY_LOCATION")
+        constraint.name = "BboneShapeTarget"
+        constraint.target = rig
+        constraint.subtarget = "Bendy"
+        constraint.head_tail = 0.35
+        constraint.use_bbone_shape = True
+    elif case == "armature_modifier":
+        if mode not in (
+            "curved_linear", "curved_preserve_volume", "straight_linear", "curved_envelopes",
+            "straight_preserve_volume",
+            "curved_envelope_multiply", "curved_zyx", "curved_axis_angle",
+        ):
+            raise ValueError("unknown B-Bone deformation mode: " + mode)
+        bone.bbone_mapping_mode = (
+            "STRAIGHT" if mode in ("straight_linear", "straight_preserve_volume") else "CURVED"
+        )
+        if mode == "curved_envelopes":
+            bone.head_radius = 0.5
+            bone.tail_radius = 0.5
+            bone.envelope_distance = 0.75
+            bone.envelope_weight = 1.0
+        elif mode == "curved_envelope_multiply":
+            bone.head_radius = 0.24
+            bone.tail_radius = 0.36
+            bone.envelope_distance = 1.05
+            bone.envelope_weight = 0.73
+            bone.use_envelope_multiply = True
+        rig.location = (0.31, -0.22, 0.18)
+        rig.rotation_euler = (0.11, -0.16, 0.09)
+        bendy_pose = rig.pose.bones["Bendy"]
+        bendy_pose.rotation_mode = "XYZ"
+        bendy_pose.rotation_euler = (0.19, -0.23, 0.14)
+        bendy_pose.location = (0.07, 0.11, -0.05)
+        bendy_pose.scale = (1.08, 0.93, 1.12)
+        bendy_pose.bbone_rollin = 0.27
+        if mode == "curved_zyx":
+            bendy_pose.rotation_mode = "ZYX"
+        elif mode == "curved_axis_angle":
+            from mathutils import Euler
+            bendy_pose.rotation_mode = "AXIS_ANGLE"
+            axis, angle = Euler((0.19, -0.23, 0.14), "XYZ").to_quaternion().to_axis_angle()
+            bendy_pose.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+        start_handle_pose = rig.pose.bones["StartHandle"]
+        start_handle_pose.rotation_mode = "XYZ"
+        start_handle_pose.rotation_euler = (0.12, -0.18, 4.0)
+        end_handle_pose = rig.pose.bones["EndHandle"]
+        end_handle_pose.rotation_mode = "XYZ"
+        end_handle_pose.rotation_euler = (-0.14, 0.1, -0.12)
+        vertices = [
+            (-0.31, 0.08, 0.18), (0.43, 0.12, -0.11),
+            (-0.18, 0.37, -0.27), (0.33, 0.43, 0.24),
+            (-0.45, 0.78, 0.13), (0.16, 0.82, -0.31),
+            (-0.09, 1.18, 0.33), (0.39, 1.22, 0.04),
+            (-0.29, 1.58, -0.22), (0.25, 1.62, 0.29),
+            (-0.13, 1.9, 0.12), (0.36, 1.88, -0.17),
+        ]
+        faces = [(0, 1, 3, 2), (2, 3, 5, 4), (4, 5, 7, 6),
+                 (6, 7, 9, 8), (8, 9, 11, 10)]
+        mesh = bpy.data.meshes.new("CaseOwnerData" + suffix)
+        mesh.from_pydata(vertices, [], faces)
+        mesh.update()
+        owner = bpy.data.objects.new("CaseOwner" + suffix, mesh)
+        scene.collection.objects.link(owner)
+        owner.location = (-0.27, 0.13, 0.24)
+        owner.rotation_euler = (0.09, -0.12, 0.17)
+        group = owner.vertex_groups.new(name="Bendy")
+        if mode == "curved_envelopes":
+            group.add([0], 0.0, "REPLACE")
+        else:
+            weights = (0.45, 1.0, 0.72, 0.38, 1.0, 0.61,
+                       0.83, 0.52, 0.3, 1.0, 0.67, 0.9)
+            for index, weight in enumerate(weights):
+                group.add([index], weight, "REPLACE")
+        modifier = owner.modifiers.new("WeightedBbone", "ARMATURE")
+        modifier.object = rig
+        modifier.use_vertex_groups = True
+        modifier.use_bone_envelopes = mode in ("curved_envelopes", "curved_envelope_multiply")
+        modifier.use_deform_preserve_volume = mode in ("curved_preserve_volume", "straight_preserve_volume")
+        bpy.context.view_layer.update()
+        evaluated = owner.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        evaluated_mesh = evaluated.to_mesh()
+        positions = [[float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)]
+                     for vertex in evaluated_mesh.vertices]
+        evaluated.to_mesh_clear()
+        pose_basis = {}
+        for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
+            pose_bone = rig.pose.bones[name]
+            pose_basis[name] = {"rotation_mode": pose_bone.rotation_mode,
+                                "rotation_euler": [float(value) for value in pose_bone.rotation_euler],
+                                "matrix_basis": [list(row) for row in pose_bone.matrix_basis]}
+        geometry[mode] = {"input_positions": vertices, "positions": positions, "pose": pose_basis}
+    elif case == "armature_constraint":
+        owner = bpy.data.objects.new("CaseOwner" + suffix, None)
+        scene.collection.objects.link(owner)
+        constraint = owner.constraints.new("ARMATURE")
+        constraint.name = "WeightedBboneTarget"
+        target = constraint.targets.new()
+        target.target = rig
+        target.subtarget = "Bendy"
+        target.weight = 0.75
     else:
-        weights = (0.45, 1.0, 0.72, 0.38, 1.0, 0.61,
-                   0.83, 0.52, 0.3, 1.0, 0.67, 0.9)
-        for index, weight in enumerate(weights):
-            group.add([index], weight, "REPLACE")
-    modifier = owner.modifiers.new("WeightedBbone", "ARMATURE")
-    modifier.object = rig
-    modifier.use_vertex_groups = True
-    modifier.use_bone_envelopes = mode in ("curved_envelopes", "curved_envelope_multiply")
-    modifier.use_deform_preserve_volume = mode in ("curved_preserve_volume", "straight_preserve_volume")
-    bpy.context.view_layer.update()
-    evaluated = owner.evaluated_get(bpy.context.evaluated_depsgraph_get())
-    evaluated_mesh = evaluated.to_mesh()
-    positions = [[float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)]
-                 for vertex in evaluated_mesh.vertices]
-    evaluated.to_mesh_clear()
-    pose_basis = {}
-    for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
-        pose_bone = rig.pose.bones[name]
-        pose_basis[name] = {"rotation_mode": pose_bone.rotation_mode,
-                            "rotation_euler": [float(value) for value in pose_bone.rotation_euler],
-                            "matrix_basis": [list(row) for row in pose_bone.matrix_basis]}
+        raise ValueError("unknown fixture case: " + case)
+
+if case == "armature_modifier":
     with open(os.path.join(root, "blender_geometry.json"), "w", encoding="utf-8") as handle:
-        json.dump({"input_positions": vertices, "positions": positions, "pose": pose_basis}, handle)
-elif case == "armature_constraint":
-    owner = bpy.data.objects.new("CaseOwner", None)
-    scene.collection.objects.link(owner)
-    constraint = owner.constraints.new("ARMATURE")
-    constraint.name = "WeightedBboneTarget"
-    target = constraint.targets.new()
-    target.target = rig
-    target.subtarget = "Bendy"
-    target.weight = 0.75
-else:
-    raise ValueError("unknown fixture case: " + case)
+        json.dump(geometry, handle)
 
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "source.blend"), check_existing=False)
 "#;
@@ -200,10 +208,10 @@ import bpy
 import json
 import sys
 
-output_path = sys.argv[sys.argv.index("--") + 1]
-case = sys.argv[sys.argv.index("--") + 2]
-rig = bpy.data.objects["Rig"]
-bone = rig.data.bones["Bendy"]
+arguments = sys.argv[sys.argv.index("--") + 1:]
+output_path = arguments[0]
+case = arguments[1]
+units = arguments[2:] or [case]
 keys = [
     "bbone_segments",
     "bbone_mapping_mode",
@@ -228,29 +236,35 @@ keys = [
     "bbone_scalein",
     "bbone_scaleout",
 ]
-settings = {}
-for key in keys:
-    value = getattr(bone, key)
-    if key in ("bbone_custom_handle_start", "bbone_custom_handle_end"):
-        value = value.name if value else None
-    elif key in ("bbone_handle_use_scale_start", "bbone_handle_use_scale_end", "bbone_scalein", "bbone_scaleout"):
-        value = list(value)
-    settings[key] = value
-result = {"settings": settings}
-if case == "target_shape":
-    constraint = bpy.data.objects["CaseOwner"].constraints["BboneShapeTarget"]
-    result["constraint"] = {
-        "use_bbone_shape": constraint.use_bbone_shape,
-        "head_tail": constraint.head_tail,
-        "target": constraint.target.name if constraint.target else None,
-        "subtarget": constraint.subtarget,
-    }
-result["pose"] = {}
-for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
-    pose_bone = rig.pose.bones[name]
-    result["pose"][name] = {"rotation_mode": pose_bone.rotation_mode,
-                            "rotation_euler": [float(value) for value in pose_bone.rotation_euler],
-                            "matrix_basis": [list(row) for row in pose_bone.matrix_basis]}
+result = {}
+for unit in units:
+    suffix = "" if unit == case else "_" + unit
+    rig = bpy.data.objects["Rig" + suffix]
+    bone = rig.data.bones["Bendy"]
+    settings = {}
+    for key in keys:
+        value = getattr(bone, key)
+        if key in ("bbone_custom_handle_start", "bbone_custom_handle_end"):
+            value = value.name if value else None
+        elif key in ("bbone_handle_use_scale_start", "bbone_handle_use_scale_end", "bbone_scalein", "bbone_scaleout"):
+            value = list(value)
+        settings[key] = value
+    entry = {"settings": settings}
+    if case == "target_shape":
+        constraint = bpy.data.objects["CaseOwner" + suffix].constraints["BboneShapeTarget"]
+        entry["constraint"] = {
+            "use_bbone_shape": constraint.use_bbone_shape,
+            "head_tail": constraint.head_tail,
+            "target": constraint.target.name if constraint.target else None,
+            "subtarget": constraint.subtarget,
+        }
+    entry["pose"] = {}
+    for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
+        pose_bone = rig.pose.bones[name]
+        entry["pose"][name] = {"rotation_mode": pose_bone.rotation_mode,
+                               "rotation_euler": [float(value) for value in pose_bone.rotation_euler],
+                               "matrix_basis": [list(row) for row in pose_bone.matrix_basis]}
+    result[unit] = entry
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(result, handle)
 "#;
@@ -399,7 +413,9 @@ fn assert_positions_move(input: &Value, output: &Value, context: &str) {
     );
 }
 
-fn run_blender(blender: &Path, root: &Path, case: &str, mode: Option<&str>) -> TestResult {
+/// Runs the fixture once. `units` are the rigs to build (one per deformation mode for
+/// `armature_modifier`); an empty list builds the single unit named by `case`.
+fn run_blender(blender: &Path, root: &Path, case: &str, units: &[&str]) -> TestResult {
     let script_path = root.join("make_fixture.py");
     fs::write(&script_path, BLENDER_FIXTURE)?;
     let root = fs::canonicalize(root)?;
@@ -409,14 +425,19 @@ fn run_blender(blender: &Path, root: &Path, case: &str, mode: Option<&str>) -> T
         .arg(script_path)
         .arg("--")
         .arg(root)
-        .arg(case);
-    if let Some(mode) = mode {
-        command.arg(mode);
-    }
+        .arg(case)
+        .args(units);
     assert_success(&run_guarded(command)?, "Blender fixture")
 }
 
-fn run_reopen(blender: &Path, root: &Path, exported: &Path, case: &str) -> TestResult<Value> {
+/// Reopens the exported scene once and returns the reopened document keyed by unit name.
+fn run_reopen(
+    blender: &Path,
+    root: &Path,
+    exported: &Path,
+    case: &str,
+    units: &[&str],
+) -> TestResult<Value> {
     let script_path = root.join("reopen.py");
     let output_path = root.join("reopened.json");
     fs::write(&script_path, BLENDER_REOPEN)?;
@@ -428,7 +449,8 @@ fn run_reopen(blender: &Path, root: &Path, exported: &Path, case: &str) -> TestR
         .arg(script_path)
         .arg("--")
         .arg(&output_path)
-        .arg(case);
+        .arg(case)
+        .args(units);
     assert_success(&run_guarded(command)?, "Blender reopen")?;
     Ok(serde_json::from_slice(&fs::read(output_path)?)?)
 }
@@ -454,8 +476,12 @@ fn pot_json(arguments: &[&str]) -> TestResult<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn assert_imported_bbone_settings(doc: &SceneDoc, mapping_mode: &str) {
-    let rig = doc.nodes.values().find(|node| node.name == "Rig").unwrap();
+fn assert_imported_bbone_settings(doc: &SceneDoc, rig_name: &str, mapping_mode: &str) {
+    let rig = doc
+        .nodes
+        .values()
+        .find(|node| node.name == rig_name)
+        .unwrap();
     let armature = doc.data_blocks[rig.data.as_ref().unwrap()]
         .armature
         .as_ref()
@@ -499,7 +525,7 @@ fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
     };
     let directory = tempdir()?;
     let root = directory.path();
-    run_blender(&blender, root, case, None)?;
+    run_blender(&blender, root, case, &[])?;
 
     let project = root.join("project");
     pot_json(&["init", project.to_str().unwrap()])?;
@@ -526,7 +552,7 @@ fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
         .as_str()
         .unwrap();
     let doc: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
-    assert_imported_bbone_settings(&doc, "CURVED");
+    assert_imported_bbone_settings(&doc, "Rig", "CURVED");
 
     let evaluation = pot_output(&["inspect", project.to_str().unwrap(), "--id", owner_id])?;
     assert!(
@@ -555,7 +581,8 @@ fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
         "--blender",
         blender.to_str().unwrap(),
     ])?;
-    let reopened = run_reopen(&blender, root, &exported, case)?;
+    let reopened_units = run_reopen(&blender, root, &exported, case, &[])?;
+    let reopened = &reopened_units[case];
     assert_json_approximately_equal(
         &reopened["settings"],
         &expected_settings(),
@@ -581,18 +608,15 @@ fn bbone_shape_target_gate_and_blend_round_trip() -> TestResult {
     run_case("target_shape", "constraint.target_bbone_shape")
 }
 
+/// Eight B-Bone deformation modes in one scene. Each mode is one unit: a `Rig_<mode>` armature and a
+/// `CaseOwner_<mode>` mesh, built by the fixture's `armature_modifier` branch and keyed by mode in the
+/// oracle and reopen documents. One fixture launch, one Potter import, one export and one reopen
+/// cover all eight; the per-mode assertions are unchanged. Before, each mode ran its own fixture,
+/// import, export and reopen (32 Blender launches and 8 Potter imports and exports). The eight
+/// Potter inspects stay, since each owner's evaluated geometry is its own assertion.
 #[test]
 fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
-    let _guard = BLENDER_BBONE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(blender) = blender() else {
-        eprintln!("skipping B-Bone integration test: Blender is unavailable");
-        return Ok(());
-    };
-    let directory = tempdir()?;
-
-    for mode in [
+    const MODES: [&str; 8] = [
         "curved_linear",
         "curved_preserve_volume",
         "straight_linear",
@@ -601,43 +625,55 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
         "curved_envelope_multiply",
         "curved_zyx",
         "curved_axis_angle",
-    ] {
-        let root = directory.path().join(mode);
-        fs::create_dir(&root)?;
-        run_blender(&blender, &root, "armature_modifier", Some(mode))?;
-        let oracle: Value = serde_json::from_slice(&fs::read(root.join("blender_geometry.json"))?)?;
+    ];
+    let _guard = BLENDER_BBONE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(blender) = blender() else {
+        eprintln!("skipping B-Bone integration test: Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    run_blender(&blender, root, "armature_modifier", &MODES)?;
+    let oracles: Value = serde_json::from_slice(&fs::read(root.join("blender_geometry.json"))?)?;
 
-        let project = root.join("project");
-        pot_json(&["init", project.to_str().unwrap()])?;
-        let imported = pot_json(&[
-            "import",
-            project.to_str().unwrap(),
-            "--file",
-            root.join("source.blend").to_str().unwrap(),
-            "--format",
-            "blend",
-            "--mode",
-            "replace",
-            "--base-revision",
-            "0",
-            "--blender",
-            blender.to_str().unwrap(),
-        ])?;
-        assert!(
-            imported["result"]["losses"].as_array().unwrap().is_empty(),
-            "{mode}: B-Bone fixture import reported losses: {imported}"
-        );
-        let owner_id = imported["result"]["id_mappings"]["Object:CaseOwner"]
-            .as_str()
-            .unwrap();
-        let doc: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let project = root.join("project");
+    pot_json(&["init", project.to_str().unwrap()])?;
+    let imported = pot_json(&[
+        "import",
+        project.to_str().unwrap(),
+        "--file",
+        root.join("source.blend").to_str().unwrap(),
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    assert!(
+        imported["result"]["losses"].as_array().unwrap().is_empty(),
+        "B-Bone fixture import reported losses: {imported}"
+    );
+    let mappings = &imported["result"]["id_mappings"];
+    let doc: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    for mode in MODES {
         let mapping_mode = if mode == "straight_linear" || mode == "straight_preserve_volume" {
             "STRAIGHT"
         } else {
             "CURVED"
         };
-        assert_imported_bbone_settings(&doc, mapping_mode);
+        assert_imported_bbone_settings(&doc, &format!("Rig_{mode}"), mapping_mode);
+    }
 
+    for mode in MODES {
+        let oracle = &oracles[mode];
+        let owner_id = mappings[&format!("Object:CaseOwner_{mode}")]
+            .as_str()
+            .unwrap();
         let inspected = pot_json(&["inspect", project.to_str().unwrap(), "--id", owner_id])?;
         let owner = inspected["result"]["items"]
             .as_array()
@@ -676,23 +712,25 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
             expected_positions,
             mode,
         );
+    }
 
-        let exported = root.join("roundtrip.blend");
-        pot_json(&[
-            "export",
-            project.to_str().unwrap(),
-            "--format",
-            "blend",
-            "--out",
-            exported.to_str().unwrap(),
-            "--blender",
-            blender.to_str().unwrap(),
-        ])?;
-        let reopened = run_reopen(&blender, &root, &exported, "armature_modifier")?;
-        assert_reopened_pose(&reopened["pose"], &oracle["pose"], mode);
+    let exported = root.join("roundtrip.blend");
+    pot_json(&[
+        "export",
+        project.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--out",
+        exported.to_str().unwrap(),
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let reopened = run_reopen(&blender, root, &exported, "armature_modifier", &MODES)?;
+    for mode in MODES {
+        assert_reopened_pose(&reopened[mode]["pose"], &oracles[mode]["pose"], mode);
         if mode == "curved_linear" {
             assert_json_approximately_equal(
-                &reopened["settings"],
+                &reopened[mode]["settings"],
                 &expected_settings(),
                 "armature modifier: reopened B-Bone RNA",
             );
