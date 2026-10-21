@@ -313,7 +313,18 @@ fn none_and_domain_without_flows_preserve_their_input_meshes() {
     );
 }
 
+/// Effector height for the flow scene: its top (z = 0.75) lies below the flow's bottom face (z = 1.0),
+/// so no particle starts inside it and Potter's collision decides the domain output.
+const EFFECTOR_BELOW_FLOW_Z: f64 = 0.6;
+/// Effector height that overlaps the flow's bottom face (z 0.8 to 1.1). Blender's oracle for this
+/// layout is the known gap: the liquid spawned inside the effector is slowed by Blender and not pushed out.
+const EFFECTOR_OVERLAPPING_FLOW_Z: f64 = 0.95;
+
 fn setup_flow_scene(scene: &Path, with_effector: bool) {
+    setup_flow_scene_at(scene, with_effector.then_some(EFFECTOR_BELOW_FLOW_Z));
+}
+
+fn setup_flow_scene_at(scene: &Path, effector_z: Option<f64>) {
     init(scene);
     let mut operations = vec![
         json!({"op":"node.create","id":"domain","kind":"box","params":{"size":4.0}}),
@@ -325,8 +336,8 @@ fn setup_flow_scene(scene: &Path, with_effector: bool) {
         json!({"op":"physics.fluid.update","target":{"id":"flow"},"set":{"inflow_rate":8.0}}),
         json!({"op":"modifier.create","target":{"id":"none"},"id":"none_fluid","type":"fluid"}),
     ];
-    if with_effector {
-        operations.push(json!({"op":"node.create","id":"effector","kind":"box","params":{"size":0.3},"transform":{"translation":[0.0,0.0,0.95]}}));
+    if let Some(effector_z) = effector_z {
+        operations.push(json!({"op":"node.create","id":"effector","kind":"box","params":{"size":0.3},"transform":{"translation":[0.0,0.0,effector_z]}}));
         operations
             .push(json!({"op":"physics.fluid.create","target":{"id":"effector"},"settings":{}}));
         operations.push(json!({"op":"modifier.update","target":{"id":"effector"},"modifier_id":"physics_fluid","set":{"params":{"fluid_type":"EFFECTOR"}}}));
@@ -371,9 +382,10 @@ fn flow_emits_into_domains_and_effectors_only_affect_domain_output() {
         5,
     );
 
-    // Blender 5.2.2 gives the size-1 FLOW at z=1.5 a 432V/860F domain surface at frame 1;
-    // the size-0.3 effector at z=0.95 changes that oracle to 434V/864F. Potter compares role
-    // behavior and relative native output, not Mantaflow's tessellation.
+    // The effector sits below the flow here, so Potter's own collision acts on the falling liquid.
+    // Blender 5.2.2's overlapping layout (effector at z=0.95) is a known gap, see
+    // `flow_spawning_inside_an_effector_reports_a_known_gap`. Potter compares role behavior and
+    // relative native output, not Mantaflow's tessellation.
     assert_ne!(
         plain_frame["fluid_particles"]["domain"].as_array().unwrap(),
         &Vec::<Value>::new()
@@ -403,6 +415,62 @@ fn flow_emits_into_domains_and_effectors_only_affect_domain_output() {
     let plain_particles = &plain_frame["fluid_particles"]["domain"];
     let blocked_particles = &blocked_frame["fluid_particles"]["domain"];
     assert_ne!(plain_particles, blocked_particles);
+}
+
+/// Blender 5.2.2 keeps liquid spawned inside an effector in the effector's column and slows it there
+/// (measured with this layout: the column's lowest liquid descends about 0.012 per frame inside the
+/// effector against about 0.075 without it, and leaves through the bottom face around frame 8). It
+/// does not push the liquid out. Potter has no grid obstacle rule, so the liquid is not slowed; the
+/// loss is reported on the domain instead of hidden.
+#[test]
+fn flow_spawning_inside_an_effector_reports_a_known_gap() {
+    let directory = tempdir().unwrap();
+    let overlapping = directory.path().join("fluid-overlapping-effector");
+    setup_flow_scene_at(&overlapping, Some(EFFECTOR_OVERLAPPING_FLOW_Z));
+    let output = pot()
+        .arg("inspect")
+        .arg(&overlapping)
+        .arg("--id")
+        .arg("domain")
+        .arg("--frame")
+        .arg("3")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "pot inspect failed");
+    let envelope = response(&output);
+    let warnings = envelope["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|warning| {
+            warning["details"]["feature_id"] == "physics.fluid_domain.emitter_inside_effector"
+                && warning["details"]["node_id"] == "domain"
+        }),
+        "{envelope}"
+    );
+
+    let separate = directory.path().join("fluid-effector-below-flow");
+    setup_flow_scene(&separate, true);
+    let output = pot()
+        .arg("inspect")
+        .arg(&separate)
+        .arg("--id")
+        .arg("domain")
+        .arg("--frame")
+        .arg("3")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "pot inspect failed");
+    let envelope = response(&output);
+    assert!(
+        envelope["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| warning["details"]["feature_id"]
+                != "physics.fluid_domain.emitter_inside_effector"),
+        "{envelope}"
+    );
 }
 
 #[test]

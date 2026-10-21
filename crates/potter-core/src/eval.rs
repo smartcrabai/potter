@@ -934,7 +934,23 @@ impl Snapshot {
         let mut paint_colors = BTreeMap::new();
         let mut paint_weights = BTreeMap::new();
         let simulation_cache_key = simulation.as_ref().map(|result| result.cache_key.clone());
+        let mut simulation_warnings = Vec::new();
         if let Some(simulation) = simulation {
+            simulation_warnings = simulation
+                .fluid_warnings
+                .into_iter()
+                .map(|warning| {
+                    PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        warning.message,
+                        json!({
+                            "feature_id": "physics.fluid_domain.emitter_inside_effector",
+                            "node_id": warning.node_id,
+                            "status": "not_supported",
+                        }),
+                    )
+                })
+                .collect();
             simulated_velocities = simulation.linear_velocities;
             deformed_vertices = simulation.deformed_vertices;
             fluid_surfaces = simulation.fluid_surfaces;
@@ -1871,7 +1887,10 @@ impl Snapshot {
             fluid_particles,
             paint_colors,
             paint_weights,
-            warnings: modifier_warnings,
+            warnings: simulation_warnings
+                .into_iter()
+                .chain(modifier_warnings)
+                .collect(),
         })
     }
 }

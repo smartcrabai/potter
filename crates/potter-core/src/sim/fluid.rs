@@ -26,6 +26,58 @@ pub struct FlowSource {
     pub inflow_rate: f64,
 }
 
+/// Whether a flow emits from a surface triangle whose centre lies inside an effector.
+///
+/// Particles spawn on the flow surface and Potter does not push a particle out of an effector it
+/// starts in, so the caller reports the case as a loss. Blender 5.2.2 keeps that liquid in the
+/// effector's column but slows it: measured headless with a 1-unit INFLOW flow at z = 1.5 and a
+/// 0.3-unit effector at z = 0.95, the column's lowest liquid descends about 0.012 per frame while it is
+/// inside, against about 0.075 without the effector, and it leaves through the bottom face around frame 8.
+/// Potter has no grid obstacle rule to reproduce that, so this is a reported gap (solver parity).
+pub fn emitter_spawns_inside_effector(flows: &[FlowSource], effectors: &[[DVec3; 3]]) -> bool {
+    flows.iter().any(|flow| {
+        flow.triangles.iter().any(|triangle| {
+            let centre = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
+            point_inside_closed_surface(centre, effectors)
+        })
+    })
+}
+
+/// Parity of ray crossings through a closed triangle set; an odd count means inside.
+fn point_inside_closed_surface(point: DVec3, triangles: &[[DVec3; 3]]) -> bool {
+    let direction = DVec3::new(1.0, 0.371_390_676_354_103_7, 0.529_173_248_214_697_2);
+    triangles
+        .iter()
+        .filter(|triangle| ray_crosses_triangle(point, direction, **triangle))
+        .count()
+        % 2
+        == 1
+}
+
+/// Möller-Trumbore test for a ray that starts at `origin` and crosses the triangle ahead of it.
+fn ray_crosses_triangle(origin: DVec3, direction: DVec3, triangle: [DVec3; 3]) -> bool {
+    let [first, second, third] = triangle;
+    let first_edge = second - first;
+    let second_edge = third - first;
+    let p_vector = direction.cross(second_edge);
+    let determinant = first_edge.dot(p_vector);
+    if determinant.abs() < 1.0e-12 {
+        return false;
+    }
+    let inverse = 1.0 / determinant;
+    let offset = origin - first;
+    let barycentric_u = offset.dot(p_vector) * inverse;
+    if !(0.0..=1.0).contains(&barycentric_u) {
+        return false;
+    }
+    let q_vector = offset.cross(first_edge);
+    let barycentric_v = direction.dot(q_vector) * inverse;
+    if barycentric_v < 0.0 || barycentric_u + barycentric_v > 1.0 {
+        return false;
+    }
+    second_edge.dot(q_vector) * inverse > 0.0
+}
+
 struct PreparedFlow<'a> {
     triangles: &'a [[DVec3; 3]],
     weighted_triangles: Vec<(f64, usize)>,

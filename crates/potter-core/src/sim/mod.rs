@@ -91,6 +91,15 @@ fn frame_steps(frame: f64, substeps: usize, feature_id: &str) -> Result<usize> {
     Ok(requested.ceil().max(1.0) as usize)
 }
 
+/// A solver limitation that a fluid domain's output carries (the result is cached, so it is serialized).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FluidWarning {
+    /// Domain object whose output the limitation affects.
+    pub node_id: String,
+    /// Human-readable description of the limitation.
+    pub message: String,
+}
+
 /// Deterministic simulation outputs for one scene and frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulationResult {
@@ -130,11 +139,17 @@ pub struct SimulationResult {
     /// Marks the frame's non-rigid physics payload as fully evaluated in cache.
     #[serde(default)]
     pub physics_cache_key: Option<String>,
+    /// Solver limitations reported for the fluid domains of this frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fluid_warnings: Vec<FluidWarning>,
 }
 
 /// Deterministic simulation outputs for one scene and frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhysicsResult {
+    /// Solver limitations reported for the fluid domains of this frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fluid_warnings: Vec<FluidWarning>,
     /// Deformed local-space mesh vertices by object.
     pub deformed_vertices: BTreeMap<Id, Vec<[f64; 3]>>,
     /// Particle positions, velocities, and birth frames by emitter object.
@@ -414,7 +429,8 @@ pub(crate) fn evaluate_stack_modifier(
                 ));
             }
             if fluid_type == "DOMAIN" {
-                let samples = simulate_fluid_domain(&context, &mesh, matrix, settings)?;
+                // The physics result reports the same emitter; this surface only needs the positions.
+                let (samples, _) = simulate_fluid_domain(&context, &mesh, matrix, settings)?;
                 if !samples.is_empty() {
                     let radius = fluid_particle_radius(settings, &mesh, matrix)?;
                     mesh = fluid_surface(&samples, matrix, radius)?;
@@ -590,6 +606,7 @@ pub(crate) fn evaluate(
     let mut result = result.unwrap_or_else(|| empty_result(key.clone()));
     result.deformed_vertices = physics.deformed_vertices;
     result.fluid_particles = physics.fluid_particles;
+    result.fluid_warnings = physics.fluid_warnings;
     result.fluid_surfaces = physics.fluid_surfaces;
     result.paint_colors = physics.paint_colors;
     result.paint_weights = physics.paint_weights;
@@ -630,6 +647,7 @@ fn empty_result(key: String) -> SimulationResult {
         paint_colors: BTreeMap::new(),
         paint_weights: BTreeMap::new(),
         physics_cache_key: None,
+        fluid_warnings: Vec::new(),
     }
 }
 
@@ -644,6 +662,7 @@ fn evaluate_physics(
     let context = FrameContext::new(doc, scene_id, frame, matrices, members, gate)?;
     let force_fields = force_field_inputs(doc, matrices, members)?;
     let mut result = PhysicsResult {
+        fluid_warnings: Vec::new(),
         deformed_vertices: BTreeMap::new(),
         particles: BTreeMap::new(),
         fluid_particles: BTreeMap::new(),
@@ -744,12 +763,19 @@ fn evaluate_physics(
             }
             if fluid_type == "DOMAIN" {
                 let domain = mesh_for_node(doc, node, id)?;
-                let particles = simulate_fluid_domain(&context, domain, matrix, settings)?;
+                let (particles, spawns_inside_effector) =
+                    simulate_fluid_domain(&context, domain, matrix, settings)?;
                 if particles.iter().any(|position| !position.is_finite()) {
                     return Err(PotError::new(
                         ErrorCode::EvaluationFailed,
                         format!("fluid state for `{id}` is not finite"),
                     ));
+                }
+                if spawns_inside_effector {
+                    result.fluid_warnings.push(FluidWarning {
+                        node_id: id.to_string(),
+                        message: "a flow spawns liquid inside an effector; Potter does not push that liquid out, and Blender slows it instead (solver parity is a known gap)".to_owned(),
+                    });
                 }
                 if !particles.is_empty() {
                     let radius = fluid_particle_radius(settings, domain, matrix)?;
@@ -1622,11 +1648,11 @@ fn simulate_fluid_domain(
     domain: &Mesh,
     matrix: DMat4,
     settings: &Value,
-) -> Result<Vec<DVec3>> {
+) -> Result<(Vec<DVec3>, bool)> {
     validate_fluid_domain(settings)?;
     let flows = fluid_flow_sources(context)?;
     if flows.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     let window = domain_cache_window(settings)?;
     let collection = collection_filter(
@@ -1636,7 +1662,8 @@ fn simulate_fluid_domain(
     )?;
     let obstacles = fluid_effector_triangles(context, collection.as_ref())?;
     let seed = setting_u32(settings, "seed").unwrap_or(context.seed);
-    fluid::simulate_with_sources(
+    let spawns_inside_effector = fluid::emitter_spawns_inside_effector(&flows, &obstacles);
+    let positions = fluid::simulate_with_sources(
         domain,
         settings,
         matrix,
@@ -1646,7 +1673,8 @@ fn simulate_fluid_domain(
         seed,
         &obstacles,
         &flows,
-    )
+    )?;
+    Ok((positions, spawns_inside_effector))
 }
 
 #[derive(Clone, Copy)]

@@ -766,7 +766,16 @@ fn dual_contour_grid_to_mesh(
                             face_edges[crossed_edges[1]],
                         ),
                         4 => {
-                            let pairs = if cube_values[face_corners[0]] < iso_level {
+                            // Saddle face: the pairing keeps corner 0's side apart from the other side
+                            // (OpenVDB's VolumeToMesh resolves the face by its inside). Inside is low for a
+                            // level set and high for a density grid, so a fog's high-density corners are
+                            // separated, as Blender's 5.2.2 mesh does (`rotated_nonuniform` at 0.35: 112 points).
+                            let corner_inside = if inside_is_low {
+                                cube_values[face_corners[0]] < iso_level
+                            } else {
+                                cube_values[face_corners[0]] >= iso_level
+                            };
+                            let pairs = if corner_inside {
                                 [
                                     (face_edges[crossed_edges[0]], face_edges[crossed_edges[3]]),
                                     (face_edges[crossed_edges[1]], face_edges[crossed_edges[2]]),

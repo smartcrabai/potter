@@ -1448,6 +1448,7 @@ fn make_result(bodies: Vec<Body>, key: String) -> Result<SimulationResult> {
         linear_velocities.insert(body.id, velocity);
     }
     Ok(SimulationResult {
+        fluid_warnings: Vec::new(),
         world_matrices,
         linear_velocities,
         cache_key: key,
