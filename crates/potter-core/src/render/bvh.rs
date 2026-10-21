@@ -17,8 +17,24 @@ pub(crate) struct BvhHit {
 pub(crate) struct Bvh {
     nodes: Vec<Node>,
     triangle_indices: Vec<usize>,
+    /// Parallel to `triangle_indices`: leaf tests read this contiguous array and never the source triangles.
+    leaf_triangles: Vec<LeafTriangle>,
     root: Option<usize>,
     triangle_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LeafTriangle {
+    positions: [DVec3; 3],
+    triangle_index: usize,
+    double_sided: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChildEntry {
+    node: usize,
+    span: (f64, f64),
+    near: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,16 +68,34 @@ impl Bvh {
                 ));
             }
         }
-        Self::build_from_positions(triangles.iter().map(|triangle| triangle.positions))
+        Self::build_primitives(
+            triangles
+                .iter()
+                .map(|triangle| (triangle.positions, triangle.double_sided)),
+        )
     }
 
-    /// A BVH over triangles given by their corner positions; primitive `i` is the `i`th item.
+    /// A BVH over triangles given by their corner positions; primitive `i` is the `i`th item. These primitives carry
+    /// no double-sided flag, so they are one-sided.
     pub(crate) fn build_from_positions(
         positions: impl IntoIterator<Item = [DVec3; 3]>,
     ) -> Result<Self> {
-        let primitive_bounds: Vec<Aabb> = positions
+        Self::build_primitives(positions.into_iter().map(|corners| (corners, false)))
+    }
+
+    fn build_primitives(items: impl IntoIterator<Item = ([DVec3; 3], bool)>) -> Result<Self> {
+        let primitives: Vec<LeafTriangle> = items
             .into_iter()
-            .map(|corners| Aabb::for_corners(&corners))
+            .enumerate()
+            .map(|(triangle_index, (positions, double_sided))| LeafTriangle {
+                positions,
+                triangle_index,
+                double_sided,
+            })
+            .collect();
+        let primitive_bounds: Vec<Aabb> = primitives
+            .iter()
+            .map(|primitive| Aabb::for_corners(&primitive.positions))
             .collect();
         let triangle_count = primitive_bounds.len();
         let node_capacity = maximum_node_count(triangle_count)?;
@@ -96,9 +130,29 @@ impl Bvh {
             )?)
         };
 
+        let mut leaf_triangles = Vec::new();
+        leaf_triangles
+            .try_reserve_exact(triangle_count)
+            .map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "BVH triangle count exceeds available memory",
+                )
+            })?;
+        for &index in &triangle_indices {
+            let Some(primitive) = primitives.get(index) else {
+                return Err(PotError::new(
+                    ErrorCode::InternalError,
+                    "BVH triangle index is out of range",
+                ));
+            };
+            leaf_triangles.push(*primitive);
+        }
+
         Ok(Self {
             nodes,
             triangle_indices,
+            leaf_triangles,
             root,
             triangle_count,
         })
@@ -161,7 +215,8 @@ impl Bvh {
         if node
             .bounds
             .padded(origin)
-            .intersect_interval(origin, direction, 0.0, f64::INFINITY)
+            .slab_span(origin, direction)
+            .and_then(|span| clip_span(span, 0.0, f64::INFINITY))
             .is_none()
         {
             return;
@@ -202,10 +257,15 @@ impl Bvh {
         }
 
         let mut nearest = None;
-        if let Some(root) = self.root {
+        if let Some(root) = self.root
+            && let Some(span) = self
+                .nodes
+                .get(root)
+                .and_then(|node| node.bounds.slab_span(origin, direction))
+        {
             self.visit(
                 root,
-                triangles,
+                span,
                 origin,
                 direction,
                 t_min,
@@ -217,6 +277,23 @@ impl Bvh {
         nearest
     }
 
+    fn entry(
+        &self,
+        index: usize,
+        origin: DVec3,
+        direction: DVec3,
+        t_min: f64,
+        max_distance: f64,
+    ) -> Option<ChildEntry> {
+        let span = self.nodes.get(index)?.bounds.slab_span(origin, direction)?;
+        let (near, _) = clip_span(span, t_min, max_distance)?;
+        Some(ChildEntry {
+            node: index,
+            span,
+            near,
+        })
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "BVH traversal carries query bounds and sidedness through recursive nodes"
@@ -224,7 +301,7 @@ impl Bvh {
     fn visit(
         &self,
         node_index: usize,
-        triangles: &[Triangle],
+        span: (f64, f64),
         origin: DVec3,
         direction: DVec3,
         t_min: f64,
@@ -236,11 +313,7 @@ impl Bvh {
             return;
         };
         let current_max = nearest.map_or(t_max, |hit: BvhHit| hit.distance.min(t_max));
-        if node
-            .bounds
-            .intersect_interval(origin, direction, t_min, current_max)
-            .is_none()
-        {
+        if clip_span(span, t_min, current_max).is_none() {
             return;
         }
 
@@ -250,21 +323,12 @@ impl Bvh {
                     return;
                 };
                 for offset in start..end {
-                    let Some(&triangle_index) = self.triangle_indices.get(offset) else {
+                    let Some(leaf) = self.leaf_triangles.get(offset) else {
                         continue;
                     };
-                    let Some(triangle) = triangles.get(triangle_index) else {
-                        continue;
-                    };
-                    let Some(hit) = intersect_triangle(
-                        triangle,
-                        triangle_index,
-                        origin,
-                        direction,
-                        t_min,
-                        current_max,
-                        two_sided,
-                    ) else {
+                    let Some(hit) =
+                        intersect_triangle(leaf, origin, direction, t_min, current_max, two_sided)
+                    else {
                         continue;
                     };
                     if nearest.is_none_or(|previous| {
@@ -277,50 +341,33 @@ impl Bvh {
                 }
             }
             NodeKind::Branch { left, right } => {
-                let max_distance = nearest.map_or(t_max, |hit: BvhHit| hit.distance.min(t_max));
-                let left_interval = self.nodes.get(left).and_then(|child| {
-                    child
-                        .bounds
-                        .intersect_interval(origin, direction, t_min, max_distance)
-                });
-                let right_interval = self.nodes.get(right).and_then(|child| {
-                    child
-                        .bounds
-                        .intersect_interval(origin, direction, t_min, max_distance)
-                });
-
-                match (left_interval, right_interval) {
-                    (Some(left_interval), Some(right_interval)) => {
-                        if left_interval.0 <= right_interval.0 {
-                            self.visit(
-                                left, triangles, origin, direction, t_min, t_max, two_sided,
-                                nearest,
-                            );
-                            self.visit(
-                                right, triangles, origin, direction, t_min, t_max, two_sided,
-                                nearest,
-                            );
+                let left_entry = self.entry(left, origin, direction, t_min, current_max);
+                let right_entry = self.entry(right, origin, direction, t_min, current_max);
+                match (left_entry, right_entry) {
+                    (Some(left_entry), Some(right_entry)) => {
+                        let (first, second) = if left_entry.near <= right_entry.near {
+                            (left_entry, right_entry)
                         } else {
-                            self.visit(
-                                right, triangles, origin, direction, t_min, t_max, two_sided,
-                                nearest,
-                            );
-                            self.visit(
-                                left, triangles, origin, direction, t_min, t_max, two_sided,
-                                nearest,
-                            );
-                        }
-                    }
-                    (Some(_), None) => {
+                            (right_entry, left_entry)
+                        };
                         self.visit(
-                            left, triangles, origin, direction, t_min, t_max, two_sided, nearest,
+                            first.node, first.span, origin, direction, t_min, t_max, two_sided,
+                            nearest,
+                        );
+                        self.visit(
+                            second.node,
+                            second.span,
+                            origin,
+                            direction,
+                            t_min,
+                            t_max,
+                            two_sided,
+                            nearest,
                         );
                     }
-                    (None, Some(_)) => {
-                        self.visit(
-                            right, triangles, origin, direction, t_min, t_max, two_sided, nearest,
-                        );
-                    }
+                    (Some(entry), None) | (None, Some(entry)) => self.visit(
+                        entry.node, entry.span, origin, direction, t_min, t_max, two_sided, nearest,
+                    ),
                     (None, None) => {}
                 }
             }
@@ -451,15 +498,11 @@ impl Aabb {
         axis
     }
 
-    fn intersect_interval(
-        self,
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        t_max: f64,
-    ) -> Option<(f64, f64)> {
-        let mut near = t_min;
-        let mut far = t_max;
+    /// The ray's span through the box's slabs, before clamping to a query interval, so it is the same for every
+    /// query. `None` when the slabs are empty or a ray parallel to an axis starts outside the box.
+    fn slab_span(self, origin: DVec3, direction: DVec3) -> Option<(f64, f64)> {
+        let mut near = f64::NEG_INFINITY;
+        let mut far = f64::INFINITY;
         for axis in 0..3 {
             let ray_origin = origin[axis];
             let ray_direction = direction[axis];
@@ -501,22 +544,32 @@ impl Aabb {
     }
 }
 
+/// Clamps a box's slab span to the query interval `[t_min, t_max]`; `None` when they are disjoint.
+fn clip_span(span: (f64, f64), t_min: f64, t_max: f64) -> Option<(f64, f64)> {
+    let (slab_near, slab_far) = span;
+    let near = t_min.max(slab_near);
+    let far = t_max.min(slab_far);
+    if near > far {
+        return None;
+    }
+    Some((near, far))
+}
+
 fn intersect_triangle(
-    triangle: &Triangle,
-    triangle_index: usize,
+    leaf: &LeafTriangle,
     origin: DVec3,
     direction: DVec3,
     t_min: f64,
     t_max: f64,
     two_sided: bool,
 ) -> Option<BvhHit> {
-    let edge1 = triangle.positions[1] - triangle.positions[0];
-    let edge2 = triangle.positions[2] - triangle.positions[0];
+    let edge1 = leaf.positions[1] - leaf.positions[0];
+    let edge2 = leaf.positions[2] - leaf.positions[0];
     let p_vector = direction.cross(edge2);
     let determinant = edge1.dot(p_vector);
     if !determinant.is_finite()
         || determinant.abs() <= f64::MIN_POSITIVE
-        || (!two_sided && !triangle.double_sided && determinant <= 0.0)
+        || (!two_sided && !leaf.double_sided && determinant <= 0.0)
     {
         return None;
     }
@@ -525,7 +578,7 @@ fn intersect_triangle(
     if !inverse_determinant.is_finite() {
         return None;
     }
-    let from_vertex = origin - triangle.positions[0];
+    let from_vertex = origin - leaf.positions[0];
     let barycentric_1 = from_vertex.dot(p_vector) * inverse_determinant;
     let q_vector = from_vertex.cross(edge1);
     let barycentric_2 = direction.dot(q_vector) * inverse_determinant;
@@ -548,7 +601,7 @@ fn intersect_triangle(
     }
 
     Some(BvhHit {
-        triangle_index,
+        triangle_index: leaf.triangle_index,
         distance,
         barycentric: [
             barycentric_0.clamp(0.0, 1.0),
