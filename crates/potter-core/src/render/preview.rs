@@ -23,7 +23,7 @@ use super::{
         SurfaceShader, ViewBasis, projection_for_camera, rasterize_wireframe, rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
-    wireframe::{self, WireEdge, WirePoint},
+    wireframe::{self, WireEdge},
 };
 
 const MIN_SIZE: u32 = 64;
@@ -224,7 +224,7 @@ pub fn render_previews(
             )?
         } else {
             rasterize_view(
-                &geometry,
+                geometry,
                 &prepared.camera,
                 request.size,
                 request.size,
@@ -675,13 +675,10 @@ fn rasterize_view(
     // Curves and strokes are wire lines in the theme wire colour (black), with no facing; a zero-length
     // stroke is a point-cloud point, drawn at its radius.
     let mut edges: Vec<WireEdge> = geometry.wire_edges.clone();
-    let mut points: Vec<WirePoint> = geometry.wire_points.clone();
+    let mut points: Vec<DVec3> = geometry.wire_points.clone();
     for line in &geometry.lines {
         if line.start == line.end {
-            points.push(WirePoint {
-                position: line.start,
-                radius: Some(line.radius_start),
-            });
+            points.push(line.start);
         } else {
             edges.push(WireEdge {
                 start: line.start,

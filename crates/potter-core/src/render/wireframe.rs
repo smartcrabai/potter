@@ -56,14 +56,6 @@ pub(crate) fn vertex_size() -> f64 {
     (3.0 * std::f64::consts::SQRT_2 / 2.0).max(1.0)
 }
 
-/// A point of the wireframe overlay: a loose vertex or a point-cloud point, each drawn as a `2 · vert` pixel
-/// square. `radius` (world units, `None` for a loose vertex) is recorded but does not change the square.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct WirePoint {
-    pub(crate) position: DVec3,
-    pub(crate) radius: Option<f64>,
-}
-
 /// A mesh edge or a stroke, in world space.
 #[derive(Clone, Debug)]
 pub(crate) struct WireEdge {
@@ -308,7 +300,7 @@ pub(crate) fn composite(
         if records[index].is_none() && neighbours.iter().all(Option::is_none) {
             continue;
         }
-        *pixel = anti_alias(&records[index], &neighbours, background);
+        *pixel = anti_alias(records[index].as_ref(), &neighbours, background);
     }
     // Points are opaque squares written over the lines (no line records, so no anti-aliasing).
     for point in points {
@@ -414,7 +406,7 @@ fn neighbour_records(
 /// each neighbour whose line runs across its offset, blended by depth, then the dense-line fix, then
 /// premultiplied over the background.
 fn anti_alias(
-    centre: &Option<Record>,
+    centre: Option<&Record>,
     neighbours: &[Option<(Record, i32, i32)>; 4],
     background: [f64; 3],
 ) -> [f64; 3] {
@@ -534,10 +526,7 @@ mod tests {
         let edges = builder.finish();
         // Four edges of the first quad, plus three new ones from the second (edge 0-1 is shared).
         assert_eq!(edges.len(), 7);
-        let first = edges[0]
-            .normals
-            .map(|normals| normals[0])
-            .unwrap_or(DVec3::ZERO);
+        let first = edges[0].normals.map_or(DVec3::ZERO, |normals| normals[0]);
         assert!((first - DVec3::Z).length() < 1e-12);
     }
 
@@ -567,7 +556,7 @@ mod tests {
 /// - Background: every pixel farther than 2.5 px from any line or point matches the capture within one
 ///   level (8-bit rounding of the theme value; the overlay's gamma display rounds one level differently
 ///   at a few theme values).
-/// - View transform: the Standard and AgX captures of the same scene are byte-identical, so overlays are
+/// - View transform: the Standard and `AgX` captures of the same scene are byte-identical, so overlays are
 ///   not view-transformed, and Wire output is not either.
 /// - Points: the interior of each loose-vertex square (within 0.25 of its side from the centre) matches
 ///   within one level (`overlay_wireframe_frag.glsl`, POINTS).
@@ -614,8 +603,9 @@ mod oracle_tests {
     const WIDTH: u32 = 818;
     const HEIGHT: u32 = 695;
     /// The object region of the captures. The viewport corners carry UI arrows, which are not compared.
-    const X_RANGE: std::ops::Range<usize> = 120..700;
-    const Y_RANGE: std::ops::Range<usize> = 120..600;
+    const OBJECT_REGION: (std::ops::Range<usize>, std::ops::Range<usize>) = (120..700, 120..600);
+    /// The whole frame, for scenes whose objects sit outside the object region (the point-cloud scene's curve).
+    const FULL_FRAME: (std::ops::Range<usize>, std::ops::Range<usize>) = (0..818, 0..695);
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -727,7 +717,10 @@ mod oracle_tests {
             let clip: [f64; 4] =
                 std::array::from_fn(|r| (0..4).map(|k| product[r][k] * v[k]).sum());
             let (x, y) = (clip[0] / clip[3], clip[1] / clip[3]);
-            [(x + 1.0) * 0.5 * width, (1.0 - y) * 0.5 * height]
+            [
+                f64::midpoint(x, 1.0) * width,
+                f64::midpoint(1.0, -y) * height,
+            ]
         })
     }
 
@@ -788,12 +781,13 @@ mod oracle_tests {
     fn errors_where(
         rgba: &[u8],
         capture: &[[u8; 3]],
+        region: (std::ops::Range<usize>, std::ops::Range<usize>),
         keep: impl Fn(usize, usize) -> bool,
     ) -> Vec<u8> {
         let width = WIDTH as usize;
         let mut out = Vec::new();
-        for y in Y_RANGE {
-            for x in X_RANGE {
+        for y in region.1 {
+            for x in region.0.clone() {
                 if !keep(x, y) {
                     continue;
                 }
@@ -841,10 +835,11 @@ mod oracle_tests {
         let capture = load_capture("oracle_cube_sphere.png")?;
         let output = rasterize_wireframe(&edges, &[], &camera(), WIDTH, HEIGHT)?;
         let distance = line_distance(&segments_of(&edges, &project));
-        let errors = errors_where(&output.rgba, &capture, |x, y| {
+        let errors = errors_where(&output.rgba, &capture, OBJECT_REGION, |x, y| {
             distance[y * WIDTH as usize + x] > 2.5
         });
-        assert!(!errors.is_empty());
+        let count = errors.len();
+        assert_ne!(count, 0);
         assert!(
             errors.iter().all(|&error| error <= 1),
             "background error {:?}",
@@ -864,7 +859,7 @@ mod oracle_tests {
             .filter(|(a, b)| a[0] < 400.0 && b[0] < 400.0)
             .collect();
         let distance = line_distance(&cube_segments);
-        let errors = errors_where(&output.rgba, &capture, |x, y| {
+        let errors = errors_where(&output.rgba, &capture, OBJECT_REGION, |x, y| {
             x < 400 && distance[y * WIDTH as usize + x] <= 0.3
         });
         assert!(
@@ -902,29 +897,26 @@ mod oracle_tests {
             })
             .collect();
         // Four point-cloud points at z = 3.5, with radii 0.05 to 0.2 (drawn as squares of 2 x vert).
-        let points: Vec<WirePoint> = [-1.5, -0.5, 0.5, 1.5]
+        let points: Vec<DVec3> = [-1.5, -0.5, 0.5, 1.5]
             .iter()
-            .zip([0.05, 0.1, 0.15, 0.2])
-            .map(|(&x, radius)| WirePoint {
-                position: DVec3::new(x, 0.0, 3.5),
-                radius: Some(radius),
-            })
+            .map(|&x| DVec3::new(x, 0.0, 3.5))
             .collect();
         let output = rasterize_wireframe(&edges, &points, &camera(), WIDTH, HEIGHT)?;
         let segments = segments_of(&edges, &project);
         let line_d = line_distance(&segments);
-        let centres: Vec<[f64; 2]> = points.iter().map(|point| project(point.position)).collect();
+        let centres: Vec<[f64; 2]> = points.iter().map(|&point| project(point)).collect();
         let point_d = point_distance(&centres);
         let side = 2.0 * vertex_size();
-        let interior = errors_where(&output.rgba, &capture, |x, y| {
+        let interior = errors_where(&output.rgba, &capture, FULL_FRAME, |x, y| {
             point_d[y * WIDTH as usize + x] <= 0.25 * side
         });
-        assert!(!interior.is_empty());
+        let count = interior.len();
+        assert_ne!(count, 0);
         assert!(
             interior.iter().all(|&error| error <= 1),
             "point interiors {interior:?}"
         );
-        let curve = errors_where(&output.rgba, &capture, |x, y| {
+        let curve = errors_where(&output.rgba, &capture, FULL_FRAME, |x, y| {
             line_d[y * WIDTH as usize + x] <= 0.5
         });
         assert!(curve.len() >= 150, "too few curve pixels: {}", curve.len());
@@ -937,10 +929,9 @@ mod oracle_tests {
     }
 
     #[test]
-    fn edge_factor_of_a_manifold_pair_follows_the_cosine_band() -> TestResult {
+    fn edge_factor_of_a_manifold_pair_follows_the_cosine_band() {
         // A flat pair (cos 1) keeps the top of the band; a right angle (cos 0) is 0.
         assert!((edge_factor(&[DVec3::Z, DVec3::Z]) - WD_STEP).abs() < 1e-12);
         assert!(edge_factor(&[DVec3::Z, DVec3::X]).abs() < 1e-12);
-        Ok(())
     }
 }

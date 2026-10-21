@@ -40,7 +40,7 @@ use super::{
         blend_corner_normals, blend_uv,
     },
     studio,
-    wireframe::{WireEdge, WireEdgeBuilder, WirePoint},
+    wireframe::{WireEdge, WireEdgeBuilder},
 };
 
 /// Most color layers one object carries, and one hit can read (Blender's per-mesh limit).
@@ -92,7 +92,7 @@ pub(super) struct Geometry {
     /// Mesh edges for the wireframe preview, each once; empty outside Wire.
     pub wire_edges: Vec<WireEdge>,
     /// Loose vertices of a mesh with no edges or faces, and point-cloud points, for the wireframe preview.
-    pub wire_points: Vec<WirePoint>,
+    pub wire_points: Vec<DVec3>,
     pub materials: Vec<Material>,
     pub prepared: Vec<PreparedMaterial>,
     pub objects: Vec<ObjectRecord>,
@@ -856,10 +856,11 @@ pub(super) fn extract_geometry(
                 }
                 // A mesh with no edges or faces is drawn as its vertices, as Blender's overlay does.
                 if mesh.edges.is_empty() && mesh.faces.is_empty() {
-                    wire_points.extend(mesh.vertices.iter().map(|vertex| WirePoint {
-                        position: matrix.transform_point3(vertex.co),
-                        radius: None,
-                    }));
+                    wire_points.extend(
+                        mesh.vertices
+                            .iter()
+                            .map(|vertex| matrix.transform_point3(vertex.co)),
+                    );
                 }
             }
             wire_edges.extend(wire_builder.finish());

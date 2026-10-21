@@ -3,7 +3,7 @@ use std::f64::consts::TAU;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
-use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, WireSegment};
+use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WireSegment};
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
 use crate::model::{CameraData, CameraProjection};
@@ -980,7 +980,7 @@ pub(crate) fn rasterize_with_lines(
 /// nearest-line and anti-aliasing rules. The background is the theme's interior colour.
 pub(crate) fn rasterize_wireframe(
     edges: &[WireEdge],
-    points: &[WirePoint],
+    points: &[DVec3],
     camera: &Camera,
     width: u32,
     height: u32,
@@ -1072,13 +1072,13 @@ pub(crate) fn rasterize_wireframe(
     }
     let mut squares = Vec::with_capacity(points.len());
     for point in points {
-        if !is_finite_vec3(point.position) {
+        if !is_finite_vec3(*point) {
             return Err(PotError::new(
                 ErrorCode::EvaluationFailed,
                 "wireframe point contains invalid geometry",
             ));
         }
-        let Some(projected) = project_world(camera, &frame, width, height, point.position) else {
+        let Some(projected) = project_world(camera, &frame, width, height, *point) else {
             continue;
         };
         // Every point is a square of `2 · vert` pixels: measured on the Metal capture of point clouds of
