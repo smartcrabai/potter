@@ -485,6 +485,30 @@ pub(crate) fn operand_to_subject(
     Some(dmat4_from_blender(&blender_mul_m4(&inverse, &object)))
 }
 
+/// Blender's Volume to Mesh transform (`MOD_volume_to_mesh.cc`): the carrier's float `world_to_object`
+/// times the volume's float `object_to_world`. OpenVDB copies the carrier's inverse and sets its
+/// bottom row to `(0, 0, 0, 1)` (`imat.setCol(3, ...)`), which only changes a non-affine rounding
+/// residue. The grid's own transform is applied by the extraction. `None` when either object has no
+/// exact replica or the carrier is not invertible; the caller then keeps its `f64` path.
+pub(crate) fn volume_to_carrier_f32(
+    doc: &SceneDoc,
+    carrier_id: &Id,
+    volume_id: &Id,
+    world_matrices: &BTreeMap<Id, DMat4>,
+) -> Option<DMat4> {
+    let carrier = object_to_world(doc, carrier_id, world_matrices, 0)?;
+    let mut carrier_inverse = blender_invert_m4(&carrier)?;
+    for column in carrier_inverse.iter_mut().take(3) {
+        column[3] = 0.0;
+    }
+    carrier_inverse[3][3] = 1.0;
+    let volume = object_to_world(doc, volume_id, world_matrices, 0)?;
+    Some(dmat4_from_blender(&blender_mul_m4(
+        &carrier_inverse,
+        &volume,
+    )))
+}
+
 /// Blender `is_negative_m4`: sign of the upper 3x3 determinant after the f32 matrix boundary.
 pub(crate) fn is_negative_m4(matrix: DMat4) -> bool {
     let matrix = matrix.to_cols_array().map(|value| value as f32);

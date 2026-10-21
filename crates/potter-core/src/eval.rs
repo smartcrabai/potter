@@ -4821,7 +4821,15 @@ pub(crate) fn apply_volume_to_mesh_modifier(
             "volume_to_mesh source transform must be invertible",
         ));
     }
-    let volume_to_mesh = source_inverse * volume_world;
+    // `world_to_object(carrier) * object_to_world(volume)` in float (`MOD_volume_to_mesh.cc`); the exact
+    // replay applies when both objects have one, else the `f64` product is used.
+    let volume_to_mesh = crate::geom::blender_matrix::volume_to_carrier_f32(
+        doc,
+        source_node_id,
+        &volume_id,
+        matrices,
+    )
+    .unwrap_or_else(|| source_inverse * volume_world);
     let grid_name = match modifier.params.get("grid_name") {
         Some(value) => value
             .as_str()
