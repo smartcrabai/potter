@@ -210,11 +210,8 @@ pub(crate) fn evaluate(
             })?;
         let ranks = blender_edge_ranks(&evaluated.faces);
         sort_edges_by_rank(&mut evaluated, &ranks);
-        // Blender's custom-normal setter splits the fans of smooth faces to mark sharp edges, so the
-        // replaced mesh takes its smooth flags from the cache normals before the normals are encoded.
-        if let Some(normals) = &sample.sample.normals {
-            cache_smooth_faces(&mut evaluated, normals);
-        }
+        // Blender's Alembic reader assumes polygons are smooth; flat shading is encoded in the custom
+        // normals, so the replaced mesh keeps the default smooth faces and the setter marks the sharp edges.
         apply_cache_attributes(
             &mut evaluated,
             sample.sample,
@@ -666,43 +663,6 @@ fn layer_limit_warning(modifier: &Modifier, layer: &str) -> PotError {
             "limit":uv_layers::MAX_LAYERS,
         }),
     )
-}
-
-/// Blender's custom-normal setter marks a face flat when every corner normal is its face normal, so a
-/// face is smooth unless all its corners match it within float32 noise.
-fn cache_smooth_faces(mesh: &mut Mesh, normals: &[[f64; 3]]) {
-    let corner_count: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
-    if normals.len() != corner_count {
-        // The corner count is checked where the normals are encoded, which reports the mismatch.
-        return;
-    }
-    let positions = mesh
-        .vertices
-        .iter()
-        .map(|vertex| (vertex.id, vertex.co))
-        .collect::<HashMap<_, _>>();
-    let flat_tolerance = 1.0 - 8.0 * f64::from(f32::EPSILON);
-    let mut offset = 0;
-    let mut smooth = serde_json::Map::new();
-    for face in &mesh.faces {
-        let count = face.vertices.len();
-        let corners = &normals[offset..offset + count];
-        offset += count;
-        let points = face
-            .vertices
-            .iter()
-            .map(|id| positions.get(id).copied().unwrap_or(DVec3::ZERO))
-            .collect::<Vec<_>>();
-        let face_normal = super::normals::face_normal(&points);
-        let flat = corners
-            .iter()
-            .all(|normal| DVec3::from_array(*normal).dot(face_normal) >= flat_tolerance);
-        smooth.insert(format!("f{}", face.id), json!(!flat));
-    }
-    mesh.attributes.insert(
-        "shade_smooth".to_owned(),
-        json!({"domain":"face","type":"bool","values":smooth}),
-    );
 }
 
 fn validate_cache_output(mesh: &Mesh, modifier: &Modifier) -> Result<()> {
