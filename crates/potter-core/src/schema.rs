@@ -278,6 +278,7 @@ fn complete_scene_schema(root: &mut Value) {
     scene["properties"]["color_management"] = json!({"$ref":"#/$defs/color_management"});
     scene["properties"]["sequencer"] = json!({"$ref":"#/$defs/sequencer"});
     let render = &mut defs["render_settings"];
+    render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
     render["required"] = json!([
         "resolution_x",
         "resolution_y",
@@ -309,6 +310,10 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["offscreen_dicing_scale"] =
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
+    defs["light"]["properties"]["sun_angle"] =
+        json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
+    defs["light"]["properties"]["use_custom_distance"] = json!({"type":"boolean"});
+    defs["light"]["properties"]["cutoff_distance"] = json!({"type":"number","minimum":0});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);

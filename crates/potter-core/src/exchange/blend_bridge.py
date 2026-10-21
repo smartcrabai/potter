@@ -2159,6 +2159,12 @@ def _render_passes(scene):
     return sorted(passes)
 
 
+def _eevee_light_threshold(scene):
+    """`scene.eevee.light_threshold` (the EEVEE light influence cut-off), or Blender's default when the scene has no EEVEE."""
+    eevee = getattr(scene, "eevee", None)
+    return float(eevee.light_threshold) if eevee is not None else 0.01
+
+
 def _cryptomatte_accurate(scene):
     return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
@@ -2392,6 +2398,7 @@ def dump_scene(scene):
                 "dicing_camera": dicing_camera.name_full if dicing_camera else None,
                 "passes": _render_passes(scene),
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
+                "eevee_light_threshold": _eevee_light_threshold(scene),
             },
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
             "compositor": _scene_compositor(scene),
@@ -2597,6 +2604,9 @@ def dump_all():
                         "size": float(getattr(x, "size", 0.25)),
                         "size_y": float(getattr(x, "size_y", 0.25)),
                         "spread": float(getattr(x, "spread", math.pi)),
+                        "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
+                        "use_custom_distance": bool(getattr(x, "use_custom_distance", False)),
+                        "cutoff_distance": float(getattr(x, "cutoff_distance", 40.0)),
                         "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.lights],
             "actions": [action_dump(x) for x in bpy.data.actions],
             "texts": [{"name": x.name_full, "potter_id": x.get("potter.id"),
@@ -7036,6 +7046,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.cycles.seed = int(render.get("seed", 0))
         elif hasattr(scene, "eevee"):
             scene.eevee.taa_render_samples = int(render.get("samples", 64))
+        if hasattr(scene, "eevee"):
+            scene.eevee.light_threshold = float(render.get("eevee_light_threshold", 0.01))
         unit = item.get("unit", {})
         try:
             scene.unit_settings.system = unit.get("system", "metric").upper()
@@ -7313,6 +7325,10 @@ def export_doc(doc, target, pack, scene_hash, context):
                 light.spot_blend = raw.get("spot_blend", 0.15)
             light.cycles.use_multiple_importance_sampling = bool(
                 raw.get("use_multiple_importance_sampling", True))
+            if raw.get("light_type") == "sun":
+                light.angle = float(raw.get("sun_angle", math.radians(0.526)))
+            light.use_custom_distance = bool(raw.get("use_custom_distance", False))
+            light.cutoff_distance = float(raw.get("cutoff_distance", 40.0))
             set_id(light, data_id)
             set_props(light, source.get("custom_properties", {}))
             if source.get("fake_user"):

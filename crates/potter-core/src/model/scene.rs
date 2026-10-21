@@ -1191,6 +1191,13 @@ pub struct RenderSettings {
     /// `rna_scene.cc`). It changes how the cryptomatte pass is generated and is not a pass itself.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cryptomatte_accurate: bool,
+    /// Blender's `eevee.light_threshold` (`DNA_scene_types.h`): the power at which an EEVEE local light's influence ends,
+    /// where `light_influence` reads `eevee_light.cc` `attenuation_radius_get`. Omitted at Blender's default of 0.01.
+    #[serde(
+        default = "default_light_threshold",
+        skip_serializing_if = "is_default_light_threshold"
+    )]
+    pub eevee_light_threshold: f64,
     #[serde(default)]
     pub motion_blur: bool,
     #[serde(default = "default_shutter")]
@@ -1240,6 +1247,7 @@ impl Default for RenderSettings {
             audio_codec: "wav".to_owned(),
             passes: vec!["combined".to_owned()],
             cryptomatte_accurate: false,
+            eevee_light_threshold: default_light_threshold(),
             motion_blur: false,
             shutter: default_shutter(),
             motion_blur_samples: default_motion_blur_samples(),
@@ -1473,6 +1481,24 @@ pub struct LightData {
     /// hit is weighted against light sampling. When `false`, the light is only light-sampled.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub use_multiple_importance_sampling: bool,
+    /// Blender's sun `angle` (`light.sun_angle`, `rna_light.cc`): the sun's angular diameter, in radians. EEVEE draws the
+    /// sun's disc from it (`eevee_light.cc`, `shape_radius = tan(angle / 2)`). Omitted at Blender's default.
+    #[serde(
+        default = "default_sun_angle",
+        skip_serializing_if = "is_default_sun_angle"
+    )]
+    pub sun_angle: f64,
+    /// Blender's `use_custom_distance` (`LA_CUSTOM_ATTENUATION`): the light's influence ends at `cutoff_distance` instead of
+    /// where its power falls to the scene's light threshold (`eevee_light.cc`, `attenuation_radius_get`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_custom_distance: bool,
+    /// Blender's `cutoff_distance` (`att_dist`), the influence radius of a light with `use_custom_distance`. Omitted at
+    /// Blender's default of 40 m.
+    #[serde(
+        default = "default_cutoff_distance",
+        skip_serializing_if = "is_default_cutoff_distance"
+    )]
+    pub cutoff_distance: f64,
 }
 
 impl Default for LightData {
@@ -1490,12 +1516,42 @@ impl Default for LightData {
             area_size_y: 0.25,
             spread: std::f64::consts::PI,
             use_multiple_importance_sampling: true,
+            sun_angle: default_sun_angle(),
+            use_custom_distance: false,
+            cutoff_distance: default_cutoff_distance(),
         }
     }
 }
 
 fn white_rgb() -> [f64; 3] {
     [1.0, 1.0, 1.0]
+}
+
+/// Blender's sun angle default, `DNA_light_types.h`: `DEG2RADF(0.526f)`.
+fn default_sun_angle() -> f64 {
+    0.526_f64.to_radians()
+}
+
+fn is_default_sun_angle(value: &f64) -> bool {
+    (value - default_sun_angle()).abs() < 1.0e-6
+}
+
+/// Blender's light cutoff distance default, `DNA_light_types.h`: 40 m.
+fn default_cutoff_distance() -> f64 {
+    40.0
+}
+
+fn is_default_cutoff_distance(value: &f64) -> bool {
+    (value - default_cutoff_distance()).abs() < 1.0e-9
+}
+
+/// Blender's `eevee.light_threshold` default, `DNA_scene_types.h`: 0.01.
+fn default_light_threshold() -> f64 {
+    0.01
+}
+
+fn is_default_light_threshold(value: &f64) -> bool {
+    (value - default_light_threshold()).abs() < 1.0e-6
 }
 fn default_volume_color() -> [f64; 3] {
     [0.5; 3]

@@ -32,12 +32,13 @@ use super::{
     },
     light_model::{
         AreaShape, area_irradiance_per_radiance, area_radiance, area_shape,
-        area_visibility_samples, emitter_radiance, point_intensity, spot_attenuation,
+        area_visibility_samples, emitter_radiance, local_light_influence, point_intensity,
+        spot_cone, sun_disc_radius,
     },
     path::{hit_params, object_for_index},
     principled_bsdf::{
         Layers, coat_coefficient, diffuse_coefficient, layers as principled_layers,
-        sheen_coefficient, specular_coefficient,
+        make_orthonormals, sheen_coefficient, specular_coefficient,
     },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
@@ -2248,6 +2249,8 @@ fn shade(
         view,
     };
     let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
+    // EEVEE's `eevee.light_threshold` sets each local light's influence radius; Blender's default is 0.01.
+    let light_threshold = scene.map_or(0.01, |scene| scene.render.eevee_light_threshold);
     if let Some(world) = scene
         .and_then(|value| value.world.as_ref())
         .and_then(|id| doc.worlds.get(id))
@@ -2292,6 +2295,7 @@ fn shade(
         };
         let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
         let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+        let influence = light_influence_at(light, matrix, point, light_threshold);
         result += light_contribution(
             light,
             matrix,
@@ -2303,7 +2307,7 @@ fn shade(
             &shading,
             shadow,
             point_shadow,
-        );
+        ) * influence;
         if let Some(glass) = &glass {
             result += glass_direct_contribution(
                 light,
@@ -2313,7 +2317,7 @@ fn shade(
                 thickness,
                 shadow,
                 point_shadow,
-            );
+            ) * influence;
         }
     }
     // In Beauty, reflectance weights every reflective closure (ambient, direct, environment).
@@ -2429,6 +2433,7 @@ fn light_contribution(
                     geometric,
                     toward_light,
                     f64::INFINITY,
+                    sun_disc_radius(light.sun_angle),
                 )
         }
         crate::model::LightType::Point => {
@@ -2448,15 +2453,14 @@ fn light_contribution(
                 geometric,
                 toward_light,
                 distance_squared.sqrt(),
+                0.0,
             )
         }
         crate::model::LightType::Spot => {
             let delta = position - point;
             let distance_squared = delta.length_squared().max(1.0e-6);
             let toward_light = delta.normalize_or_zero();
-            let direction = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();
-            let cosine = direction.dot(-toward_light).clamp(-1.0, 1.0);
-            let falloff = spot_attenuation(cosine, light.spot_size, light.spot_blend);
+            let falloff = spot_cone(&matrix, toward_light, light.spot_size, light.spot_blend);
             if falloff <= 0.0 {
                 return DVec3::ZERO;
             }
@@ -2473,6 +2477,7 @@ fn light_contribution(
                 geometric,
                 toward_light,
                 distance_squared.sqrt(),
+                0.0,
             )
         }
         crate::model::LightType::Area => {
@@ -2565,6 +2570,7 @@ fn area_visible_fraction(
             geometric,
             sample.direction,
             sample.distance,
+            0.0,
         );
         visible_weight += sample.weight * visibility;
     }
@@ -2574,6 +2580,8 @@ fn area_visible_fraction(
     visible_weight / total_weight
 }
 
+/// The visibility of a light from `point`: its depth map for a point or spot light, else the scene's rays. `sun_radius` is a
+/// sun's disc radius (`sun_disc_radius`) and is read only at an infinite distance, where the light is a sun.
 fn visibility_for_light(
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
@@ -2581,9 +2589,10 @@ fn visibility_for_light(
     normal: DVec3,
     direction: DVec3,
     distance: f64,
+    sun_radius: f64,
 ) -> f64 {
     let Some(shadow_map) = point_shadow else {
-        return shadow_visibility(shadow, point, normal, direction, distance);
+        return shadow_visibility(shadow, point, normal, direction, distance, sun_radius);
     };
     let opaque = shadow_map.visibility(point);
     match shadow {
@@ -2625,6 +2634,7 @@ fn shadow_visibility(
     normal: DVec3,
     direction: DVec3,
     distance: f64,
+    sun_radius: f64,
 ) -> f64 {
     const PCF_OFFSETS: [[f64; 2]; 9] = [
         [-1.0, -1.0],
@@ -2644,24 +2654,19 @@ fn shadow_visibility(
     if direction == DVec3::ZERO {
         return 0.0;
     }
-    let epsilon = SHADOW_EPSILON;
     let normal = normal.normalize_or_zero();
+    if !distance.is_finite() {
+        return sun_disc_visibility(shadow, point, normal, direction, sun_radius);
+    }
+    let epsilon = SHADOW_EPSILON;
     let tangent = if normal.z.abs() < 0.999 {
         normal.cross(DVec3::Z).normalize_or_zero()
     } else {
         normal.cross(DVec3::Y).normalize_or_zero()
     };
     let bitangent = normal.cross(tangent).normalize_or_zero();
-    let angular_radius = if distance.is_finite() {
-        (0.02 / distance.max(0.02)).min(0.02)
-    } else {
-        0.003
-    };
-    let maximum_distance = if distance.is_finite() {
-        (distance - epsilon).max(0.0)
-    } else {
-        f64::INFINITY
-    };
+    let angular_radius = (0.02 / distance.max(0.02)).min(0.02);
+    let maximum_distance = (distance - epsilon).max(0.0);
     if maximum_distance <= epsilon {
         return 1.0;
     }
@@ -2677,6 +2682,37 @@ fn shadow_visibility(
     visible / 9.0
 }
 
+/// The directions of a sun's disc: `SUN_DISC_SAMPLES` unit vectors uniform over the disc of tangent radius `radius` about
+/// `direction`, in a Vogel spiral.
+fn sun_disc_directions(direction: DVec3, radius: f64) -> impl Iterator<Item = DVec3> {
+    let (tangent, bitangent) = make_orthonormals(direction);
+    let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+    (0..SUN_DISC_SAMPLES).map(move |index| {
+        let offset = ((index as f64 + 0.5) / SUN_DISC_SAMPLES as f64).sqrt() * radius;
+        let angle = index as f64 * golden_angle;
+        (direction + tangent * (offset * angle.cos()) + bitangent * (offset * angle.sin()))
+            .normalize_or_zero()
+    })
+}
+
+/// A sun's visibility at a receiver: the mean over rays from the receiver to the sun's disc, each blocked by an opaque
+/// occluder (`ray_transmittance`).
+fn sun_disc_visibility(
+    shadow: ShadowScene<'_>,
+    point: DVec3,
+    normal: DVec3,
+    direction: DVec3,
+    radius: f64,
+) -> f64 {
+    let total: f64 = sun_disc_directions(direction, radius)
+        .map(|sample| {
+            let origin = shadow_origin(point, normal, sample);
+            ray_transmittance(shadow, origin, sample, f64::INFINITY, true)
+        })
+        .sum();
+    total / SUN_DISC_SAMPLES as f64
+}
+
 /// The receiver of direct light at a shading point: the point and its shadow origin, its shading and geometric normals,
 /// and the view the lobes are evaluated along.
 #[derive(Clone, Copy)]
@@ -2688,13 +2724,11 @@ struct Receiver {
     view: DVec3,
 }
 
-/// EEVEE's `eevee.light_threshold` default: the power at which a local light's influence radius ends.
-const LIGHT_THRESHOLD: f64 = 0.01;
 /// The smallest radius of a light's shape (`shape_parameters_set`: `max(0.001, radius)`).
 const MIN_SHAPE_RADIUS: f64 = 0.001;
-/// A sun's shape radius, the tangent of its half angle. The model carries no angle, so EEVEE's minimum stands in and
-/// the sun is a delta light.
-const SUN_SHAPE_RADIUS: f64 = 0.001;
+/// The samples of a sun's disc: a Vogel spiral that integrates the disc's shadow as EEVEE's soft shadow cone does
+/// (`shadow_ray_generate_directional`). Sixteen match EEVEE's penumbra to within its noise, where nine taps do not.
+const SUN_DISC_SAMPLES: usize = 16;
 
 /// A light as EEVEE's light pass sees it from one point: its emitter, the direction and distance to its centre, the
 /// radiance of its colour and power, and the attenuation the lobes share (`light_attenuation_surface`: the influence
@@ -2719,22 +2753,29 @@ struct DirectEmitter {
     /// The area light's shape, or `None` for a point, spot or sun light.
     area: Option<AreaShape>,
     sun: bool,
+    /// A sun's disc radius in tangent units (`sun_disc_radius`), zero for the other lights.
+    sun_radius: f64,
 }
 
-/// EEVEE's `light_influence_attenuation` for a local light: the fade to zero at the distance where its power falls to
-/// `LIGHT_THRESHOLD` (`eevee_light.cc` `shape_parameters_set`, with the surface's diffuse and specular factors at one).
-fn light_influence(light: &crate::model::LightData, distance_squared: f64) -> f64 {
-    let max_power =
-        DVec3::from_array(light.color).max_element().max(0.0) * (light.energy.abs() / 100.0);
-    let radius_squared = max_power / LIGHT_THRESHOLD;
-    if radius_squared <= 0.0 {
-        return 0.0;
+/// EEVEE's influence of a light at `point` (`light_attenuation_surface`), applied to every closure of the light. A sun
+/// has none; a local light fades to zero at its influence radius (`local_light_influence`).
+fn light_influence_at(
+    light: &crate::model::LightData,
+    matrix: DMat4,
+    point: DVec3,
+    threshold: f64,
+) -> f64 {
+    if matches!(light.light_type, crate::model::LightType::Sun) {
+        return 1.0;
     }
-    let factor = (1.0 - (distance_squared / radius_squared).powi(2)).clamp(0.0, 1.0);
-    factor * factor
+    let distance_squared = (matrix.transform_point3(DVec3::ZERO) - point)
+        .length_squared()
+        .max(1.0e-6);
+    local_light_influence(light, distance_squared, threshold)
 }
 
-/// A light as EEVEE's light pass sees it from `point`, or `None` for an area light with no area.
+/// A light as EEVEE's light pass sees it from `point`, or `None` for an area light with no area. The lobes' shared
+/// attenuation is the cone of a spot and the emitting side of an area light; the influence is `light_influence_at`'s.
 fn direct_emitter(
     light: &crate::model::LightData,
     matrix: DMat4,
@@ -2746,12 +2787,11 @@ fn direct_emitter(
     let axis = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
     match light.light_type {
         crate::model::LightType::Sun => {
+            let radius = sun_disc_radius(light.sun_angle);
             // `shape_radiance_get` for a sun: `(1 + 1 / r²) / π` per unit of irradiance.
-            let inv_sin_squared = 1.0 + 1.0 / (SUN_SHAPE_RADIUS * SUN_SHAPE_RADIUS);
+            let inv_sin_squared = 1.0 + 1.0 / (radius * radius);
             Some(DirectEmitter {
-                emitter: Emitter::Disk {
-                    radius: SUN_SHAPE_RADIUS,
-                },
+                emitter: Emitter::Disk { radius },
                 direction: axis,
                 to_centre: axis,
                 distance: 1.0,
@@ -2762,6 +2802,7 @@ fn direct_emitter(
                 axis,
                 area: None,
                 sun: true,
+                sun_radius: radius,
             })
         }
         crate::model::LightType::Point | crate::model::LightType::Spot => {
@@ -2775,15 +2816,11 @@ fn direct_emitter(
             } else {
                 Emitter::Sphere { radius }
             };
-            let mut attenuation = light_influence(light, distance_squared);
-            if matches!(light.light_type, crate::model::LightType::Spot) {
-                let spot_axis = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();
-                attenuation *= spot_attenuation(
-                    spot_axis.dot(-direction).clamp(-1.0, 1.0),
-                    light.spot_size,
-                    light.spot_blend,
-                );
-            }
+            let attenuation = if matches!(light.light_type, crate::model::LightType::Spot) {
+                spot_cone(&matrix, direction, light.spot_size, light.spot_blend)
+            } else {
+                1.0
+            };
             Some(DirectEmitter {
                 emitter,
                 direction,
@@ -2796,6 +2833,7 @@ fn direct_emitter(
                 axis,
                 area: None,
                 sun: false,
+                sun_radius: 0.0,
             })
         }
         crate::model::LightType::Area => {
@@ -2822,11 +2860,12 @@ fn direct_emitter(
                 distance,
                 shadow_distance: distance,
                 radiance: color * area_radiance(energy, shape.area),
-                attenuation: emitting_side * light_influence(light, distance_squared),
+                attenuation: emitting_side,
                 centre: position,
                 axis,
                 area: Some(shape),
                 sun: false,
+                sun_radius: 0.0,
             })
         }
     }
@@ -2905,11 +2944,14 @@ fn transmittance_toward(
     ray_transmittance(shadow, origin, direction, maximum, true)
 }
 
-/// The visibility of a punctual light for a transmission: one ray from the amended origin to the light's centre, or
-/// along a sun's direction.
+/// The visibility of a light for a transmission: one ray from the amended origin to a point light's centre, or the mean
+/// over a sun's disc.
 fn transmitted_visibility(shadow: ShadowContext<'_>, origin: DVec3, direct: &DirectEmitter) -> f64 {
     if direct.sun {
-        return transmittance_toward(shadow, origin, direct.direction, f64::INFINITY);
+        let total: f64 = sun_disc_directions(direct.direction, direct.sun_radius)
+            .map(|sample| transmittance_toward(shadow, origin, sample, f64::INFINITY))
+            .sum();
+        return total / SUN_DISC_SAMPLES as f64;
     }
     let to_centre = direct.centre - origin;
     transmittance_toward(shadow, origin, to_centre, to_centre.length())
@@ -2985,6 +3027,7 @@ fn glass_direct_contribution(
                 receiver.geometric,
                 direct.direction,
                 direct.shadow_distance,
+                direct.sun_radius,
             ),
         };
         let form = direct.emitter.form_factor(

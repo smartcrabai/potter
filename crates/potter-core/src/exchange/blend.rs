@@ -3010,6 +3010,7 @@ fn build_imported_graph(
                 .get("cryptomatte_accurate")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            eevee_light_threshold: number_field(&render, "eevee_light_threshold", 0.01),
             motion_blur: render
                 .get("motion_blur")
                 .and_then(Value::as_bool)
@@ -3306,6 +3307,12 @@ fn build_imported_graph(
                             spread
                         }
                     },
+                    sun_angle: number_field(item, "sun_angle", 0.526_f64.to_radians()),
+                    use_custom_distance: item
+                        .get("use_custom_distance")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    cutoff_distance: number_field(item, "cutoff_distance", 40.0),
                 }),
                 grease_pencil: None,
                 ..DataBlock::default()
