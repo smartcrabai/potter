@@ -1118,7 +1118,13 @@ pub(crate) const SINGULAR_MIS_WEIGHT: f64 = 1.0e6;
 pub(crate) enum GlassSample {
     /// A delta reflection or refraction. `weight` is the Fresnel share over the branch probability (`branch`,
     /// the glass probability in the lobe mixture), times the energy gain, the reflectance and the layers.
-    Singular { direction: DVec3, weight: DVec3 },
+    /// `mis_weight` is Cycles' singular pdf for the widening average, `SINGULAR_MIS_WEIGHT · branch · share`
+    /// (`bsdf_microfacet_sample`: `*pdf *= 1e6f` when `m_singular`, with the Fresnel share as the pick probability).
+    Singular {
+        direction: DVec3,
+        weight: DVec3,
+        mis_weight: f64,
+    },
     /// A rough draw, which the caller weights by the lobe mixture's density.
     Rough { direction: DVec3 },
     /// A draw on the wrong side of the normal or the geometric normal: Cycles' `LABEL_NONE`.
@@ -1176,6 +1182,7 @@ pub(crate) fn sample_glass(
     GlassSample::Singular {
         direction,
         weight: value * lobe.gain * scale / (branch * share),
+        mis_weight: SINGULAR_MIS_WEIGHT * branch * share,
     }
 }
 

@@ -12,17 +12,17 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, SceneDoc, VolumeSampling},
     shader::{
-        BsdfParams, EvaluatedSubsurfaceMethod, EvaluatorWorkspace, HitContext, HitFootprint,
-        HitUvLayers, PreparedMaterial, ShaderClosure, SubsurfaceMethod, SurfaceShading,
-        equirectangular_uv, evaluate_displacement_with_workspace, evaluate_surface_with_workspace,
-        heaviest, height_gradient, make_orthonormals,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitFootprint, HitUvLayers, PreparedMaterial,
+        ShaderClosure, SubsurfaceMethod, SurfaceShading, equirectangular_uv,
+        evaluate_displacement_with_workspace, evaluate_surface_with_workspace, heaviest,
+        height_gradient, make_orthonormals,
     },
 };
 
 use super::principled_bsdf::{
-    GlassSample, Layers, SINGULAR_MIS_WEIGHT, base_color, continuous_density, continuous_lobes,
-    diffuse_coefficient, evaluate as evaluate_bsdf, layers_at, lobe_probabilities, sample_glass,
-    sheen_coefficient, specular_eta, subsurface_closure_weight,
+    GlassSample, Layers, base_color, continuous_density, continuous_lobes, diffuse_coefficient,
+    evaluate as evaluate_bsdf, layers_at, lobe_probabilities, sample_glass, sheen_coefficient,
+    specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -434,9 +434,16 @@ impl Closures {
         let closure = &self.items[index];
         match sample_lobes(&closure.params, &closure.layers, geometric, rng) {
             LobeDraw::Absorbed => Reflection::Absorbed,
-            LobeDraw::Delta { direction, weight } => Reflection::Delta {
+            LobeDraw::Delta {
+                direction,
+                weight,
+                pdf,
+                mis_weight,
+            } => Reflection::Delta {
                 direction,
                 weight: weight * self.selection_total,
+                pdf,
+                mis_weight,
             },
             LobeDraw::Subsurface { weight, method } => Reflection::Subsurface {
                 weight: weight * self.selection_total,
@@ -675,6 +682,10 @@ enum Reflection {
     Delta {
         direction: DVec3,
         weight: DVec3,
+        /// The lobe mixture's pdf of the draw (`min_ray_pdf`).
+        pdf: f64,
+        /// Cycles' singular pdf for the widening average, `1e6 · branch · share`.
+        mis_weight: f64,
     },
     Subsurface {
         weight: DVec3,
@@ -2197,11 +2208,11 @@ fn trace_path(
                 if bounce >= max_bounces {
                     break;
                 }
-                // Cycles' singular pdf is `1e6` (`bsdf_microfacet_sample`), which dominates the widening average.
-                let singular_weight = if matches!(draw, Reflection::Delta { .. }) {
-                    SINGULAR_MIS_WEIGHT
-                } else {
-                    0.0
+                // Cycles' singular pdf for the widening average, `1e6 · branch · share`, carried from the draw; a
+                // continuous draw has none.
+                let singular_weight = match draw {
+                    Reflection::Delta { mis_weight, .. } => mis_weight,
+                    _ => 0.0,
                 };
                 let (next_direction, weight) = match draw {
                     Reflection::Continuous {
@@ -2219,7 +2230,13 @@ fn trace_path(
                         });
                         (direction, weight)
                     }
-                    Reflection::Delta { direction, weight } => {
+                    Reflection::Delta {
+                        direction,
+                        weight,
+                        pdf,
+                        ..
+                    } => {
+                        min_ray_pdf = min_ray_pdf.min(pdf);
                         previous = Scatter::Delta(surface.point);
                         (direction, weight)
                     }
@@ -3740,7 +3757,16 @@ fn sample_lobes(
         let rands = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
         return match sample_glass(params, layers, geometric, probabilities.transmission, rands) {
             GlassSample::Absorbed => LobeDraw::Absorbed,
-            GlassSample::Singular { direction, weight } => LobeDraw::Delta { direction, weight },
+            GlassSample::Singular {
+                direction,
+                weight,
+                mis_weight,
+            } => LobeDraw::Delta {
+                direction,
+                weight,
+                pdf: mis_weight + continuous_density(params, layers, direction),
+                mis_weight,
+            },
             GlassSample::Rough { direction } => LobeDraw::Continuous {
                 direction,
                 diffuse: false,
