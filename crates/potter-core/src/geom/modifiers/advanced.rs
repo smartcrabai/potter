@@ -17,9 +17,9 @@ use crate::model::{Id, Modifier};
 
 use super::displacement::{VertexGroup, vertex_group};
 use super::{
-    MergedGeometry, Polygon, bool_param, build_mesh, closest_point_triangle, cyclic_pairs,
-    edge_pairs, id_indices, invalid_parameter, loose_edges, number_param, polygons, positions,
-    schema_value, string_param, uint_param, usize_as_f64, validated, vec3_param,
+    MergedGeometry, Polygon, bool_param, build_mesh, cyclic_pairs, edge_pairs, id_indices,
+    invalid_parameter, loose_edges, number_param, polygons, positions, schema_value, string_param,
+    uint_param, usize_as_f64, validated, vec3_param,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -787,6 +787,8 @@ pub(super) fn screw(
             serde_json::json!({"domain": "face", "type": "bool", "values": values}),
         );
     }
+    // MOD_screw.cc always calls `lookup_or_add_for_write_span("sharp_face")`, so its output has the attribute.
+    crate::geom::normals::record_sharp_face(&mut result);
     if has_uv_layers {
         // A generated face has no source UV entry, so it starts from zero before its U and V are set.
         let mut layers = uv_layers::read_layers(&result);
@@ -1035,78 +1037,6 @@ fn screw_calculate_normals(
             }
         }
     }
-}
-
-pub(super) fn shrinkwrap(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let target = modifier
-        .runtime
-        .target_mesh
-        .as_ref()
-        .ok_or_else(|| invalid_parameter(modifier, "target", "a mesh object operand"))?;
-    validated(target)?;
-    let method = string_param(modifier, "wrap_method")?.to_ascii_uppercase();
-    let offset = number_param(modifier, "offset")?;
-    let wrap_mode = string_param(modifier, "wrap_mode")?.to_ascii_uppercase();
-    // shrinkwrap.cc BKE_shrinkwrap_init_tree: a target without vertices, or without faces for the
-    // surface and projection methods, builds no tree. Blender then leaves positions unchanged and
-    // reports no error; nearest-vertex lookup needs only vertices.
-    if target.vertices.is_empty() || (method != "NEAREST_VERTEX" && target.faces.is_empty()) {
-        return Ok(mesh.clone());
-    }
-    let mut result = mesh.clone();
-    let triangles = target_triangles(target)?;
-    for vertex in &mut result.vertices {
-        let (point, normal) = match method.as_str() {
-            "NEAREST_VERTEX" => {
-                let nearest = target
-                    .vertices
-                    .iter()
-                    .min_by(|left, right| {
-                        left.co
-                            .distance_squared(vertex.co)
-                            .total_cmp(&right.co.distance_squared(vertex.co))
-                    })
-                    .ok_or_else(|| invalid_parameter(modifier, "target", "a non-empty mesh"))?;
-                let normal =
-                    nearest_surface(&triangles, nearest.co).map_or(DVec3::Z, |(_, normal)| normal);
-                (nearest.co, normal)
-            }
-            "NEAREST_SURFACEPOINT" | "NEAREST_FACE_INTERPOLATED" => {
-                nearest_surface(&triangles, vertex.co).ok_or_else(|| {
-                    invalid_parameter(modifier, "target", "a mesh with at least one face")
-                })?
-            }
-            "PROJECT" => {
-                // not a schema parameter; removed by PR18 PR-E
-                let project_axis = -DVec3::Z;
-                project_surface(&triangles, vertex.co, project_axis, modifier)?
-            }
-            _ => {
-                return Err(invalid_parameter(
-                    modifier,
-                    "wrap_method",
-                    "NEAREST_SURFACEPOINT, NEAREST_VERTEX, NEAREST_FACE_INTERPOLATED, or PROJECT",
-                ));
-            }
-        };
-        let offset_direction = match wrap_mode.as_str() {
-            "ON_SURFACE" | "OUTSIDE_SURFACE" => {
-                (vertex.co - point).try_normalize().unwrap_or(normal)
-            }
-            "INSIDE" => -normal,
-            "OUTSIDE" | "ABOVE_SURFACE" => normal,
-            _ => {
-                return Err(invalid_parameter(
-                    modifier,
-                    "wrap_mode",
-                    "ON_SURFACE, INSIDE, OUTSIDE, OUTSIDE_SURFACE, or ABOVE_SURFACE",
-                ));
-            }
-        };
-        vertex.co = point + offset_direction * offset;
-    }
-    validated(&result)?;
-    Ok(result)
 }
 
 /// Subject-local to referenced-object transform the scene resolved for this modifier; `None` without a reference.
@@ -1597,96 +1527,6 @@ fn find_corner(parent: &mut [usize], mut index: usize) -> usize {
         index = parent[index];
     }
     index
-}
-
-fn target_triangles(mesh: &Mesh) -> Result<Vec<[DVec3; 3]>> {
-    let positions: HashMap<_, _> = mesh
-        .vertices
-        .iter()
-        .map(|vertex| (vertex.id, vertex.co))
-        .collect();
-    mesh.tessellate()
-        .map_err(|error| {
-            PotError::invalid_argument(format!("invalid target triangulation: {error}"))
-        })?
-        .into_iter()
-        .map(|triangle| {
-            Ok([
-                *positions.get(&triangle[0]).ok_or_else(|| {
-                    PotError::invalid_argument("target face references missing vertex")
-                })?,
-                *positions.get(&triangle[1]).ok_or_else(|| {
-                    PotError::invalid_argument("target face references missing vertex")
-                })?,
-                *positions.get(&triangle[2]).ok_or_else(|| {
-                    PotError::invalid_argument("target face references missing vertex")
-                })?,
-            ])
-        })
-        .collect()
-}
-
-fn nearest_surface(triangles: &[[DVec3; 3]], point: DVec3) -> Option<(DVec3, DVec3)> {
-    triangles
-        .iter()
-        .map(|triangle| {
-            let projected = closest_point_triangle(point, triangle[0], triangle[1], triangle[2]);
-            let normal = (triangle[1] - triangle[0])
-                .cross(triangle[2] - triangle[0])
-                .normalize_or_zero();
-            (projected, normal, projected.distance_squared(point))
-        })
-        .min_by(|left, right| left.2.total_cmp(&right.2))
-        .map(|(point, normal, _)| (point, normal))
-}
-
-fn project_surface(
-    triangles: &[[DVec3; 3]],
-    origin: DVec3,
-    direction: DVec3,
-    modifier: &Modifier,
-) -> Result<(DVec3, DVec3)> {
-    let axis = direction
-        .try_normalize()
-        .ok_or_else(|| invalid_parameter(modifier, "project_axis", "a non-zero 3D vector"))?;
-    let hit = triangles
-        .iter()
-        .filter_map(|triangle| {
-            let edge1 = triangle[1] - triangle[0];
-            let edge2 = triangle[2] - triangle[0];
-            let p = axis.cross(edge2);
-            let determinant = edge1.dot(p);
-            if determinant.abs() <= 1.0e-12 {
-                return None;
-            }
-            let inverse = 1.0 / determinant;
-            let t = origin - triangle[0];
-            let u = t.dot(p) * inverse;
-            if !(0.0..=1.0).contains(&u) {
-                return None;
-            }
-            let q = t.cross(edge1);
-            let v = axis.dot(q) * inverse;
-            if v < 0.0 || u + v > 1.0 {
-                return None;
-            }
-            let distance = edge2.dot(q) * inverse;
-            if distance < 0.0 {
-                return None;
-            }
-            let point = origin + axis * distance;
-            let normal = edge1.cross(edge2).normalize_or_zero();
-            Some((point, normal, distance))
-        })
-        .min_by(|left, right| left.2.total_cmp(&right.2));
-    hit.map(|(point, normal, _)| (point, normal))
-        .ok_or_else(|| {
-            invalid_parameter(
-                modifier,
-                "project_axis",
-                "a direction intersecting the target surface",
-            )
-        })
 }
 
 pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -2990,45 +2830,13 @@ impl FalloffCurve {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "geometry modifier unit tests")]
 mod tests {
-    use super::{build, curve, mask, shrinkwrap};
+    use super::{build, curve, mask};
     use crate::geom::{
-        BoxParams, Mesh, UvSphereParams,
+        BoxParams, Mesh,
         clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput},
         origindex_values, set_origindex,
     };
     use serde_json::json;
-
-    #[test]
-    fn shrinkwrap_nearest_surface_projects_vertices_to_sphere_radius() {
-        let source = Mesh::uv_sphere(UvSphereParams {
-            segments: 8,
-            ring_count: 4,
-            radius: 2.0,
-        })
-        .unwrap();
-        // The 32 x 16 unit sphere is the `uv_sphere_default` oracle, whose largest radius error in
-        // Blender's f32 output is 1.2177e-6 (`primitive_uv_oracle.json`); the bound below covers it.
-        let target = Mesh::uv_sphere(UvSphereParams {
-            segments: 32,
-            ring_count: 16,
-            radius: 1.0,
-        })
-        .unwrap();
-        let modifier = modifier_with_target(
-            "shrinkwrap",
-            json!({"wrap_method":"NEAREST_VERTEX"}),
-            target,
-        );
-        let result = shrinkwrap(&source, &modifier).unwrap();
-        // Blender stores UV sphere vertices as f32: its own radius-1 sphere output is off by up to
-        // 1.22e-6 (`tests/fixtures/primitive_uvs/primitive_uv_oracle.json`, `uv_sphere_default`).
-        assert!(
-            result
-                .vertices
-                .iter()
-                .all(|vertex| (vertex.co.length() - 1.0).abs() < 2.0e-6)
-        );
-    }
 
     #[test]
     fn curve_modifier_maps_deform_axis_distance_to_curve_length() {
@@ -3090,35 +2898,6 @@ mod tests {
             Some(codes[..4].to_vec()),
             "the subset retains the source codes for its copied loops"
         );
-    }
-
-    #[test]
-    fn shrinkwrap_offset_moves_each_projected_vertex_by_the_requested_distance() {
-        let source = Mesh::uv_sphere(UvSphereParams {
-            segments: 8,
-            ring_count: 4,
-            radius: 2.0,
-        })
-        .unwrap();
-        let target = Mesh::uv_sphere(UvSphereParams {
-            segments: 16,
-            ring_count: 8,
-            radius: 1.0,
-        })
-        .unwrap();
-        let evaluate_at_offset = |offset| {
-            let modifier = modifier_with_target(
-                "shrinkwrap",
-                json!({"wrap_method":"NEAREST_VERTEX","offset":offset}),
-                target.clone(),
-            );
-            shrinkwrap(&source, &modifier).unwrap()
-        };
-        let projected = evaluate_at_offset(0.0);
-        let offset = evaluate_at_offset(0.25);
-        for (base, shifted) in projected.vertices.iter().zip(&offset.vertices) {
-            assert!((base.co.distance(shifted.co) - 0.25).abs() < 1.0e-12);
-        }
     }
 
     #[test]

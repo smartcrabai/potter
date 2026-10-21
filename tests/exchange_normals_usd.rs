@@ -259,7 +259,7 @@ fn imported_constant_normal_applies_to_every_corner() -> TestResult {
 }
 
 /// Imports a cube whose normals cannot be mapped: the strict import fails, `--allow-lossy`
-/// reports a `mesh.normals` loss, and the normals are dropped to flat shading.
+/// reports a `mesh.normals` loss, and the polygons stay smooth (`io/usd/intern/usd_reader_mesh.cc`).
 fn assert_normals_reported_as_loss(normals: &str) -> TestResult {
     let directory = tempdir()?;
     let source = directory.path().join("cube.usda");
@@ -284,8 +284,16 @@ fn assert_normals_reported_as_loss(normals: &str) -> TestResult {
     let exported = export(&project, "usda", &directory.path().join("out.usda"))?;
     let corners = usd_world_corners(&fs::read_to_string(exported)?)?;
     assert_eq!(corners.len(), 24);
-    for (index, corner) in corners.iter().enumerate() {
-        assert_normal(corner.normal, CUBE_FLAT_NORMALS[index / 4]);
+    for corner in &corners {
+        // Smooth polygons without custom normals take the averaged cube normal, which points from the
+        // centre through the corner (the cube has corners at (+-1, +-1, +-1)).
+        let length = corner
+            .corner
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        assert_normal(corner.normal, corner.corner.map(|value| value / length));
     }
     Ok(())
 }
