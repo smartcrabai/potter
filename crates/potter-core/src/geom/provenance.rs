@@ -22,7 +22,7 @@ use super::clnor::{self, NormalCodeOptions};
 use super::color_layers::{self, ColorDomain, ColorLayer};
 use super::interpolation::interp_weights_poly_v2;
 use super::uv_layers::{self, UvLayer};
-use super::{Mesh, edge_key};
+use super::{Mesh, ORIGINDEX_ATTRIBUTE, ORIGINDEX_NONE, edge_key};
 
 /// Where each element of a rebuilt mesh came from, indexed by output storage order.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -30,6 +30,10 @@ pub(crate) struct Origin {
     /// Per output vertex: input vertex storage indices with weights summing to one.
     /// An empty list marks a new vertex without input data.
     pub vertices: Vec<Vec<(usize, f64)>>,
+    /// Per output vertex: the input storage index whose `blender_origindex` value it takes, or
+    /// `None` for Blender `ORIGINDEX_NONE`. When `Some`, it overrides the weight-one rule of
+    /// [`carrier_source`]; weighted attribute provenance is unaffected.
+    pub source_vertices: Option<Vec<Option<usize>>>,
     /// Per output polygon, in the order passed to `build_mesh`: the input polygon storage index,
     /// or `None` for a generated polygon.
     pub faces: Vec<Option<usize>>,
@@ -41,18 +45,33 @@ pub(crate) struct Origin {
 
 impl Origin {
     /// Origin where each output vertex copies one input vertex, or is new when `None`.
+    /// `source_vertices` is `None`; [`carrier_source`] then uses the weight-one rule.
     pub(crate) fn copies(
         vertices: impl IntoIterator<Item = Option<usize>>,
         faces: Vec<Option<usize>>,
     ) -> Self {
+        let vertices = vertices
+            .into_iter()
+            .map(|source| source.map(|index| vec![(index, 1.0)]).unwrap_or_default())
+            .collect();
         Self {
-            vertices: vertices
-                .into_iter()
-                .map(|source| source.map(|index| vec![(index, 1.0)]).unwrap_or_default())
-                .collect(),
+            vertices,
+            source_vertices: None,
             faces,
             corners: None,
         }
+    }
+}
+
+/// The input storage index whose `blender_origindex` value output vertex `vertex` takes, or `None`
+/// for `ORIGINDEX_NONE`. An exact source wins; else a single weight-one source is used.
+fn carrier_source(origin: &Origin, vertex: usize) -> Option<usize> {
+    if let Some(exact) = &origin.source_vertices {
+        return exact[vertex];
+    }
+    match origin.vertices[vertex].as_slice() {
+        [(index, weight)] if weight.to_bits() == 1.0_f64.to_bits() => Some(*index),
+        _ => None,
     }
 }
 
@@ -265,7 +284,16 @@ fn remap_attributes_internal(
             "staged modifier provenance does not describe the rebuilt mesh",
         ));
     }
-    if origin.vertices.len() != output.vertices.len() || origin.faces.len() != output.faces.len() {
+    if origin.vertices.len() != output.vertices.len()
+        || origin.faces.len() != output.faces.len()
+        || origin.source_vertices.as_ref().is_some_and(|vertices| {
+            vertices.len() != output.vertices.len()
+                || vertices
+                    .iter()
+                    .flatten()
+                    .any(|index| *index >= source.vertices.len())
+        })
+    {
         return Err(PotError::new(
             ErrorCode::InternalError,
             "modifier provenance does not describe the rebuilt mesh",
@@ -406,6 +434,17 @@ fn remap_attributes_internal(
                 .map(|values| Value::Object(sources.vertex_object(values, "FLOAT"))),
             "blender_skin_vertices" => value.as_array().map(|vertices| {
                 Value::Array(sources.vertex_values(vertices, "FLOAT", || json!({})))
+            }),
+            ORIGINDEX_ATTRIBUTE => value.as_array().map(|indices| {
+                Value::Array(
+                    (0..origin.vertices.len())
+                        .map(|vertex| {
+                            carrier_source(origin, vertex)
+                                .and_then(|source| indices.get(source).cloned())
+                                .unwrap_or_else(|| json!(ORIGINDEX_NONE))
+                        })
+                        .collect(),
+                )
             }),
             "shade_smooth" => Some(sources.shade_smooth(value)),
             "sharp" => Some(sources.sharp(value)),
@@ -1662,6 +1701,16 @@ fn is_integer(data_type: &str) -> bool {
     matches!(data_type, "INT" | "INT8")
 }
 
+/// A blended float rounded to the f32 precision Blender stores attribute layers in, so a constant
+/// input blends back to exactly its value.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Blender stores float attribute layers as f32"
+)]
+fn stored_float(sum: f64) -> f64 {
+    f64::from(sum as f32)
+}
+
 /// The RGBA components of a color value, when it has exactly four numbers.
 fn rgba_value(value: &Value) -> Option<[f64; 4]> {
     let components = value
@@ -1714,7 +1763,7 @@ fn blend_with_boolean_mixer<'a>(
         return Some(if is_integer(data_type) {
             json!(sum.round() as i64)
         } else {
-            json!(sum)
+            json!(stored_float(sum))
         });
     }
     if data_type == "QUATERNION" && items.iter().all(|(value, _)| is_quaternion(value)) {
@@ -1746,7 +1795,7 @@ fn blend_with_boolean_mixer<'a>(
                     if rounds {
                         json!(sum.round() as i64)
                     } else {
-                        json!(sum)
+                        json!(stored_float(sum))
                     }
                 })
                 .collect(),
@@ -1926,6 +1975,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: None,
         };
@@ -1935,6 +1985,33 @@ mod tests {
         assert_eq!(groups[format!("v{}", out_ids[0])], json!(1.0));
         assert_eq!(groups[format!("v{}", out_ids[1])], json!(0.0));
         assert_eq!(groups[format!("v{}", out_ids[2])], json!(0.5));
+    }
+
+    #[test]
+    fn origindex_carrier_follows_single_weight_one_sources() {
+        let mut source = triangle();
+        crate::geom::set_origindex(&mut source, &[1, ORIGINDEX_NONE, 2]);
+
+        let mut output = triangle();
+        let copied = Origin::copies([Some(2), None, Some(0)], vec![Some(0)]);
+        remap_attributes(&source, &mut output, &copied).expect("remap copied indices");
+        assert_eq!(
+            crate::geom::origindex_values(&output),
+            Some(vec![2, ORIGINDEX_NONE, 1])
+        );
+
+        let mut output = triangle();
+        let blended = Origin {
+            vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
+            faces: vec![Some(0)],
+            corners: None,
+        };
+        remap_attributes(&source, &mut output, &blended).expect("remap blended indices");
+        assert_eq!(
+            crate::geom::origindex_values(&output),
+            Some(vec![1, ORIGINDEX_NONE, ORIGINDEX_NONE])
+        );
     }
 
     /// A JSON object of keyed entries, for attribute fixtures.
@@ -2002,6 +2079,7 @@ mod tests {
                 vec![(3, 0.5), (0, 0.5)],
                 vec![(0, 0.25), (1, 0.25), (2, 0.25), (3, 0.25)],
             ],
+            source_vertices: None,
             faces: vec![Some(0); 4],
             corners: None,
         };
@@ -2065,6 +2143,7 @@ mod tests {
                 vec![(0, 1.0 / 3.0), (2, 1.0 / 3.0), (4, 1.0 / 3.0)],
                 vec![(1, 1.0 / 3.0), (3, 1.0 / 3.0), (5, 1.0 / 3.0)],
             ],
+            source_vertices: None,
             faces: Vec::new(),
             corners: None,
         };
@@ -2114,6 +2193,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: None,
         };
@@ -2170,6 +2250,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: None,
         };
@@ -2276,6 +2357,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(0, 0.5), (1, 0.5)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: None,
         };
@@ -2338,6 +2420,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: Some(vec![
                 vec![(0, 0.49), (1, 0.51)],
@@ -2406,6 +2489,7 @@ mod tests {
         );
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: Some(vec![
                 vec![(0, 0.49), (1, 0.51)],
@@ -2489,6 +2573,7 @@ mod tests {
         let mut output = triangle();
         let origin = Origin {
             vertices: vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)]],
+            source_vertices: None,
             faces: vec![Some(0)],
             corners: Some(vec![
                 vec![(0, 0.25), (1, 0.75)],
@@ -2543,6 +2628,7 @@ mod tests {
                 vec![(1, 0.5), (3, 0.5)],
                 Vec::new(),
             ],
+            source_vertices: None,
             faces: vec![None],
             corners: Some(vec![
                 vec![(0, 1.0)],

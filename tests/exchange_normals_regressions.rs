@@ -144,9 +144,11 @@ fn obj_corner_normals(text: &str, name: &str) -> TestResult<Vec<[f64; 3]>> {
             }
             Some("f") if current == name => {
                 for corner in words {
+                    // Blender writes `v//vn` without UVs and `v/vt/vn` with them; the normal is last.
                     let index: usize = corner
-                        .split("//")
-                        .nth(1)
+                        .rsplit('/')
+                        .next()
+                        .filter(|_| corner.contains('/'))
                         .ok_or("OBJ face corner has no normal index")?
                         .parse()?;
                     corners.push(*vn.get(index - 1).ok_or("OBJ normal index out of range")?);
@@ -271,13 +273,22 @@ fn flat_degenerate_scene_exports_to_every_format_without_losses() -> TestResult 
     write_scene(&scene, false)?;
     for (format, extension) in FORMATS {
         let out = directory.path().join(format!("{format}.{extension}"));
-        let envelope = export(&scene, format, &out, false)?;
+        // The primitives carry Blender's default `UVMap`. STL has no UV coordinates and reports it;
+        // every other format keeps it (or writes the one active layer), so only STL needs the flag.
+        let envelope = export(&scene, format, &out, format == "stl")?;
         assert!(out.exists(), "{format} wrote no file");
-        assert_eq!(
-            losses(&envelope),
-            Vec::<Value>::new(),
-            "{format} reported losses"
-        );
+        let reported = losses(&envelope);
+        if format == "stl" {
+            assert!(
+                !reported.is_empty(),
+                "STL must report the UV layer it cannot store"
+            );
+            for loss in &reported {
+                assert_eq!(loss["feature_id"], "mesh.uv_layer", "{format}: {loss}");
+            }
+        } else {
+            assert_eq!(reported, Vec::<Value>::new(), "{format} reported losses");
+        }
     }
     Ok(())
 }
@@ -293,10 +304,10 @@ fn shaded_degenerate_scene_exports_to_every_format_with_only_shading_losses() ->
         assert!(out.exists(), "{format} wrote no file");
         let reported = losses(&envelope);
         for loss in &reported {
-            assert_eq!(
-                loss["feature_id"], "mesh.shading",
-                "{format} reported an unexpected loss: {loss}"
-            );
+            // STL also reports the UV layer the primitives carry (its writer stores no UVs).
+            let expected = loss["feature_id"] == "mesh.shading"
+                || (format == "stl" && loss["feature_id"] == "mesh.uv_layer");
+            assert!(expected, "{format} reported an unexpected loss: {loss}");
         }
         if format == "stl" {
             assert!(

@@ -39,10 +39,8 @@ pub(crate) fn principled_glass_tint(base: [f64; 4]) -> [f64; 3] {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 5] {
+) -> [Option<(&'static str, &'static str)>; 4] {
     [
-        (params.subsurface_weight > 0.0)
-            .then_some(("shader.principled.subsurface", "Subsurface Weight")),
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
         (params.thin_film_thickness > 0.0)
             .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
@@ -133,6 +131,31 @@ enum VolumeClosure {
     Absorption,
 }
 
+/// Cycles' subsurface method, the Principled node's `subsurface_method` property (`node_shader_bsdf_principled.cc`,
+/// `CLOSURE_BSSRDF_*_ID`). The default is random walk. Each method is its own closure: a Mix or Add of two arms with
+/// different methods keeps both closures, so there is no mixed method.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SubsurfaceMethod {
+    Burley,
+    #[default]
+    RandomWalk,
+    RandomWalkSkin,
+    RandomWalkLegacy,
+}
+
+impl SubsurfaceMethod {
+    /// The Blender enum identifier of a method, as the node property stores it.
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        match token {
+            "BURLEY" => Some(Self::Burley),
+            "RANDOM_WALK" => Some(Self::RandomWalk),
+            "RANDOM_WALK_SKIN" => Some(Self::RandomWalkSkin),
+            "RANDOM_WALK_LEGACY" => Some(Self::RandomWalkLegacy),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -161,6 +184,12 @@ pub struct BsdfParams {
     pub subsurface_weight: f64,
     pub subsurface_radius: [f64; 3],
     pub subsurface_scale: f64,
+    /// Cycles' subsurface method (`SubsurfaceMethod`), read from the Principled node's `subsurface_method` property.
+    pub subsurface_method: SubsurfaceMethod,
+    /// The Principled Subsurface IOR, used by the random walk skin method's refractive entry.
+    pub subsurface_ior: f64,
+    /// The Principled Subsurface Anisotropy: the thin branch's reflection and transmission split (`bsdf_thin_subsurface_setup`), and the random walk's phase function g.
+    pub subsurface_anisotropy: f64,
     pub coat_weight: f64,
     pub coat_roughness: f64,
     pub coat_ior: f64,
@@ -181,8 +210,9 @@ pub struct BsdfParams {
     /// Oren-Nayar roughness of the diffuse lobe. Potter's diffuse lobe is Lambert, so a value above
     /// zero is reported as unevaluated (Cycles `bsdf_oren_nayar_setup`).
     pub diffuse_roughness: f64,
-    /// Thin Wall (Cycles' `thin_wall`): transmission through a thin sheet. Potter does not evaluate
-    /// it; it is reported as unevaluated.
+    /// Thin Wall (Cycles' `thin_wall`, `svm/closure.h`): the thin branch replaces the BSSRDF with the thin-subsurface
+    /// closure. Potter evaluates that closure's diffuse reflection (`subsurface_share`), but not its translucent
+    /// transmission (`bsdf_thin_subsurface_setup`), so the input is reported as unevaluated.
     pub thin_wall: bool,
     /// Cycles' scattering coefficient σs per channel, absolute: the volume closure's scatter weight times its
     /// Density. The medium sums the volume closures by their weights (`SurfaceShading::volume`).
@@ -278,8 +308,11 @@ impl BsdfParams {
             transparent_tint: [1.0; 3],
             reflectance: 1.0,
             subsurface_weight: 0.0,
-            subsurface_radius: [1.0; 3],
-            subsurface_scale: 0.05,
+            subsurface_radius: [1.0, 0.2, 0.1],
+            subsurface_scale: 0.005,
+            subsurface_method: SubsurfaceMethod::default(),
+            subsurface_anisotropy: 0.0,
+            subsurface_ior: 1.4,
             coat_weight: 0.0,
             coat_roughness: 0.03,
             coat_ior: 1.5,
@@ -1306,6 +1339,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
 
     fn principled(&mut self, id: &Id) -> Result<BsdfParams> {
         let node = self.node(id)?;
+        // Blender's default is random walk; a node without the property (an authored graph) is that default.
+        let method_token = node
+            .properties
+            .get("subsurface_method")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("RANDOM_WALK")
+            .to_owned();
         if node
             .properties
             .get("potter_simple_material")
@@ -1346,9 +1386,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.subsurface_weight =
             self.scalar_input(id, &["Subsurface Weight", "Subsurface"], 0.0)?;
         params.subsurface_radius = self
-            .vector_input(id, &["Subsurface Radius"], DVec3::ONE)?
+            .vector_input(id, &["Subsurface Radius"], DVec3::new(1.0, 0.2, 0.1))?
             .to_array();
-        params.subsurface_scale = self.scalar_input(id, &["Subsurface Scale"], 0.05)?;
+        params.subsurface_scale = self.scalar_input(id, &["Subsurface Scale"], 0.005)?;
+        let method = method_token.as_str();
+        params.subsurface_method = SubsurfaceMethod::parse(method)
+            .ok_or_else(|| invalid(format!("unknown Principled subsurface method `{method}`")))?;
+        params.subsurface_ior = self.scalar_input(id, &["Subsurface IOR"], 1.4)?;
+        params.subsurface_anisotropy = self.scalar_input(id, &["Subsurface Anisotropy"], 0.0)?;
         params.coat_weight = self.scalar_input(id, &["Coat Weight", "Clearcoat"], 0.0)?;
         params.coat_roughness =
             self.scalar_input(id, &["Coat Roughness", "Clearcoat Roughness"], 0.03)?;
@@ -3087,6 +3132,61 @@ mod tests {
         graph
     }
 
+    #[test]
+    fn a_mix_of_two_subsurface_methods_keeps_each_closure_its_own_method() {
+        use super::SubsurfaceMethod;
+        // Each Principled arm carries its own method. Mix Shader concatenates the arms' closures, so both methods reach
+        // the surface and neither is replaced by a mixed or first-arm method (Cycles keeps the closures separate).
+        let mut graph = NodeGroup::new("MixMethods", GraphKind::Shader);
+        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(
+            &mut graph,
+            "mix",
+            "ShaderNodeMixShader",
+            json!({"Fac": 0.5}),
+        );
+        insert_node(
+            &mut graph,
+            "burley",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Subsurface Weight": 1.0}),
+        );
+        insert_node(
+            &mut graph,
+            "walk",
+            "ShaderNodeBsdfPrincipled",
+            json!({"Subsurface Weight": 1.0}),
+        );
+        for (id, method) in [("burley", "BURLEY"), ("walk", "RANDOM_WALK")] {
+            let node = graph
+                .nodes
+                .get_mut(&Id::new(id.to_owned()).unwrap())
+                .unwrap();
+            node.properties
+                .insert("subsurface_method".to_owned(), json!(method));
+        }
+        link(&mut graph, "burley", "BSDF", "mix", "Shader");
+        link(&mut graph, "walk", "BSDF", "mix", "Shader_001");
+        link(&mut graph, "mix", "Shader", "output", "Surface");
+        let id = Id::new("mix_methods".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(id.clone(), graph);
+        let material = Material {
+            node_tree: Some(id),
+            ..Material::default()
+        };
+        let shading = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+        let methods: Vec<SubsurfaceMethod> = shading
+            .closures
+            .iter()
+            .map(|closure| closure.params.subsurface_method)
+            .collect();
+        assert_eq!(
+            methods,
+            [SubsurfaceMethod::Burley, SubsurfaceMethod::RandomWalk]
+        );
+    }
+
     fn is_transparent(graph: NodeGroup) -> bool {
         let id = Id::new("transparency_graph").unwrap();
         let mut groups = Registry::new();
@@ -3328,15 +3428,15 @@ mod tests {
         evaluate_surface(&native, &context).unwrap();
         evaluate_surface(&native, &context).unwrap();
 
-        // A graph material sets subsurface and rough transmission on its Principled node. Subsurface is not
-        // evaluated and warns; rough transmission and coat are evaluated, so they must not warn.
+        // A graph material sets subsurface (the default random walk, which is evaluated) and Thin Wall (which is not)
+        // on its Principled node, with rough transmission. Thin Wall warns; subsurface, rough transmission and coat do not.
         let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
             &mut graph,
             "principled",
             "ShaderNodeBsdfPrincipled",
-            json!({"Subsurface Weight":0.5,"Transmission Weight":0.5,"Roughness":0.3}),
+            json!({"Subsurface Weight":0.5,"Thin Wall":1.0,"Transmission Weight":0.5,"Roughness":0.3}),
         );
         link(&mut graph, "principled", "BSDF", "output", "Surface");
         let graph_id = Id::new("graph_shader".to_owned()).unwrap();
@@ -3362,14 +3462,12 @@ mod tests {
                 .count()
         };
         assert_eq!(count("Native", "Transmission Weight"), 0);
-        assert_eq!(count("Graph", "Subsurface Weight"), 1);
+        assert_eq!(count("Graph", "Subsurface Weight"), 0);
+        assert_eq!(count("Graph", "Thin Wall"), 1);
         assert_eq!(count("Graph", "Coat Weight"), 0);
         assert_eq!(count("Graph", "Transmission Weight"), 0);
-        let subsurface_warning = warnings
-            .iter()
-            .find(|w| w["input"] == "Subsurface Weight")
-            .unwrap();
-        assert_eq!(subsurface_warning["node_id"], "principled");
+        let thin_wall_warning = warnings.iter().find(|w| w["input"] == "Thin Wall").unwrap();
+        assert_eq!(thin_wall_warning["node_id"], "principled");
     }
 
     /// Two Principled BSDFs joined by `combiner` (Mix or Add Shader), evaluated as the surface's closures. The first
@@ -3883,4 +3981,30 @@ fn kani_bounded_mix_factor_stays_unit_interval() {
     kani::assume(factor.is_finite());
     let bounded = bounded_factor(factor);
     assert!(bounded >= 0.0 && bounded <= 1.0);
+}
+
+#[cfg(test)]
+mod subsurface_method_tests {
+    use super::SubsurfaceMethod;
+
+    #[test]
+    fn subsurface_method_parses_the_blender_identifiers() {
+        assert_eq!(
+            SubsurfaceMethod::parse("BURLEY"),
+            Some(SubsurfaceMethod::Burley)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK"),
+            Some(SubsurfaceMethod::RandomWalk)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK_SKIN"),
+            Some(SubsurfaceMethod::RandomWalkSkin)
+        );
+        assert_eq!(
+            SubsurfaceMethod::parse("RANDOM_WALK_LEGACY"),
+            Some(SubsurfaceMethod::RandomWalkLegacy)
+        );
+        assert_eq!(SubsurfaceMethod::parse("random_walk"), None);
+    }
 }

@@ -10,13 +10,23 @@ use crate::{
     model::{Id, LightType, Material, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
-        SurfaceShading, equirectangular_uv, evaluate_surface_with_workspace, height_gradient,
+        SubsurfaceMethod, SurfaceShading, equirectangular_uv, evaluate_surface_with_workspace,
+        height_gradient,
     },
 };
 
 use super::principled_bsdf::{
-    GlassSample, Layers, continuous_density, diffuse_coefficient, evaluate as evaluate_bsdf,
-    layers, lobe_probabilities, sample_glass,
+    GlassSample, Layers, base_color, continuous_density, diffuse_coefficient,
+    evaluate as evaluate_bsdf, layers, lobe_probabilities, make_orthonormals, sample_glass,
+    specular_eta, subsurface_closure_weight,
+};
+use super::subsurface::{
+    MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
+    exit_params, pdf_mean, pick_channel, raw_radius, sample_radius,
+};
+use super::subsurface_walk::{
+    WalkEntry, WalkMethod, entry_direction, skin_entry_direction, walk, walk_anisotropy,
+    walk_radius, walk_uses_van_de_hulst,
 };
 use super::{
     bvh::{Bvh, BvhHit},
@@ -352,8 +362,8 @@ impl Closures {
     }
 
     /// Draws the reflective share of closure `index`, which `pick` chose, and returns the throughput weight of the
-    /// closure set. A continuous draw carries `Σ w·α·f·|cos| / p_mix` with `p_mix = Σ w·α·p / S`. A delta draw
-    /// carries the lobe weight times `S`, since the picked share's `w·α` over its pick probability `w·α / S` is `S`.
+    /// closure set. A continuous draw carries `Σ w·α·f·|cos| / p_mix` with `p_mix = Σ w·α·p / S`. A delta or subsurface
+    /// draw carries the lobe weight times `S`, since the picked share's `w·α` over its pick probability `w·α / S` is `S`.
     fn reflect(&self, index: usize, geometric: DVec3, rng: &mut Pcg32) -> Reflection {
         let closure = &self.items[index];
         match sample_lobes(&closure.params, &closure.layers, geometric, rng) {
@@ -362,15 +372,37 @@ impl Closures {
                 direction,
                 weight: weight * self.selection_total,
             },
-            LobeDraw::Continuous(direction) => {
+            LobeDraw::Subsurface { weight, method } => Reflection::Subsurface {
+                weight: weight * self.selection_total,
+                method,
+            },
+            LobeDraw::Continuous { direction, diffuse } => {
                 let pdf = self.continuous_pdf(direction);
                 Reflection::Continuous {
                     direction,
                     weight: self.bsdf_eval(direction) / pdf.max(1.0e-8),
                     pdf,
+                    diffuse,
                 }
             }
         }
+    }
+
+    /// Cycles' falling back to diffuse after a diffuse bounce (`bssrdf_setup` with `PATH_RAY_DIFFUSE_ANCESTOR`): a
+    /// Burley closure loses its subsurface weight. The random walk keeps its closure.
+    fn disable_burley_subsurface(&mut self) {
+        let items: Vec<HitClosure> = self
+            .items
+            .iter()
+            .map(|closure| {
+                let mut params = closure.params;
+                if params.subsurface_method == SubsurfaceMethod::Burley {
+                    params.subsurface_weight = 0.0;
+                }
+                HitClosure::new(closure.weight, &params, closure.layers.view)
+            })
+            .collect();
+        *self = Closures::new(items, self.smooth);
     }
 }
 
@@ -485,19 +517,28 @@ struct Surface {
     medium: Medium,
     object_index: u32,
     element_index: u32,
+    /// The triangle the hit lies on, which a random walk entering through it must not hit first (`ray.self.prim`).
+    triangle_index: usize,
 }
 
-/// The result of a reflective draw of the closure set. `Continuous` carries its throughput weight and the mixture density
-/// that MIS weighs light sampling against. `Delta` is a sharp glass direction. `Absorbed` ends the path.
+/// The result of a reflective draw of the closure set. `Continuous` carries its throughput weight, the mixture density
+/// that MIS weighs light sampling against, and whether it is a diffuse draw (a Burley subsurface closure falls back to
+/// diffuse after one). `Delta` is a sharp glass direction. `Subsurface` enters the surface through the subsurface lobe of
+/// its method; the path leaves at that method's exit. `Absorbed` ends the path.
 enum Reflection {
     Continuous {
         direction: DVec3,
         weight: DVec3,
         pdf: f64,
+        diffuse: bool,
     },
     Delta {
         direction: DVec3,
         weight: DVec3,
+    },
+    Subsurface {
+        weight: DVec3,
+        method: SubsurfaceMethod,
     },
     Absorbed,
 }
@@ -1217,8 +1258,19 @@ fn trace_path(
     // Set by the pass that reaches the cap: the next surface is shaded for emission and ends the
     // path (`PATH_RAY_TERMINATE_ON_NEXT_SURFACE`, `integrate_surface_terminate`).
     let mut terminate_on_next_surface = false;
+    // A subsurface exit replaces the next closest hit: the probe's hit is shaded as the exit (`exit_hit`), a diffuse
+    // surface built from the entry closure's parameters (`exit_entry`). `diffuse_ancestor` disables the Burley
+    // closure after a diffuse bounce.
+    let mut exit_hit: Option<BvhHit> = None;
+    let mut exit_entry: Option<BsdfParams> = None;
+    // Cycles' `PATH_RAY_SUBSURFACE_BACKFACING`: the entry was on a backfacing side, which flips the exit's normal.
+    let mut exit_backfacing = false;
+    let mut diffuse_ancestor = false;
     loop {
-        let hit = closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY);
+        let hit = match exit_hit.take() {
+            Some(exit) => Some(exit),
+            None => closest_hit(geometry, bvh, origin, direction, RAY_EPSILON, f64::INFINITY),
+        };
         let surface_distance = hit.map_or(f64::INFINITY, |hit| hit.distance);
         // Camera rays do not see lights, and a volume scatter is light-sampled only. A surface
         // vertex's light hit needs its light sample as MIS partner, which a volume scatter on the
@@ -1233,7 +1285,18 @@ fn trace_path(
         });
         let segment_limit = light.map_or(surface_distance, |light| light.distance);
         let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
-        let volume_segment = trace_volume_segment(volumes, origin, direction, segment_limit, rng)?;
+        // The exit probe is a local intersection inside the object (`subsurface_disk`), not a light path: no volume
+        // transport, emission or scatter applies along it, so it takes the neutral segment.
+        let volume_segment = if exit_entry.is_some() {
+            VolumeSegment {
+                transmittance: 1.0,
+                emission: DVec3::ZERO,
+                event: None,
+                stochastic: false,
+            }
+        } else {
+            trace_volume_segment(volumes, origin, direction, segment_limit, rng)?
+        };
         radiance += throughput * volume_segment.emission;
         if !volume_segment.stochastic {
             throughput *= volume_segment.transmittance;
@@ -1305,7 +1368,7 @@ fn trace_path(
             escaped = true;
             break;
         };
-        let surface = make_surface(
+        let mut surface = make_surface(
             doc,
             snapshot,
             geometry,
@@ -1315,6 +1378,30 @@ fn trace_path(
             images,
             evaluator_workspace,
         )?;
+        if let Some(entry) = exit_entry.take() {
+            // The exit of a subsurface entry is a diffuse surface (`subsurface_shader_data_setup`), not the material it
+            // hits. Cycles shades it along the exit hit's own normal: `subsurface_disk` sets the probe ray to `Ng[hit]`,
+            // flipped for a backfacing entry, and `subsurface_scatter` reverses that ray, so the exit faces outward.
+            if let Some(outward) = intrinsic_normal(geometry, hit.triangle_index) {
+                let outward = if exit_backfacing { -outward } else { outward };
+                if surface.normal.dot(outward) < 0.0 {
+                    surface.normal = -surface.normal;
+                    surface.geometric_normal = -surface.geometric_normal;
+                }
+            }
+            // Cycles' diffuse closure has no view term (`bsdf_diffuse_setup`, `bsdf_diffuse_eval` tests only N·omega), so
+            // the exit's view is its own normal, and the exit is the entry closure's diffuse lobe alone.
+            let mut params = exit_params(&entry);
+            params.normal = surface.normal;
+            surface.closures = Closures::new(
+                vec![HitClosure::new(1.0, &params, surface.normal)],
+                surface.normal,
+            );
+        } else if diffuse_ancestor {
+            // A Burley closure falls back to diffuse after a diffuse bounce (Cycles' `bssrdf_setup` with
+            // `PATH_RAY_DIFFUSE_ANCESTOR`). The random walk keeps its closure.
+            surface.closures.disable_burley_subsurface();
+        }
         if surface.medium.has_medium()
             && let Some(boundary) = closest_hit(
                 geometry,
@@ -1390,33 +1477,66 @@ fn trace_path(
                 origin = offset_origin(surface.point, direction, surface.geometric_normal);
             }
             Some(Pick::Reflect(index)) => {
+                let draw = surface
+                    .closures
+                    .reflect(index, surface.geometric_normal, rng);
+                // A subsurface entry takes no bounce, so it is taken at the budget too (`subsurface_bounce`, which
+                // `path_state_next` does not count). The path leaves at the method's exit, keeping this vertex's count.
+                if let Reflection::Subsurface { weight, method } = draw {
+                    let entry = surface.closures.items[index];
+                    let Some(exit) = subsurface_exit(
+                        geometry,
+                        bvh,
+                        &surface,
+                        &entry,
+                        method,
+                        throughput * weight,
+                        rng,
+                    ) else {
+                        break;
+                    };
+                    // The exit's normal faces outward as Cycles' `subsurface_bounce` and `subsurface_scatter` set it: a
+                    // Burley exit is oriented by its probe's entry (`subsurface_disk`), and a random walk exit faces
+                    // along the walk's last flight, since Cycles reverses that ray at the exit point.
+                    exit_backfacing = match method {
+                        SubsurfaceMethod::Burley => intrinsic_normal(geometry, hit.triangle_index)
+                            .is_some_and(|normal| normal.dot(direction) > 0.0),
+                        _ => intrinsic_normal(geometry, exit.hit.triangle_index)
+                            .is_some_and(|normal| normal.dot(exit.direction) < 0.0),
+                    };
+                    throughput = exit.throughput;
+                    origin = exit.origin;
+                    direction = exit.direction;
+                    exit_hit = Some(exit.hit);
+                    exit_entry = Some(entry.params);
+                    previous = Scatter::Camera;
+                    continue;
+                }
                 if bounce == max_bounces {
                     break;
                 }
-                let (next_direction, weight) =
-                    match surface
-                        .closures
-                        .reflect(index, surface.geometric_normal, rng)
-                    {
-                        Reflection::Continuous {
-                            direction,
-                            weight,
-                            pdf,
-                        } => {
-                            previous = Scatter::Surface(MisVertex {
-                                bsdf_pdf: pdf,
-                                normal: surface.normal,
-                                point: surface.point,
-                            });
-                            (direction, weight)
-                        }
-                        Reflection::Delta { direction, weight } => {
-                            previous = Scatter::Delta(surface.point);
-                            (direction, weight)
-                        }
-                        // Cycles' `LABEL_NONE`: a rejected draw ends the path.
-                        Reflection::Absorbed => break,
-                    };
+                let (next_direction, weight) = match draw {
+                    Reflection::Continuous {
+                        direction,
+                        weight,
+                        pdf,
+                        diffuse,
+                    } => {
+                        diffuse_ancestor |= diffuse;
+                        previous = Scatter::Surface(MisVertex {
+                            bsdf_pdf: pdf,
+                            normal: surface.normal,
+                            point: surface.point,
+                        });
+                        (direction, weight)
+                    }
+                    Reflection::Delta { direction, weight } => {
+                        previous = Scatter::Delta(surface.point);
+                        (direction, weight)
+                    }
+                    // Cycles' `LABEL_NONE`: a rejected draw ends the path. A subsurface draw was handled above.
+                    Reflection::Absorbed | Reflection::Subsurface { .. } => break,
+                };
                 if !next_direction.is_finite() || !weight.is_finite() {
                     break;
                 }
@@ -1849,6 +1969,7 @@ fn make_surface(
     images: &BTreeMap<String, ImageData>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
+    let triangle_index = hit.triangle_index;
     with_hit_frame(
         doc,
         snapshot,
@@ -1916,6 +2037,7 @@ fn make_surface(
                 medium: Medium::from_closures(&shading.volume),
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
+                triangle_index,
             })
         },
     )
@@ -2606,11 +2728,22 @@ enum Scatter {
 }
 
 /// A direction drawn from one closure's own lobes, before the closure set weights it. `Continuous` is a lobe-mixture
-/// draw of that closure. `Delta` is a singular glass direction with its weight over its branch probability.
-/// `Absorbed` is a draw Cycles rejects (`LABEL_NONE`).
+/// draw of that closure, flagged diffuse for a diffuse-branch draw. `Delta` is a singular glass direction with its weight
+/// over its branch probability. `Subsurface` enters through the closure's subsurface lobe, with its weight over that
+/// branch probability. `Absorbed` is a draw Cycles rejects (`LABEL_NONE`).
 enum LobeDraw {
-    Continuous(DVec3),
-    Delta { direction: DVec3, weight: DVec3 },
+    Continuous {
+        direction: DVec3,
+        diffuse: bool,
+    },
+    Delta {
+        direction: DVec3,
+        weight: DVec3,
+    },
+    Subsurface {
+        weight: DVec3,
+        method: SubsurfaceMethod,
+    },
     Absorbed,
 }
 
@@ -2626,30 +2759,43 @@ fn sample_lobes(
     let view = layers.view;
     let probabilities = lobe_probabilities(params, layers);
     let choice = rng.next_f64();
-    if choice < probabilities.transmission {
+    // The subsurface lobe's probability is zero for a closure with no Subsurface Weight, so `choice` never reaches the
+    // branch without one. Every method is evaluated, so the branch needs no method check.
+    if choice < probabilities.subsurface {
+        let method = params.subsurface_method;
+        let weight = subsurface_closure_weight(params, normal, view, layers.lower)
+            / probabilities.subsurface.max(1.0e-8);
+        return LobeDraw::Subsurface { weight, method };
+    }
+    let transmission_end = probabilities.subsurface + probabilities.transmission;
+    if choice < transmission_end {
         let rands = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
         return match sample_glass(params, layers, geometric, probabilities.transmission, rands) {
             GlassSample::Absorbed => LobeDraw::Absorbed,
             GlassSample::Singular { direction, weight } => LobeDraw::Delta { direction, weight },
-            GlassSample::Rough { direction } => LobeDraw::Continuous(direction),
+            GlassSample::Rough { direction } => LobeDraw::Continuous {
+                direction,
+                diffuse: false,
+            },
         };
     }
-    let diffuse_end = probabilities.transmission + probabilities.diffuse;
+    let diffuse_end = transmission_end + probabilities.diffuse;
     let sheen_end = diffuse_end + probabilities.sheen;
     let coat_end = sheen_end + probabilities.coat;
-    let direction = if choice < diffuse_end {
-        sample_cosine_hemisphere(normal, rng).0
+    // Cycles' sheen samples are `LABEL_REFLECT | LABEL_DIFFUSE` (`bsdf_sheen.h`), so they set the diffuse ancestor.
+    let (direction, diffuse) = if choice < diffuse_end {
+        (sample_cosine_hemisphere(normal, rng).0, true)
     } else if choice < sheen_end {
         let first = rng.next_f64();
         let second = rng.next_f64();
-        layers.sample_sheen(first, second)
+        (layers.sample_sheen(first, second), true)
     } else if choice < coat_end {
         let half_vector =
             sample_ggx_half(params.coat_normal_or_shading(), params.coat_roughness, rng);
-        reflect(-view, half_vector).normalize_or_zero()
+        (reflect(-view, half_vector).normalize_or_zero(), false)
     } else {
         let half_vector = sample_ggx_half(normal, params.roughness, rng);
-        reflect(-view, half_vector).normalize_or_zero()
+        (reflect(-view, half_vector).normalize_or_zero(), false)
     };
     // Cycles keeps a reflection sample only above the geometric normal: `bsdf_diffuse.h:65-71` zeroes it otherwise, and
     // the microfacet sampler rejects the same case (`bsdf_microfacet.h:863`). The check is in sampling only; the
@@ -2657,7 +2803,273 @@ fn sample_lobes(
     if direction.dot(geometric) <= 0.0 {
         return LobeDraw::Absorbed;
     }
-    LobeDraw::Continuous(direction)
+    LobeDraw::Continuous { direction, diffuse }
+}
+
+/// The exit of a subsurface entry, by the method the entry sampled (Cycles' `subsurface_bounce` and
+/// `subsurface_scatter`). `entry` is the closure whose subsurface lobe was sampled, and `throughput` the path throughput
+/// with the entry weight already applied.
+fn subsurface_exit(
+    geometry: &Geometry,
+    bvh: &Bvh,
+    surface: &Surface,
+    entry: &HitClosure,
+    method: SubsurfaceMethod,
+    throughput: DVec3,
+    rng: &mut Pcg32,
+) -> Option<SubsurfaceExit> {
+    match method {
+        SubsurfaceMethod::Burley => burley_exit(geometry, bvh, surface, entry, throughput, rng),
+        SubsurfaceMethod::RandomWalk => random_walk_exit(
+            geometry,
+            bvh,
+            surface,
+            entry,
+            WalkMethod::RandomWalk,
+            throughput,
+            rng,
+        ),
+        SubsurfaceMethod::RandomWalkSkin => random_walk_exit(
+            geometry,
+            bvh,
+            surface,
+            entry,
+            WalkMethod::Skin,
+            throughput,
+            rng,
+        ),
+        SubsurfaceMethod::RandomWalkLegacy => random_walk_exit(
+            geometry,
+            bvh,
+            surface,
+            entry,
+            WalkMethod::Legacy,
+            throughput,
+            rng,
+        ),
+    }
+}
+
+/// Cycles' random walk from an entry (`subsurface_entry_bounce`, `subsurface_random_walk`). The walk starts exactly
+/// at the surface point, as `subsurface_bounce` sets `ray.P = sd->P`, and on its first bounce it does not hit the
+/// triangle it entered through (`ray.self.prim`). It ends at the object's surface, shaded as the diffuse exit. The
+/// entry is the refraction through an interface of the surface's roughness squared, or for the skin a diffuse lobe
+/// or a refraction through a rough interface (`skin_entry_direction`).
+fn random_walk_exit(
+    geometry: &Geometry,
+    bvh: &Bvh,
+    surface: &Surface,
+    closure: &HitClosure,
+    method: WalkMethod,
+    throughput: DVec3,
+    rng: &mut Pcg32,
+) -> Option<SubsurfaceExit> {
+    let params = &closure.params;
+    let (u, v) = (rng.next_f64(), rng.next_f64());
+    // The entry's GGX interface has the clamped roughness squared (`bssrdf->alpha = sqr(roughness)`), and refracts at the
+    // specular layer's eta (`bssrdf->ior = eta`, `svm/closure.h`). The skin refracts at its Subsurface IOR instead.
+    let roughness = params.roughness.clamp(0.0, 1.0);
+    let direction = match method {
+        WalkMethod::RandomWalk | WalkMethod::Legacy => entry_direction(
+            closure.params.normal,
+            closure.layers.view,
+            roughness * roughness,
+            specular_eta(params),
+            u,
+            v,
+        ),
+        WalkMethod::Skin => skin_entry_direction(
+            closure.params.normal,
+            closure.layers.view,
+            params.subsurface_ior,
+            u,
+            v,
+        ),
+    }?;
+    if surface.geometric_normal.dot(direction) >= 0.0 {
+        return None;
+    }
+    let albedo = base_color(params);
+    let anisotropy = walk_anisotropy(method, params.subsurface_anisotropy);
+    // A channel below the minimum radius has no closure (`bssrdf_setup`), so its radius is zero.
+    let mask = channel_mask(raw_radius(params));
+    let radius = walk_radius(params, albedo, method);
+    let radius = DVec3::from_array(std::array::from_fn(|channel| {
+        if mask[channel] { radius[channel] } else { 0.0 }
+    }));
+    let entry = WalkEntry {
+        point: surface.point,
+        normal: closure.params.normal,
+        direction,
+        albedo,
+        radius,
+        anisotropy,
+        van_de_hulst: walk_uses_van_de_hulst(method, anisotropy),
+        entry_triangle: surface.triangle_index,
+        throughput,
+        epsilon: RAY_EPSILON,
+    };
+    let mut draw = || rng.next_f64();
+    walk(
+        &geometry.triangles,
+        bvh,
+        surface.object_index,
+        &entry,
+        &mut draw,
+    )
+}
+
+/// The geometric normal of a triangle from its winding, as Cycles' `Ng` is: the cross product of its edges, outward
+/// for a mesh wound outward. It is not flipped towards any ray, so a subsurface exit can tell its side of the surface.
+fn intrinsic_normal(geometry: &Geometry, triangle_index: usize) -> Option<DVec3> {
+    let triangle = geometry.triangles.get(triangle_index)?;
+    Some(
+        (triangle.positions[1] - triangle.positions[0])
+            .cross(triangle.positions[2] - triangle.positions[0])
+            .normalize_or_zero(),
+    )
+}
+
+/// Probes the object of `surface` for the exit of the Burley profile, as Cycles' `subsurface_disk` does: a disk
+/// sample of the profile on one of the three axes of the surface, a ray through the object along that axis, and an
+/// importance resample among the hits of the ray on the object. At most `MAX_HITS` hits are kept, by Cycles'
+/// reservoir (`subsurface_disk.h`, `scene_intersect_local` with `max_hits`), and the weight of a probe that saw more
+/// is scaled by `num_hits / max_hits`. `throughput` includes the entry weight.
+fn burley_exit(
+    geometry: &Geometry,
+    bvh: &Bvh,
+    surface: &Surface,
+    entry: &HitClosure,
+    throughput: DVec3,
+    rng: &mut Pcg32,
+) -> Option<SubsurfaceExit> {
+    let radius = burley_radius(&entry.params);
+    let mask = channel_mask(raw_radius(&entry.params));
+    // One draw picks the channel and, remapped, the radius (`bssrdf_sample`).
+    let (channel, xi_radius) = pick_channel(mask, rng.next_f64())?;
+    let mean_free_path = radius.to_array()[channel];
+    let (disk_radius, height) = sample_radius(mean_free_path, xi_radius);
+    // The second draw picks the disk's axis and phase (`subsurface_disk`).
+    let axis_draw = rng.next_f64();
+    let normal = surface.geometric_normal;
+    // Cycles' `make_orthonormals(disk_N, &disk_T, &disk_B)`: the tangent and bitangent the T and B probes travel along.
+    // Their hit distribution is not symmetric about the normal, so the basis changes the exit weights.
+    let (tangent, bitangent) = make_orthonormals(normal);
+    // The normal axis is probed with half the probability, the others with a quarter each.
+    let (disk_normal, disk_tangent, disk_bitangent, pick_pdf, phase_draw) = if axis_draw < 0.5 {
+        (
+            normal,
+            tangent,
+            bitangent,
+            [0.5, 0.25, 0.25],
+            axis_draw * 2.0,
+        )
+    } else if axis_draw < 0.75 {
+        (
+            tangent,
+            normal,
+            bitangent,
+            [0.25, 0.5, 0.25],
+            (axis_draw - 0.5) * 4.0,
+        )
+    } else {
+        (
+            bitangent,
+            tangent,
+            normal,
+            [0.25, 0.25, 0.5],
+            (axis_draw - 0.75) * 4.0,
+        )
+    };
+    let phase = std::f64::consts::TAU * phase_draw;
+    let disk_point =
+        (disk_radius * phase.cos()) * disk_tangent + (disk_radius * phase.sin()) * disk_bitangent;
+    let origin = surface.point + disk_normal * height + disk_point;
+    let direction = -disk_normal;
+    // Cycles records at most `MAX_HITS` hits of the object as a reservoir (`scene_intersect_local`, `kernel/bvh/local.h`),
+    // with a generator seeded from the path's random numbers (`lcg_state_init` in `subsurface_disk`).
+    let mut probe = ProbeHits::new(rng.next_u32());
+    bvh.walk_hits(
+        &geometry.triangles,
+        origin,
+        direction,
+        RAY_EPSILON,
+        2.0 * height,
+        |hit, from| {
+            if geometry
+                .triangles
+                .get(hit.triangle_index)
+                .is_some_and(|triangle| triangle.object_index == surface.object_index)
+            {
+                // The hit's distance along the probe: the key of Cycles' duplicate test and of its sort.
+                let t = (from - origin).dot(direction) + hit.distance;
+                probe.record(t, (hit, from));
+            }
+            true
+        },
+    );
+    let (seen, mut found) = probe.finish();
+    // The recorded hits are sorted by distance (`sort_intersections_and_normals`), so the resample has a fixed order.
+    // The empty slots of the fixed array sort last.
+    found.sort_by(|a, b| match (a, b) {
+        (Some(a), Some(b)) => a.0.total_cmp(&b.0),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    // Hits the reservoir replaced still count: `w *= num_hits / max_hits` (`subsurface_disk`).
+    let reservoir_scale = if seen > MAX_HITS {
+        seen as f64 / MAX_HITS as f64
+    } else {
+        1.0
+    };
+    let disk_pdf = pdf_mean(radius, mask, disk_radius);
+    if disk_pdf <= 0.0 || found.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut weighted: [Option<(BvhHit, DVec3, DVec3)>; MAX_HITS] = [None; MAX_HITS];
+    let mut count = 0;
+    let mut total = 0.0;
+    for (_, (hit, from)) in found.into_iter().flatten() {
+        let Some(ng) = intrinsic_normal(geometry, hit.triangle_index) else {
+            continue;
+        };
+        let point = from + direction * hit.distance;
+        let pdf_n = pick_pdf[0] * disk_normal.dot(ng).abs();
+        let pdf_t = pick_pdf[1] * disk_tangent.dot(ng).abs();
+        let pdf_b = pick_pdf[2] * disk_bitangent.dot(ng).abs();
+        // The power-heuristic weight of the normal axis over the three axes (`subsurface_disk`).
+        let denominator = pdf_n * pdf_n + pdf_t * pdf_t + pdf_b * pdf_b;
+        let mis = if denominator > 0.0 {
+            pdf_n / denominator
+        } else {
+            0.0
+        };
+        let distance = (point - surface.point).length();
+        let weight = burley_eval(radius, mask, distance) / disk_pdf * mis * reservoir_scale;
+        total += weight.abs().element_sum() / 3.0;
+        weighted[count] = Some((hit, from, weight));
+        count += 1;
+    }
+    if total <= 0.0 {
+        return None;
+    }
+    // Importance resampling: one hit, chosen in proportion to its mean weight.
+    let target = rng.next_f64() * total;
+    let mut partial = 0.0;
+    for (hit, from, weight) in weighted.into_iter().take(count).flatten() {
+        let average = weight.abs().element_sum() / 3.0;
+        partial += average;
+        if average > 0.0 && target < partial {
+            return Some(SubsurfaceExit {
+                origin: from,
+                direction,
+                hit,
+                throughput: throughput * (weight * (total / average)),
+            });
+        }
+    }
+    None
 }
 
 /// Density with which a direction is light-sampled at a surface vertex. The cosine strategy is
@@ -3684,6 +4096,7 @@ mod sampling_tests {
             let weight = match closures.reflect(0, normal, &mut rng) {
                 Reflection::Continuous { weight, .. } | Reflection::Delta { weight, .. } => weight,
                 Reflection::Absorbed => DVec3::ZERO,
+                Reflection::Subsurface { .. } => panic!("the test closure has no subsurface lobe"),
             };
             sum += weight;
             sum_squares += weight * weight;
