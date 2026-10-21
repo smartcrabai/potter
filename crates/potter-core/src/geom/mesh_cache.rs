@@ -210,16 +210,13 @@ pub(crate) fn evaluate(
             })?;
         let ranks = blender_edge_ranks(&evaluated.faces);
         sort_edges_by_rank(&mut evaluated, &ranks);
-        // Blender builds a replacement from the receiver as a template: when the face and vertex counts
-        // match it keeps the receiver's shading; otherwise its polygons are smooth, as the Alembic reader
-        // assumes (abc_reader_mesh.cc: "Polygons are always assumed to be smooth-shaded").
-        if mesh.faces.len() == evaluated.faces.len()
-            && mesh.vertices.len() == evaluated.vertices.len()
-        {
-            carry_shading(mesh, &mut evaluated)?;
-        } else {
-            set_all_faces_smooth(&mut evaluated);
-        }
+        // Blender reads a changed topology into a new mesh (abc_reader_mesh.cc read_mesh: "topology_changed
+        // ... new_mesh = BKE_mesh_new_nomain_from_template"). That template copies attribute layouts and
+        // fills them with defaults (mesh.cc BKE_mesh_new_nomain_from_template_ex: AttributeInitDefaultValue),
+        // so no receiver sharp_face or sharp_edge carries over. read_mpolys never writes sharp_face: "Polygons
+        // are always assumed to be smooth-shaded" (abc_reader_mesh.cc read_mpolys). Potter's missing flags read as
+        // flat, so the smooth default is written explicitly.
+        set_all_faces_smooth(&mut evaluated);
         apply_cache_attributes(
             &mut evaluated,
             sample.sample,
