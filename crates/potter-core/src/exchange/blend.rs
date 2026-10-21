@@ -18233,6 +18233,8 @@ mod workbench_display_loss_tests {
     #[test]
     fn eevee_filter_size_is_reported_only_for_eevee_and_non_default() {
         let feature = "blender.render.filter_size";
+        // Only the filter-size feature is asserted: other render losses (such as an unknown engine)
+        // are reported by their own rules and do not bear on this one.
         let imported = |engine: &str, size: f64| {
             import_losses(&json!({"scenes": [{
                 "name": "Scene",
@@ -18241,6 +18243,7 @@ mod workbench_display_loss_tests {
             }]}))
             .into_iter()
             .map(|loss| loss.feature_id)
+            .filter(|feature_id| feature_id == "blender.render.filter_size")
             .collect::<Vec<String>>()
         };
         assert_eq!(imported("BLENDER_EEVEE_NEXT", 2.0), [feature]);
