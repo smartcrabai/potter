@@ -17,7 +17,7 @@ use crate::{
 
 use super::principled_bsdf::{
     GlassSample, Layers, base_color, continuous_density, diffuse_coefficient,
-    evaluate as evaluate_bsdf, layers, lobe_probabilities, make_orthonormals, sample_glass,
+    evaluate as evaluate_bsdf, layers_at, lobe_probabilities, make_orthonormals, sample_glass,
     specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
@@ -131,8 +131,8 @@ struct HitClosure {
 }
 
 impl HitClosure {
-    fn new(weight: f64, params: &BsdfParams, view: DVec3) -> Self {
-        let closure_layers = layers(params, params.normal, view);
+    fn new(weight: f64, params: &BsdfParams, view: DVec3, geometric: DVec3) -> Self {
+        let closure_layers = layers_at(params, params.normal, view, geometric);
         Self {
             weight,
             params: *params,
@@ -209,6 +209,8 @@ struct Closures {
     items: Vec<HitClosure>,
     /// The smooth shading normal, Cycles' `sd->N` before bump or normal mapping: the reference of the shading-side test.
     smooth: DVec3,
+    /// The geometric normal, Cycles' `sd->Ng`: the reference that bends the specular lobes (`layers_at`).
+    geometric: DVec3,
     /// Sum of every share's selection weight, reflective and pass-through: the selection normaliser.
     selection_total: f64,
     /// Sum of the reflective selection weights.
@@ -228,7 +230,7 @@ struct Closures {
 }
 
 impl Closures {
-    fn new(items: Vec<HitClosure>, smooth: DVec3) -> Self {
+    fn new(items: Vec<HitClosure>, smooth: DVec3, geometric: DVec3) -> Self {
         let mut selection_total = 0.0;
         let mut reflect_total = 0.0;
         let mut emission = DVec3::ZERO;
@@ -263,6 +265,7 @@ impl Closures {
         Self {
             items,
             smooth,
+            geometric,
             selection_total,
             reflect_total,
             emission,
@@ -399,10 +402,10 @@ impl Closures {
                 if params.subsurface_method == SubsurfaceMethod::Burley {
                     params.subsurface_weight = 0.0;
                 }
-                HitClosure::new(closure.weight, &params, closure.layers.view)
+                HitClosure::new(closure.weight, &params, closure.layers.view, self.geometric)
             })
             .collect();
-        *self = Closures::new(items, self.smooth);
+        *self = Closures::new(items, self.smooth, self.geometric);
     }
 }
 
@@ -1224,6 +1227,7 @@ fn world_radiance(
     crate::shader::evaluate_world(world, &doc.node_groups, images, direction)
 }
 
+/// The volume and transport state of one path: the scene, the bounce budgets and the sampling state.
 #[expect(
     clippy::too_many_arguments,
     reason = "one path's ray, scene state, sampling, and world context are explicit"
@@ -1394,8 +1398,14 @@ fn trace_path(
             let mut params = exit_params(&entry);
             params.normal = surface.normal;
             surface.closures = Closures::new(
-                vec![HitClosure::new(1.0, &params, surface.normal)],
+                vec![HitClosure::new(
+                    1.0,
+                    &params,
+                    surface.normal,
+                    surface.geometric_normal,
+                )],
                 surface.normal,
+                surface.geometric_normal,
             );
         } else if diffuse_ancestor {
             // A Burley closure falls back to diffuse after a diffuse bounce (Cycles' `bssrdf_setup` with
@@ -2021,7 +2031,12 @@ fn make_surface(
                     normal = -normal;
                 }
                 params.normal = normal;
-                items.push(HitClosure::new(closure.weight, &params, -direction));
+                items.push(HitClosure::new(
+                    closure.weight,
+                    &params,
+                    -direction,
+                    frame.geometric_normal,
+                ));
             }
             // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
             let normal = items
@@ -2033,7 +2048,7 @@ fn make_surface(
                 normal,
                 geometric_normal: frame.geometric_normal,
                 shadow_point: frame.shadow_point,
-                closures: Closures::new(items, frame.normal),
+                closures: Closures::new(items, frame.normal, frame.geometric_normal),
                 medium: Medium::from_closures(&shading.volume),
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
@@ -2156,6 +2171,8 @@ fn direct_lighting(
     Ok(contribution)
 }
 
+/// The direct light of a volume scatter: each light's next-event estimate weighted by the scatter's phase function, and one
+/// environment sample with MIS against the phase function.
 #[expect(
     clippy::too_many_arguments,
     reason = "volume direct lighting needs explicit transport and world state"
@@ -2252,6 +2269,8 @@ fn power_heuristic(first_pdf: f64, second_pdf: f64) -> f64 {
     first_squared / (first_squared + second_squared).max(f64::MIN_POSITIVE)
 }
 
+/// The transmittance of a shadow ray: opaque hits block it, transparent surfaces and medium boundaries pass it, and each
+/// medium it crosses attenuates it.
 #[expect(
     clippy::too_many_arguments,
     reason = "shadow traversal needs exact scene visibility, materials, and medium state"
@@ -2790,11 +2809,10 @@ fn sample_lobes(
         let second = rng.next_f64();
         (layers.sample_sheen(first, second), true)
     } else if choice < coat_end {
-        let half_vector =
-            sample_ggx_half(params.coat_normal_or_shading(), params.coat_roughness, rng);
+        let half_vector = sample_ggx_half(layers.coat_normal, params.coat_roughness, rng);
         (reflect(-view, half_vector).normalize_or_zero(), false)
     } else {
-        let half_vector = sample_ggx_half(normal, params.roughness, rng);
+        let half_vector = sample_ggx_half(layers.specular, params.roughness, rng);
         (reflect(-view, half_vector).normalize_or_zero(), false)
     };
     // Cycles keeps a reflection sample only above the geometric normal: `bsdf_diffuse.h:65-71` zeroes it otherwise, and
@@ -4078,8 +4096,9 @@ mod sampling_tests {
                         theta.cos(),
                     );
                     let cosine = light.dot(normal);
-                    total += evaluate_bsdf(&params, &layers(&params, normal, view), light)
-                        * (cosine * theta.sin() * d_theta * d_phi);
+                    total +=
+                        evaluate_bsdf(&params, &layers_at(&params, normal, view, normal), light)
+                            * (cosine * theta.sin() * d_theta * d_phi);
                 }
             }
             total
@@ -4089,7 +4108,11 @@ mod sampling_tests {
 
         let samples = 400_000_usize;
         let mut rng = Pcg32::for_sample(1, 0, 0, 0);
-        let closures = Closures::new(vec![HitClosure::new(1.0, &params, view)], normal);
+        let closures = Closures::new(
+            vec![HitClosure::new(1.0, &params, view, normal)],
+            normal,
+            normal,
+        );
         let mut sum = DVec3::ZERO;
         let mut sum_squares = DVec3::ZERO;
         for _ in 0..samples {
