@@ -2574,15 +2574,16 @@ fn set_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str, value: b
         clear_output_edge_flag(mesh, edge_index, name);
     }
 }
-/// Blender's new `BMesh` edges start with zeroed attributes. An output edge that is not an input edge
-/// (kept input edges keep their values) loses its edge-domain attribute values, except the seam and
-/// sharp flags, which the marks set. Rebuilt rungs copy their source values afterwards.
-fn zero_generated_edge_attributes(output: &mut Mesh, source_edges: &HashSet<(u32, u32)>) {
+/// Blender's new `BMesh` edges start with zeroed attributes. Each output edge with `generated[index]`
+/// set is not an input edge (its origin vertices do not form one) and loses its edge-domain attribute
+/// values, except the seam and sharp flags, which the marks set. Rebuilt rungs copy afterwards.
+fn zero_generated_edge_attributes(output: &mut Mesh, generated: &[bool]) {
     let generated: Vec<String> = output
         .edges
         .iter()
-        .filter(|edge| !source_edges.contains(&edge_key(edge.vertices[0], edge.vertices[1])))
-        .map(|edge| format!("e{}", edge.id))
+        .zip(generated)
+        .filter(|(_, generated)| **generated)
+        .map(|(edge, _)| format!("e{}", edge.id))
         .collect();
     for (name, attribute) in &mut output.attributes {
         if name == "sharp"
@@ -3467,12 +3468,43 @@ pub(super) fn finish(
     let mut result =
         build_mesh_with_edge_identity(points, polygons, loose, &origin, Some(&identities), mesh)?;
     clear_origindex(&mut result);
-    let source_edges: HashSet<(u32, u32)> = mesh
+    // Blender keeps an input edge's BMesh edge and its data: an output edge is an input edge when its
+    // endpoints' origin vertices (`identities`, input storage indices) form an input edge.
+    let storage_of: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let input_pairs: HashSet<(usize, usize)> = mesh
         .edges
         .iter()
-        .map(|edge| edge_key(edge.vertices[0], edge.vertices[1]))
+        .filter_map(|edge| {
+            let first = *storage_of.get(&edge.vertices[0])?;
+            let second = *storage_of.get(&edge.vertices[1])?;
+            Some((first.min(second), first.max(second)))
+        })
         .collect();
-    zero_generated_edge_attributes(&mut result, &source_edges);
+    let output_index: HashMap<u32, usize> = result
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let generated: Vec<bool> = result
+        .edges
+        .iter()
+        .map(|edge| {
+            let origin = |id: u32| output_index.get(&id).map(|&index| identities[index]);
+            match (origin(edge.vertices[0]), origin(edge.vertices[1])) {
+                (Some(first), Some(second)) => {
+                    !input_pairs.contains(&(first.min(second), first.max(second)))
+                }
+                _ => true,
+            }
+        })
+        .collect();
+    zero_generated_edge_attributes(&mut result, &generated);
     if !emitted_edge_flag_suppressions.is_empty()
         || !emitted_seam_edges.is_empty()
         || !emitted_sharp_edges.is_empty()
