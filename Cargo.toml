@@ -115,6 +115,7 @@ ci = "github"
 install-path = "CARGO_HOME"
 installers = ["shell", "homebrew"]
 publish-jobs = ["homebrew"]
+recursive-tarball = true
 tap = "smartcrabai/homebrew-tap"
 targets = [
   "aarch64-apple-darwin",
