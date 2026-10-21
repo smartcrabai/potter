@@ -1546,7 +1546,7 @@ def _uv_layer_index(layers, attribute):
 MESH_HANDLED_KEYS = frozenset((
     "alembic_normals", "alembic_time_samples", "alembic_velocity", "blender_attributes", "blender_metadata", "blender_skin_vertices",
     "color_layers", "crease_edge", "custom_normal", "seam", "sharp", "shade_smooth", "skin_radii", "skin_roots",
-    "multires_displacement",
+    "multires_displacement", "subdivision_optimal_edges",
     "uv_layers",
     "vertex_groups",
 ))
