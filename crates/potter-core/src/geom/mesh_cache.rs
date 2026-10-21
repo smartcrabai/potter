@@ -208,6 +208,8 @@ pub(crate) fn evaluate(
                     json!({"modifier_id":modifier.id,"reason":error.to_string()}),
                 )
             })?;
+        let ranks = blender_edge_ranks(&evaluated.faces);
+        sort_edges_by_rank(&mut evaluated, &ranks);
         // Blender's custom-normal setter splits the fans of smooth faces to mark sharp edges, so the
         // replaced mesh takes its smooth flags from the cache normals before the normals are encoded.
         if let Some(normals) = &sample.sample.normals {
@@ -265,6 +267,14 @@ pub(crate) fn evaluate(
                 json!({"modifier_id":modifier.id,"reason":error.to_string()}),
             )
         })?;
+    // A same-topology read keeps the receiver's edge order, which the receiver's sharp flags index.
+    let receiver_ranks: HashMap<[u32; 2], usize> = mesh
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| (sorted_pair(edge.vertices), index))
+        .collect();
+    sort_edges_by_rank(&mut evaluated, &receiver_ranks);
     carry_uv_store(mesh, &mut evaluated);
     carry_shading(mesh, &mut evaluated)?;
     apply_cache_attributes(
@@ -465,6 +475,38 @@ fn carry_uv_store(input: &Mesh, replacement: &mut Mesh) {
         }
     }
     uv_layers::write(replacement, &store);
+}
+
+/// Blender's edge order on a mesh built from faces: one edge per corner `(previous corner, this corner)`
+/// in corner order, kept at its first appearance (`mesh_calc_edges`). Maps each edge's sorted vertex pair
+/// to its rank.
+fn blender_edge_ranks(faces: &[crate::geom::Face]) -> HashMap<[u32; 2], usize> {
+    let mut ranks = HashMap::new();
+    for face in faces {
+        let count = face.vertices.len();
+        for corner in 0..count {
+            let previous = face.vertices[(corner + count - 1) % count];
+            let next_rank = ranks.len();
+            ranks
+                .entry(sorted_pair([previous, face.vertices[corner]]))
+                .or_insert(next_rank);
+        }
+    }
+    ranks
+}
+
+/// Puts a mesh's edges in the order of `ranks`, keeping each edge's ID. Edges without a rank go last.
+fn sort_edges_by_rank(mesh: &mut Mesh, ranks: &HashMap<[u32; 2], usize>) {
+    mesh.edges.sort_by_key(|edge| {
+        ranks
+            .get(&sorted_pair(edge.vertices))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+}
+
+fn sorted_pair(vertices: [u32; 2]) -> [u32; 2] {
+    [vertices[0].min(vertices[1]), vertices[0].max(vertices[1])]
 }
 
 /// Carries the receiver's shading onto a replacement with the same faces. Blender keeps a receiver's
