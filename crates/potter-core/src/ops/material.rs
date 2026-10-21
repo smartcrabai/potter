@@ -45,6 +45,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "roughness",
             "double_sided",
             "use_transparent_shadow",
+            "use_bump_map_correction",
             "emission_color",
             "emission_strength",
             "transmission",
@@ -172,6 +173,10 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         material.use_transparent_shadow =
             read_bool(engine, operation, "use_transparent_shadow", true)?;
     }
+    if operation.contains_key("use_bump_map_correction") {
+        material.use_bump_map_correction =
+            read_bool(engine, operation, "use_bump_map_correction", true)?;
+    }
     if let Some(value) = operation.get("emission_color") {
         material.emission_color = read_emission_color(
             engine,
@@ -270,6 +275,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "roughness",
             "double_sided",
             "use_transparent_shadow",
+            "use_bump_map_correction",
             "emission_color",
             "emission_strength",
             "transmission",
@@ -389,6 +395,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             })
         })
         .transpose()?;
+    let use_bump_map_correction = set
+        .get("use_bump_map_correction")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "use_bump_map_correction must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/use_bump_map_correction"),
+                )
+            })
+        })
+        .transpose()?;
     let base_color_texture = set
         .get("base_color_texture")
         .map(|value| parse_texture_ref(engine, value, "set/base_color_texture"))
@@ -496,8 +514,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .map(|value| read_unit_interval(engine, value, "set/displacement_midlevel"))
         .transpose()?;
     let mut changed = false;
+    let mut graph_writes = Vec::new();
     for id in targets {
         let item_changed = if let Some(material) = engine.doc.materials.get_mut(&id) {
+            let before = material.clone();
             let mut item_changed = false;
             if let Some(name) = &name
                 && material.name != *name
@@ -569,6 +589,12 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && material.use_transparent_shadow != value
             {
                 material.use_transparent_shadow = value;
+                item_changed = true;
+            }
+            if let Some(value) = use_bump_map_correction
+                && material.use_bump_map_correction != value
+            {
+                material.use_bump_map_correction = value;
                 item_changed = true;
             }
             if let Some(value) = &base_color_texture
@@ -643,6 +669,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 material.displacement_midlevel = value;
                 item_changed = true;
             }
+            let writes = super::shader::principled_writes(&before, material);
+            if !writes.is_empty() {
+                graph_writes.push((id.clone(), writes));
+            }
             item_changed
         } else {
             false
@@ -651,6 +681,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             engine.mark("materials", &id, ChangeKind::Updated);
             changed = true;
         }
+    }
+    for (id, writes) in graph_writes {
+        super::shader::write_authored_inputs(engine, &id, &writes)?;
     }
     Ok(changed)
 }

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, WireSegment};
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
+use crate::geom::GeneratedCorners;
 use crate::model::{CameraData, CameraProjection, RayKind};
 
 /// A camera projection in Blender's units: angles in radians, lengths in millimetres.
@@ -243,6 +244,10 @@ pub(crate) enum AlphaMode {
 #[derive(Debug, Clone)]
 pub(crate) struct Triangle {
     pub(crate) positions: [DVec3; 3],
+    /// The Generated coordinate of each corner and the Jacobian the corners share. A hit interpolates the corners over
+    /// its barycentric weights, as Cycles stores Generated per vertex and interpolates it
+    /// (`intern/cycles/blender/mesh.cpp`, `ATTR_STD_GENERATED`), so a corner value of zero stays zero.
+    pub(crate) generated: GeneratedCorners,
     pub(crate) object_index: u32,
     /// Source element index; face records carry per-slot UV bindings through subdivision copies.
     pub(crate) element_index: u32,
@@ -267,16 +272,18 @@ pub(crate) struct Triangle {
 }
 
 impl Triangle {
-    /// This triangle's shading attributes over new corner geometry.
+    /// This triangle's shading attributes over new corner geometry, whose Generated coordinates are `generated`.
     pub(crate) fn with_corners(
         &self,
         positions: [DVec3; 3],
+        generated: GeneratedCorners,
         uv: [[f64; 2]; 3],
         layer_uvs: Vec<[[f64; 2]; 3]>,
         layer_colors: Vec<[[f64; 4]; 3]>,
     ) -> Self {
         Self {
             positions,
+            generated,
             object_index: self.object_index,
             element_index: self.element_index,
             color: self.color,
@@ -299,7 +306,13 @@ impl Triangle {
         if self.lit_per_pixel {
             self.clone()
         } else {
-            self.with_corners(self.positions, self.uv, Vec::new(), Vec::new())
+            self.with_corners(
+                self.positions,
+                self.generated,
+                self.uv,
+                Vec::new(),
+                Vec::new(),
+            )
         }
     }
 }
@@ -2943,6 +2956,7 @@ mod smooth_shading_tests {
                 DVec3::new(2.0, -2.0, 0.0),
                 DVec3::new(0.0, 2.0, 0.0),
             ],
+            generated: crate::geom::GeneratedCorners::default(),
             object_index: 1,
             element_index: 1,
             color: [0.8, 0.4, 0.2, 1.0],
@@ -3232,6 +3246,7 @@ mod visibility_tests {
     fn triangle(positions: [DVec3; 3]) -> Triangle {
         Triangle {
             positions,
+            generated: crate::geom::GeneratedCorners::default(),
             object_index: 1,
             element_index: 1,
             color: [0.5, 0.5, 0.5, 1.0],

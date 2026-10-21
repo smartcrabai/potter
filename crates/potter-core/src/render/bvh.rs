@@ -616,6 +616,7 @@ mod tests {
                             center + DVec3::new(*size, -*size, 0.0),
                             center + DVec3::new(0.0, *size, 0.0),
                         ],
+                        generated: crate::geom::GeneratedCorners::default(),
                         object_index: index as u32,
                         element_index: index as u32,
                         color: [1.0; 4],

@@ -17,9 +17,9 @@
 //!
 //! Estimator contract: `evaluate` is the continuous BSDF times reflectance: the diffuse, specular,
 //! sheen and coat lobes above the surface, and the glass lobe on both sides (its reflection above,
-//! its transmission below). `continuous_density` is the density with which `path.rs` draws continuous
-//! directions (lobe mixture), so `evaluate / density` is unbiased for the mixture over the sampler's
-//! domain. The glass lobe's eval and density follow Cycles' `bsdf_microfacet_eval`, which also covers
+//! its transmission below). `continuous_density` is the density of one closure's continuous directions, its lobe
+//! mixture, so `evaluate / density` is unbiased for that closure over its sampler's domain. `path.rs` mixes the closures
+//! of a hit by selection weight. The glass lobe's eval and density follow Cycles' `bsdf_microfacet_eval`, which also covers
 //! half vectors the VNDF sampler never draws, so MIS on glass matches Cycles' eval/pdf and is not an
 //! exact density. A singular glass lobe (roughness zero) is a delta that `sample_glass` draws; light
 //! sampling cannot reach it.
@@ -102,8 +102,8 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     }
 }
 
-/// Density of the continuous (diffuse, sheen, coat and specular) directions drawn by `path.rs`, in solid
-/// angle, with the glass lobe's density as Cycles' eval and pdf define it. Diffuse is cosine-distributed;
+/// Density, in solid angle, of the continuous (diffuse, sheen, coat and specular) directions that one closure's lobe
+/// sampler draws, with the glass lobe's density as Cycles' eval and pdf define it. Diffuse is cosine-distributed;
 /// sheen is the LTC distribution; the coat and specular lobes are the GGX half-vector distribution D·cosθh
 /// mapped to the reflected direction. The glass lobe's density is its reflection above the surface and its
 /// refraction below it.
@@ -115,9 +115,10 @@ pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DV
     if let Some(coat) = layers.coat {
         density += probabilities.coat * half_vector_pdf(coat.normal, coat.roughness, view, light);
     }
-    density += probabilities.specular * half_vector_pdf(normal, params.roughness, view, light);
+    density +=
+        probabilities.specular * half_vector_pdf(layers.specular, params.roughness, view, light);
     if let Some(glass) = &layers.glass {
-        density += probabilities.transmission * glass_eval(glass, normal, view, light).1;
+        density += probabilities.transmission * glass_eval(glass, layers.specular, view, light).1;
     }
     density
 }
@@ -232,7 +233,7 @@ fn diffuse_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -
 /// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the
 /// light or view is below the surface.
 pub(crate) fn specular_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
-    specular_lobe(params, layers.normal, layers.view, light, layers.lower)
+    specular_lobe(params, layers.specular, layers.view, light, layers.lower)
 }
 
 /// The specular lobe, given the coat's lower-layer factor (set up once by the caller).
@@ -303,15 +304,28 @@ fn specular_lobe(
 /// Cycles' `CLOSURE_WEIGHT_CUTOFF`: a coat weight at or below it is not set up.
 const COAT_WEIGHT_CUTOFF: f64 = 1.0e-5;
 
-/// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator.
-pub(crate) fn evaluate(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
-    // The reflected lobes sit above the surface; the glass lobe takes both sides. A surface is hidden from no ray kind.
-    let reflected = if layers.normal.dot(light) > 0.0 {
-        reflected_lobes_coefficient(params, layers, light, RayKind::ALL_MASK)
+/// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator, keeping only the lobes
+/// that a light's ray mask admits. Cycles drops a closure from a light's direct lighting when that light excludes its
+/// ray kind (`surface_shader.h`, `_surface_shader_exclude`). The diffuse, sheen and coat lobes sit above the shading
+/// normal, so they are gated on it. The specular lobe checks its own, bent normal, so it is not gated by the shading
+/// normal, and the glass lobe takes both sides. With every kind admitted (`RayKind::ALL_MASK`) this is the whole BSDF.
+pub(crate) fn evaluate_masked(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    ray_mask: u8,
+) -> DVec3 {
+    let above_shading = if layers.normal.dot(light) > 0.0 {
+        above_shading_coefficient(params, layers, light, ray_mask)
     } else {
         DVec3::ZERO
     };
-    reflected + glass_lobes_coefficient(params, layers, light, RayKind::ALL_MASK)
+    let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
+        specular_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    above_shading + specular + glass_lobes_coefficient(params, layers, light, ray_mask)
 }
 
 /// The sheen lobe along `light`, times reflectance. It depends on the light, so an area light is
@@ -336,14 +350,13 @@ struct CoatLayer {
     albedo: f64,
 }
 
-/// The coat layer for `view`, or `None` when the coat is off or the view is below its normal. The
-/// normal is the linked Coat Normal, or the final shading normal when unlinked.
-fn coat_layer(params: &BsdfParams, view: DVec3) -> Option<CoatLayer> {
+/// The coat layer for `view`, or `None` when the coat is off or the view is below its normal. `normal` is the coat's
+/// normal: the linked Coat Normal, or the final shading normal when unlinked, bent as Cycles' coat is (`layers_at`).
+fn coat_layer(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<CoatLayer> {
     let weight = params.coat_weight.max(0.0);
     if weight <= COAT_WEIGHT_CUTOFF {
         return None;
     }
-    let normal = params.coat_normal_or_shading();
     let n_dot_v = normal.dot(view);
     if n_dot_v <= 0.0 {
         return None;
@@ -381,7 +394,14 @@ fn coat_layer(params: &BsdfParams, view: DVec3) -> Option<CoatLayer> {
 /// as Cycles layers them (`principled_bsdf_emission`, `kernel/svm/closure.h`).
 #[derive(Clone, Copy)]
 pub(crate) struct Layers {
+    /// The shading normal, which the diffuse and sheen lobes use.
     pub(crate) normal: DVec3,
+    /// The sheen's normal: the shading normal mixed towards the coat normal by the coat weight (`principled_bsdf_emission`).
+    pub(crate) sheen_normal: DVec3,
+    /// The normal of the specular and glass microfacets: the shading normal bent by [`valid_specular_normal`].
+    pub(crate) specular: DVec3,
+    /// The coat's normal, bent the same way as Cycles' `valid_coat_normal`.
+    pub(crate) coat_normal: DVec3,
     pub(crate) view: DVec3,
     coat: Option<CoatLayer>,
     sheen: SheenLobe,
@@ -389,9 +409,30 @@ pub(crate) struct Layers {
     glass: Option<GlassLobe>,
 }
 
-/// Sets up the sheen and coat layers of a shading point with normal `normal`, seen along `view`.
+/// Sets up the sheen and coat layers of a shading point with normal `normal`, seen along `view`. The geometric normal
+/// is taken as `normal` itself, so nothing is bent. Use [`layers_at`] where the geometric normal is known.
 pub(crate) fn layers(params: &BsdfParams, normal: DVec3, view: DVec3) -> Layers {
-    let coat = coat_layer(params, view);
+    // The normals coincide, so `use_bump_map_correction` has nothing to bend and takes its default.
+    layers_at(params, normal, view, normal, true)
+}
+
+/// `layers` at a point whose geometric normal is `geometric` (Cycles' `sd->Ng`). The specular, coat and glass
+/// microfacets take their normals bent by [`valid_specular_normal`]; diffuse and sheen keep `normal`.
+pub(crate) fn layers_at(
+    params: &BsdfParams,
+    normal: DVec3,
+    view: DVec3,
+    geometric: DVec3,
+    bump_correction: bool,
+) -> Layers {
+    let specular = valid_specular_normal(geometric, normal, view, bump_correction);
+    let coat_normal = valid_specular_normal(
+        geometric,
+        params.coat_normal_or_shading(),
+        view,
+        bump_correction,
+    );
+    let coat = coat_layer(params, coat_normal, view);
     // Cycles sets the sheen's normal to `safe_normalize(mix(N, coat normal, saturate(coat weight)))`
     // (`kernel/svm/closure.h`, `principled_bsdf_emission`), so the sheen frame and LTC follow the coat.
     let coat_weight = params.coat_weight.clamp(0.0, 1.0);
@@ -403,15 +444,67 @@ pub(crate) fn layers(params: &BsdfParams, normal: DVec3, view: DVec3) -> Layers 
     };
     let sheen = sheen_lobe(params, sheen_normal, view);
     let lower = coat_lower_factor_of(params, coat.as_ref()) * sheen.layer_weight();
-    let glass = glass_lobe(params, normal, view);
+    let glass = glass_lobe(params, specular, view);
     Layers {
         normal,
+        sheen_normal,
+        specular,
+        coat_normal,
         view,
         coat,
         sheen,
         lower,
         glass,
     }
+}
+
+/// Cycles' `maybe_ensure_valid_specular_reflection` (`kernel/closure/bsdf_util.h:399-409`): `normal`, unless the material's
+/// `use_bump_map_correction` is off or `normal` is the geometric normal. Cycles applies it to every closure that
+/// reflects specularly (the Principled specular, coat and glass, and the Glossy and Glass nodes).
+pub(crate) fn valid_specular_normal(
+    geometric: DVec3,
+    normal: DVec3,
+    view: DVec3,
+    bump_correction: bool,
+) -> DVec3 {
+    if !bump_correction || normal == geometric {
+        return normal;
+    }
+    ensure_valid_specular_reflection(geometric, view, normal)
+}
+
+/// Cycles' `ensure_valid_specular_reflection` (`bsdf_util.h:322-395`): raises `normal` towards `geometric` until the
+/// reflection of `incoming` stays above the threshold `min(0.9 cos_i, 0.01)`. Cycles solves the reflection equation in
+/// the plane through `geometric` and `normal`, where `x` is the normal's tangent and `nz` its height above `geometric`.
+fn ensure_valid_specular_reflection(geometric: DVec3, incoming: DVec3, normal: DVec3) -> DVec3 {
+    let reflected = 2.0 * normal.dot(incoming) * normal - incoming;
+    let iz = incoming.dot(geometric);
+    let threshold = (0.9 * iz).min(0.01);
+    if geometric.dot(reflected) >= threshold {
+        return normal;
+    }
+    let tangent = normal - normal.dot(geometric) * geometric;
+    let x = if tangent.length_squared() > 0.0 {
+        tangent.normalize()
+    } else {
+        normal
+    };
+    let ix = incoming.dot(x);
+    let a = ix * ix + iz * iz;
+    if a <= 0.0 {
+        return normal;
+    }
+    let b = 2.0 * (a + iz * threshold);
+    let c = (threshold + iz) * (threshold + iz);
+    let root = (b * b - 4.0 * a * c).max(0.0).sqrt();
+    let nz2 = if ix < 0.0 {
+        0.25 * (b + root) / a
+    } else {
+        0.25 * (b - root) / a
+    };
+    let nx = (1.0 - nz2).max(0.0).sqrt();
+    let nz = nz2.max(0.0).sqrt();
+    nx * x + nz * geometric
 }
 
 impl Layers {
@@ -423,12 +516,6 @@ impl Layers {
     /// Sheen direction for the square sample `(u, v)` in `[0, 1)²`, drawn from the LTC distribution.
     pub(crate) fn sample_sheen(&self, u: f64, v: f64) -> DVec3 {
         self.sheen.direction(u, v)
-    }
-
-    /// Whether a light below the surface can reach it through the glass lobe. A singular lobe is drawn only as a
-    /// delta, which light sampling cannot reach, so it does not count.
-    pub(crate) fn transmits(&self) -> bool {
-        self.glass.is_some_and(|glass| !glass.singular)
     }
 }
 
@@ -638,13 +725,10 @@ pub(super) fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
     (tangent, normal.cross(tangent))
 }
 
-/// The reflected lobes of `params` towards `light` that a light emits through, each kept only where the light's ray
-/// mask admits its ray kind. Cycles drops a closure from a light's direct lighting when that light excludes its kind
-/// (`surface_shader.h`, `_surface_shader_exclude`). Sheen is a diffuse-class closure (`CLOSURE_IS_BSDF_DIFFUSE`,
-/// `svm/types.h`), and the coat is a glossy GGX closure. This is not side-gated: the caller decides which side of the
-/// surface the light is on (`evaluate`, `direct_lighting`), and the raster's area lights integrate over a centre that
-/// may lie below the horizon.
-pub(crate) fn reflected_lobes_coefficient(
+/// The lobes above the shading normal that a ray mask admits, at `light`: diffuse and sheen on the `Diffuse` bit, the
+/// coat on the `Glossy` bit. Sheen is a diffuse-class closure (`CLOSURE_IS_BSDF_DIFFUSE`, `svm/types.h`), and the coat
+/// is a glossy GGX closure. The caller gates this on the light being above the shading normal, as `evaluate` does.
+pub(crate) fn above_shading_coefficient(
     params: &BsdfParams,
     layers: &Layers,
     light: DVec3,
@@ -655,12 +739,29 @@ pub(crate) fn reflected_lobes_coefficient(
     } else {
         DVec3::ZERO
     };
-    let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
-        specular_coefficient(params, layers, light) + coat_coefficient(params, layers, light)
+    let coat = if ray_mask & RayKind::Glossy.bit() != 0 {
+        coat_coefficient(params, layers, light)
     } else {
         DVec3::ZERO
     };
-    diffuse + specular
+    diffuse + coat
+}
+
+/// The reflected lobes of `params` at `light` that a ray mask admits, without the glass lobe and without the shading-side
+/// gate: the realtime raster's reflective term, which shades the diffuse lobe without subsurface (`without_subsurface`).
+/// The caller gates it where the raster does.
+pub(crate) fn reflected_lobes_coefficient(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    ray_mask: u8,
+) -> DVec3 {
+    let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
+        specular_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    above_shading_coefficient(params, layers, light, ray_mask) + specular
 }
 
 /// The glass lobe towards `light`, kept where the light's ray mask admits glossy or transmission. A glass closure is
@@ -1035,11 +1136,11 @@ pub(crate) fn glass_coefficient(params: &BsdfParams, layers: &Layers, light: DVe
     let Some(lobe) = layers.glass.as_ref() else {
         return DVec3::ZERO;
     };
-    let cosine = layers.normal.dot(light).abs();
+    let cosine = layers.specular.dot(light).abs();
     if cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    let (value, _) = glass_eval(lobe, layers.normal, layers.view, light);
+    let (value, _) = glass_eval(lobe, layers.specular, layers.view, light);
     value / cosine * (params.reflectance.clamp(0.0, 1.0) * layers.lower)
 }
 
@@ -1066,7 +1167,7 @@ pub(crate) fn sample_glass(
     let Some(lobe) = layers.glass.as_ref() else {
         return GlassSample::Absorbed;
     };
-    let (normal, view) = (layers.normal, layers.view);
+    let (normal, view) = (layers.specular, layers.view);
     let half = if lobe.singular {
         normal
     } else {
@@ -1892,7 +1993,12 @@ mod single_bounce_tests {
                     * RADIUS
                     * RADIUS;
                 let weight = area * cos_emitter / (distance * distance) * radiance * cos_receiver;
-                total += evaluate(params, &layers(params, normal, view), direction) * weight;
+                total += evaluate_masked(
+                    params,
+                    &layers(params, normal, view),
+                    direction,
+                    RayKind::ALL_MASK,
+                ) * weight;
             }
         }
         total
@@ -2153,14 +2259,36 @@ mod subsurface_tests {
     }
 
     #[test]
-    fn an_unevaluated_method_has_no_subsurface_lobe() {
-        // A method Potter does not evaluate must not take probability mass from the diffuse lobe.
-        let params = principled(SubsurfaceMethod::Mixed, 0.5);
-        let layers = layers(&params, DVec3::Z, DVec3::Z);
-        assert_eq!(lobe_probabilities(&params, &layers).subsurface, 0.0);
+    fn a_reflection_below_the_geometric_plane_is_lifted_and_a_valid_normal_is_kept() {
+        // Cycles' `maybe_ensure_valid_specular_reflection`: the normal (0.9, 0, 0.436) about 64 degrees from Ng reflects
+        // the view at 30 degrees to a direction below Ng (R_z ≈ -0.145), so it is raised until R_z reaches the
+        // threshold min(0.9 cos_i, 0.01) = 0.01.
+        let geometric = DVec3::Z;
+        let view = DVec3::new(0.5, 0.0, 0.866_025_403_784_438_6);
+        let tilted = DVec3::new(0.9, 0.0, 0.435_889_894_354_067_4).normalize();
+        let reflect = |normal: DVec3| 2.0 * normal.dot(view) * normal - view;
+        let threshold = (0.9 * view.dot(geometric)).min(0.01);
+        assert!(geometric.dot(reflect(tilted)) < threshold);
+        let bent = valid_specular_normal(geometric, tilted, view, true);
+        assert!(
+            geometric.dot(reflect(bent)) >= threshold - 1.0e-9,
+            "the lifted reflection {} is below the threshold {threshold}",
+            geometric.dot(reflect(bent))
+        );
+        assert!(
+            bent.dot(geometric) > tilted.dot(geometric),
+            "the normal rises towards Ng"
+        );
+        // A normal whose reflection is already above the threshold, and the geometric normal itself, are unchanged.
         assert_eq!(
-            subsurface_closure_weight(&params, DVec3::Z, DVec3::Z, layers.lower),
-            DVec3::ZERO
+            valid_specular_normal(geometric, DVec3::Z, view, true),
+            DVec3::Z
+        );
+        assert_eq!(valid_specular_normal(geometric, view, view, true), view);
+        // With `use_bump_map_correction` off, the normal is kept as it is (`maybe_ensure_valid_specular_reflection`).
+        assert_eq!(
+            valid_specular_normal(geometric, tilted, view, false),
+            tilted
         );
     }
 
