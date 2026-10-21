@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::BTreeMap, path::Path};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    ops::{Deref, Range},
+    path::Path,
+};
 
 use glam::{DMat4, DVec3};
 
@@ -38,10 +43,13 @@ use super::{
         point_intensity, spot_attenuation, spread_attenuation, spread_region,
     },
     raster::{
-        Camera, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals, camera_eye,
-        rasterize_with_lines, ray_for_sample, smooth_shadow_origin,
+        Camera, CameraFrame, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals,
+        camera_eye, camera_frame, rasterize_with_lines, ray_for_sample, ray_for_sample_in_frame,
+        smooth_shadow_origin,
     },
-    scene::{Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space},
+    scene::{
+        ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space,
+    },
 };
 
 const RAY_EPSILON: f64 = 1.0e-5;
@@ -190,6 +198,22 @@ fn transparent_tint(params: &BsdfParams) -> DVec3 {
     DVec3::from_array(params.transparent_tint).max(DVec3::ZERO)
 }
 
+/// Cycles' shadow transparency `Σ w · (1 − α) · tint` over each closure's `(weight, alpha, tint)`, one when no closure
+/// has weight (`surface_shader_transparency`). `Closures::new` and the shadow probe both take it, so they cannot drift.
+fn shadow_transparency(closures: impl Iterator<Item = (f64, f64, DVec3)>) -> DVec3 {
+    let mut transparency = DVec3::ZERO;
+    let mut weight_total = 0.0;
+    for (weight, alpha, tint) in closures {
+        transparency += tint * (weight * (1.0 - alpha));
+        weight_total += weight;
+    }
+    if weight_total > 0.0 {
+        transparency
+    } else {
+        DVec3::ONE
+    }
+}
+
 /// The share a surface event takes: a reflective draw from closure `Reflect`, or a camera pass-through whose
 /// `multiplier` is the throughput Cycles' transparent closure gives it.
 enum Pick {
@@ -231,8 +255,7 @@ fn diffuse_smoothing(smooth: DVec3, normal: DVec3, light: DVec3) -> f64 {
     1.0 / (1.0 + lambda)
 }
 
-/// The closures of one hit with the totals Cycles' closure loops compute: selection, emission, coverage, and shadow
-/// transparency.
+/// The closures of one hit with the totals Cycles' closure loops compute: selection, emission, and coverage.
 struct Closures {
     items: Vec<HitClosure>,
     /// The smooth shading normal, Cycles' `sd->N` before bump or normal mapping: the reference of the shading-side test.
@@ -253,11 +276,8 @@ struct Closures {
     emission_pass: DVec3,
     /// Weight-averaged base colour: the albedo pass.
     albedo: [f64; 4],
-    /// Camera coverage, one minus the mean of the transparency below; zero for a hit without closures.
+    /// Camera coverage, one minus the mean shadow transparency of the closures; zero for a hit without closures.
     coverage: f64,
-    /// Shadow transparency, `Σ w · (1 − α) · tint` (Cycles' `surface_shader_transparency`); one for a hit without
-    /// closures.
-    transparency: DVec3,
 }
 
 impl Closures {
@@ -268,7 +288,6 @@ impl Closures {
         let mut emission_pass = DVec3::ZERO;
         let mut albedo = [0.0; 4];
         let mut weight_total = 0.0;
-        let mut transparency = DVec3::ZERO;
         for closure in &items {
             let (weight, params) = (closure.weight, &closure.params);
             let reflect = closure.reflect_weight();
@@ -283,13 +302,17 @@ impl Closures {
                 *channel += weight * value;
             }
             weight_total += weight;
-            transparency += transparent_tint(params) * (weight * (1.0 - params.alpha));
         }
         if weight_total > 0.0 {
             albedo = albedo.map(|channel| channel / weight_total);
-        } else {
-            transparency = DVec3::ONE;
         }
+        let transparency = shadow_transparency(items.iter().map(|closure| {
+            (
+                closure.weight,
+                closure.params.alpha,
+                transparent_tint(&closure.params),
+            )
+        }));
         // Cycles' film alpha is one minus the mean transparent weight (`surface_shader_transparency`), tinted. An Add with a
         // Transparent arm therefore covers the pixel by its other arms only, and a hit without closures covers nothing.
         let coverage = (1.0 - transparency.element_sum() / 3.0).clamp(0.0, 1.0);
@@ -304,7 +327,6 @@ impl Closures {
             emission_pass,
             albedo,
             coverage,
-            transparency,
         }
     }
 
@@ -747,6 +769,260 @@ impl WorldImportanceSampler {
     }
 }
 
+/// Stack size of a render worker, so recursive shader evaluation has the headroom of the main thread.
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// The read-only geometry a path trace reads. It has no interior mutability, so every worker shares it.
+#[derive(Clone, Copy)]
+struct SharedGeometry<'a> {
+    triangles: &'a [Triangle],
+    materials: &'a [Material],
+    prepared: &'a [PreparedMaterial],
+    objects: &'a [ObjectRecord],
+    elements: &'a [ElementRecord],
+}
+
+impl<'a> SharedGeometry<'a> {
+    fn of(geometry: &'a Geometry) -> Self {
+        Self {
+            triangles: geometry.triangles.as_slice(),
+            materials: geometry.materials.as_slice(),
+            prepared: geometry.prepared.as_slice(),
+            objects: geometry.objects.as_slice(),
+            elements: geometry.elements.as_slice(),
+        }
+    }
+}
+
+/// A trace's view of the geometry: the shared part, and the sink its shading warnings are recorded in. Each worker
+/// records into its own sink, and the sinks are merged in pixel order once the workers finish.
+#[derive(Clone, Copy)]
+struct TraceGeometry<'a> {
+    shared: SharedGeometry<'a>,
+    warnings: &'a RefCell<Vec<serde_json::Value>>,
+}
+
+impl<'a> TraceGeometry<'a> {
+    fn of(geometry: &'a Geometry) -> Self {
+        Self {
+            shared: SharedGeometry::of(geometry),
+            warnings: &geometry.shader_warnings,
+        }
+    }
+}
+
+impl<'a> Deref for TraceGeometry<'a> {
+    type Target = SharedGeometry<'a>;
+
+    fn deref(&self) -> &SharedGeometry<'a> {
+        &self.shared
+    }
+}
+
+/// What the workers of one render share. Every field is read-only, so the job is shared by reference.
+struct RenderJob<'a> {
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    geometry: SharedGeometry<'a>,
+    bvh: &'a Bvh,
+    lights: &'a [PointLight],
+    volumes: &'a [VolumeInstance<'a>],
+    images: &'a BTreeMap<String, ImageData>,
+    importance: Option<&'a WorldImportanceSampler>,
+    /// The camera and its frame for each eye: one for a mono camera, the left then the right eye for anaglyph.
+    eyes: &'a [(Camera, CameraFrame)],
+    anaglyph: bool,
+    width: u32,
+    height: u32,
+    width_usize: usize,
+    samples: u32,
+    seed: u32,
+    max_bounces: u32,
+    volume_bounces: u32,
+    transparent_max_bounces: u32,
+    film_transparent: bool,
+    environment: DVec3,
+}
+
+/// Renders the rows `rows` of the frame into `linear` and `rgba`, the bands of the output this worker owns. Its
+/// shading warnings are recorded in `warnings`.
+fn render_rows(
+    job: &RenderJob<'_>,
+    rows: Range<usize>,
+    linear: &mut [[f32; 4]],
+    rgba: &mut [u8],
+    warnings: &RefCell<Vec<serde_json::Value>>,
+) -> Result<()> {
+    let geometry = TraceGeometry {
+        shared: job.geometry,
+        warnings,
+    };
+    let scene = SceneRefs {
+        doc: job.doc,
+        snapshot: job.snapshot,
+        geometry: &geometry,
+        bvh: job.bvh,
+        lights: job.lights,
+        volumes: job.volumes,
+        images: job.images,
+        importance: job.importance,
+    };
+    let bounces = Bounces {
+        surface: job.max_bounces,
+        volume: job.volume_bounces,
+        transparent: job.transparent_max_bounces,
+    };
+    let mut evaluator_workspace = EvaluatorWorkspace::default();
+    for (row_index, row) in rows.enumerate() {
+        let y = u32::try_from(row).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "image height exceeds platform limits",
+            )
+        })?;
+        for x in 0..job.width {
+            let column = usize::try_from(x).map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "image width exceeds platform limits",
+                )
+            })?;
+            let index = row_index * job.width_usize + column;
+            let mut sum = DVec3::ZERO;
+            let mut alpha_sum = 0.0;
+            for sample_index in 0..job.samples {
+                let mut rng = Pcg32::for_sample(job.seed, x, y, sample_index);
+                let sample_x = rng.next_f64();
+                let sample_y = rng.next_f64();
+                let (radiance, alpha) = if job.anaglyph {
+                    let (left_camera, left_frame) = &job.eyes[0];
+                    let (right_camera, right_frame) = &job.eyes[1];
+                    let left_ray = ray_for_sample_in_frame(
+                        left_frame,
+                        left_camera,
+                        job.width,
+                        job.height,
+                        x,
+                        y,
+                        sample_x,
+                        sample_y,
+                    )?;
+                    let right_ray = ray_for_sample_in_frame(
+                        right_frame,
+                        right_camera,
+                        job.width,
+                        job.height,
+                        x,
+                        y,
+                        sample_x,
+                        sample_y,
+                    )?;
+                    let mut left_rng = rng.clone();
+                    let mut right_rng = rng.clone();
+                    // A sample with no ray (outside a fisheye's circle, or past its field of view) is opaque black: Blender's
+                    // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
+                    let (left, left_alpha) = match left_ray {
+                        Some((left_origin, left_direction)) => trace_path(
+                            scene,
+                            bounces,
+                            left_origin,
+                            left_direction,
+                            job.environment,
+                            &mut left_rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    };
+                    let (right, right_alpha) = match right_ray {
+                        Some((right_origin, right_direction)) => trace_path(
+                            scene,
+                            bounces,
+                            right_origin,
+                            right_direction,
+                            job.environment,
+                            &mut right_rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    };
+                    (
+                        DVec3::new(left.x, right.y, right.z),
+                        f64::midpoint(left_alpha, right_alpha),
+                    )
+                } else {
+                    let (camera, frame) = &job.eyes[0];
+                    match ray_for_sample_in_frame(
+                        frame, camera, job.width, job.height, x, y, sample_x, sample_y,
+                    )? {
+                        Some((origin, direction)) => trace_path(
+                            scene,
+                            bounces,
+                            origin,
+                            direction,
+                            job.environment,
+                            &mut rng,
+                            &mut evaluator_workspace,
+                        )?,
+                        None => (DVec3::ZERO, 1.0),
+                    }
+                };
+                sum += radiance;
+                alpha_sum += alpha;
+            }
+            let sample_scale = 1.0 / f64::from(job.samples);
+            let color = sum * sample_scale;
+            let alpha = if job.film_transparent {
+                alpha_sum * sample_scale
+            } else {
+                1.0
+            };
+            linear[index] = [
+                finite_f32(color.x),
+                finite_f32(color.y),
+                finite_f32(color.z),
+                finite_f32(alpha),
+            ];
+            rgba[index * 4..index * 4 + 4].copy_from_slice(&[
+                to_srgb_byte(color.x),
+                to_srgb_byte(color.y),
+                to_srgb_byte(color.z),
+                (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]);
+        }
+    }
+    Ok(())
+}
+
+/// The contiguous row bands that split `height` rows across at most `band_count` workers, in row order. Each band has
+/// `ceil(height / band_count)` rows except the last, and no band is empty.
+fn band_rows(height: usize, band_count: usize) -> Vec<Range<usize>> {
+    let rows_per_band = height.div_ceil(band_count.max(1)).max(1);
+    (0..height)
+        .step_by(rows_per_band)
+        .map(|start| start..(start + rows_per_band).min(height))
+        .collect()
+}
+
+/// Appends one worker's shading warnings to `sink`, dropping those the serial render would not have recorded. A
+/// Principled input is recorded once per (material, input) (`record_unevaluated_inputs`); the layer warnings once per
+/// equal warning (`layer_index`, `color_layer_missing`). Workers record into their own sinks, so a duplicate across
+/// workers is caught here, against the workers that came before in pixel order.
+fn merge_shader_warnings(sink: &RefCell<Vec<serde_json::Value>>, warnings: Vec<serde_json::Value>) {
+    let mut recorded = sink.borrow_mut();
+    for warning in warnings {
+        let duplicate = match warning["input"].as_str() {
+            Some(input) => recorded.iter().any(|existing| {
+                existing["material"] == warning["material"]
+                    && existing["input"].as_str() == Some(input)
+            }),
+            None => recorded.contains(&warning),
+        };
+        if !duplicate {
+            recorded.push(warning);
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "camera and sampling configuration are explicit at the render boundary"
@@ -843,122 +1119,102 @@ pub(super) fn render(
     })?;
     let environment = world.max(DVec3::ZERO);
 
-    let scene = SceneRefs {
-        doc,
-        snapshot,
-        geometry,
-        bvh: &bvh,
-        lights: &lights,
-        volumes: &volumes,
-        images,
-        importance: world_importance.as_ref(),
-    };
-    let bounces = Bounces {
-        surface: max_bounces,
-        volume: volume_bounces,
-        transparent: transparent_max_bounces,
-    };
-
-    for y in 0..height {
-        for x in 0..width {
-            let index = usize::try_from(y)
-                .ok()
-                .and_then(|row| row.checked_mul(width_usize))
-                .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "pixel index exceeds platform limits",
-                    )
-                })?;
-            let mut sum = DVec3::ZERO;
-            let mut alpha_sum = 0.0;
-            for sample_index in 0..samples {
-                let mut rng = Pcg32::for_sample(seed, x, y, sample_index);
-                let sample_x = rng.next_f64();
-                let sample_y = rng.next_f64();
-                let (radiance, alpha) = if camera.stereo_mode == StereoMode::Anaglyph {
-                    let left_camera = camera_eye(camera, -1.0);
-                    let right_camera = camera_eye(camera, 1.0);
-                    let left_ray =
-                        ray_for_sample(&left_camera, width, height, x, y, sample_x, sample_y)?;
-                    let right_ray =
-                        ray_for_sample(&right_camera, width, height, x, y, sample_x, sample_y)?;
-                    let mut left_rng = rng.clone();
-                    let mut right_rng = rng.clone();
-                    // A sample with no ray (outside a fisheye's circle, or past its field of view) is opaque black: Blender's
-                    // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
-                    let (left, left_alpha) = match left_ray {
-                        Some((left_origin, left_direction)) => trace_path(
-                            scene,
-                            bounces,
-                            left_origin,
-                            left_direction,
-                            environment,
-                            &mut left_rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
-                    };
-                    let (right, right_alpha) = match right_ray {
-                        Some((right_origin, right_direction)) => trace_path(
-                            scene,
-                            bounces,
-                            right_origin,
-                            right_direction,
-                            environment,
-                            &mut right_rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
-                    };
-                    (
-                        DVec3::new(left.x, right.y, right.z),
-                        f64::midpoint(left_alpha, right_alpha),
-                    )
-                } else {
-                    match ray_for_sample(camera, width, height, x, y, sample_x, sample_y)? {
-                        Some((origin, direction)) => trace_path(
-                            scene,
-                            bounces,
-                            origin,
-                            direction,
-                            environment,
-                            &mut rng,
-                            &mut evaluator_workspace,
-                        )?,
-                        None => (DVec3::ZERO, 1.0),
-                    }
-                };
-                sum += radiance;
-                alpha_sum += alpha;
+    if pixel_count > 0 {
+        let anaglyph = camera.stereo_mode == StereoMode::Anaglyph;
+        let eyes = if anaglyph {
+            let left_camera = camera_eye(camera, -1.0);
+            let right_camera = camera_eye(camera, 1.0);
+            vec![
+                (left_camera, camera_frame(&left_camera, width, height)?),
+                (right_camera, camera_frame(&right_camera, width, height)?),
+            ]
+        } else {
+            vec![(*camera, camera_frame(camera, width, height)?)]
+        };
+        let height_usize = usize::try_from(height).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "image height exceeds platform limits",
+            )
+        })?;
+        let job = RenderJob {
+            doc,
+            snapshot,
+            geometry: SharedGeometry::of(geometry),
+            bvh: &bvh,
+            lights: &lights,
+            volumes: &volumes,
+            images,
+            importance: world_importance.as_ref(),
+            eyes: &eyes,
+            anaglyph,
+            width,
+            height,
+            width_usize,
+            samples,
+            seed,
+            max_bounces,
+            volume_bounces,
+            transparent_max_bounces,
+            film_transparent,
+            environment,
+        };
+        let bands = band_rows(
+            height_usize,
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        );
+        let outcomes = std::thread::scope(|scope| {
+            let job = &job;
+            let mut workers = Vec::with_capacity(bands.len());
+            let mut linear_rest = output.linear_rgba.as_mut_slice();
+            let mut rgba_rest = output.rgba.as_mut_slice();
+            for rows in bands {
+                let band_len = rows.len() * width_usize;
+                let (linear, linear_tail) = std::mem::take(&mut linear_rest).split_at_mut(band_len);
+                let (rgba, rgba_tail) = std::mem::take(&mut rgba_rest).split_at_mut(band_len * 4);
+                linear_rest = linear_tail;
+                rgba_rest = rgba_tail;
+                workers.push(
+                    std::thread::Builder::new()
+                        .stack_size(WORKER_STACK_BYTES)
+                        .spawn_scoped(scope, move || {
+                            let warnings = RefCell::new(Vec::new());
+                            let result = render_rows(job, rows, linear, rgba, &warnings);
+                            (result, warnings.into_inner())
+                        }),
+                );
             }
-            let sample_scale = 1.0 / f64::from(samples);
-            let color = sum * sample_scale;
-            let alpha = if film_transparent {
-                alpha_sum * sample_scale
-            } else {
-                1.0
-            };
-            output.linear_rgba[index] = [
-                finite_f32(color.x),
-                finite_f32(color.y),
-                finite_f32(color.z),
-                finite_f32(alpha),
-            ];
-            output.rgba[index * 4..index * 4 + 4].copy_from_slice(&[
-                to_srgb_byte(color.x),
-                to_srgb_byte(color.y),
-                to_srgb_byte(color.z),
-                (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-            ]);
+            workers
+                .into_iter()
+                .map(|worker| match worker {
+                    Ok(handle) => handle.join().unwrap_or_else(|_| {
+                        (
+                            Err(PotError::new(
+                                ErrorCode::InternalError,
+                                "render worker panicked",
+                            )),
+                            Vec::new(),
+                        )
+                    }),
+                    Err(error) => (
+                        Err(PotError::new(
+                            ErrorCode::InternalError,
+                            format!("cannot start a render worker: {error}"),
+                        )),
+                        Vec::new(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        });
+        for (result, warnings) in outcomes {
+            merge_shader_warnings(&geometry.shader_warnings, warnings);
+            result?;
         }
     }
 
     write_center_passes(
         doc,
-        snapshot,
-        geometry,
+        &TraceGeometry::of(geometry),
         &bvh,
         &volumes,
         images,
@@ -1204,7 +1460,7 @@ fn world_radiance(
 struct SceneRefs<'a, 'v> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
-    geometry: &'a Geometry,
+    geometry: &'a TraceGeometry<'a>,
     bvh: &'a Bvh,
     lights: &'a [PointLight],
     volumes: &'a [VolumeInstance<'v>],
@@ -1424,15 +1680,7 @@ fn trace_path(
     let mut diffuse_ancestor = false;
     // The volume stack: the media the path is inside, innermost last. It starts with the mesh media that contain the
     // camera (Cycles' `volume_stack_init`).
-    let mut media = camera_media(
-        doc,
-        snapshot,
-        geometry,
-        bvh,
-        origin,
-        images,
-        evaluator_workspace,
-    )?;
+    let mut media = camera_media(doc, geometry, bvh, origin, images, evaluator_workspace)?;
     loop {
         let hit = match exit_hit.take() {
             Some(exit) => Some(exit),
@@ -1451,7 +1699,6 @@ fn trace_path(
             nearest_light_hit(lights, origin, direction, receiver, surface_distance)
         });
         let segment_limit = light.map_or(surface_distance, |light| light.distance);
-        let environment = world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
         // The exit probe is a local intersection inside the object (`subsurface_disk`), not a light path: no volume
         // transport, emission or scatter applies along it, so it takes the neutral segment.
         let stack = if exit_entry.is_some() {
@@ -1593,7 +1840,13 @@ fn trace_path(
                             incoming: direction,
                             phase: &phase,
                             light_weights: &weights,
-                            environment,
+                            environment: world_radiance(
+                                doc,
+                                &snapshot.scene_id,
+                                images,
+                                direction,
+                                environment,
+                            )?,
                         },
                         budget,
                         rng,
@@ -1647,7 +1900,13 @@ fn trace_path(
                             incoming: direction,
                             phase: &phase,
                             light_weights: &weights,
-                            environment,
+                            environment: world_radiance(
+                                doc,
+                                &snapshot.scene_id,
+                                images,
+                                direction,
+                                environment,
+                            )?,
                         },
                         budget,
                         rng,
@@ -1720,7 +1979,13 @@ fn trace_path(
                             incoming: direction,
                             phase: &phase,
                             light_weights: &weights,
-                            environment,
+                            environment: world_radiance(
+                                doc,
+                                &snapshot.scene_id,
+                                images,
+                                direction,
+                                environment,
+                            )?,
                         },
                         budget,
                         rng,
@@ -1771,7 +2036,13 @@ fn trace_path(
                                 incoming: direction,
                                 phase: &phase,
                                 light_weights: &weights,
-                                environment,
+                                environment: world_radiance(
+                                    doc,
+                                    &snapshot.scene_id,
+                                    images,
+                                    direction,
+                                    environment,
+                                )?,
                             },
                             budget,
                             rng,
@@ -1820,13 +2091,14 @@ fn trace_path(
                     power_heuristic(phase_pdf, volume_sampling_pdf(direction, importance))
                 }
             };
+            let environment =
+                world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
             radiance += throughput * environment * environment_weight;
             escaped = true;
             break;
         };
         let mut surface = make_surface(
             doc,
-            snapshot,
             geometry,
             hit,
             origin,
@@ -2019,8 +2291,7 @@ fn trace_path(
 )]
 fn write_center_passes(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     volumes: &[VolumeInstance<'_>],
     images: &BTreeMap<String, ImageData>,
@@ -2065,7 +2336,6 @@ fn write_center_passes(
             };
             let surface = make_surface(
                 doc,
-                snapshot,
                 geometry,
                 hit,
                 origin,
@@ -2082,7 +2352,7 @@ fn write_center_passes(
             output.normals[index] = surface.normal.to_array().map(finite_f32);
             output.ambient_occlusion[index] = finite_f32(super::raster::ambient_visibility(
                 bvh,
-                &geometry.triangles,
+                geometry.triangles,
                 surface.point,
                 surface.geometric_normal,
                 surface.normal,
@@ -2216,14 +2486,14 @@ fn overlay_rasterized_lines(
 }
 
 fn closest_hit(
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     origin: DVec3,
     direction: DVec3,
     t_min: f64,
     t_max: f64,
 ) -> Option<BvhHit> {
-    bvh.closest_hit_two_sided(&geometry.triangles, origin, direction, t_min, t_max)
+    bvh.closest_hit_two_sided(geometry.triangles, origin, direction, t_min, t_max)
 }
 
 /// The shading of one hit for the transparent pass of a realtime shadow ray (`render/scene.rs`). Each closure carries its
@@ -2232,7 +2502,6 @@ fn closest_hit(
 /// evaluation runs.
 pub(super) fn hit_params(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
     geometry: &Geometry,
     hit: BvhHit,
     origin: DVec3,
@@ -2242,8 +2511,7 @@ pub(super) fn hit_params(
 ) -> Result<SurfaceShading> {
     with_hit_frame(
         doc,
-        snapshot,
-        geometry,
+        &TraceGeometry::of(geometry),
         hit,
         origin,
         direction,
@@ -2280,8 +2548,7 @@ struct HitFrame<'a> {
 /// Builds the frame of `hit` and calls `body` with it: the one place a hit's geometry, UVs and context are set up.
 fn with_hit_frame<T>(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     hit: BvhHit,
     origin: DVec3,
     direction: DVec3,
@@ -2317,7 +2584,7 @@ fn with_hit_frame<T>(
         }
     };
 
-    let object = object_for_index(&geometry.objects, triangle.object_index).ok_or_else(|| {
+    let object = object_for_index(geometry.objects, triangle.object_index).ok_or_else(|| {
         PotError::new(
             ErrorCode::EvaluationFailed,
             "triangle references an unmapped object",
@@ -2358,12 +2625,12 @@ fn with_hit_frame<T>(
     let context = layered_context(
         doc,
         images,
-        &geometry.shader_warnings,
+        geometry.warnings,
         object,
         triangle,
         HitPose {
             point,
-            object: object_space(snapshot, object, point),
+            object: object_space(object, point),
             normal,
             view: -direction,
             barycentric: hit.barycentric,
@@ -2424,8 +2691,7 @@ fn surface_media(object_index: u32, volume: &[ShaderClosure]) -> Vec<MeshMedium>
 
 fn make_surface(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     hit: BvhHit,
     origin: DVec3,
     direction: DVec3,
@@ -2433,104 +2699,134 @@ fn make_surface(
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
     let triangle_index = hit.triangle_index;
-    with_hit_frame(
-        doc,
-        snapshot,
-        geometry,
-        hit,
-        origin,
-        direction,
-        images,
-        |frame| {
-            let shading = evaluate_surface_with_workspace(
-                frame.material,
-                frame.prepared,
-                &frame.context,
-                evaluator_workspace,
-            )?;
-            // A displacement height field perturbs every closure's normal, as Cycles' bump displaces `sd->N` before
-            // the closures are built.
-            let gradient = if shading.displacement_height != 0.0
-                && frame.material.displacement_method != "displacement"
-            {
-                Some(height_gradient(&frame.context, frame.normal, |sample| {
-                    evaluate_displacement_with_workspace(
-                        frame.material,
-                        frame.prepared,
-                        sample,
-                        evaluator_workspace,
-                    )
-                })?)
-            } else {
-                None
-            };
-            // Cycles' bump from displacement writes the bumped normal into `sd->N` before the closures are built
-            // (`scene/shader_graph.cpp`, `bump_from_displacement`), so the shading-side test and the diffuse smoothing
-            // measure against the bumped normal, not the undisplaced one.
-            let smooth = match gradient {
-                Some(shift) => {
-                    let bumped = (frame.normal - shift).normalize_or_zero();
-                    let bumped = if bumped == DVec3::ZERO {
-                        frame.normal
-                    } else {
-                        bumped
-                    };
-                    if bumped.dot(-direction) < 0.0 {
-                        -bumped
-                    } else {
-                        bumped
-                    }
+    with_hit_frame(doc, geometry, hit, origin, direction, images, |frame| {
+        let shading = evaluate_surface_with_workspace(
+            frame.material,
+            frame.prepared,
+            &frame.context,
+            evaluator_workspace,
+        )?;
+        // A displacement height field perturbs every closure's normal, as Cycles' bump displaces `sd->N` before
+        // the closures are built.
+        let gradient = if shading.displacement_height != 0.0
+            && frame.material.displacement_method != "displacement"
+        {
+            Some(height_gradient(&frame.context, frame.normal, |sample| {
+                evaluate_displacement_with_workspace(
+                    frame.material,
+                    frame.prepared,
+                    sample,
+                    evaluator_workspace,
+                )
+            })?)
+        } else {
+            None
+        };
+        // Cycles' bump from displacement writes the bumped normal into `sd->N` before the closures are built
+        // (`scene/shader_graph.cpp`, `bump_from_displacement`), so the shading-side test and the diffuse smoothing
+        // measure against the bumped normal, not the undisplaced one.
+        let smooth = match gradient {
+            Some(shift) => {
+                let bumped = (frame.normal - shift).normalize_or_zero();
+                let bumped = if bumped == DVec3::ZERO {
+                    frame.normal
+                } else {
+                    bumped
+                };
+                if bumped.dot(-direction) < 0.0 {
+                    -bumped
+                } else {
+                    bumped
                 }
-                None => frame.normal,
+            }
+            None => frame.normal,
+        };
+        let mut items = Vec::with_capacity(shading.closures.len());
+        for closure in shading
+            .closures
+            .iter()
+            .filter(|closure| closure.weight > 0.0)
+        {
+            let mut params = closure.params;
+            apply_hit_alpha(frame.material, &mut params);
+            params.back_facing = frame.back_facing;
+            let perturbed = gradient.map_or(params.normal, |shift| params.normal - shift);
+            let mut normal = if perturbed.is_finite() {
+                perturbed.normalize_or_zero()
+            } else {
+                frame.normal
             };
-            let mut items = Vec::with_capacity(shading.closures.len());
-            for closure in shading
+            if normal.dot(-direction) < 0.0 {
+                normal = -normal;
+            }
+            params.normal = normal;
+            items.push(HitClosure::new(
+                closure.weight,
+                &params,
+                -direction,
+                frame.geometric_normal,
+                frame.material.use_bump_map_correction,
+            ));
+        }
+        // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
+        let normal = heaviest(&items, |closure| closure.weight)
+            .map_or(frame.normal, |closure| closure.params.normal);
+        Ok(Surface {
+            point: frame.point,
+            normal,
+            geometric_normal: frame.geometric_normal,
+            shadow_point: frame.shadow_point,
+            closures: Closures::new(
+                items,
+                smooth,
+                frame.geometric_normal,
+                frame.material.use_bump_map_correction,
+            ),
+            media: surface_media(frame.triangle.object_index, &shading.volume),
+            object_index: frame.triangle.object_index,
+            element_index: frame.triangle.element_index,
+            triangle_index,
+        })
+    })
+}
+
+/// The media and shadow transparency of one hit, which is all a shadow ray or the camera's medium probe reads from it.
+/// Neither depends on the normal, so the displacement gradient is not evaluated here. Consequently a warning, or an error,
+/// that only the gradient's samples produce is not raised from a shadow ray; path and camera hits still raise it.
+fn shadow_hit(
+    doc: &SceneDoc,
+    geometry: &TraceGeometry<'_>,
+    hit: BvhHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<(Vec<MeshMedium>, DVec3)> {
+    with_hit_frame(doc, geometry, hit, origin, direction, images, |frame| {
+        let shading = evaluate_surface_with_workspace(
+            frame.material,
+            frame.prepared,
+            &frame.context,
+            evaluator_workspace,
+        )?;
+        // The closures `make_surface` keeps (weight above zero), with alpha after the material's alpha mode, as `Closures::new`
+        // reads them.
+        let transparency = shadow_transparency(
+            shading
                 .closures
                 .iter()
                 .filter(|closure| closure.weight > 0.0)
-            {
-                let mut params = closure.params;
-                apply_hit_alpha(frame.material, &mut params);
-                params.back_facing = frame.back_facing;
-                let perturbed = gradient.map_or(params.normal, |shift| params.normal - shift);
-                let mut normal = if perturbed.is_finite() {
-                    perturbed.normalize_or_zero()
-                } else {
-                    frame.normal
-                };
-                if normal.dot(-direction) < 0.0 {
-                    normal = -normal;
-                }
-                params.normal = normal;
-                items.push(HitClosure::new(
-                    closure.weight,
-                    &params,
-                    -direction,
-                    frame.geometric_normal,
-                    frame.material.use_bump_map_correction,
-                ));
-            }
-            // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
-            let normal = heaviest(&items, |closure| closure.weight)
-                .map_or(frame.normal, |closure| closure.params.normal);
-            Ok(Surface {
-                point: frame.point,
-                normal,
-                geometric_normal: frame.geometric_normal,
-                shadow_point: frame.shadow_point,
-                closures: Closures::new(
-                    items,
-                    smooth,
-                    frame.geometric_normal,
-                    frame.material.use_bump_map_correction,
-                ),
-                media: surface_media(frame.triangle.object_index, &shading.volume),
-                object_index: frame.triangle.object_index,
-                element_index: frame.triangle.element_index,
-                triangle_index,
-            })
-        },
-    )
+                .map(|closure| {
+                    let mut params = closure.params;
+                    apply_hit_alpha(frame.material, &mut params);
+                    (closure.weight, params.alpha, transparent_tint(&params))
+                }),
+        );
+        Ok((
+            surface_media(frame.triangle.object_index, &shading.volume),
+            transparency,
+        ))
+    })
 }
 
 pub(super) fn object_for_index(
@@ -2924,7 +3220,6 @@ fn shadow_transmittance(
 ) -> Result<DVec3> {
     let SceneRefs {
         doc,
-        snapshot,
         geometry,
         bvh,
         volumes,
@@ -2950,15 +3245,14 @@ fn shadow_transmittance(
         f64::INFINITY
     };
     let (origin, remaining) = bvh.walk_hits(
-        &geometry.triangles,
+        geometry.triangles,
         shadow_origin(point, direction, normal, shading),
         direction,
         RAY_EPSILON,
         remaining,
         |hit, origin| {
-            let surface = match make_surface(
+            let (media, transparency) = match shadow_hit(
                 doc,
-                snapshot,
                 geometry,
                 hit,
                 origin,
@@ -2966,7 +3260,7 @@ fn shadow_transmittance(
                 images,
                 evaluator_workspace,
             ) {
-                Ok(surface) => surface,
+                Ok(shadow) => shadow,
                 Err(error) => {
                     failure = Some(error);
                     return false;
@@ -2975,10 +3269,10 @@ fn shadow_transmittance(
             if let Some(stack) = stack_medium(&shadow_media) {
                 transmittance *= medium_transmittance(&stack, hit.distance);
             }
-            if !surface.media.is_empty() {
+            if !media.is_empty() {
                 // A medium boundary passes the shadow ray and changes the volume stack, as it does for a path. It is not a
                 // transparent surface, so it does not count against the budget, and its opaque alpha does not block.
-                for medium in &surface.media {
+                for medium in &media {
                     toggle_mesh_medium(&mut shadow_media, medium);
                 }
                 return true;
@@ -2994,7 +3288,7 @@ fn shadow_transmittance(
             // (`kernel/integrator/surface_shader.h`, `surface_shader_transparency`). A glass or other transmissive
             // closure has none, so it blocks the shadow ray: its shader lacks `SD_HAS_TRANSPARENT_SHADOW`
             // (`scene/shader.cpp`, `kernel/bvh/intersect_filter.h`).
-            transmittance *= surface.closures.transparency;
+            transmittance *= transparency;
             if transmittance.max_element() <= 1.0e-5 {
                 blocked = true;
                 return false;
@@ -3491,7 +3785,7 @@ fn sample_lobes(
 /// `subsurface_scatter`). `entry` is the closure whose subsurface lobe was sampled, and `throughput` the path throughput
 /// with the entry weight already applied.
 fn subsurface_exit(
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     surface: &Surface,
     entry: &HitClosure,
@@ -3537,7 +3831,7 @@ fn subsurface_exit(
 /// entry is the refraction through an interface of the surface's roughness squared, or for the skin a diffuse lobe
 /// or a refraction through a rough interface (`skin_entry_direction`).
 fn random_walk_exit(
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     surface: &Surface,
     closure: &HitClosure,
@@ -3592,7 +3886,7 @@ fn random_walk_exit(
     };
     let mut draw = || rng.next_f64();
     walk(
-        &geometry.triangles,
+        geometry.triangles,
         bvh,
         surface.object_index,
         &entry,
@@ -3602,7 +3896,7 @@ fn random_walk_exit(
 
 /// The geometric normal of a triangle from its winding, as Cycles' `Ng` is: the cross product of its edges, outward
 /// for a mesh wound outward. It is not flipped towards any ray, so a subsurface exit can tell its side of the surface.
-fn intrinsic_normal(geometry: &Geometry, triangle_index: usize) -> Option<DVec3> {
+fn intrinsic_normal(geometry: &TraceGeometry<'_>, triangle_index: usize) -> Option<DVec3> {
     let triangle = geometry.triangles.get(triangle_index)?;
     Some(
         (triangle.positions[1] - triangle.positions[0])
@@ -3617,7 +3911,7 @@ fn intrinsic_normal(geometry: &Geometry, triangle_index: usize) -> Option<DVec3>
 /// reservoir (`subsurface_disk.h`, `scene_intersect_local` with `max_hits`), and the weight of a probe that saw more
 /// is scaled by `num_hits / max_hits`. `throughput` includes the entry weight.
 fn burley_exit(
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     surface: &Surface,
     entry: &HitClosure,
@@ -3671,7 +3965,7 @@ fn burley_exit(
     // with a generator seeded from the path's random numbers (`lcg_state_init` in `subsurface_disk`).
     let mut probe = ProbeHits::new(rng.next_u32());
     bvh.walk_hits(
-        &geometry.triangles,
+        geometry.triangles,
         origin,
         direction,
         RAY_EPSILON,
@@ -4283,8 +4577,7 @@ fn stack_medium(media: &[MeshMedium]) -> Option<BsdfParams> {
 /// times, that is, when the origin is inside it. The probe direction is fixed and oblique, so it avoids axis-aligned edges.
 fn camera_media(
     doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     bvh: &Bvh,
     origin: DVec3,
     images: &BTreeMap<String, ImageData>,
@@ -4298,15 +4591,14 @@ fn camera_media(
     let mut inside: Vec<MeshMedium> = Vec::new();
     let mut failure = None;
     bvh.walk_hits(
-        &geometry.triangles,
+        geometry.triangles,
         origin,
         probe,
         RAY_EPSILON,
         f64::INFINITY,
         |hit, hit_origin| {
-            let surface = match make_surface(
+            let (media, _) = match shadow_hit(
                 doc,
-                snapshot,
                 geometry,
                 hit,
                 hit_origin,
@@ -4314,13 +4606,13 @@ fn camera_media(
                 images,
                 evaluator_workspace,
             ) {
-                Ok(surface) => surface,
+                Ok(shadow) => shadow,
                 Err(error) => {
                     failure = Some(error);
                     return false;
                 }
             };
-            for medium in &surface.media {
+            for medium in &media {
                 toggle_mesh_medium(&mut inside, medium);
             }
             true
@@ -5883,5 +6175,83 @@ mod sampling_tests {
             start.z > 0.0 && light.z < 0.0,
             "ray from {start:?} does not cross the plane"
         );
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use std::cell::RefCell;
+
+    use serde_json::{Value, json};
+
+    use super::{band_rows, merge_shader_warnings};
+
+    /// Records one warning as a worker's sink does: a Principled input once per (material, input)
+    /// (`record_unevaluated_inputs`), any other warning once per equal value (`layer_index`, `color_layer_missing`).
+    fn record(sink: &mut Vec<Value>, warning: Value) {
+        let duplicate = match warning["input"].as_str() {
+            Some(input) => sink.iter().any(|existing| {
+                existing["material"] == warning["material"]
+                    && existing["input"].as_str() == Some(input)
+            }),
+            None => sink.contains(&warning),
+        };
+        if !duplicate {
+            sink.push(warning);
+        }
+    }
+
+    #[test]
+    fn bands_cover_every_row_once_in_order() {
+        for height in [1_usize, 2, 7, 64, 192] {
+            for band_count in [0_usize, 1, 2, 3, 6, 64, 500] {
+                let bands = band_rows(height, band_count);
+                assert!(bands.len() <= band_count.max(1));
+                let mut next = 0;
+                for band in &bands {
+                    assert_eq!(band.start, next);
+                    assert!(!band.is_empty());
+                    next = band.end;
+                }
+                assert_eq!(next, height, "height {height}, band count {band_count}");
+            }
+        }
+    }
+
+    #[test]
+    fn merged_band_warnings_equal_the_single_band_warnings() {
+        // A pixel-ordered stream in which each warning recurs in every band, as a shared material does.
+        let stream: Vec<Value> = (0..48)
+            .map(|index| match index % 4 {
+                0 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.anisotropic",
+                    "material": "a", "input": "Anisotropic", "message": "a"}),
+                1 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.anisotropic",
+                    "material": "b", "input": "Anisotropic", "message": "b"}),
+                2 => json!({"code": "uv.layer_missing", "layer": "UV2",
+                    "message": "UV layer `UV2` is not on this mesh; the render layer was used"}),
+                _ => json!({"code": "mesh.color_layer_missing", "layer": "Col",
+                    "message": "color layer `Col` is not on this mesh; opaque black was used"}),
+            })
+            .collect();
+        let mut single = Vec::new();
+        for warning in &stream {
+            record(&mut single, warning.clone());
+        }
+        assert_eq!(
+            single.len(),
+            4,
+            "the single-band render records each distinct warning once"
+        );
+        for band_count in [1_usize, 2, 3, 5, 7, 48] {
+            let sink = RefCell::new(Vec::new());
+            for rows in band_rows(stream.len(), band_count) {
+                let mut band_sink = Vec::new();
+                for warning in &stream[rows] {
+                    record(&mut band_sink, warning.clone());
+                }
+                merge_shader_warnings(&sink, band_sink);
+            }
+            assert_eq!(sink.into_inner(), single, "band count {band_count}");
+        }
     }
 }
