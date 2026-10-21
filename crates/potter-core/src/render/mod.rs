@@ -11,8 +11,8 @@ mod principled_tables_data;
 mod scene;
 mod sequence;
 mod studio;
-mod wireframe;
 mod subsurface;
+mod wireframe;
 
 pub use pick::pick;
 pub use preview::{PreviewRequest, render_previews};
