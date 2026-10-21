@@ -309,6 +309,7 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["offscreen_dicing_scale"] =
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
+    render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);

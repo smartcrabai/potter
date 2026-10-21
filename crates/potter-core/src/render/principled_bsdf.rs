@@ -34,7 +34,7 @@ use super::principled_tables::{
     sheen_ltc,
 };
 use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
-use crate::shader::{BsdfParams, dielectric_f0};
+use crate::shader::{BsdfParams, dielectric_f0, make_orthonormals};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
@@ -614,30 +614,6 @@ fn sheen_frame(normal: DVec3, view: DVec3) -> (DVec3, DVec3) {
         return make_orthonormals(normal);
     }
     (bitangent.cross(normal), bitangent)
-}
-
-/// Cycles' `make_orthonormals` (`util/math_float3.h`): a tangent from the cross product with
-/// `(1, 1, 1)`, chosen by exact component equality.
-#[expect(
-    clippy::float_cmp,
-    reason = "Cycles selects the tangent basis by exact component equality of the normal"
-)]
-pub(super) fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
-    let tangent = if normal.x != normal.y || normal.x != normal.z {
-        DVec3::new(
-            normal.z - normal.y,
-            normal.x - normal.z,
-            normal.y - normal.x,
-        )
-    } else {
-        DVec3::new(
-            normal.z - normal.y,
-            normal.x + normal.z,
-            -normal.y - normal.x,
-        )
-    }
-    .normalize_or_zero();
-    (tangent, normal.cross(tangent))
 }
 
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).

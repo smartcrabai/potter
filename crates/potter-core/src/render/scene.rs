@@ -250,6 +250,7 @@ impl<'a> ShadowOccluders<'a> {
             origin,
             direction,
             self.images,
+            None,
             &mut self.workspace.borrow_mut(),
         )?;
         Ok(Some(transparent_shadow_pass(&params)))

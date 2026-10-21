@@ -9,15 +9,15 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, SceneDoc},
     shader::{
-        BsdfParams, EvaluatedSubsurfaceMethod, EvaluatorWorkspace, HitContext, HitUvLayers,
-        PreparedMaterial, SubsurfaceMethod, equirectangular_uv, evaluate_surface_with_workspace,
-        height_gradient,
+        BsdfParams, EvaluatedSubsurfaceMethod, EvaluatorWorkspace, HitContext, HitFootprint,
+        HitUvLayers, PreparedMaterial, SubsurfaceMethod, equirectangular_uv,
+        evaluate_surface_with_workspace, height_gradient, make_orthonormals,
     },
 };
 
 use super::principled_bsdf::{
     GlassSample, Layers, base_color, continuous_density, evaluate as evaluate_bsdf, layers,
-    lobe_probabilities, make_orthonormals, sample_glass, specular_eta, subsurface_closure_weight,
+    lobe_probabilities, sample_glass, specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -132,6 +132,129 @@ struct Surface {
     element_index: u32,
     /// The triangle the hit lies on, which a random walk entering through it must not hit first (`ray.self.prim`).
     triangle_index: usize,
+    /// The hit's camera footprint, Cycles' `sd->dP`: the bump's screen differentials, and the footprint of the
+    /// shadow and light rays from this vertex (which carry `dP` unchanged, with no `dD`).
+    footprint: f64,
+}
+
+/// Cycles' compact camera ray differentials (`kernel/camera/camera.h`): `dP`, the change of the ray origin, and `dD`,
+/// the change of its direction, per raster pixel. A path's footprint at a hit is `ray.dP + t · ray.dD` (Cycles'
+/// `differential_transfer_compact`, `kernel/util/differential.h`), with `t` the distance from the ray origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CameraFootprint {
+    dp: f64,
+    dd: f64,
+}
+
+impl CameraFootprint {
+    /// The footprint at distance `t` along a ray that carries this differential (`sd->dP`).
+    fn at_distance(self, t: f64) -> f64 {
+        self.dp + t * self.dd
+    }
+}
+
+/// The camera footprint of the sample (`sample_x`, `sample_y`) of pixel (`x`, `y`): the compact lengths of the origin
+/// and direction changes to the rays one pixel to the right and one pixel down, as Cycles' pinhole branch takes them
+/// (`dD = normalize(D + dx) - normalize(D)`, compacted by `differential_make_compact` at `differential_scale` 1).
+/// A perspective camera has `dP = 0` and an orthographic camera `dD = 0`. Panoramic, fisheye and depth-of-field
+/// cameras use the same finite difference rather than Cycles' per-projection formulas, and a one-pixel-wide or
+/// one-pixel-high image has no neighbour along that axis, which contributes nothing.
+fn camera_footprint(
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    sample_x: f64,
+    sample_y: f64,
+) -> Result<CameraFootprint> {
+    let Some((origin, direction)) =
+        ray_for_sample(camera, width, height, x, y, sample_x, sample_y)?
+    else {
+        return Ok(CameraFootprint::default());
+    };
+    let direction = direction.normalize_or_zero();
+    let right = if x + 1 < width {
+        x + 1
+    } else {
+        x.saturating_sub(1)
+    };
+    let down = if y + 1 < height {
+        y + 1
+    } else {
+        y.saturating_sub(1)
+    };
+    let mut dp = 0.0;
+    let mut dd = 0.0;
+    for (neighbour_x, neighbour_y) in [(right, y), (x, down)] {
+        if let Some((neighbour_origin, neighbour_direction)) = ray_for_sample(
+            camera,
+            width,
+            height,
+            neighbour_x,
+            neighbour_y,
+            sample_x,
+            sample_y,
+        )? {
+            dp += (neighbour_origin - origin).length();
+            dd += (neighbour_direction.normalize_or_zero() - direction).length();
+        }
+    }
+    Ok(CameraFootprint {
+        dp: 0.5 * dp,
+        dd: 0.5 * dd,
+    })
+}
+
+/// The filter glossy widening scale of the scene, Cycles' `differential_widen_scale = min(1, filter_glossy)`
+/// (`intern/cycles/scene/integrator.cpp`). Blender's Filter Glossy defaults to 0, which never widens `dD`.
+fn filter_glossy_widen_scale(doc: &SceneDoc) -> f64 {
+    doc.scenes
+        .get(&doc.active_scene)
+        .map_or(0.0, |scene| scene.render.filter_glossy.clamp(0.0, 1.0))
+}
+
+/// Cycles' `bsdf_widen_dD` (`kernel/closure/bsdf.h`): `dD` widens to `scale · sqrt(avg roughness²)` when that is
+/// larger, and keeps its value for a zero average, as a singular bounce has.
+fn widen_ray_dd(ray_dd: f64, scale: f64, average_roughness_squared: f64) -> f64 {
+    if average_roughness_squared > 0.0 {
+        ray_dd.max(scale * average_roughness_squared.sqrt())
+    } else {
+        ray_dd
+    }
+}
+
+/// Cycles' average of the closures' squared roughness (`surface_shader_bsdf_sample`, `kernel/integrator/surface_shader.h`):
+/// a singular lobe has 0, a microfacet lobe `alpha_x · alpha_y` (roughness⁴, with alpha the squared roughness), and a
+/// diffuse or sheen lobe 1 (`bsdf_get_specular_roughness_squared`). Cycles weights the closures by their pdf; Potter
+/// weights the lobes by their sampling probabilities, which select the same pdf-weighted mixture.
+fn average_roughness_squared(params: &BsdfParams, layers: &Layers) -> f64 {
+    // The roughness below which Potter, like Cycles, treats a microfacet lobe as a delta.
+    const DELTA_ROUGHNESS: f64 = 1.0e-5;
+    let microfacet = |roughness: f64| {
+        if roughness < DELTA_ROUGHNESS {
+            0.0
+        } else {
+            roughness.powi(4)
+        }
+    };
+    let probabilities = lobe_probabilities(params, layers);
+    let lobes = [
+        (probabilities.diffuse, 1.0),
+        (probabilities.sheen, 1.0),
+        (probabilities.coat, microfacet(params.coat_roughness)),
+        (probabilities.specular, microfacet(params.roughness)),
+        (probabilities.transmission, microfacet(params.roughness)),
+    ];
+    let total: f64 = lobes.iter().map(|(probability, _)| probability).sum();
+    if total <= 0.0 {
+        return 0.0;
+    }
+    lobes
+        .iter()
+        .map(|(probability, roughness_squared)| probability * roughness_squared)
+        .sum::<f64>()
+        / total
 }
 
 #[derive(Clone, Copy)]
@@ -491,6 +614,15 @@ pub(super) fn render(
                             world_importance.as_ref(),
                             left_origin,
                             left_direction,
+                            camera_footprint(
+                                &left_camera,
+                                width,
+                                height,
+                                x,
+                                y,
+                                sample_x,
+                                sample_y,
+                            )?,
                             environment,
                             max_bounces,
                             transparent_max_bounces,
@@ -511,6 +643,15 @@ pub(super) fn render(
                             world_importance.as_ref(),
                             right_origin,
                             right_direction,
+                            camera_footprint(
+                                &right_camera,
+                                width,
+                                height,
+                                x,
+                                y,
+                                sample_x,
+                                sample_y,
+                            )?,
                             environment,
                             max_bounces,
                             transparent_max_bounces,
@@ -536,6 +677,7 @@ pub(super) fn render(
                             world_importance.as_ref(),
                             origin,
                             direction,
+                            camera_footprint(camera, width, height, x, y, sample_x, sample_y)?,
                             environment,
                             max_bounces,
                             transparent_max_bounces,
@@ -831,6 +973,7 @@ fn trace_path(
     importance: Option<&WorldImportanceSampler>,
     mut origin: DVec3,
     mut direction: DVec3,
+    footprint: CameraFootprint,
     environment: DVec3,
     max_bounces: u32,
     transparent_max_bounces: u32,
@@ -847,6 +990,12 @@ fn trace_path(
     // (`intern/cycles/kernel/integrator/path_state.h`, the FIXME at `path_state_next`).
     let transparent_cap = transparent_max_bounces.max(1);
     let mut volume_bounds = 0u32;
+    // The ray differentials of the path: `ray_dp` is the compact `ray.dP` and `ray_dd` the compact `ray.dD` (Cycles'
+    // `INTEGRATOR_STATE(ray, dP)` and `dD`). A hit's footprint is `ray_dp + t · ray_dd`, and a surface bounce keeps that
+    // footprint as the next ray's `dP`, widening `dD` only by the filter glossy scale.
+    let mut ray_dp = footprint.dp;
+    let mut ray_dd = footprint.dd;
+    let widen_scale = filter_glossy_widen_scale(doc);
     // Set by the pass that reaches the cap: the next surface is shaded for emission and ends the
     // path (`PATH_RAY_TERMINATE_ON_NEXT_SURFACE`, `integrate_surface_terminate`).
     let mut terminate_on_next_surface = false;
@@ -901,6 +1050,8 @@ fn trace_path(
                 break;
             }
             throughput *= event.albedo / scatter_probability;
+            // The scatter's footprint, Cycles' volume `sd->dP` (`differential_transfer_compact`).
+            let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
             radiance += throughput
                 * direct_volume_lighting(
                     doc,
@@ -912,6 +1063,7 @@ fn trace_path(
                     images,
                     importance,
                     event,
+                    event_footprint,
                     direction,
                     environment,
                     transparent_max_bounces.saturating_sub(transparent_bounce),
@@ -923,6 +1075,7 @@ fn trace_path(
             }
             direction = sample_henyey_greenstein_direction(direction, event.anisotropy, rng);
             origin = event.point + direction * RAY_EPSILON;
+            ray_dp = event_footprint;
             previous = Scatter::Volume;
             bounce += 1;
             continue;
@@ -955,6 +1108,7 @@ fn trace_path(
             escaped = true;
             break;
         };
+        let footprint_here = ray_dp + hit.distance * ray_dd;
         let mut surface = make_surface(
             doc,
             snapshot,
@@ -963,6 +1117,7 @@ fn trace_path(
             origin,
             direction,
             images,
+            footprint_here,
             evaluator_workspace,
         )?;
         if std::mem::take(&mut exit_pending) {
@@ -1137,6 +1292,14 @@ fn trace_path(
             }
             throughput /= survival;
         }
+        // Cycles' `bsdf_widen_dD` after a non-transparent bounce (`kernel/closure/bsdf.h`): the next ray carries the
+        // hit's footprint as `dP`, and `dD` widens to `widen_scale · sqrt(avg roughness²)` when that is larger.
+        ray_dp = surface.footprint;
+        ray_dd = widen_ray_dd(
+            ray_dd,
+            widen_scale,
+            average_roughness_squared(&surface.params, &surface.layers),
+        );
         direction = next_direction.normalize_or_zero();
         origin = offset_origin(surface.point, direction, surface.geometric_normal);
         bounce += 1;
@@ -1208,6 +1371,7 @@ fn write_center_passes(
                 }
                 continue;
             };
+            let footprint = camera_footprint(camera, width, height, x, y, 0.5, 0.5)?;
             let surface = make_surface(
                 doc,
                 snapshot,
@@ -1216,6 +1380,7 @@ fn write_center_passes(
                 origin,
                 direction,
                 images,
+                footprint.at_distance(hit.distance),
                 evaluator_workspace,
             )?;
             if surface.params.alpha <= 0.0 {
@@ -1384,6 +1549,7 @@ pub(super) fn hit_params(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    footprint: Option<f64>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<BsdfParams> {
     with_hit_frame(
@@ -1394,6 +1560,7 @@ pub(super) fn hit_params(
         origin,
         direction,
         images,
+        footprint,
         |frame| {
             let mut params = evaluate_surface_with_workspace(
                 frame.material,
@@ -1431,6 +1598,7 @@ fn with_hit_frame<T>(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    footprint: Option<f64>,
     body: impl FnOnce(&HitFrame<'_>) -> Result<T>,
 ) -> Result<T> {
     let triangle = geometry.triangles.get(hit.triangle_index).ok_or_else(|| {
@@ -1517,6 +1685,13 @@ fn with_hit_frame<T>(
         uv_layers,
         &mut tables,
     )?;
+    let context = match footprint {
+        Some(dp) => context.with_footprint(HitFootprint {
+            dp,
+            geometric_normal,
+        }),
+        None => context,
+    };
     body(&HitFrame {
         point,
         shadow_point,
@@ -1554,6 +1729,7 @@ fn make_surface(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    footprint: f64,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
     let triangle_index = hit.triangle_index;
@@ -1565,6 +1741,7 @@ fn make_surface(
         origin,
         direction,
         images,
+        Some(footprint),
         |frame| {
             let mut params = evaluate_surface_with_workspace(
                 frame.material,
@@ -1608,6 +1785,7 @@ fn make_surface(
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
                 triangle_index,
+                footprint,
             })
         },
     )
@@ -1670,6 +1848,7 @@ fn direct_lighting(
             images,
             surface.shadow_point,
             geometric,
+            surface.footprint,
             sample.direction,
             sample.distance,
             transparent_budget,
@@ -1713,6 +1892,7 @@ fn direct_lighting(
             images,
             surface.shadow_point,
             geometric,
+            surface.footprint,
             direction,
             f64::INFINITY,
             transparent_budget,
@@ -1746,6 +1926,7 @@ fn direct_volume_lighting(
     images: &BTreeMap<String, ImageData>,
     importance: Option<&WorldImportanceSampler>,
     event: VolumeEvent,
+    footprint: f64,
     incoming_direction: DVec3,
     environment: DVec3,
     transparent_budget: u32,
@@ -1769,6 +1950,7 @@ fn direct_volume_lighting(
             images,
             event.point,
             DVec3::ZERO,
+            footprint,
             sample.direction,
             sample.distance,
             transparent_budget,
@@ -1794,6 +1976,7 @@ fn direct_volume_lighting(
             images,
             event.point,
             DVec3::ZERO,
+            footprint,
             direction,
             f64::INFINITY,
             transparent_budget,
@@ -1835,6 +2018,7 @@ fn shadow_transmittance(
     images: &BTreeMap<String, ImageData>,
     point: DVec3,
     normal: DVec3,
+    footprint: f64,
     direction: DVec3,
     distance: f64,
     transparent_budget: u32,
@@ -1865,6 +2049,7 @@ fn shadow_transmittance(
                 origin,
                 direction,
                 images,
+                footprint,
                 evaluator_workspace,
             ) {
                 Ok(surface) => surface,
