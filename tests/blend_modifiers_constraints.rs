@@ -689,7 +689,7 @@ for name, mode, use_parent, use_modifier in cases:
     obj.scale = (1.4, 0.65, 1.1)
     obj.rotation_mode = mode
     if mode in ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX"):
-        obj.rotation_euler = (0.37, -0.21, math.pi / 2.0)
+        obj.rotation_euler = (0.37, -0.21, 4.0 if name == "EulerRoot" else math.pi / 2.0)
     elif mode == "QUATERNION":
         obj.rotation_quaternion = Quaternion((1.0, 2.0, -1.0), 0.91)
     else:
@@ -707,18 +707,45 @@ def matrix_values(matrix):
 
 expected = {
     name: {
+        "rotation_mode": obj.rotation_mode,
+        "rotation_euler": [float(value) for value in obj.rotation_euler],
         "local": matrix_values(obj.matrix_basis),
         "world": matrix_values(obj.matrix_world),
     }
     for name, obj in objects.items()
 }
 expected["A_TransformParent"] = {
+    "rotation_mode": parent.rotation_mode,
+    "rotation_euler": [float(value) for value in parent.rotation_euler],
     "local": matrix_values(parent.matrix_basis),
     "world": matrix_values(parent.matrix_world),
 }
 with open(os.path.join(root, "transform_expected.json"), "w", encoding="utf-8") as handle:
     json.dump(expected, handle)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "transform_source.blend"))
+"#;
+
+const TRANSFORM_REOPEN: &str = r#"
+import bpy
+import json
+import sys
+
+output = sys.argv[sys.argv.index("--") + 1]
+
+def matrix_values(matrix):
+    return [float(matrix[row][column])
+            for column in range(4) for row in range(4)]
+
+result = {
+    obj.name: {
+        "rotation_mode": obj.rotation_mode,
+        "rotation_euler": [float(value) for value in obj.rotation_euler],
+        "local": matrix_values(obj.matrix_basis),
+    }
+    for obj in bpy.data.objects
+}
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump(result, handle)
 "#;
 
 const MODIFIER_REOPEN: &str = r#"
@@ -1320,25 +1347,32 @@ fn assert_skin_branch_round_trip(
         .args(["--id", owner_id, "--json"]);
     let output = run_guarded(command)?;
     assert!(
-        !output.status.success(),
-        "Skin branch inspection must reject unsupported evaluated geometry"
+        output.status.success(),
+        "Skin branch inspection must evaluate successfully: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
-    let response: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(response["error"]["code"], "UNSUPPORTED_FEATURE");
-    assert_eq!(
-        response["error"]["details"]["feature_id"],
-        "modifier.skin.branch_hull"
-    );
-
-    let feature_catalog = potter_core::catalog::feature_catalog();
-    let branch_feature = feature_catalog["features"]
+    let inspection: Value = serde_json::from_slice(&output.stdout)?;
+    let owner = inspection["result"]["items"]
         .as_array()
-        .unwrap()
-        .iter()
-        .find(|feature| feature["feature_id"] == "modifier.skin.branch_hull")
-        .unwrap();
-    assert_eq!(branch_feature["status"], "not_supported");
-    assert_eq!(branch_feature["capabilities"]["evaluate"], false);
+        .and_then(|items| items.iter().find(|item| item["id"] == owner_id))
+        .ok_or("Skin branch inspection omitted the owner")?;
+    let evaluated = &owner["evaluated_geometry"];
+    assert_matching_topology(evaluated, before_geometry, case["name"].as_str().unwrap());
+    let position_error = modifier_position_error(
+        evaluated["positions"].as_array().unwrap(),
+        before_geometry["positions"].as_array().unwrap(),
+    )
+    .ok_or_else(|| {
+        format!(
+            "{}: inspected vertex count differs from Blender",
+            case["name"]
+        )
+    })?;
+    assert!(
+        position_error <= 1.0e-5,
+        "{}: inspected branch geometry differs from Blender by {position_error}",
+        case["name"]
+    );
 
     let exported = root.join("modifier_roundtrip.blend");
     let export_result = pot_json(&[
@@ -1396,7 +1430,7 @@ fn assert_skin_branch_round_trip(
         case["name"]
     );
     println!(
-        "{}: Potter inspection reports UnsupportedFeature; .blend modifier settings and Blender-evaluated geometry round-trip",
+        "{}: Potter branch geometry matches Blender; .blend modifier settings and evaluated geometry round-trip",
         case["name"]
     );
     Ok(())
@@ -2032,5 +2066,59 @@ fn blender_transform_import_parity_across_rotation_modes() -> Result<(), Box<dyn
             &format!("{name} world"),
         );
     }
+    let exported = root.join("transform_roundtrip.blend");
+    pot_json(&[
+        "export",
+        project.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--out",
+        exported.to_str().unwrap(),
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let reopened_path = root.join("transform_after.json");
+    let script_path = root.join("reopen_transform.py");
+    fs::write(&script_path, TRANSFORM_REOPEN)?;
+    let mut command = Command::new(&blender);
+    command
+        .args(["--background"])
+        .arg(&exported)
+        .arg("--python")
+        .arg(&script_path)
+        .arg("--")
+        .arg(&reopened_path);
+    let output = run_guarded(command)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && !stdout.contains("Traceback") && !stderr.contains("Traceback"),
+        "Blender transform reopen failed: stdout={stdout} stderr={stderr}",
+    );
+    let after: Value = serde_json::from_slice(&fs::read(reopened_path)?)?;
+    for (name, matrices) in expected.as_object().unwrap() {
+        assert_eq!(
+            after[name]["rotation_mode"], matrices["rotation_mode"],
+            "{name} rotation mode after reopen"
+        );
+        assert_matrix_parity(
+            after[name]["local"].as_array().unwrap(),
+            matrices["local"].as_array().unwrap(),
+            &format!("{name} local after reopen"),
+        );
+        if matrices["rotation_mode"] != "QUATERNION" && matrices["rotation_mode"] != "AXIS_ANGLE" {
+            // A no-op round trip writes the source Euler values back unchanged: no 2*pi wrapping.
+            assert_matrix_parity(
+                after[name]["rotation_euler"].as_array().unwrap(),
+                matrices["rotation_euler"].as_array().unwrap(),
+                &format!("{name} rotation_euler after reopen"),
+            );
+        }
+    }
+    let euler_root_z = after["EulerRoot"]["rotation_euler"][2].as_f64().unwrap();
+    assert!(
+        (euler_root_z - 4.0).abs() <= 1.0e-6,
+        "EulerRoot rotation_euler z must survive a no-op round trip as 4.0 rad, got {euler_root_z}"
+    );
     Ok(())
 }
