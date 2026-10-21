@@ -355,10 +355,18 @@ fn homogeneous_volume_cube_transmittance_matches_beer_lambert() -> Result<(), Bo
         render_png(&scene, &directory.path().join("render"), Some("path"))?;
     let alpha = f64::from(pixel(&pixels, width, height, width / 2, height / 2)?[3]) / 255.0;
     let measured_transmittance = 1.0 - alpha;
-    let expected_transmittance = (-density).exp();
+    // Cycles' volume mesh is the active voxel box dilated by one voxel for linear interpolation, with corners at max + 1
+    // (`intern/cycles/scene/volume.cpp`, `create_volume_mesh`, `add_padding`, `generate_vertices_and_quads`), and NanoVDB
+    // samples node i at index i (`intern/cycles/kernel/util/image_3d.h`, `kernel_image_interp_trilinear_nanovdb`, `floor`
+    // without a half-voxel shift). The density is full on the nodes' span of (2 - 1) voxels and ramps to zero over one
+    // padded voxel on each side, so the centre ray sees an effective length of 1 + 2 * 0.5 = 2 voxels. Its transmittance is
+    // e^(-density * 2) = e^-1.4, not the box's e^-0.7. Blender 5.2.2 renders a 16^3 grid of the same convention within 0.3 %
+    // of this model; a 2^3 grid differs by 6 %, which this test does not claim.
+    let effective_length = 2.0_f64;
+    let expected_transmittance = (-density * effective_length).exp();
     assert!(
         (measured_transmittance - expected_transmittance).abs() < 0.01,
-        "one unit of homogeneous density {density} should transmit e^(-density): {measured_transmittance} vs {expected_transmittance}"
+        "homogeneous density {density} over an effective length of {effective_length} should transmit {expected_transmittance}, got {measured_transmittance}"
     );
     Ok(())
 }

@@ -11,12 +11,14 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-const SIZE: u32 = 24;
+const SIZE: u32 = 12;
 /// The pixels on each side of the centre that are averaged. The subject fills the centre of the frame, so every averaged
 /// pixel has the same expectation, and the block mean reduces the noise of a stochastic render.
-const BLOCK: usize = 4;
+const BLOCK: usize = 2;
 const GRAPH: &str = "emission_graph";
-const SAMPLES: u32 = 128;
+/// Samples per pixel of the mesh cube, which is cheap, and of the voxel grid, whose render is the test's cost.
+const CUBE_SAMPLES: u32 = 512;
+const VOXEL_SAMPLES: u32 = 32;
 /// The seeds for a stochastic case: their spread is Potter's own noise.
 const SEEDS: u32 = 3;
 /// The Principled Volume's Density, which is σ of an absorbing medium of unit colour.
@@ -102,12 +104,12 @@ fn volume_inputs(albedo: f64) -> Value {
 
 /// The camera, the black world, the render settings, and the scene's bounce budget. Volume scatter takes Cycles'
 /// `volume_bounces` budget, here at Blender's default of zero, and no light reaches the camera but emission.
-fn frame_operations(seed: u32) -> Vec<Value> {
+fn frame_operations(seed: u32, samples: u32) -> Vec<Value> {
     vec![
         json!({"op":"world.create","id":"world_main","color":[0.0,0.0,0.0],"strength":1.0}),
         json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
-        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":SAMPLES,"seed":seed,"max_bounces":0,"volume_bounces":0}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":samples,"seed":seed,"max_bounces":0,"volume_bounces":0}}),
     ]
 }
 
@@ -116,7 +118,7 @@ fn cube_operations(albedo: f64, seed: u32) -> Vec<Value> {
     let mut operations = graph_operations(&volume_inputs(albedo));
     operations.push(json!({"op":"material.create","id":"emitter","graph":GRAPH}));
     operations.push(json!({"op":"node.create","id":"cube","kind":"box","params":{"size":1.0},"material":"emitter"}));
-    operations.extend(frame_operations(seed));
+    operations.extend(frame_operations(seed, CUBE_SAMPLES));
     operations
 }
 
@@ -126,7 +128,7 @@ fn voxel_operations(albedo: f64, seed: u32) -> Vec<Value> {
     let mut operations = graph_operations(&volume_inputs(albedo));
     operations.push(json!({"op":"material.create","id":"emitter","graph":GRAPH}));
     operations.push(json!({"op":"volume.create","id":"emissive","materials":["emitter"],"grids":[{"dims":[16,16,16],"voxel_size":0.125,"origin":[-0.9375,-0.9375,-0.9375],"values":vec![1.0_f64; 16 * 16 * 16]}]}));
-    operations.extend(frame_operations(seed));
+    operations.extend(frame_operations(seed, VOXEL_SAMPLES));
     operations
 }
 
@@ -189,28 +191,34 @@ fn oracle_case(file: &str, name: &str) -> Result<([f64; 3], [f64; 3]), Box<dyn E
     ))
 }
 
-/// Checks a stochastic case: Potter's mean over `SEEDS` renders matches Blender's mean within three noise floors, the
-/// floor being Blender's seed standard error combined with Potter's standard error of the mean across seeds.
+/// Checks Potter's mean over `seeds` renders against Blender's mean within three noise floors. The floor is Blender's seed
+/// standard error combined with Potter's standard error of the mean across the seeds. A deterministic case (one seed) has
+/// no Potter spread, so its floor is Blender's alone.
 fn assert_matches_blender(
     file: &str,
     name: &str,
+    seeds: u32,
     operations: impl Fn(u32) -> Vec<Value>,
 ) -> Result<(), Box<dyn Error>> {
     let (blender, blender_error) = oracle_case(file, name)?;
     let mut renders = Vec::new();
-    for seed in 0..SEEDS {
+    for seed in 0..seeds {
         renders.push(render_center_block(&operations(seed))?);
     }
-    let count = f64::from(SEEDS);
+    let count = f64::from(seeds);
     for channel in 0..3 {
         let values: Vec<f64> = renders.iter().map(|render| render[channel]).collect();
         let mean = values.iter().sum::<f64>() / count;
-        let variance = values
-            .iter()
-            .map(|value| (value - mean).powi(2))
-            .sum::<f64>()
-            / (count - 1.0);
-        let potter_error = (variance / count).sqrt();
+        let potter_error = if seeds > 1 {
+            let variance = values
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / (count - 1.0);
+            (variance / count).sqrt()
+        } else {
+            0.0
+        };
         let floor = (blender_error[channel].powi(2) + potter_error.powi(2)).sqrt();
         assert!(
             (mean - blender[channel]).abs() <= 3.0 * floor,
@@ -256,11 +264,13 @@ fn scattering_emissive_cube_matches_blender() -> Result<(), Box<dyn Error>> {
     assert_matches_blender(
         "blender_volume_emission.json",
         "emissive_cube_color05",
+        SEEDS,
         |seed| cube_operations(0.5, seed),
     )?;
     assert_matches_blender(
         "blender_volume_emission.json",
         "emissive_cube_color1",
+        SEEDS,
         |seed| cube_operations(1.0, seed),
     )
 }
@@ -269,9 +279,11 @@ fn scattering_emissive_cube_matches_blender() -> Result<(), Box<dyn Error>> {
 /// boundary fade, is the reference.
 #[test]
 fn absorbing_emissive_voxel_matches_blender() -> Result<(), Box<dyn Error>> {
+    // Absorption only is deterministic, so one render is the whole Potter estimate.
     assert_matches_blender(
         "blender_volume_emission_voxel.json",
         "emissive_voxel_color0",
+        1,
         |seed| voxel_operations(0.0, seed),
     )
 }
@@ -283,6 +295,7 @@ fn scattering_emissive_voxel_matches_blender() -> Result<(), Box<dyn Error>> {
     assert_matches_blender(
         "blender_volume_emission_voxel.json",
         "emissive_voxel_color05",
+        SEEDS,
         |seed| voxel_operations(0.5, seed),
     )
 }
