@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::principled_bsdf::{
-    GlassSample, Layers, continuous_density, evaluate as evaluate_bsdf, layers, lobe_probabilities,
-    sample_glass,
+    GlassSample, Layers, continuous_density, diffuse_coefficient, evaluate as evaluate_bsdf,
+    layers, lobe_probabilities, sample_glass,
 };
 use super::{
     bvh::{Bvh, BvhHit},
@@ -159,10 +159,46 @@ enum Pick {
     Pass { multiplier: DVec3 },
 }
 
+/// Cycles' shading-side test of `bump_shadowing_term` (`intern/cycles/kernel/closure/bsdf.h:94-137`). A closure whose
+/// normal `normal` is bent away from the smooth normal `smooth`, by bump, a normal map, or the specular correction,
+/// evaluates to zero when `light` lies on the other side of the smooth surface than the closure normal does: the sign
+/// of `cosNsI * cosNsN * cosNI`, with the smooth normal taken for the light and the closure normal for `cosNI`. A closure
+/// whose normal equals the smooth normal always passes.
+fn shading_side_passes(smooth: DVec3, normal: DVec3, light: DVec3) -> bool {
+    if normal == smooth {
+        return true;
+    }
+    smooth.dot(light) * smooth.dot(normal) * normal.dot(light) >= 0.0
+}
+
+/// Cycles' diffuse smoothing of `bump_shadowing_term` (`bsdf.h:94-137`): at grazing light, a diffuse lobe whose normal is
+/// bent from the smooth normal takes the GGX shadowing term of Conty et al. (`A Microfacet-Based Shadowing Function to
+/// Solve the Bump Terminator Problem`), with `alpha² = saturate(tan²θ_bend / 8)`. The factor is `G = 1 / (1 + Λ)` at the
+/// light's cosine, with Cycles' GGX `Λ` (`bsdf_microfacet.h:602-623`).
+fn diffuse_smoothing(smooth: DVec3, normal: DVec3, light: DVec3) -> f64 {
+    if normal == smooth {
+        return 1.0;
+    }
+    let cos_light = smooth.dot(light).abs();
+    let cos_bend = smooth.dot(normal).abs();
+    if cos_bend >= 1.0 || cos_light >= 1.0 {
+        return 1.0;
+    }
+    if cos_light < 1.0e-6 {
+        return 0.0;
+    }
+    let alpha2 = ((1.0 / (cos_bend * cos_bend) - 1.0) / 8.0).clamp(0.0, 1.0);
+    let tan2_light = (1.0 / (cos_light * cos_light) - 1.0).max(0.0);
+    let lambda = 0.5 * ((1.0 + alpha2 * tan2_light).sqrt() - 1.0);
+    1.0 / (1.0 + lambda)
+}
+
 /// The closures of one hit with the totals Cycles' closure loops compute: selection, emission, coverage, and shadow
 /// transparency.
 struct Closures {
     items: Vec<HitClosure>,
+    /// The smooth shading normal, Cycles' `sd->N` before bump or normal mapping: the reference of the shading-side test.
+    smooth: DVec3,
     /// Sum of every share's selection weight, reflective and pass-through: the selection normaliser.
     selection_total: f64,
     /// Sum of the reflective selection weights.
@@ -182,7 +218,7 @@ struct Closures {
 }
 
 impl Closures {
-    fn new(items: Vec<HitClosure>) -> Self {
+    fn new(items: Vec<HitClosure>, smooth: DVec3) -> Self {
         let mut selection_total = 0.0;
         let mut reflect_total = 0.0;
         let mut emission = DVec3::ZERO;
@@ -216,6 +252,7 @@ impl Closures {
         }
         Self {
             items,
+            smooth,
             selection_total,
             reflect_total,
             emission,
@@ -268,15 +305,28 @@ impl Closures {
     }
 
     /// The reflective share at `light`: `Σ w·α·f·|cos|` over the closures, each with its own lobes, normal and cosine
-    /// (Cycles' `surface_shader_bsdf_eval`).
+    /// (Cycles' `surface_shader_bsdf_eval`). A closure fails the shading-side test when its normal is bent off the smooth
+    /// normal, and its diffuse lobe is smoothed at grazing light (`bump_shadowing_term`, evaluated with `is_eval`).
     fn bsdf_eval(&self, light: DVec3) -> DVec3 {
         self.items.iter().fold(DVec3::ZERO, |sum, closure| {
             let reflect = closure.reflect_weight();
             if reflect <= 0.0 {
                 return sum;
             }
-            let cosine = closure.layers.normal.dot(light).abs();
-            sum + evaluate_bsdf(&closure.params, &closure.layers, light) * (reflect * cosine)
+            let (params, layers) = (&closure.params, &closure.layers);
+            if !shading_side_passes(self.smooth, layers.normal, light) {
+                return sum;
+            }
+            let cosine = layers.normal.dot(light).abs();
+            // The diffuse lobe is inside `evaluate`; its smoothing replaces that share by the smoothed one.
+            let diffuse = if layers.normal.dot(light) > 0.0 {
+                diffuse_coefficient(params, layers)
+            } else {
+                DVec3::ZERO
+            };
+            let smoothing = diffuse_smoothing(self.smooth, layers.normal, light);
+            let shaded = evaluate_bsdf(params, layers, light) + diffuse * (smoothing - 1.0);
+            sum + shaded * (reflect * cosine)
         })
     }
 
@@ -1862,7 +1912,7 @@ fn make_surface(
                 normal,
                 geometric_normal: frame.geometric_normal,
                 shadow_point: frame.shadow_point,
-                closures: Closures::new(items),
+                closures: Closures::new(items, frame.normal),
                 medium: Medium::from_closures(&shading.volume),
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
@@ -3627,7 +3677,7 @@ mod sampling_tests {
 
         let samples = 400_000_usize;
         let mut rng = Pcg32::for_sample(1, 0, 0, 0);
-        let closures = Closures::new(vec![HitClosure::new(1.0, &params, view)]);
+        let closures = Closures::new(vec![HitClosure::new(1.0, &params, view)], normal);
         let mut sum = DVec3::ZERO;
         let mut sum_squares = DVec3::ZERO;
         for _ in 0..samples {
@@ -3988,5 +4038,47 @@ mod sampling_tests {
             (pdf - 4.0).abs() < 1.0e-12,
             "density {pdf} is not measured from the receiver"
         );
+    }
+
+    #[test]
+    fn bent_closure_normal_fails_only_when_the_light_is_on_the_other_side_of_the_smooth_surface() {
+        let smooth = DVec3::Z;
+        let bent = DVec3::new(0.6, 0.0, 0.8);
+        // Above both the smooth surface and the bent normal: the three signs agree.
+        assert!(shading_side_passes(
+            smooth,
+            bent,
+            DVec3::new(0.643, 0.0, 0.766)
+        ));
+        // Below the smooth surface (`cos_smooth < 0`) but above the bent normal (`cos_bent > 0`): the product is
+        // negative, so the closure is zero (Cycles `bump_shadowing_term`, `cosNsI * cosNsN * cosNI < 0`).
+        assert!(!shading_side_passes(
+            smooth,
+            bent,
+            DVec3::new(0.9, 0.0, -0.1).normalize()
+        ));
+        // A closure on the smooth normal passes for every light.
+        assert!(shading_side_passes(
+            smooth,
+            smooth,
+            DVec3::new(0.9, 0.0, -0.1)
+        ));
+    }
+
+    #[test]
+    fn diffuse_smoothing_is_conty_s_ggx_shadowing_at_grazing_light_and_one_otherwise() {
+        let smooth = DVec3::Z;
+        let bent = DVec3::new(0.6, 0.0, 0.8);
+        // The light at cos 0.5 from the smooth normal and the bend's cos 0.8: alpha² = (1/0.64 - 1) / 8 = 0.0703125,
+        // tan²(light) = 3, Λ = ½(√(1 + 0.2109375) - 1) = 0.0502131, G = 1 / (1 + Λ) = 0.95219.
+        let grazing = DVec3::new(0.866_025_403_784_438_6, 0.0, 0.5);
+        let smoothing = diffuse_smoothing(smooth, bent, grazing);
+        assert!(
+            (smoothing - 0.95219).abs() < 1.0e-4,
+            "grazing smoothing {smoothing}"
+        );
+        // The light straight above is not shadowed, and a flat closure is never smoothed.
+        assert!((diffuse_smoothing(smooth, bent, DVec3::Z) - 1.0).abs() < 1.0e-12);
+        assert_eq!(diffuse_smoothing(smooth, smooth, grazing), 1.0);
     }
 }
