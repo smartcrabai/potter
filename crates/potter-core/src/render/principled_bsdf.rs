@@ -170,17 +170,21 @@ fn diffuse_layer_weight(params: &BsdfParams, normal: DVec3, view: DVec3) -> f64 
     }
 }
 
-/// The share of the diffuse base that the subsurface closure leaves to diffuse. Burley: `1 - Subsurface Weight` on the
-/// channels with a radius, and `1` on the others, which fall back to diffuse (`bssrdf_setup`); a Thin Wall keeps the
-/// whole diffuse base. The random walk closure leaves `1 - Subsurface Weight` on every channel
-/// (`svm/closure.h`, `diffuse_weight = base × (1 - subsurface_weight) × weight`).
+/// The share of the diffuse base that the subsurface closures leave to diffuse, as Cycles' `closure` setup does
+/// (`svm/closure.h`). The diffuse closure keeps `1 - Subsurface Weight` for every method. A Thin Wall adds its thin
+/// reflection (`bsdf_thin_subsurface_setup`), a Lambert of weight `sat(0.5 (1 - anisotropy)) × subsurface weight`, to
+/// the same diffuse. Burley without Thin Wall takes the per-channel share of `bssrdf_setup`: `1 - Subsurface Weight` on
+/// the channels with a radius, and `1` on the others. The random walk takes `1 - Subsurface Weight` on every channel.
 fn subsurface_share(params: &BsdfParams) -> DVec3 {
+    let sss = params.subsurface_weight.clamp(0.0, 1.0);
+    if params.thin_wall {
+        let reflection = (0.5 * (1.0 - params.subsurface_anisotropy)).clamp(0.0, 1.0);
+        return DVec3::splat(1.0 - sss + sss * reflection);
+    }
     if !subsurface_evaluated(params) {
         return DVec3::ONE;
     }
-    let sss = params.subsurface_weight.clamp(0.0, 1.0);
     match params.subsurface_method {
-        SubsurfaceMethod::Burley if params.thin_wall => DVec3::ONE,
         SubsurfaceMethod::Burley => {
             let mask = channel_mask(closure_radius(params));
             DVec3::from_array(std::array::from_fn(|channel| {
@@ -2088,6 +2092,19 @@ mod subsurface_tests {
             + probabilities.transmission;
         assert!((total - 1.0).abs() < 1.0e-12, "{total}");
         assert!(probabilities.subsurface > 0.0);
+    }
+
+    #[test]
+    fn thin_wall_share_is_the_thin_branch_of_closure_setup() {
+        // `svm/closure.h`: the diffuse keeps `1 - sw`, and `bsdf_thin_subsurface_setup` adds a reflection of weight
+        // `sat(0.5 (1 - a)) × sw`. Both are Lambert, so one share. Anisotropy 0.5 gives a reflection of 0.25.
+        let mut params = principled(SubsurfaceMethod::Burley, 0.5);
+        params.thin_wall = true;
+        params.subsurface_anisotropy = 0.5;
+        let expected = 1.0 - 0.5 + 0.5 * 0.25;
+        for channel in subsurface_share(&params).to_array() {
+            assert!((channel - expected).abs() < 1e-12, "{channel}");
+        }
     }
 
     #[test]

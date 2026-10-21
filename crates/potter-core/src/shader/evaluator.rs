@@ -216,7 +216,7 @@ pub struct BsdfParams {
     pub subsurface_scale: f64,
     /// Cycles' subsurface method (`SubsurfaceMethod`), read from the Principled node's `subsurface_method` property.
     pub subsurface_method: SubsurfaceMethod,
-    /// The Principled Subsurface Anisotropy, the phase function's g of the random walk.
+    /// The Principled Subsurface Anisotropy: the thin branch's reflection and transmission split (`bsdf_thin_subsurface_setup`), and the random walk's phase function g.
     pub subsurface_anisotropy: f64,
     pub coat_weight: f64,
     pub coat_roughness: f64,
@@ -238,8 +238,9 @@ pub struct BsdfParams {
     /// Oren-Nayar roughness of the diffuse lobe. Potter's diffuse lobe is Lambert, so a value above
     /// zero is reported as unevaluated (Cycles `bsdf_oren_nayar_setup`).
     pub diffuse_roughness: f64,
-    /// Thin Wall (Cycles' `thin_wall`): transmission through a thin sheet. Potter does not evaluate
-    /// it; it is reported as unevaluated.
+    /// Thin Wall (Cycles' `thin_wall`, `svm/closure.h`): the thin branch replaces the BSSRDF with the thin-subsurface
+    /// closure. Potter evaluates that closure's diffuse reflection (`subsurface_share`), but not its translucent
+    /// transmission (`bsdf_thin_subsurface_setup`), so the input is reported as unevaluated.
     pub thin_wall: bool,
     /// Cycles' scattering coefficient σs per channel, absolute: each closure's scatter weight times
     /// its Density. Add Shader sums it and Mix Shader mixes it per closure, as Cycles weights closures.
