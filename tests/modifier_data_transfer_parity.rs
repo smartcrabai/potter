@@ -8,9 +8,10 @@ use std::{
 use glam::{DMat4, DVec3, Mat4};
 use potter_core::{
     geom::{
-        Mesh,
+        Mesh, ResolvedTexture,
         modifiers::attributes::{
-            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32, evaluate_with_context,
+            AttributeLayerSelection, SceneOperand, SceneOperandMatricesF32,
+            evaluate_with_context as evaluate_attribute,
         },
     },
     model::{CameraData, Modifier, ModifierRuntime},
@@ -38,6 +39,29 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         binding_data: None,
         runtime: ModifierRuntime::default(),
     })
+}
+
+/// Evaluates an attribute modifier with no texture, so no texture coordinate mapping applies. These
+/// fixtures never sample a mask texture.
+fn evaluate_with_context(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    operands: &BTreeMap<String, Vec<SceneOperand>>,
+    texture: Option<&ResolvedTexture>,
+    subject_world: DMat4,
+    subject_name: &str,
+    subject_layer_selection: &AttributeLayerSelection,
+) -> potter_core::error::Result<Mesh> {
+    evaluate_attribute(
+        mesh,
+        modifier,
+        operands,
+        texture,
+        None,
+        subject_world,
+        subject_name,
+        subject_layer_selection,
+    )
 }
 
 fn layer_selection(groups: &[&str], active_group: Option<usize>) -> AttributeLayerSelection {
@@ -294,6 +318,36 @@ fn domain_attribute_values(mesh: &Mesh, name: &str) -> Value {
     )
 }
 
+/// The color values of a layer in row order: one per vertex for a point layer, one per corner for a
+/// corner layer. A missing layer reads as empty.
+fn color_values(mesh: &Mesh, name: &str) -> Value {
+    let Some(attribute) = mesh.attributes.get(name) else {
+        return json!([]);
+    };
+    let Some(values) = attribute.get("values").and_then(Value::as_object) else {
+        return json!([]);
+    };
+    if attribute.get("domain").and_then(Value::as_str) == Some("point") {
+        Value::Array(
+            mesh.vertices
+                .iter()
+                .filter_map(|vertex| values.get(&format!("v{}", vertex.id)).cloned())
+                .collect(),
+        )
+    } else {
+        let mut colors = Vec::new();
+        for face in &mesh.faces {
+            if let Some(row) = values
+                .get(&format!("f{}", face.id))
+                .and_then(Value::as_array)
+            {
+                colors.extend(row.iter().cloned());
+            }
+        }
+        Value::Array(colors)
+    }
+}
+
 fn set_custom_normal_codes(mesh: &mut Mesh, raw_codes: &Value) -> Result<(), Box<dyn Error>> {
     let codes = raw_codes
         .as_array()
@@ -497,7 +551,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
                 "max_distance":10.0,"ray_radius":0.01
             }),
         )?;
-        let actual = evaluate_with_context(
+        let actual = evaluate_attribute(
             &destination,
             &modifier,
             &source_operands,
@@ -521,7 +575,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
             "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":10.0,
         }),
     )?;
-    let no_transform_actual = evaluate_with_context(
+    let no_transform_actual = evaluate_attribute(
         &no_transform_destination,
         &no_transform_modifier,
         &source_operands,
@@ -555,7 +609,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
             "vert_mapping":"NEAREST","mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,"max_distance":0.1
         }),
     )?;
-    let cutoff_actual = evaluate_with_context(
+    let cutoff_actual = evaluate_attribute(
         &cutoff,
         &cutoff_modifier,
         &source_operands,
@@ -592,7 +646,7 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
             "mix_mode":"REPLACE","mix_factor":1.0
         }),
     )?;
-    let actual = evaluate_with_context(
+    let actual = evaluate_attribute(
         &topology,
         &modifier,
         &source_operands,
@@ -731,13 +785,13 @@ fn vgroup_active_index_mix_and_mask_match_blender() -> Result<(), Box<dyn Error>
     let mut destination = quad()?;
     set_group(&mut destination, "D0", &[0.2; 4]);
     set_group(&mut destination, "D1", &[0.3; 4]);
-    let modifier = modifier(
+    let active_modifier = modifier(
         "data_transfer",
         json!({"object":"source","use_vert_data":true,"data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"TOPOLOGY","layers_vgroup_select_src":"ACTIVE","layers_vgroup_select_dst":"ACTIVE","mix_mode":"REPLACE","mix_factor":1.0}),
     )?;
     let actual = evaluate_with_context(
         &destination,
-        &modifier,
+        &active_modifier,
         &operands,
         None,
         DMat4::IDENTITY,
@@ -1259,7 +1313,8 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
             [0.85, 0.8, -0.15, 1.0],
         ],
     )?;
-    let mut source_operand = operand(source.clone(), DMat4::IDENTITY, &[], None);
+    let source_operand = operand(source.clone(), DMat4::IDENTITY, &[], None);
+    let mut operands = BTreeMap::new();
     operands.insert("object".to_owned(), vec![source_operand]);
     let transfer = modifier(
         "data_transfer",
@@ -1402,33 +1457,6 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         )
         .is_err()
     );
-    let color_values = |mesh: &Mesh, name: &str| -> Value {
-        let Some(attribute) = mesh.attributes.get(name) else {
-            return json!([]);
-        };
-        let Some(values) = attribute.get("values").and_then(Value::as_object) else {
-            return json!([]);
-        };
-        if attribute.get("domain").and_then(Value::as_str) == Some("point") {
-            Value::Array(
-                mesh.vertices
-                    .iter()
-                    .filter_map(|vertex| values.get(&format!("v{}", vertex.id)).cloned())
-                    .collect(),
-            )
-        } else {
-            let mut colors = Vec::new();
-            for face in &mesh.faces {
-                if let Some(row) = values
-                    .get(&format!("f{}", face.id))
-                    .and_then(Value::as_array)
-                {
-                    colors.extend(row.iter().cloned());
-                }
-            }
-            Value::Array(colors)
-        }
-    };
     let mut point_destination = destination.clone();
     set_color_layer(
         &mut point_destination,
@@ -1883,7 +1911,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
     )?;
     assert_eq!(
         domain_attribute_values(&no_active_actual, "ActiveColor"),
-        json!(colors(&expected["destination"])),
+        json!(colors(&expected["destination"])?),
         "ACTIVE destination selection must no-op when the ColorStore has no active layer",
     );
     let mut no_active_source = source.clone();
@@ -1906,7 +1934,7 @@ fn active_color_store_selectors_match_blender_all_name_path() -> Result<(), Box<
     )?;
     assert_eq!(
         domain_attribute_values(&no_active_source_actual, "ActiveColor"),
-        json!(colors(&expected["destination"])),
+        json!(colors(&expected["destination"])?),
         "ACTIVE source selection must no-op when the ColorStore has no active layer",
     );
     Ok(())
@@ -2017,7 +2045,7 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
         DVec3::new(0.0, 0.2, 0.8),
     ];
     let mut expected_precision_zero: Option<Value> = None;
-    for precision in [0.0, 1.0] {
+    for (key, precision) in [("0", 0.0), ("1", 1.0)] {
         let mut destination =
             Mesh::from_positions_and_faces(destination_positions.clone(), vec![vec![0, 1, 2, 3]])?;
         set_uv_layers(
@@ -2828,9 +2856,9 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
             &AttributeLayerSelection::default(),
         )?;
         let actual_values = match data_type {
-            "SHARP_EDGE" => edge_flag_values(&actual, "sharp"),
-            "SEAM" => edge_flag_values(&actual, "seam"),
-            "SMOOTH" => face_flag_values(&actual, "shade_smooth"),
+            "SHARP_EDGE" => domain_attribute_values(&actual, "sharp"),
+            "SEAM" => domain_attribute_values(&actual, "seam"),
+            "SMOOTH" => domain_attribute_values(&actual, "shade_smooth"),
             "BEVEL_WEIGHT_VERT" => domain_attribute_values(&actual, "bevel_weight_vert"),
             "CREASE" => domain_attribute_values(&actual, "crease_edge"),
             "BEVEL_WEIGHT_EDGE" => domain_attribute_values(&actual, "bevel_weight_edge"),
