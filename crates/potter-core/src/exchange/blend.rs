@@ -9357,6 +9357,17 @@ fn socket_rgb(
 /// they are never a loss. Any other mesh attribute is a loss.
 pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // A USD cache resource has no Blender CacheFile to become: the exporter does not create an Alembic CacheFile
+    // on a USD path, so its modifiers are written without a cache file (a no-op in Blender).
+    for (resource_id, resource) in &doc.resources {
+        if resource.get("kind").and_then(Value::as_str) == Some("usd_cache") {
+            losses.push(loss(
+                "cache.usd",
+                Some(resource_id.as_str()),
+                "USD cache files are not exported; the cache resource is written without a Blender CacheFile, so its modifiers do nothing",
+            ));
+        }
+    }
     for (image_id, image) in &doc.images {
         if image.base_is_missing() {
             losses.push(loss(
@@ -10177,6 +10188,18 @@ fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss
 mod tests {
     #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
     use super::*;
+    #[test]
+    fn usd_cache_resources_export_as_cache_usd_losses() {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.resources.insert(
+            Id::new("usd_cache_id").unwrap(),
+            json!({"kind": "usd_cache", "uri": "/x/a.usdc", "hash": "x", "packed": false}),
+        );
+        let losses = export_losses(&doc);
+        assert!(losses.iter().any(|loss| loss.feature_id == "cache.usd"
+            && loss.data_id.as_deref() == Some("usd_cache_id")));
+    }
+
     #[test]
     fn usd_cache_files_import_as_cache_usd_losses() {
         let raw =

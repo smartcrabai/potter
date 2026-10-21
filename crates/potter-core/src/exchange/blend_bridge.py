@@ -5694,6 +5694,11 @@ def _relative_blend_path(path, target):
 
 
 def _cache_file_for_resource(doc, reference, target, params=None):
+    # A USD cache has no Alembic CacheFile. Its modifiers and constraints are written without one (Blender's
+    # cache-less modifier does nothing), and the Rust export reports the cache.usd loss.
+    resource = _resource_record_for_reference(doc, reference)
+    if resource and resource.get("kind") == "usd_cache":
+        return None
     filepath = _resource_path(doc, reference)
     if not filepath or not os.path.isfile(filepath):
         raise ValueError("Alembic cache resource is missing: %s" % reference)

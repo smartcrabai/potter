@@ -4660,9 +4660,10 @@ fn transform_cache_matrix(
         .get(&resource_id)
         .and_then(|resource| resource.get("kind"))
         .and_then(Value::as_str)
-        && ["usd", "usdc", "usdz"]
-            .iter()
-            .any(|supported| kind.eq_ignore_ascii_case(supported))
+        && (kind == "usd_cache"
+            || ["usd", "usdc", "usdz"]
+                .iter()
+                .any(|supported| kind.eq_ignore_ascii_case(supported)))
     {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -4670,7 +4671,7 @@ fn transform_cache_matrix(
             json!({
                 "constraint_id":constraint.id,
                 "resource_id":resource_id,
-                "feature_id":"constraint.transform_cache.usd",
+                "feature_id": if kind == "usd_cache" { "cache.usd" } else { "constraint.transform_cache.usd" },
             }),
         ));
     }
@@ -9080,6 +9081,28 @@ fn call_expression_function(name: &str, arguments: &[f64]) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usd_cache_transform_cache_is_refused_with_cache_usd() -> Result<()> {
+        let mut doc = SceneDoc::new("scene".to_owned());
+        doc.resources.insert(
+            Id::new("cache")?,
+            json!({"kind":"usd_cache","uri":"cache.usdc","hash":"x","packed":false}),
+        );
+        let constraint = Constraint {
+            constraint_type: ConstraintType::TransformCache,
+            params: json!({"resource":"cache","object_path":"/a/b","frame_offset":0.0,"scale":1.0})
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            ..Constraint::default()
+        };
+        let error = transform_cache_matrix(&doc, &constraint, None, 1.0, 24, 1.0)
+            .expect_err("a usd_cache resource must be refused");
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(error.details["feature_id"], "cache.usd");
+        Ok(())
+    }
 
     #[test]
     fn expression_evaluation_is_arithmetic_only() {
