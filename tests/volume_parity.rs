@@ -6,7 +6,7 @@ use std::{
     fs,
 };
 
-use glam::DVec3;
+use glam::{DMat4, DVec3};
 use potter_core::{
     error::ErrorCode,
     eval::{EvaluationContext, Snapshot},
@@ -228,6 +228,39 @@ fn canonical_rotation(vertices: &[usize]) -> Vec<usize> {
         .expect("polygon has at least three vertices")
 }
 
+/// The smooth faces of a mesh, from its `shade_smooth` face attribute; a missing flag is flat.
+fn smooth_face_count(mesh: &Mesh) -> usize {
+    let values = mesh
+        .attributes
+        .get("shade_smooth")
+        .and_then(|attribute| attribute.get("values"))
+        .and_then(serde_json::Value::as_object);
+    mesh.faces
+        .iter()
+        .filter(|face| {
+            values
+                .and_then(|values| values.get(&format!("f{}", face.id)))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Blender's per-polygon `use_smooth` flags, as the oracle records them, match Potter's smooth faces.
+fn assert_smooth_flags_match(oracle: &OracleMesh, actual: &Mesh, context: &str) {
+    assert_eq!(
+        actual.faces.len(),
+        oracle.smooth_flags.len(),
+        "{context}: smooth flag count"
+    );
+    let expected = oracle.smooth_flags.iter().filter(|smooth| **smooth).count();
+    assert_eq!(
+        smooth_face_count(actual),
+        expected,
+        "{context}: smooth faces"
+    );
+}
+
 fn assert_mesh_matches(oracle: &OracleMesh, actual: &Mesh, context: &str) {
     let (vertices, polygons) = canonical_actual(actual);
     assert_eq!(
@@ -330,14 +363,18 @@ fn check_fixture(file: OracleFile, shape: &str) {
                 case.adaptivity,
                 oracle.threshold
             );
-            let actual = volume::volume_to_mesh_named_adaptive(
+            // The generator sets `use_smooth_shade` on every case.
+            let actual = volume::volume_to_mesh_placed(
                 &volume,
                 oracle.threshold,
                 "density",
                 case.adaptivity,
+                DMat4::IDENTITY,
+                true,
             )
             .unwrap_or_else(|error| panic!("{context}: {error}"));
             assert_mesh_matches(oracle, &actual, &context);
+            assert_smooth_flags_match(oracle, &actual, &context);
         }
     }
 }
@@ -518,9 +555,11 @@ fn volume_modifier_doc(resolution_mode: &str, size: f64, amount: f64) -> (SceneD
 
 #[test]
 fn invalid_mesh_to_volume_settings_leave_existing_volume_unchanged() {
-    for (resolution_mode, voxel_size, voxel_amount) in
-        [("VOXEL_SIZE", 1.0e-6, 32.0), ("VOXEL_AMOUNT", 0.1, 0.5)]
-    {
+    for (resolution_mode, voxel_size, voxel_amount) in [
+        ("VOXEL_SIZE", 1.0e-6, 32.0),
+        ("VOXEL_AMOUNT", 0.1, 0.5),
+        ("VOXEL_AMOUNT", 0.1, 0.0),
+    ] {
         let (doc, volume_node_id, volume_data_id) =
             volume_modifier_doc(resolution_mode, voxel_size, voxel_amount);
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())
@@ -818,11 +857,9 @@ fn blender_volume_displace_image_mapping_modes_match_full_mesh_fixtures() {
             .meshes
             .get(&carrier_id)
             .expect("Volume to Mesh generated carrier geometry");
-        assert_mesh_matches(
-            &case.mesh,
-            actual,
-            &format!("Volume Displace {}", case.texture_map_mode),
-        );
+        let context = format!("Volume Displace {}", case.texture_map_mode);
+        assert_mesh_matches(&case.mesh, actual, &context);
+        assert_smooth_flags_match(&case.mesh, actual, &context);
     }
 }
 
@@ -1152,6 +1189,11 @@ fn blender_multigrid_vdb_displacement_preserves_named_grid_types_and_samples() {
         actual_mesh,
         "multi-grid VDB density displacement",
     );
+    assert_smooth_flags_match(
+        &oracle.volume_to_mesh,
+        actual_mesh,
+        "multi-grid VDB density displacement",
+    );
 
     let mut vector_mesh_doc = doc.clone();
     vector_mesh_doc
@@ -1182,6 +1224,11 @@ fn blender_multigrid_vdb_displacement_preserves_named_grid_types_and_samples() {
         .get(&precision_mesh_node_id)
         .expect("standalone double scalar VOLUME_TO_MESH result");
     assert_mesh_matches(
+        &oracle.precision_volume_to_mesh,
+        precision_mesh,
+        "double-precision VDB VOLUME_TO_MESH",
+    );
+    assert_smooth_flags_match(
         &oracle.precision_volume_to_mesh,
         precision_mesh,
         "double-precision VDB VOLUME_TO_MESH",

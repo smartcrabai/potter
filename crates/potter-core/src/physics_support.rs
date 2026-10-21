@@ -114,7 +114,6 @@ pub(crate) fn honoured_properties(system: &str) -> &'static [&'static str] {
             "thickness_outer",
             "thickness_inner",
             "use_culling",
-            "use_normal",
             "cloth_friction",
         ],
         "fluid_domain" | "fluid_domain_liquid" => &[

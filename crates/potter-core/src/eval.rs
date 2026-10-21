@@ -1841,10 +1841,11 @@ impl Snapshot {
                                         json!({"modifier_id":modifier.id}),
                                     )
                                 })?;
-                                if !amount.is_finite() || amount <= 0.0 {
+                                // The schema's minimum is 0; an amount below 1 keeps the input volume (below).
+                                if !amount.is_finite() || amount < 0.0 {
                                     return Err(PotError::with_details(
                                         ErrorCode::InvalidArgument,
-                                        "mesh-to-volume voxel_amount must be positive",
+                                        "mesh-to-volume voxel_amount must be non-negative",
                                         json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
                                     ));
                                 }
@@ -4868,12 +4869,29 @@ pub(crate) fn apply_volume_to_mesh_modifier(
     };
     // The output transform is applied inside the extraction, in double precision, before the single
     // rounding to `float` that Blender's mesh positions carry (`MOD_volume_to_mesh.cc`).
+    let use_smooth_shade = match modifier.params.get("use_smooth_shade") {
+        Some(value) => value.as_bool().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh use_smooth_shade must be a boolean",
+                json!({"modifier_id":modifier.id,"parameter":"use_smooth_shade"}),
+            )
+        })?,
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "use_smooth_shade",
+        )
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false),
+    };
     let extracted = crate::geom::volume::volume_to_mesh_placed(
         volume,
         threshold,
         &grid_name,
         adaptivity,
         volume_to_mesh,
+        use_smooth_shade,
     )?;
     if extracted
         .vertices

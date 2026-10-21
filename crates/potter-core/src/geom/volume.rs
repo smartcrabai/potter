@@ -485,13 +485,20 @@ pub fn volume_to_mesh_placed(
     grid_name: &str,
     adaptivity: f64,
     output: DMat4,
+    use_smooth_shade: bool,
 ) -> Result<Mesh> {
     if !output.is_finite() {
         return Err(invalid_volume(
             "volume_to_mesh output transform is not finite",
         ));
     }
-    volume_to_mesh_for_grid(volume, iso_level, Some(grid_name), adaptivity, output)
+    let mut mesh = volume_to_mesh_for_grid(volume, iso_level, Some(grid_name), adaptivity, output)?;
+    // `mesh_smooth_set(*mesh, flag & VOLUME_TO_MESH_USE_SMOOTH_SHADE)` (`MOD_volume_to_mesh.cc`);
+    // the extraction itself produces flat faces.
+    if use_smooth_shade {
+        crate::geom::normals::shade_faces_smooth(&mut mesh);
+    }
+    Ok(mesh)
 }
 
 /// Whether the grid a Volume to Mesh modifier selects has any active voxel.
@@ -1709,173 +1716,6 @@ fn vdb_resource_unavailable() -> PotError {
     )
 }
 
-/// Sample a closed mesh's signed-distance approximation onto a regular grid.
-///
-/// The grid includes at least one exterior sample on every side; `padding` adds
-/// further voxels beyond that minimum.
-///
-/// # Errors
-///
-/// Returns `InvalidArgument` for invalid/open meshes or a non-positive/non-finite
-/// voxel size, and `LimitExceeded` when bounded grid or distance work is exceeded.
-pub fn mesh_to_volume(mesh: &Mesh, voxel_size: f64, padding: u32) -> Result<VolumeData> {
-    if !voxel_size.is_finite() || voxel_size <= 0.0 {
-        return Err(invalid_volume("voxel_size must be finite and positive"));
-    }
-    if mesh.vertices.len() > MAX_INPUT_VERTICES
-        || mesh.faces.len() > MAX_INPUT_TRIANGLES
-        || mesh.edges.len() > MAX_INPUT_TRIANGLES * 3
-    {
-        return Err(resource_error());
-    }
-    let input_corner_count = mesh
-        .faces
-        .iter()
-        .try_fold(0_usize, |count, face| {
-            count.checked_add(face.vertices.len())
-        })
-        .ok_or_else(resource_error)?;
-    if input_corner_count > MAX_INPUT_TRIANGLES * 3 {
-        return Err(resource_error());
-    }
-    mesh.validate()
-        .map_err(|error| invalid_mesh_input(&error))?;
-    let bounds = mesh
-        .bounds()
-        .ok_or_else(|| invalid_volume("mesh_to_volume requires a non-empty closed mesh"))?;
-    if mesh.faces.is_empty() {
-        return Err(invalid_volume(
-            "mesh_to_volume requires a non-empty closed mesh",
-        ));
-    }
-
-    let mut edge_uses = HashMap::new();
-    let mut surface_vertices = HashSet::with_capacity(mesh.vertices.len());
-    let mut triangle_count = 0_usize;
-    for face in &mesh.faces {
-        triangle_count = triangle_count
-            .checked_add(face.vertices.len() - 2)
-            .ok_or_else(resource_error)?;
-        for index in 0..face.vertices.len() {
-            let first = face.vertices[index];
-            let second = face.vertices[(index + 1) % face.vertices.len()];
-            surface_vertices.insert(first);
-            let key = edge_key(first, second);
-            let uses = edge_uses.entry(key).or_insert(0_u8);
-            *uses = uses.saturating_add(1);
-        }
-    }
-    if triangle_count == 0 || triangle_count > MAX_INPUT_TRIANGLES {
-        return Err(resource_error());
-    }
-    if surface_vertices.len() != mesh.vertices.len() || edge_uses.values().any(|count| *count != 2)
-    {
-        return Err(invalid_volume(
-            "mesh_to_volume requires a closed two-manifold mesh",
-        ));
-    }
-
-    let triangles = mesh
-        .tessellate()
-        .map_err(|error| invalid_mesh_input(&error))?;
-    let vertex_positions: HashMap<_, _> = mesh
-        .vertices
-        .iter()
-        .map(|vertex| (vertex.id, vertex.co))
-        .collect();
-    let mut surface = Vec::with_capacity(triangles.len());
-    for triangle in triangles {
-        let points = [
-            *vertex_positions
-                .get(&triangle[0])
-                .ok_or_else(|| invalid_volume("mesh triangle references a missing vertex"))?,
-            *vertex_positions
-                .get(&triangle[1])
-                .ok_or_else(|| invalid_volume("mesh triangle references a missing vertex"))?,
-            *vertex_positions
-                .get(&triangle[2])
-                .ok_or_else(|| invalid_volume("mesh triangle references a missing vertex"))?,
-        ];
-        surface.push(points);
-    }
-
-    let effective_padding = padding.max(1) as usize;
-    let size = bounds.size();
-    if !size.is_finite() || size.cmplt(DVec3::ZERO).any() {
-        return Err(invalid_volume("mesh bounds are not finite"));
-    }
-    let dims = [
-        grid_axis(size.x, voxel_size, effective_padding)?,
-        grid_axis(size.y, voxel_size, effective_padding)?,
-        grid_axis(size.z, voxel_size, effective_padding)?,
-    ];
-    let sample_count = dims[0]
-        .checked_mul(dims[1])
-        .and_then(|count| count.checked_mul(dims[2]))
-        .ok_or_else(resource_error)?;
-    let cell_count = (dims[0] - 1)
-        .checked_mul(dims[1] - 1)
-        .and_then(|count| count.checked_mul(dims[2] - 1))
-        .ok_or_else(resource_error)?;
-    let distance_tests = sample_count
-        .checked_mul(surface.len())
-        .ok_or_else(resource_error)?;
-    if sample_count > MAX_GRID_SAMPLES
-        || cell_count > MAX_GRID_CELLS
-        || distance_tests > MAX_DISTANCE_TESTS
-    {
-        return Err(resource_error());
-    }
-
-    let origin = bounds.min - DVec3::splat(voxel_size * effective_padding as f64);
-    let last_position = origin
-        + voxel_size
-            * DVec3::new(
-                (dims[0] - 1) as f64,
-                (dims[1] - 1) as f64,
-                (dims[2] - 1) as f64,
-            );
-    if !origin.is_finite() || !last_position.is_finite() {
-        return Err(invalid_volume(
-            "voxel grid transform produces non-finite positions",
-        ));
-    }
-
-    let mut values = Vec::with_capacity(sample_count);
-    for z in 0..dims[2] {
-        for y in 0..dims[1] {
-            for x in 0..dims[0] {
-                let point = origin + voxel_size * DVec3::new(x as f64, y as f64, z as f64);
-                let distance = signed_distance(point, &surface);
-                let value = distance as f32;
-                if !distance.is_finite() || !value.is_finite() {
-                    return Err(resource_error());
-                }
-                values.push(value);
-            }
-        }
-    }
-    Ok(VolumeData {
-        grids: vec![VolumeGrid {
-            dims: [
-                u32::try_from(dims[0]).map_err(|_| resource_error())?,
-                u32::try_from(dims[1]).map_err(|_| resource_error())?,
-                u32::try_from(dims[2]).map_err(|_| resource_error())?,
-            ],
-            voxel_size,
-            origin,
-            index_to_local: None,
-            values: Some(values),
-            blob_f32: None,
-            content_ref: None,
-        }],
-        source: VolumeSource::Generated(VolumeGeneratedSource {
-            algorithm: "signed_distance".to_owned(),
-        }),
-        decoded_vdb: None,
-    })
-}
-
 /// Rasterize a mesh as a Blender-compatible fog-density grid.
 ///
 /// The dense inline representation stores integer-index samples over the source bounds plus one
@@ -2808,32 +2648,6 @@ fn validate_grid_samples(grid: &VolumeGrid) -> Result<GridSamples<'_>> {
     Ok(samples)
 }
 
-fn grid_axis(extent: f64, voxel_size: f64, padding: usize) -> Result<usize> {
-    let axis = (extent / voxel_size).ceil() + 1.0 + 2.0 * padding as f64;
-    if !axis.is_finite() || axis < 3.0 || axis > MAX_GRID_AXIS as f64 {
-        return Err(resource_error());
-    }
-    Ok(axis as usize)
-}
-
-fn signed_distance(point: DVec3, triangles: &[[DVec3; 3]]) -> f64 {
-    let mut closest_squared = f64::INFINITY;
-    let mut intersections = 0_usize;
-    let ray = DVec3::new(1.0, 0.371_390_676_354_103_7, 0.529_173_248_214_697_2);
-    for triangle in triangles {
-        closest_squared = closest_squared.min(point_triangle_distance_squared(point, *triangle));
-        if ray_intersects_triangle(point, ray, *triangle) {
-            intersections += 1;
-        }
-    }
-    let distance = closest_squared.sqrt();
-    if intersections % 2 == 1 {
-        -distance
-    } else {
-        distance
-    }
-}
-
 #[expect(
     clippy::many_single_char_names,
     reason = "point-triangle distance uses standard barycentric variables"
@@ -2967,7 +2781,7 @@ mod tests {
     };
 
     use super::{
-        VolumeData, VolumeGrid, cubic_weights, mesh_to_fog_volume, mesh_to_volume, sample_density,
+        VolumeData, VolumeGrid, cubic_weights, mesh_to_fog_volume, sample_density,
         sample_density_checked, sample_density_with, volume_to_mesh,
     };
     use crate::model::VolumeInterpolation;
@@ -2990,23 +2804,6 @@ mod tests {
         let point = DVec3::new(0.25, 0.5, 0.75);
         assert!((sample_density(point, &volume) - 3.5).abs() < 1.0e-12);
         assert_eq!(sample_density(DVec3::new(-0.01, 0.0, 0.0), &volume), 0.0);
-    }
-
-    #[test]
-    fn mesh_volume_mesh_preserves_bounds_within_one_voxel() {
-        let source = Mesh::box_mesh(BoxParams {
-            size: DVec3::new(1.7, 2.1, 1.3),
-        })
-        .unwrap();
-        let voxel_size = 0.3;
-        let volume = mesh_to_volume(&source, voxel_size, 2).unwrap();
-        let result = volume_to_mesh(&volume, 0.0).unwrap();
-        let source_bounds = source.bounds().unwrap();
-        let result_bounds = result.bounds().unwrap();
-        for axis in 0..3 {
-            assert!((source_bounds.min[axis] - result_bounds.min[axis]).abs() <= voxel_size);
-            assert!((source_bounds.max[axis] - result_bounds.max[axis]).abs() <= voxel_size);
-        }
     }
 
     #[test]

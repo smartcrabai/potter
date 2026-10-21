@@ -9363,8 +9363,6 @@ fn collect_potter_physics_export_losses(
     }
 }
 
-/// The physics system of a block nested in `system`: a cloth's `collision_settings`, each dynamic-paint canvas surface (one block
-/// per surface), and any `point_cache`. Other nested values are compared whole against their default.
 fn has_verbatim_native_movie_clip(doc: &SceneDoc, clip: &MovieClip) -> bool {
     let original_blend = doc.compatibility.values().any(|entry| {
         entry.get("format").and_then(Value::as_str) == Some("blend")

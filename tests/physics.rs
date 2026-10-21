@@ -613,6 +613,12 @@ fn soft_body_sphere_on_collider_rebounds_below_its_drop_height() {
         apex < release_height - 1.0e-6,
         "soft-body rebound apex {apex} is not strictly below the drop height {release_height}"
     );
+    // A body that sticks to the floor keeps its contact height; a rebound rises above it.
+    let centre_at_contact = centers[contact];
+    assert!(
+        apex > centre_at_contact + 1.0e-6,
+        "soft body did not rebound: apex {apex} after contact, centre {centre_at_contact} at contact"
+    );
 }
 
 #[test]

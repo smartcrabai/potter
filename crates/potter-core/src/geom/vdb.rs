@@ -5,7 +5,7 @@
 //! the standard `Tree_*_5_4_3` hierarchy and returns typed errors for other variants.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Read,
     sync::{Arc, LazyLock, Mutex},
 };
@@ -119,17 +119,18 @@ pub struct VdbTree {
     pub background: f64,
     background_value: VdbValue,
     values: HashMap<IVec3, VdbValue>,
+    /// Index coordinates of the active voxels, from the leaf value masks (`OpenVDB` `isValueOn`).
+    active_voxels: HashSet<IVec3>,
     tiles: HashMap<(IVec3, i32), VdbTile>,
     /// Tight bounds of active voxels or active tiles in index space.
     pub active_bbox: Option<([i32; 3], [i32; 3])>,
 }
 
 impl VdbTree {
-    /// Index coordinates Blender treats as active: stored samples plus every voxel of an active tile.
-    /// Stored inactive non-background samples count as active because the reader keeps no per-voxel
-    /// activity flags.
+    /// Index coordinates Blender treats as active: the active voxels plus every voxel of an active tile.
+    /// Inactive stored samples are not seeds, as `dilateActiveValues` visits only active values.
     pub(crate) fn active_seeds(&self, limit: usize) -> Result<Vec<IVec3>> {
-        let mut seeds: Vec<IVec3> = self.values.keys().copied().collect();
+        let mut seeds: Vec<IVec3> = self.active_voxels.iter().copied().collect();
         for tile in self.tiles.values().filter(|tile| tile.active) {
             let count = (0..3)
                 .try_fold(1_usize, |count, axis| {
@@ -159,7 +160,9 @@ impl VdbTree {
         Ok(seeds)
     }
 
-    /// A tree with this background whose only voxels are `values`, with tight active bounds.
+    /// A tree with this background whose voxels are `values`, all active, with tight active bounds.
+    /// Inactive tiles keep their values, as Blender's displaced copy keeps every inactive value; active
+    /// tiles are replaced by their voxels in `values`, which the displacement domain covers.
     pub(crate) fn with_samples(&self, values: HashMap<IVec3, VdbValue>) -> Self {
         let active_bbox =
             values
@@ -182,11 +185,19 @@ impl VdbTree {
                         ),
                     })
                 });
+        let active_voxels = values.keys().copied().collect();
+        let tiles = self
+            .tiles
+            .iter()
+            .filter(|(_, tile)| !tile.active)
+            .map(|(key, tile)| (*key, *tile))
+            .collect();
         Self {
             background: self.background,
             background_value: self.background_value,
             values,
-            tiles: HashMap::new(),
+            active_voxels,
+            tiles,
             active_bbox,
         }
     }
@@ -851,6 +862,7 @@ impl<'a> Parser<'a> {
             background: background.scalar(),
             background_value: background,
             values: HashMap::new(),
+            active_voxels: HashSet::new(),
             tiles: HashMap::new(),
             active_bbox: None,
         };
@@ -898,6 +910,7 @@ impl<'a> Parser<'a> {
                 let active = leaf.active[offset];
                 if active {
                     Self::include_active(&mut tree.active_bbox, coordinate, coordinate);
+                    tree.active_voxels.insert(IVec3::from_array(coordinate));
                 }
                 if active || value != background {
                     tree.values.insert(IVec3::from_array(coordinate), value);
@@ -2036,6 +2049,47 @@ mod sampling_tests {
     use super::*;
 
     #[test]
+    fn active_seeds_skip_inactive_samples_and_displaced_trees_keep_inactive_tiles() {
+        let active = IVec3::new(1, 1, 1);
+        let inactive_sample = IVec3::new(5, 5, 5);
+        let inactive_tile = VdbTile {
+            min: [64, 0, 0],
+            max: [71, 7, 7],
+            value: VdbValue::Float(-1.0),
+            active: false,
+        };
+        let active_tile = VdbTile {
+            min: [128, 0, 0],
+            max: [135, 7, 7],
+            value: VdbValue::Float(0.0),
+            active: true,
+        };
+        let tree = VdbTree {
+            background: 0.0,
+            background_value: VdbValue::Float(0.0),
+            values: HashMap::from([
+                (active, VdbValue::Float(1.0)),
+                (inactive_sample, VdbValue::Float(-2.0)),
+            ]),
+            active_voxels: HashSet::from([active]),
+            tiles: HashMap::from([
+                ((IVec3::new(64, 0, 0), 8), inactive_tile),
+                ((IVec3::new(128, 0, 0), 8), active_tile),
+            ]),
+            active_bbox: None,
+        };
+        let seeds = tree.active_seeds(usize::MAX).unwrap();
+        // One active voxel plus the eight-cubed voxels of the active tile; the inactive sample is not seeded.
+        assert_eq!(seeds.len(), 1 + 512);
+        assert!(seeds.contains(&active));
+        assert!(!seeds.contains(&inactive_sample));
+        // The displaced copy keeps the inactive tile and drops the active tile, whose voxels are values now.
+        let displaced = tree.with_samples(HashMap::from([(active, VdbValue::Float(1.0))]));
+        assert_eq!(displaced.tiles.len(), 1);
+        assert!(displaced.tiles.values().all(|tile| !tile.active));
+    }
+
+    #[test]
     fn world_sampling_uses_sparse_voxel_background_outside_the_sphere() {
         let mut values = HashMap::new();
         for z in 0..16 {
@@ -2048,10 +2102,12 @@ mod sampling_tests {
                 }
             }
         }
+        let active_voxels = values.keys().copied().collect();
         let tree = Arc::new(VdbTree {
             background: 0.0,
             background_value: VdbValue::Float(0.0),
             values,
+            active_voxels,
             tiles: HashMap::new(),
             active_bbox: Some(([2, 2, 2], [13, 13, 13])),
         });

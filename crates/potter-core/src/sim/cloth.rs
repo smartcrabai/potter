@@ -174,10 +174,13 @@ pub fn simulate(
     })?;
     // Blender's goal spring: stiffness `goal * goal_spring / avg_spring_len` toward the input position,
     // for every vertex that is not pinned and has a goal weight above zero (`cloth_calc_force`).
+    // A zero `goal_spring` has no force, so no spring is built: its compliance would be infinite.
     let goal_springs = goals
         .iter()
         .enumerate()
-        .filter(|(_, goal)| !goal.pinned && goal.weight > f64::from(f32::EPSILON))
+        .filter(|(_, goal)| {
+            !goal.pinned && goal.weight > f64::from(f32::EPSILON) && config.goal_spring > 0.0
+        })
         .map(|(index, goal)| GoalSpring {
             index,
             alpha: spring_compliance(
@@ -949,6 +952,28 @@ mod tests {
         // the unconstrained fall.
         assert!(held[0].z > free[0].z);
         assert!(held[0].z < mesh.vertices[0].co.z);
+    }
+
+    #[test]
+    fn zero_goal_spring_applies_no_goal_force_and_stays_finite() {
+        let mut mesh = Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            vec![vec![0, 1, 2]],
+        )
+        .unwrap();
+        mesh.attributes
+            .insert("vertex_groups".to_owned(), json!({"partial": {"0": 0.5}}));
+        let result = simulate(
+            &mesh,
+            &json!({"vertex_group_mass": "partial", "iterations": 12, "goal_spring": 0.0}),
+            1.0,
+            24.0,
+            DVec3::new(0.0, 0.0, -9.81),
+            &[],
+        )
+        .unwrap();
+        assert!(result.iter().all(|position| position.is_finite()));
+        assert!(result[0].z < mesh.vertices[0].co.z);
     }
 
     #[test]

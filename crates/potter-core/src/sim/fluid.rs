@@ -34,10 +34,19 @@ pub struct FlowSource {
 /// 0.3-unit effector at z = 0.95, the column's lowest liquid descends about 0.012 per frame while it is
 /// inside, against about 0.075 without the effector, and it leaves through the bottom face around frame 8.
 /// Potter has no grid obstacle rule to reproduce that, so this is a reported gap (solver parity).
+///
+/// `effectors` holds one closed triangle list per effector. A point is inside when it is inside one
+/// effector's own surface, so an overlap of two effectors does not cancel the crossings.
 #[must_use]
-pub fn emitter_spawns_inside_effector(flows: &[FlowSource], effectors: &[[DVec3; 3]]) -> bool {
+pub fn emitter_spawns_inside_effector(flows: &[FlowSource], effectors: &[Vec<[DVec3; 3]>]) -> bool {
     const SAMPLE_DIVISIONS: usize = 8;
-    let Some((effector_min, effector_max)) = triangle_bounds_all(effectors) else {
+    let Some((effector_min, effector_max)) =
+        effectors.iter().flatten().map(triangle_bounds).reduce(
+            |(minimum, maximum), (next_min, next_max)| {
+                (minimum.min(next_min), maximum.max(next_max))
+            },
+        )
+    else {
         return false;
     };
     flows.iter().any(|flow| {
@@ -48,8 +57,11 @@ pub fn emitter_spawns_inside_effector(flows: &[FlowSource], effectors: &[[DVec3;
                 maximum[axis] < effector_min[axis] || minimum[axis] > effector_max[axis]
             });
             !apart
-                && triangle_samples(*triangle, SAMPLE_DIVISIONS)
-                    .any(|point| point_inside_closed_surface(point, effectors))
+                && triangle_samples(*triangle, SAMPLE_DIVISIONS).any(|point| {
+                    effectors
+                        .iter()
+                        .any(|effector| point_inside_closed_surface(point, effector))
+                })
         })
     })
 }
@@ -59,15 +71,6 @@ fn triangle_bounds(triangle: &[DVec3; 3]) -> (DVec3, DVec3) {
         triangle[0].min(triangle[1]).min(triangle[2]),
         triangle[0].max(triangle[1]).max(triangle[2]),
     )
-}
-
-fn triangle_bounds_all(triangles: &[[DVec3; 3]]) -> Option<(DVec3, DVec3)> {
-    triangles
-        .iter()
-        .map(triangle_bounds)
-        .reduce(|(minimum, maximum), (next_min, next_max)| {
-            (minimum.min(next_min), maximum.max(next_max))
-        })
 }
 
 /// Points on a regular barycentric grid over `triangle`, `divisions` steps along each edge.
@@ -696,7 +699,7 @@ mod tests {
 
     use crate::geom::{Mesh, Vertex};
 
-    use super::{FlowSource, simulate, simulate_with_sources};
+    use super::{FlowSource, emitter_spawns_inside_effector, simulate, simulate_with_sources};
 
     #[test]
     fn liquid_is_deterministic_bounded_and_falls_under_gravity() {
@@ -887,5 +890,55 @@ mod tests {
         .expect("outside flow succeeds");
         assert_ne!(baseline, Vec::<DVec3>::new());
         assert_eq!(ignored, Vec::<DVec3>::new());
+    }
+
+    /// Triangles of the closed axis-aligned box from `low` to `high`.
+    fn cube_triangles(low: DVec3, high: DVec3) -> Vec<[DVec3; 3]> {
+        let corner = |x: f64, y: f64, z: f64| DVec3::new(x, y, z);
+        let c000 = corner(low.x, low.y, low.z);
+        let c100 = corner(high.x, low.y, low.z);
+        let c010 = corner(low.x, high.y, low.z);
+        let c110 = corner(high.x, high.y, low.z);
+        let c001 = corner(low.x, low.y, high.z);
+        let c101 = corner(high.x, low.y, high.z);
+        let c011 = corner(low.x, high.y, high.z);
+        let c111 = corner(high.x, high.y, high.z);
+        vec![
+            [c000, c100, c110],
+            [c000, c110, c010],
+            [c001, c111, c101],
+            [c001, c011, c111],
+            [c000, c101, c100],
+            [c000, c001, c101],
+            [c010, c110, c111],
+            [c010, c111, c011],
+            [c000, c010, c011],
+            [c000, c011, c001],
+            [c100, c101, c111],
+            [c100, c111, c110],
+        ]
+    }
+
+    #[test]
+    fn emitter_inside_two_overlapping_effectors_is_reported() {
+        // A triangle wholly inside the box [0, 2]^3: every sample lies in both copies.
+        let flow = || FlowSource {
+            triangles: vec![[
+                DVec3::splat(0.9),
+                DVec3::new(1.1, 0.9, 0.9),
+                DVec3::new(0.9, 1.1, 0.9),
+            ]],
+            inflow_rate: 1.0,
+        };
+        let cube = cube_triangles(DVec3::ZERO, DVec3::splat(2.0));
+        assert!(emitter_spawns_inside_effector(
+            &[flow()],
+            std::slice::from_ref(&cube)
+        ));
+        // Two identical effectors would cancel under a single parity count; per effector they do not.
+        assert!(emitter_spawns_inside_effector(
+            &[flow()],
+            &[cube.clone(), cube]
+        ));
     }
 }

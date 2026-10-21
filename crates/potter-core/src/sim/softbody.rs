@@ -7,10 +7,12 @@
 //! - `friction` is Blender's damping constant `kd = 0.01 * friction` (`softbody.cc`), applied as
 //!   the force `-kd * v`. The velocity therefore decays at the rate `kd / mass` per second.
 //! - `use_goal`, `goal_spring`, `goal_default`, `goal_min`, `goal_max`, and `vertex_group_goal`
-//!   give each vertex the goal weight `g = (goal_min + w * |goal_max - goal_min|)^4`, where `w` is
-//!   the group weight or `goal_default` for an unassigned vertex (`softbody.cc`). A goal of at
-//!   least 0.999 pins the vertex. Otherwise the vertex is pulled toward its input position by the
-//!   spring `ks = 1 / (1 - g * goal_spring) - 1`.
+//!   give each vertex the goal weight `g = (goal_min + goal * |goal_max - goal_min|)^4`, where
+//!   `goal` is `goal_default` times the group weight, and the weight is zero for a vertex outside
+//!   the group (`softbody.cc`: `bp->goal = defgoal`, then `*= group weight`). Without a group,
+//!   `goal` is `goal_default` for every vertex. A goal of at least 0.999 pins the vertex.
+//!   Otherwise the vertex is pulled toward its input position by the spring
+//!   `ks = 1 / (1 - g * goal_spring) - 1`.
 //! - `use_edges` enables the edge constraints, which use Potter's internal `EDGE_STIFFNESS`.
 //!   Blender's `pull` and `push` springs are not mapped, so non-default values are refused.
 //! - `speed` scales the solver time (`softbody.cc`).
@@ -409,20 +411,24 @@ fn inside_collision_triangle(point: DVec3, triangle: &CollisionTriangle) -> bool
     crate::geom::point_in_triangle_barycentric(u, v, 1.0e-10)
 }
 
-/// Goal weight `g = (goal_min + w * |goal_max - goal_min|)^4` per vertex.
-///
-/// `w` is the goal-group weight, or `goal_default` for an unassigned vertex. All weights are zero
-/// when `use_goal` is off.
+/// Goal weight `g = (goal_min + goal * |goal_max - goal_min|)^4` per vertex, with
+/// `goal = goal_default * group weight` (`softbody.cc` `bp->goal *= BKE_defvert_find_weight`).
+/// A vertex outside the goal group has weight zero. All weights are zero when `use_goal` is off.
 fn goal_weights(mesh: &Mesh, config: &Config, ids: &BTreeMap<u32, usize>) -> Result<Vec<f64>> {
     if !config.use_goal {
         return Ok(vec![0.0; mesh.vertices.len()]);
     }
     let range = (config.goal_max - config.goal_min).abs();
+    let grouped = config.goal_group.is_some();
     Ok(load_weights(mesh, config.goal_group.as_deref(), ids)?
         .into_iter()
         .map(|weight| {
-            let weight = weight.unwrap_or(config.goal_default);
-            (config.goal_min + weight * range).clamp(0.0, 1.0).powi(4)
+            let goal = if grouped {
+                config.goal_default * weight.unwrap_or(0.0)
+            } else {
+                config.goal_default
+            };
+            (config.goal_min + goal * range).powi(4)
         })
         .collect())
 }
@@ -661,7 +667,7 @@ mod tests {
             .insert("vertex_groups".to_owned(), json!({"fixed": {"0": 1.0}}));
         let result = simulate(
             &closed,
-            &json!({"substeps": 2, "iterations": 16, "vertex_group_goal": "fixed"}),
+            &json!({"substeps": 2, "iterations": 16, "vertex_group_goal": "fixed", "goal_default": 1.0}),
             1.0,
             24.0,
             DVec3::new(0.0, 0.0, -9.81),
@@ -669,6 +675,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result[0], closed.vertices[0].co);
+    }
+
+    #[test]
+    fn goal_weight_is_default_times_group_weight_and_zero_outside_the_group() {
+        let mut closed = tetrahedron();
+        closed.attributes.insert(
+            "vertex_groups".to_owned(),
+            json!({"fixed": {"0": 1.0, "1": 0.5}}),
+        );
+        let config =
+            Config::parse(&json!({"vertex_group_goal": "fixed", "goal_default": 0.7})).unwrap();
+        let ids = closed
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(index, vertex)| (vertex.id, index))
+            .collect::<BTreeMap<_, _>>();
+        let goals = goal_weights(&closed, &config, &ids).unwrap();
+        // Blender: `goal = defgoal * weight`, `goal = 0` outside the group, then `goal^4`.
+        let expected = [0.7_f64.powi(4), (0.7_f64 * 0.5).powi(4), 0.0, 0.0];
+        for (actual, expected) in goals.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 1.0e-12,
+                "{actual} vs {expected}"
+            );
+        }
     }
 
     #[test]

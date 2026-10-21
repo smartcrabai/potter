@@ -1816,10 +1816,17 @@ pub fn feature_catalog() -> Value {
         ),
         unsupported(
             "physics.dynamic_paint_surface.frame_start",
-            "Dynamic paint surfaces evaluated outside their frame range",
+            "Dynamic paint surfaces before their frame range",
             "DynamicPaintSurface",
             &[],
-            "A frame outside a surface's frame_start to frame_end range is refused with physics.dynamic_paint_surface.frame_start rather than painted.",
+            "A frame before a surface's frame_start leaves the canvas unpainted, as Blender does; Blender does not evaluate the surface there.",
+        ),
+        unsupported(
+            "physics.dynamic_paint_surface.frame_end",
+            "Dynamic paint surfaces after their frame range",
+            "DynamicPaintSurface",
+            &[],
+            "A frame after a surface's frame_end is refused with physics.dynamic_paint_surface.frame_end. Blender holds the surface's last state there, which Potter does not keep.",
         ),
         unsupported(
             "physics.point_cache.is_baked",
@@ -1854,7 +1861,7 @@ pub fn feature_catalog() -> Value {
             "Blender collision damping, absorption, permeability, and particle friction",
             "Collision",
             &[],
-            "Cloth and soft bodies apply Blender's thickness_outer, thickness_inner, use_culling, use_normal, and cloth_friction; particles and liquid apply use and thickness_outer only. Collision collections resolve to imported collections, and other collection references are cleared on import and reported. Other collision settings are refused at evaluation.",
+            "Cloth and soft bodies apply Blender's thickness_outer, thickness_inner, use_culling, and cloth_friction; use_normal is not modelled, so a non-default value is refused or reported as a loss; particles and liquid apply use and thickness_outer only. Collision collections resolve to imported collections, and other collection references are cleared on import and reported. Other collision settings are refused at evaluation.",
         ),
         unsupported(
             "physics",

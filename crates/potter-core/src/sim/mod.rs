@@ -1597,8 +1597,8 @@ fn flow_inflow_rate(settings: &Value) -> Result<f64> {
 fn fluid_effector_triangles(
     context: &FrameContext<'_>,
     collection: Option<&BTreeSet<Id>>,
-) -> Result<Vec<[DVec3; 3]>> {
-    let mut triangles = Vec::new();
+) -> Result<Vec<Vec<[DVec3; 3]>>> {
+    let mut effectors = Vec::new();
     for (node_id, node) in &context.doc.nodes {
         if !context.members.contains(node_id)
             || collection.is_some_and(|members| !members.contains(node_id))
@@ -1632,14 +1632,14 @@ fn fluid_effector_triangles(
         if !bool_setting(settings, "use_effector", true, "fluid effector")? {
             continue;
         }
-        triangles.extend(fluid_mesh_triangles(
+        effectors.push(fluid_mesh_triangles(
             context.doc,
             context.matrices,
             node,
             node_id,
         )?);
     }
-    Ok(triangles)
+    Ok(effectors)
 }
 
 /// Liquid particles that the fluid domain holds at the context frame. Empty without an emitter.
@@ -1660,9 +1660,10 @@ fn simulate_fluid_domain(
         settings.get("effector_group"),
         "physics.fluid_domain.effector_group",
     )?;
-    let obstacles = fluid_effector_triangles(context, collection.as_ref())?;
+    let effectors = fluid_effector_triangles(context, collection.as_ref())?;
+    let obstacles = effectors.iter().flatten().copied().collect::<Vec<_>>();
     let seed = setting_u32(settings, "seed").unwrap_or(context.seed);
-    let spawns_inside_effector = fluid::emitter_spawns_inside_effector(&flows, &obstacles);
+    let spawns_inside_effector = fluid::emitter_spawns_inside_effector(&flows, &effectors);
     let positions = fluid::simulate_with_sources(
         domain,
         settings,
@@ -1799,14 +1800,11 @@ fn dynamic_paint_brush_settings(
     Ok(brushes)
 }
 
-/// Rejects Blender canvas surfaces that Potter does not paint.
-///
-/// Potter paints one vertex-colour layer, so only PAINT surfaces in VERTEX format evaluate, and
-/// only on frames inside the surface's frame range. Other surface and point-cache properties go
-/// through the honoured-property check.
 /// Whether a canvas paints at `frame`. Blender's dynamic paint does not evaluate a surface before its
-/// `frame_start` (the canvas keeps its geometry there), and holds the state of `frame_end` afterwards
-/// (`dynamicPaint_frameUpdate`). A canvas paints when any of its surfaces has started.
+/// `frame_start` (`dynamicPaint_frameUpdate` reads the cache there), so the canvas keeps its geometry
+/// and is unpainted. After `frame_end` Blender holds the surface's last state, which Potter does not
+/// keep, so such a frame is refused with `physics.dynamic_paint_surface.frame_end`. A canvas paints
+/// when any of its surfaces has started.
 fn canvas_paints_at(canvas: &Value, frame: f64) -> Result<bool> {
     let Some(surfaces) = canvas.get("canvas_surfaces") else {
         return Ok(true);
@@ -1825,6 +1823,24 @@ fn canvas_paints_at(canvas: &Value, frame: f64) -> Result<bool> {
             "dynamic-paint surface",
             "a finite number",
         )?;
+        let end = setting_number(
+            surface,
+            "frame_end",
+            250.0,
+            "dynamic-paint surface",
+            "a finite number",
+        )?;
+        if frame > end {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "dynamic-paint frame is after the surface's frame_end, which Potter does not hold",
+                json!({
+                    "feature_id": "physics.dynamic_paint_surface.frame_end",
+                    "property": "frame_end",
+                    "status": "not_supported",
+                }),
+            ));
+        }
         if frame >= start {
             return Ok(true);
         }
@@ -1832,6 +1848,10 @@ fn canvas_paints_at(canvas: &Value, frame: f64) -> Result<bool> {
     Ok(false)
 }
 
+/// Rejects Blender canvas surfaces that Potter does not paint.
+///
+/// Potter paints one vertex-colour layer, so only PAINT surfaces in VERTEX format evaluate. Other
+/// surface and point-cache properties go through the honoured-property check.
 fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
     let Some(surfaces) = canvas.get("canvas_surfaces") else {
         return Ok(());
@@ -1901,4 +1921,26 @@ fn paint_canvas(
         }
     }
     Ok(colors)
+}
+
+#[cfg(test)]
+mod dynamic_paint_frame_tests {
+    use serde_json::json;
+
+    use super::canvas_paints_at;
+
+    #[test]
+    fn canvas_is_unpainted_before_frame_start_and_paints_inside_the_range() {
+        let canvas = json!({"canvas_surfaces": [{"frame_start": 5, "frame_end": 20}]});
+        assert!(!canvas_paints_at(&canvas, 4.0).unwrap());
+        assert!(canvas_paints_at(&canvas, 5.0).unwrap());
+        assert!(canvas_paints_at(&canvas, 20.0).unwrap());
+    }
+
+    #[test]
+    fn frame_after_frame_end_is_refused_not_painted_from_live_brushes() {
+        let canvas = json!({"canvas_surfaces": [{"frame_start": 1, "frame_end": 20}]});
+        let error = canvas_paints_at(&canvas, 21.0).unwrap_err();
+        assert!(error.to_string().contains("frame_end"), "{error}");
+    }
 }
