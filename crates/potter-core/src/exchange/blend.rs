@@ -15,8 +15,9 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     float::{equal_f64, equal_f64_array},
     geom::{
-        Edge, Face, IdCounters, Mesh, Vertex, attribute_keys, clnor,
+        Edge, Face, IdCounters, Mesh, TEXTURE_SPACE_KEY, Vertex, attribute_keys, clnor,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
+        normals,
         uv_layers::{self, UvLayer, UvStore},
     },
     graph::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
@@ -3166,7 +3167,8 @@ fn build_imported_graph(
             &mut mappings,
             "Mesh",
         )?;
-        let mesh = convert_mesh(item)?;
+        let mut mesh = convert_mesh(item)?;
+        insert_texture_space_record(item, name, &mut mesh)?;
         let (shape_keys, key_group_names) = parse_shape_keys(item, &mesh, name, &mut mappings)?;
         if !key_group_names.is_empty() {
             shape_key_vertex_groups.insert(id.clone(), key_group_names);
@@ -3371,6 +3373,10 @@ fn build_imported_graph(
                     .unwrap_or(true),
                 use_transparent_shadow: item
                     .get("use_transparent_shadow")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                use_bump_map_correction: item
+                    .get("use_bump_map_correction")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
                 displacement_method: displacement_method_field(name, item)?,
@@ -6715,6 +6721,37 @@ fn unique_id(name: &str, prefix: &str, used: &mut BTreeSet<String>) -> String {
     value
 }
 
+/// Stores a mesh's manual texture space (`use_auto_texspace` off) as its texture-space record, from the RNA
+/// properties the bridge dumps: `texspace_location` and `texspace_size`. An automatic texture space is not stored,
+/// since it is the bounds of the mesh.
+fn insert_texture_space_record(item: &Value, name: &str, mesh: &mut Mesh) -> Result<()> {
+    let Some(rna) = item.get("rna_properties") else {
+        return Ok(());
+    };
+    if rna.get("use_auto_texspace").and_then(Value::as_bool) != Some(false) {
+        return Ok(());
+    }
+    let vector = |key: &str| -> Result<Value> {
+        let values = rna
+            .get(key)
+            .and_then(Value::as_array)
+            .filter(|values| {
+                values.len() == 3 && values.iter().all(|value| value.as_f64().is_some())
+            })
+            .ok_or_else(|| {
+                invalid_intermediate(&format!(
+                    "mesh {name} has a manual texture space without a valid {key}"
+                ))
+            })?;
+        Ok(Value::Array(values.clone()))
+    };
+    mesh.attributes.insert(
+        TEXTURE_SPACE_KEY.to_owned(),
+        json!({"location": vector("texspace_location")?, "size": vector("texspace_size")?}),
+    );
+    Ok(())
+}
+
 fn convert_mesh(item: &Value) -> Result<Mesh> {
     let vertices_raw = item
         .get("vertices")
@@ -6804,6 +6841,16 @@ fn convert_mesh(item: &Value) -> Result<Mesh> {
         face_keys,
         &smooth,
     );
+    // Blender keeps an all-false `sharp_face` attribute after `use_smooth` on every face and removes it
+    // after `shade_smooth()`; Shrinkwrap reads the difference, so the importer records it.
+    if flag_field(item, "sharp_face_present")
+        && let Some(fields) = mesh
+            .attributes
+            .get_mut("shade_smooth")
+            .and_then(Value::as_object_mut)
+    {
+        fields.insert(normals::SHARP_FACE_PRESENT.to_owned(), json!(true));
+    }
     let edge_keys: Vec<String> = mesh
         .edges
         .iter()
@@ -7087,7 +7134,8 @@ fn is_blender_managed_attribute(name: &str, domain: &str, data_type: &str) -> bo
 }
 
 /// Mesh-level keys that the `.blend` writer recreates or restores itself.
-const BLENDER_HANDLED_MESH_KEYS: [&str; 13] = [
+const BLENDER_HANDLED_MESH_KEYS: [&str; 14] = [
+    "texture_space",
     "uv_layers",
     "color_layers",
     "shade_smooth",
@@ -11383,6 +11431,69 @@ mod tests {
         Ok(())
     }
 
+    /// Blender keeps `sharp_face` after `use_smooth` on every face (an all-false attribute) and removes it
+    /// after `shade_smooth()`. Both states are all smooth; only Potter's `sharp_face_present` tells them
+    /// apart, so the exporter must write each state and the importer must read it back.
+    #[test]
+    fn blender_roundtrip_keeps_use_smooth_and_shade_smooth_states_apart() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let project = Project::init(directory.path().join("project"))?;
+        for (index, present) in [true, false].into_iter().enumerate() {
+            let mut mesh = box_with_attributes(Vec::new())?;
+            let values: Map<String, Value> = mesh
+                .faces
+                .iter()
+                .map(|face| (format!("f{}", face.id), json!(true)))
+                .collect();
+            let mut shading = json!({"domain": "face", "type": "bool", "values": values});
+            if present {
+                shading[crate::geom::normals::SHARP_FACE_PRESENT] = json!(true);
+            }
+            mesh.attributes.insert("shade_smooth".to_owned(), shading);
+            let mut doc = roundtrip_scene()?;
+            doc.data_blocks
+                .get_mut(&Id::new("mesh_box")?)
+                .ok_or_else(|| invalid_intermediate("fixture mesh is missing"))?
+                .mesh = Some(mesh);
+            let output = directory.path().join(format!("smooth-{index}.blend"));
+            let context = crate::eval::EvaluationContext::default();
+            let options = ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            };
+            export_blend(&doc, &project, &output, &options)?;
+            let imported = import_blend(&output, Some(&blender))?;
+            let imported_mesh = imported
+                .doc
+                .data_blocks
+                .values()
+                .filter_map(|data| data.mesh.as_ref())
+                .find(|mesh| mesh.attributes.contains_key("shade_smooth"))
+                .ok_or_else(|| invalid_intermediate("imported smooth flags are missing"))?;
+            let shade = &imported_mesh.attributes["shade_smooth"];
+            assert!(
+                shade["values"]
+                    .as_object()
+                    .is_some_and(|values| values.values().all(|value| *value == json!(true))),
+                "every face stays smooth"
+            );
+            let reopened = shade
+                .get(crate::geom::normals::SHARP_FACE_PRESENT)
+                .and_then(Value::as_bool)
+                == Some(true);
+            assert_eq!(
+                reopened, present,
+                "sharp_face presence after a .blend round trip"
+            );
+        }
+        Ok(())
+    }
+
     fn roundtrip_scene() -> Result<SceneDoc> {
         let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
         doc.worlds.insert(
@@ -13043,13 +13154,16 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
             .materials
             .get(&material_id)
             .ok_or_else(|| invalid_intermediate("source material is missing"))?;
-        let source_normal = crate::shader::evaluate_surface(
+        let source_shading = crate::shader::evaluate_surface(
             source_material,
             &crate::shader::HitContext::new(&doc.node_groups)
                 .with_images(&image_data)
                 .with_uv_layers(hit_layers),
-        )?
-        .normal;
+        )?;
+        let source_normal = source_shading
+            .dominant()
+            .ok_or_else(|| invalid_intermediate("source material has no closure"))?
+            .normal;
 
         let project = Project::init(directory.path().join("project"))?;
         let output = directory.path().join("normal-handedness.blend");
@@ -13193,13 +13307,16 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                 .any(|node| node.node_type == "ShaderNodeVectorMath"),
             "Blender-only green conversion nodes should collapse to the canonical glTF marker"
         );
-        let roundtrip_normal = crate::shader::evaluate_surface(
+        let roundtrip_shading = crate::shader::evaluate_surface(
             imported_material,
             &crate::shader::HitContext::new(&imported.doc.node_groups)
                 .with_images(&image_data)
                 .with_uv_layers(hit_layers),
-        )?
-        .normal;
+        )?;
+        let roundtrip_normal = roundtrip_shading
+            .dominant()
+            .ok_or_else(|| invalid_intermediate("round-trip material has no closure"))?
+            .normal;
         assert!(
             source_normal.distance(roundtrip_normal) <= 1.0e-12,
             "normal direction changed across .blend round-trip: {source_normal:?} != {roundtrip_normal:?}"
@@ -13705,18 +13822,24 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                     render: Some(0),
                     available_mask: None,
                 };
-                let source = crate::shader::evaluate_surface(
+                let source_shading = crate::shader::evaluate_surface(
                     source_material,
                     &crate::shader::HitContext::new(&doc.node_groups)
                         .with_images(&image_data)
                         .with_uv_layers(layers),
                 )?;
-                let reopened = crate::shader::evaluate_surface(
+                let source = source_shading
+                    .dominant()
+                    .ok_or_else(|| invalid_intermediate("source material has no closure"))?;
+                let reopened_shading = crate::shader::evaluate_surface(
                     reopened_material,
                     &crate::shader::HitContext::new(&imported.doc.node_groups)
                         .with_images(&reopened_image_data)
                         .with_uv_layers(layers),
                 )?;
+                let reopened = reopened_shading
+                    .dominant()
+                    .ok_or_else(|| invalid_intermediate("round-trip material has no closure"))?;
                 for (channel, expected) in base[index].into_iter().enumerate() {
                     assert!(
                         close(source.base_color[channel], expected),
@@ -17766,8 +17889,18 @@ print("UNSUPPORTED_POSE " + json.dumps({
             .ok_or_else(|| invalid_intermediate("roundtrip material is missing"))?;
         let source_hit = crate::shader::HitContext::new(&doc.node_groups);
         let reopened_hit = crate::shader::HitContext::new(&imported.doc.node_groups);
-        let source_params = crate::shader::evaluate_surface(source, &source_hit)?;
-        let reopened_params = crate::shader::evaluate_surface(reopened, &reopened_hit)?;
+        let source_shading = crate::shader::evaluate_surface(source, &source_hit)?;
+        let reopened_shading = crate::shader::evaluate_surface(reopened, &reopened_hit)?;
+        let source_params = source_shading
+            .volume
+            .first()
+            .ok_or_else(|| invalid_intermediate("source material has no volume closure"))?
+            .params;
+        let reopened_params = reopened_shading
+            .volume
+            .first()
+            .ok_or_else(|| invalid_intermediate("round-trip material has no volume closure"))?
+            .params;
         assert!(close(
             reopened_params.volume_anisotropy,
             source_params.volume_anisotropy

@@ -356,20 +356,47 @@ fn normal_layer_overrides_smoothing_without_loss() -> TestResult {
     assert_triangle_corners(&imported)
 }
 
+/// Blender's `import_face_smoothing` (`fbx_import_mesh.cc`) reads a per-polygon smoothing layer even
+/// without normals, so the layer imports with no loss and value 1 keeps the triangle smooth.
 #[test]
-fn smoothing_without_normals_is_a_loss() -> TestResult {
-    let blocked = import_minimal(SMOOTHING, false)?;
+fn smoothing_without_normals_imports_without_loss() -> TestResult {
+    let imported = import_minimal(SMOOTHING, false)?;
     assert!(
-        !blocked.output.status.success(),
-        "import must need --allow-lossy"
+        imported.output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.output.stdout)
     );
+    assert_eq!(loss_ids(&imported.output)?, Vec::<String>::new());
+    Ok(())
+}
+
+/// A zero smoothing value is `sharp_face = true` in Blender, so the triangle is flat and every corner
+/// takes the face normal.
+#[test]
+fn flat_smoothing_value_makes_the_face_flat() -> TestResult {
+    let layers = SMOOTHING.replace("a: 1", "a: 0");
+    let imported = import_minimal(&layers, false)?;
     assert!(
-        String::from_utf8_lossy(&blocked.output.stdout).contains("format.fbx.smoothing"),
-        "lossy refusal must name format.fbx.smoothing"
+        imported.output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.output.stdout)
     );
-    let allowed = import_minimal(SMOOTHING, true)?;
-    assert!(allowed.output.status.success());
-    assert_eq!(loss_ids(&allowed.output)?, ["format.fbx.smoothing"]);
+    let obj = export(
+        &imported.scene,
+        "obj",
+        &imported.directory.path().join("triangle.obj"),
+    )?;
+    let corners = obj_corners(&fs::read_to_string(obj)?)?;
+    assert_eq!(corners.len(), 3, "triangle corner count");
+    for corner in &corners {
+        for (axis, expected) in [0.0, 0.0, 1.0].into_iter().enumerate() {
+            assert!(
+                (corner.normal[axis] - expected).abs() <= normal_tolerance(true),
+                "flat corner normal {:?} differs from +Z",
+                corner.normal
+            );
+        }
+    }
     Ok(())
 }
 

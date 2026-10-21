@@ -3,11 +3,10 @@ mod world;
 mod evaluator;
 
 pub use evaluator::{
-    BsdfParams, EvaluatedSubsurfaceMethod, EvaluatorWorkspace, HitContext, HitUvLayers,
-    PreparedMaterial, SubsurfaceMethod, evaluate_displacement,
-    evaluate_displacement_with_workspace, evaluate_surface, evaluate_surface_with_workspace,
-    fill_color_layers, height_gradient,
+    BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
+    SubsurfaceMethod, SurfaceShading, evaluate_displacement, evaluate_displacement_with_workspace,
+    evaluate_surface, evaluate_surface_with_workspace, fill_color_layers, height_gradient,
 };
-pub(crate) use evaluator::{dielectric_f0, record_unevaluated_inputs};
+pub(crate) use evaluator::{dielectric_f0, heaviest, record_unevaluated_inputs};
 pub(crate) use world::equirectangular_uv;
 pub use world::evaluate_world;

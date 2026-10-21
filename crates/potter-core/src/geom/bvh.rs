@@ -17,9 +17,9 @@ pub(crate) type Vec3 = [f32; 3];
 /// Unit axes `bvhtree_kdop_axes[0..3]`.
 const AXES: [Vec3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 /// `BLI_bvhtree_new` clamps the tree epsilon to `FLT_EPSILON`; leaf boxes are inflated by it.
-const TREE_EPSILON: f32 = f32::EPSILON;
-/// `BVH_RAYCAST_DIST_MAX` (`BLI_kdopbvh.hh`).
-const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
+pub(crate) const TREE_EPSILON: f32 = f32::EPSILON;
+/// `BVH_RAYCAST_DIST_MAX` (`BLI_kdopbvh.hh`): `FLT_MAX / 2`, the open ray length.
+pub(crate) const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
 
 pub(crate) fn sub(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -64,9 +64,9 @@ fn axis_dominant(v: Vec3) -> usize {
     }
 }
 
-/// Leaf box of one triangle: its extent on x, y and z (`create_kdop_hull`), inflated by the tree epsilon
+/// Leaf box of one triangle: its extent on x, y and z (`create_kdop_hull`), inflated by `epsilon`
 /// (`bvhtree_node_inflate`). The axis lengths are 1 for x, y and z.
-fn triangle_bounds(tri: [Vec3; 3]) -> [f32; 6] {
+fn triangle_bounds(tri: [Vec3; 3], epsilon: f32) -> [f32; 6] {
     let mut bounds = [0.0_f32; 6];
     for axis in 0..3 {
         let mut min = f32::MAX;
@@ -75,8 +75,8 @@ fn triangle_bounds(tri: [Vec3; 3]) -> [f32; 6] {
             min = min.min(point[axis]);
             max = max.max(point[axis]);
         }
-        bounds[2 * axis] = min - TREE_EPSILON;
-        bounds[2 * axis + 1] = max + TREE_EPSILON;
+        bounds[2 * axis] = min - epsilon;
+        bounds[2 * axis + 1] = max + epsilon;
     }
     bounds
 }
@@ -495,7 +495,12 @@ impl KdopTree {
 
     /// The leaf box of one triangle: its extent inflated by the tree epsilon (`create_kdop_hull`).
     pub(crate) fn leaf_bounds_for_triangle(tri: [Vec3; 3]) -> [f32; 6] {
-        triangle_bounds(tri)
+        triangle_bounds(tri, TREE_EPSILON)
+    }
+
+    /// The leaf box of one vertex: the point inflated by the tree epsilon, as Blender's vertex tree.
+    pub(crate) fn leaf_bounds_for_point(point: Vec3) -> [f32; 6] {
+        triangle_bounds([point; 3], TREE_EPSILON)
     }
 
     /// `BLI_bvhtree_ray_cast_ex` with `BVH_RAYCAST_WATERTIGHT`. `callback` receives each leaf index the
