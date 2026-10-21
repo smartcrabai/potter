@@ -365,6 +365,7 @@ pub(crate) fn remesh_target_project(mesh: &Mesh, target: &Mesh, voxel_size: f64)
         show_render: true,
         params: params.as_object().cloned().unwrap_or_default(),
         binding_data: None,
+        baked_ocean_cache: None,
         runtime,
     };
     evaluate(mesh, &modifier)
@@ -1602,6 +1603,7 @@ mod tests {
             show_render: true,
             params: serde_json::from_value(params).test_value(),
             binding_data: None,
+            baked_ocean_cache: None,
             runtime: ModifierRuntime::default(),
         };
         modifier.runtime.shrinkwrap_target_mesh = Some(target);
