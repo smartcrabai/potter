@@ -91,18 +91,6 @@ impl ColorStore {
     pub(crate) fn render_index(&self) -> Option<usize> {
         self.render.as_deref().and_then(|name| self.index_of(name))
     }
-
-    /// Resolves a layer reference. `None` names the render layer. A name that no layer has
-    /// resolves to `None` and is returned as the second element, so the caller can report it.
-    pub(crate) fn resolve(&self, reference: Option<&str>) -> (Option<usize>, Option<String>) {
-        match reference {
-            None => (self.render_index(), None),
-            Some(name) => match self.index_of(name) {
-                Some(index) => (Some(index), None),
-                None => (None, Some(name.to_owned())),
-            },
-        }
-    }
 }
 
 /// Parses one `[r, g, b, a]` value.
