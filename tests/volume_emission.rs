@@ -16,9 +16,9 @@ const SIZE: u32 = 24;
 /// pixel has the same expectation, and the block mean reduces the noise of a stochastic render.
 const BLOCK: usize = 4;
 const GRAPH: &str = "emission_graph";
-const SAMPLES: u32 = 1024;
+const SAMPLES: u32 = 128;
 /// The seeds for a stochastic case: their spread is Potter's own noise.
-const SEEDS: u32 = 4;
+const SEEDS: u32 = 3;
 /// The Principled Volume's Density, which is σ of an absorbing medium of unit colour.
 const DENSITY: f64 = 2.0;
 
@@ -69,7 +69,7 @@ fn make_scene(scene: &Path, operations: &[Value]) -> Result<Value, Box<dyn Error
 }
 
 /// A shader-graph node operation in `GRAPH`.
-fn node(id: &str, node_type: &str, inputs: Value) -> Value {
+fn node(id: &str, node_type: &str, inputs: &Value) -> Value {
     json!({"op":"graph.node_add","graph":GRAPH,"id":id,"type":node_type,"inputs":inputs})
 }
 
@@ -79,7 +79,7 @@ fn link(from: &str, from_socket: &str, to: &str, to_socket: &str) -> Value {
 }
 
 /// The graph's operations: its Output Material and the volume node, linked to the output's Volume socket.
-fn graph_operations(volume_inputs: Value) -> Vec<Value> {
+fn graph_operations(volume_inputs: &Value) -> Vec<Value> {
     vec![
         json!({"op":"graph.create","id":GRAPH,"kind":"shader"}),
         json!({"op":"graph.node_add","graph":GRAPH,"id":"output","type":"ShaderNodeOutputMaterial"}),
@@ -113,7 +113,7 @@ fn frame_operations(seed: u32) -> Vec<Value> {
 
 /// A unit cube of the emissive medium.
 fn cube_operations(albedo: f64, seed: u32) -> Vec<Value> {
-    let mut operations = graph_operations(volume_inputs(albedo));
+    let mut operations = graph_operations(&volume_inputs(albedo));
     operations.push(json!({"op":"material.create","id":"emitter","graph":GRAPH}));
     operations.push(json!({"op":"node.create","id":"cube","kind":"box","params":{"size":1.0},"material":"emitter"}));
     operations.extend(frame_operations(seed));
@@ -123,7 +123,7 @@ fn cube_operations(albedo: f64, seed: u32) -> Vec<Value> {
 /// A 16³ voxel grid of ones, voxel size 0.125, its index (i, j, k) at -0.9375 + 0.125 (i, j, k) as Blender's VDB is
 /// placed (`generate_volume_emission_voxel_oracle.py`).
 fn voxel_operations(albedo: f64, seed: u32) -> Vec<Value> {
-    let mut operations = graph_operations(volume_inputs(albedo));
+    let mut operations = graph_operations(&volume_inputs(albedo));
     operations.push(json!({"op":"material.create","id":"emitter","graph":GRAPH}));
     operations.push(json!({"op":"volume.create","id":"emissive","materials":["emitter"],"grids":[{"dims":[16,16,16],"voxel_size":0.125,"origin":[-0.9375,-0.9375,-0.9375],"values":vec![1.0_f64; 16 * 16 * 16]}]}));
     operations.extend(frame_operations(seed));

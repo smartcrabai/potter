@@ -304,11 +304,50 @@ pub fn sample_density_checked_with(
     }
     let grid = first_grid(volume)?;
     let values = validate_grid(grid)?;
-
     let coordinate = grid
         .checked_index_to_local_matrix()?
         .inverse()
         .transform_point3(position);
+    sample_index_checked(coordinate, grid, &values, interpolation)
+}
+
+/// The inverse of the first inline grid's index-to-local matrix: volume-local positions to index coordinates. The renderer
+/// builds it once per volume, so sampling does not invert the matrix at every sample.
+pub fn local_to_index_matrix(volume: &VolumeData) -> Result<DMat4> {
+    let grid = first_grid(volume)?;
+    validate_grid(grid)?;
+    Ok(grid.checked_index_to_local_matrix()?.inverse())
+}
+
+/// The density at an index-space coordinate of the first inline grid, with the material's interpolation.
+/// `local_to_index_matrix` maps volume-local positions to these coordinates.
+pub fn sample_index_density_checked_with(
+    coordinate: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> Result<f64> {
+    let grid = first_grid(volume)?;
+    let values = validate_grid(grid)?;
+    sample_index_checked(coordinate, grid, &values, interpolation)
+}
+
+/// `sample_index_density_checked_with` as a NaN where it errors.
+#[must_use]
+pub fn sample_index_density_with(
+    coordinate: DVec3,
+    volume: &VolumeData,
+    interpolation: VolumeInterpolation,
+) -> f64 {
+    sample_index_density_checked_with(coordinate, volume, interpolation).unwrap_or(f64::NAN)
+}
+
+/// The interpolated density of an inline grid at an index-space coordinate; a non-finite coordinate samples as zero.
+fn sample_index_checked(
+    coordinate: DVec3,
+    grid: &VolumeGrid,
+    values: &GridSamples<'_>,
+    interpolation: VolumeInterpolation,
+) -> Result<f64> {
     if !coordinate.is_finite() {
         return Ok(0.0);
     }
@@ -319,7 +358,7 @@ pub fn sample_density_checked_with(
         VolumeInterpolation::Linear => sample_inline_nodes(
             coordinate,
             grid,
-            &values,
+            values,
             [
                 [1.0 - fraction.x, fraction.x],
                 [1.0 - fraction.y, fraction.y],
@@ -330,7 +369,7 @@ pub fn sample_density_checked_with(
         VolumeInterpolation::Cubic => sample_inline_nodes(
             coordinate,
             grid,
-            &values,
+            values,
             [
                 cubic_weights(fraction.x),
                 cubic_weights(fraction.y),

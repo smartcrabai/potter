@@ -5,7 +5,10 @@ use glam::{DMat4, DVec3};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
-    geom::volume::{VolumeData, sample_density_checked_with, sample_density_with},
+    geom::volume::{
+        VolumeData, local_to_index_matrix, sample_density_checked_with, sample_density_with,
+        sample_index_density_checked_with, sample_index_density_with,
+    },
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, SceneDoc, VolumeSampling},
     shader::{
@@ -93,6 +96,9 @@ struct VolumeInstance<'a> {
     sampling: crate::model::VolumeSampling,
     /// Blender's `cycles.volume_interpolation` of the volume's material.
     interpolation: crate::model::VolumeInterpolation,
+    /// The inverse of an inline grid's index-to-local matrix, built once per volume (`local_to_index_matrix`). `None` for a
+    /// decoded VDB, which samples at its local position.
+    index_from_local: Option<DMat4>,
 }
 
 #[derive(Clone, Copy)]
@@ -482,9 +488,9 @@ pub(super) fn render(
                                 importance: world_importance.as_ref(),
                             },
                             Bounces {
-                                max_bounces,
-                                volume_bounces,
-                                transparent_max_bounces,
+                                surface: max_bounces,
+                                volume: volume_bounces,
+                                transparent: transparent_max_bounces,
                             },
                             left_origin,
                             left_direction,
@@ -507,9 +513,9 @@ pub(super) fn render(
                                 importance: world_importance.as_ref(),
                             },
                             Bounces {
-                                max_bounces,
-                                volume_bounces,
-                                transparent_max_bounces,
+                                surface: max_bounces,
+                                volume: volume_bounces,
+                                transparent: transparent_max_bounces,
                             },
                             right_origin,
                             right_direction,
@@ -537,9 +543,9 @@ pub(super) fn render(
                                 importance: world_importance.as_ref(),
                             },
                             Bounces {
-                                max_bounces,
-                                volume_bounces,
-                                transparent_max_bounces,
+                                surface: max_bounces,
+                                volume: volume_bounces,
+                                transparent: transparent_max_bounces,
                             },
                             origin,
                             direction,
@@ -838,9 +844,9 @@ struct SceneRefs<'a, 'v> {
 /// transparent passes.
 #[derive(Clone, Copy)]
 struct Bounces {
-    max_bounces: u32,
-    volume_bounces: u32,
-    transparent_max_bounces: u32,
+    surface: u32,
+    volume: u32,
+    transparent: u32,
 }
 
 /// A shadow ray from `point` along `direction` for `distance`. A surface receiver offsets its ray by `normal`; a volume
@@ -1011,9 +1017,9 @@ fn trace_path(
         importance,
     } = scene;
     let Bounces {
-        max_bounces,
-        volume_bounces,
-        transparent_max_bounces,
+        surface: max_bounces,
+        volume: volume_bounces,
+        transparent: transparent_max_bounces,
     } = bounces;
     let mut radiance = DVec3::ZERO;
     let mut throughput = DVec3::ONE;
@@ -3274,6 +3280,11 @@ fn collect_volumes<'a>(
                 params.volume_sampling
             }),
             interpolation,
+            index_from_local: if volume.decoded_vdb.is_some() {
+                None
+            } else {
+                Some(local_to_index_matrix(volume)?)
+            },
         });
     }
     Ok(volumes)
@@ -3918,15 +3929,42 @@ fn trace_volume_segment(
 
 fn volume_density_at(instance: &VolumeInstance<'_>, world_position: DVec3) -> Result<f64> {
     let local_position = instance.world_to_local.transform_point3(world_position);
-    let density = sample_density_with(local_position, instance.volume, instance.interpolation);
+    let density = instance_density(instance, local_position);
     if !density.is_finite() {
-        sample_density_checked_with(local_position, instance.volume, instance.interpolation)?;
+        instance_density_checked(instance, local_position)?;
         return Err(PotError::new(
             ErrorCode::EvaluationFailed,
             "volume density is not finite",
         ));
     }
     Ok(density.max(0.0))
+}
+
+/// The density of a volume instance at a volume-local position. An inline grid samples at its index coordinate, through the
+/// inverse cached on the instance; a decoded VDB samples at its local position.
+fn instance_density(instance: &VolumeInstance<'_>, local_position: DVec3) -> f64 {
+    match instance.index_from_local {
+        Some(index_from_local) => sample_index_density_with(
+            index_from_local.transform_point3(local_position),
+            instance.volume,
+            instance.interpolation,
+        ),
+        None => sample_density_with(local_position, instance.volume, instance.interpolation),
+    }
+}
+
+/// `instance_density` with its error, which reports why a density is not finite.
+fn instance_density_checked(instance: &VolumeInstance<'_>, local_position: DVec3) -> Result<f64> {
+    match instance.index_from_local {
+        Some(index_from_local) => sample_index_density_checked_with(
+            index_from_local.transform_point3(local_position),
+            instance.volume,
+            instance.interpolation,
+        ),
+        None => {
+            sample_density_checked_with(local_position, instance.volume, instance.interpolation)
+        }
+    }
 }
 
 fn march_volumes(
@@ -3999,17 +4037,9 @@ fn march_volumes_with_budget(
                         break;
                     }
                     let local_position = local_origin + local_direction * distance;
-                    let density = sample_density_with(
-                        local_position,
-                        instance.volume,
-                        instance.interpolation,
-                    );
+                    let density = instance_density(instance, local_position);
                     if !density.is_finite() {
-                        sample_density_checked_with(
-                            local_position,
-                            instance.volume,
-                            instance.interpolation,
-                        )?;
+                        instance_density_checked(instance, local_position)?;
                         return Err(PotError::new(
                             ErrorCode::EvaluationFailed,
                             "volume density is not finite",
@@ -4039,14 +4069,9 @@ fn march_volumes_with_budget(
         for sample_index in 0..steps {
             let distance = entry + (sample_index as f64 + 0.5) * step;
             let local_position = local_origin + local_direction * distance;
-            let density =
-                sample_density_with(local_position, instance.volume, instance.interpolation);
+            let density = instance_density(instance, local_position);
             if !density.is_finite() {
-                sample_density_checked_with(
-                    local_position,
-                    instance.volume,
-                    instance.interpolation,
-                )?;
+                instance_density_checked(instance, local_position)?;
                 return Err(PotError::new(
                     ErrorCode::EvaluationFailed,
                     "volume density is not finite",
@@ -4265,6 +4290,7 @@ mod volume_extinction_tests {
             extinction_scale: 1.0,
             sampling: crate::model::VolumeSampling::MultipleImportance,
             interpolation: crate::model::VolumeInterpolation::Linear,
+            index_from_local: None,
         };
         let mut rng = Pcg32::for_sample(0, 0, 0, 0);
         let transmittance = march_volumes(
