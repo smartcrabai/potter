@@ -20,7 +20,7 @@ use crate::{
         uv_layers::{self, UvLayer},
     },
     hash,
-    model::model::{
+    model::{
         ArmatureData, CameraData, ConstraintType, DataBlock, Id, Modifier, Node, Scene, SceneDoc,
         TextureCoordinateMapping, VertexGroup,
     },

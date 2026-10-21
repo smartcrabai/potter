@@ -439,7 +439,6 @@ fn collect_bones(
         select: false,
         head_radius: 0.1,
         tail_radius: 0.1,
-        select: false,
         bbone_settings: std::collections::BTreeMap::new(),
     };
     bones.insert(id.clone(), bone);

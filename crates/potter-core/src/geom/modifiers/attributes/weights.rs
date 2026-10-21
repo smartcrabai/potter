@@ -473,7 +473,7 @@ pub(super) fn vertex_weight_proximity(
             .collect::<BTreeMap<_, _>>();
         target
             .mesh
-            .triangulate()
+            .tessellate()
             .map_err(|error| {
                 PotError::invalid_argument(format!(
                     "invalid proximity target triangulation: {error}"

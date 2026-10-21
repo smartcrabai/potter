@@ -2,13 +2,59 @@
 
 use super::*;
 use crate::blender_rng::BlenderRng;
-use crate::geom::bvh::{KdopTree, RayHit};
+use crate::geom::bvh::{KdopTree, NearestHit, RayHit};
 use crate::geom::color_layers::{self, ColorDomain};
 use crate::geom::uv_layers::{UvLayer, UvStore, read as read_uv_store, read_layers, write_layers};
 use glam::{DVec2, DVec3};
 use serde_json::{Map, Value, json};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+
+/// `BLI_bvhtree_find_nearest` (depth-first, `BLI_kdopbvh.cc:1696`) over a leaf tree, for transfer's
+/// nearest-point mappings. `test(leaf, co)` returns the leaf's squared distance and a payload, or
+/// `None` when the leaf is rejected; the nearest accepted leaf within `max_distance_squared` wins.
+trait NearestQuery {
+    fn nearest<T>(
+        &self,
+        co: DVec3,
+        max_distance_squared: f64,
+        test: impl FnMut(usize, DVec3) -> Option<(f64, T)>,
+    ) -> Option<(usize, f64, T)>;
+}
+
+impl NearestQuery for KdopTree {
+    fn nearest<T>(
+        &self,
+        co: DVec3,
+        max_distance_squared: f64,
+        mut test: impl FnMut(usize, DVec3) -> Option<(f64, T)>,
+    ) -> Option<(usize, f64, T)> {
+        let co_f32 = co.as_vec3().to_array();
+        let mut nearest = NearestHit {
+            index: -1,
+            co: co_f32,
+            dist_sq: max_distance_squared as f32,
+        };
+        let mut found = None;
+        self.find_nearest(
+            co_f32,
+            &mut nearest,
+            &mut |leaf: usize, _: [f32; 3], hit: &mut NearestHit| {
+                let Some((distance, payload)) = test(leaf, co) else {
+                    return;
+                };
+                if distance < f64::from(hit.dist_sq) {
+                    hit.index = leaf as isize;
+                    hit.co = co_f32;
+                    hit.dist_sq = distance as f32;
+                    found = Some((leaf, distance, payload));
+                }
+            },
+            false,
+        );
+        found
+    }
+}
 
 pub(super) fn data_transfer(
     mesh: &Mesh,
@@ -19,7 +65,7 @@ pub(super) fn data_transfer(
     let Some(source_name) = optional_string(modifier, "object")? else {
         return Ok(mesh.clone());
     };
-    let Some(source) = operands.get(&source_name).and_then(|items| items.first()) else {
+    let Some(source) = operands.get(source_name).and_then(|items| items.first()) else {
         return Ok(mesh.clone());
     };
     let use_transform = boolean(modifier, "use_object_transform")?;
@@ -380,6 +426,7 @@ fn validate_transfer_mapping(modifier: &Modifier, field: &str, value: &str) -> R
             value,
             "TOPOLOGY" | "NEAREST" | "NORMAL" | "POLYINTERP_PNORPROJ"
         ),
+        _ => false,
     };
     if valid {
         Ok(())
@@ -1875,7 +1922,7 @@ fn build_source_face_graph(
         if triangle.corners.len() != 3 {
             return None;
         }
-        let vertex = |corner| {
+        let vertex = |corner: usize| {
             face.vertices
                 .get(corner)
                 .and_then(|vertex_id| vertex_indices.get(vertex_id))
@@ -2236,7 +2283,6 @@ fn mapped_loop_sources(
                     best = Some((index, score, center_distance));
                 }
             }
-            loop_start += source_face.vertices.len();
         }
         return best.map(|(index, _, _)| MappedSources(vec![(index, 1.0)]));
     }
@@ -2428,6 +2474,7 @@ fn loop_candidate_for_island(
     let vertex_id = *destination_face.vertices.get(destination_corner)?;
     let vertex_index = *context.destination_vertex_indices.get(&vertex_id)?;
     let destination_vertex = destination.vertices.get(vertex_index)?;
+    let point = context.point_to_source(destination_vertex.co);
     let destination_normal = context
         .destination_corner_normal(destination_face_index, destination_corner)
         .unwrap_or_else(|| {
@@ -3095,8 +3142,8 @@ fn ray_cast_nearest<T>(
     let max_distance = max_distance.min(f64::from(f32::MAX));
     let mut nearest = None;
     tree.ray_cast(
-        origin.as_vec3(),
-        direction.as_vec3(),
+        origin.as_vec3().to_array(),
+        direction.as_vec3().to_array(),
         &mut RayHit::open(),
         &mut |leaf, _ray, running| {
             let t_max = f64::from(running.dist).min(max_distance);
@@ -3687,8 +3734,8 @@ fn polygon_normal_from_face(
         return DVec3::Z;
     }
     let mut normal = glam::Vec3::ZERO;
-    let mut first = None;
-    let mut previous = None;
+    let mut first: Option<glam::Vec3> = None;
+    let mut previous: Option<glam::Vec3> = None;
     let mut count = 0;
     for &vertex_id in &face.vertices {
         let Some(current) = position(vertex_id) else {

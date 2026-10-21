@@ -3387,7 +3387,7 @@ pub(crate) fn mesh_export_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<
                 node_id, node, snapshot, data, mesh, &owner, &surfaces,
             ));
         for loss in found {
-            if reported.insert((owner.clone(), loss.reason.clone())) {
+            if reported.insert((owner.to_string(), loss.reason.to_string())) {
                 losses.push(loss);
             }
         }
@@ -6581,7 +6581,6 @@ fn import_skins(
                         select: false,
                         head_radius: 0.1,
                         tail_radius: 0.1,
-                        select: false,
                         bbone_settings: std::collections::BTreeMap::new(),
                     },
                 );

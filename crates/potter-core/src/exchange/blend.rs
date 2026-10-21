@@ -5543,10 +5543,6 @@ fn import_armatures(
                     custom_shape: None,
                     envelope_distance: number_field(raw_bone, "envelope_distance", 0.25),
                     envelope_weight: number_field(raw_bone, "envelope_weight", 1.0),
-                    select: raw_bone
-                        .get("select")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
                     head_radius: number_field(raw_bone, "head_radius", 0.1),
                     tail_radius: number_field(raw_bone, "tail_radius", 0.1),
                     bbone_settings,

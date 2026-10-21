@@ -5,10 +5,6 @@ use serde_json::{Map, Value};
 
 use super::{Id, Registry};
 
-fn is_false(value: &bool) -> bool {
-    !value
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArmatureData {

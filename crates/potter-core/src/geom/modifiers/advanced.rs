@@ -1935,6 +1935,7 @@ pub(super) fn mask(
     }
     let origin = Origin {
         vertices: vertex_origins,
+        source_vertices: None,
         faces: face_origins,
         corners: Some(corner_origins),
     };
