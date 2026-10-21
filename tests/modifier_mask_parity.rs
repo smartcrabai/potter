@@ -124,6 +124,8 @@ fn mask_modifier(params: Value) -> Result<Modifier, Box<dyn Error>> {
         modifier_type: "mask".to_owned(),
         name: "Mask".to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("mask params must be an object")?

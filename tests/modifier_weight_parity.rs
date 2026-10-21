@@ -462,6 +462,8 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
         enabled: true,
+        show_viewport: true,
+        show_render: true,
         params: params
             .as_object()
             .ok_or("modifier parameters must be an object")?
@@ -495,7 +497,7 @@ fn source_mesh() -> Result<Mesh, Box<dyn Error>> {
 }
 
 fn target_mesh() -> Result<Mesh, Box<dyn Error>> {
-    Mesh::from_positions_and_faces(
+    Ok(Mesh::from_positions_and_faces(
         vec![
             DVec3::ZERO,
             DVec3::new(2.0, 0.0, 0.0),
@@ -503,7 +505,7 @@ fn target_mesh() -> Result<Mesh, Box<dyn Error>> {
             DVec3::new(0.0, 1.5, 0.0),
         ],
         vec![vec![0, 1, 2, 3]],
-    )
+    )?)
 }
 
 fn weights(mesh: &Mesh, group: &str) -> Result<Vec<f64>, Box<dyn Error>> {
