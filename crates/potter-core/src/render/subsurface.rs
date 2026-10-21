@@ -64,12 +64,17 @@ pub(crate) fn subsurface_evaluated(params: &BsdfParams) -> bool {
 /// The mean free path of each channel, clamped at zero: `subsurface_radius × subsurface_scale` (`svm/closure.h`),
 /// times `0.25 / π` for Burley (`bssrdf_setup_radius`). The random walk keeps the radius unchanged.
 pub(crate) fn closure_radius(params: &BsdfParams) -> DVec3 {
-    let radius = DVec3::from_array(params.subsurface_radius).max(DVec3::ZERO)
-        * params.subsurface_scale.max(0.0);
+    let radius = raw_radius(params);
     match params.subsurface_method {
         SubsurfaceMethod::Burley => radius * (0.25 / PI),
         _ => radius,
     }
+}
+
+/// The radius before the Burley scaling: `subsurface_radius × subsurface_scale`, clamped at zero (`svm/closure.h`).
+/// Cycles tests the channels against `BSSRDF_MIN_RADIUS` on this radius, before `bssrdf_setup_radius` scales it.
+pub(crate) fn raw_radius(params: &BsdfParams) -> DVec3 {
+    DVec3::from_array(params.subsurface_radius).max(DVec3::ZERO) * params.subsurface_scale.max(0.0)
 }
 
 /// Where a subsurface path leaves the surface: the exit hit, the origin and direction of the ray that reached it, and
@@ -81,7 +86,8 @@ pub(crate) struct SubsurfaceExit {
     pub(crate) throughput: DVec3,
 }
 
-/// The channels that take part in the profile: those with a radius of at least [`MIN_RADIUS`].
+/// The channels that take part in the profile: those whose raw radius is at least [`MIN_RADIUS`]. A channel below it
+/// falls back to diffuse (`bssrdf_setup`, `kernel/closure/bssrdf.h`), so the mask takes a radius from [`raw_radius`].
 pub(crate) fn channel_mask(radius: DVec3) -> [bool; 3] {
     radius.to_array().map(|value| value >= MIN_RADIUS)
 }
@@ -372,6 +378,17 @@ mod tests {
         assert!((walk.x - 0.005).abs() < 1.0e-15, "{walk:?}");
         assert!((walk.y - 0.001).abs() < 1.0e-15, "{walk:?}");
         assert!((walk.z - 0.0005).abs() < 1.0e-15, "{walk:?}");
+    }
+
+    #[test]
+    fn channel_mask_tests_the_raw_radius_before_burley_scaling() {
+        // `bssrdf_setup` (`kernel/closure/bssrdf.h`) tests `BSSRDF_MIN_RADIUS` before `bssrdf_setup_radius` scales the
+        // radius. A raw radius of 2e-8 is covered; its Burley mean free path, 2e-8 × 0.25 / π, is below the minimum.
+        let mut params = principled(SubsurfaceMethod::Burley, 1.0);
+        params.subsurface_radius = [2.0e-8, 2.0e-8, 2.0e-8];
+        params.subsurface_scale = 1.0;
+        assert_eq!(channel_mask(raw_radius(&params)), [true; 3]);
+        assert_eq!(channel_mask(closure_radius(&params)), [false; 3]);
     }
 
     #[test]

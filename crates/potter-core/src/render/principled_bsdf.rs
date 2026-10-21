@@ -33,8 +33,8 @@ use super::principled_tables::{
     ggx_glass_energy_average, ggx_glass_inverse_energy, ggx_glass_inverse_energy_average,
     sheen_ltc,
 };
-use super::subsurface::{channel_mask, closure_radius, subsurface_evaluated};
-use crate::shader::{BsdfParams, SubsurfaceMethod, dielectric_f0};
+use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
+use crate::shader::{BsdfParams, dielectric_f0};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
@@ -60,7 +60,7 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     let diffuse_weight = ((1.0 - metallic) * (1.0 - transmission) * diffuse_share).max(0.0);
     // The subsurface closure's sample weight is its mean channel weight times the channels it covers
     // (`bssrdf_setup`, `sample_weight = |average(weight)| * channels`).
-    let covered_channels = channel_mask(closure_radius(params))
+    let covered_channels = channel_mask(raw_radius(params))
         .iter()
         .filter(|&&on| on)
         .count() as f64;
@@ -173,8 +173,9 @@ fn diffuse_layer_weight(params: &BsdfParams, normal: DVec3, view: DVec3) -> f64 
 /// The share of the diffuse base that the subsurface closures leave to diffuse, as Cycles' `closure` setup does
 /// (`svm/closure.h`). The diffuse closure keeps `1 - Subsurface Weight` for every method. A Thin Wall adds its thin
 /// reflection (`bsdf_thin_subsurface_setup`), a Lambert of weight `sat(0.5 (1 - anisotropy)) × subsurface weight`, to
-/// the same diffuse. Burley without Thin Wall takes the per-channel share of `bssrdf_setup`: `1 - Subsurface Weight` on
-/// the channels with a radius, and `1` on the others. The random walk takes `1 - Subsurface Weight` on every channel.
+/// the same diffuse. Otherwise `bssrdf_setup` moves a channel whose raw radius is below `BSSRDF_MIN_RADIUS` into a
+/// diffuse BSDF of its closure weight, so that channel keeps its full diffuse; the other channels keep `1 - Subsurface
+/// Weight`. Every method takes this share.
 fn subsurface_share(params: &BsdfParams) -> DVec3 {
     let sss = params.subsurface_weight.clamp(0.0, 1.0);
     if params.thin_wall {
@@ -184,16 +185,11 @@ fn subsurface_share(params: &BsdfParams) -> DVec3 {
     if !subsurface_evaluated(params) {
         return DVec3::ONE;
     }
-    match params.subsurface_method {
-        SubsurfaceMethod::Burley => {
-            let mask = channel_mask(closure_radius(params));
-            DVec3::from_array(std::array::from_fn(|channel| {
-                if mask[channel] { 1.0 - sss } else { 1.0 }
-            }))
-        }
-        // `subsurface_evaluated` admits only Burley and the random walk, so the other methods never reach here.
-        _ => DVec3::splat(1.0 - sss),
-    }
+    // Every method keeps its diffuse on a channel below `BSSRDF_MIN_RADIUS` (the raw radius, `bssrdf_setup`).
+    let mask = channel_mask(raw_radius(params));
+    DVec3::from_array(std::array::from_fn(|channel| {
+        if mask[channel] { 1.0 - sss } else { 1.0 }
+    }))
 }
 
 /// The subsurface closure's weight per channel, `clamped base × subsurface weight × diffuse layer weight × reflectance
@@ -208,7 +204,7 @@ pub(crate) fn subsurface_closure_weight(
     if !subsurface_evaluated(params) || params.thin_wall || normal.dot(view) <= 0.0 {
         return DVec3::ZERO;
     }
-    let mask = channel_mask(closure_radius(params));
+    let mask = channel_mask(raw_radius(params));
     let covered = DVec3::from_array(mask.map(|on| if on { 1.0 } else { 0.0 }));
     base_color(params)
         * covered

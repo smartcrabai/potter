@@ -20,7 +20,7 @@ use super::principled_bsdf::{
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, channel_mask, closure_radius, eval as burley_eval,
-    exit_params, pdf_mean, pick_channel, sample_radius, subsurface_evaluated,
+    exit_params, pdf_mean, pick_channel, raw_radius, sample_radius, subsurface_evaluated,
 };
 use super::subsurface_walk::{WalkEntry, entry_direction, walk};
 use super::{
@@ -2468,7 +2468,7 @@ fn burley_exit(
     rng: &mut Pcg32,
 ) -> Option<SubsurfaceExit> {
     let radius = closure_radius(&surface.params);
-    let mask = channel_mask(radius);
+    let mask = channel_mask(raw_radius(&surface.params));
     // One draw picks the channel and, remapped, the radius (`bssrdf_sample`).
     let (channel, xi_radius) = pick_channel(mask, rng.next_f64())?;
     let mean_free_path = radius.to_array()[channel];
