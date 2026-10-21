@@ -524,6 +524,7 @@ pub(crate) fn mesh_attribute_losses(format: &str, mesh_id: &str, mesh: &Mesh) ->
                     | "custom_normal"
                     | "shade_smooth"
                     | "sharp"
+                    | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES
             ) || (format == "alembic" && key == "alembic_normals") =>
             {
                 continue;
