@@ -15,15 +15,12 @@ use super::bevel_boundary::{
 };
 use super::bevel_shading::Kind;
 use super::bevel_vmesh::{
-    Emission, Profile, ProfileSpacing, VMesh, bounds_center, closest_on_segment, cube_corner_vmesh,
-    general_vmesh, pipe_adj_vmesh, point_strictly_inside, profile_fullness, project_to_face,
-    square_out_adj_vmesh, two_edge_vertex_samples, weld_profile_samples,
+    EdgeState, Emission, Profile, ProfileSpacing, VMesh, bounds_center, closest_on_segment,
+    cube_corner_vmesh, general_vmesh, pipe_adj_vmesh, point_strictly_inside, profile_fullness,
+    project_to_face, square_out_adj_vmesh, two_edge_vertex_samples, weld_profile_samples,
 };
 use crate::error::Result;
 use crate::geom::edge_key;
-/// An output edge's final `(endpoints, sharp, seam, source mesh edge)` as a rebuilt face's copy
-/// assigns it. The source is `None` when the copied edge is not an input edge.
-type EdgeState = ((usize, usize), bool, bool, Option<usize>);
 
 /// Blender's `BEVEL_EPSILON`.
 const EPSILON: f64 = 1.0e-6;

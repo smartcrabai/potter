@@ -1592,6 +1592,10 @@ pub(super) fn pipe_adj_vmesh(
     Ok(vm)
 }
 
+/// An output edge's final `(endpoints, sharp, seam, source mesh edge)` as a rebuilt face's copy
+/// assigns it. The source is `None` when the copied edge is not an input edge.
+pub(super) type EdgeState = ((usize, usize), bool, bool, Option<usize>);
+
 /// Output points, origins, polygons, and Blender edge/face classifications of a rebuilt bevel.
 pub(super) struct Emission {
     points: Vec<DVec3>,
@@ -1603,7 +1607,7 @@ pub(super) struct Emission {
     /// Edges whose final `(sharp, seam)` and attributes Blender assigns by copying a source edge
     /// (`bev_rebuild_polygon`, which runs last): these overwrite the marks above. The source edge
     /// index is `None` for an edge that is not an input edge.
-    edge_states: Vec<((usize, usize), bool, bool, Option<usize>)>,
+    edge_states: Vec<EdgeState>,
 }
 
 /// An output polygon: per corner, the output point, its UV query and source face. `face` is the
@@ -2570,7 +2574,7 @@ fn set_output_edge_flag(mesh: &mut Mesh, edge_index: usize, name: &str, value: b
         clear_output_edge_flag(mesh, edge_index, name);
     }
 }
-/// Blender's new BMesh edges start with zeroed attributes. An output edge that is not an input edge
+/// Blender's new `BMesh` edges start with zeroed attributes. An output edge that is not an input edge
 /// (kept input edges keep their values) loses its edge-domain attribute values, except the seam and
 /// sharp flags, which the marks set. Rebuilt rungs copy their source values afterwards.
 fn zero_generated_edge_attributes(output: &mut Mesh, source_edges: &HashSet<(u32, u32)>) {
@@ -2580,7 +2584,7 @@ fn zero_generated_edge_attributes(output: &mut Mesh, source_edges: &HashSet<(u32
         .filter(|edge| !source_edges.contains(&edge_key(edge.vertices[0], edge.vertices[1])))
         .map(|edge| format!("e{}", edge.id))
         .collect();
-    for (name, attribute) in output.attributes.iter_mut() {
+    for (name, attribute) in &mut output.attributes {
         if name == "sharp"
             || name == "seam"
             || attribute.get("domain").and_then(Value::as_str) != Some("edge")
