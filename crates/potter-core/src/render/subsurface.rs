@@ -371,7 +371,7 @@ mod tests {
         params.subsurface_radius = [2.0e-8, 2.0e-8, 2.0e-8];
         params.subsurface_scale = 1.0;
         assert_eq!(channel_mask(raw_radius(&params)), [true; 3]);
-        assert_eq!(channel_mask(burley_radius(&params)), [false; 3]);
+        assert_eq!(channel_mask(closure_radius(&params)), [false; 3]);
     }
 
     #[test]
