@@ -138,14 +138,13 @@ impl WireEdgeBuilder {
         for corner in 0..count {
             let next = (corner + 1) % count;
             let key = edge_key(vertices[corner], vertices[next]);
-            let slot = match self.index.get(&key) {
-                Some(&slot) => slot,
-                None => {
-                    let slot = self.slots.len();
-                    self.slots.push(None);
-                    self.index.insert(key, slot);
-                    slot
-                }
+            let slot = if let Some(&slot) = self.index.get(&key) {
+                slot
+            } else {
+                let slot = self.slots.len();
+                self.slots.push(None);
+                self.index.insert(key, slot);
+                slot
             };
             if let Some(edge) = self.slots[slot].as_mut() {
                 if edge.face_count < 2 {
@@ -990,7 +989,7 @@ mod oracle_tests {
             let clip: [f64; 4] =
                 std::array::from_fn(|r| (0..4).map(|k| product[r][k] * v[k]).sum());
             let (x, y) = (clip[0] / clip[3], clip[1] / clip[3]);
-            [(x + 1.0) * 0.5 * width, (1.0 - y) * 0.5 * height]
+            [f64::midpoint(x, 1.0) * width, (1.0 - y) * 0.5 * height]
         })
     }
 
@@ -1100,7 +1099,7 @@ mod oracle_tests {
         let errors = errors_where(&output.rgba, &capture, &OBJECT_REGION, |x, y| {
             distance[y * WIDTH as usize + x] > 2.5
         });
-        assert!(!errors.is_empty());
+        assert_ne!(errors.len(), 0);
         let worst = errors.iter().copied().max().unwrap_or(0);
         assert!(
             worst <= 1,
