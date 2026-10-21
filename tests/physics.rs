@@ -309,7 +309,7 @@ fn physics_system_operations_persist_update_and_delete_settings() {
             "operations":[
                 {"op":"physics.cloth.create","target":{"id":"body"},"settings":{"pin_group":"pinned","quality":4}},
                 {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"goal_group":"goal","volume_stiffness":0.9}},
-                {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"rate":3,"lifetime":20},"seed":17},
+                {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"count":3,"lifetime":20},"seed":17},
                 {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"type":"liquid","resolution":8}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"body"},"settings":{"role":"canvas","radius":0.5,"color":[0.2,0.4,0.8,1.0]}}
             ]
@@ -346,7 +346,7 @@ fn physics_system_operations_persist_update_and_delete_settings() {
             "operations":[
                 {"op":"physics.cloth.update","target":{"id":"body"},"set":{"stiffness":0.7}},
                 {"op":"physics.soft_body.update","target":{"id":"body"},"set":{"volume_stiffness":0.8}},
-                {"op":"physics.particle_emitter.update","target":{"id":"body"},"set":{"rate":6}},
+                {"op":"physics.particle_emitter.update","target":{"id":"body"},"set":{"count":6}},
                 {"op":"physics.fluid.update","target":{"id":"body"},"set":{"viscosity":0.1}},
                 {"op":"physics.dynamic_paint.update","target":{"id":"body"},"set":{"strength":0.5}}
             ]
@@ -363,7 +363,7 @@ fn physics_system_operations_persist_update_and_delete_settings() {
         0.8
     );
     assert_eq!(
-        updated["nodes"]["body"]["properties"]["physics_particle_emitter"]["rate"],
+        updated["nodes"]["body"]["properties"]["physics_particle_emitter"]["count"],
         6
     );
     assert_eq!(
@@ -569,14 +569,15 @@ fn soft_body_sphere_rebounds_while_preserving_volume() {
 }
 
 #[test]
-fn particles_are_seeded_and_emitted_at_rate_times_frames() {
+fn particles_are_seeded_and_born_by_count_over_frames() {
     use glam::{DMat4, DVec3};
     use potter_core::geom::Mesh;
 
     let emitter =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
             .unwrap();
-    let settings = json!({"rate":3,"lifetime":20,"speed":1,"source":"faces"});
+    let settings =
+        json!({"count":12,"frame_start":1,"frame_end":1,"lifetime":20,"speed":1,"source":"faces"});
     let first = potter_core::sim::particles::simulate(
         &emitter,
         &settings,
@@ -711,7 +712,7 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
                 {"op":"node.create","id":"weight_canvas","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}},
                 {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1}},
                 {"op":"physics.cloth.create","target":{"id":"cloth"}},
-                {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"rate":2,"lifetime":10,"speed":0.5},"seed":17},
+                {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"count":2,"frame_start":1,"frame_end":1,"lifetime":10,"speed":0.5},"seed":17},
                 {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"type":"liquid","resolution":4}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","radius":1.0,"color":[0.1,0.8,0.3,1.0]}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"]}},
@@ -774,7 +775,7 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
             "schema_version":1,
             "base_revision":1,
             "operations":[
-                {"op":"physics.particle_emitter.update","target":{"id":"emitter"},"set":{"rate":3}}
+                {"op":"physics.particle_emitter.update","target":{"id":"emitter"},"set":{"count":3}}
             ]
         }),
     );

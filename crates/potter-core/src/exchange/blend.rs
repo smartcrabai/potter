@@ -3988,6 +3988,7 @@ fn build_imported_graph(
                         &movie_clip_ids,
                         &action_ids,
                     )?;
+                    canonicalize_particle_texture_slots(&mut settings, &resource_ids);
                     if model_type == "particle_system" {
                         if !properties.contains_key(property) {
                             properties.insert(property.to_owned(), settings.clone());
@@ -8561,10 +8562,54 @@ fn imported_fisheye_lens(item: &Value) -> Option<f64> {
     }
 }
 
+/// Particle texture channels that Potter does not apply, with the Blender name each reports.
+const PARTICLE_UNSUPPORTED_CHANNELS: [(&str, &str); 10] = [
+    ("use_map_velocity", "velocity"),
+    ("use_map_field", "force fields"),
+    ("use_map_gravity", "gravity"),
+    ("use_map_damp", "damping"),
+    ("use_map_clump", "clumping"),
+    ("use_map_kink_amp", "kink amplitude"),
+    ("use_map_kink_freq", "kink frequency"),
+    ("use_map_rough", "roughness"),
+    ("use_map_length", "length"),
+    ("use_map_twist", "twist"),
+];
+
+/// Particle texture slots name their texture by Blender data name. A slot whose texture was not exported
+/// as a Potter record is unset here, and `import_losses` reports it.
+fn canonicalize_particle_texture_slots(
+    settings: &mut Value,
+    resource_ids: &BTreeMap<String, String>,
+) {
+    let Some(slots) = settings
+        .get_mut("texture_slots")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for slot in slots {
+        let Some(slot) = slot.as_object_mut() else {
+            continue;
+        };
+        let resource = slot
+            .get("texture")
+            .and_then(|reference| reference.get("name"))
+            .and_then(Value::as_str)
+            .and_then(|name| resource_ids.get(name))
+            .cloned();
+        slot.insert(
+            "texture".to_owned(),
+            resource.map_or(Value::Null, Value::String),
+        );
+    }
+}
+
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
-    // Blender evaluates a particle texture slot (`psys_get_texture`) for exist, time, size, life, and the other
-    // particle settings it maps. Potter does not evaluate particle textures, so each such slot is reported.
+    // Particle texture slots (`psys_get_texture`) that Potter cannot apply are reported. Potter applies
+    // the time, life, density, and size channels with GLOBAL or OBJECT coordinates; a texture without a
+    // Potter record is not applied. A slot that maps no channel does nothing and is not reported.
     for object in raw
         .get("objects")
         .and_then(Value::as_array)
@@ -8578,29 +8623,72 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             .into_iter()
             .flatten()
         {
-            for slot in modifier
-                .get("particle_texture_slots")
+            let Some(settings) = modifier.get("physics_settings") else {
+                continue;
+            };
+            for slot in settings
+                .get("texture_slots")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
             {
+                let mapped = |key: &str| slot.get(key).and_then(Value::as_bool) == Some(true);
+                let unsupported = PARTICLE_UNSUPPORTED_CHANNELS
+                    .iter()
+                    .filter(|(key, _)| mapped(key))
+                    .map(|(_, label)| *label)
+                    .collect::<Vec<_>>();
+                let supported_mapped = [
+                    "use_map_time",
+                    "use_map_life",
+                    "use_map_density",
+                    "use_map_size",
+                ]
+                .iter()
+                .any(|key| mapped(key));
+                if unsupported.is_empty() && !supported_mapped {
+                    continue;
+                }
                 let index = slot.get("slot").and_then(Value::as_u64).unwrap_or(0);
-                let texture = slot.get("texture").and_then(Value::as_str).unwrap_or("");
-                let maps = slot
-                    .get("maps")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                losses.push(loss(
-                    "blender.particle_system.texture_slot",
-                    name,
-                    &format!(
-                        "Blender's particle texture slot {index} (texture `{texture}`) drives {maps}; Potter does not evaluate particle textures, so the slot is not kept and the particle settings stay constant"
-                    ),
-                ));
+                let texture = slot
+                    .get("texture")
+                    .and_then(|reference| reference.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if slot.get("texture_exported").and_then(Value::as_bool) != Some(true) {
+                    losses.push(loss(
+                        "blender.particle_system.texture_slot",
+                        name,
+                        &format!(
+                            "Blender's particle texture slot {index} (texture `{texture}`) has no Potter texture record, so the slot is not applied and the particle settings stay constant"
+                        ),
+                    ));
+                    continue;
+                }
+                let coords = slot
+                    .get("texture_coords")
+                    .and_then(Value::as_str)
+                    .unwrap_or("GLOBAL");
+                if !matches!(coords, "GLOBAL" | "OBJECT") {
+                    losses.push(loss(
+                        "blender.particle_system.texture_coords",
+                        name,
+                        &format!(
+                            "Blender's particle texture slot {index} (texture `{texture}`) uses {coords} coordinates; Potter evaluates GLOBAL and OBJECT particle texture coordinates, so the slot is not applied"
+                        ),
+                    ));
+                    continue;
+                }
+                if !unsupported.is_empty() {
+                    losses.push(loss(
+                        "blender.particle_system.texture_channel",
+                        name,
+                        &format!(
+                            "Blender's particle texture slot {index} (texture `{texture}`) maps {}; Potter applies particle texture influence to time, life, density, and size only, so those channels stay constant",
+                            unsupported.join(", ")
+                        ),
+                    ));
+                }
             }
         }
     }

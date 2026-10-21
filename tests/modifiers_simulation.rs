@@ -110,7 +110,7 @@ fn physics_operations_create_stack_entries_linked_to_their_settings() -> Result<
             {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"goal_strength":0.7}},
             {"op":"physics.dynamic_paint.create","target":{"id":"body"},"settings":{"role":"canvas"}},
             {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"type":"liquid","resolution":4}},
-            {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"rate":1.0,"lifetime":12.0}},
+            {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"count":1,"lifetime":12.0}},
             {"op":"physics.collision.create","target":{"id":"body"},"settings":{"thickness":0.01}}
         ]),
         0,
@@ -176,7 +176,7 @@ fn modifier_flag_updates_keep_linked_physics_settings() -> Result<(), Box<dyn Er
         &json!([
             {"op":"node.create","id":"body","kind":"box","params":{}},
             {"op":"physics.cloth.create","target":{"id":"body"},"settings":{"mass":2.0,"quality":7,"tension_stiffness":12.0}},
-            {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"rate":1.0,"lifetime":12.0}},
+            {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"count":1,"lifetime":12.0}},
             {"op":"modifier.create","target":{"id":"body"},"id":"second_emitter","type":"particle_system","params":{"settings_id":"second_emitter","show_expanded":true}}
         ]),
         0,
@@ -186,13 +186,13 @@ fn modifier_flag_updates_keep_linked_physics_settings() -> Result<(), Box<dyn Er
     let seeded_path = scene.join("scene.json");
     let mut seeded: Value = serde_json::from_slice(&fs::read(&seeded_path)?)?;
     seeded["nodes"]["body"]["properties"]["physics_particle_systems"]["second_emitter"] =
-        json!({"rate":3.0,"lifetime":5.0});
+        json!({"count":3,"lifetime":5.0});
     fs::write(&seeded_path, serde_json::to_vec(&seeded)?)?;
     let before: Value = serde_json::from_slice(&fs::read(&seeded_path)?)?;
     let stored_before = before["nodes"]["body"]["properties"].clone();
     assert_eq!(stored_before["physics_cloth"]["mass"], 2.0);
     assert_eq!(
-        stored_before["physics_particle_systems"]["second_emitter"]["rate"],
+        stored_before["physics_particle_systems"]["second_emitter"]["count"],
         3.0
     );
 

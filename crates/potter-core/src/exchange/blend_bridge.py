@@ -601,6 +601,7 @@ def _physics_modifier_settings(obj, modifier):
         result = _physics_rna_values(settings)
         if settings is not None:
             result["type"] = str(settings.type)
+            result["texture_slots"] = _particle_texture_slots(settings)
         if particle_system:
             result["seed"] = int(particle_system.seed)
             result["child_seed"] = int(particle_system.child_seed)
@@ -661,22 +662,40 @@ def _physics_modifier_settings(obj, modifier):
     return result
 
 
-def _particle_texture_slots(modifier):
-    """Texture slots that drive a particle setting: Blender applies a slot with a texture and a use_map_* flag (`psys_get_texture`)."""
-    if modifier.type != "PARTICLE_SYSTEM":
-        return []
-    particle_system = getattr(modifier, "particle_system", None)
-    settings = getattr(particle_system, "settings", None) if particle_system else None
-    if settings is None:
-        return []
+PARTICLE_USE_MAP_KEYS = (
+    "use_map_time", "use_map_life", "use_map_density", "use_map_size", "use_map_velocity",
+    "use_map_field", "use_map_gravity", "use_map_damp", "use_map_clump", "use_map_kink_amp",
+    "use_map_kink_freq", "use_map_rough", "use_map_length", "use_map_twist",
+)
+
+
+def _particle_texture_slots(settings):
+    """Particle texture slots (`psys_get_texture`): each slot with a texture, its coordinates, placement, blend, default, and mapped channels."""
     slots = []
     for index, slot in enumerate(settings.texture_slots):
         if slot is None or slot.texture is None:
             continue
-        maps = [prop.identifier for prop in slot.bl_rna.properties
-                if prop.identifier.startswith("use_map_") and getattr(slot, prop.identifier)]
-        if maps:
-            slots.append({"slot": index, "texture": slot.texture.name, "maps": maps})
+        record = {
+            "slot": index,
+            "texture": plain(slot.texture),
+            "texture_coords": slot.texture_coords,
+            "object": plain(slot.object) if slot.object else None,
+            "mapping_x": slot.mapping_x,
+            "mapping_y": slot.mapping_y,
+            "mapping_z": slot.mapping_z,
+            "offset": [float(value) for value in slot.offset],
+            "scale": [float(value) for value in slot.scale],
+            "default_value": float(slot.default_value),
+            "blend_type": slot.blend_type,
+            "time_factor": float(slot.time_factor),
+            "life_factor": float(slot.life_factor),
+            "density_factor": float(slot.density_factor),
+            "size_factor": float(slot.size_factor),
+            "texture_exported": _legacy_texture_record(slot.texture) is not None,
+        }
+        for key in PARTICLE_USE_MAP_KEYS:
+            record[key] = bool(getattr(slot, key))
+        slots.append(record)
     return slots
 
 def _color_ramp_settings(ramp):
@@ -2143,7 +2162,6 @@ def object_dump(obj):
                           "properties": properties,
                           "native_target_mesh": native_target_mesh,
                           "physics_settings": _physics_modifier_settings(obj, modifier),
-                          "particle_texture_slots": _particle_texture_slots(modifier),
                           "custom_properties": custom_props(modifier)})
     inverse_map = _object_solver_inverse_map(obj).get("objects", {})
     constraints = [

@@ -1,5 +1,6 @@
 //! Deterministic mesh-emitter particle simulation.
 
+use super::particle_textures::{TextureSlot, birth_values, maps_time};
 use super::{ParticleLifeState, ParticlePathInterpolation, ParticlePathKey};
 use std::collections::HashMap;
 
@@ -57,6 +58,9 @@ pub struct Particle {
     pub path: Vec<ParticlePathKey>,
     pub size: f64,
     pub mass: f64,
+    /// False when the density texture keeps this particle from existing (Blender's `PARS_UNEXIST`).
+    #[serde(default = "particle_exists_default")]
+    pub exists: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +151,33 @@ pub fn simulate(
     force_fields: &[(DVec3, &str, f64, f64)],
     colliders: &[[DVec3; 3]],
 ) -> Result<Vec<Particle>> {
+    simulate_textured(
+        mesh,
+        settings,
+        world,
+        frame,
+        fps,
+        gravity,
+        seed,
+        force_fields,
+        colliders,
+        &[],
+    )
+}
+
+/// [`simulate`] with the particle system's texture slots (`psys_get_texture`) applied at birth.
+pub fn simulate_textured(
+    mesh: &Mesh,
+    settings: &Value,
+    world: DMat4,
+    frame: f64,
+    fps: f64,
+    gravity: DVec3,
+    seed: u32,
+    force_fields: &[(DVec3, &str, f64, f64)],
+    colliders: &[[DVec3; 3]],
+    textures: &[TextureSlot<'_>],
+) -> Result<Vec<Particle>> {
     simulate_with_lifecycle(
         mesh,
         settings,
@@ -158,6 +189,7 @@ pub fn simulate(
         force_fields,
         colliders,
         false,
+        textures,
     )
 }
 
@@ -173,6 +205,33 @@ pub fn simulate_lifecycle(
     force_fields: &[(DVec3, &str, f64, f64)],
     colliders: &[[DVec3; 3]],
 ) -> Result<Vec<Particle>> {
+    simulate_lifecycle_textured(
+        mesh,
+        settings,
+        world,
+        frame,
+        fps,
+        gravity,
+        seed,
+        force_fields,
+        colliders,
+        &[],
+    )
+}
+
+/// [`simulate_lifecycle`] with the particle system's texture slots applied at birth.
+pub fn simulate_lifecycle_textured(
+    mesh: &Mesh,
+    settings: &Value,
+    world: DMat4,
+    frame: f64,
+    fps: f64,
+    gravity: DVec3,
+    seed: u32,
+    force_fields: &[(DVec3, &str, f64, f64)],
+    colliders: &[[DVec3; 3]],
+    textures: &[TextureSlot<'_>],
+) -> Result<Vec<Particle>> {
     simulate_with_lifecycle(
         mesh,
         settings,
@@ -184,7 +243,12 @@ pub fn simulate_lifecycle(
         force_fields,
         colliders,
         true,
+        textures,
     )
+}
+
+fn particle_exists_default() -> bool {
+    true
 }
 
 fn simulate_with_lifecycle(
@@ -198,6 +262,7 @@ fn simulate_with_lifecycle(
     force_fields: &[(DVec3, &str, f64, f64)],
     colliders: &[[DVec3; 3]],
     include_lifecycle: bool,
+    textures: &[TextureSlot<'_>],
 ) -> Result<Vec<Particle>> {
     if !frame.is_finite() || frame < 0.0 {
         return Err(invalid("particle frame must be finite and non-negative"));
@@ -378,7 +443,13 @@ fn simulate_with_lifecycle(
     if !emitted_float.is_finite() || emitted_float >= u64::MAX as f64 {
         return Err(limit("particle emission count exceeds the supported range"));
     }
-    let emitted = emitted_float.floor() as u64;
+    // A time-mapped texture moves births off the schedule, so every particle is considered.
+    let time_mapped = !is_hair && maps_time(textures);
+    let emitted = if time_mapped {
+        count.floor() as u64
+    } else {
+        emitted_float.floor() as u64
+    };
     if emitted == 0 || mesh.vertices.is_empty() {
         return Ok(Vec::new());
     }
@@ -389,7 +460,7 @@ fn simulate_with_lifecycle(
     } else {
         world
     };
-    let first_event = if include_lifecycle {
+    let first_event = if include_lifecycle || time_mapped {
         0
     } else {
         // Births before `frame - maximum_lifetime` are dead by `frame`; keep one earlier event as margin.
@@ -561,22 +632,105 @@ fn simulate_with_lifecycle(
     let total_area = triangles
         .last()
         .map_or(0.0, |triangle| triangle.cumulative_area);
+    let mut texture_rng = BlenderRng::seed_random(system_seed);
     for event in first_event..emitted {
+        let particle_index =
+            u32::try_from(event).map_err(|_| limit("particle index exceeds supported range"))?;
+        let path = if let Some(paths) = path_values {
+            particle_path(paths, event)?
+        } else {
+            Vec::new()
+        };
+        let path_root_rotation = path
+            .first()
+            .and_then(|birth| emitter_root_frame(birth.position, world, &triangles))
+            .map(|(rotation, _)| rotation);
+        // Path keys give the birth point; without them Blender's emitter sample does.
+        let sampled = if path.is_empty() {
+            let mut random = Random::new(seed ^ event.wrapping_mul(0xd6e8_feb8_6659_fd93));
+            let (local_position, local_normal) = if from_volume {
+                (
+                    sample_volume_position(mesh, &triangles, &mut random)?,
+                    DVec3::Z,
+                )
+            } else if from_vertex || triangles.is_empty() || total_area <= 0.0 {
+                let index = (random.unit() * mesh.vertices.len() as f64) as usize;
+                let index = index.min(mesh.vertices.len() - 1);
+                (
+                    mesh.vertices[index].co,
+                    vertex_normals[index].normalize_or_zero(),
+                )
+            } else {
+                sample_triangle(&triangles, total_area, &mut random)
+            };
+            let normal = normal_transform
+                .transform_vector3(local_normal)
+                .normalize_or_zero();
+            let direction = if normal.length_squared() > 0.0 {
+                normal
+            } else {
+                DVec3::Z
+            };
+            let local_random = DVec3::new(
+                random.signed() * random_velocity.x,
+                random.signed() * random_velocity.y,
+                random.signed() * random_velocity.z,
+            );
+            let start = world.transform_point3(local_position);
+            let velocity =
+                direction * speed + world.transform_vector3(initial_velocity + local_random);
+            if !start.is_finite() || !velocity.is_finite() {
+                return Err(invalid("particle emission produced a non-finite value"));
+            }
+            let birth_rotation = if !from_vertex && !from_volume {
+                emitter_root_frame(start.to_array(), world, &triangles).map_or_else(
+                    || {
+                        if normal.length_squared() > f64::EPSILON {
+                            DQuat::from_rotation_arc(DVec3::X, normal.normalize()).to_array()
+                        } else {
+                            DQuat::IDENTITY.to_array()
+                        }
+                    },
+                    |(rotation, _)| rotation,
+                )
+            } else if normal.length_squared() > f64::EPSILON {
+                DQuat::from_rotation_arc(DVec3::X, normal.normalize()).to_array()
+            } else {
+                DQuat::IDENTITY.to_array()
+            };
+            Some((start, velocity, normal, birth_rotation))
+        } else {
+            None
+        };
+        let birth_point = match (path.first(), &sampled) {
+            (Some(first), _) => DVec3::from_array(first.position),
+            (None, Some((start, ..))) => *start,
+            (None, None) => return Err(invalid("particle emission sample is missing")),
+        };
+        // `init_particle`: the default emission time is the particle's index over the count.
+        let default_time = if count > 0.0 {
+            event as f64 / count
+        } else {
+            0.0
+        };
+        let values = birth_values(textures, birth_point, default_time, &mut texture_rng)?;
         let birth_frame = if is_hair {
             0.0
         } else {
-            frame_start + frame_span * event as f64 / count
+            frame_start + frame_span * values.time
         };
-        let particle_index =
-            u32::try_from(event).map_err(|_| limit("particle index exceeds supported range"))?;
         let actual_lifetime = if is_hair {
             100.0
         } else {
             lifetime
+                * values.life
                 * (1.0
                     - lifetime_random
                         * f64::from(psys_frand(system_seed, particle_index.wrapping_add(21))))
         };
+        // Blender's `PARS_UNEXIST`: the density texture value below a particle's random draw removes it.
+        let exists = !(values.density
+            < f64::from(psys_frand(system_seed, particle_index.wrapping_add(125))));
         let raw_age = frame - birth_frame;
         let unborn = raw_age < 0.0;
         if unborn && !include_lifecycle {
@@ -597,15 +751,6 @@ fn simulate_with_lifecycle(
         if life_state != ParticleLifeState::Alive && !include_lifecycle {
             continue;
         }
-        let mut path = if let Some(paths) = path_values {
-            particle_path(paths, event)?
-        } else {
-            Vec::new()
-        };
-        let path_root_rotation = path
-            .first()
-            .and_then(|birth| emitter_root_frame(birth.position, world, &triangles))
-            .map(|(rotation, _)| rotation);
         let path_time = if is_hair {
             0.0
         } else if actual_lifetime <= f64::EPSILON {
@@ -637,41 +782,8 @@ fn simulate_with_lifecycle(
                     DVec3::from_array(current.velocity),
                 )
             } else {
-                let mut random = Random::new(seed ^ event.wrapping_mul(0xd6e8_feb8_6659_fd93));
-                let (local_position, local_normal) = if from_volume {
-                    (
-                        sample_volume_position(mesh, &triangles, &mut random)?,
-                        DVec3::Z,
-                    )
-                } else if from_vertex || triangles.is_empty() || total_area <= 0.0 {
-                    let index = (random.unit() * mesh.vertices.len() as f64) as usize;
-                    let index = index.min(mesh.vertices.len() - 1);
-                    (
-                        mesh.vertices[index].co,
-                        vertex_normals[index].normalize_or_zero(),
-                    )
-                } else {
-                    sample_triangle(&triangles, total_area, &mut random)
-                };
-                let normal = normal_transform
-                    .transform_vector3(local_normal)
-                    .normalize_or_zero();
-                let direction = if normal.length_squared() > 0.0 {
-                    normal
-                } else {
-                    DVec3::Z
-                };
-                let local_random = DVec3::new(
-                    random.signed() * random_velocity.x,
-                    random.signed() * random_velocity.y,
-                    random.signed() * random_velocity.z,
-                );
-                let start = world.transform_point3(local_position);
-                let velocity =
-                    direction * speed + world.transform_vector3(initial_velocity + local_random);
-                if !start.is_finite() || !velocity.is_finite() {
-                    return Err(invalid("particle emission produced a non-finite value"));
-                }
+                let (start, velocity, normal, birth_rotation) =
+                    sampled.ok_or_else(|| invalid("particle emission sample is missing"))?;
                 let (position, final_velocity) = integrate_particle(
                     start,
                     velocity,
@@ -681,22 +793,6 @@ fn simulate_with_lifecycle(
                     &fields,
                     &world_colliders,
                 )?;
-                let birth_rotation = if !from_vertex && !from_volume {
-                    emitter_root_frame(start.to_array(), world, &triangles).map_or_else(
-                        || {
-                            if normal.length_squared() > f64::EPSILON {
-                                DQuat::from_rotation_arc(DVec3::X, normal.normalize()).to_array()
-                            } else {
-                                DQuat::IDENTITY.to_array()
-                            }
-                        },
-                        |(rotation, _)| rotation,
-                    )
-                } else if normal.length_squared() > f64::EPSILON {
-                    DQuat::from_rotation_arc(DVec3::X, normal.normalize()).to_array()
-                } else {
-                    DQuat::IDENTITY.to_array()
-                };
                 (
                     start,
                     velocity,
@@ -722,6 +818,7 @@ fn simulate_with_lifecycle(
             )?);
         }
         let size = particle_size
+            * values.size
             * (1.0
                 - size_random * f64::from(psys_frand(system_seed, particle_index.wrapping_add(1))));
         let mass = setting_alias_number(settings, &["mass"], 1.0)?;
@@ -748,6 +845,7 @@ fn simulate_with_lifecycle(
             path,
             size,
             mass,
+            exists,
         });
     }
     if include_lifecycle {
@@ -1677,6 +1775,7 @@ fn append_simple_children(
                                 child_number.wrapping_add(26),
                             ))),
                 mass: parent.mass,
+                exists: true,
             });
         }
     }
@@ -1808,6 +1907,7 @@ fn append_interpolated_children(
                             child_index.wrapping_add(26),
                         ))),
             mass,
+            exists: true,
         });
     }
     if settings.virtual_parents > 0.0 {
@@ -2383,6 +2483,7 @@ mod tests {
             ],
             size: 3.0,
             mass: 1.0,
+            exists: true,
         };
         let settings = ChildSettings {
             count: 1,

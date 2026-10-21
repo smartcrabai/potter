@@ -87,7 +87,7 @@ KINDS = {
         "blender_type": "PARTICLE_SYSTEM",
         "potter_type": "particle_system",
         "params": {},
-        "potter_settings": {"rate": 1.0, "lifetime": 12.0},
+        "potter_settings": {"count": 1, "lifetime": 12.0},
     },
     "multires": {
         "blender_type": "MULTIRES",

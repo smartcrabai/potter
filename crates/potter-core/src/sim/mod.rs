@@ -4,6 +4,7 @@ mod cache;
 pub mod cloth;
 pub mod dynamic_paint;
 pub mod fluid;
+mod particle_textures;
 pub mod particles;
 pub mod softbody;
 mod solver;
@@ -212,6 +213,8 @@ pub struct ParticleState {
     pub path_interpolation: ParticlePathInterpolation,
     pub size: f64,
     pub mass: f64,
+    /// Blender's `PARS_UNEXIST` is its inverse: false when the density texture keeps the particle from existing.
+    pub exists: bool,
 }
 
 impl Default for ParticleState {
@@ -237,6 +240,7 @@ impl Default for ParticleState {
             path_interpolation: ParticlePathInterpolation::Hermite,
             size: 1.0,
             mass: 1.0,
+            exists: true,
         }
     }
 }
@@ -284,6 +288,7 @@ fn particle_state(particle: particles::Particle, system_index: u32) -> ParticleS
         path_interpolation: particle.path_interpolation,
         size: particle.size,
         mass: particle.mass,
+        exists: particle.exists,
     }
 }
 
@@ -580,7 +585,10 @@ pub(crate) fn evaluate_stack_modifier(
                 .map(|(_, triangle)| *triangle)
                 .collect::<Vec<_>>();
             let fields = force_field_inputs(doc, matrices, &members)?;
-            let states = particles::simulate_lifecycle(
+            let textures =
+                load_particle_textures(&solver_settings, doc, gate.context.project_root)?;
+            let slots = particle_textures::texture_slots(&solver_settings, &textures, matrices)?;
+            let states = particles::simulate_lifecycle_textured(
                 &mesh,
                 &solver_settings,
                 matrix,
@@ -590,6 +598,7 @@ pub(crate) fn evaluate_stack_modifier(
                 seed,
                 &fields,
                 &colliders,
+                &slots,
             )?
             .into_iter()
             .map(|particle| particle_state(particle, system_index))
@@ -705,6 +714,21 @@ fn particle_system_index(node: &Node, modifier_id: &str) -> u32 {
         .position(|modifier| modifier.id.as_str() == modifier_id)
         .and_then(|index| u32::try_from(index).ok())
         .unwrap_or(0)
+}
+
+/// Resolves the texture resources that a particle system's supported texture slots refer to.
+fn load_particle_textures(
+    settings: &Value,
+    doc: &SceneDoc,
+    project_root: Option<&std::path::Path>,
+) -> Result<BTreeMap<String, crate::geom::legacy_texture::ResolvedTexture>> {
+    let mut textures = BTreeMap::new();
+    for name in particle_textures::texture_ids(settings) {
+        let id = Id::new(name.clone())?;
+        let resolved = crate::geom::legacy_texture::resolve_texture(doc, &id, project_root)?;
+        textures.insert(name, resolved);
+    }
+    Ok(textures)
 }
 
 fn normalize_solver_settings(settings: &Value, system: &str) -> Value {
@@ -1051,7 +1075,9 @@ fn evaluate_physics(
                 .filter(|(collider_id, _)| collider_id != id)
                 .map(|(_, triangle)| *triangle)
                 .collect::<Vec<_>>();
-            let particles = particles::simulate(
+            let textures = load_particle_textures(settings, doc, gate.context.project_root)?;
+            let slots = particle_textures::texture_slots(settings, &textures, matrices)?;
+            let particles = particles::simulate_textured(
                 mesh,
                 settings,
                 matrix,
@@ -1061,6 +1087,7 @@ fn evaluate_physics(
                 seed,
                 &force_fields,
                 &colliders,
+                &slots,
             )?;
             if particles.iter().any(|particle| {
                 particle.position.iter().any(|value| !value.is_finite())
@@ -1582,6 +1609,7 @@ mod tests {
             path,
             size: 1.0,
             mass: 1.0,
+            exists: true,
         }
     }
 
