@@ -15,7 +15,7 @@ use potter_core::{
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-fn assert_backface_glass_lit(light: Value, case: &str) -> TestResult {
+fn assert_backface_glass_lit(light: &Value, case: &str) -> TestResult {
     let root = tempdir()?;
     let project = root.path().join("project");
     pot_json(|command| {
@@ -75,7 +75,7 @@ fn assert_backface_glass_lit(light: Value, case: &str) -> TestResult {
 #[test]
 fn realtime_glass_transmits_toward_a_viewer_on_its_back_side() -> TestResult {
     assert_backface_glass_lit(
-        json!({
+        &json!({
             "op": "light.create", "id": "transmitted_point", "light_type": "point", "energy": 1000.0,
             "radius": 0.1, "transform": {"translation": [0.0, 0.0, -2.0]}
         }),
@@ -86,7 +86,7 @@ fn realtime_glass_transmits_toward_a_viewer_on_its_back_side() -> TestResult {
 #[test]
 fn realtime_glass_reflects_direct_light_on_its_back_side() -> TestResult {
     assert_backface_glass_lit(
-        json!({
+        &json!({
             "op": "light.create", "id": "reflected_point", "light_type": "point", "energy": 1000.0,
             "radius": 0.1, "transform": {"translation": [0.0, 0.0, 2.0]}
         }),
@@ -97,7 +97,7 @@ fn realtime_glass_reflects_direct_light_on_its_back_side() -> TestResult {
 #[test]
 fn realtime_glass_transmits_area_light_toward_a_viewer_on_its_back_side() -> TestResult {
     assert_backface_glass_lit(
-        json!({
+        &json!({
             "op": "light.create", "id": "transmitted_area", "light_type": "area", "energy": 1000.0,
             "transform": {
                 "translation": [0.0, 0.0, -2.0],
