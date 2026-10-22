@@ -12,6 +12,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Test artifacts stay optimized; DWARF is unnecessary for ~200 test executables.
+      CARGO_PROFILE_TEST_DEBUG: "0"
     # About 40 minutes (tests, then clippy) with warm caches; a hung Blender test should not hold the runner for 6 hours.
     timeout-minutes: 75
     steps:
@@ -78,8 +81,6 @@ jobs:
         shell: bash
         env:
           POTTER_REQUIRE_BLENDER: "1"
-          # Test artifacts stay optimized; DWARF is unnecessary for ~200 test executables.
-          CARGO_PROFILE_TEST_DEBUG: "0"
         run: cargo test --workspace --all-features --no-fail-fast
 
   vrm-consumer:
