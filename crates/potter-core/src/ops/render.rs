@@ -25,7 +25,7 @@ const SET_FIELDS: &[&str] = &[
     "dicing_rate",
     "preview_dicing_rate",
     "max_subdivisions",
-    "offscreen_dicing_scale",
+    "eevee_use_volumetric_shadows",
     "dicing_camera",
 ];
 
@@ -167,6 +167,18 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
             })
         })
         .transpose()?;
+    let eevee_use_volumetric_shadows = set
+        .get("eevee_use_volumetric_shadows")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "eevee_use_volumetric_shadows must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/eevee_use_volumetric_shadows"),
+                )
+            })
+        })
+        .transpose()?;
     let shutter = set
         .get("shutter")
         .map(|value| {
@@ -283,6 +295,9 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         }
         if let Some(value) = film_transparent {
             scene.render.film_transparent = value;
+        }
+        if let Some(value) = eevee_use_volumetric_shadows {
+            scene.render.eevee_use_volumetric_shadows = value;
         }
         if let Some(value) = filter_size {
             scene.render.filter_size = value;

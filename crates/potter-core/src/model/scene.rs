@@ -1225,6 +1225,9 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_light_threshold"
     )]
     pub eevee_light_threshold: f64,
+    /// Blender's `Scene.eevee.use_volumetric_shadows`; disabled by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub eevee_use_volumetric_shadows: bool,
     #[serde(default)]
     pub motion_blur: bool,
     #[serde(default = "default_shutter")]
@@ -1277,7 +1280,7 @@ impl Default for RenderSettings {
             audio_codec: "wav".to_owned(),
             passes: vec!["combined".to_owned()],
             cryptomatte_accurate: false,
-            eevee_light_threshold: default_light_threshold(),
+            eevee_use_volumetric_shadows: false,
             motion_blur: false,
             shutter: default_shutter(),
             motion_blur_samples: default_motion_blur_samples(),

@@ -10,6 +10,7 @@
     "eevee_direct_light_cases.py": "0fceceb23e734a3e76d0e02b11ad59e4fecd4ad320031e196aee369ad4a6e007",
     "eevee_light_factors.py": "c77aeeae6ba8f55d0679f1ba0caf1fd0c78fa9acd05e4539e11c52c9e029d2ff",
     "eevee_volume_factor.py": "cd0688243e558f12fe3985de348ccceba096f562e81ef6d7d67511d8704787d2",
+    "eevee_volume_shadowed.py": "ff4e80bc6e9eb02e888052148a6b2b150968f04e257ac8ca15a9d8211d2f45f8",
     "eevee_world_background.py": "3dfbc770812ece43429906a7d0425c9e32ef12d101701af8ab56b04f3591e29b",
     "export_eevee_fixture.py": "214d2ab63f343f7e59af8eaa7752217f7b26b574696e9c21b0518279ddd55606"
   },
@@ -39,6 +40,7 @@
     "volume_volume_base.f32le": 110592,
     "volume_volume_half.f32le": 110592,
     "volume_volume_zero.f32le": 110592,
+    "volume_volume_shadowed.f32le": 110592,
     "world_background_node_black.f32le": 49152,
     "world_background_node_colour.f32le": 49152
   },

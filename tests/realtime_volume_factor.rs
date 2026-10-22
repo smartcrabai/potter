@@ -1,16 +1,11 @@
-//! Realtime Beauty's volume in-scatter follows a light's `volume_factor`, as EEVEE's `power[LIGHT_VOLUME]` does.
+//! Realtime Beauty's mesh-volume in-scatter responds to a light's `volume_factor`, as EEVEE's `power[LIGHT_VOLUME]` does.
 //!
-//! `fixtures/native_oracle/eevee_volume_factor.py` renders a pure scatterer, a 2 m cube, lit by a 200 W point light above it,
-//! three times: with the light's Volume Factor at 1, at 0, and at 0.5. The black world leaves the in-scatter alone, so the
-//! three renders test one linear law: the in-scatter is proportional to the factor, and a factor of 0 switches it off.
+//! The committed Blender 5.2.2 renders use a pure scatterer in a 2 m cube lit by a 200 W point light, at factors 1, 0 and 0.5. EEVEE's volume influence radius also depends on the factor, so its half capture is not exactly half the base capture.
 //!
-//! - EEVEE: the factor-0.5 render is half the factor-1 render within 1.5e-3 (EEVEE's own sampling noise: the largest pixel
-//!   deviation measured over the 96 by 96 image is 7.0e-4, and 1.5e-3 is twice that, rounded up); the factor-0 render is black.
-//! - Potter: the same three relations hold for Potter's renders, to 1e-6, since the in-scatter is multiplied by the factor
-//!   exactly.
+//! - EEVEE: the half-vs-half-base max error in the committed 96 × 96 macOS arm64 fixture is 7.019e-4, within its 1.5e-3 native bound.
+//! - Potter: the half render is compared with half its own base under that same native response bound; its zero-factor render remains black within 1e-6.
 //!
-//! The absolute in-scatter is not compared with EEVEE: Potter's realtime volume is a single-scatter model with Cycles'
-//! light radiance, which differs from EEVEE's volume light (`point_radiance_get`) for area and sun lights.
+//! Potter's absolute base in-scatter is not compared with EEVEE because their realtime volume-light models differ in point-light radiance.
 //!
 //! EEVEE's three renders are the committed macOS arm64 renders (`fixtures/native_oracle/eevee_macos/`; see its
 //! `MANIFEST.json`), not live renders, so the test has no platform term.
@@ -41,6 +36,9 @@ use tempfile::tempdir;
 
 /// The oracle's script: it saves each case's `.blend` and, given `-` for the render paths, stops before rendering.
 const EEVEE_SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_volume_factor.py");
+const EEVEE_SHADOWED_SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_volume_shadowed.py");
+const EEVEE_SHADOWED_RENDER: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/volume_volume_shadowed.f32le");
 
 /// The three cases with their committed macOS arm64 EEVEE renders, as little-endian f32 RGB rows bottom-up.
 const EEVEE_RENDERS: [(&str, &[u8]); 3] = [
@@ -61,10 +59,10 @@ const EEVEE_RENDERS: [(&str, &[u8]); 3] = [
 const SIZE: u32 = 96;
 const ORTHO_SCALE: f64 = 3.0;
 
-/// The EEVEE half-factor bound (see the module docs).
-const EEVEE_LINEAR_TOLERANCE: f64 = 1.5e-3;
-/// Potter's relations are exact up to the render's float precision.
-const POTTER_LINEAR_TOLERANCE: f64 = 1.0e-6;
+/// Existing native bound for the half/base relation and Potter's half capture.
+const NATIVE_HALF_TOLERANCE: f64 = 1.5e-3;
+/// Potter's exact pixel comparisons.
+const POTTER_PIXEL_TOLERANCE: f64 = 1.0e-6;
 
 #[test]
 fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
@@ -99,26 +97,52 @@ fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
 
     let eevee_half_error = worst_difference(&eevee_half, &scaled(&eevee_base, 0.5));
     assert!(
-        eevee_half_error <= EEVEE_LINEAR_TOLERANCE,
-        "EEVEE's half-factor render is not half its base: error {eevee_half_error}"
+        eevee_half_error <= NATIVE_HALF_TOLERANCE,
+        "EEVEE's half-factor render differs from half its base: error {eevee_half_error}"
     );
     let eevee_zero_max = eevee_zero.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
     assert!(
-        eevee_zero_max <= EEVEE_LINEAR_TOLERANCE,
+        eevee_zero_max <= NATIVE_HALF_TOLERANCE,
         "EEVEE's zero-factor render is not black: {eevee_zero_max}"
     );
 
     let potter_zero_max = potter_zero.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
     assert!(
-        potter_zero_max <= POTTER_LINEAR_TOLERANCE,
+        potter_zero_max <= POTTER_PIXEL_TOLERANCE,
         "Potter's zero-factor render keeps in-scatter: {potter_zero_max}"
     );
-    let potter_half_error = worst_difference(&potter_half, &scaled(&potter_base, 0.5));
-    assert!(
-        potter_half_error <= POTTER_LINEAR_TOLERANCE,
-        "Potter's half-factor render is not half its base: error {potter_half_error}"
-    );
+    let eevee_base_max = eevee_base.iter().fold(0.0_f64, |a, b| a.max(*b));
+    let eevee_half_max = eevee_half.iter().fold(0.0_f64, |a, b| a.max(*b));
     let potter_base_max = potter_base.iter().fold(0.0_f64, |a, b| a.max(*b));
+    let potter_half_max = potter_half.iter().fold(0.0_f64, |a, b| a.max(*b));
+    let potter_half_error = worst_difference(&potter_half, &scaled(&potter_base, 0.5));
+    let pixel_size = ORTHO_SCALE / f64::from(SIZE);
+    let interior_limit = 1.0 - pixel_size;
+    let mut eevee_interior_error = 0.0_f64;
+    let mut potter_interior_error = 0.0_f64;
+    let mut interior_pixels = 0;
+    for row in 0..SIZE {
+        for column in 0..SIZE {
+            let world_x = (f64::from(column) + 0.5) * pixel_size - ORTHO_SCALE * 0.5;
+            let world_y = (f64::from(row) + 0.5) * pixel_size - ORTHO_SCALE * 0.5;
+            if world_x.abs() > interior_limit || world_y.abs() > interior_limit {
+                continue;
+            }
+            let index = row as usize * SIZE as usize + column as usize;
+            eevee_interior_error =
+                eevee_interior_error.max((eevee_half[index] - eevee_base[index] * 0.5).abs());
+            potter_interior_error =
+                potter_interior_error.max((potter_half[index] - potter_base[index] * 0.5).abs());
+            interior_pixels += 1;
+        }
+    }
+    eprintln!(
+        "VOLUME_FACTOR_METRICS eevee_base_max={eevee_base_max} eevee_half_max={eevee_half_max} eevee_full={eevee_half_error} eevee_interior={eevee_interior_error} potter_base_max={potter_base_max} potter_half_max={potter_half_max} potter_full={potter_half_error} potter_interior={potter_interior_error} interior_pixels={interior_pixels}"
+    );
+    assert!(
+        potter_half_error <= NATIVE_HALF_TOLERANCE,
+        "Potter's half-factor render differs from half its base: error {potter_half_error}"
+    );
     assert!(
         potter_base_max > 1.0e-3,
         "Potter's volume shows no in-scatter, so the factor is not tested ({potter_base_max})"
@@ -126,7 +150,150 @@ fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
     Ok(())
 }
 
-/// A linked Volume output with no Surface stays transparent even when its sampled medium is zero.
+#[test]
+fn realtime_volumetric_shadow_setting_matches_native_ab_response() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let source_script = write_script(root.path(), "eevee_volume_factor.py", EEVEE_SCRIPT)?;
+    let source_blend = root.path().join("volume_base.blend");
+    run_blender_arguments(
+        &blender,
+        &source_script,
+        None,
+        &[
+            Path::new("volume_base"),
+            source_blend.as_path(),
+            Path::new("-"),
+            Path::new("-"),
+        ],
+    )?;
+    let shadow_script = write_script(
+        root.path(),
+        "eevee_volume_shadowed.py",
+        EEVEE_SHADOWED_SCRIPT,
+    )?;
+    let shadowed_blend = root.path().join("volume_shadowed.blend");
+    run_blender_arguments(
+        &blender,
+        &shadow_script,
+        None,
+        &[
+            source_blend.as_path(),
+            shadowed_blend.as_path(),
+            Path::new("-"),
+        ],
+    )?;
+    let (project, _) = import_blend(&blender, root.path(), "volume_shadows", &shadowed_blend)?;
+    let scene = read_scene(&project)?;
+    let active = scene["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?
+        .to_owned();
+    assert_eq!(
+        scene["scenes"][active.as_str()]["render"]["eevee_use_volumetric_shadows"].as_bool(),
+        Some(true)
+    );
+    let configured = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "camera.create", "id": "camera_main",
+             "transform": {"translation": [0.0, 0.0, 10.0]},
+             "projection": "orthographic", "ortho_scale": ORTHO_SCALE},
+            {"op": "scene.update", "target": {"id": active.as_str()}, "set": {"camera": "camera_main"}},
+            {"op": "render.update", "target": {"id": active.as_str()},
+             "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 64, "seed": 0,
+                     "eevee_use_volumetric_shadows": true}}
+        ]),
+    )?;
+    assert_eq!(configured["ok"], true, "{configured}");
+    let exported_blend = root.path().join("volume_shadows_roundtrip.blend");
+    let exported = pot()
+        .arg("export")
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&exported_blend)
+        .args(["--blender"])
+        .arg(&blender)
+        .arg("--json")
+        .output()?;
+    assert!(
+        exported.status.success(),
+        "Blender export failed: {}",
+        String::from_utf8_lossy(&exported.stdout)
+    );
+    let (roundtrip, _) = import_blend(
+        &blender,
+        root.path(),
+        "volume_shadows_roundtrip",
+        &exported_blend,
+    )?;
+    let roundtrip_scene = read_scene(&roundtrip)?;
+    let roundtrip_active = roundtrip_scene["active_scene"]
+        .as_str()
+        .ok_or("round-trip active scene is missing")?;
+    assert_eq!(
+        roundtrip_scene["scenes"][roundtrip_active]["render"]["eevee_use_volumetric_shadows"]
+            .as_bool(),
+        Some(true)
+    );
+
+    let disabled = apply_operations(
+        &project,
+        root.path(),
+        json!([{"op": "render.update", "target": {"id": active.as_str()},
+                "set": {"eevee_use_volumetric_shadows": false}}]),
+    )?;
+    assert_eq!(disabled["ok"], true, "{disabled}");
+    assert_eq!(
+        read_scene(&project)?["scenes"][active.as_str()]["render"]["eevee_use_volumetric_shadows"]
+            .as_bool()
+            .unwrap_or(false),
+        false
+    );
+    let unshadowed = render_project(root.path(), &project, "volume_unshadowed")?;
+
+    let enabled = apply_operations(
+        &project,
+        root.path(),
+        json!([{"op": "render.update", "target": {"id": active.as_str()},
+                "set": {"eevee_use_volumetric_shadows": true}}]),
+    )?;
+    assert_eq!(enabled["ok"], true, "{enabled}");
+    let shadowed = render_project(root.path(), &project, "volume_shadowed")?;
+
+    let eevee_unshadowed = eevee_red(EEVEE_RENDERS[0].1)?;
+    let eevee_shadowed = eevee_red(EEVEE_SHADOWED_RENDER)?;
+    let native_delta: Vec<_> = eevee_unshadowed
+        .iter()
+        .zip(&eevee_shadowed)
+        .map(|(unshadowed, shadowed)| unshadowed - shadowed)
+        .collect();
+    let potter_unshadowed = plane_values(&unshadowed);
+    let potter_shadowed = plane_values(&shadowed);
+    let potter_delta: Vec<_> = potter_unshadowed
+        .iter()
+        .zip(&potter_shadowed)
+        .map(|(unshadowed, shadowed)| unshadowed - shadowed)
+        .collect();
+    let native_shadow_effect = native_delta
+        .iter()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    assert!(
+        native_shadow_effect > 0.0,
+        "the committed EEVEE shadow toggle has no pixel effect"
+    );
+    let response_error = worst_difference(&potter_delta, &native_delta);
+    assert!(
+        response_error <= NATIVE_HALF_TOLERANCE,
+        "Potter's volumetric shadow toggle differs from EEVEE: error {response_error}"
+    );
+    Ok(())
+}
+
+/// A zero-density Volume-only mesh has no Beauty surface and casts no opaque shadow on a lit receiver.
 #[test]
 fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
@@ -186,8 +353,7 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
         .as_array()
         .and_then(|links| {
             links.iter().find(|link| {
-                link["to_node"].as_str() == Some(output_node_id)
-                    && link["to_socket"] == "Surface"
+                link["to_node"].as_str() == Some(output_node_id) && link["to_socket"] == "Surface"
             })
         })
         .ok_or("the transparent Surface link is missing")?;
@@ -208,6 +374,7 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
     let active_scene = scene["active_scene"]
         .as_str()
         .ok_or("active scene is missing")?;
+    let light_id = native_oracle::node_id(&scene, "Light")?;
     let configured = apply_operations(
         &project,
         root.path(),
@@ -217,6 +384,9 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
             {"op": "graph.unlink", "graph": graph_id,
              "from_node": surface_link[0], "from_socket": surface_link[1],
              "to_node": surface_link[2], "to_socket": surface_link[3]},
+            {"op": "node.create", "id": "receiver", "kind": "plane", "params": {"size": 4.0},
+             "transform": {"translation": [0.0, 0.0, -2.0]}},
+            {"op": "light.update", "target": {"id": light_id}, "set": {"shadow": true}},
             {"op": "camera.create", "id": "camera_main",
              "transform": {"translation": [0.0, 0.0, 10.0]},
              "projection": "orthographic", "ortho_scale": ORTHO_SCALE},
@@ -235,9 +405,15 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
     )?;
     assert_eq!(hidden["ok"], true, "{hidden}");
     let no_object = render_project(root.path(), &project, "no_object")?;
-    let difference = worst_difference(&plane_values(&volume_only), &plane_values(&no_object));
+    let no_object_values = plane_values(&no_object);
+    let receiver_max = no_object_values.iter().fold(0.0_f64, |a, b| a.max(*b));
     assert!(
-        difference <= POTTER_LINEAR_TOLERANCE,
+        receiver_max > 1.0e-3,
+        "the point-lit receiver is unexpectedly black without the volume mesh: {receiver_max}"
+    );
+    let difference = worst_difference(&plane_values(&volume_only), &no_object_values);
+    assert!(
+        difference <= POTTER_PIXEL_TOLERANCE,
         "a zero-density Volume-only mesh changes the no-object image: {difference}"
     );
     Ok(())
@@ -309,24 +485,27 @@ fn render_potter(
         .as_str()
         .ok_or("active scene is missing")?
         .to_owned();
+    assert!(
+        !scene_data["scenes"][active.as_str()]["render"]["eevee_use_volumetric_shadows"]
+            .as_bool()
+            .unwrap_or(false),
+        "Blender's default volumetric shadows are enabled unexpectedly"
+    );
     let applied = apply_operations(
         &project,
         root,
         json!([
             {"op": "camera.create", "id": "camera_main", "transform": {"translation": [0.0, 0.0, 10.0]}, "projection": "orthographic", "ortho_scale": ORTHO_SCALE},
-            {"op": "scene.update", "target": {"id": active}, "set": {"camera": "camera_main"}},
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 1, "seed": 0}}
+            {"op": "scene.update", "target": {"id": active.as_str()}, "set": {"camera": "camera_main"}},
+            {"op": "render.update", "target": {"id": active.as_str()},
+             "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 64, "seed": 0}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
     render_project(root, &project, case)
 }
 
-fn render_project(
-    root: &Path,
-    project: &Path,
-    case: &str,
-) -> Result<ImageData, Box<dyn Error>> {
+fn render_project(root: &Path, project: &Path, case: &str) -> Result<ImageData, Box<dyn Error>> {
     let frames = root.join(format!("frames_{case}"));
     let rendered = pot()
         .arg("render")

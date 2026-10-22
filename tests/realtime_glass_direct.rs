@@ -119,7 +119,8 @@ fn realtime_glass_direct_reflection_honors_light_visible_glossy() -> TestResult 
             worst.world,
         );
     }
-    let transmission = render_realtime_scene(&blender, root.path(), &script, "point_below", Some(false))?;
+    let transmission =
+        render_realtime_scene(&blender, root.path(), &script, "point_below", Some(false))?;
     let eevee_pixels = eevee_rgb(EEVEE_POINT_BELOW)?;
     for (name, centre_x) in SPHERES {
         let worst = worst_deviation(&transmission, &eevee_pixels, sphere_centre_px(centre_x))?;

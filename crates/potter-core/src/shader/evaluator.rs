@@ -1157,8 +1157,10 @@ impl LinkIndex {
                 .or_default()
                 .push(socket_index);
         }
-        let (has_surface, has_volume, has_displacement) =
-            output.map_or((false, false, false), |output| scan_output_feeds(group, output));
+        let (has_surface, has_volume, has_displacement) = output
+            .map_or((false, false, false), |output| {
+                scan_output_feeds(group, output)
+            });
         Self {
             graph: Some(graph_id.clone()),
             links_address: group.links.as_ptr().addr(),
@@ -1236,21 +1238,12 @@ impl PreparedMaterial {
     }
 
     /// Whether a link reaches the `Surface`, `Volume`, and `Displacement` sockets of `output` in `group`.
-    fn output_feeds(
-        &self,
-        graph_id: &Id,
-        group: &NodeGroup,
-        output: &Id,
-    ) -> (bool, bool, bool) {
+    fn output_feeds(&self, graph_id: &Id, group: &NodeGroup, output: &Id) -> (bool, bool, bool) {
         match self
             .link_index(graph_id, group)
             .filter(|index| index.output.as_ref() == Some(output))
         {
-            Some(index) => (
-                index.has_surface,
-                index.has_volume,
-                index.has_displacement,
-            ),
+            Some(index) => (index.has_surface, index.has_volume, index.has_displacement),
             None => scan_output_feeds(group, output),
         }
     }

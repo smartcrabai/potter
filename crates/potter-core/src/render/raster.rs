@@ -646,12 +646,14 @@ pub(crate) fn rasterize_with_samples(
     seed: u32,
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
+    volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
         return Err(PotError::invalid_argument(
             "sample count must be greater than zero",
         ));
     }
+    let mut volume_pass = volume_pass;
     if camera.stereo_mode == StereoMode::Anaglyph {
         let left_camera = camera_eye(camera, -1.0);
         let right_camera = camera_eye(camera, 1.0);
@@ -667,6 +669,7 @@ pub(crate) fn rasterize_with_samples(
             seed,
             filter_size,
             shader,
+            volume_pass.as_deref_mut(),
         )?;
         let right_output = rasterize_with_samples(
             triangles,
@@ -680,6 +683,7 @@ pub(crate) fn rasterize_with_samples(
             seed,
             filter_size,
             shader,
+            volume_pass.as_deref_mut(),
         )?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
         let (right_pixels, _) = right_output.rgba.as_chunks::<4>();
@@ -862,6 +866,23 @@ pub(crate) fn rasterize_with_samples(
                         // The composite walks every surface along the ray, nearest first. A transparent pane that only
                         // tints sits in front of an opaque surface and is not the opacity hit, so the opacity hit alone
                         // cannot decide the colour: an opaque front layer ends the walk inside `composite_layers`.
+                        let mut volume_sample = volume_pass
+                            .as_deref_mut()
+                            .map(|volume_pass| {
+                                volume_pass.begin_sample(super::path::RealtimeVolumeSampleInfo {
+                                    camera,
+                                    frame: &frame,
+                                    width,
+                                    height,
+                                    x,
+                                    y,
+                                    sample_x,
+                                    sample_y,
+                                    ray: (sample_ray.origin, sample_ray.direction),
+                                    sample_index,
+                                })
+                            })
+                            .transpose()?;
                         composite_sample(
                             &prepared,
                             &visibility,
@@ -872,6 +893,7 @@ pub(crate) fn rasterize_with_samples(
                             world,
                             shader,
                             sample_hit,
+                            volume_sample.as_mut(),
                         )?
                     } else {
                         sample_background(background_linear, world, None)?
@@ -952,7 +974,9 @@ pub(crate) fn rasterize_with_lines(
     seed: u32,
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
+    volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
+    let mut volume_pass = volume_pass;
     let mut output = rasterize_with_samples(
         triangles,
         camera,
@@ -965,6 +989,7 @@ pub(crate) fn rasterize_with_lines(
         seed,
         filter_size,
         shader,
+        volume_pass.as_deref_mut(),
     )?;
     if lines.is_empty() {
         return Ok(output);
@@ -1121,6 +1146,7 @@ pub(crate) fn rasterize_wireframe(
         // Wire is never a film Beauty render, so no film filter applies.
         0.0,
         None,
+        None,
     )?;
     let mut output = rasterize_with_lines(
         triangles,
@@ -1134,6 +1160,7 @@ pub(crate) fn rasterize_wireframe(
         1,
         0,
         0.0,
+        None,
         None,
     )?;
     let frame = camera_frame(camera, width, height)?;
@@ -2213,6 +2240,7 @@ fn composite_sample(
     world: Option<WorldRadiance<'_>>,
     shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
+    mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
 ) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
@@ -2266,6 +2294,52 @@ fn composite_sample(
         }
         hits[insert_at] = Some(visible_hit);
         hit_count = next_count;
+    }
+    if let Some(volume_sample) = volume_sample.as_deref_mut() {
+        let mut transmittance = DVec3::ONE;
+        let mut alpha_transmittance = 1.0;
+        let mut premultiplied = DVec3::ZERO;
+        let mut start_distance = 0.0;
+        for visible_hit in hits.iter().take(hit_count).flatten() {
+            let (radiance, segment_transmittance) =
+                volume_sample.integrate_segment(start_distance, visible_hit.hit.distance)?;
+            premultiplied += transmittance * radiance;
+            transmittance *= segment_transmittance;
+            alpha_transmittance *= segment_transmittance.element_sum() / 3.0;
+            let triangle = &triangles[visible_hit.triangle_index];
+            let color = visible_hit.color;
+            let opacity = hit_opacity(&triangle.source, color);
+            premultiplied += DVec3::new(color[0], color[1], color[2]) * (transmittance * opacity);
+            let passed = 1.0 - opacity;
+            transmittance *= DVec3::from_array(visible_hit.transparent_tint) * passed;
+            alpha_transmittance *= visible_hit.transparent_tint.iter().sum::<f64>() / 3.0 * passed;
+            start_distance = visible_hit.hit.distance;
+            if transmittance.max_element() <= 1.0e-6 && alpha_transmittance <= 1.0e-6 {
+                break;
+            }
+        }
+        if transmittance.max_element() > 1.0e-6 || alpha_transmittance > 1.0e-6 {
+            let (radiance, segment_transmittance) =
+                volume_sample.integrate_segment(start_distance, volume_sample.far_distance)?;
+            premultiplied += transmittance * radiance;
+            transmittance *= segment_transmittance;
+            alpha_transmittance *= segment_transmittance.element_sum() / 3.0;
+        }
+        let background_alpha = background[3].clamp(0.0, 1.0);
+        let background_rgb = if transmittance == DVec3::ZERO {
+            [0.0; 3]
+        } else {
+            let color = sample_background(background, world, Some(ray.direction))?;
+            [color[0], color[1], color[2]]
+        };
+        premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
+        let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
+        let color = if alpha <= f64::MIN_POSITIVE {
+            premultiplied + DVec3::from_array(background_rgb)
+        } else {
+            premultiplied / alpha
+        };
+        return Ok([color.x, color.y, color.z, alpha]);
     }
     let layers = hits.iter().take(hit_count).flatten().map(|visible_hit| {
         let triangle = &triangles[visible_hit.triangle_index];
@@ -3128,6 +3202,7 @@ mod tests {
             0,
             1.5,
             None,
+            None,
         )?;
         assert!(
             output.ids.contains(&7),
@@ -3165,6 +3240,7 @@ mod tests {
             1,
             0,
             1.5,
+            None,
             None,
         )?;
         let mut drawn = 0_usize;
@@ -3234,6 +3310,7 @@ mod line_tests {
             1,
             0,
             1.5,
+            None,
             None,
         );
         assert!(output.is_ok());
@@ -3365,6 +3442,7 @@ mod smooth_shading_tests {
             0,
             1.5,
             shader,
+            None,
         )
         .expect("triangle rasterizes")
     }
@@ -3807,6 +3885,7 @@ mod visibility_tests {
                     ray,
                     &frame,
                     BACKGROUND,
+                    None,
                     None,
                     None,
                     None,

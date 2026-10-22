@@ -2214,6 +2214,11 @@ def _eevee_light_threshold(scene):
     return float(eevee.light_threshold) if eevee is not None else 0.01
 
 
+def _eevee_use_volumetric_shadows(scene):
+    eevee = getattr(scene, "eevee", None)
+    return bool(getattr(eevee, "use_volumetric_shadows", False)) if eevee is not None else False
+
+
 def _cryptomatte_accurate(scene):
     return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
@@ -2452,6 +2457,7 @@ def dump_scene(scene):
                 "passes": _render_passes(scene),
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
                 "eevee_light_threshold": _eevee_light_threshold(scene),
+                "eevee_use_volumetric_shadows": _eevee_use_volumetric_shadows(scene),
                 "use_simplify": bool(scene.render.use_simplify),
                 "simplify_volumes": float(scene.render.simplify_volumes),
             },
@@ -7259,6 +7265,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.eevee.taa_render_samples = int(render.get("samples", 64))
         if hasattr(scene, "eevee"):
             scene.eevee.light_threshold = float(render.get("eevee_light_threshold", 0.01))
+            scene.eevee.use_volumetric_shadows = bool(render.get("eevee_use_volumetric_shadows", False))
         unit = item.get("unit", {})
         try:
             scene.unit_settings.system = unit.get("system", "metric").upper()

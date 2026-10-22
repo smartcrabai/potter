@@ -2643,41 +2643,6 @@ fn glass_environment(world: &WorldProbe, closures: &GlassClosures) -> DVec3 {
         closures.transmission_roughness,
         probe_radiance,
     );
-    // TEMPORARY DIAGNOSTIC (remove with the glass_world investigation): the rough sphere's centre pixel of the glass world
-    // test, identified by its reflection direction (about (-0.118, 0.073, 0.990) for uv (0.807, 0.505)).
-    if (closures.reflection_roughness - 0.5).abs() < 1.0e-9
-        && (closures.reflection_direction - DVec3::new(-0.1184, 0.0726, 0.9903)).length() < 0.02
-    {
-        eprintln!(
-            "WORLD_DIAG tdir={:?} trough={:.4} tweight={:?} rdir={:?} rrough={:.4} rweight={:?} reflected={:?} transmitted={:?}",
-            closures.transmission_direction,
-            closures.transmission_roughness,
-            closures.transmission,
-            closures.reflection_direction,
-            closures.reflection_roughness,
-            closures.reflection,
-            reflected,
-            transmitted,
-        );
-        for offset in [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-            let spread = closures.transmission_roughness.powi(2) * 0.5;
-            let axis = closures.transmission_direction.normalize_or_zero();
-            let tangent = if axis.z.abs() < 0.999 {
-                axis.cross(DVec3::Z).normalize_or_zero()
-            } else {
-                axis.cross(DVec3::Y).normalize_or_zero()
-            };
-            let bitangent = axis.cross(tangent).normalize_or_zero();
-            let direction =
-                (axis + tangent * (spread * offset.0) + bitangent * (spread * offset.1))
-                    .normalize_or_zero();
-            let colour = world.radiance(direction);
-            eprintln!(
-                "WORLD_DIAG tap offset={offset:?} direction={direction:?} world={colour:?} stored={:?}",
-                probe_radiance(colour)
-            );
-        }
-    }
     reflected * closures.reflection + transmitted * closures.transmission
 }
 
@@ -2898,17 +2863,6 @@ fn area_visible_fraction(
             0.0,
         );
         visible_weight += sample.weight * visibility;
-        // TEMPORARY DIAGNOSTIC (remove with the area_above investigation): the area samples at the glass DIAG pixel.
-        if (point - DVec3::new(-2.0979, -0.0396, 0.9517)).length() < 0.001 {
-            eprintln!(
-                "AREA_DIAG sample_dir={:?} distance={:.4} weight={:.4e} visibility={visibility:.4} shadow_point={shadow_point:?} geometric={geometric:?} has_map={} has_shadow={}",
-                sample.direction,
-                sample.distance,
-                sample.weight,
-                point_shadow.is_some(),
-                shadow.is_some(),
-            );
-        }
     }
     if total_weight <= 0.0 || visible_weight <= 0.0 {
         return 0.0;
@@ -3531,7 +3485,6 @@ impl LightFactors {
         }
     }
 }
-
 
 #[cfg(test)]
 mod shading_normal_tests {

@@ -3023,6 +3023,10 @@ fn build_imported_graph(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             eevee_light_threshold: number_field(&render, "eevee_light_threshold", 0.01),
+            eevee_use_volumetric_shadows: render
+                .get("eevee_use_volumetric_shadows")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             motion_blur: render
                 .get("motion_blur")
                 .and_then(Value::as_bool)
@@ -9292,14 +9296,14 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                             ),
                             Some(
                                 "ShaderNodeBackground"
-                                    | "ShaderNodeOutputWorld"
-                                    | "ShaderNodeEmission"
-                                    | "ShaderNodeTexSky"
-                                    | "ShaderNodeTexEnvironment"
-                                    | "ShaderNodeTexCoord"
-                                    | "ShaderNodeMixRGB"
-                                    | "ShaderNodeMixShader"
-                                    | "ShaderNodeAddShader"
+                                | "ShaderNodeOutputWorld"
+                                | "ShaderNodeEmission"
+                                | "ShaderNodeTexSky"
+                                | "ShaderNodeTexEnvironment"
+                                | "ShaderNodeTexCoord"
+                                | "ShaderNodeMixRGB"
+                                | "ShaderNodeMixShader"
+                                | "ShaderNodeAddShader",
                             ) => false,
                             _ => true,
                         }

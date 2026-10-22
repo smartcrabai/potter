@@ -296,6 +296,8 @@ fn complete_scene_schema(root: &mut Value) {
     }
     let render = &mut defs["render_settings"];
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
+    render["properties"]["eevee_use_volumetric_shadows"] =
+        json!({"type":"boolean","default":false});
     render["required"] = json!([
         "resolution_x",
         "resolution_y",
@@ -2547,6 +2549,7 @@ fn set_schema(operation: &str) -> Value {
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "filter_glossy":{"type":"number","minimum":0,"maximum":10},
             "film_transparent":{"type":"boolean"},
+            "eevee_use_volumetric_shadows":{"type":"boolean","default":false},
             "filter_size":{"type":"number","minimum":0,"maximum":500},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},

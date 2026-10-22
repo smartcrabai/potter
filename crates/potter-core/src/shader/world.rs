@@ -295,9 +295,7 @@ impl WorldEvaluator<'_> {
                     as_color(self.input(id, "B_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
                 let blended = match mode {
                     WorldMixMode::Mix => second,
-                    WorldMixMode::Add => {
-                        std::array::from_fn(|index| first[index] + second[index])
-                    }
+                    WorldMixMode::Add => std::array::from_fn(|index| first[index] + second[index]),
                     WorldMixMode::Multiply => {
                         std::array::from_fn(|index| first[index] * second[index])
                     }

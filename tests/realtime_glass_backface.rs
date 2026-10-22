@@ -64,7 +64,9 @@ fn assert_backface_glass_lit(light: Value, case: &str) -> TestResult {
     let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
     let pixel = sample(&data, [0.5, 0.5], false);
     assert!(
-        pixel[..3].iter().any(|channel| channel.is_finite() && *channel > 1.0e-4),
+        pixel[..3]
+            .iter()
+            .any(|channel| channel.is_finite() && *channel > 1.0e-4),
         "back-side glass did not receive {case}: {pixel:?}"
     );
     Ok(())
