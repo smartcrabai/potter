@@ -4707,12 +4707,39 @@ fn transform_cache_matrix(
             match crate::eval::read_cache_sequence_resource(resource, project_root, sequence_frame)?
             {
                 crate::eval::CacheSequenceRead::Available(bytes, _) => bytes,
-                crate::eval::CacheSequenceRead::Missing { frame, reason } => {
-                    return Err(PotError::with_details(
-                        ErrorCode::DependencyMissing,
-                        "Alembic sequence frame is unavailable for Transform Cache",
-                        json!({"constraint_id":constraint.id,"resource_id":resource_id,"frame":frame,"reason":reason}),
-                    ));
+                crate::eval::CacheSequenceRead::Missing {
+                    frame: missing_frame,
+                    reason,
+                } => {
+                    let previous_frame = resource
+                        .get("sequence_frames")
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flat_map(|frames| frames.keys())
+                        .filter_map(|key| key.parse::<i32>().ok())
+                        .filter(|frame| *frame < missing_frame)
+                        .max();
+                    let Some(previous_frame) = previous_frame else {
+                        return Err(PotError::with_details(
+                            ErrorCode::DependencyMissing,
+                            "Alembic sequence frame is unavailable for Transform Cache",
+                            json!({"constraint_id":constraint.id,"resource_id":resource_id,"frame":missing_frame,"reason":reason}),
+                        ));
+                    };
+                    match crate::eval::read_cache_sequence_resource(
+                        resource,
+                        project_root,
+                        f64::from(previous_frame),
+                    )? {
+                        crate::eval::CacheSequenceRead::Available(bytes, _) => bytes,
+                        crate::eval::CacheSequenceRead::Missing { frame, reason } => {
+                            return Err(PotError::with_details(
+                                ErrorCode::DependencyMissing,
+                                "previous Alembic sequence frame is unavailable for Transform Cache",
+                                json!({"constraint_id":constraint.id,"resource_id":resource_id,"frame":missing_frame,"previous_frame":frame,"reason":reason}),
+                            ));
+                        }
+                    }
                 }
             }
         }

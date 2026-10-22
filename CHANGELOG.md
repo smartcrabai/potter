@@ -259,6 +259,7 @@
 - Modifier apply forwards explicitly marked modifier diagnostics (`modifier_warning`) as warnings alongside successful output.
 - Mesh Sequence Cache takes its CacheFile fields `is_sequence`, `velocity_name` and `velocity_unit` as modifier params, mirrored from the CacheFile on import. A file sequence is addressed by its frame with no frame offset or rate, as Blender's `BKE_cachefile_time_offset` gives it. Breaking: the `scale` param is removed from `mesh_sequence_cache`; Blender applies `CacheFile.scale` only through a Transform Cache constraint.
 - Mesh Cache and Mesh Sequence Cache refuse USD cache files (`cache.usd`); `.blend` import reports each Blender USD CacheFile as a `cache.usd` loss, and `.blend` export reports each USD cache resource the same way, without creating an Alembic CacheFile on the USD path. A `.blend` Alembic sequence imports as a packed sequence, and exporting one writes its frame files beside the CacheFile. Automatic custom-normal corners are stored as the code pair `[0, 0]` (`null` still reads as automatic), as Blender stores them.
+- Transform Cache on an Alembic sequence uses the nearest earlier available frame when the requested frame is missing, matching Blender's cache reader retaining its last valid transform.
 
 ## 0.2.0 - 2026-10-13
 - `pot workflow refine` now requires `-p/--provider <NAME>` and `-m/--model <ID>`, sent to jcode as `<NAME>:<ID>` (examples: `openai`, `openai-api`, `claude-oauth`, `copilot`, `openrouter`) for the modeler and every reviewer; agents no longer fall back to jcode's default model.

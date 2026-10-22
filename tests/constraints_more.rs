@@ -2163,6 +2163,125 @@ with open(output_path, "w", encoding="utf-8") as output:
     Ok(())
 }
 #[test]
+fn blender_transform_cache_sequence_gap_uses_the_last_valid_frame() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        return Err(
+            io::Error::other("Blender is required for the Transform Cache sequence probe").into(),
+        );
+    };
+    let directory = tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    let output_path = root.join("sequence_matrices.json");
+    let script = r#"
+import bpy, json, os, sys
+root = sys.argv[sys.argv.index("--") + 1]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+for frame, x in ((1, 10.0), (2, 20.0), (4, 40.0)):
+    scene.frame_set(frame)
+    mesh = bpy.data.meshes.new("Mesh")
+    mesh.from_pydata([(0,0,0),(1,0,0),(0,1,0)], [], [(0,1,2)])
+    obj = bpy.data.objects.new("Animated", mesh)
+    scene.collection.objects.link(obj)
+    obj.location.x = x
+    obj.select_set(True); bpy.context.view_layer.objects.active = obj
+    bpy.ops.wm.alembic_export(filepath=os.path.join(root, f"seq.{frame:04d}.abc"),
+        start=frame, end=frame, selected=True, flatten=False, uvs=False, normals=False,
+        as_background_job=False)
+    bpy.data.objects.remove(obj, do_unlink=True); bpy.data.meshes.remove(mesh)
+first_path = os.path.join(root, "seq.0001.abc")
+bpy.ops.wm.alembic_import(filepath=first_path, set_frame_range=False,
+    always_add_cache_reader=True, as_background_job=False)
+cache = bpy.data.cache_files[-1]
+object_path = cache.object_paths[0].path
+cache.filepath = first_path; cache.is_sequence = True
+for obj in list(bpy.data.objects):
+    if obj.type == "MESH": bpy.data.objects.remove(obj, do_unlink=True)
+owner = bpy.data.objects.new("Owner", None); scene.collection.objects.link(owner)
+owner.location = (3.0, 5.0, 7.0); owner.rotation_euler = (0.2, -0.3, 0.4); owner.scale = (1.5, 2.0, 0.75)
+constraint = owner.constraints.new("TRANSFORM_CACHE")
+constraint.cache_file = cache; constraint.object_path = object_path
+assert constraint.is_valid
+result = {}
+for frame in (1, 2, 3):
+    scene.frame_set(frame); bpy.context.view_layer.update()
+    matrix = owner.evaluated_get(bpy.context.evaluated_depsgraph_get()).matrix_world
+    result[str(frame)] = [float(matrix[r][c]) for c in range(4) for r in range(4)]
+assert result["1"] != result["2"], "Xform sequence frames must differ"
+assert result["3"] == result["2"], "Blender holds its last Transform Cache matrix on a missing frame"
+with open(os.path.join(root, "sequence_matrices.json"), "w", encoding="utf-8") as f:
+    json.dump(result, f)
+"#;
+    let script_path = root.join("make_transform_sequence.py");
+    fs::write(&script_path, script)?;
+    let blender_output = Command::new(&blender)
+        .args(["--background", "--factory-startup", "--python"])
+        .arg(&script_path)
+        .args(["--", root.to_str().ok_or("probe path is not UTF-8")?])
+        .output()?;
+    assert!(
+        blender_output.status.success(),
+        "Blender sequence probe failed: {}",
+        String::from_utf8_lossy(&blender_output.stderr)
+    );
+    let pattern = root.join("seq.####.abc");
+    let (_directory, project_path) = project(&json!([
+        {"op":"node.create","id":"owner","kind":"empty","transform":{"translation":[3.0,5.0,7.0],"rotation_deg":[11.459_156,-17.188_734,22.918_312],"scale":[1.5,2.0,0.75]}},
+        {"op":"resource.pack","id":"cache","uri":pattern,"kind":"alembic","sequence":{"start":1,"end":2}},
+        {"op":"constraint.create","target":{"id":"owner"},"id":"cache","type":"transform_cache","params":{"resource":"cache","object_path":"/Animated/Mesh","frame_offset":0.0,"scale":1.0,"override_frame":null}}
+    ]))?;
+    let frame4 = fs::read(root.join("seq.0004.abc"))?;
+    let digest = potter_core::hash::sha256(&frame4);
+    let mut document: Value = serde_json::from_slice(&fs::read(project_path.join("scene.json"))?)?;
+    document["resources"]["cache"]["sequence_end"] = json!(4);
+    document["resources"]["cache"]["sequence_frames"]["4"] = json!({
+        "uri":root.join("seq.0004.abc"),"kind":"alembic","hash":digest,"packed":true,
+        "bytes":serde_json::to_value(frame4)?
+    });
+    fs::write(
+        project_path.join("scene.json"),
+        serde_json::to_vec_pretty(&document)?,
+    )?;
+    let document: SceneDoc = serde_json::from_slice(&fs::read(project_path.join("scene.json"))?)?;
+    let oracle: Value = serde_json::from_slice(&fs::read(output_path)?)?;
+    for frame in [1.0, 2.0] {
+        let snapshot = Snapshot::evaluate_with_cache(
+            &document,
+            &EvaluationContext {
+                frame: Some(frame),
+                ..EvaluationContext::default()
+            },
+            Some(&project_path),
+            Some(&project_path.join(".potter/cache")),
+        )?;
+        let actual = snapshot.nodes[&Id::new("owner")?].world_matrix;
+        assert!(
+            max_matrix_error(
+                DMat4::from_cols_array(&actual),
+                blender_matrix(&oracle[frame.to_string()])?
+            ) < 1.0e-5
+        );
+    }
+    let missing = Snapshot::evaluate_with_cache(
+        &document,
+        &EvaluationContext {
+            frame: Some(3.0),
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+    )?;
+    let actual = missing.nodes[&Id::new("owner")?].world_matrix;
+    assert!(
+        max_matrix_error(
+            DMat4::from_cols_array(&actual),
+            blender_matrix(&oracle["3"])?
+        ) < 1.0e-5,
+        "a missing frame in a sequence must retain Blender's last valid Transform Cache matrix"
+    );
+    Ok(())
+}
+#[test]
 fn transform_cache_usd_reports_its_unsupported_feature_id() -> TestResult {
     let source_directory = tempdir()?;
     let archive = source_directory.path().join("cache.usd");
