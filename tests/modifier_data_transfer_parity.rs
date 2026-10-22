@@ -1321,11 +1321,12 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "Color1",
         "point",
         "FLOAT_COLOR",
+        // Blender's colour RNA clamps blue to [0, 1] when the source is written (PROP_COLOR hardmin 0).
         vec![
-            [0.5, 0.75, -0.1, 1.0],
-            [0.6, 0.75, -0.1, 1.0],
-            [0.7, 0.75, -0.1, 1.0],
-            [0.8, 0.75, -0.1, 1.0],
+            [0.5, 0.75, 0.0, 1.0],
+            [0.6, 0.75, 0.0, 1.0],
+            [0.7, 0.75, 0.0, 1.0],
+            [0.8, 0.75, 0.0, 1.0],
         ],
     )?;
     set_color_layer(
@@ -1346,10 +1347,10 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         "corner",
         "FLOAT_COLOR",
         vec![
-            [0.55, 0.8, -0.15, 1.0],
-            [0.65, 0.8, -0.15, 1.0],
-            [0.75, 0.8, -0.15, 1.0],
-            [0.85, 0.8, -0.15, 1.0],
+            [0.55, 0.8, 0.0, 1.0],
+            [0.65, 0.8, 0.0, 1.0],
+            [0.75, 0.8, 0.0, 1.0],
+            [0.85, 0.8, 0.0, 1.0],
         ],
     )?;
     let source_operand = operand(source.clone(), DMat4::IDENTITY, &[], None);
