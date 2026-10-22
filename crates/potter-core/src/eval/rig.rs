@@ -4701,7 +4701,23 @@ fn transform_cache_matrix(
             "Transform Cache sample time is not finite",
         ));
     }
-    let (bytes, _) = crate::eval::read_cache_resource(doc, project_root, &resource_id)?;
+    let bytes = match doc.resources.get(&resource_id) {
+        Some(resource) if resource.get("sequence_frames").is_some() => {
+            let sequence_frame = override_frame.unwrap_or(frame);
+            match crate::eval::read_cache_sequence_resource(resource, project_root, sequence_frame)?
+            {
+                crate::eval::CacheSequenceRead::Available(bytes, _) => bytes,
+                crate::eval::CacheSequenceRead::Missing { frame, reason } => {
+                    return Err(PotError::with_details(
+                        ErrorCode::DependencyMissing,
+                        "Alembic sequence frame is unavailable for Transform Cache",
+                        json!({"constraint_id":constraint.id,"resource_id":resource_id,"frame":frame,"reason":reason}),
+                    ));
+                }
+            }
+        }
+        _ => crate::eval::read_cache_resource(doc, project_root, &resource_id)?.0,
+    };
     let matrix = DMat4::from_cols_array(&crate::exchange::alembic::read_xform_matrix(
         &bytes,
         object_path,

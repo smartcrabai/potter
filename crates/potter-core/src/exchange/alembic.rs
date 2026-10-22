@@ -2800,29 +2800,6 @@ fn cache_has_multiple_topology_samples(counts: &ParsedProperty, indices: &Parsed
         .any(|property| property.sample_count > 1)
 }
 
-/// The UV layer names of a `PolyMesh` cache's first sample, in file order, and the layer that a read
-/// without polygons leaves unwritten (the active `uv` parameter). A diagnostic for oracle tests.
-///
-/// # Errors
-///
-/// Returns the import errors of [`read_mesh_cache`].
-pub fn mesh_cache_uv_layers(
-    bytes: &[u8],
-    object_path: &str,
-) -> Result<(Vec<String>, Option<String>)> {
-    let samples = read_mesh_cache(bytes, object_path, true, false, false, "")?;
-    let first = samples
-        .first()
-        .ok_or_else(|| import_error("Alembic PolyMesh has no samples"))?;
-    let names = first
-        .uv_layers
-        .iter()
-        .flatten()
-        .map(|layer| layer.name.clone())
-        .collect();
-    Ok((names, first.uv_primary.clone()))
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "decoding one cache sample set needs coordinated topology, geom-parameter, and time-sampling validation"
@@ -3059,15 +3036,30 @@ pub(crate) fn read_mesh_cache(
                     extent,
                     sample_slot(values, sample_index),
                 )?;
+                // Blender reads facevarying normals only when they count one per corner, and vertex or varying normals
+                // only when they count one per point (`process_normals` and `process_loop_normals`,
+                // `abc_reader_mesh.cc`). Uniform and constant normals, empty rows and mismatched counts are ignored.
+                let corner_total: usize = file_faces.iter().map(Vec::len).sum();
+                let fits = match &*scope {
+                    "facevarying" => tuples.len() == corner_total,
+                    "vertex" | "varying" => tuples.len() == points.len(),
+                    _ => false,
+                };
+                if !fits || tuples.is_empty() {
+                    return Ok(None);
+                }
                 let corners = normal_corners(&file_faces, &scope, &tuples)?;
                 reverse_corner_runs(&file_faces, corners).map(|corners| {
-                    corners
-                        .into_iter()
-                        .map(|normal| potter_vector(normal.to_array()))
-                        .collect::<Vec<[f64; 3]>>()
+                    Some(
+                        corners
+                            .into_iter()
+                            .map(|normal| potter_vector(normal.to_array()))
+                            .collect::<Vec<[f64; 3]>>(),
+                    )
                 })
             })
-            .transpose()?;
+            .transpose()?
+            .flatten();
         let sample_time = sample_seconds(
             time_property,
             sample_slot(time_property, sample_index),

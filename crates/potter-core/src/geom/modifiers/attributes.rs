@@ -461,16 +461,6 @@ fn integrate_cache_samples(
     samples: &mut [DVec3],
     modifier: &Modifier,
 ) -> Result<()> {
-    if source_mesh.vertices.len() != current.len() || samples.len() != current.len() {
-        return Err(invalid(
-            modifier,
-            "deform_mode",
-            "matching source, current, and cache vertex counts",
-        ));
-    }
-    if source_mesh.faces.is_empty() {
-        return Err(invalid(modifier, "deform_mode", "a source mesh with faces"));
-    }
     let vertex_indices = source_mesh
         .vertices
         .iter()

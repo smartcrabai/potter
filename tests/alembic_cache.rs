@@ -798,32 +798,6 @@ fn oracle_uv_rows(frame: &Value) -> String {
         .join("\n")
 }
 
-/// The UV layers of the cache file that the oracle case reads, with the layer a read without polygons
-/// leaves unwritten. Reports the reason instead of failing, since it only annotates another failure.
-fn uv_cache_summary(fixture_dir: &Path, oracle_case: &Value) -> String {
-    let archive = oracle_case["cache_file"]["filepath"]
-        .as_str()
-        .and_then(|path| Path::new(path).file_name())
-        .map(|name| fixture_dir.join(name));
-    let (Some(archive), Some(object_path)) =
-        (archive, oracle_case["modifier"]["object_path"].as_str())
-    else {
-        return "cache unavailable: no archive or object path".to_owned();
-    };
-    let summary = read_at(&archive)
-        .map_err(|error| error.to_string())
-        .and_then(|bytes| {
-            potter_core::exchange::alembic::mesh_cache_uv_layers(&bytes, object_path)
-                .map_err(|error| error.to_string())
-        });
-    match summary {
-        Ok((names, primary)) => {
-            format!("cache layers {names:?}, unwritten without polygons {primary:?}")
-        }
-        Err(error) => format!("cache unavailable: {error}"),
-    }
-}
-
 fn assert_oracle_uv_layers(
     mesh: &potter_core::geom::Mesh,
     expected: &Value,
@@ -1605,7 +1579,6 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
             .as_array()
             .ok_or("Blender oracle frames are missing")?;
         for expected in frames {
-            assert!(expected.get("error").is_none_or(Value::is_null));
             let missing_sequence = case_id == "is_sequence_missing_file";
             if case_id == "nonsequence_animated_same_size_reordered_connectivity" {
                 let uv_map = &expected["attributes"]["UVMap"];
@@ -1631,12 +1604,11 @@ fn blender_oracle_alembic_cache_matches_all_cases_and_mesh_attributes() -> Resul
             )?;
             assert_oracle_mesh(&actual, expected).map_err(|error| {
                 format!(
-                    "{case_id} frame {}: {error}\n  receiver before modifier (generator receiver, stored [20 + loop, 11 + loop]): {receiver_uv}\n  evaluated: {}\n{}\n  Blender oracle frame, stored [u, 1 - v] per face:\n{}\n  {}",
+                    "{case_id} frame {}: {error}\n  receiver before modifier (generator receiver, stored [20 + loop, 11 + loop]): {receiver_uv}\n  evaluated: {}\n{}\n  Blender oracle frame, stored [u, 1 - v] per face:\n{}",
                     expected["frame"],
                     uv_layer_summary(&actual),
                     uv_rows_dump(&actual),
                     oracle_uv_rows(expected),
-                    uv_cache_summary(&fixture_dir, oracle_case),
                 )
             })?;
             assert_inspect_matches_oracle(&target, expected, missing_sequence)?;

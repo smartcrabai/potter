@@ -205,12 +205,9 @@ struct CacheSequencePattern<'a> {
 
 impl CacheSequencePattern<'_> {
     fn filename(&self, frame: i32) -> String {
+        // Blender's `BLI_path_frame` prints `%.*d`: the width counts digits, and a negative frame's sign comes in addition.
         let number = if frame < 0 {
-            format!(
-                "-{:0width$}",
-                frame.unsigned_abs(),
-                width = self.width.saturating_sub(1)
-            )
+            format!("-{:0width$}", frame.unsigned_abs(), width = self.width)
         } else {
             format!("{frame:0width$}", width = self.width)
         };
@@ -232,10 +229,14 @@ impl CacheSequencePattern<'_> {
             return None;
         }
         let digits = &filename[self.prefix.len()..digits_end];
-        if digits.len() != self.width {
+        let (sign, unsigned) = match digits.strip_prefix('-') {
+            Some(rest) => (-1_i64, rest),
+            None => (1_i64, digits),
+        };
+        if unsigned.len() < self.width || !unsigned.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        digits.parse().ok()
+        i32::try_from(sign * unsigned.parse::<i64>().ok()?).ok()
     }
 }
 

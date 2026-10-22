@@ -18,6 +18,8 @@ const ORACLE_SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/mesh_cache/blender_mesh_cache_oracle.py"
 );
+// Positions are stored as f32, so each coordinate carries one f32 rounding (ulp 9.5e-7 at magnitude 8, 1.2e-7 at
+// magnitude 1). 1e-5 allows about ten such roundings in the reader and the Blender write.
 const TOLERANCE: f64 = 1.0e-5;
 const FRAME_COUNT: usize = 6;
 const MDD_TIMES: [f32; FRAME_COUNT] = [0.0, 0.1, 0.35, 0.4, 0.9, 1.5];
@@ -569,32 +571,32 @@ fn blender_mesh_cache_pc2_and_mdd_match_native_pot() -> TestResult {
         let blender_frames = expected[id]
             .as_array()
             .ok_or_else(|| format!("Blender frames missing for {id}"))?;
-        for (frame, expected_points) in spec["frames"]
-            .as_array()
-            .ok_or("frames")?
-            .iter()
-            .zip(blender_frames)
-        {
+        let frames = spec["frames"].as_array().ok_or("frames")?;
+        assert_eq!(frames.len(), blender_frames.len(), "{id} frame count");
+        for (frame, expected_points) in frames.iter().zip(blender_frames) {
             let frame = frame.as_f64().ok_or("frame")?;
             let actual = inspect_positions(&scene, id, frame)?;
             let expected_points = expected_points.as_array().ok_or("expected positions")?;
             assert_eq!(actual.len(), expected_points.len(), "{id} at {frame}");
-            let mut max_error = 0.0_f64;
             for (actual, expected) in actual.iter().zip(expected_points) {
-                for (actual, expected) in actual.iter().zip(
-                    expected
-                        .as_array()
-                        .ok_or("expected vector")?
-                        .iter()
-                        .map(|value| value.as_f64().unwrap_or(f64::NAN)),
-                ) {
-                    max_error = max_error.max((actual - expected).abs());
+                let expected = expected.as_array().ok_or("expected vector")?;
+                assert_eq!(
+                    expected.len(),
+                    3,
+                    "{id} at {frame}: expected a three-component vector"
+                );
+                for (component, expected) in actual.iter().zip(expected) {
+                    let expected = expected.as_f64().ok_or_else(|| {
+                        format!("{id} at {frame}: Blender component is not numeric")
+                    })?;
+                    // A NaN error fails this comparison too, so a non-numeric value cannot pass.
+                    let error = (component - expected).abs();
+                    assert!(
+                        error <= TOLERANCE,
+                        "{id} at frame {frame}: error {error} exceeds {TOLERANCE}"
+                    );
                 }
             }
-            assert!(
-                max_error <= TOLERANCE,
-                "{id} at frame {frame}: max error {max_error} exceeds {TOLERANCE}"
-            );
             checked += 1;
         }
     }

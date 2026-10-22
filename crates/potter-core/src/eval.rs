@@ -3102,12 +3102,12 @@ fn apply_mesh_sequence_cache_modifier(
     )
 }
 
-enum CacheSequenceRead {
+pub(crate) enum CacheSequenceRead {
     Available(Vec<u8>, String),
     Missing { frame: i32, reason: &'static str },
 }
 
-fn read_cache_sequence_resource(
+pub(crate) fn read_cache_sequence_resource(
     resource: &Value,
     project_root: Option<&Path>,
     requested_frame: f64,
@@ -3213,16 +3213,15 @@ fn read_cache_sequence_resource(
         }
     }
     let Some(frame_record) = frame_records.get(&frame.to_string()) else {
-        if packed_sequence {
-            return Err(PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "packed Alembic sequence is missing a selected frame record",
-                json!({"frame":frame}),
-            ));
-        }
+        // A frame inside the packed range with no record is a gap in the source: Blender cannot open that frame, and
+        // the scene still evaluates without it.
         return Ok(CacheSequenceRead::Missing {
             frame,
-            reason: "frame is outside the registered source sequence",
+            reason: if packed_sequence {
+                "frame is missing from the packed source sequence"
+            } else {
+                "frame is outside the registered source sequence"
+            },
         });
     };
     let frame_kind = frame_record

@@ -342,7 +342,7 @@ fn unpack_sequence(
             )
         })?
         .to_owned();
-    if kind != "alembic" || record.get("hash").is_some() || record.get("bytes").is_some() {
+    if !matches!(kind.as_str(), "alembic" | "alembic_cache") || record.get("bytes").is_some() {
         return Err(engine.error(
             ErrorCode::SceneInvalid,
             "packed Alembic sequence must use the standard container record",
@@ -389,20 +389,6 @@ fn unpack_sequence(
                 &operation_pointer(engine.operation_index, "id/sequence_frames"),
             )
         })?;
-    let expected_frames = usize::try_from(frame_count).map_err(|_| {
-        engine.error(
-            ErrorCode::SceneInvalid,
-            "packed Alembic sequence frame range cannot be represented",
-            &operation_pointer(engine.operation_index, "id/sequence_frames"),
-        )
-    })?;
-    if frames.len() != expected_frames {
-        return Err(engine.error(
-            ErrorCode::SceneInvalid,
-            "packed Alembic sequence does not contain every frame in its inclusive range",
-            &operation_pointer(engine.operation_index, "id/sequence_frames"),
-        ));
-    }
     for key in frames.keys() {
         let frame = key.parse::<i32>().ok();
         if frame
@@ -419,15 +405,20 @@ fn unpack_sequence(
     let pattern = resolve_path(raw_path);
     let mut output_paths = BTreeSet::new();
     let mut sequence_outputs = Vec::with_capacity(frames.len());
-    for frame in start..=end {
-        let frame_key = frame.to_string();
-        let frame_record = frames.get(&frame_key).ok_or_else(|| {
-            engine.error(
-                ErrorCode::SceneInvalid,
-                "packed Alembic sequence is missing an in-range frame record",
-                &operation_pointer(engine.operation_index, "id/sequence_frames"),
-            )
-        })?;
+    // Frames the sequence does not hold are gaps: they are not written, and evaluation reports them as missing.
+    let mut present = frames
+        .iter()
+        .filter_map(|(key, record)| Some((key.parse::<i32>().ok()?, key, record)))
+        .collect::<Vec<_>>();
+    present.sort_by_key(|(frame, _, _)| *frame);
+    if present.is_empty() {
+        return Err(engine.error(
+            ErrorCode::SceneInvalid,
+            "packed Alembic sequence holds no frames",
+            &operation_pointer(engine.operation_index, "id/sequence_frames"),
+        ));
+    }
+    for (frame, frame_key, frame_record) in present {
         let frame_kind = frame_record.get("kind").and_then(Value::as_str);
         if frame_kind != Some(kind.as_str())
             || frame_record.get("packed").and_then(Value::as_bool) != Some(true)
@@ -468,7 +459,7 @@ fn unpack_sequence(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(PotError::io(&error)),
         }
-        sequence_outputs.push((frame, frame_key, frame_record, frame_path));
+        sequence_outputs.push((frame, frame_key.clone(), frame_record, frame_path));
     }
 
     let mut output_files = Vec::with_capacity(sequence_outputs.len());
