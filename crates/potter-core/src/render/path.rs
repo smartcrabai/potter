@@ -2735,6 +2735,8 @@ fn overlay_rasterized_lines(
         [0, 0, 0, 0],
         1,
         seed,
+        // One sample per pixel: EEVEE's film filter is off, so the overlay is drawn unfiltered.
+        0.0,
         None,
     )?;
     for index in 0..output.ids.len() {
