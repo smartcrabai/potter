@@ -9097,8 +9097,9 @@ mod tests {
                 .unwrap_or_default(),
             ..Constraint::default()
         };
-        let error = transform_cache_matrix(&doc, &constraint, None, 1.0, 24, 1.0)
-            .expect_err("a usd_cache resource must be refused");
+        let Err(error) = transform_cache_matrix(&doc, &constraint, None, 1.0, 24, 1.0) else {
+            panic!("a usd_cache resource must be refused");
+        };
         assert_eq!(error.code, ErrorCode::UnsupportedFeature);
         assert_eq!(error.details["feature_id"], "cache.usd");
         Ok(())

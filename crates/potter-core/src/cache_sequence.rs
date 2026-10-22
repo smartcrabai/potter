@@ -42,7 +42,9 @@ mod tests {
     #[test]
     fn usd_cache_bytes_are_refused_with_an_unsupported_feature() {
         for bytes in [&b"PXR-USDC\x00\x00"[..], b"#usda 1.0\n", b"PK\x03\x04zip"] {
-            let error = reject_usd_cache(bytes, "cache").expect_err("USD must be refused");
+            let Err(error) = reject_usd_cache(bytes, "cache") else {
+                panic!("USD bytes must be refused");
+            };
             assert_eq!(error.code, ErrorCode::UnsupportedFeature);
         }
         assert!(reject_usd_cache(b"Ogawa\xff\x00\x01\x00", "cache").is_ok());

@@ -1297,7 +1297,7 @@ fn assert_blender_corner_normals(
         .to_str()
         .ok_or("Blender normal output path is not UTF-8")?;
     let script = format!(
-        r#"import bpy, json
+        r#"import bpy, json, math, os
 samples = {frames}
 output_path = {output_path}
 obj = bpy.data.objects.get("OracleReceiver")
@@ -1307,7 +1307,8 @@ result = {{}}
 scene = bpy.context.scene
 for sample in samples:
     frame = float(sample["frame"])
-    scene.frame_set(frame)
+    whole = math.floor(frame)
+    scene.frame_set(int(whole), subframe=frame - whole)
     evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
     mesh = evaluated.to_mesh()
     try:
@@ -1334,6 +1335,15 @@ with open(output_path, "w", encoding="utf-8") as handle:
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if !output_path.is_file() {
+        return Err(format!(
+            "Blender exited successfully but wrote no corner normals to {}\nstdout:\n{}\nstderr:\n{}",
+            output_path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
     let actual: Value = serde_json::from_slice(&read_at(output_path)?)?;
     let expected_frames = oracle_case["frames"]
         .as_array()

@@ -1265,6 +1265,7 @@ impl Snapshot {
                                     "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
                                         mesh,
                                         modifier,
+                                        id,
                                         doc,
                                         modifier_context.project_root,
                                         frame,
@@ -1586,6 +1587,7 @@ impl Snapshot {
                                     "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
                                         mesh,
                                         modifier,
+                                        id,
                                         doc,
                                         modifier_context.project_root,
                                         frame,
@@ -2987,6 +2989,7 @@ fn apply_mesh_cache_modifier(
 fn apply_mesh_sequence_cache_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
+    subject_id: &Id,
     doc: &SceneDoc,
     project_root: Option<&Path>,
     frame: f64,
@@ -3057,7 +3060,7 @@ fn apply_mesh_sequence_cache_modifier(
                 return Ok(vec![PotError::with_details(
                     ErrorCode::DependencyMissing,
                     "Alembic sequence frame is unavailable; Mesh Sequence Cache was skipped",
-                    json!({"modifier_id":modifier.id,"resource_id":resource_id,"frame":frame,"reason":reason}),
+                    json!({"modifier_id":modifier.id,"node_id":subject_id,"resource_id":resource_id,"frame":frame,"reason":reason}),
                 )]);
             }
         }

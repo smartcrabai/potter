@@ -1648,7 +1648,7 @@ fn packed_resource_bytes(packed: &[Value]) -> Result<Vec<u8>> {
 }
 
 /// Writes a sequence resource's frame files into a folder named for the resource inside the sidecar. The frames keep
-/// their file names, so Blender's CacheFile finds the rest of the sequence beside its first frame. Returns that first
+/// their file names, so Blender's `CacheFile` finds the rest of the sequence beside its first frame. Returns that first
 /// frame's path, which becomes the resource's export path.
 fn export_sequence_frame_files(
     project: &Project,
@@ -6286,6 +6286,42 @@ fn import_blender_resources(
             "source_packed": source_packed,
             "status": status,
         });
+        // A sequence CacheFile names its first frame, and its other frames sit beside it. The sequence is imported as a
+        // packed sequence, as `resource.pack` stores one: every frame's bytes and the inclusive frame range.
+        if kind == "alembic_cache"
+            && source
+                .get("cache_file")
+                .and_then(|cache_file| cache_file.get("is_sequence"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && let Some(path) = &resolved_path
+        {
+            let manifest = crate::cache_sequence::cache_sequence_manifest(path, None)?;
+            if let (Some(start), Some(end)) = (
+                manifest.files.keys().next(),
+                manifest.files.keys().next_back(),
+            ) {
+                let mut frames = Map::new();
+                for (frame, frame_path) in &manifest.files {
+                    let frame_bytes = fs::read(frame_path)
+                        .map_err(|error| PotError::io_at(&error, frame_path))?;
+                    let digest = crate::hash::sha256(&frame_bytes);
+                    frames.insert(
+                        frame.to_string(),
+                        crate::cache_sequence::cache_sequence_resource_record(
+                            &frame_path.to_string_lossy(),
+                            kind,
+                            &digest,
+                            Some(frame_bytes.as_slice()),
+                        ),
+                    );
+                }
+                resource["packed"] = json!(true);
+                resource["sequence_start"] = json!(start);
+                resource["sequence_end"] = json!(end);
+                resource["sequence_frames"] = Value::Object(frames);
+            }
+        }
         if let Some(cache_file) = source.get("cache_file") {
             resource["cache_file"] = cache_file.clone();
         }

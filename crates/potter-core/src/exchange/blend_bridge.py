@@ -5718,9 +5718,10 @@ def _cache_file_for_resource(doc, reference, target, params=None):
     if resource:
         if identity is not None:
             cache_file.name = identity
-        # `type` is derived from the file extension on export and is not an RNA property to write.
+        # `type` is derived from the file extension on export, and `filepath` is the resource's own path (export_path,
+        # set above), so neither is written from the record's settings.
         settings = {key: value for key, value in resource.get("cache_file", {}).items()
-                    if key != "type"}
+                    if key not in ("type", "filepath")}
         set_rna(cache_file, settings, {}, strict=True, owner="Alembic CacheFile")
     for key in SEQUENCE_CACHE_FILE_KEYS:
         if key in params:
