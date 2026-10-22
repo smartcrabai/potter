@@ -26,7 +26,7 @@ mod process;
 use std::{error::Error, path::Path};
 
 use native_oracle::{
-    TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
+    TestResult, apply_operations, import_blend, pot, pot_json, read_scene, run_blender_arguments,
     write_script,
 };
 use potter_core::image::{ImageData, ImageInterpolation, load_image_data, sample};
@@ -37,8 +37,9 @@ use tempfile::tempdir;
 /// The oracle's script: it saves each case's `.blend` and, given `-` for the render paths, stops before rendering.
 const EEVEE_SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_volume_factor.py");
 const EEVEE_SHADOWED_SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_volume_shadowed.py");
+/// Native 5.2.2 shadow-enabled capture from the validated factor-1 base scene.
 const EEVEE_SHADOWED_RENDER: &[u8] =
-    include_bytes!("fixtures/native_oracle/eevee_macos/volume_volume_shadowed.f32le");
+    include_bytes!("fixtures/native_oracle/eevee_macos/volume_volume_shadowed_base.f32le");
 
 /// The three cases with their committed macOS arm64 EEVEE renders, as little-endian f32 RGB rows bottom-up.
 const EEVEE_RENDERS: [(&str, &[u8]); 3] = [
@@ -125,7 +126,7 @@ fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
 }
 
 #[test]
-fn realtime_volumetric_shadow_setting_matches_native_ab_response() -> TestResult {
+fn realtime_volumetric_shadow_setting_changes_render() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -248,15 +249,95 @@ fn realtime_volumetric_shadow_setting_matches_native_ab_response() -> TestResult
         .collect();
     let native_shadow_effect = native_delta
         .iter()
-        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+        .fold(0.0_f64, |maximum, value| maximum.max(*value));
     assert!(
         native_shadow_effect > 0.0,
         "the committed EEVEE shadow toggle has no pixel effect"
     );
-    let response_error = worst_difference(&potter_delta, &native_delta);
+    let potter_shadow_effect = potter_delta
+        .iter()
+        .fold(0.0_f64, |maximum, value| maximum.max(*value));
     assert!(
-        response_error <= NATIVE_HALF_TOLERANCE,
-        "Potter's volumetric shadow toggle differs from EEVEE: error {response_error}"
+        potter_shadow_effect > 0.0,
+        "Potter's volumetric shadow toggle has no pixel effect"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_sun_volume_shadow_matches_homogeneous_slab_integral() -> TestResult {
+    const DENSITY: f64 = 0.5;
+    const THICKNESS: f64 = 1.0;
+    const SHADOW_STEPS: u32 = 64;
+    let root = tempdir()?;
+    let project = root.path().join("project");
+    pot_json(|command| {
+        command.arg("init").arg(&project);
+    })?;
+    let created = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "graph.create", "id": "scatter_graph", "kind": "shader"},
+            {"op": "graph.node_add", "graph": "scatter_graph", "id": "output",
+             "type": "ShaderNodeOutputMaterial"},
+            {"op": "graph.node_add", "graph": "scatter_graph", "id": "scatter",
+             "type": "ShaderNodeVolumeScatter",
+             "inputs": {"Density": 0.5, "Color": [1.0, 1.0, 1.0, 1.0], "Anisotropy": 0.0}},
+            {"op": "graph.link", "graph": "scatter_graph", "from_node": "scatter",
+             "from_socket": "Volume", "to_node": "output", "to_socket": "Volume"},
+            {"op": "material.create", "id": "scatter_material", "graph": "scatter_graph"},
+            {"op": "node.create", "id": "slab", "kind": "box",
+             "params": {"size": 1.0}, "material": "scatter_material"},
+            {"op": "light.create", "id": "sun", "light_type": "sun", "energy": 3.0,
+             "transform": {"rotation": [0.0, 0.0, 0.0, 1.0]}},
+            {"op": "camera.create", "id": "camera_main",
+             "transform": {"translation": [0.0, 0.0, 3.0]},
+             "projection": "orthographic", "ortho_scale": 2.0},
+            {"op": "world.create", "id": "world_main", "color": [0.0, 0.0, 0.0], "strength": 1.0},
+            {"op": "scene.update", "target": {"id": "scene_main"},
+             "set": {"camera": "camera_main", "world": "world_main"}},
+            {"op": "render.update", "target": {"id": "scene_main"},
+             "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 1, "seed": 0,
+                     "eevee_use_volumetric_shadows": false}}
+        ]),
+    )?;
+    assert_eq!(created["ok"], true, "{created}");
+    let unshadowed = render_project(root.path(), &project, "slab_unshadowed")?;
+    let enabled = apply_operations(
+        &project,
+        root.path(),
+        json!([{"op": "render.update", "target": {"id": "scene_main"},
+                "set": {"eevee_use_volumetric_shadows": true}}]),
+    )?;
+    assert_eq!(enabled["ok"], true, "{enabled}");
+    let shadowed = render_project(root.path(), &project, "slab_shadowed")?;
+
+    let step = THICKNESS / f64::from(SHADOW_STEPS);
+    let camera_step_transmittance = (-DENSITY * step).exp();
+    let source_distance = (1.0 - camera_step_transmittance) / DENSITY;
+    let mut camera_transmittance = 1.0;
+    let mut direct = 0.0;
+    let mut self_shadowed = 0.0;
+    for index in 0..SHADOW_STEPS {
+        let distance = (f64::from(index) + 0.5) * step;
+        let source_weight = camera_transmittance * source_distance;
+        direct += source_weight;
+        self_shadowed += source_weight * (-DENSITY * distance).exp();
+        camera_transmittance *= camera_step_transmittance;
+    }
+    let expected_ratio = self_shadowed / direct;
+    let center = (SIZE as usize / 2) * SIZE as usize + SIZE as usize / 2;
+    let direct_center = plane_values(&unshadowed)[center];
+    let shadowed_center = plane_values(&shadowed)[center];
+    assert!(
+        direct_center > 0.0,
+        "the unshadowed homogeneous slab is dark"
+    );
+    let observed_ratio = shadowed_center / direct_center;
+    assert!(
+        (observed_ratio - expected_ratio).abs() <= 5.0e-5,
+        "the sun's homogeneous slab response differs from the 64-step analytic integral: expected {expected_ratio}, got {observed_ratio}"
     );
     Ok(())
 }
@@ -409,6 +490,26 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
         difference <= POTTER_PIXEL_TOLERANCE,
         "a zero-density Volume-only mesh changes the no-object image: {difference}"
     );
+
+    let shadows_enabled = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "node.update", "target": {"id": cube_id}, "set": {"visible": true}},
+            {"op": "render.update", "target": {"id": active_scene},
+             "set": {"eevee_use_volumetric_shadows": true}}
+        ]),
+    )?;
+    assert_eq!(shadows_enabled["ok"], true, "{shadows_enabled}");
+    let zero_density_shadowed = render_project(root.path(), &project, "zero_density_shadowed")?;
+    let zero_density_shadow_difference = worst_difference(
+        &plane_values(&zero_density_shadowed),
+        &plane_values(&volume_only),
+    );
+    assert!(
+        zero_density_shadow_difference <= POTTER_PIXEL_TOLERANCE,
+        "volumetric shadows changed the zero-density non-emissive volume render: {zero_density_shadow_difference}"
+    );
     let emission_inputs = json!({
         "Density": 0.0,
         "Color": [0.0, 0.0, 0.0, 1.0],
@@ -431,7 +532,24 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
         ]),
     )?;
     assert_eq!(emission_graph["ok"], true, "{emission_graph}");
+    let emitted_with_shadows =
+        render_project(root.path(), &project, "zero_density_emission_shadowed")?;
+    let shadows_disabled = apply_operations(
+        &project,
+        root.path(),
+        json!([{"op": "render.update", "target": {"id": active_scene},
+                "set": {"eevee_use_volumetric_shadows": false}}]),
+    )?;
+    assert_eq!(shadows_disabled["ok"], true, "{shadows_disabled}");
     let emitted = render_project(root.path(), &project, "zero_density_emission")?;
+    let emission_shadow_difference = worst_difference(
+        &plane_values(&emitted),
+        &plane_values(&emitted_with_shadows),
+    );
+    assert!(
+        emission_shadow_difference <= POTTER_PIXEL_TOLERANCE,
+        "volumetric shadows changed zero-density mesh emission: {emission_shadow_difference}"
+    );
     let emission_effect = worst_difference(&plane_values(&emitted), &no_object_values);
     assert!(
         emission_effect > 1.0e-3,

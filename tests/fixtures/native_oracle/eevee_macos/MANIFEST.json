@@ -12,7 +12,7 @@
     "eevee_light_shapes.py": "0e5e23a4b0462837586bcebfb101a35620a988dfc9d3c419736cd7c29ee3a5a7",
     "eevee_light_shapes_extra.py": "8a33650f50c3b94a3d2cf4a6b413e67a53e3b5578ec2cb92f54ae2b1416cbb02",
     "eevee_volume_factor.py": "cd0688243e558f12fe3985de348ccceba096f562e81ef6d7d67511d8704787d2",
-    "eevee_volume_shadowed.py": "ff4e80bc6e9eb02e888052148a6b2b150968f04e257ac8ca15a9d8211d2f45f8",
+    "eevee_volume_shadowed.py": "3b422aa762119de096acef4765f3c9bd30fd5c3f80762e3b1b3631ead89037d9",
     "eevee_world_background.py": "3dfbc770812ece43429906a7d0425c9e32ef12d101701af8ab56b04f3591e29b",
     "export_eevee_fixture.py": "214d2ab63f343f7e59af8eaa7752217f7b26b574696e9c21b0518279ddd55606"
   },
@@ -42,7 +42,7 @@
     "volume_volume_base.f32le": 110592,
     "volume_volume_half.f32le": 110592,
     "volume_volume_zero.f32le": 110592,
-    "volume_volume_shadowed.f32le": 110592,
+    "volume_volume_shadowed_base.f32le": 110592,
     "world_background_node_black.f32le": 49152,
     "world_background_node_colour.f32le": 49152,
     "area_point.f32le": 49152,
