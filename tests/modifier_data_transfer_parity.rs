@@ -352,6 +352,46 @@ fn set_custom_normal_codes(mesh: &mut Mesh, raw_codes: &Value) -> Result<(), Box
     Ok(())
 }
 
+/// Blender's edge indices differ from Potter's, so per-edge values are matched by sorted vertex pair.
+const SOURCE_EDGE_CREASES: [((u32, u32), f64); 4] =
+    [((0, 3), 0.1), ((0, 1), 0.3), ((1, 2), 0.5), ((2, 3), 0.7)];
+
+fn sorted_pair(vertices: [u32; 2]) -> (u32, u32) {
+    (vertices[0].min(vertices[1]), vertices[0].max(vertices[1]))
+}
+
+/// The source quad's crease values, in Potter's edge order.
+fn source_edge_creases(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
+    let mut values = Vec::with_capacity(mesh.edges.len());
+    for edge in &mesh.edges {
+        let key = sorted_pair(edge.vertices);
+        let (_, value) = SOURCE_EDGE_CREASES
+            .iter()
+            .find(|(pair, _)| *pair == key)
+            .ok_or("source edge has no crease")?;
+        values.push(json!(value));
+    }
+    Ok(Value::Array(values))
+}
+
+/// Blender's per-edge oracle values, keyed `"a-b"` by sorted vertex pair, in `mesh`'s edge order.
+fn pair_expected(mesh: &Mesh, expected: &Value) -> Result<Value, Box<dyn Error>> {
+    let by_pair = expected
+        .as_object()
+        .ok_or("edge oracle must be keyed by vertex pair")?;
+    let mut values = Vec::with_capacity(mesh.edges.len());
+    for edge in &mesh.edges {
+        let (first, second) = sorted_pair(edge.vertices);
+        values.push(
+            by_pair
+                .get(&format!("{first}-{second}"))
+                .cloned()
+                .ok_or("edge oracle lacks a destination vertex pair")?,
+        );
+    }
+    Ok(Value::Array(values))
+}
+
 fn max_error(actual: &Value, expected: &Value) -> Result<f64, Box<dyn Error>> {
     match (actual, expected) {
         (Value::Number(a), Value::Number(b)) => {
@@ -2233,7 +2273,8 @@ def make(name,verts,faces):
     ob=bpy.data.objects.new(name,mesh); bpy.context.collection.objects.link(ob); return ob
 source=make('EdgeSource',[(0,0,0),(2,0,0),(2,2,0),(0,2,0)],[(0,1,2,3)])
 crease=source.data.attributes.get('crease_edge') or source.data.attributes.new(name='crease_edge',type='FLOAT',domain='EDGE')
-for edge in source.data.edges: crease.data[edge.index].value=0.1+0.2*edge.index
+PAIR_CREASES={(0,3):0.1,(0,1):0.3,(1,2):0.5,(2,3):0.7}
+for edge in source.data.edges: crease.data[edge.index].value=PAIR_CREASES[tuple(sorted(edge.vertices))]
 edge_result={}
 dest_vertices=[(0.2,0.0,0.1),(1.4,0.0,0.1),(0.9,1.5,0.1)]
 for mapping in ('NEAREST','VERT_NEAREST','POLY_NEAREST','EDGEINTERP_VNORPROJ'):
@@ -2244,7 +2285,7 @@ for mapping in ('NEAREST','VERT_NEAREST','POLY_NEAREST','EDGEINTERP_VNORPROJ'):
     mod.data_types_edges={'CREASE'}; mod.edge_mapping=mapping; mod.mix_mode='REPLACE'; mod.mix_factor=1.0
     mod.use_max_distance=True; mod.max_distance=5.0; mod.ray_radius=0.15
     bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
-    edge_result[mapping]=[me.attributes['crease_edge'].data[e.index].value for e in me.edges]; ev.to_mesh_clear()
+    edge_result[mapping]={'%d-%d'%tuple(sorted(e.vertices)): me.attributes['crease_edge'].data[e.index].value for e in me.edges}; ev.to_mesh_clear()
 dest=make('EdgeRadiusZero',dest_vertices,[(0,1,2)])
 attr=dest.data.attributes.get('crease_edge') or dest.data.attributes.new(name='crease_edge',type='FLOAT',domain='EDGE')
 for edge in dest.data.edges: attr.data[edge.index].value=0.0
@@ -2252,14 +2293,14 @@ mod=dest.modifiers.new('Transfer','DATA_TRANSFER'); mod.object=source; mod.use_e
 mod.data_types_edges={'CREASE'}; mod.edge_mapping='EDGEINTERP_VNORPROJ'; mod.mix_mode='REPLACE'; mod.mix_factor=1.0
 mod.use_max_distance=True; mod.max_distance=5.0; mod.ray_radius=0.0
 bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
-edge_result['EDGEINTERP_VNORPROJ_R0']=[me.attributes['crease_edge'].data[e.index].value for e in me.edges]; ev.to_mesh_clear()
+edge_result['EDGEINTERP_VNORPROJ_R0']={'%d-%d'%tuple(sorted(e.vertices)): me.attributes['crease_edge'].data[e.index].value for e in me.edges}; ev.to_mesh_clear()
 dest=make('EdgeTOPOLOGY',[(0,0,0.1),(2,0,0.1),(2,2,0.1),(0,2,0.1)],[(0,1,2,3)])
 attr=dest.data.attributes.get('crease_edge') or dest.data.attributes.new(name='crease_edge',type='FLOAT',domain='EDGE')
 for edge in dest.data.edges: attr.data[edge.index].value=0.0
 mod=dest.modifiers.new('Transfer','DATA_TRANSFER'); mod.object=source; mod.use_edge_data=True
 mod.data_types_edges={'CREASE'}; mod.edge_mapping='TOPOLOGY'; mod.mix_mode='REPLACE'; mod.mix_factor=1.0
 bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
-edge_result['TOPOLOGY']=[me.attributes['crease_edge'].data[e.index].value for e in me.edges]; ev.to_mesh_clear()
+edge_result['TOPOLOGY']={'%d-%d'%tuple(sorted(e.vertices)): me.attributes['crease_edge'].data[e.index].value for e in me.edges}; ev.to_mesh_clear()
 poly_source=make('FaceSource',[(0,0,0),(1,0,0),(0,1,0),(3,0,0),(4,0,0),(3,1,0)],[(0,1,2),(3,4,5)])
 freestyle=poly_source.data.attributes.new(name='freestyle_face',type='BOOLEAN',domain='FACE')
 freestyle.data[0].value=False; freestyle.data[1].value=True
@@ -2415,13 +2456,8 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         ],
         vec![vec![0, 1, 2, 3]],
     )?;
-    set_blender_attribute(
-        &mut source,
-        "crease_edge",
-        "EDGE",
-        "FLOAT",
-        &json!([0.1, 0.3, 0.5, 0.7]),
-    )?;
+    let source_creases = source_edge_creases(&source)?;
+    set_blender_attribute(&mut source, "crease_edge", "EDGE", "FLOAT", &source_creases)?;
     let mut operands = BTreeMap::new();
     operands.insert(
         "object".to_owned(),
@@ -2466,7 +2502,10 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             &AttributeLayerSelection::default(),
         )?;
         let values = actual.attributes["blender_attributes"][0]["values"].clone();
-        let error = max_error(&values, &expected["edge"][mapping])?;
+        let error = max_error(
+            &values,
+            &pair_expected(&destination, &expected["edge"][mapping])?,
+        )?;
         assert!(
             error < 3.0e-4,
             "edge {mapping} max error {error}; actual={values}, expected={}",
@@ -2504,7 +2543,10 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         radius_zero_actual.attributes["blender_attributes"][0]["values"].clone();
     let radius_zero_error = max_error(
         &radius_zero_values,
-        &expected["edge"]["EDGEINTERP_VNORPROJ_R0"],
+        &pair_expected(
+            &radius_zero_destination,
+            &expected["edge"]["EDGEINTERP_VNORPROJ_R0"],
+        )?,
     )?;
     assert!(
         radius_zero_error < 3.0e-4,
@@ -2544,7 +2586,10 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         &AttributeLayerSelection::default(),
     )?;
     let values = actual.attributes["blender_attributes"][0]["values"].clone();
-    let error = max_error(&values, &expected["edge"]["TOPOLOGY"])?;
+    let error = max_error(
+        &values,
+        &pair_expected(&topology_destination, &expected["edge"]["TOPOLOGY"])?,
+    )?;
     assert!(error < 1.0e-6, "edge TOPOLOGY max error {error}");
     let mut face_source = Mesh::from_positions_and_faces(
         vec![
