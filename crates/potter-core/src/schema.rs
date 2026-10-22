@@ -142,7 +142,7 @@ fn scene_schema() -> Value {
         "data_block":{"type":"object","required":["type"],"properties":{"type":{"type":"string"},"descriptor":{"type":["object","null"]},"mesh":{"oneOf":[{"$ref":"#/$defs/mesh"},{"type":"null"}]},"camera":{"oneOf":[{"$ref":"#/$defs/camera"},{"type":"null"}]},"light":{"oneOf":[{"$ref":"#/$defs/light"},{"type":"null"}]},"grease_pencil":{"type":["object","null"]},"armature":{"type":["object","null"]},"shape_keys":{"type":["object","null"]},"vertex_groups":{"type":"array","items":{"type":"object"}},"vertex_weights":{"type":"object"}},"additionalProperties":false},
         "camera": camera_data_schema(),
         "light":{"type":"object","required":["light_type","color","energy","radius","spot_size","spot_blend"],"properties":{"light_type":{"enum":["point","sun","spot","area"]},"color":{"$ref":"#/$defs/vec3"},"energy":{"type":"number"},"radius":{"type":"number"},"soft_falloff":{"type":"boolean"},"use_multiple_importance_sampling":{"type":"boolean"},"spread":{"type":"number","minimum":0,"maximum":std::f64::consts::PI},"spot_size":{"type":"number"},"spot_blend":{"type":"number"}},"additionalProperties":false},
-        "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
+        "material":{"type":"object","required":["name","base_color","metallic","roughness","emission_color","emission_strength","transmission","ior","double_sided","node_tree","base_color_texture","roughness_texture","metallic_texture","normal_texture"],"properties":{"name":{"type":"string"},"base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},"metallic":{"type":"number","minimum":0,"maximum":1},"roughness":{"type":"number","minimum":0,"maximum":1},"emission_color":{"$ref":"#/$defs/vec3"},"emission_strength":{"type":"number","minimum":0},"transmission":{"type":"number","minimum":0,"maximum":1},"ior":{"type":"number","exclusiveMinimum":0},"thickness_mode":{"type":"string","enum":["sphere","slab"]},"double_sided":{"type":"boolean"},"node_tree":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"base_color_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"roughness_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"metallic_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]},"normal_texture":{"oneOf":[{"$ref":"#/$defs/texture_ref"},{"type":"null"}]}},"additionalProperties":false},
         "texture_ref":texture_ref,
         "world":{"type":"object","required":["color","strength"],"properties":{"color":{"$ref":"#/$defs/vec3"},"strength":{"type":"number","minimum":0}},"additionalProperties":false},
         "keyframe":keyframe_schema(),
@@ -282,7 +282,22 @@ fn complete_scene_schema(root: &mut Value) {
     scene["properties"]["compositor"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
     scene["properties"]["color_management"] = json!({"$ref":"#/$defs/color_management"});
     scene["properties"]["sequencer"] = json!({"$ref":"#/$defs/sequencer"});
+    defs["light"]["properties"]["sun_angle"] =
+        json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
+    defs["light"]["properties"]["use_custom_distance"] = json!({"type":"boolean"});
+    defs["light"]["properties"]["cutoff_distance"] = json!({"type":"number","minimum":0});
+    for factor in [
+        "diffuse_factor",
+        "specular_factor",
+        "transmission_factor",
+        "volume_factor",
+    ] {
+        defs["light"]["properties"][factor] = json!({"type":"number","minimum":0});
+    }
     let render = &mut defs["render_settings"];
+    render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
+    render["properties"]["eevee_use_volumetric_shadows"] =
+        json!({"type":"boolean","default":false});
     render["required"] = json!([
         "resolution_x",
         "resolution_y",
@@ -314,6 +329,9 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["offscreen_dicing_scale"] =
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
+    render["properties"]["pixel_filter_type"] =
+        json!({"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"],"default":"BLACKMAN_HARRIS"});
+    render["properties"]["filter_width"] = json!({"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX,"default":crate::model::DEFAULT_FILTER_WIDTH});
     render["properties"]["filter_size"] = json!({"type":"number","minimum":0,"maximum":500});
     render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0,"maximum":10});
     render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
@@ -336,6 +354,7 @@ fn complete_scene_schema(root: &mut Value) {
         "emission_strength",
         "transmission",
         "ior",
+        "thickness_mode",
         "double_sided",
         "node_tree",
         "base_color_texture",
@@ -1007,6 +1026,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "emission_strength",
                 "transmission",
                 "ior",
+                "thickness_mode",
                 "base_color_texture",
                 "roughness_texture",
                 "metallic_texture",
@@ -2532,8 +2552,11 @@ fn set_schema(operation: &str) -> Value {
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "volume_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
+            "filter_width":{"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX},
             "filter_glossy":{"type":"number","minimum":0,"maximum":10},
             "film_transparent":{"type":"boolean"},
+            "eevee_use_volumetric_shadows":{"type":"boolean","default":false},
             "filter_size":{"type":"number","minimum":0,"maximum":500},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},
@@ -2761,6 +2784,7 @@ fn material_set_properties() -> Value {
         "emission_strength":{"type":"number","minimum":0},
         "transmission":{"type":"number","minimum":0,"maximum":1},
         "ior":{"type":"number","exclusiveMinimum":0},
+        "thickness_mode":{"type":"string","enum":["sphere","slab"]},
         "base_color_texture":nullable_texture_ref_schema(),
         "roughness_texture":nullable_texture_ref_schema(),
         "metallic_texture":nullable_texture_ref_schema(),

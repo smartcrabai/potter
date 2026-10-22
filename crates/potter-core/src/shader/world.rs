@@ -17,6 +17,44 @@ enum WorldValue {
     Vector(DVec3),
 }
 
+#[derive(Clone, Copy)]
+enum WorldMixMode {
+    Mix,
+    Add,
+    Multiply,
+    Subtract,
+    Divide,
+}
+
+#[derive(Clone, Copy)]
+enum WorldMixError<'a> {
+    UnsupportedDataType(&'a str),
+    UnsupportedBlendType(&'a str),
+}
+
+fn world_mix_mode<'a>(
+    data_type: Option<&'a str>,
+    blend_type: Option<&'a str>,
+) -> std::result::Result<WorldMixMode, WorldMixError<'a>> {
+    let data_type = data_type.unwrap_or("FLOAT");
+    if data_type != "RGBA" {
+        return Err(WorldMixError::UnsupportedDataType(data_type));
+    }
+
+    match blend_type.unwrap_or("MIX") {
+        "MIX" => Ok(WorldMixMode::Mix),
+        "ADD" => Ok(WorldMixMode::Add),
+        "MULTIPLY" => Ok(WorldMixMode::Multiply),
+        "SUBTRACT" => Ok(WorldMixMode::Subtract),
+        "DIVIDE" => Ok(WorldMixMode::Divide),
+        unsupported => Err(WorldMixError::UnsupportedBlendType(unsupported)),
+    }
+}
+
+pub(crate) fn world_mix_supported(data_type: Option<&str>, blend_type: Option<&str>) -> bool {
+    world_mix_mode(data_type, blend_type).is_ok()
+}
+
 /// Evaluates the World node graph for a single outgoing direction.
 pub fn evaluate_world(
     world: &World,
@@ -219,46 +257,25 @@ impl WorldEvaluator<'_> {
                 Ok(WorldValue::Color(result))
             }
             "ShaderNodeMix" => {
-                let data_type = node
-                    .properties
-                    .get("data_type")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("FLOAT");
-                if data_type != "RGBA" {
-                    return Err(PotError::with_details(
+                let mode = world_mix_mode(
+                    node.properties
+                        .get("data_type")
+                        .and_then(JsonValue::as_str),
+                    node.properties
+                        .get("blend_type")
+                        .and_then(JsonValue::as_str),
+                )
+                .map_err(|error| match error {
+                    WorldMixError::UnsupportedDataType(data_type) => PotError::with_details(
                         ErrorCode::UnsupportedFeature,
                         format!("world ShaderNodeMix data type `{data_type}` is not supported"),
                         json!({
                             "feature_id": format!("world.node.ShaderNodeMix.data_type.{data_type}"),
                             "node_id": id,
                         }),
-                    ));
-                }
-                let blend_type = node
-                    .properties
-                    .get("blend_type")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("MIX");
-                let factor = as_scalar(self.input(id, "Factor_Float", WorldValue::Scalar(0.5))?)
-                    .clamp(0.0, 1.0);
-                let first =
-                    as_color(self.input(id, "A_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
-                let second =
-                    as_color(self.input(id, "B_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
-                let blended = match blend_type {
-                    "MIX" => second,
-                    "ADD" => std::array::from_fn(|index| first[index] + second[index]),
-                    "MULTIPLY" => std::array::from_fn(|index| first[index] * second[index]),
-                    "SUBTRACT" => std::array::from_fn(|index| first[index] - second[index]),
-                    "DIVIDE" => std::array::from_fn(|index| {
-                        if second[index].abs() <= f64::EPSILON {
-                            first[index]
-                        } else {
-                            first[index] / second[index]
-                        }
-                    }),
-                    unsupported => {
-                        return Err(PotError::with_details(
+                    ),
+                    WorldMixError::UnsupportedBlendType(unsupported) => {
+                        PotError::with_details(
                             ErrorCode::UnsupportedFeature,
                             format!(
                                 "world ShaderNodeMix blend type `{unsupported}` is not supported"
@@ -267,8 +284,31 @@ impl WorldEvaluator<'_> {
                                 "feature_id": format!("world.node.ShaderNodeMix.blend_type.{unsupported}"),
                                 "node_id": id,
                             }),
-                        ));
+                        )
                     }
+                })?;
+                let factor = as_scalar(self.input(id, "Factor_Float", WorldValue::Scalar(0.5))?)
+                    .clamp(0.0, 1.0);
+                let first =
+                    as_color(self.input(id, "A_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
+                let second =
+                    as_color(self.input(id, "B_Color", WorldValue::Color([0.5, 0.5, 0.5, 1.0]))?);
+                let blended = match mode {
+                    WorldMixMode::Mix => second,
+                    WorldMixMode::Add => std::array::from_fn(|index| first[index] + second[index]),
+                    WorldMixMode::Multiply => {
+                        std::array::from_fn(|index| first[index] * second[index])
+                    }
+                    WorldMixMode::Subtract => {
+                        std::array::from_fn(|index| first[index] - second[index])
+                    }
+                    WorldMixMode::Divide => std::array::from_fn(|index| {
+                        if second[index].abs() <= f64::EPSILON {
+                            first[index]
+                        } else {
+                            first[index] / second[index]
+                        }
+                    }),
                 };
                 Ok(WorldValue::Color(std::array::from_fn(|index| {
                     first[index] + (blended[index] - first[index]) * factor

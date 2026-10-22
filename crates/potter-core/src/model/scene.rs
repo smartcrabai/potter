@@ -1177,6 +1177,43 @@ pub struct GreasePencilPoint {
     pub time: f64,
 }
 
+/// Cycles' film pixel filter (`intern/cycles/scene/film.h`, `FilterType`). Blender's default is
+/// Blackman-Harris, serialized as Blender's enum identifiers (`BOX`, `GAUSSIAN`, `BLACKMAN_HARRIS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PixelFilterType {
+    #[serde(rename = "BOX")]
+    Box,
+    #[serde(rename = "GAUSSIAN")]
+    Gaussian,
+    #[serde(rename = "BLACKMAN_HARRIS")]
+    BlackmanHarris,
+}
+
+/// Blender's `filter_width` default (`properties.py`): 1.5 pixels.
+pub const DEFAULT_FILTER_WIDTH: f64 = 1.5;
+/// Blender's `filter_width` RNA range. Blender stores the value as float32, so the lower bound is
+/// `0.01_f32` widened: a `.blend` holding the clamped minimum reads back as this value exactly.
+pub const FILTER_WIDTH_MIN: f64 = 0.01_f32 as f64;
+pub const FILTER_WIDTH_MAX: f64 = 10.0;
+
+fn default_pixel_filter_type() -> PixelFilterType {
+    PixelFilterType::BlackmanHarris
+}
+
+/// serde's `skip_serializing_if` passes a reference. The predicates are generic so that the
+/// by-reference signature needs no lint suppression for a small `Copy` type.
+fn is_default_pixel_filter_type<T: PartialEq<PixelFilterType>>(value: &T) -> bool {
+    PartialEq::eq(value, &PixelFilterType::BlackmanHarris)
+}
+
+fn default_filter_width() -> f64 {
+    DEFAULT_FILTER_WIDTH
+}
+
+fn is_default_filter_width<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64((*value).into(), DEFAULT_FILTER_WIDTH)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenderSettings {
@@ -1204,6 +1241,18 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_filter_glossy"
     )]
     pub filter_glossy: f64,
+    /// Cycles' `pixel_filter_type` (`scene/film.h`). Omitted when equal to Blender's default.
+    #[serde(
+        default = "default_pixel_filter_type",
+        skip_serializing_if = "is_default_pixel_filter_type"
+    )]
+    pub pixel_filter_type: PixelFilterType,
+    /// Cycles' `filter_width` in pixels, Blender's RNA range 0.01..=10. Omitted at Blender's default.
+    #[serde(
+        default = "default_filter_width",
+        skip_serializing_if = "is_default_filter_width"
+    )]
+    pub filter_width: f64,
     pub film_transparent: bool,
     /// Blender's `render.filter_size` (`scene.r.gauss`, `rna_scene.cc`): the reconstruction radius, in pixels, of
     /// EEVEE's film (`eevee_film.cc`). Realtime Beauty uses it; Solid and the path tracer do not.
@@ -1218,6 +1267,16 @@ pub struct RenderSettings {
     /// `rna_scene.cc`). It changes how the cryptomatte pass is generated and is not a pass itself.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cryptomatte_accurate: bool,
+    /// Blender's `eevee.light_threshold` (`DNA_scene_types.h`): the power at which an EEVEE local light's influence ends,
+    /// where `light_influence` reads `eevee_light.cc` `attenuation_radius_get`. Omitted at Blender's default of 0.01.
+    #[serde(
+        default = "default_light_threshold",
+        skip_serializing_if = "is_default_light_threshold"
+    )]
+    pub eevee_light_threshold: f64,
+    /// Blender's `Scene.eevee.use_volumetric_shadows`; disabled by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub eevee_use_volumetric_shadows: bool,
     #[serde(default)]
     pub motion_blur: bool,
     #[serde(default = "default_shutter")]
@@ -1247,6 +1306,12 @@ impl RenderSettings {
                 "Cycles adaptive dicing settings are outside Blender RNA ranges",
             ));
         }
+        if !(FILTER_WIDTH_MIN..=FILTER_WIDTH_MAX).contains(&self.filter_width) {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles filter_width is outside Blender RNA range 0.01..=10",
+            ));
+        }
         Ok(())
     }
 }
@@ -1263,6 +1328,8 @@ impl Default for RenderSettings {
             volume_bounces: 0,
             transparent_max_bounces: 8,
             filter_glossy: 1.0,
+            pixel_filter_type: PixelFilterType::BlackmanHarris,
+            filter_width: DEFAULT_FILTER_WIDTH,
             film_transparent: false,
             filter_size: default_filter_size(),
             engine: "path".to_owned(),
@@ -1270,6 +1337,8 @@ impl Default for RenderSettings {
             audio_codec: "wav".to_owned(),
             passes: vec!["combined".to_owned()],
             cryptomatte_accurate: false,
+            eevee_light_threshold: default_light_threshold(),
+            eevee_use_volumetric_shadows: false,
             motion_blur: false,
             shutter: default_shutter(),
             motion_blur_samples: default_motion_blur_samples(),
@@ -1514,6 +1583,45 @@ pub struct LightData {
         skip_serializing_if = "is_default_sun_angle"
     )]
     pub sun_angle: f64,
+    /// Blender's `use_custom_distance` (`LA_CUSTOM_ATTENUATION`): the light's influence ends at `cutoff_distance` instead of
+    /// where its power falls to the scene's light threshold (`eevee_light.cc`, `attenuation_radius_get`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_custom_distance: bool,
+    /// Blender's `cutoff_distance` (`att_dist`), the influence radius of a light with `use_custom_distance`. Omitted at
+    /// Blender's default of 40 m.
+    #[serde(
+        default = "default_cutoff_distance",
+        skip_serializing_if = "is_default_cutoff_distance"
+    )]
+    pub cutoff_distance: f64,
+    /// Blender's `diffuse_factor` (`Light.diff_fac`, `rna_light.cc`): the multiplier of the light's diffuse closures
+    /// (diffuse, sheen and subsurface). EEVEE applies it (`eevee_light.cc`, `power[LIGHT_DIFFUSE]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub diffuse_factor: f64,
+    /// Blender's `specular_factor` (`Light.spec_fac`): the multiplier of the specular and coat closures, and of the glass
+    /// reflection. EEVEE applies it (`power[LIGHT_SPECULAR]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub specular_factor: f64,
+    /// Blender's `transmission_factor` (`Light.transmission_fac`): the multiplier of the transmission closures. EEVEE
+    /// applies it (`power[LIGHT_TRANSMISSION]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub transmission_factor: f64,
+    /// Blender's `volume_factor` (`Light.volume_fac`): the multiplier of the light's volume scattering (`power[LIGHT_VOLUME]`).
+    /// EEVEE applies it; Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub volume_factor: f64,
 }
 
 impl Default for LightData {
@@ -1532,6 +1640,12 @@ impl Default for LightData {
             spread: std::f64::consts::PI,
             use_multiple_importance_sampling: true,
             sun_angle: default_sun_angle(),
+            use_custom_distance: false,
+            cutoff_distance: default_cutoff_distance(),
+            diffuse_factor: default_light_factor(),
+            specular_factor: default_light_factor(),
+            transmission_factor: default_light_factor(),
+            volume_factor: default_light_factor(),
         }
     }
 }
@@ -1547,6 +1661,34 @@ fn default_sun_angle() -> f64 {
 
 fn is_default_sun_angle<T: Into<f64> + Copy>(value: &T) -> bool {
     ((*value).into() - default_sun_angle()).abs() < 1.0e-6
+}
+
+/// Blender's light closure multipliers default to one (`DNA_light_types.h`: `diff_fac`, `spec_fac`, `transmission_fac`,
+/// `volume_fac`).
+fn default_light_factor() -> f64 {
+    1.0
+}
+
+fn is_default_light_factor<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - 1.0).abs() < 1.0e-6
+}
+
+/// Blender's light cutoff distance default, `DNA_light_types.h`: 40 m.
+fn default_cutoff_distance() -> f64 {
+    40.0
+}
+
+fn is_default_cutoff_distance<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_cutoff_distance()).abs() < 1.0e-9
+}
+
+/// Blender's `eevee.light_threshold` default, `DNA_scene_types.h`: 0.01.
+fn default_light_threshold() -> f64 {
+    0.01
+}
+
+fn is_default_light_threshold<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_light_threshold()).abs() < 1.0e-6
 }
 fn default_volume_color() -> [f64; 3] {
     [0.5; 3]
@@ -2887,6 +3029,26 @@ pub struct ViewportDisplay {
     pub metallic: f64,
 }
 
+/// Blender's `Material.thickness_mode` (`MA_THICKNESS_SPHERE`, `MA_THICKNESS_SLAB`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThicknessMode {
+    #[default]
+    Sphere,
+    Slab,
+}
+
+impl ThicknessMode {
+    /// The name the operation schema and the Blender bridge use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sphere => "sphere",
+            Self::Slab => "slab",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Material {
@@ -2909,6 +3071,10 @@ pub struct Material {
     pub transmission: f64,
     #[serde(default = "default_ior")]
     pub ior: f64,
+    /// Blender's `Material.thickness_mode`: the refraction thickness model EEVEE uses when the Thickness socket is not
+    /// linked (`eevee_thickness_lib.bsl.hh`). Sphere is Blender's default.
+    #[serde(default)]
+    pub thickness_mode: ThicknessMode,
     /// Blender's `use_backface_culling` is off for new materials (`MA_BL_CULL_BACKFACE` unset in `DNA_material_types.h`).
     #[serde(default = "default_true")]
     pub double_sided: bool,
@@ -2966,6 +3132,7 @@ impl Default for Material {
             emission_strength: 0.0,
             transmission: 0.0,
             ior: default_ior(),
+            thickness_mode: ThicknessMode::Sphere,
             double_sided: default_true(),
             use_transparent_shadow: default_true(),
             use_bump_map_correction: default_true(),

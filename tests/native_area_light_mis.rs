@@ -43,7 +43,7 @@ const PATCH: [f64; 8] = [
 ];
 /// Samples per pixel and seeds, the same for Blender and Potter.
 const SAMPLES: u32 = 256;
-const SEEDS: u32 = 4;
+const SEEDS: u32 = 16;
 /// Standard errors of the combined means that the difference may span.
 const SIGMAS: f64 = 3.0;
 
@@ -141,6 +141,16 @@ fn check_scenario(roughness: f64, light_size: f64) -> TestResult {
         .as_str()
         .ok_or("active scene is missing")?
         .to_owned();
+    assert_eq!(
+        scene["scenes"][active.as_str()]["render"]["pixel_filter_type"],
+        "BOX",
+        "the imported scene and Cycles oracle must use the same pixel filter type"
+    );
+    assert_eq!(
+        scene["scenes"][active.as_str()]["render"]["filter_width"],
+        1.0,
+        "the imported scene and Cycles oracle must use the same filter width"
+    );
     let mut potter_runs = Vec::new();
     for seed in 0..SEEDS {
         let applied = apply_operations(

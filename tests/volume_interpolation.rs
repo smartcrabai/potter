@@ -73,7 +73,7 @@ fn make_scene(
         json!({"op":"material.create","id":"voxels","graph":"voxel_graph","volume_interpolation":interpolation}),
         json!({"op":"volume.create","id":"voxel_volume","materials":["voxels"],"grids":[{"dims":[N,N,N],"voxel_size":1.0 / 16.0,"origin":[-0.5,-0.5,-0.5],"values":values}]}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
-        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":SAMPLES,"seed":seed,"max_bounces":0}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":SAMPLES,"seed":seed,"max_bounces":0,"pixel_filter_type":"BOX","filter_width":1.0}}),
     ];
     let scene = root.join("scene");
     assert_cli_success(&pot().arg("init").arg(&scene).arg("--json").output()?)?;

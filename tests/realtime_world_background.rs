@@ -24,8 +24,8 @@ mod process;
 use std::{error::Error, path::Path};
 
 use native_oracle::{
-    TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
-    write_script,
+    TestResult, apply_operations, import_blend, loss_features, pot, pot_json, read_scene,
+    run_blender_arguments, write_script,
 };
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
@@ -34,6 +34,31 @@ use tempfile::tempdir;
 
 /// The scene and EEVEE render (`eevee_world_background.py`).
 const SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_world_background.py");
+
+/// Builds a generic Mix node connected to the world background, then saves the `.blend`.
+const MIX_WORLD_SCRIPT: &str = r#"
+import sys
+import bpy
+
+data_type, blend_out = sys.argv[sys.argv.index("--") + 1:][:2]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+world = bpy.data.worlds.new("World")
+world.use_nodes = True
+scene.world = world
+tree = world.node_tree
+tree.nodes.clear()
+mix = tree.nodes.new("ShaderNodeMix")
+mix.data_type = data_type
+mix.blend_type = "MIX"
+background = tree.nodes.new("ShaderNodeBackground")
+output = tree.nodes.new("ShaderNodeOutputWorld")
+result = next(socket for socket in mix.outputs if socket.name == "Result")
+target = background.inputs["Strength"] if data_type == "FLOAT" else background.inputs["Color"]
+tree.links.new(result, target)
+tree.links.new(background.outputs["Background"], output.inputs["Surface"])
+bpy.ops.wm.save_as_mainfile(filepath=blend_out)
+"#;
 
 /// The committed macOS arm64 EEVEE renders, as little-endian f32 RGB rows bottom-up.
 const EEVEE_NODE_BLACK: &[u8] =
@@ -163,5 +188,58 @@ fn realtime_world_background_matches_eevee() -> TestResult {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn blender_float_world_mix_into_strength_is_reported_as_a_loss() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        eprintln!("skipping generic world Mix import; no executable Blender was found");
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(root.path(), "generic_world_mix.py", MIX_WORLD_SCRIPT)?;
+
+    for (case, data_type, should_report_loss) in [
+        ("float_strength", "FLOAT", true),
+        ("rgba_color", "RGBA", false),
+    ] {
+        let blend = root.path().join(format!("{case}.blend"));
+        run_blender_arguments(
+            &blender,
+            &script,
+            None,
+            &[Path::new(data_type), blend.as_path()],
+        )?;
+
+        let project = root.path().join(format!("{case}_project"));
+        pot_json(|command| {
+            command.arg("init").arg(&project);
+        })?;
+        let report = pot_json(|command| {
+            command
+                .arg("import")
+                .arg(&project)
+                .arg("--file")
+                .arg(&blend)
+                .args([
+                    "--format",
+                    "blend",
+                    "--mode",
+                    "replace",
+                    "--base-revision",
+                    "0",
+                    "--blender",
+                ])
+                .arg(&blender)
+                .arg("--allow-lossy");
+        })?;
+        let features = loss_features(&report);
+        assert_eq!(
+            features.contains(&"blender.world.node_graph".to_owned()),
+            should_report_loss,
+            "{case}: unexpected world graph losses: {features:?}"
+        );
+    }
     Ok(())
 }

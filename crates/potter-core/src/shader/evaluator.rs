@@ -11,7 +11,7 @@ use crate::{
     geom::{GeneratedCorners, TextureSpace},
     graph::{GraphKind, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
-    model::{Id, Material, Registry, TextureRef},
+    model::{Id, Material, Registry, TextureRef, ThicknessMode},
 };
 
 /// Blender's Principled "Specular IOR Level" default: `SOCKET_IN_FLOAT(specular_ior_level,
@@ -166,6 +166,11 @@ pub struct BsdfParams {
     pub emission_strength: f64,
     pub transmission: f64,
     pub ior: f64,
+    /// The Material Output's Thickness socket when it is linked (EEVEE's `nodetree_thickness`); `None` takes the
+    /// object's bounds. A linked zero is no thickness, as EEVEE's `Thickness::from` gives it.
+    pub thickness: Option<f64>,
+    /// Blender's `Material.thickness_mode` is Slab rather than Sphere (`eevee_thickness_lib.bsl.hh`).
+    pub thickness_slab: bool,
     /// Tints of the rough glass lobe (Cycles' `generalized_schlick_setup`): the reflection tint and the
     /// transmission tint. The Principled BSDF takes white reflection and the square root of its base colour
     /// for transmission (`kernel/svm/closure.h`); the Glass BSDF node takes its Color for both.
@@ -287,6 +292,8 @@ impl BsdfParams {
             emission_strength: material.emission_strength,
             transmission: material.transmission,
             ior: material.ior,
+            thickness: None,
+            thickness_slab: material.thickness_mode == ThicknessMode::Slab,
             glass_reflection_tint: [1.0; 3],
             glass_transmission_tint: principled_glass_tint(material.base_color),
             back_facing: false,
@@ -685,7 +692,8 @@ fn evaluate_surface_inner(
             "shader graph has no OutputMaterial node",
         )
     })?;
-    let (has_volume, has_displacement) = prepared.output_feeds(graph_id, group, output);
+    let (has_surface, has_volume, has_displacement) =
+        prepared.output_feeds(graph_id, group, output);
     let mut evaluator = Evaluator {
         group,
         material,
@@ -694,10 +702,15 @@ fn evaluate_surface_inner(
         alpha_linked_images: &prepared.alpha_linked_images,
         links: prepared.link_index(graph_id, group),
     };
-    let Value::Shader(surface) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
-        return Err(eval_error("material surface output is not a shader"));
+    // Only an unlinked Surface alongside a linked Volume is empty; other Shader sockets keep their defaults.
+    let mut closures = if !has_surface && has_volume {
+        Vec::new()
+    } else {
+        let Value::Shader(surface) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
+            return Err(eval_error("material surface output is not a shader"));
+        };
+        evaluator.workspace.closures_of(surface).to_vec()
     };
-    let mut closures = evaluator.workspace.closures_of(surface).to_vec();
     // The volume closures come from the Volume output alone. Without one, the material's own
     // coefficients stand, as they do for a material with no graph.
     let volume = if has_volume {
@@ -707,6 +720,20 @@ fn evaluate_surface_inner(
         evaluator.workspace.closures_of(volume).to_vec()
     } else {
         single_closure(&BsdfParams::from_material(material, hit_ctx.normal))
+    };
+    // The Thickness socket, when linked, is the refraction thickness of the whole material (EEVEE's `nodetree_thickness`);
+    // unlinked, the object's bounds decide it. The mode is the material's.
+    let thickness = if group
+        .links
+        .iter()
+        .any(|link| link.to_node == *output && link.to_socket == "Thickness")
+    {
+        match evaluator.input(output, "Thickness", ValueKind::Scalar)? {
+            Value::Scalar(thickness) => Some(thickness.max(0.0)),
+            _ => return Err(eval_error("material thickness is not a scalar")),
+        }
+    } else {
+        None
     };
     let displacement_height = if has_displacement {
         let normal = hit_ctx.normal;
@@ -723,6 +750,8 @@ fn evaluate_surface_inner(
     };
     for closure in &mut closures {
         apply_material_textures(material, hit_ctx, &mut closure.params)?;
+        closure.params.thickness = thickness;
+        closure.params.thickness_slab = material.thickness_mode == ThicknessMode::Slab;
     }
     Ok(SurfaceShading {
         closures,
@@ -804,7 +833,7 @@ fn evaluate_displacement_inner(
     let Some(output) = active_output.or(fallback_output) else {
         return Ok(0.0);
     };
-    let (_, has_displacement) = prepared.output_feeds(graph_id, group, output);
+    let (_, _, has_displacement) = prepared.output_feeds(graph_id, group, output);
     if !has_displacement {
         return Ok(0.0);
     }
@@ -1109,8 +1138,10 @@ struct LinkIndex {
     /// For each target node, the indices into `NodeGroup::links` of its incoming links in link order. The first entry
     /// matching a socket is the same link that a scan of all links finds first.
     incoming: BTreeMap<Id, Vec<usize>>,
-    /// The output node that the two flags below describe.
+    /// The output node that the socket flags below describe.
     output: Option<Id>,
+    /// Whether a link reaches the output's `Surface` socket.
+    has_surface: bool,
     /// Whether a link reaches the output's `Volume` socket.
     has_volume: bool,
     /// Whether a link reaches the output's `Displacement` socket.
@@ -1126,8 +1157,10 @@ impl LinkIndex {
                 .or_default()
                 .push(socket_index);
         }
-        let (has_volume, has_displacement) =
-            output.map_or((false, false), |output| scan_output_feeds(group, output));
+        let (has_surface, has_volume, has_displacement) = output
+            .map_or((false, false, false), |output| {
+                scan_output_feeds(group, output)
+            });
         Self {
             graph: Some(graph_id.clone()),
             links_address: group.links.as_ptr().addr(),
@@ -1135,14 +1168,19 @@ impl LinkIndex {
             incoming,
             output: output.cloned(),
             has_volume,
+            has_surface,
             has_displacement,
         }
     }
 }
 
-/// Whether a link reaches the `Volume` socket of `output`, and whether a link reaches its `Displacement` socket.
-fn scan_output_feeds(group: &NodeGroup, output: &Id) -> (bool, bool) {
+/// Whether links reach the `Surface`, `Volume`, and `Displacement` sockets of `output`.
+fn scan_output_feeds(group: &NodeGroup, output: &Id) -> (bool, bool, bool) {
     (
+        group
+            .links
+            .iter()
+            .any(|link| link.to_node == *output && link.to_socket == "Surface"),
         group
             .links
             .iter()
@@ -1199,13 +1237,13 @@ impl PreparedMaterial {
         .then_some(index)
     }
 
-    /// Whether a link reaches the `Volume` and the `Displacement` socket of `output` in `group`.
-    fn output_feeds(&self, graph_id: &Id, group: &NodeGroup, output: &Id) -> (bool, bool) {
+    /// Whether a link reaches the `Surface`, `Volume`, and `Displacement` sockets of `output` in `group`.
+    fn output_feeds(&self, graph_id: &Id, group: &NodeGroup, output: &Id) -> (bool, bool, bool) {
         match self
             .link_index(graph_id, group)
             .filter(|index| index.output.as_ref() == Some(output))
         {
-            Some(index) => (index.has_volume, index.has_displacement),
+            Some(index) => (index.has_surface, index.has_volume, index.has_displacement),
             None => scan_output_feeds(group, output),
         }
     }
@@ -1213,6 +1251,15 @@ impl PreparedMaterial {
     /// Whether a surface of this material casts a transparent shadow, as EEVEE's static transparency decides it.
     pub(crate) fn is_transparent(&self) -> bool {
         self.transparent
+    }
+    /// Whether this material graph has a linked Volume output.
+    pub(crate) fn has_volume_output(&self) -> bool {
+        self.links.graph.is_some() && self.links.has_volume
+    }
+
+    /// Whether the graph has a linked Volume output and no linked Surface output.
+    pub(crate) fn is_volume_only(&self) -> bool {
+        self.has_volume_output() && !self.links.has_surface
     }
 
     /// The output node a surface evaluates from: the active one, else the first `OutputMaterial`.

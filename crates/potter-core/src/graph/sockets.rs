@@ -284,6 +284,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
                 ("Surface", "shader"),
                 ("Volume", "shader"),
                 ("Displacement", "vector"),
+                ("Thickness", "float"),
             ]),
             Vec::new(),
         ),

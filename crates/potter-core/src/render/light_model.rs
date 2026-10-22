@@ -57,6 +57,92 @@ pub(crate) fn spot_attenuation(cos_axis: f64, spot_size: f64, spot_blend: f64) -
     t * t * (3.0 - 2.0 * t)
 }
 
+/// EEVEE's `light_spot_attenuation` (`eevee_light_lib.bsl.hh`): the cone of a spot light seen from a receiver along
+/// `to_light`, the unit direction to the light. In the light's frame the cone is an ellipse whose scale stretches it
+/// (`spot_size_inv = scale.z / max(scale.xy, 1e-8)`, `eevee_light.cc` `shape_parameters_set`). At unit scale it is the
+/// Cycles cone of [`spot_attenuation`].
+pub(crate) fn spot_cone(matrix: &DMat4, to_light: DVec3, spot_size: f64, spot_blend: f64) -> f64 {
+    let axes = [
+        matrix.x_axis.truncate(),
+        matrix.y_axis.truncate(),
+        matrix.z_axis.truncate(),
+    ];
+    let scale = axes.map(DVec3::length);
+    // `transform_direction_transposed` of the object's rotation: the direction in the light's own frame.
+    let local = DVec3::new(
+        axes[0].normalize_or_zero().dot(to_light),
+        axes[1].normalize_or_zero().dot(to_light),
+        axes[2].normalize_or_zero().dot(to_light),
+    );
+    if local.z <= 0.0 {
+        return 0.0;
+    }
+    let cos_half = (spot_size.clamp(0.0, PI) * 0.5).cos();
+    let blend = (1.0 - cos_half) * spot_blend.clamp(0.0, 1.0);
+    let spot_mul = 1.0 / blend.max(1.0e-8);
+    let spot_bias = -cos_half * spot_mul;
+    let stretched_x = local.x * (scale[2] / scale[0].max(1.0e-8)) / local.z;
+    let stretched_y = local.y * (scale[2] / scale[1].max(1.0e-8)) / local.z;
+    let ellipse = 1.0 / (1.0 + stretched_x * stretched_x + stretched_y * stretched_y).sqrt();
+    let t = (ellipse * spot_mul + spot_bias).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The squared influence radius of a local light for a closure class with multiplier `class_factor`: the custom distance when
+/// `use_custom_distance` is on, else `sqrt(power / threshold)` with `power = max colour · |energy| / 100 · class_factor`
+/// (`eevee_light.cc` `shape_parameters_set` and `attenuation_radius_get`). Surfaces use the larger of the diffuse and
+/// specular factors, and volumes the volume factor.
+pub(crate) fn local_light_influence_radius_squared(
+    data: &LightData,
+    class_factor: f64,
+    threshold: f64,
+) -> f64 {
+    if data.use_custom_distance {
+        return data.cutoff_distance * data.cutoff_distance;
+    }
+    let max_power = DVec3::from_array(data.color).max_element().max(0.0)
+        * (data.energy.abs() / 100.0)
+        * class_factor.max(0.0);
+    max_power / threshold
+}
+
+/// EEVEE's `light_influence_attenuation` (`eevee_light_lib.bsl.hh`): `(1 - (d / R)⁴)²`, which reaches zero at the influence
+/// radius `R`. A zero radius culls the light, so it contributes nothing.
+pub(crate) fn influence_fade(distance_squared: f64, radius_squared: f64) -> f64 {
+    if radius_squared <= 0.0 {
+        return 0.0;
+    }
+    let factor = (distance_squared / radius_squared).powi(2);
+    let fade = (1.0 - factor).clamp(0.0, 1.0);
+    fade * fade
+}
+
+/// The influence of a local light on its surfaces (`light_attenuation_surface`): the fade at `distance_squared` with the
+/// radius of the larger of the diffuse and specular factors.
+pub(crate) fn local_light_influence(
+    data: &LightData,
+    distance_squared: f64,
+    threshold: f64,
+) -> f64 {
+    influence_fade(
+        distance_squared,
+        local_light_influence_radius_squared(
+            data,
+            data.diffuse_factor.max(data.specular_factor),
+            threshold,
+        ),
+    )
+}
+
+/// The radius of a sun's disc in tangent units, EEVEE's `shape_radius` (`eevee_light.cc`): `tan(angle / 2)` for the
+/// sun's angular diameter, with the angle capped below 179.9° and the radius clamped to [0.001, 20]. The disc's radiance
+/// is `energy · (1 + 1 / r²) / π` (`Light::shape_radiance_get`).
+pub(crate) fn sun_disc_radius(angle: f64) -> f64 {
+    (angle.clamp(0.0, 179.9_f64.to_radians()) * 0.5)
+        .tan()
+        .clamp(0.001, 20.0)
+}
+
 /// The shape of a Blender area light in world space: unit axes, half extents with the object
 /// scale applied, whether it is an ellipse, and its area.
 ///
@@ -617,5 +703,106 @@ mod tests {
             DVec3::NEG_Z,
         );
         assert!(irradiance.abs() < 1.0e-12, "irradiance {irradiance}");
+    }
+}
+
+#[cfg(test)]
+mod realtime_cutoff_tests {
+    use super::*;
+
+    fn light(energy: f64, color: [f64; 3]) -> LightData {
+        LightData {
+            color,
+            energy,
+            ..LightData::default()
+        }
+    }
+
+    #[test]
+    fn influence_is_one_at_the_light_and_zero_at_the_radius() {
+        // 40 W, white: max power 0.4, so R² = 0.4 / 0.01 = 40 m² at the default threshold.
+        let data = light(40.0, [1.0; 3]);
+        assert!((local_light_influence(&data, 0.0, 0.01) - 1.0).abs() < 1.0e-12);
+        assert!(local_light_influence(&data, 40.0, 0.01).abs() < 1.0e-12);
+        // At d² = 10 the fade is (1 - (10 / 40)²)² = 0.9375².
+        assert!((local_light_influence(&data, 10.0, 0.01) - 0.9375_f64.powi(2)).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn a_higher_threshold_shortens_the_radius_and_a_custom_distance_replaces_it() {
+        let mut data = light(40.0, [1.0; 3]);
+        // threshold 0.1: R² = 4, so a point at d² = 4 is already cut.
+        assert!(local_light_influence(&data, 4.0, 0.1).abs() < 1.0e-12);
+        data.use_custom_distance = true;
+        data.cutoff_distance = 3.0;
+        // The custom distance wins whatever the threshold: R² = 9.
+        assert!(local_light_influence(&data, 9.0, 0.1).abs() < 1.0e-12);
+        assert!((local_light_influence(&data, 0.0, 0.1) - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn the_volume_factor_sets_the_volume_radius() {
+        // volume_factor 0.5 quarters R² relative to 2 (the power halves): R² = 0.2 / 0.01 = 20.
+        let mut data = light(40.0, [1.0; 3]);
+        data.volume_factor = 0.5;
+        let radius_squared = local_light_influence_radius_squared(&data, data.volume_factor, 0.01);
+        assert!((radius_squared - 20.0).abs() < 1.0e-9);
+        assert_eq!(influence_fade(20.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_larger_surface_factor_sets_the_radius() {
+        // max(diffuse, specular) = 2 doubles the power: R² = 0.8 / 0.01 = 80 instead of 40.
+        let mut data = light(40.0, [1.0; 3]);
+        data.diffuse_factor = 2.0;
+        data.specular_factor = 0.5;
+        let expected = 1.0 - (60.0_f64 / 80.0).powi(2);
+        assert!((local_light_influence(&data, 60.0, 0.01) - expected * expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn a_zero_radius_culls_the_light() {
+        let mut data = light(40.0, [1.0; 3]);
+        data.use_custom_distance = true;
+        data.cutoff_distance = 0.0;
+        assert_eq!(local_light_influence(&data, 0.5, 0.01), 0.0);
+    }
+
+    #[test]
+    fn a_unit_scaled_spot_cone_is_the_cycles_cone() {
+        let matrix = DMat4::IDENTITY;
+        for angle in [0.2_f64, 0.8, 1.2] {
+            for blend in [0.0, 0.15, 1.0] {
+                for theta in [0.0_f64, 0.1, 0.3, 0.5, 0.9] {
+                    let to_light = DVec3::new(theta.sin(), 0.0, theta.cos());
+                    let axis = -DVec3::Z;
+                    let cycles = spot_attenuation(axis.dot(-to_light), angle, blend);
+                    let eevee = spot_cone(&matrix, to_light, angle, blend);
+                    assert!(
+                        (cycles - eevee).abs() < 1.0e-9,
+                        "angle {angle} blend {blend} theta {theta}: {cycles} vs {eevee}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_scaled_spot_cone_narrows_along_its_stretched_axis() {
+        // A 60° cone with no blend. Unscaled, a point at 20° is inside (its cosine exceeds cos 30°). Scaled by 2 along Z,
+        // the ellipse's radial stretch is 2 · tan 20°, which puts it outside.
+        let theta = 20.0_f64.to_radians();
+        let to_light = DVec3::new(theta.sin(), 0.0, theta.cos());
+        let spot = 60.0_f64.to_radians();
+        assert_eq!(spot_cone(&DMat4::IDENTITY, to_light, spot, 0.0), 1.0);
+        let stretched = DMat4::from_scale(DVec3::new(1.0, 1.0, 2.0));
+        assert_eq!(spot_cone(&stretched, to_light, spot, 0.0), 0.0);
+    }
+
+    #[test]
+    fn sun_disc_radius_is_the_tangent_of_the_half_angle() {
+        let blender_default = 0.526_f64.to_radians();
+        assert!((sun_disc_radius(blender_default) - (blender_default * 0.5).tan()).abs() < 1.0e-12);
+        assert_eq!(sun_disc_radius(0.0), 0.001);
     }
 }
