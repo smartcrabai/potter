@@ -2983,6 +2983,7 @@ fn build_imported_graph(
             ))
             .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
             dicing_rate: number_field(&render, "dicing_rate", 1.0),
+            filter_glossy: number_field(&render, "filter_glossy", 1.0),
             preview_dicing_rate: number_field(&render, "preview_dicing_rate", 8.0),
             max_subdivisions: u32::try_from(integer_field(&render, "max_subdivisions", 12))
                 .map_err(|_| invalid_intermediate("render max_subdivisions is out of range"))?,

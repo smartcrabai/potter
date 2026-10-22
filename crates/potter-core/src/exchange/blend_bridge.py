@@ -2429,6 +2429,7 @@ def dump_scene(scene):
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
                 "volume_bounces": int(getattr(getattr(scene, "cycles", None), "volume_bounces", 0)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
+                "filter_glossy": float(getattr(getattr(scene, "cycles", None), "blur_glossy", 1.0)),
                 "volume_biased": bool(getattr(getattr(scene, "cycles", None), "volume_biased", False)),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
@@ -7225,6 +7226,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine
         if hasattr(scene, "cycles"):
+            scene.cycles.blur_glossy = float(render.get("filter_glossy", 1.0))
             scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
             scene.cycles.preview_dicing_rate = float(render.get("preview_dicing_rate", 8.0))
             scene.cycles.max_subdivisions = int(render.get("max_subdivisions", 12))
