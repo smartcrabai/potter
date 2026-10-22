@@ -671,6 +671,12 @@ fn read_exr_data(bytes: &[u8]) -> Result<ExrImageData> {
         })
 }
 
+/// Decodes an Ocean bake EXR as stored. Blender writes these without finite-value validation, so
+/// the samples are kept as they are.
+pub(crate) fn decode_ocean_cache_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
+    decode_exr_default_with_validation(&read_exr_data(bytes)?, false)
+}
+
 fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
     let (width, height, pixels) = decode_exr_default(&read_exr_data(bytes)?)?;
     Ok((width, height, pixels))
@@ -768,6 +774,13 @@ fn decode_exr_with_image_user(
 
 /// Decodes the first RGB layer with its values as stored (see [`ImageData::pixels`]).
 fn decode_exr_default(image: &ExrImageData) -> Result<(u32, u32, Vec<[f64; 4]>)> {
+    decode_exr_default_with_validation(image, true)
+}
+
+fn decode_exr_default_with_validation(
+    image: &ExrImageData,
+    validate_finite: bool,
+) -> Result<(u32, u32, Vec<[f64; 4]>)> {
     let has_rgb = |layer: &&ExrLayerData| {
         exr_channel(layer, &["r", "red"]).is_some()
             && exr_channel(layer, &["g", "green"]).is_some()
@@ -853,7 +866,9 @@ fn decode_exr_default(image: &ExrImageData) -> Result<(u32, u32, Vec<[f64; 4]>)>
             alpha.map_or(Ok(1.0), |channel| exr_sample(channel, index))?,
         ]);
     }
-    validate_pixels(width, height, &pixels)?;
+    if validate_finite {
+        validate_pixels(width, height, &pixels)?;
+    }
     Ok((width, height, pixels))
 }
 

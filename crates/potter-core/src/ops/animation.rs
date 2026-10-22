@@ -117,6 +117,23 @@ fn update_action(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             Ok(curves)
         })
         .transpose()?;
+    let changes_bound_curves = fcurves.as_ref().is_some_and(|curves| {
+        engine.doc.actions.get(&id).is_some_and(|action| {
+            action.modifier_bindings.keys().any(|curve_index| {
+                usize::try_from(*curve_index)
+                    .ok()
+                    .and_then(|index| action.fcurves.get(index).zip(curves.get(index)))
+                    .is_none_or(|(old, new)| old.path != new.path || old.index != new.index)
+            })
+        })
+    });
+    if changes_bound_curves {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "bulk F-Curve replacement cannot preserve modifier parameter bindings; edit bound keyframes in place",
+            &operation_pointer(engine.operation_index, "set/fcurves"),
+        ));
+    }
     let action = engine.doc.actions.get_mut(&id).ok_or_else(|| {
         crate::error::PotError::new(ErrorCode::InternalError, "action disappeared during update")
     })?;
