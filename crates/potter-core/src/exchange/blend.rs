@@ -9366,46 +9366,30 @@ fn rekey_nodes_bakes(params: &mut Map<String, Value>, group: &NodeGroup) {
     params.insert("bakes".to_owned(), Value::Object(rekeyed));
 }
 
-/// Facts the bridge reports for a Geometry Nodes modifier's Blender bakes. Data-blocks are not remapped by Potter,
-/// and a bake with no node has no settings to carry. Blender 5.2.2 exposes no RNA for a bake's packed payload
-/// (`NodesModifierBake` has no `packed`, `bake_size`, or baked-state property), so every bake whose effective target
-/// is PACKED is reported: it may carry a packed payload Potter cannot read.
+/// Facts the bridge reports for a Geometry Nodes modifier's Blender bakes. Data-block references are not remapped by
+/// Potter. Since Blender exposes no RNA for `NodesModifierBake.packed`, the bridge inspects each bake in a disposable
+/// Blender process and reports only packed entries with metadata files.
 fn nodes_bake_import_losses(modifier: &Value) -> Vec<Loss> {
     let name = modifier.get("name").and_then(Value::as_str);
-    let properties = modifier.get("properties");
     let mut losses = Vec::new();
-    let modifier_target = properties
-        .and_then(|properties| properties.get("bake_target"))
-        .and_then(Value::as_str)
-        .unwrap_or("PACKED");
-    for (bake, entry) in properties
-        .and_then(|properties| properties.get("bakes"))
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-    {
-        let node_target = entry
-            .get("bake_target")
-            .and_then(Value::as_str)
-            .unwrap_or("INHERIT");
-        let target = if node_target == "INHERIT" {
-            modifier_target
-        } else {
-            node_target
-        };
-        if target == "PACKED" {
-            losses.push(loss(
-                "blender.modifier.nodes_bake_packed",
-                name,
-                &format!(
-                    "Blender bake {bake} targets PACKED and may carry a packed payload; Blender exposes no RNA for packed bake data, so Potter cannot read it and the bake is re-evaluated live"
-                ),
-            ));
-        }
-    }
     let Some(bake_losses) = modifier.get("bake_losses") else {
         return losses;
     };
+    for bake in bake_losses
+        .get("packed_payloads")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        losses.push(loss(
+            "blender.modifier.nodes_bake_packed",
+            name,
+            &format!(
+                "Blender bake {bake} has packed data that Potter cannot read because Blender exposes no RNA for it; the bake is re-evaluated live"
+            ),
+        ));
+    }
     for bake in bake_losses
         .get("data_blocks")
         .and_then(Value::as_array)
@@ -18452,9 +18436,14 @@ print("UNSUPPORTED_POSE " + json.dumps({
                 "type": "NODES",
                 "properties": {"node_group": "Geometry", "bakes": {
                     "bake_main": {"bake_mode": "STILL"},
-                    "bake_disk": {"bake_target": "DISK"}
+                    "bake_disk": {"bake_target": "DISK"},
+                    "bake_empty_packed": {"bake_target": "PACKED"}
                 }},
-                "bake_losses": {"data_blocks": ["bake_main"], "unmapped": ["Bake.001"]}
+                "bake_losses": {
+                    "packed_payloads": ["bake_main"],
+                    "data_blocks": ["bake_main"],
+                    "unmapped": ["Bake.001"]
+                }
             }, {
                 "name": "Plain",
                 "type": "NODES",

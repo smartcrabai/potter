@@ -11,7 +11,7 @@ import ctypes
 import json
 import math
 import os
-import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -1568,12 +1568,91 @@ def _nodes_bake_potter_id(bake):
     return potter_id if isinstance(potter_id, str) else None
 
 
+_NODE_BAKE_PACKED_PAYLOADS = None
+
+
+def _node_bake_packed_payloads():
+    """Detect actual packed payloads in a disposable Blender process; Blender exposes no RNA for `bake.packed`."""
+    global _NODE_BAKE_PACKED_PAYLOADS
+    if _NODE_BAKE_PACKED_PAYLOADS is not None:
+        return _NODE_BAKE_PACKED_PAYLOADS
+    if not bpy.data.filepath:
+        raise ValueError("Cannot inspect packed Bake data for an unsaved Blender file")
+    root = tempfile.mkdtemp(prefix="potter-bake-packed-probe-")
+    script = r"""
+import bpy, json, os, sys
+root = sys.argv[sys.argv.index("--") + 1]
+packed = []
+index = 0
+for obj in bpy.data.objects:
+    for modifier in obj.modifiers:
+        if modifier.type != "NODES":
+            continue
+        for bake in modifier.bakes:
+            if bake.node is None:
+                continue
+            directory = os.path.join(root, str(index))
+            os.makedirs(directory, exist_ok=True)
+            original = (bake.bake_target, bake.use_custom_path, bake.directory)
+            bake.use_custom_path = True
+            bake.directory = directory
+            try:
+                with bpy.context.temp_override(object=obj, active_object=obj):
+                    bpy.ops.object.geometry_node_bake_unpack_single(
+                        session_uid=obj.session_uid,
+                        modifier_name=modifier.name,
+                        bake_id=bake.bake_id,
+                        method="WRITE_ORIGINAL")
+                metadata = os.path.join(directory, "meta")
+                if os.path.isdir(metadata) and os.listdir(metadata):
+                    packed.append((obj.name, modifier.name, bake.node.name))
+            finally:
+                bake.bake_target, bake.use_custom_path, bake.directory = original
+            index += 1
+print("POTTER_PACKED_BAKES=" + json.dumps(packed))
+"""
+    try:
+        output = subprocess.run(
+            [
+                bpy.app.binary_path,
+                "-b",
+                bpy.data.filepath,
+                "--python-exit-code",
+                "1",
+                "--python-expr",
+                script,
+                "--",
+                root,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if output.returncode != 0:
+            raise ValueError("Blender packed-bake inspection failed: %s" % output.stderr)
+        errors = [line for line in output.stdout.splitlines() if line.startswith("Error:")]
+        if errors:
+            raise ValueError("Blender packed-bake inspection failed: %s" % "; ".join(errors))
+        result = next(
+            (line[len("POTTER_PACKED_BAKES="):] for line in output.stdout.splitlines()
+             if line.startswith("POTTER_PACKED_BAKES=")),
+            None,
+        )
+        if result is None:
+            raise ValueError("Blender packed-bake inspection returned no state")
+        _NODE_BAKE_PACKED_PAYLOADS = {tuple(entry) for entry in json.loads(result)}
+        return _NODE_BAKE_PACKED_PAYLOADS
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+
 def _nodes_bakes_dump(modifier):
     """Settings of every Blender bake entry keyed by the name of its bake node, and the facts Potter cannot keep.
 
     The name is the key because it exists on every node, including nodes of files Potter did not write. Names are
     unique within a node tree; the importer maps each name to the imported node ID."""
-    bakes = {}
+    packed_payloads = []
     data_blocks = []
     unmapped = []
     for bake in modifier.bakes:
@@ -1590,9 +1669,15 @@ def _nodes_bakes_dump(modifier):
             "frame_start": int(bake.frame_start),
             "frame_end": int(bake.frame_end),
         }
+        if (modifier.id_data.name, modifier.name, node_name) in _node_bake_packed_payloads():
+            packed_payloads.append(node_name)
         if len(bake.data_blocks):
             data_blocks.append(node_name)
-    return bakes, {"data_blocks": data_blocks, "unmapped": unmapped}
+    return bakes, {
+        "packed_payloads": packed_payloads,
+        "data_blocks": data_blocks,
+        "unmapped": unmapped,
+    }
 
 
 def _apply_nodes_bakes(modifier, bakes):

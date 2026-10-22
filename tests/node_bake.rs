@@ -1794,3 +1794,84 @@ fn bake_node_survives_blend_export_and_import() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn packed_bake_without_data_block_references_is_reported_on_import() -> Result<(), Box<dyn Error>> {
+    let Some(blender) = std::env::var_os("POTTER_BLENDER") else {
+        assert!(
+            std::env::var_os("POTTER_REQUIRE_BLENDER").is_none(),
+            "POTTER_REQUIRE_BLENDER is set but POTTER_BLENDER is not"
+        );
+        eprintln!("skipping packed Bake loss check: POTTER_BLENDER is unset");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let blend = directory.path().join("packed-bake.blend");
+    let script = r#"
+import bpy, sys
+blend = sys.argv[sys.argv.index("--") + 1]
+obj = bpy.context.object
+tree = bpy.data.node_groups.new("Geometry", "GeometryNodeTree")
+tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+cube = tree.nodes.new("GeometryNodeMeshCube")
+bake_node = tree.nodes.new("GeometryNodeBake")
+bake_node.bake_items.new("GEOMETRY", "Geometry")
+output = tree.nodes.new("NodeGroupOutput")
+tree.links.new(cube.outputs["Mesh"], bake_node.inputs["Geometry"])
+tree.links.new(bake_node.outputs["Geometry"], output.inputs["Geometry"])
+modifier = obj.modifiers.new("GeometryNodes", "NODES")
+modifier.node_group = tree
+modifier.bake_target = "PACKED"
+bake = modifier.bakes[0]
+assert len(bake.data_blocks) == 0
+result = bpy.ops.object.geometry_node_bake_single(
+    session_uid=obj.session_uid, modifier_name=modifier.name, bake_id=bake.bake_id)
+assert "FINISHED" in result
+assert len(bake.data_blocks) == 0
+bpy.ops.wm.save_as_mainfile(filepath=blend)
+"#;
+    run_ok(
+        Command::new(blender)
+            .args([
+                "-b",
+                "--factory-startup",
+                "--python-exit-code",
+                "1",
+                "--python-expr",
+                script,
+                "--",
+            ])
+            .arg(&blend),
+        "creating a packed geometry Bake with no data-block references",
+    )?;
+    let imported = directory.path().join("packed-bake-import");
+    run_json(
+        pot().arg("init").arg(&imported),
+        "initializing the import project",
+    )?;
+    let revision = document(&imported)?["revision"]
+        .as_u64()
+        .ok_or_else(|| std::io::Error::other("initialized project revision is missing"))?;
+    let output = pot()
+        .arg("import")
+        .arg(&imported)
+        .arg("--file")
+        .arg(&blend)
+        .args(["--format", "blend", "--base-revision"])
+        .arg(revision.to_string())
+        .arg("--json")
+        .output()?;
+    assert!(!output.status.success());
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(response["error"]["code"], "UNREPRESENTABLE_FEATURE");
+    assert!(
+        response["result"]["losses"]
+            .as_array()
+            .is_some_and(|losses| {
+                losses
+                    .iter()
+                    .any(|loss| loss["feature_id"] == "blender.modifier.nodes_bake_packed")
+            })
+    );
+    Ok(())
+}
