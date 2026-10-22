@@ -144,9 +144,9 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                 let deformed_meshes = snapshot
                     .meshes
                     .iter()
-                    .filter(|(id, _)| {
+                    .filter(|&(id, _)| {
                         matches_target(id)
-                            && doc.nodes.get(*id).is_some_and(|node| {
+                            && doc.nodes.get(id).is_some_and(|node| {
                                 [
                                     "physics_cloth",
                                     "physics_soft_body",

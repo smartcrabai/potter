@@ -720,8 +720,8 @@ pub(super) fn extract_geometry(
                                 .map(|local| matrix.transform_point3(*local))
                         })
                         .collect();
-                    if let Some(positions) = positions {
-                        wire_builder.add_polygon(&face.vertices, &positions, face_corner_normals);
+                    if let Some(positions) = &positions {
+                        wire_builder.add_polygon(&face.vertices, positions, face_corner_normals);
                     }
                 }
                 // Corners are numbered across faces in order, as `color_layers::read` lays them

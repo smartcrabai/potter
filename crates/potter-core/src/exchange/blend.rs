@@ -4006,11 +4006,13 @@ fn build_imported_graph(
                         .and_then(Value::as_array)
                         .ok_or_else(|| invalid_intermediate("UV Project projectors are invalid"))?
                         .iter()
-                        .filter_map(|projector| {
+                        // Empty slots stay in place: `projectors_num` counts them (MOD_uvproject.cc).
+                        .map(|projector| {
                             projector
                                 .get("object")
                                 .filter(|object| !object.is_null())
                                 .cloned()
+                                .unwrap_or(Value::Null)
                         })
                         .collect::<Vec<_>>();
                     params.insert("projectors".to_owned(), Value::Array(projectors));
@@ -4350,6 +4352,7 @@ fn build_imported_graph(
             up_axis: object_axis(item, "up_axis")?,
             transform,
             data: data_id,
+            active_vertex_group_index: None,
             materials: material_slots,
             material_links,
             modifiers,
@@ -4394,6 +4397,7 @@ fn build_imported_graph(
         doc.nodes.insert(id.clone(), node);
         if let Some(mesh_id) = data_name.and_then(|name| mesh_ids.get(name)) {
             let mut group_ids = BTreeMap::new();
+            let mut ordered_group_ids = Vec::new();
             for group_source in optional_array(item, "vertex_groups")? {
                 let group_name = group_source
                     .get("name")
@@ -4408,6 +4412,7 @@ fn build_imported_graph(
                     &mut mappings,
                     &format!("VertexGroup:{mesh_id}"),
                 )?;
+                ordered_group_ids.push(group_id.clone());
                 let Some(data) = doc.data_blocks.get_mut(mesh_id) else {
                     continue;
                 };
@@ -4427,6 +4432,25 @@ fn build_imported_graph(
                         .entry(vertex_id)
                         .or_default()
                         .insert(group_id.clone(), amount);
+                }
+            }
+            if let Some(active) = item
+                .get("active_vertex_group_index")
+                .and_then(Value::as_u64)
+            {
+                let active_group = usize::try_from(active)
+                    .ok()
+                    .and_then(|index| ordered_group_ids.get(index))
+                    .ok_or_else(|| {
+                        invalid_intermediate("active vertex-group index is out of range")
+                    })?;
+                let active_index = doc.data_blocks.get(mesh_id).and_then(|data| {
+                    data.vertex_groups
+                        .iter()
+                        .position(|group| group.id == *active_group)
+                });
+                if let Some(node) = doc.nodes.get_mut(&id) {
+                    node.active_vertex_group_index = active_index;
                 }
             }
             if let (Some(group_names), Some(data)) = (
@@ -16385,10 +16409,10 @@ print("RIGPROBE " + json.dumps({"groups": groups, "shapes": shape_names,
                                 custom_shape: None,
                                 envelope_distance: 0.25,
                                 envelope_weight: 1.0,
+                                select: false,
                                 head_radius: 0.1,
                                 tail_radius: 0.1,
                                 bbone_settings: BTreeMap::new(),
-                                select: false,
                             },
                         ),
                         (
@@ -16405,10 +16429,10 @@ print("RIGPROBE " + json.dumps({"groups": groups, "shapes": shape_names,
                                 custom_shape: None,
                                 envelope_distance: 0.25,
                                 envelope_weight: 1.0,
+                                select: false,
                                 head_radius: 0.1,
                                 tail_radius: 0.1,
                                 bbone_settings: BTreeMap::new(),
-                                select: false,
                             },
                         ),
                     ]),

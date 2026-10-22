@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     image::{
-        ColourCache, ImageData, ImageInterpolation, ImageStorage,
+        ColourCache, ImageData, ImageInterpolation, ImageStorage, Precision,
         storage::{ImageUserSelection, load_image_data_for_legacy_texture},
     },
     model::{Id, Image, ImageAlphaMode, ImageColorspace, SceneDoc, migrate},
@@ -247,6 +247,8 @@ pub(crate) struct ImageSamplerSettings {
     pub(crate) use_clamp: bool,
     source_channels: usize,
     source_srgb_encoded: bool,
+    /// An 8-bit source: its texels are premultiplied as Blender's byte `ibuf_get_color` does (texture_image.cc:78-81).
+    source_byte: bool,
     use_color_ramp: bool,
     color_ramp: ColorRamp,
 }
@@ -279,6 +281,7 @@ pub(crate) const DEFAULT_IMAGE_SETTINGS: ImageSamplerSettings = ImageSamplerSett
     use_clamp: false,
     source_channels: 4,
     source_srgb_encoded: false,
+    source_byte: false,
     use_color_ramp: false,
     color_ramp: DEFAULT_COLOR_RAMP,
 };
@@ -299,6 +302,36 @@ enum ResolvedTextureKind {
     Legacy(LegacyTexture),
 }
 impl ResolvedTexture {
+    /// Whether a colour read of this texture is linear: Blender's `do_color_manage` converts an 8-bit sRGB image's RGB
+    /// result to scene linear (`texture_procedural.cc`, after `imagewrap` un-premultiplies it). Float buffers are
+    /// linear already.
+    pub(crate) fn linearises_rgb(&self) -> bool {
+        match &self.resolved {
+            ResolvedTextureKind::ImageWithSettings { settings, .. } => {
+                settings.source_srgb_encoded && settings.source_byte
+            }
+            ResolvedTextureKind::Image(_) | ResolvedTextureKind::Legacy(_) => false,
+        }
+    }
+
+    /// A texture for an image already in memory, sampled as Blender's image Tex is: the
+    /// `DNA_texture_types.h` defaults (`extend = TEX_REPEAT`, `imaflag = TEX_INTERPOL | TEX_USEALPHA`,
+    /// `flag = TEX_CHECKER_ODD | TEX_NO_CLAMP`) with `TEX_INTERPOL` cleared for `Closest` images, read
+    /// through `BKE_texture_get_value` as in `MOD_weightvg_util.cc:166`.
+    #[must_use]
+    pub fn from_image(image: ImageData) -> Self {
+        // The file facts `load_legacy_image` records, taken from the image itself: sRGB storage, and 8-bit texels.
+        let settings = ImageSamplerSettings {
+            interpolation: matches!(image.interpolation, ImageInterpolation::Linear),
+            source_srgb_encoded: image.srgb,
+            source_byte: image.storage.precision == Precision::Byte,
+            ..DEFAULT_IMAGE_SETTINGS
+        };
+        Self {
+            resolved: ResolvedTextureKind::ImageWithSettings { image, settings },
+        }
+    }
+
     pub(crate) fn source(&self) -> TextureSource<'_> {
         match &self.resolved {
             ResolvedTextureKind::Image(image) => TextureSource::Image(image),
@@ -1255,6 +1288,7 @@ fn load_legacy_image(
         load_image_data_for_legacy_texture(image, root, interpolation, image_user)?;
     sampler.source_channels = source_channels;
     sampler.source_srgb_encoded = color_pass && image.colorspace == ImageColorspace::Srgb;
+    sampler.source_byte = data.storage.precision == Precision::Byte;
     Ok(data)
 }
 
@@ -1595,26 +1629,23 @@ fn image_pixel(
         .get(index)
         .copied()
         .ok_or_else(|| invalid_image_sample("image texture texel index is invalid"))?;
+    // A buffer without RGB copies its single value into all four components (`ibuf_get_color`,
+    // texture_image.cc), so no colour is filled in here; `use_alpha` only selects the alpha (`talpha`).
     let mut texel = pixel.map(|value| value as f32);
-    if !matches!(settings.source_channels, 3 | 4) && settings.use_alpha && !settings.calculate_alpha
-    {
-        texel[..3].fill(1.0);
-    }
     if settings.source_srgb_encoded {
         texel[0] = srgb_encoded_channel(texel[0]);
         texel[1] = srgb_encoded_channel(texel[1]);
         texel[2] = srgb_encoded_channel(texel[2]);
     }
+    // Byte texels are premultiplied on read (`ibuf_get_color`, texture_image.cc:78-81); `imagewrap` divides by alpha
+    // after filtering. Float buffers keep the values as stored.
+    if settings.source_byte {
+        let alpha = texel[3];
+        texel[0] *= alpha;
+        texel[1] *= alpha;
+        texel[2] *= alpha;
+    }
     Ok(texel)
-}
-
-/// Blender premultiplies every texel before filtering, whatever the source format.
-fn premultiplied(texel: [f32; 4]) -> [f32; 3] {
-    [
-        texel[0] * texel[3],
-        texel[1] * texel[3],
-        texel[2] * texel[3],
-    ]
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1782,7 +1813,7 @@ fn sample_filter_rect(
     }
     if start_x == end_x && start_y == end_y {
         let texel = image_pixel(pixels, width, height_i, start_y, start_x, settings)?;
-        return Ok((premultiplied(texel), texel[3]));
+        return Ok(([texel[0], texel[1], texel[2]], texel[3]));
     }
     let mut rgb_sum = [0.0_f32; 3];
     let mut alpha_sum = 0.0_f32;
@@ -1801,7 +1832,7 @@ fn sample_filter_rect(
         }
         if start_x == end_x {
             let texel = image_pixel(pixels, width, height_i, row, start_x, settings)?;
-            let rgb = premultiplied(texel);
+            let rgb = [texel[0], texel[1], texel[2]];
             for channel in 0..3 {
                 rgb_sum[channel] += row_weight * rgb[channel];
             }
@@ -1820,7 +1851,7 @@ fn sample_filter_rect(
                 }
                 if weight > 0.0 {
                     let texel = image_pixel(pixels, width, height_i, row, column, settings)?;
-                    let rgb = premultiplied(texel);
+                    let rgb = [texel[0], texel[1], texel[2]];
                     for channel in 0..3 {
                         rgb_sum[channel] += weight * rgb[channel];
                     }
@@ -2058,7 +2089,7 @@ fn sample_image(
         )?
     } else {
         let texel = image_pixel(pixels, width, height_i, y, x, settings)?;
-        (premultiplied(texel), texel[3], 1.0)
+        ([texel[0], texel[1], texel[2]], texel[3], 1.0)
     };
     rgb = rgb.map(|value| value * coverage);
     let tint = if alpha_active {
@@ -3927,9 +3958,20 @@ mod tests {
             }),
             coords,
         )?;
-        assert_rgb_close(depth_without_alpha.rgb, [0.5625; 3]);
-        assert_eq!(depth_without_alpha.alpha, 1.0);
-        assert_eq!(depth_without_alpha.intensity, 0.5625);
+        // Blender 5.2.2 probe (tests/fixtures/legacy_depth/depth_alpha_probe.py, use_alpha off). The alpha is forced to 1
+        // without dividing, so rgb keeps the texel value.
+        let probe: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/legacy_depth/depth_alpha_probe.expected.json"
+        ))?;
+        let probe_off = &probe["use_alpha_off"];
+        let probe_red = probe_off["RED"].as_f64().ok_or("probe RED is missing")?;
+        let probe_alpha = probe_off["ALPHA"]
+            .as_f64()
+            .ok_or("probe ALPHA is missing")?;
+        let probe_int = probe_off["INT"].as_f64().ok_or("probe INT is missing")?;
+        assert_rgb_close(depth_without_alpha.rgb, [probe_red; 3]);
+        assert!((depth_without_alpha.alpha - probe_alpha).abs() < 1e-6);
+        assert!((depth_without_alpha.intensity - probe_int).abs() < 1e-6);
 
         let missing_pass = sample_scene_image_record(
             &mut doc,

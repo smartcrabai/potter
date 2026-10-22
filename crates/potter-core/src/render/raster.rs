@@ -606,6 +606,26 @@ pub(crate) fn camera_eye(camera: &Camera, eye: f64) -> Camera {
     result
 }
 
+/// The scene world's radiance along a view ray. Realtime Beauty shows it where no surface covers a sample, as EEVEE
+/// shows its world, and modes without one show their constant background colour.
+pub(crate) type WorldRadiance<'a> = &'a dyn Fn(DVec3) -> Result<DVec3>;
+
+/// The background a sample shows: the world's radiance along its ray when a world is given and the ray exists, else the
+/// constant background. The constant's alpha is the film's alpha either way.
+fn sample_background(
+    constant: [f64; 4],
+    world: Option<WorldRadiance<'_>>,
+    direction: Option<DVec3>,
+) -> Result<[f64; 4]> {
+    match (world, direction) {
+        (Some(world), Some(direction)) => {
+            let radiance = world(direction)?;
+            Ok([radiance.x, radiance.y, radiance.z, constant[3]])
+        }
+        _ => Ok(constant),
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "raster configuration is explicit at this low-level boundary"
@@ -617,6 +637,7 @@ pub(crate) fn rasterize_with_samples(
     height: u32,
     mode: Mode,
     background: [u8; 4],
+    world: Option<WorldRadiance<'_>>,
     samples: u32,
     seed: u32,
     filter_size: f64,
@@ -637,6 +658,7 @@ pub(crate) fn rasterize_with_samples(
             height,
             mode,
             background,
+            world,
             samples,
             seed,
             filter_size,
@@ -649,6 +671,7 @@ pub(crate) fn rasterize_with_samples(
             height,
             mode,
             background,
+            world,
             samples,
             seed,
             filter_size,
@@ -842,11 +865,12 @@ pub(crate) fn rasterize_with_samples(
                             sample_ray,
                             &frame,
                             background_linear,
+                            world,
                             shader,
                             sample_hit,
                         )?
                     } else {
-                        background_linear
+                        sample_background(background_linear, world, None)?
                     };
                     let count = f64::from(sample_index + 1);
                     let previous_weight = 1.0 - 1.0 / count;
@@ -942,6 +966,7 @@ pub(crate) fn rasterize_with_lines(
     height: u32,
     mode: Mode,
     background: [u8; 4],
+    world: Option<WorldRadiance<'_>>,
     samples: u32,
     seed: u32,
     filter_size: f64,
@@ -954,6 +979,7 @@ pub(crate) fn rasterize_with_lines(
         height,
         mode,
         background,
+        world,
         samples,
         seed,
         filter_size,
@@ -1108,6 +1134,7 @@ pub(crate) fn rasterize_wireframe(
         height,
         Mode::Wire,
         [0; 4],
+        None,
         1,
         0,
         // Wire is never a film Beauty render, so no film filter applies.
@@ -1122,6 +1149,7 @@ pub(crate) fn rasterize_wireframe(
         height,
         Mode::Wire,
         wireframe::background_rgba(),
+        None,
         1,
         0,
         0.0,
@@ -2198,6 +2226,7 @@ fn composite_sample(
     ray: Ray,
     frame: &CameraFrame,
     background: [f64; 4],
+    world: Option<WorldRadiance<'_>>,
     shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
 ) -> Result<[f64; 4]> {
@@ -2259,7 +2288,10 @@ fn composite_sample(
             tint: visible_hit.transparent_tint,
         }
     });
-    Ok(composite_layers(layers, background))
+    composite_layers_with_background(layers, background[3], || {
+        let background = sample_background(background, world, Some(ray.direction))?;
+        Ok([background[0], background[1], background[2]])
+    })
 }
 
 /// One surface of a pixel's stack, for `composite_layers`.
@@ -2281,7 +2313,11 @@ struct Layer {
 /// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
 /// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
 /// scalar composite of the layers. Returns the un-premultiplied colour and that alpha.
-fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
+fn composite_layers_with_background(
+    layers: impl IntoIterator<Item = Layer>,
+    background_alpha: f64,
+    background_rgb: impl FnOnce() -> Result<[f64; 3]>,
+) -> Result<[f64; 4]> {
     let mut transmittance = DVec3::ONE;
     let mut alpha_transmittance = 1.0;
     let mut premultiplied = DVec3::ZERO;
@@ -2295,15 +2331,25 @@ fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4
             break;
         }
     }
-    let background_alpha = background[3].clamp(0.0, 1.0);
-    premultiplied += DVec3::from_array([background[0], background[1], background[2]])
-        * (transmittance * background_alpha);
+    let background_alpha = background_alpha.clamp(0.0, 1.0);
+    // Opaque surfaces block the world, so avoid evaluating its graph for these samples.
+    let background_rgb = if transmittance == DVec3::ZERO {
+        [0.0; 3]
+    } else {
+        background_rgb()?
+    };
+    premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
     let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
     if alpha <= f64::MIN_POSITIVE {
-        return background;
+        return Ok([
+            background_rgb[0],
+            background_rgb[1],
+            background_rgb[2],
+            alpha,
+        ]);
     }
     let color = premultiplied / alpha;
-    [color.x, color.y, color.z, alpha]
+    Ok([color.x, color.y, color.z, alpha])
 }
 
 /// Primary-ray triangles. Realtime Beauty leaves out objects hidden from camera rays; the other
@@ -3088,6 +3134,7 @@ mod tests {
             32,
             Mode::Id,
             [0; 4],
+            None,
             1,
             0,
             1.5,
@@ -3125,6 +3172,7 @@ mod tests {
             height,
             Mode::Id,
             [0; 4],
+            None,
             1,
             0,
             1.5,
@@ -3193,6 +3241,7 @@ mod line_tests {
             5,
             Mode::Beauty,
             [242, 242, 242, 255],
+            None,
             1,
             0,
             1.5,
@@ -3322,6 +3371,7 @@ mod smooth_shading_tests {
             SIZE,
             mode,
             [0, 0, 0, 255],
+            None,
             1,
             0,
             1.5,
@@ -3563,8 +3613,9 @@ mod visibility_tests {
 
     use super::{
         AlphaMode, Camera, CameraFrame, Hit, Layer, Mode, PreparedTriangle, Projection, Ray,
-        StereoMode, Triangle, camera_frame, composite_layers, composite_sample, hit_opacity,
-        intersect_triangle, nearest_visible_hit, prepare_triangles, ray_for_pixel_in_frame,
+        StereoMode, Triangle, camera_frame, composite_layers_with_background, composite_sample,
+        hit_opacity, intersect_triangle, nearest_visible_hit, prepare_triangles,
+        ray_for_pixel_in_frame,
     };
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
@@ -3677,7 +3728,7 @@ mod visibility_tests {
         ray: Ray,
         frame: &CameraFrame,
         background: [f64; 4],
-    ) -> [f64; 4] {
+    ) -> super::Result<[f64; 4]> {
         let mut layers: Vec<(usize, Hit)> = Vec::new();
         for (index, triangle) in triangles.iter().enumerate() {
             let Some(hit) = intersect_triangle(triangle, ray, frame) else {
@@ -3693,7 +3744,7 @@ mod visibility_tests {
             layers.insert(at, (index, hit));
             layers.truncate(16);
         }
-        composite_layers(
+        composite_layers_with_background(
             layers.iter().map(|(index, _)| {
                 let triangle = &triangles[*index];
                 let color = triangle.source.color;
@@ -3703,7 +3754,8 @@ mod visibility_tests {
                     tint: [1.0; 3],
                 }
             }),
-            background,
+            background[3],
+            || Ok([background[0], background[1], background[2]]),
         )
     }
 
@@ -3757,7 +3809,8 @@ mod visibility_tests {
                 let ray = ray_for_pixel_in_frame(&frame, camera.position, SIZE, SIZE, x, y)
                     .expect("pixel ray")
                     .expect("the perspective test view has a ray");
-                let expected = scan_composite(&prepared, ray, &frame, BACKGROUND);
+                let expected = scan_composite(&prepared, ray, &frame, BACKGROUND)
+                    .expect("reference composite resolves");
                 let actual = composite_sample(
                     &prepared,
                     &visibility,
@@ -3765,6 +3818,7 @@ mod visibility_tests {
                     ray,
                     &frame,
                     BACKGROUND,
+                    None,
                     None,
                     None,
                 )
@@ -3777,7 +3831,16 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod composite_layer_tests {
-    use super::{Layer, composite_layers};
+    use super::{Layer, composite_layers_with_background};
+
+    fn composite_layers(
+        layers: impl IntoIterator<Item = Layer>,
+        background: [f64; 4],
+    ) -> super::Result<[f64; 4]> {
+        composite_layers_with_background(layers, background[3], || {
+            Ok([background[0], background[1], background[2]])
+        })
+    }
 
     fn assert_close(actual: [f64; 4], expected: [f64; 4]) {
         for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
@@ -3796,7 +3859,7 @@ mod composite_layer_tests {
     /// Background (0.5,0.5,0.5), alpha 0.6: colour += (0.5,0.5,0.5) * (0.1,0.1,0) * 0.6 = (0.03,0.03,0).
     /// So the colour sums to (0.53,0.03,0) and the alpha is 1 - (0.25 * 1.4/3) * (1 - 0.6).
     #[test]
-    fn coloured_layers_over_a_partly_transparent_background() {
+    fn coloured_layers_over_a_partly_transparent_background() -> super::Result<()> {
         let layers = [
             Layer {
                 rgb: [1.0, 0.0, 0.0],
@@ -3810,14 +3873,15 @@ mod composite_layer_tests {
             },
         ];
         let alpha = 1.0 - (0.25 * 1.4 / 3.0) * (1.0 - 0.6);
-        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 0.6]);
+        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 0.6])?;
         assert_close(actual, [0.53 / alpha, 0.03 / alpha, 0.0, alpha]);
+        Ok(())
     }
 
     /// Two panes that tint different channels over a transparent film. Each mean is 1/3, so the alpha is
     /// 1 - (1/3) * (1/3) = 8/9. A product of the colour vectors would give zero transmittance and alpha 1.
     #[test]
-    fn overlapping_panes_multiply_their_alpha_means() {
+    fn overlapping_panes_multiply_their_alpha_means() -> super::Result<()> {
         let layers = [
             Layer {
                 rgb: [0.0; 3],
@@ -3830,27 +3894,30 @@ mod composite_layer_tests {
                 tint: [0.0, 1.0, 0.0],
             },
         ];
-        let actual = composite_layers(layers, [0.0; 4]);
+        let actual = composite_layers(layers, [0.0; 4])?;
         assert_close(actual, [0.0, 0.0, 0.0, 8.0 / 9.0]);
+        Ok(())
     }
 
     /// A white layer is the scalar composite: colour (0.8,0.2,0.4) at opacity 0.25 over an opaque background of
     /// (0.5,0.5,0.5). The colour is 0.25 * (0.8,0.2,0.4) + 0.75 * (0.5,0.5,0.5) = (0.575,0.425,0.475), alpha 1.
     #[test]
-    fn white_layer_is_the_scalar_composite() {
+    fn white_layer_is_the_scalar_composite() -> super::Result<()> {
         let layers = [Layer {
             rgb: [0.8, 0.2, 0.4],
             opacity: 0.25,
             tint: [1.0; 3],
         }];
-        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 1.0]);
+        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 1.0])?;
         assert_close(actual, [0.575, 0.425, 0.475, 1.0]);
+        Ok(())
     }
 
     /// No layer over a fully transparent background is that background, as the film has nothing to show.
     #[test]
-    fn empty_stack_over_transparent_background_is_the_background() {
-        let actual = composite_layers(std::iter::empty(), [0.3, 0.4, 0.5, 0.0]);
+    fn empty_stack_over_transparent_background_is_the_background() -> super::Result<()> {
+        let actual = composite_layers(std::iter::empty(), [0.3, 0.4, 0.5, 0.0])?;
         assert_close(actual, [0.3, 0.4, 0.5, 0.0]);
+        Ok(())
     }
 }

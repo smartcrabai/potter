@@ -21,7 +21,8 @@ use super::{
     pixel_filter::PixelFilter,
     raster::{
         Camera, CameraEngine, DepthOfField, Mode, Projection, RasterOutput, StereoMode,
-        SurfaceShader, ViewBasis, projection_for_camera, rasterize_wireframe, rasterize_with_lines,
+        SurfaceShader, ViewBasis, WorldRadiance, projection_for_camera, rasterize_wireframe,
+        rasterize_with_lines,
     },
     scene::{Geometry, extract_geometry, surface_shader},
     wireframe,
@@ -233,6 +234,7 @@ pub fn render_previews(
                 request.size,
                 mode,
                 background,
+                None,
                 1,
                 0,
                 scene.render.filter_size,
@@ -369,7 +371,25 @@ pub(crate) fn render_camera_frame(
         .scenes
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
-    let background = background_color(doc, &snapshot, mode, film_transparent);
+    // Realtime Beauty shows the world along each ray, from its node tree or colour, as EEVEE does. Its constant is
+    // black, so only the film's alpha of the constant is used.
+    let scene_world = scene.world.as_ref().and_then(|id| doc.worlds.get(id));
+    let beauty_world = scene_world.filter(|_| matches!(mode, Mode::Beauty));
+    let background = match beauty_world {
+        Some(_) => [
+            0,
+            0,
+            0,
+            background_color(doc, &snapshot, mode, film_transparent)[3],
+        ],
+        None => background_color(doc, &snapshot, mode, film_transparent),
+    };
+    let images_ref = &images;
+    let world_radiance = beauty_world.map(|world| {
+        move |direction: DVec3| {
+            crate::shader::evaluate_world(world, &doc.node_groups, images_ref, direction)
+        }
+    });
     let mut raster = if matches!(mode, Mode::Beauty) && engine == "path" {
         super::path::render(
             doc,
@@ -395,6 +415,9 @@ pub(crate) fn render_camera_frame(
             height,
             mode,
             background,
+            world_radiance
+                .as_ref()
+                .map(|evaluate| evaluate as WorldRadiance<'_>),
             samples,
             seed,
             scene.render.filter_size,
@@ -661,6 +684,7 @@ fn rasterize_view(
     height: u32,
     mode: Mode,
     background: [u8; 4],
+    world: Option<WorldRadiance<'_>>,
     samples: u32,
     seed: u32,
     filter_size: f64,
@@ -675,6 +699,7 @@ fn rasterize_view(
             height,
             mode,
             background,
+            world,
             samples,
             seed,
             filter_size,
