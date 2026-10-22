@@ -1796,7 +1796,7 @@ fn attach_native_packed_bake_states(
         let Some(bake_losses) = modifier.get("bake_losses") else {
             continue;
         };
-        let bake_ids = bake_losses
+        bake_losses
             .get("bake_ids")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid_intermediate("node-bake IDs are missing from bake metadata"))?;
@@ -1841,6 +1841,11 @@ fn attach_native_packed_bake_states(
         .filter_map(|object| object.get_mut("modifiers").and_then(Value::as_array_mut))
         .flatten()
     {
+        let modifier_name = modifier
+            .get("blender_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid_intermediate("Blender modifier name is missing"))?;
         let Some(bake_losses) = modifier
             .get_mut("bake_losses")
             .and_then(Value::as_object_mut)
@@ -1869,10 +1874,6 @@ fn attach_native_packed_bake_states(
             .get("owner_name")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_intermediate("Bake owner identity is missing"))?;
-        let modifier_name = modifier
-            .get("blender_name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_intermediate("Blender modifier name is missing"))?;
         let mut reported_ids = BTreeSet::new();
         let mut packed_payloads = Vec::new();
         let mut packed_unmapped_ids = Vec::new();
