@@ -34,10 +34,10 @@ mod process;
 use std::{error::Error, path::Path};
 
 use native_oracle::{
-    TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
+    TestResult, apply_operations, import_blend, node_id, pot, read_scene, run_blender_arguments,
     write_script,
 };
-use potter_core::image::{ImageInterpolation, load_image_data, sample};
+use potter_core::image::{ImageData, ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
 use serde_json::json;
 use tempfile::tempdir;
@@ -84,62 +84,7 @@ fn realtime_glass_direct_light_matches_eevee() -> TestResult {
     let root = tempdir()?;
     let script = write_script(root.path(), "eevee_glass_direct.py", EEVEE_SCRIPT)?;
     for (scene, eevee) in SCENES {
-        let blend = root.path().join(format!("{scene}.blend"));
-        run_blender_arguments(
-            &blender,
-            &script,
-            None,
-            &[
-                Path::new(scene),
-                blend.as_path(),
-                Path::new("-"),
-                Path::new("-"),
-            ],
-        )?;
-
-        let project_name = format!("project_{scene}");
-        let (project, _) = import_blend(&blender, root.path(), &project_name, &blend)?;
-        let scene_data = read_scene(&project)?;
-        let active = scene_data["active_scene"]
-            .as_str()
-            .ok_or("active scene is missing")?
-            .to_owned();
-        let applied = apply_operations(
-            &project,
-            root.path(),
-            json!([
-                {"op": "camera.create", "id": "camera_main", "transform": {"translation": [0.0, 0.0, 10.0]}, "projection": "orthographic", "ortho_scale": ORTHO_SCALE},
-                {"op": "scene.update", "target": {"id": active}, "set": {"camera": "camera_main"}},
-                {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 1, "seed": 0}}
-            ]),
-        )?;
-        assert_eq!(applied["ok"], true, "{applied}");
-
-        let frames = root.path().join(format!("frames_{scene}"));
-        let rendered = pot()
-            .arg("render")
-            .arg(&project)
-            .args(["--engine", "realtime", "--format", "exr", "--out"])
-            .arg(&frames)
-            .arg("--json")
-            .output()?;
-        // Diagnostic: the DIAG lines of `scene.rs` (`glass_direct_contribution`) are on the render's stderr.
-        eprint!("{}", String::from_utf8_lossy(&rendered.stderr));
-        assert!(
-            rendered.status.success(),
-            "{scene}: realtime render failed: {}",
-            String::from_utf8_lossy(&rendered.stdout)
-        );
-        let loaded = apply_operations(
-            &project,
-            root.path(),
-            json!([{"op": "image.load", "id": "render", "path": frames.join("frame_0001.exr").to_string_lossy()}]),
-        )?;
-        assert_eq!(loaded["ok"], true, "{loaded}");
-
-        let image: Image =
-            serde_json::from_value(read_scene(&project)?["images"]["render"].clone())?;
-        let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
+        let data = render_realtime_scene(&blender, root.path(), &script, scene, None)?;
         let eevee_pixels = eevee_rgb(eevee)?;
         for (name, centre_x) in SPHERES {
             let worst = worst_deviation(&data, &eevee_pixels, sphere_centre_px(centre_x))?;
@@ -154,6 +99,117 @@ fn realtime_glass_direct_light_matches_eevee() -> TestResult {
         }
     }
     Ok(())
+}
+
+#[test]
+fn realtime_glass_direct_reflection_honors_light_visible_glossy() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(root.path(), "eevee_glass_direct.py", EEVEE_SCRIPT)?;
+    let data = render_realtime_scene(&blender, root.path(), &script, "point_above", Some(false))?;
+    let black = vec![[0.0; 3]; (SIZE * SIZE) as usize];
+    for (name, centre_x) in SPHERES {
+        let worst = worst_deviation(&data, &black, sphere_centre_px(centre_x))?;
+        assert!(
+            worst.max <= 1.0e-6,
+            "{name} sphere still reflects a light with visible_glossy=false: RGB {:?} at world {:?}",
+            worst.actual,
+            worst.world,
+        );
+    }
+    let transmission = render_realtime_scene(&blender, root.path(), &script, "point_below", Some(false))?;
+    let eevee_pixels = eevee_rgb(EEVEE_POINT_BELOW)?;
+    for (name, centre_x) in SPHERES {
+        let worst = worst_deviation(&transmission, &eevee_pixels, sphere_centre_px(centre_x))?;
+        assert!(
+            worst.max <= TOLERANCE,
+            "{name} glass transmission changed with light visible_glossy=false: {:?} differs from EEVEE {:?} by {}",
+            worst.actual,
+            worst.wanted,
+            worst.max,
+        );
+    }
+    Ok(())
+}
+
+fn render_realtime_scene(
+    blender: &Path,
+    root: &Path,
+    script: &Path,
+    scene: &str,
+    visible_glossy: Option<bool>,
+) -> TestResult<ImageData> {
+    let blend = root.join(format!("{scene}.blend"));
+    run_blender_arguments(
+        blender,
+        script,
+        None,
+        &[
+            Path::new(scene),
+            blend.as_path(),
+            Path::new("-"),
+            Path::new("-"),
+        ],
+    )?;
+
+    let project_name = format!("project_{scene}");
+    let (project, _) = import_blend(blender, root, &project_name, &blend)?;
+    let scene_data = read_scene(&project)?;
+    let active = scene_data["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?
+        .to_owned();
+    let mut operations = vec![
+        json!({"op": "camera.create", "id": "camera_main", "transform": {"translation": [0.0, 0.0, 10.0]}, "projection": "orthographic", "ortho_scale": ORTHO_SCALE}),
+        json!({"op": "scene.update", "target": {"id": active}, "set": {"camera": "camera_main"}}),
+        json!({"op": "render.update", "target": {"id": active}, "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 1, "seed": 0}}),
+    ];
+    if let Some(visible_glossy) = visible_glossy {
+        let light = node_id(&scene_data, &format!("Light_{scene}"))?;
+        operations.push(json!({
+            "op": "node.update",
+            "target": {"id": light},
+            "set": {"ray_visibility": {
+                "camera": false,
+                "diffuse": true,
+                "glossy": visible_glossy,
+                "transmission": true,
+                "volume_scatter": true,
+                "shadow": true
+            }}
+        }));
+    }
+    let applied = apply_operations(&project, root, json!(operations))?;
+    assert_eq!(applied["ok"], true, "{applied}");
+
+    let frames = root.join(format!("frames_{scene}"));
+    let rendered = pot()
+        .arg("render")
+        .arg(&project)
+        .args(["--engine", "realtime", "--format", "exr", "--out"])
+        .arg(&frames)
+        .arg("--json")
+        .output()?;
+    assert!(
+        rendered.status.success(),
+        "{scene}: realtime render failed: {}",
+        String::from_utf8_lossy(&rendered.stdout)
+    );
+    let loaded = apply_operations(
+        &project,
+        root,
+        json!([{"op": "image.load", "id": "render", "path": frames.join("frame_0001.exr").to_string_lossy()}]),
+    )?;
+    assert_eq!(loaded["ok"], true, "{loaded}");
+
+    let image: Image = serde_json::from_value(read_scene(&project)?["images"]["render"].clone())?;
+    Ok(load_image_data(
+        &image,
+        &project,
+        ImageInterpolation::Closest,
+    )?)
 }
 
 /// The committed EEVEE render's RGB values, one `[f64; 3]` per pixel in Blender's row order.

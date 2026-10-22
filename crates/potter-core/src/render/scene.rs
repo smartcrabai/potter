@@ -2563,6 +2563,7 @@ fn shade(
             let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
             let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
             let influence = light_influence_at(light, matrix, point, light_threshold);
+            let ray_visibility = light_node.resolved_ray_visibility();
             lobes += light_contribution(
                 light,
                 matrix,
@@ -2574,7 +2575,7 @@ fn shade(
                 &shading,
                 shadow,
                 point_shadow,
-                light_node.resolved_ray_visibility(),
+                ray_visibility,
             ) * influence;
             if let Some(glass) = &glass {
                 lobes += glass_direct_contribution(
@@ -2583,6 +2584,7 @@ fn shade(
                     receiver,
                     glass,
                     thickness,
+                    ray_visibility,
                     shadow,
                     point_shadow,
                 ) * influence;
@@ -3307,6 +3309,7 @@ fn glass_direct_contribution(
     receiver: Receiver,
     glass: &GlassLight,
     thickness: Thickness,
+    ray_visibility: RayVisibility,
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
 ) -> DVec3 {
@@ -3324,7 +3327,7 @@ fn glass_direct_contribution(
         receiver.normal,
         false,
     );
-    if facing > 0.0 {
+    if ray_visibility.allows(RayKind::Glossy) && facing > 0.0 {
         let visibility = match direct.area {
             Some(shape) => area_visible_fraction(
                 shadow,
@@ -3353,34 +3356,6 @@ fn glass_direct_contribution(
             glass.reflection_matrix,
             direct.to_centre,
         );
-        // TEMPORARY DIAGNOSTIC (remove after the glass_direct regression is found): the reflection's terms at the
-        // point_above clear-sphere pixel at world (-2.098, -0.0396).
-        let target = receiver.point - DVec3::new(-2.098, -0.0396, 0.0);
-        if target.x.abs() < 0.02 && target.y.abs() < 0.02 && receiver.point.z > 0.5 {
-            let map = point_shadow.map(|map| map.visibility(receiver.shadow_point));
-            let bvh = shadow_visibility(
-                shadow,
-                receiver.shadow_point,
-                receiver.geometric,
-                direct.direction,
-                direct.shadow_distance,
-                0.0,
-            );
-            eprintln!(
-                "DIAG point={:?} normal={:?} view={:?} facing={facing:.4} attenuation={:.4} visibility={visibility:.4} \
-                 map_vis={map:?} bvh_vis={bvh:.4} form={form:.4} radiance={:?} reflection={:?} specular_factor={:.3} \
-                 dist={:.4} light_pos={:?}",
-                receiver.point,
-                receiver.normal,
-                receiver.view,
-                direct.attenuation,
-                direct.radiance,
-                glass.reflection,
-                factors.specular,
-                direct.distance,
-                matrix.transform_point3(DVec3::ZERO),
-            );
-        }
         result += glass.reflection
             * direct.radiance
             * (direct.attenuation * facing * visibility * form * factors.specular);

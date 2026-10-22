@@ -366,9 +366,10 @@ pub(crate) struct GlassLight {
     pub(crate) transmission_matrix: PackedMatrix,
 }
 
-/// The inputs both glass evaluations share at a shading point: the clamped IOR and roughness, the `bsdf_lut` split, the
-/// reflection tint, and the lobe weight `lower · (1 - metallic) · transmission`.
+/// The inputs both glass evaluations share at a shading point: the viewer-facing normal, clamped IOR and roughness, the
+/// `bsdf_lut` split, reflection tint, and lobe weight `lower · (1 - metallic) · transmission`.
 struct GlassLobe {
+    normal: DVec3,
     ior: f64,
     roughness: f64,
     split: GlassSplit,
@@ -376,9 +377,14 @@ struct GlassLobe {
     lobe_weight: DVec3,
 }
 
-/// The glass lobe at a shading point, or `None` when its weight `(1 - metallic) · transmission` is zero or the view is
-/// below the normal.
+/// The glass lobe at a shading point, with its normal oriented toward the view, or `None` when its weight
+/// `(1 - metallic) · transmission` is zero or the view is tangent to the normal.
 fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> Option<GlassLobe> {
+    let normal = if normal.dot(view) < 0.0 {
+        -normal
+    } else {
+        normal
+    };
     let weight = (1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0);
     if weight <= 0.0 || normal.dot(view) <= 0.0 {
         return None;
@@ -392,6 +398,7 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> 
     let transmission_tint = DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
     let reflection_tint = DVec3::from_array(params.glass_reflection_tint).max(DVec3::ZERO);
     Some(GlassLobe {
+        normal,
         ior,
         roughness,
         split: glass_split(ior, roughness, normal.dot(view), f0, transmission_tint),
@@ -400,9 +407,10 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> 
     })
 }
 
-/// The glass closures of a Principled Transmission or Glass BSDF at a shading point with `normal`, seen along `view`,
-/// with `lower` the layers above it (coat and sheen) and `thickness` the object's thickness. `None` when the
-/// transmission weight `(1 - metallic) · transmission` is zero or the view is below the normal.
+/// The glass closures of a Principled Transmission or Glass BSDF at a shading point, with the normal oriented toward the
+/// view (flipped when needed for a double-sided material), seen along `view`, with `lower` the layers above it (coat and
+/// sheen) and `thickness` the object's thickness. `None` when the transmission weight `(1 - metallic) · transmission` is
+/// zero or the view is tangent to the normal.
 pub(crate) fn glass_closures(
     params: &BsdfParams,
     normal: DVec3,
@@ -418,11 +426,11 @@ pub(crate) fn glass_closures(
     }
     Some(GlassClosures {
         reflection,
-        reflection_direction: reflection_direction(normal, view, lobe.roughness),
+        reflection_direction: reflection_direction(lobe.normal, view, lobe.roughness),
         reflection_roughness: lobe.roughness,
         transmission,
         transmission_direction: transmission_direction(
-            normal,
+            lobe.normal,
             view,
             lobe.ior,
             lobe.roughness,
@@ -447,10 +455,10 @@ pub(crate) fn glass_light(
         transmission *= transmission;
     }
     let (transmission_normal, cos_theta) =
-        transmission_light_normal(normal, view, lobe.ior, lobe.roughness, thickness);
+        transmission_light_normal(lobe.normal, view, lobe.ior, lobe.roughness, thickness);
     Some(GlassLight {
         reflection: lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight,
-        reflection_matrix: sample_matrix(normal.dot(view), lobe.roughness),
+        reflection_matrix: sample_matrix(lobe.normal.dot(view), lobe.roughness),
         transmission,
         transmission_normal,
         transmission_matrix: sample_matrix(

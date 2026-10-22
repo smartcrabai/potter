@@ -78,7 +78,7 @@ fn from_up_axis(up: DVec3) -> DMat3 {
 /// `tangent_basis`: the columns `T1`, `T2`, `N`, with `T1` along the view's tangent component.
 fn tangent_basis(normal: DVec3, view: DVec3) -> DMat3 {
     let normal_view = normal.dot(view);
-    if normal_view > 0.999_999 {
+    if normal_view.abs() > 0.999_999 {
         return from_up_axis(normal);
     }
     let t1 = (view - normal * normal_view).normalize_or_zero();
