@@ -7831,6 +7831,7 @@ mod tests {
                 assert_eq!(modifier.modifier_type, "lattice");
                 Ok(Some(2))
             },
+            |_, _, _| Ok(None),
         )
         .unwrap()
         .mesh;
