@@ -29,6 +29,7 @@ fn modifier(modifier_type: &str, params: Value) -> Modifier {
         show_viewport: true,
         show_render: true,
         params: serde_json::from_value(params).unwrap(),
+        baked_ocean_cache: None,
         binding_data: None,
         runtime: ModifierRuntime::default(),
     }
