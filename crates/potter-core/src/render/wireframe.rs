@@ -923,6 +923,7 @@ mod oracle_tests {
             normals: None,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
+            ray_mask: crate::model::RayVisibility::default().mask(),
         }
     }
 

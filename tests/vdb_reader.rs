@@ -605,7 +605,7 @@ fn reads_blender_float_half_vector_tile_and_nonuniform_transform_grids()
     assert_close(f64::from(grid.sample_index([-2, 0, 1])), 1.25, 1.0e-6);
     assert_close(
         f64::from(grid.sample_index([10, 10, 10])),
-        f64::from(grid.tree.background),
+        grid.tree.background,
         1.0e-6,
     );
     assert_eq!(grid.active_bbox, Some(([-2, 0, 0], [0, 0, 1])));
@@ -645,7 +645,7 @@ fn reads_blender_float_half_vector_tile_and_nonuniform_transform_grids()
     assert_close(f64::from(tile_grid.sample_index([7, 7, 7])), 2.0, 1.0e-6);
     assert_close(
         f64::from(tile_grid.sample_index([8, 8, 8])),
-        f64::from(tile_grid.tree.background),
+        tile_grid.tree.background,
         1.0e-6,
     );
     assert_eq!(tile_grid.active_bbox, Some(([0, 0, 0], [7, 7, 7])));
@@ -783,6 +783,7 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
             "replace",
             "--base-revision",
             "0",
+            "--allow-lossy",
             "--blender",
             blender.to_str().unwrap(),
         ],

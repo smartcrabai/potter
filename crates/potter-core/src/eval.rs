@@ -799,6 +799,43 @@ impl Snapshot {
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
     ) -> Result<Self> {
+        // Settings that an accepted lossy import reported are not evaluated: evaluate a copy without them,
+        // and carry one warning per value.
+        let accepted = crate::physics_support::without_accepted_losses(doc);
+        let (doc, accepted_warnings) = match &accepted {
+            Some((copy, warnings)) => (copy, warnings.clone()),
+            None => (doc, Vec::new()),
+        };
+        let mut snapshot = Self::evaluate_gated_inner(
+            doc,
+            scene_hash,
+            simulation_scene_hash,
+            context,
+            modifier_context,
+            selected_nodes,
+            suppressed,
+            mesh_dependencies,
+            world_matrix_ids,
+            modifier_prefix,
+            driver_values,
+        )?;
+        snapshot.warnings.splice(0..0, accepted_warnings);
+        Ok(snapshot)
+    }
+
+    fn evaluate_gated_inner(
+        doc: &SceneDoc,
+        scene_hash: &str,
+        simulation_scene_hash: &str,
+        context: &EvaluationContext,
+        modifier_context: ModifierEvaluationContext<'_>,
+        selected_nodes: Option<&BTreeSet<Id>>,
+        suppressed: &BTreeSet<Id>,
+        mesh_dependencies: &ObjectMeshDependencies,
+        world_matrix_ids: Option<&BTreeSet<Id>>,
+        modifier_prefix: Option<ModifierPrefix<'_>>,
+        driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+    ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
             suppressed,
@@ -907,7 +944,23 @@ impl Snapshot {
         let mut paint_colors = BTreeMap::new();
         let mut paint_weights = BTreeMap::new();
         let simulation_cache_key = simulation.as_ref().map(|result| result.cache_key.clone());
+        let mut simulation_warnings = Vec::new();
         if let Some(simulation) = simulation {
+            simulation_warnings = simulation
+                .fluid_warnings
+                .into_iter()
+                .map(|warning| {
+                    PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        warning.message,
+                        json!({
+                            "feature_id": "physics.fluid_domain.emitter_inside_effector",
+                            "node_id": warning.node_id,
+                            "status": "not_supported",
+                        }),
+                    )
+                })
+                .collect();
             simulated_velocities = simulation.linear_velocities;
             deformed_vertices = simulation.deformed_vertices;
             fluid_surfaces = simulation.fluid_surfaces;
@@ -1697,6 +1750,18 @@ impl Snapshot {
                             json!({ "data": data_id }),
                         )
                     })?;
+                    // Volume To Mesh is a Mesh-only modifier: Blender's OB_VOLUME accepts only
+                    // modifiers with a geometry-set hook, and MOD_volume_to_mesh has none
+                    // (object.cc BKE_object_support_modifier_type_check).
+                    if let Some(modifier) = node.modifiers.iter().find(|modifier| {
+                        gate.is_active(id, modifier) && modifier.modifier_type == "volume_to_mesh"
+                    }) {
+                        return Err(PotError::with_details(
+                            ErrorCode::InvalidOperation,
+                            "volume_to_mesh modifier can only be used on mesh objects",
+                            json!({"node_id":id,"modifier_id":modifier.id}),
+                        ));
+                    }
                     let mut generated = None;
                     for modifier in node.modifiers.iter().filter(|modifier| {
                         gate.is_active(id, modifier) && modifier.modifier_type == "mesh_to_volume"
@@ -1737,19 +1802,34 @@ impl Snapshot {
                                     json!({"modifier_id":modifier.id,"object":object_id}),
                                 )
                             })?;
-                        let owner_inverse = matrix.inverse();
-                        if !owner_inverse.is_finite() {
+                        // Blender's `ctx->object->world_to_object() * object_to_convert->object_to_world()`
+                        // in single precision (`MOD_mesh_to_volume.cc`).
+                        let owner_f32 =
+                            crate::geom::blender_matrix::blender_matrix_from_f64(matrix);
+                        let Some(owner_inverse_f32) =
+                            crate::geom::blender_matrix::blender_invert_m4(&owner_f32)
+                        else {
                             return Err(PotError::with_details(
                                 ErrorCode::InvalidArgument,
                                 "mesh-to-volume owner transform is singular",
                                 json!({"modifier_id":modifier.id,"owner":id}),
                             ));
-                        }
-                        let operand_to_owner = owner_inverse * operand_matrix;
-                        let mut transformed = (*operand_mesh).clone();
-                        for vertex in &mut transformed.vertices {
-                            vertex.co = operand_to_owner.transform_point3(vertex.co);
-                        }
+                        };
+                        // `world_to_object(owner) * object_to_world(operand)` in float (`MOD_mesh_to_volume.cc`);
+                        // the exact replay of the operand's composition is used when it applies.
+                        let mesh_to_owner = match crate::geom::blender_matrix::operand_to_subject(
+                            doc, id, &object_id, &matrices,
+                        ) {
+                            Some(replayed) => {
+                                crate::geom::blender_matrix::blender_matrix_from_f64(replayed)
+                            }
+                            None => crate::geom::blender_matrix::blender_mul_m4(
+                                &owner_inverse_f32,
+                                &crate::geom::blender_matrix::blender_matrix_from_f64(
+                                    operand_matrix,
+                                ),
+                            ),
+                        };
                         // A parameter the modifier does not store takes its Blender default from the schema table.
                         let number = |parameter: &str| -> Result<f64> {
                             match modifier.params.get(parameter).and_then(Value::as_f64) {
@@ -1777,25 +1857,52 @@ impl Snapshot {
                                     )
                                 })?,
                         };
+                        // Blender returns the input volume unchanged when the voxel size is below 1e-5 or
+                        // the voxel amount is below 1 (`MOD_mesh_to_volume.cc`, `mesh_to_volume`).
                         let voxel_size = match resolution_mode {
-                            "VOXEL_SIZE" => number("voxel_size")?,
+                            "VOXEL_SIZE" => {
+                                let voxel_size = number("voxel_size")?;
+                                (voxel_size >= 1.0e-5).then_some(voxel_size)
+                            }
                             "VOXEL_AMOUNT" => {
                                 let amount = number("voxel_amount")?;
-                                let bounds = transformed.bounds().ok_or_else(|| {
+                                // Blender's `volume_compute_voxel_size` takes the operand's local bounds, not
+                                // the bounds of its transformed vertices (`MOD_mesh_to_volume.cc`).
+                                let bounds = operand_mesh.bounds().ok_or_else(|| {
                                     PotError::with_details(
                                         ErrorCode::InvalidArgument,
                                         "mesh-to-volume operand mesh is empty",
                                         json!({"modifier_id":modifier.id}),
                                     )
                                 })?;
-                                if !amount.is_finite() || amount <= 0.0 {
+                                // The schema's minimum is 0; an amount below 1 keeps the input volume (below).
+                                if !amount.is_finite() || amount < 0.0 {
                                     return Err(PotError::with_details(
                                         ErrorCode::InvalidArgument,
-                                        "mesh-to-volume voxel_amount must be positive",
+                                        "mesh-to-volume voxel_amount must be non-negative",
                                         json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
                                     ));
                                 }
-                                (bounds.size().length() / amount) as f32 as f64
+                                // Blender computes the diagonal between the transformed bounds corners and the
+                                // voxel size in single precision (`volume_compute_voxel_size`, float4x4 and
+                                // float3), then divides by max(1, amount) in single precision.
+                                (amount >= 1.0).then(|| {
+                                    let flat: [f32; 16] = std::array::from_fn(|index| {
+                                        mesh_to_owner[index / 4][index % 4]
+                                    });
+                                    let minimum =
+                                        crate::geom::blender_matrix::blender_transform_point_f32(
+                                            &flat,
+                                            bounds.min.as_vec3(),
+                                        );
+                                    let maximum =
+                                        crate::geom::blender_matrix::blender_transform_point_f32(
+                                            &flat,
+                                            bounds.max.as_vec3(),
+                                        );
+                                    let diagonal = (maximum - minimum).length();
+                                    f64::from(diagonal / (amount as f32).max(1.0))
+                                })
                             }
                             _ => {
                                 return Err(PotError::with_details(
@@ -1805,13 +1912,16 @@ impl Snapshot {
                                 ));
                             }
                         };
-                        generated = Some(crate::geom::volume::mesh_to_fog_volume(
-                            &transformed,
-                            voxel_size as f32 as f64,
-                            number("interior_band_width")?,
-                            number("density")?,
-                            true,
-                        )?);
+                        if let Some(voxel_size) = voxel_size {
+                            generated =
+                                Some(crate::geom::volume::mesh_to_fog_volume_with_transform(
+                                    operand_mesh,
+                                    &mesh_to_owner,
+                                    voxel_size as f32 as f64,
+                                    number("interior_band_width")?,
+                                    number("density")?,
+                                )?);
+                        }
                     }
                     if let Some(generated) = generated {
                         volume_data.insert(data_id.clone(), generated);
@@ -2066,7 +2176,10 @@ impl Snapshot {
             fluid_particles,
             paint_colors,
             paint_weights,
-            warnings: modifier_warnings,
+            warnings: simulation_warnings
+                .into_iter()
+                .chain(modifier_warnings)
+                .collect(),
         })
     }
 }
@@ -2625,7 +2738,9 @@ fn object_mesh_dependencies(
                 continue;
             }
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
-                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => &["object"],
+                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" | "volume_to_mesh" => {
+                    &["object"]
+                }
                 "shrinkwrap" => &["target", "auxiliary_target"],
                 "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
                 "array" => &["start_cap", "end_cap"],
@@ -5155,6 +5270,78 @@ fn lattice_vertex_group_weights(
     ))
 }
 
+/// The Volume to Mesh resolution of a modifier: `resolution_mode`, with `voxel_size` or `voxel_amount`
+/// for the resampled modes (`MOD_volume_to_mesh.cc`).
+fn volume_to_mesh_resolution(
+    modifier: &Modifier,
+) -> Result<crate::geom::volume::VolumeToMeshResolution> {
+    let default = |parameter: &str| {
+        crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            parameter,
+        )
+        .cloned()
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                format!("volume_to_mesh default `{parameter}` is missing"),
+            )
+        })
+    };
+    let mode_value = match modifier.params.get("resolution_mode") {
+        Some(value) => value.clone(),
+        None => default("resolution_mode")?,
+    };
+    let mode = mode_value.as_str().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "volume_to_mesh resolution_mode must be a string",
+            json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+        )
+    })?;
+    Ok(match mode {
+        "GRID" => crate::geom::volume::VolumeToMeshResolution::Grid,
+        "VOXEL_SIZE" => {
+            let size = match modifier.params.get("voxel_size") {
+                Some(value) => value.as_f64(),
+                None => default("voxel_size")?.as_f64(),
+            }
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh voxel_size must be a number",
+                    json!({"modifier_id":modifier.id,"parameter":"voxel_size"}),
+                )
+            })?;
+            crate::geom::volume::VolumeToMeshResolution::VoxelSize(size)
+        }
+        "VOXEL_AMOUNT" => {
+            let amount = match modifier.params.get("voxel_amount") {
+                Some(value) => value.clone(),
+                None => default("voxel_amount")?,
+            }
+            .as_u64()
+            .and_then(|amount| u32::try_from(amount).ok())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh voxel_amount must be a non-negative integer",
+                    json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
+                )
+            })?;
+            crate::geom::volume::VolumeToMeshResolution::VoxelAmount(amount)
+        }
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh resolution_mode must be GRID, VOXEL_SIZE, or VOXEL_AMOUNT",
+                json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+            ));
+        }
+    })
+}
+
 pub(crate) fn apply_volume_to_mesh_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -5257,15 +5444,96 @@ pub(crate) fn apply_volume_to_mesh_modifier(
             "volume_to_mesh source transform must be invertible",
         ));
     }
-    let volume_to_mesh = source_inverse * volume_world;
-    let mut extracted = crate::geom::volume::volume_to_mesh(volume, threshold)?;
-    for vertex in &mut extracted.vertices {
-        vertex.co = volume_to_mesh.transform_point3(vertex.co);
-        if !vertex.co.is_finite() {
-            return Err(PotError::invalid_argument(
-                "volume_to_mesh produced non-finite mesh coordinates",
-            ));
-        }
+    // `world_to_object(carrier) * object_to_world(volume)` in float (`MOD_volume_to_mesh.cc`); the exact
+    // replay applies when both objects have one, else the `f64` product is used.
+    let volume_to_mesh = crate::geom::blender_matrix::volume_to_carrier_f32(
+        doc,
+        source_node_id,
+        &volume_id,
+        matrices,
+    )
+    .unwrap_or_else(|| source_inverse * volume_world);
+    let grid_name = match modifier.params.get("grid_name") {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh grid_name must be a string",
+                    json!({"modifier_id":modifier.id,"parameter":"grid_name"}),
+                )
+            })?
+            .to_owned(),
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "grid_name",
+        )
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("density")
+        .to_owned(),
+    };
+    let adaptivity = match modifier.params.get("adaptivity") {
+        Some(value) => value.as_f64().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh adaptivity must be a number",
+                json!({"modifier_id":modifier.id,"parameter":"adaptivity"}),
+            )
+        })?,
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "adaptivity",
+        )
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0),
+    };
+    // The output transform is applied inside the extraction, in double precision, before the single
+    // rounding to `float` that Blender's mesh positions carry (`MOD_volume_to_mesh.cc`).
+    let use_smooth_shade = match modifier.params.get("use_smooth_shade") {
+        Some(value) => value.as_bool().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh use_smooth_shade must be a boolean",
+                json!({"modifier_id":modifier.id,"parameter":"use_smooth_shade"}),
+            )
+        })?,
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "use_smooth_shade",
+        )
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false),
+    };
+    let resolution = volume_to_mesh_resolution(modifier)?;
+    // Blender returns an empty mesh for a zero voxel size or voxel amount (`MOD_volume_to_mesh.cc`).
+    if match resolution {
+        crate::geom::volume::VolumeToMeshResolution::VoxelSize(size) => size <= 0.0,
+        crate::geom::volume::VolumeToMeshResolution::VoxelAmount(amount) => amount == 0,
+        crate::geom::volume::VolumeToMeshResolution::Grid => false,
+    } {
+        *mesh = Mesh::default();
+        return Ok(());
+    }
+    let extracted = crate::geom::volume::volume_to_mesh_placed(
+        volume,
+        threshold,
+        &grid_name,
+        adaptivity,
+        volume_to_mesh,
+        use_smooth_shade,
+        resolution,
+    )?;
+    if extracted
+        .vertices
+        .iter()
+        .any(|vertex| !vertex.co.is_finite())
+    {
+        return Err(PotError::invalid_argument(
+            "volume_to_mesh produced non-finite mesh coordinates",
+        ));
     }
     *mesh = extracted;
     Ok(())
@@ -6791,6 +7059,13 @@ fn apply_volume_displace_modifier(
             json!({"node_id":volume_id}),
         )
     })?;
+    // Blender's `ctx->object->object_to_world()` is composed in float (`object.cc`); the exact
+    // replay is used when it applies, else the f64 world matrix is rounded.
+    let subject_world =
+        crate::geom::blender_matrix::object_to_world(doc, volume_id, world_matrices, 0)
+            .map_or(volume_world, |matrix| {
+                crate::geom::blender_matrix::dmat4_from_blender(&matrix)
+            });
     let texture_mapping = if texture_source.is_some()
         && params
             .get("strength")
@@ -6799,7 +7074,7 @@ fn apply_volume_displace_modifier(
     {
         texture_coordinate_mapping_with_parameters(
             modifier,
-            volume_world,
+            subject_world,
             doc,
             world_matrices,
             bone_pose_matrices,

@@ -444,6 +444,19 @@ pub struct HitContext<'a> {
     /// Color layers at this hit, by layer name in layer order; see
     /// [`HitContext::with_color_layers`].
     pub color_layers: Option<&'a [(&'a str, [f64; 4])]>,
+    /// The camera footprint of a path-traced hit (Cycles' `sd->dP`); `None` where no camera footprint is tracked,
+    /// in which case a bump node uses its finite-difference fallback. See [`HitContext::with_footprint`].
+    pub footprint: Option<HitFootprint>,
+}
+
+/// The camera footprint of a path-traced hit: Cycles' compact `sd->dP` (`kernel/geom/shader_data.h`) and the
+/// geometric normal that orients its screen differentials (`differential_from_compact`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitFootprint {
+    /// The compact differential: the average length of the hit's screen differentials, in world units.
+    pub dp: f64,
+    /// The geometric normal of the hit's triangle.
+    pub geometric_normal: DVec3,
 }
 
 impl<'a> HitContext<'a> {
@@ -463,7 +476,15 @@ impl<'a> HitContext<'a> {
             view_direction: DVec3::Z,
             color_render: None,
             color_layers: None,
+            footprint: None,
         }
+    }
+
+    /// Attach the camera footprint of a path-traced hit, which bump nodes read (Cycles' `sd->dP`).
+    #[must_use]
+    pub const fn with_footprint(mut self, footprint: HitFootprint) -> Self {
+        self.footprint = Some(footprint);
+        self
     }
 
     /// Add pre-resolved pixels for Image Texture nodes and material texture references.
@@ -1284,6 +1305,15 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         }
     }
 
+    /// Whether `socket` of `node_id` takes a link, so its value comes from another node rather than the socket's
+    /// stored default.
+    fn is_linked(&self, node_id: &Id, socket: &str) -> bool {
+        self.group
+            .links
+            .iter()
+            .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket))
+    }
+
     fn output(&mut self, node_id: &Id, socket: &str, socket_index: usize) -> Result<Value> {
         let Some((node_key, node)) = self.group.nodes.get_key_value(node_id) else {
             return Err(invalid(format!(
@@ -1794,26 +1824,83 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         if socket != "Normal" {
             return Err(invalid(format!("unknown Bump output `{socket}`")));
         }
-        let normal = normalize_or(
-            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
-            self.hit_ctx.normal,
-        );
-        let strength = self.scalar_input(id, &["Strength"], 1.0)?;
-        let distance = self.scalar_input(id, &["Distance"], 1.0)?;
-        if strength.abs() <= f64::EPSILON || distance.abs() <= f64::EPSILON {
-            return Ok(Value::Vector(normal));
-        }
-        let context = self.hit_ctx;
-        let gradient = height_gradient(&context, normal, |context| self.height_at(id, context))?;
+        // Cycles' `stack_load_float3_default(stack, normal_offset, sd->N)` (`kernel/svm/displace.h`): an unlinked
+        // Normal is the shading normal, whatever the socket stores (Blender stores a zero vector there).
+        let normal = if self.is_linked(id, "Normal") {
+            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?
+        } else {
+            self.hit_ctx.normal
+        };
+        let strength = self.scalar_input(id, &["Strength"], 1.0)?.max(0.0);
+        let distance = self.scalar_input(id, &["Distance"], 0.001)?;
         let invert = self
             .node(id)?
             .properties
             .get("invert")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
-        let sign = if invert { -1.0 } else { 1.0 };
-        let perturbed = normal - gradient * (strength * distance * sign);
-        Ok(Value::Vector(normalize_or(perturbed, normal)))
+        let scale = if invert { -distance } else { distance };
+        if let Some(footprint) = self.hit_ctx.footprint {
+            let filter_width = self.scalar_input(id, &["Filter Width"], 0.1)?;
+            self.footprint_bump(id, normal, strength, scale, filter_width, footprint)
+        } else {
+            // Without a camera footprint (realtime, preview, baking) the height is a symmetric finite difference
+            // over a fixed step, and Filter Width has no footprint to scale: a known gap against Cycles.
+            if strength.abs() <= f64::EPSILON || distance.abs() <= f64::EPSILON {
+                return Ok(Value::Vector(normalize_or(normal, self.hit_ctx.normal)));
+            }
+            let unit = normalize_or(normal, self.hit_ctx.normal);
+            let context = self.hit_ctx;
+            let gradient = height_gradient(&context, unit, |context| self.height_at(id, context))?;
+            let perturbed = unit - gradient * (strength * scale);
+            Ok(Value::Vector(normalize_or(perturbed, unit)))
+        }
+    }
+
+    /// Cycles' `svm_node_set_bump` (`kernel/svm/displace.h`). The screen differentials `dP/dx` and `dP/dy` are
+    /// `differential_from_compact(Ng, dP)` (`kernel/util/differential.h`): the compact footprint along the two
+    /// axes of Ng's orthonormal basis. The height is taken at the centre and one filter width along each
+    /// differential, and the normal is `filter_width |det| N - scale sign(det) surfgrad`, where
+    /// `det = dPdx · (dPdy × N)` and `surfgrad = (h_x - h_c)(dPdy × N) + (h_y - h_c)(N × dPdx)`.
+    fn footprint_bump(
+        &mut self,
+        id: &Id,
+        normal: DVec3,
+        strength: f64,
+        scale: f64,
+        filter_width: f64,
+        footprint: HitFootprint,
+    ) -> Result<Value> {
+        let (axis_x, axis_y) = make_orthonormals(footprint.geometric_normal);
+        let dp_x = axis_x * footprint.dp;
+        let dp_y = axis_y * footprint.dp;
+        let rx = dp_y.cross(normal);
+        let ry = normal.cross(dp_x);
+        let det = dp_x.dot(rx);
+        let context = self.hit_ctx;
+        let center = self.height_at(id, &context)?;
+        let shifted_x = context.shifted(SurfaceStep {
+            world: dp_x * filter_width,
+            uv: [0.0; 2],
+        });
+        let shifted_y = context.shifted(SurfaceStep {
+            world: dp_y * filter_width,
+            uv: [0.0; 2],
+        });
+        let height_x = self.height_at(id, &shifted_x)?;
+        let height_y = self.height_at(id, &shifted_y)?;
+        let surfgrad = (height_x - center) * rx + (height_y - center) * ry;
+        // Cycles' `signf`, which maps zero to +1.
+        let sign = if det < 0.0 { -1.0 } else { 1.0 };
+        let raw = normal * (filter_width * det.abs()) - surfgrad * (scale * sign);
+        let bent = raw.normalize_or_zero();
+        if bent == DVec3::ZERO {
+            return Ok(Value::Vector(normal));
+        }
+        Ok(Value::Vector(normalize_or(
+            bent * strength + normal * (1.0 - strength),
+            normal,
+        )))
     }
 
     fn height_at(&mut self, id: &Id, context: &HitContext<'registry>) -> Result<f64> {
@@ -2135,6 +2222,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             "TANGENT" => first.tan(),
             "SQRT" => first.max(0.0).sqrt(),
             "ABSOLUTE" => first.abs(),
+            // Cycles' `NODE_MATH_FRACTION` (`intern/cycles/kernel/svm/math_util.h`): `a - floorf(a)`.
+            "FRACT" => first - first.floor(),
             "MINIMUM" => first.min(second),
             "MAXIMUM" => first.max(second),
             "LESS_THAN" => f64::from(first < second),
@@ -2680,6 +2769,29 @@ fn normalize_or(value: DVec3, fallback: DVec3) -> DVec3 {
     } else {
         fallback
     }
+}
+/// Cycles' `make_orthonormals` (`util/math_float3.h`): a tangent from the cross product with
+/// `(1, 1, 1)`, chosen by exact component equality, and the bitangent `N × tangent`.
+#[expect(
+    clippy::float_cmp,
+    reason = "Cycles selects the tangent basis by exact component equality of the normal"
+)]
+pub(crate) fn make_orthonormals(normal: DVec3) -> (DVec3, DVec3) {
+    let tangent = if normal.x != normal.y || normal.x != normal.z {
+        DVec3::new(
+            normal.z - normal.y,
+            normal.x - normal.z,
+            normal.y - normal.x,
+        )
+    } else {
+        DVec3::new(
+            normal.z - normal.y,
+            normal.x + normal.z,
+            -normal.y - normal.x,
+        )
+    }
+    .normalize_or_zero();
+    (tangent, normal.cross(tangent))
 }
 
 fn tangent_basis(normal: DVec3) -> (DVec3, DVec3) {

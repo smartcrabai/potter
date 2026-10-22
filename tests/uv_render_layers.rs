@@ -119,7 +119,10 @@ fn bump_material(uv_map: Option<&str>) -> (Material, Registry<NodeGroup>) {
                 node("OutputMaterial", &[("is_active_output", json!(true))], &[]),
             ),
             ("diffuse", node("ShaderNodeBsdfDiffuse", &[], &[])),
-            ("bump", node("ShaderNodeBump", &[], &[])),
+            (
+                "bump",
+                node("ShaderNodeBump", &[], &[("Distance", json!(1.0))]),
+            ),
             ("uv", node("ShaderNodeUVMap", &properties, &[])),
         ],
         &[

@@ -619,7 +619,7 @@ fn physics_reference_errors_report_exact_codes_and_pointers() {
             json!([{"op":"node.create","id":"emitter","kind":"box","params":{"size":1.0}}]),
             json!({"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"render_type":"OBJECT"}}),
             "INVALID_OPERATION",
-            Some("/settings/instance_object"),
+            Some("/operations/0/settings/instance_object"),
             None,
         ),
         invalid_case(
@@ -627,7 +627,7 @@ fn physics_reference_errors_report_exact_codes_and_pointers() {
             json!([{"op":"node.create","id":"emitter","kind":"box","params":{"size":1.0}}]),
             json!({"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"render_type":"OBJECT","instance_object":"emitter"}}),
             "INVALID_OPERATION",
-            Some("/settings/instance_object"),
+            Some("/operations/0/settings/instance_object"),
             None,
         ),
         invalid_case(
@@ -635,7 +635,7 @@ fn physics_reference_errors_report_exact_codes_and_pointers() {
             json!([{"op":"node.create","id":"emitter","kind":"box","params":{"size":1.0}}]),
             json!({"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"render_type":"OBJECT","instance_object":"absent"}}),
             "TARGET_NOT_FOUND",
-            Some("/settings/instance_object"),
+            Some("/operations/0/settings/instance_object"),
             None,
         ),
         invalid_case(
@@ -643,7 +643,7 @@ fn physics_reference_errors_report_exact_codes_and_pointers() {
             json!([{"op":"node.create","id":"emitter","kind":"box","params":{"size":1.0}}]),
             json!({"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"render_type":"COLLECTION","instance_collection":"absent"}}),
             "TARGET_NOT_FOUND",
-            Some("/settings/instance_collection"),
+            Some("/operations/0/settings/instance_collection"),
             None,
         ),
         invalid_case(
@@ -655,7 +655,7 @@ fn physics_reference_errors_report_exact_codes_and_pointers() {
             ]),
             json!({"op":"physics.dynamic_paint.update","target":{"id":"canvas"},"set":{"brushes":["brush"]}}),
             "INVALID_OPERATION",
-            Some("/settings/brushes/0"),
+            Some("/operations/0/settings/brushes/0"),
             None,
         ),
         invalid_case(
@@ -666,7 +666,7 @@ fn physics_reference_errors_report_exact_codes_and_pointers() {
             ]),
             json!({"op":"physics.dynamic_paint.update","target":{"id":"canvas"},"set":{"brushes":["absent"]}}),
             "TARGET_NOT_FOUND",
-            Some("/settings/brushes/0"),
+            Some("/operations/0/settings/brushes/0"),
             None,
         ),
     ];

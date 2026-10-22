@@ -233,6 +233,7 @@ pub fn render_previews(
                 background,
                 1,
                 0,
+                scene.render.filter_size,
                 shader.as_deref(),
             )?
         };
@@ -393,6 +394,7 @@ pub(crate) fn render_camera_frame(
             background,
             samples,
             seed,
+            scene.render.filter_size,
             shader.as_deref(),
         )?
     };
@@ -658,6 +660,7 @@ fn rasterize_view(
     background: [u8; 4],
     samples: u32,
     seed: u32,
+    filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<RasterOutput> {
     if !matches!(mode, Mode::Wire) {
@@ -671,6 +674,7 @@ fn rasterize_view(
             background,
             samples,
             seed,
+            filter_size,
             shader,
         );
     }
