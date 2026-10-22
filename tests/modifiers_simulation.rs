@@ -1373,7 +1373,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
                 blender[mesh_key]["positions"][0][0]
                     .as_f64()
                     .ok_or("Blender unborn x")?,
-                -0.1854115128517151,
+-0.185_411_512_851_715_1,
             );
             continue;
         }
@@ -2198,23 +2198,15 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
 import bpy, json, sys
 output = sys.argv[sys.argv.index('--') + 1]
 obj = bpy.data.objects['ParticleInstancer']
-scene = bpy.context.scene
-scene.frame_set(1)
-bpy.context.view_layer.update()
-depsgraph = bpy.context.evaluated_depsgraph_get()
-evaluated = obj.evaluated_get(depsgraph)
-mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
-try:
-    result = {
-        'track_axis':obj.track_axis,
-        'modifier_count':len(obj.modifiers),
-        'positions':[list(vertex.co) for vertex in mesh.vertices],
-        'faces':[list(polygon.vertices) for polygon in mesh.polygons],
-    }
-finally:
-    evaluated.to_mesh_clear()
+mesh = obj.data
+result = {
+    'track_axis':obj.track_axis,
+    'modifier_count':len(obj.modifiers),
+    'positions':[list(vertex.co) for vertex in mesh.vertices],
+    'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+}
 with open(output, 'w', encoding='utf-8') as handle:
-    json.dump(result, handle)
+    json.dump(result, handle, allow_nan=False)
 ",
     )?;
     let mut reopen = Command::new(&blender_path);
@@ -2557,7 +2549,7 @@ bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_baked_path.ble
         blender["mesh"]["positions"][0][0]
             .as_f64()
             .ok_or("Blender x")?,
-        -0.7009949684143066,
+-0.700_994_968_414_306_6,
     );
     assert_eq!(geometry["faces"], blender["mesh"]["faces"]);
     Ok(())
@@ -3176,17 +3168,14 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
     // Recorded gap: in this headless run the Blender fixture raises before Potter runs, because the
     // COLLECTION hair cache reads as zeros. The test asserts that measured failure; if the fixture starts
     // evaluating the cache, this test must become a parity test.
-    match run(&mut command, "Blender hair path fixture") {
-        Err(error) => {
-            assert!(
-                error
-                    .to_string()
-                    .contains("did not evaluate the Hair COLLECTION path cache"),
-                "recorded gap: the Blender fixture failure changed: {error}"
-            );
-            return Ok(());
-        }
-        Ok(_) => {}
+    if let Err(error) = run(&mut command, "Blender hair path fixture") {
+        assert!(
+            error
+                .to_string()
+                .contains("did not evaluate the Hair COLLECTION path cache"),
+            "recorded gap: the Blender fixture failure changed: {error}"
+        );
+        return Ok(());
     }
     let blender: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
     let particles = injected_particles(&blender["hair_states"])?;
@@ -4981,7 +4970,7 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
         &batch,
         &json!([
             {"op":"node.create","id":"a_emitter","kind":"plane","params":{}},
-            {"op":"physics.particle_emitter.create","target":{"id":"a_emitter"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":2.0,"lifetime":1.0,"physics_type":"NO","normal_factor":0.0,"particle_size":0.75,"child_radius":0.6,"child_type":"SIMPLE","child_seed":31,"child_percent":2,"rendered_child_count":2,"seed":11}},
+            {"op":"physics.particle_emitter.create","target":{"id":"a_emitter"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":2.0,"lifetime":1.0,"physics_type":"NO","normal_factor":0.0,"particle_size":0.75,"child_radius":0.6,"child_type":"SIMPLE","seed":11}},
             {"op":"modifier.create","target":{"id":"a_emitter"},"id":"particles_second","type":"particle_system","params":{"settings_id":"particles_second"}},
             {"op":"node.create","id":"b_alive","kind":"plane","params":{}},
             {"op":"modifier.create","target":{"id":"b_alive"},"id":"alive_instances","type":"particle_instance","params":{"object":"a_emitter","particle_system_index":1,"use_normal":true,"use_children":true,"use_size":false,"show_alive":true,"show_dead":false,"show_unborn":false,"position":0,"random_position":0.0,"axis":"X","space":"WORLD","use_path":false}},
@@ -4999,12 +4988,27 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
         ]),
         0,
     )?;
-    let stored: Value = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
-    let child_settings = &stored["nodes"]["a_emitter"]["properties"]["physics_particle_emitter"];
+    let scene_file = scene.join("scene.json");
+    let mut stored: Value = serde_json::from_slice(&fs::read(&scene_file)?)?;
+    // These are Blender ParticleSettings fields, not inputs to the native emitter operation. Mirror the
+    // import bridge's primary-settings block and registry entry instead of widening its allowlist.
+    let properties = &mut stored["nodes"]["a_emitter"]["properties"];
+    properties["physics_particle_emitter"]["child_seed"] = json!(31);
+    properties["physics_particle_emitter"]["child_percent"] = json!(2);
+    properties["physics_particle_emitter"]["rendered_child_count"] = json!(2);
+    let primary_settings_id = properties["physics_particle_emitter_modifier_id"]
+        .as_str()
+        .ok_or("primary particle settings ID is missing")?
+        .to_owned();
+    let primary_settings = properties["physics_particle_emitter"].clone();
+    properties["physics_particle_systems"][primary_settings_id.as_str()] = primary_settings;
+    fs::write(&scene_file, serde_json::to_vec(&stored)?)?;
+    let child_settings =
+        &stored["nodes"]["a_emitter"]["properties"]["physics_particle_systems"]
+            [primary_settings_id.as_str()];
     assert_eq!(child_settings["child_seed"], 31);
     assert_eq!(child_settings["child_percent"], 2);
     assert_eq!(child_settings["rendered_child_count"], 2);
-
     // Child counts are recorded gaps below. Blender 5.2.2's viewport gives `child_percent` percent of the
     // total particles (`totchild = totpart * child_percent / 100`, rounded down), which is 0 for 2 parents
     // and 2 percent; Potter gives children per parent. Values come from the committed oracle

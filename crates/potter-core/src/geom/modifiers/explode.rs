@@ -11,6 +11,7 @@ use crate::{
     blender_f32,
     blender_rng::BlenderRng,
     geom::{
+        clnor::{self, CornerNormalCode, NormalCodeOptions},
         Edge, Face, Mesh, Vertex,
         color_layers::{self, ColorDomain},
         edge_key,
@@ -325,6 +326,15 @@ pub fn explode(
     }
     origin.corners = Some(output_corner_copies);
     remap_attributes(mesh, &mut output, &origin)?;
+    // Blender rebuilds Explode loops from legacy MFace data, so their custom-normal codes are Auto.
+    if clnor::corner_codes(mesh)?.is_some() {
+        let automatic = vec![CornerNormalCode::Auto; clnor::corner_count(&output)];
+        clnor::write_codes(
+            &mut output,
+            Some(automatic.as_slice()),
+            NormalCodeOptions::default(),
+        )?;
+    }
     if let Some(corner_sources) = origin.corners.as_deref() {
         fill_triangle_byte_color_padding(mesh, &mut output, corner_sources)?;
     }
