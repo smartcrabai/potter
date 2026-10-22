@@ -18018,6 +18018,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
                 ("node_group".to_owned(), json!("group_geo")),
                 ("bakes".to_owned(), bakes),
             ]),
+            baked_ocean_cache: None,
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         });

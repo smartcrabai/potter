@@ -1101,7 +1101,7 @@ fn directory_open_error(error: &std::io::Error) -> PotError {
             "node-bake path contains a symlink or non-directory",
         )
     } else {
-        storage_error(&error)
+        storage_error(error)
     }
 }
 
