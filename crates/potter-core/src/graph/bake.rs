@@ -1048,9 +1048,10 @@ fn open_directory_chain(root: &File, relative: &Path, create: bool) -> Result<Op
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(PotError::io(&error)),
                 }
-                current = open_directory_at(&current, name).map_err(directory_open_error)?;
+                current = open_directory_at(&current, name)
+                    .map_err(|error| directory_open_error(&error))?;
             }
-            Err(error) => return Err(directory_open_error(error)),
+            Err(error) => return Err(directory_open_error(&error)),
         }
     }
     Ok(Some(current))
@@ -1088,7 +1089,7 @@ fn open_directory_at(parent: &File, name: &std::ffi::OsStr) -> std::io::Result<F
     }
 }
 
-fn directory_open_error(error: std::io::Error) -> PotError {
+fn directory_open_error(error: &std::io::Error) -> PotError {
     if matches!(
         error.kind(),
         std::io::ErrorKind::NotADirectory

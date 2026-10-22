@@ -3684,7 +3684,7 @@ mod node_bake_tests {
     use super::{NodeBakeFrame, NodeBakeRecord, NodeBakeValue, mix_bake_values, read_bake_value};
     use crate::{
         error::{ErrorCode, PotError, Result},
-        geom::{Face, IdCounters, Mesh, Vertex},
+        geom::{Edge, Face, IdCounters, Mesh, Vertex},
     };
     use glam::DVec3;
     use serde_json::json;
@@ -3694,8 +3694,21 @@ mod node_bake_tests {
         PotError::new(ErrorCode::InternalError, message)
     }
 
-    /// A triangle fan whose `next_id` counters allocate past every element ID, as a valid mesh must.
+    /// A single-triangle mesh with the boundary edges a valid mesh must carry (`face boundary edge is
+    /// missing` otherwise) and `next_id` counters allocated past every element ID.
     fn triangle(z: f64, vertex_count: u32, winding: [u32; 3]) -> Mesh {
+        let edges = [
+            [winding[0], winding[1]],
+            [winding[1], winding[2]],
+            [winding[2], winding[0]],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, vertices)| Edge {
+            id: u32::try_from(index).unwrap_or(u32::MAX),
+            vertices,
+        })
+        .collect::<Vec<_>>();
         Mesh {
             vertices: (0..vertex_count)
                 .map(|id| Vertex {
@@ -3703,6 +3716,7 @@ mod node_bake_tests {
                     co: DVec3::new(f64::from(id), 0.0, z),
                 })
                 .collect(),
+            edges,
             faces: vec![Face {
                 id: 0,
                 vertices: winding.to_vec(),
@@ -3710,7 +3724,7 @@ mod node_bake_tests {
             }],
             next_id: IdCounters {
                 vertex: vertex_count,
-                edge: 0,
+                edge: 3,
                 face: 1,
             },
             ..Mesh::default()
