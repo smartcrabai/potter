@@ -171,6 +171,7 @@ mod tests {
                 "mode":"BLOCKS", "octree_depth":3, "scale":0.9
             }))?,
             binding_data: None,
+            baked_ocean_cache: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
         let result = remesh_modifier(&source, &modifier)?;

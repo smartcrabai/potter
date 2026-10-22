@@ -260,6 +260,7 @@ fn modifier(id: impl Into<String>, modifier_type: &str, params: &Value) -> TestR
             .ok_or("modifier params must be an object")?
             .clone(),
         binding_data: None,
+        baked_ocean_cache: None,
         runtime: ModifierRuntime::default(),
     })
 }

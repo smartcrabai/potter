@@ -10,7 +10,7 @@ use crate::{
     error::{PotError, Result},
     geom::{
         Mesh,
-        bvh::{KdopTree, NearestHit},
+        bvh::{Bounds, KdopTree, NearestHit, TREE_EPSILON, kdop_bounds},
         modifiers::shrinkwrap::{closest_on_triangle, tri_weights},
     },
 };
@@ -105,18 +105,20 @@ impl SourceSampler {
             }
         }
         // `BLI_bvhtree_new` clamps the epsilon to FLT_EPSILON, so the leaves are the inflated kdop boxes.
-        let bounds: Vec<[f32; 6]> = triangles
+        let bounds: Vec<Bounds> = triangles
             .iter()
             .map(|triangle| {
-                KdopTree::leaf_bounds_for_triangle(
-                    triangle.vertices.map(|vertex| points[vertex].to_array()),
+                kdop_bounds(
+                    &triangle.vertices.map(|vertex| points[vertex].to_array()),
+                    TREE_EPSILON,
+                    6,
                 )
             })
             .collect();
         Ok(Self {
             triangles,
             points,
-            tree: KdopTree::from_leaf_bounds(&bounds),
+            tree: KdopTree::new(bounds, 2, 6),
         })
     }
 

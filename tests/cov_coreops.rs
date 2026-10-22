@@ -677,7 +677,7 @@ fn validation_reports_all_check_statuses_issue_severities_and_format_losses() {
                     ..Keyframe::default()
                 }],
             }],
-            slots: Vec::new(),
+            ..Action::default()
         },
     );
 

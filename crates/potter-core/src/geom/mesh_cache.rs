@@ -819,6 +819,7 @@ mod tests {
             show_render: true,
             params: serde_json::Map::new(),
             binding_data: None,
+            baked_ocean_cache: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
         let point_values = [

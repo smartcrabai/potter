@@ -117,6 +117,7 @@ fn mesh_volume_round_trip_stays_within_one_voxel_of_source_bounds() {
             ("padding".to_owned(), json!(1)),
         ]),
         binding_data: None,
+        baked_ocean_cache: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     };
     let modified = potter_core::geom::modifiers::evaluate_modifiers(

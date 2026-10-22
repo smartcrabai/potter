@@ -121,6 +121,7 @@ fn near_uv(a: [f64; 2], b: [f64; 2]) -> bool {
 fn scene(input: &Value) -> TestResult<SceneDoc> {
     let mesh: Mesh = serde_json::from_value(input["mesh"].clone())?;
     let modifier = Modifier {
+        baked_ocean_cache: None,
         id: Id::new("solidify")?,
         modifier_type: "solidify".to_owned(),
         name: "solidify".to_owned(),

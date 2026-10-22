@@ -2041,6 +2041,50 @@ def object_dump(obj):
             "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots"))}
 
 
+def _action_slot_assigned_objects(action, slot):
+    action_pointer = action.as_pointer()
+    slot_pointer = slot.as_pointer()
+    assigned = []
+    for obj in bpy.data.objects:
+        animation_data = obj.animation_data
+        if animation_data is None:
+            continue
+        active_action = animation_data.action
+        active_slot = getattr(animation_data, "action_slot", None)
+        if (active_action is not None and active_slot is not None
+                and active_action.as_pointer() == action_pointer
+                and active_slot.as_pointer() == slot_pointer):
+            assigned.append(obj)
+            continue
+        if any(
+                strip.action is not None
+                and strip.action.as_pointer() == action_pointer
+                and getattr(strip, "action_slot", None) is not None
+                and strip.action_slot.as_pointer() == slot_pointer
+                for track in animation_data.nla_tracks
+                for strip in track.strips):
+            assigned.append(obj)
+    return assigned
+
+
+def _modifier_bindings_for_fcurve(curve, slot, objects):
+    slot_identifier = getattr(slot, "identifier", None) or None
+    bindings = []
+    for obj in objects:
+        for modifier in obj.modifiers:
+            if modifier.type != "OCEAN":
+                continue
+            if modifier.path_from_id("time") == curve.data_path:
+                bindings.append({
+                    "node": obj.name_full,
+                    "modifier": modifier.name,
+                    "parameter": "time",
+                    "action_slot": slot_identifier,
+                })
+    return bindings
+
+
+
 def action_dump(action):
     slot_ids = _id_map(action, "potter.action_slot_ids_json")
     slots = []
@@ -2049,6 +2093,7 @@ def action_dump(action):
     try:
         for slot in action.slots:
             slot_curves = []
+            assigned_objects = _action_slot_assigned_objects(action, slot)
             for layer in action.layers:
                 for strip in layer.strips:
                     if strip.type != "KEYFRAME":
@@ -2059,7 +2104,10 @@ def action_dump(action):
                         channelbag = None
                     if channelbag is None:
                         continue
-                    bag_curves = [dump_fcurve(curve) for curve in channelbag.fcurves]
+                    bag_curves = [
+                        dict(dump_fcurve(curve), modifier_bindings=_modifier_bindings_for_fcurve(
+                            curve, slot, assigned_objects))
+                        for curve in channelbag.fcurves]
                     slot_curves.extend(bag_curves)
                     channelbags.append({"slot": getattr(slot, "identifier", ""),
                                         "layer": layer.name,
@@ -5331,10 +5379,10 @@ def _canonical_drivers(doc, node, source_drivers):
     return result
 
 
-def _canonical_nla(doc, node, source_tracks):
+def _canonical_nla(doc, node, source_tracks, action_slot_refs_by_action_id):
     """Rebuild NLA tracks from the canonical potter graph; compatibility
     payload only fills properties the graph does not model."""
-    model = _nla_from_model(doc, node)
+    model = _nla_from_model(doc, node, action_slot_refs_by_action_id)
     compat_by_track = {item.get("name"): item for item in source_tracks or []}
     result = []
     for track in model:
@@ -6410,19 +6458,23 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
             raise ValueError("sequencer strips contain an unresolved input cycle or reference")
 
 
-def _canonical_fcurves(model_curves, source_curves, doc, include_unmatched=True):
+def _canonical_fcurves(model_curves, source_curves, doc, include_unmatched=True,
+                       include_indices=None, include_unmatched_indices=()):
     sources = {}
     for source in source_curves:
         key = (source.get("path"), int(source.get("index", 0)))
         sources.setdefault(key, []).append(source)
     result = []
-    for model in model_curves:
+    for curve_index, model in enumerate(model_curves):
+        if include_indices is not None and curve_index not in include_indices:
+            continue
         path = model.get("path", "")
         index = int(model.get("index", 0))
         key = (blender_animation_path(path, doc), index)
         candidates = sources.get(key, [])
         source = candidates.pop(0) if candidates else None
-        if source is None and not include_unmatched:
+        if (source is None and not include_unmatched
+                and curve_index not in include_unmatched_indices):
             continue
         curve = dict(source or {})
         curve["path"] = path
@@ -6463,8 +6515,64 @@ def _model_action_slot(doc, action_id, model_slot, flat_curves):
     }
 
 
-def _canonical_action_data(doc, item, source, action_id):
-    model_curves = item.get("fcurves", [])
+def _modifier_binding_path(doc, object_map, binding):
+    node_id = binding.get("node")
+    node = doc.get("nodes", {}).get(node_id)
+    obj = object_map.get(node_id)
+    if node is None or obj is None:
+        raise ValueError("Action modifier binding references missing node %s" % node_id)
+    modifier_id = binding.get("modifier")
+    modifier_source = next(
+        (modifier for modifier in node.get("modifiers", [])
+         if modifier.get("id") == modifier_id), None)
+    if modifier_source is None:
+        raise ValueError("Action modifier binding references missing modifier %s"
+                         % modifier_id)
+    modifier = obj.modifiers.get(modifier_source.get("name", ""))
+    if modifier is None:
+        raise ValueError("Action modifier binding cannot resolve modifier %s on node %s"
+                         % (modifier_id, node_id))
+    parameter = binding.get("parameter")
+    if not isinstance(parameter, str) or not parameter:
+        raise ValueError("Action modifier binding has no parameter")
+    try:
+        return modifier.path_from_id(parameter)
+    except Exception as error:
+        raise ValueError("cannot resolve Action modifier parameter %s on modifier %s"
+                         % (parameter, modifier_id)) from error
+
+
+def _canonical_action_data(doc, item, source, action_id, object_map):
+    model_curves = [dict(curve) for curve in item.get("fcurves", [])]
+    binding_slots = {}
+    for raw_index, bindings in item.get("modifier_bindings", {}).items():
+        try:
+            curve_index = int(raw_index)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Action modifier binding has invalid FCurve index %s"
+                             % raw_index) from error
+        if curve_index < 0 or curve_index >= len(model_curves):
+            raise ValueError("Action modifier binding references missing FCurve %s"
+                             % raw_index)
+        if not isinstance(bindings, list):
+            raise ValueError("Action FCurve %s modifier bindings are not a vector"
+                             % raw_index)
+        if not bindings:
+            continue
+        paths = [_modifier_binding_path(doc, object_map, binding)
+                 for binding in bindings]
+        if any(path != paths[0] for path in paths[1:]):
+            raise ValueError(
+                "Action FCurve %s cannot represent modifier bindings with different data paths"
+                % raw_index)
+        model_curves[curve_index]["path"] = paths[0]
+        slot_ids = {binding.get("action_slot") for binding in bindings
+                    if binding.get("action_slot") is not None}
+        if len(slot_ids) > 1:
+            raise ValueError(
+                "Action FCurve %s cannot represent modifier bindings assigned to multiple Action slots"
+                % raw_index)
+        binding_slots[curve_index] = next(iter(slot_ids), None)
     flat_curves = _canonical_fcurves(
         model_curves, source.get("fcurves", []), doc)
     slot_sources = [dict(slot) for slot in source.get("slots", [])]
@@ -6484,14 +6592,33 @@ def _canonical_action_data(doc, item, source, action_id):
     if not slot_sources and flat_curves:
         slot_sources = [{"identifier": "", "name": item["name"],
                          "target_type": "OBJECT", "fcurves": flat_curves}]
-    elif len(slot_sources) == 1:
+    slot_ids = {slot.get("potter_id") for slot in slot_sources}
+    missing_slots = {slot_id for slot_id in binding_slots.values()
+                     if slot_id is not None and slot_id not in slot_ids}
+    if missing_slots:
+        raise ValueError("Action modifier binding references missing Action slot %s"
+                         % next(iter(missing_slots)))
+    if len(slot_sources) == 1:
         slot_sources = [dict(slot_sources[0], fcurves=flat_curves)]
-    else:
-        slot_sources = [
-            dict(slot, fcurves=_canonical_fcurves(
-                model_curves, slot.get("fcurves", []), doc, include_unmatched=False))
-            for slot in slot_sources
-        ]
+    elif len(slot_sources) > 1:
+        restored_slots = []
+        for slot in slot_sources:
+            slot_id = slot.get("potter_id")
+            include_indices = {
+                index for index in range(len(model_curves))
+                if index not in binding_slots
+                or binding_slots[index] is None
+                or binding_slots[index] == slot_id}
+            include_unmatched_indices = {
+                index for index, binding_slot in binding_slots.items()
+                if binding_slot is not None and binding_slot == slot_id}
+            restored_slots.append(dict(
+                slot,
+                fcurves=_canonical_fcurves(
+                    model_curves, slot.get("fcurves", []), doc,
+                    include_unmatched=False, include_indices=include_indices,
+                    include_unmatched_indices=include_unmatched_indices)))
+        slot_sources = restored_slots
     return slot_sources, flat_curves
 
 
@@ -6538,6 +6665,17 @@ def _slot_matches(slots, reference):
     return None
 
 
+def _action_slot_reference(action_slot_refs_by_action_id, action_id, slot_id):
+    if slot_id is None:
+        return None
+    slot_source = next((source for source in action_slot_refs_by_action_id.get(action_id, [])
+                        if source.get("potter_id") == slot_id), None)
+    if slot_source is None:
+        raise ValueError("Action references missing slot ID %s" % slot_id)
+    return {key: slot_source[key] for key in ("identifier", "name", "target_type")
+            if key in slot_source}
+
+
 def _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup):
     if not tracks:
         return
@@ -6559,13 +6697,17 @@ def _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup):
             set_props(strip, source_strip.get("custom_properties", {}))
             slot_reference = source_strip.get("action_slot")
             action_slots = action_slots_by_name.get(action.name_full, [])
+            if slot_reference is None and len(action_slots) > 1:
+                raise ValueError(
+                    "NLA strip %s uses a multi-slot Action without a slot assignment"
+                    % strip.name)
             slot = _slot_matches(action_slots, slot_reference)
             if slot_reference and slot is None:
                 raise ValueError("NLA strip %s references missing Action slot" % strip.name)
             if slot is not None and hasattr(strip, "action_slot"):
                 strip.action_slot = slot
 
-def _nla_from_model(doc, node):
+def _nla_from_model(doc, node, action_slot_refs_by_action_id):
     actions = doc.get("actions", {})
     tracks = []
     for source_track in node.get("nla_tracks", []):
@@ -6577,7 +6719,7 @@ def _nla_from_model(doc, node):
             if action is None:
                 raise ValueError("NLA strip references missing action %s" %
                                  source_strip.get("action"))
-            track["strips"].append({
+            strip = {
                 "name": action.get("name", "Action"),
                 "action": action.get("name"),
                 "properties": {
@@ -6592,7 +6734,14 @@ def _nla_from_model(doc, node):
                     "extrapolation": source_strip.get("extrapolation", "hold").upper(),
                     "blend_in": source_strip.get("blend_in", 0.0),
                     "blend_out": source_strip.get("blend_out", 0.0),
-                }})
+                },
+            }
+            slot_reference = _action_slot_reference(
+                action_slot_refs_by_action_id, source_strip.get("action"),
+                source_strip.get("action_slot"))
+            if slot_reference is not None:
+                strip["action_slot"] = slot_reference
+            track["strips"].append(strip)
         tracks.append(track)
     return tracks
 
@@ -7956,10 +8105,24 @@ def export_doc(doc, target, pack, scene_hash, context):
         slot_ids = _id_map(action, "potter.action_slot_ids_json")
         slots = list(action.slots)
         slot_sources = [
-            {"identifier": getattr(slot, "identifier", ""),
-             "name": getattr(slot, "name_display", getattr(slot, "name", "")),
-             "potter_id": slot_ids.get(getattr(slot, "identifier", ""))}
-            for slot in slots]
+            {
+                "identifier": getattr(slot, "identifier", ""),
+                "name": getattr(slot, "name_display", getattr(slot, "name", "")),
+                "target_type": getattr(slot, "target_id_type", ""),
+                "potter_id": slot_ids.get(getattr(slot, "identifier", "")),
+            }
+            for slot in slots
+        ]
+        model_slots = doc.get("actions", {}).get(action_id, {}).get("slots", [])
+        for slot_source in slot_sources:
+            if slot_source.get("potter_id"):
+                continue
+            slot_id = next((
+                model_slot.get("id") for model_slot in model_slots
+                if model_slot.get("blender_identifier") == slot_source.get("identifier")
+            ), None)
+            if slot_id:
+                slot_source["potter_id"] = slot_id
         action_map[action_id] = (action, slots, slot_sources)
         action_by_name[action.name_full] = action
         action_slots_by_name[action.name_full] = slots
@@ -7975,7 +8138,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         if source.get("fake_user"):
             action.use_fake_user = True
         slot_sources, flat_curves = _canonical_action_data(
-            doc, item, source, action_id)
+            doc, item, source, action_id, object_map)
         slot_ids = {}
         slots = []
         source_slot_refs = []
@@ -7987,11 +8150,13 @@ def export_doc(doc, target, pack, scene_hash, context):
             except Exception as error:
                 raise ValueError("cannot create Action slot %s (%s)" %
                                  (slot_name, target_type)) from error
+            slot_identifier = getattr(slot, "identifier", "")
+            slot_source = dict(slot_source, identifier=slot_identifier)
             slots.append(slot)
             source_slot_refs.append(slot_source)
             slot_id = slot_source.get("potter_id")
             if slot_id:
-                slot_ids[getattr(slot, "identifier", "")] = slot_id
+                slot_ids[slot_identifier] = slot_id
         if slot_ids:
             action["potter.action_slot_ids_json"] = json.dumps(slot_ids, sort_keys=True)
         action_slots_by_name[action.name_full] = slots
@@ -8012,6 +8177,10 @@ def export_doc(doc, target, pack, scene_hash, context):
         id_lookup[action.name_full] = action
         id_lookup[action_id] = action
     _resolve_deferred_id_assignments(id_lookup)
+    action_slot_refs_by_action_id = {
+        action_id: slot_refs
+        for action_id, (_action, _slots, slot_refs) in action_map.items()
+    }
     for data_id, data in doc.get("data_blocks", {}).items():
         shape = data.get("shape_keys") or {}
         action_id = shape.get("action")
@@ -8052,17 +8221,29 @@ def export_doc(doc, target, pack, scene_hash, context):
             action, slots, source_slot_refs = action_data
             obj.animation_data_create()
             obj.animation_data.action = action
-            reference = node.get("action_slot") or source_object.get("action_slot")
+            active_slot_id = (
+                (doc.get("actions", {}).get(action_id, {}).get("active_slots") or {}).get(node_id)
+                if action_id else None
+            )
+            reference = _action_slot_reference(
+                action_slot_refs_by_action_id, action_id, active_slot_id)
+            if reference is None and source_object.get("action") == action.name_full:
+                reference = source_object.get("action_slot")
             slot = None
             if reference:
                 slot = _slot_matches(slots, reference)
                 if slot is None:
                     raise ValueError("object %s references missing Action slot" % obj.name)
-            elif slots:
+            elif len(slots) == 1:
                 slot = slots[0]
+            elif len(slots) > 1:
+                raise ValueError(
+                    "object %s uses an Action with multiple slots but no slot assignment"
+                    % obj.name)
             if slot is not None:
                 obj.animation_data.action_slot = slot
-        tracks = _canonical_nla(doc, node, source_object.get("nla_tracks"))
+        tracks = _canonical_nla(
+            doc, node, source_object.get("nla_tracks"), action_slot_refs_by_action_id)
         _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup)
         hide_set_states = source_object.get("hide_set_by_view_layer") or {}
         restored_hide_set = False
