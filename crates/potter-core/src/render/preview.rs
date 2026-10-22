@@ -422,18 +422,32 @@ pub(crate) fn render_camera_frame(
         )?
     };
     drop(shader);
-    if engine == "realtime" && matches!(mode, Mode::Beauty) {
+    let realtime_volume_transport =
+        if engine == "realtime" && matches!(mode, Mode::Beauty) {
+            super::path::prepare_realtime_volume_transport(
+                doc,
+                &snapshot,
+                &geometry,
+                &images,
+                &geometry.shader_warnings,
+            )?
+        } else {
+            None
+        };
+    let mut volume_scratch = super::path::RealtimeVolumeScratch::default();
+    if let Some(transport) = &realtime_volume_transport {
         super::path::composite_realtime_volumes(
-            doc,
-            &snapshot,
-            &camera.camera,
-            width,
-            height,
-            seed,
-            film_transparent,
-            &images,
+            transport,
+            &geometry,
+            super::path::RealtimeVolumeFrame {
+                camera: &camera.camera,
+                width,
+                height,
+                seed,
+                film_transparent,
+            },
             &mut raster,
-            &geometry.shader_warnings,
+            &mut volume_scratch,
         )?;
     }
     crate::compositor::apply(

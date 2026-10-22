@@ -170,6 +170,10 @@ impl Geometry {
         }
         all
     }
+    /// The shared realtime BVH contains every geometry triangle; callers apply their own ray-kind filter.
+    pub(super) fn realtime_bvh(&self) -> Option<&Bvh> {
+        self.shadows.as_ref().map(|shadows| &shadows.bvh)
+    }
 }
 
 /// Shadow acceleration for the realtime Beauty engine; built once per geometry and shared by the per-pixel shading of
@@ -211,12 +215,9 @@ type ShadowContext<'a> = Option<ShadowScene<'a>>;
 /// Tolerance of shadow rays along their own surface and at a hit (the epsilon of the realtime shadow code).
 const SHADOW_EPSILON: f64 = 1.0e-5;
 
-/// Whether a surface casts a transparent shadow. EEVEE's pass needs the material compiled as transparent, a static
-/// property of its graph (`PreparedMaterial::is_transparent`: `GPU_MATFLAG_TRANSPARENT`), and transparent shadows on
-/// (`eevee_shader.cc` `transparent_shadows`, `eevee_material.cc` `has_transparent_shadows`). A material whose graph is
-/// opaque, such as a plain Principled, casts an ordinary shadow whatever its render method.
+/// Whether a surface casts a transparent shadow. Volume-only geometry has no surface to occlude a light.
 fn casts_transparent_shadow(material: &Material, prepared: &PreparedMaterial) -> bool {
-    material.use_transparent_shadow && prepared.is_transparent()
+    prepared.is_volume_only() || (material.use_transparent_shadow && prepared.is_transparent())
 }
 
 /// EEVEE's transparent shadow pass for one hit (`eevee_surf_shadow.bsl.hh`): a fragment is kept with probability
@@ -302,8 +303,13 @@ impl<'a> ShadowOccluders<'a> {
                     "triangle references an unmapped material",
                 )
             })?;
-        let prepared = self.geometry.prepared.get(triangle.material_index);
-        if !prepared.is_some_and(|prepared| casts_transparent_shadow(material, prepared)) {
+        let Some(prepared) = self.geometry.prepared.get(triangle.material_index) else {
+            return Ok(None);
+        };
+        if prepared.is_volume_only() {
+            return Ok(Some(1.0));
+        }
+        if !casts_transparent_shadow(material, prepared) {
             return Ok(None);
         }
         let shading = hit_params(
@@ -1918,6 +1924,15 @@ impl SurfaceShader for SceneShader<'_> {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
+        if matches!(self.mode, Mode::Beauty)
+            && prepared.is_some_and(|prepared| prepared.is_volume_only())
+        {
+            return Ok(SurfaceSample {
+                color: [0.0; 4],
+                has_surface: false,
+                transparent_tint: [1.0; 3],
+            });
+        }
         let graph_shading = if triangle.lit_per_pixel {
             material
                 .zip(prepared)
@@ -2014,6 +2029,7 @@ impl SurfaceShader for SceneShader<'_> {
         occluders.finish()?;
         Ok(SurfaceSample {
             color,
+            has_surface: true,
             transparent_tint: beauty_tint(material, surface_tint(closures)),
         })
     }
@@ -2413,6 +2429,9 @@ fn opaque_share(closures: &[ShaderClosure]) -> f64 {
 /// (`eevee_nodetree_lib.bsl.hh`, `closure_eval(ClosureTransparency)`), and Cycles sums the closures' transparent weights
 /// the same way. So a mix of closures passes `sum w (1 - alpha) tint`, and the tint is that over the pass chance.
 fn surface_tint(closures: &[ShaderClosure]) -> [f64; 3] {
+    if closures.is_empty() {
+        return [1.0; 3];
+    }
     weighted_tint(
         closures.iter().map(|closure| {
             (

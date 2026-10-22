@@ -333,10 +333,13 @@ pub(crate) struct SurfaceHit {
     pub(crate) view: DVec3,
 }
 
-/// What a surface shader returns at a hit: its linear RGBA, and the tint of the transparent share it passes.
+/// What the raster hit evaluator returns: its linear RGBA, whether it is a camera surface,
+/// and the tint of the transparent share it passes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SurfaceSample {
     pub(crate) color: [f64; 4],
+    /// Whether this sample is an actual surface rather than a volume-only boundary.
+    pub(crate) has_surface: bool,
     /// The Transparent closure's colour per channel, as `(1 - alpha) * tint` is its transmittance. White for a
     /// surface that passes nothing, and a Blender DITHERED material's channel mean (`scene.rs` `beauty_tint`).
     pub(crate) transparent_tint: [f64; 3],
@@ -347,6 +350,7 @@ impl SurfaceSample {
     pub(crate) fn opaque(color: [f64; 4]) -> Self {
         Self {
             color,
+            has_surface: true,
             transparent_tint: [1.0; 3],
         }
     }
@@ -2182,7 +2186,7 @@ fn nearest_visible_hit(
         let sample = hit_color(triangle, hit, ray, shader)?;
         // The nearest surface with opacity is the pixel's data-pass hit (ids, depth, normals, albedo, AO). A transparent
         // pane that only tints is not, so it cannot change those passes; the Beauty composite finds it separately.
-        if hit_opacity(&triangle.source, sample.color) > 0.0 {
+        if sample.has_surface && hit_opacity(&triangle.source, sample.color) > 0.0 {
             return Ok(Some(VisibleHit {
                 triangle_index,
                 hit,
@@ -2230,11 +2234,15 @@ fn composite_sample(
                 |cached| {
                     Ok(SurfaceSample {
                         color: cached.color,
+                        has_surface: true,
                         transparent_tint: cached.transparent_tint,
                     })
                 },
             )?;
-        if hit_opacity(&triangle.source, sample.color) <= 0.0 && is_white(sample.transparent_tint) {
+        if !sample.has_surface
+            || (hit_opacity(&triangle.source, sample.color) <= 0.0
+                && is_white(sample.transparent_tint))
+        {
             continue;
         }
         let visible_hit = VisibleHit {
@@ -2293,13 +2301,6 @@ struct Layer {
 /// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
 /// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
 /// scalar composite of the layers. Returns the un-premultiplied colour and that alpha.
-#[cfg(test)]
-fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
-    composite_layers_with_background(layers, background[3], || {
-        Ok([background[0], background[1], background[2]])
-    })
-    .expect("constant background evaluation cannot fail")
-}
 
 fn composite_layers_with_background(
     layers: impl IntoIterator<Item = Layer>,
@@ -3601,8 +3602,9 @@ mod visibility_tests {
 
     use super::{
         AlphaMode, Camera, CameraFrame, Hit, Layer, Mode, PreparedTriangle, Projection, Ray,
-        StereoMode, Triangle, camera_frame, composite_layers, composite_sample, hit_opacity,
-        intersect_triangle, nearest_visible_hit, prepare_triangles, ray_for_pixel_in_frame,
+        StereoMode, Triangle, camera_frame, composite_layers_with_background, composite_sample,
+        hit_opacity, intersect_triangle, nearest_visible_hit, prepare_triangles,
+        ray_for_pixel_in_frame,
     };
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
@@ -3715,7 +3717,7 @@ mod visibility_tests {
         ray: Ray,
         frame: &CameraFrame,
         background: [f64; 4],
-    ) -> [f64; 4] {
+    ) -> Result<[f64; 4]> {
         let mut layers: Vec<(usize, Hit)> = Vec::new();
         for (index, triangle) in triangles.iter().enumerate() {
             let Some(hit) = intersect_triangle(triangle, ray, frame) else {
@@ -3731,7 +3733,7 @@ mod visibility_tests {
             layers.insert(at, (index, hit));
             layers.truncate(16);
         }
-        composite_layers(
+        composite_layers_with_background(
             layers.iter().map(|(index, _)| {
                 let triangle = &triangles[*index];
                 let color = triangle.source.color;
@@ -3741,7 +3743,8 @@ mod visibility_tests {
                     tint: [1.0; 3],
                 }
             }),
-            background,
+            background[3],
+            || Ok([background[0], background[1], background[2]]),
         )
     }
 
@@ -3795,7 +3798,8 @@ mod visibility_tests {
                 let ray = ray_for_pixel_in_frame(&frame, camera.position, SIZE, SIZE, x, y)
                     .expect("pixel ray")
                     .expect("the perspective test view has a ray");
-                let expected = scan_composite(&prepared, ray, &frame, BACKGROUND);
+                let expected = scan_composite(&prepared, ray, &frame, BACKGROUND)
+                    .expect("reference composite resolves");
                 let actual = composite_sample(
                     &prepared,
                     &visibility,
@@ -3816,7 +3820,14 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod composite_layer_tests {
-    use super::{Layer, composite_layers};
+    use super::{Layer, composite_layers_with_background};
+
+    fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
+        composite_layers_with_background(layers, background[3], || {
+            Ok([background[0], background[1], background[2]])
+        })
+        .expect("constant test background resolves")
+    }
 
     fn assert_close(actual: [f64; 4], expected: [f64; 4]) {
         for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {

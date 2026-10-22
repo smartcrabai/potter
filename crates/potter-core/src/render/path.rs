@@ -623,6 +623,8 @@ struct Surface {
     /// One medium per volume closure that scatters or absorbs light, keyed by (object, closure index), as Cycles' object
     /// volume stack keys its entries (`kernel/types.h`, `VolumeStack`).
     media: Vec<MeshMedium>,
+    /// A linked Volume output with no linked Surface remains a boundary even at zero density.
+    volume_boundary: bool,
     object_index: u32,
     element_index: u32,
     /// The triangle the hit lies on, which a random walk entering through it must not hit first (`ray.self.prim`).
@@ -636,9 +638,9 @@ struct Surface {
 /// the change of its direction, per raster pixel. A path's footprint at a hit is `ray.dP + t · ray.dD` (Cycles'
 /// `differential_transfer_compact`, `kernel/util/differential.h`), with `t` the distance from the ray origin.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct CameraFootprint {
-    dp: f64,
-    dd: f64,
+pub(super) struct CameraFootprint {
+    pub(super) dp: f64,
+    pub(super) dd: f64,
 }
 
 impl CameraFootprint {
@@ -655,7 +657,7 @@ impl CameraFootprint {
 /// A perspective camera has `dP = 0` and an orthographic camera `dD = 0`. Panoramic, fisheye and depth-of-field
 /// cameras use the same finite difference rather than Cycles' per-projection formulas, and a one-pixel-wide or
 /// one-pixel-high image has no neighbour along that axis, which contributes nothing.
-fn camera_footprint(
+pub(super) fn camera_footprint(
     frame: &CameraFrame,
     camera: &Camera,
     width: u32,
@@ -1495,27 +1497,73 @@ pub(super) fn render(
     )?;
     Ok(output)
 }
-pub(super) fn composite_realtime_volumes(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    camera: &Camera,
-    width: u32,
-    height: u32,
-    seed: u32,
-    film_transparent: bool,
-    images: &BTreeMap<String, ImageData>,
-    output: &mut RasterOutput,
+
+
+fn geometry_has_volume_material(geometry: &Geometry) -> bool {
+    geometry.triangles.iter().any(|triangle| {
+        if triangle.ray_mask & RayKind::Camera.bit() == 0 {
+            return false;
+        }
+        let Some(material) = geometry.materials.get(triangle.material_index) else {
+            return false;
+        };
+        geometry
+            .prepared
+            .get(triangle.material_index)
+            .is_some_and(PreparedMaterial::has_volume_output)
+            || (material.node_tree.is_none()
+                && material.volume_density.is_finite()
+                && material.volume_density > 0.0)
+    })
+}
+pub(super) struct RealtimeVolumeTransport<'a> {
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    images: &'a BTreeMap<String, ImageData>,
+    bvh: Option<&'a Bvh>,
+    volumes: Vec<VolumeInstance<'a>>,
+    lights: Vec<PointLight>,
+    fallback: DVec3,
+    meters_per_unit: f64,
+    has_mesh_volumes: bool,
+}
+
+#[derive(Default)]
+pub(super) struct RealtimeVolumeScratch {
+    media: Vec<MeshMedium>,
+    hit_media: Vec<MeshMedium>,
+    boundaries: Vec<(f64, MeshMedium)>,
+    evaluator_workspace: EvaluatorWorkspace,
+}
+
+pub(super) struct RealtimeVolumeFrame<'a> {
+    pub camera: &'a Camera,
+    pub width: u32,
+    pub height: u32,
+    pub seed: u32,
+    pub film_transparent: bool,
+}
+
+pub(super) fn prepare_realtime_volume_transport<'a>(
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    geometry: &'a Geometry,
+    images: &'a BTreeMap<String, ImageData>,
     warnings: &RefCell<Vec<serde_json::Value>>,
-) -> Result<()> {
+) -> Result<Option<RealtimeVolumeTransport<'a>>> {
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
     let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images, warnings)?;
-    if volumes.is_empty() {
-        return Ok(());
+    let has_mesh_volumes = geometry_has_volume_material(geometry);
+    let bvh = geometry.realtime_bvh();
+    if has_mesh_volumes && bvh.is_none() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "realtime mesh volume tracing requires the geometry BVH",
+        ));
     }
-    let lights = collect_lights(doc, snapshot);
     let fallback = scene
         .world
         .as_ref()
@@ -1523,12 +1571,74 @@ pub(super) fn composite_realtime_volumes(
         .map_or(DVec3::ZERO, |world| {
             DVec3::from_array(world.color) * world.strength
         });
+    Ok(Some(RealtimeVolumeTransport {
+        doc,
+        snapshot,
+        images,
+        bvh,
+        volumes,
+        lights: collect_lights(doc, snapshot),
+        fallback,
+        meters_per_unit: scene.unit.scale_length,
+        has_mesh_volumes,
+    }))
+}
+
+
+pub(super) fn composite_realtime_volumes(
+    transport: &RealtimeVolumeTransport<'_>,
+    geometry: &Geometry,
+    render: RealtimeVolumeFrame<'_>,
+    output: &mut RasterOutput,
+    scratch: &mut RealtimeVolumeScratch,
+) -> Result<()> {
+    if transport.volumes.is_empty() && !transport.has_mesh_volumes {
+        return Ok(());
+    }
+    let RealtimeVolumeFrame {
+        camera,
+        width,
+        height,
+        seed,
+        film_transparent,
+    } = render;
     let width_usize = usize::try_from(width).map_err(|_| {
         PotError::new(
             ErrorCode::LimitExceeded,
             "image width exceeds platform limits",
         )
     })?;
+    let trace_geometry = TraceGeometry::of(geometry);
+    let mesh_query = if transport.has_mesh_volumes {
+        let bvh = transport.bvh.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "realtime mesh volume tracing requires the geometry BVH",
+            )
+        })?;
+        let scene = SceneRefs {
+            doc: transport.doc,
+            snapshot: transport.snapshot,
+            geometry: &trace_geometry,
+            bvh,
+            lights: &transport.lights,
+            volumes: &transport.volumes,
+            images: transport.images,
+            importance: None,
+        };
+        Some(RealtimeMeshQuery {
+            transport,
+            geometry: &trace_geometry,
+            bvh,
+            scene: Some(scene),
+        })
+    } else {
+        None
+    };
+    let camera_frame = transport
+        .has_mesh_volumes
+        .then(|| camera_frame(camera, width, height))
+        .transpose()?;
     for y in 0..height {
         let row = usize::try_from(y)
             .ok()
@@ -1552,38 +1662,76 @@ pub(super) fn composite_realtime_volumes(
                     "pixel index exceeds platform limits",
                 )
             })?;
-            let Some((origin, direction)) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?
-            else {
+            let Some(ray) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)? else {
                 continue;
             };
-            let max_distance = if output.ids[index] == 0 {
-                f64::INFINITY
-            } else {
+            let has_surface_depth = output.ids[index] != 0;
+            let max_distance = if has_surface_depth {
                 let projected_depth = f64::from(output.depths[index]);
-                camera.ray_distance_for_depth(direction, projected_depth)
+                camera.ray_distance_for_depth(ray.1, projected_depth)
+            } else {
+                f64::INFINITY
             };
             let mut rng = Pcg32::for_sample(seed, x, y, 0);
-            let (volume_radiance, transmittance) = realtime_volume_integral(
-                doc,
-                snapshot,
-                images,
-                &lights,
-                &volumes,
-                origin,
-                direction,
-                max_distance,
-                fallback,
-                &mut rng,
-            )?;
-            if transmittance >= 1.0 && volume_radiance.max_element() <= 0.0 {
+            let (volume_radiance, transmittance) = if let (Some(query), Some(camera_frame)) =
+                (mesh_query, camera_frame.as_ref())
+            {
+                let footprint = camera_footprint(
+                    camera_frame,
+                    camera,
+                    width,
+                    height,
+                    x,
+                    y,
+                    0.5,
+                    0.5,
+                    ray,
+                )?;
+                realtime_mesh_volume_integral(
+                    query,
+                    RealtimeVolumeRay {
+                        origin: ray.0,
+                        direction: ray.1,
+                        max_distance,
+                        far_distance: camera.ray_distance_for_depth(ray.1, camera.far),
+                        has_surface_depth,
+                        footprint,
+                    },
+                    scratch,
+                    &mut rng,
+                )?
+            } else {
+                let (radiance, transmittance) = realtime_voxel_integral(
+                    transport.doc,
+                    transport.snapshot,
+                    transport.images,
+                    &transport.lights,
+                    &transport.volumes,
+                    ray.0,
+                    ray.1,
+                    max_distance,
+                    transport.fallback,
+                    &mut rng,
+                    true,
+                )?;
+                (radiance, DVec3::splat(transmittance))
+            };
+            if transmittance.min_element() >= 1.0 && volume_radiance.max_element() <= 0.0 {
                 continue;
             }
             let previous = output.linear_rgba[index];
-            let red = f64::from(previous[0]) * transmittance + volume_radiance.x;
-            let green = f64::from(previous[1]) * transmittance + volume_radiance.y;
-            let blue = f64::from(previous[2]) * transmittance + volume_radiance.z;
+            let red = f64::from(previous[0]) * transmittance.x + volume_radiance.x;
+            let green = f64::from(previous[1]) * transmittance.y + volume_radiance.y;
+            let blue = f64::from(previous[2]) * transmittance.z + volume_radiance.z;
+            let mean_transmittance = if transmittance.x == transmittance.y
+                && transmittance.y == transmittance.z
+            {
+                transmittance.x
+            } else {
+                transmittance.element_sum() / 3.0
+            };
             let alpha = if film_transparent {
-                1.0 - transmittance + f64::from(previous[3]) * transmittance
+                1.0 - mean_transmittance + f64::from(previous[3]) * mean_transmittance
             } else {
                 1.0
             };
@@ -1604,12 +1752,500 @@ pub(super) fn composite_realtime_volumes(
     }
     Ok(())
 }
+/// The camera-ray transmittance through all realtime mesh and voxel volumes up to `max_distance`.
+pub(super) fn realtime_volume_transmittance(
+    transport: &RealtimeVolumeTransport<'_>,
+    geometry: &Geometry,
+    origin: DVec3,
+    direction: DVec3,
+    max_distance: f64,
+    footprint: CameraFootprint,
+    scratch: &mut RealtimeVolumeScratch,
+) -> Result<DVec3> {
+    if transport.volumes.is_empty() && !transport.has_mesh_volumes {
+        return Ok(DVec3::ONE);
+    }
+    let mut rng = Pcg32::for_sample(0, 0, 0, 0);
+    if transport.has_mesh_volumes {
+        let trace_geometry = TraceGeometry::of(geometry);
+        let bvh = transport.bvh.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "realtime mesh volume tracing requires the geometry BVH",
+            )
+        })?;
+        let query = RealtimeMeshQuery {
+            transport,
+            geometry: &trace_geometry,
+            bvh,
+            scene: None,
+        };
+        let (_, transmittance) = realtime_mesh_volume_integral(
+            query,
+            RealtimeVolumeRay {
+                origin,
+                direction,
+                max_distance,
+                far_distance: max_distance,
+                has_surface_depth: false,
+                footprint,
+            },
+            scratch,
+            &mut rng,
+        )?;
+        Ok(transmittance)
+    } else {
+        let (_, transmittance) = realtime_voxel_integral(
+            transport.doc,
+            transport.snapshot,
+            transport.images,
+            &transport.lights,
+            &transport.volumes,
+            origin,
+            direction,
+            max_distance,
+            transport.fallback,
+            &mut rng,
+            false,
+        )?;
+        Ok(DVec3::splat(transmittance))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RealtimeVolumeRay {
+    origin: DVec3,
+    direction: DVec3,
+    max_distance: f64,
+    far_distance: f64,
+    has_surface_depth: bool,
+    footprint: CameraFootprint,
+}
+
+#[derive(Clone, Copy)]
+struct RealtimeMeshQuery<'a, 'v> {
+    transport: &'a RealtimeVolumeTransport<'v>,
+    geometry: &'a TraceGeometry<'a>,
+    bvh: &'a Bvh,
+    scene: Option<SceneRefs<'a, 'v>>,
+}
+
+fn realtime_mesh_volume_integral(
+    query: RealtimeMeshQuery<'_, '_>,
+    ray: RealtimeVolumeRay,
+    scratch: &mut RealtimeVolumeScratch,
+    rng: &mut Pcg32,
+) -> Result<(DVec3, DVec3)> {
+    let transport = query.transport;
+    let include_sources = query.scene.is_some();
+    let origin = ray.origin;
+    let direction = ray.direction;
+    let mut max_distance = ray.max_distance;
+    if !ray.has_surface_depth {
+        max_distance = ray.far_distance;
+    }
+    let footprint = ray.footprint;
+    let media = &mut scratch.media;
+    let hit_media = &mut scratch.hit_media;
+    let boundaries = &mut scratch.boundaries;
+    let evaluator_workspace = &mut scratch.evaluator_workspace;
+    camera_media(
+        transport.doc,
+        query.geometry,
+        query.bvh,
+        origin,
+        transport.images,
+        footprint,
+        media,
+        hit_media,
+        evaluator_workspace,
+    )?;
+    boundaries.clear();
+    let mut travelled = 0.0;
+    let mut first_boundary = None;
+    let mut first_surface = None;
+    let mut failure = None;
+    query.bvh.walk_hits(
+        query.geometry.triangles,
+        WalkRay {
+            origin,
+            direction,
+            epsilon: RAY_EPSILON,
+            remaining: if ray.has_surface_depth {
+                f64::INFINITY
+            } else {
+                max_distance
+            },
+            kind: Some(RayKind::Camera),
+        },
+        |hit, hit_origin| {
+            let distance = travelled + hit.distance;
+            let (_, volume_boundary) = match shadow_hit_into(
+                transport.doc,
+                query.geometry,
+                hit,
+                hit_origin,
+                direction,
+                transport.images,
+                Some(footprint.at_distance(distance)),
+                hit_media,
+                evaluator_workspace,
+            ) {
+                Ok(shading) => shading,
+                Err(error) => {
+                    failure = Some(error);
+                    return false;
+                }
+            };
+            if !volume_boundary {
+                first_surface.get_or_insert(distance);
+            }
+            if volume_boundary || !hit_media.is_empty() {
+                first_boundary.get_or_insert(distance);
+                boundaries.extend(hit_media.iter().copied().map(|medium| (distance, medium)));
+            }
+            travelled = distance + RAY_EPSILON;
+            true
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    // The raster depth can be the volume boundary itself, which path tracing passes through.
+    if has_surface_depth
+        && max_distance.is_finite()
+        && let Some(boundary) = first_boundary
+    {
+        let tolerance = (RAY_EPSILON * 4.0).max(max_distance.abs() * 2.0e-6);
+        if (boundary - max_distance).abs() <= tolerance
+            && first_surface.is_none_or(|surface| surface > boundary)
+        {
+            max_distance = first_surface.map_or(far_distance, |surface| surface.min(far_distance));
+        }
+    }
+    let has_mesh_medium =
+        !media.is_empty() || boundaries.iter().any(|(distance, _)| *distance <= max_distance);
+    if !has_mesh_medium {
+        let (radiance, transmittance) = realtime_voxel_integral(
+            transport.doc,
+            transport.snapshot,
+            transport.images,
+            &transport.lights,
+            &transport.volumes,
+            origin,
+            direction,
+            max_distance,
+            transport.fallback,
+            rng,
+            include_sources,
+        )?;
+        return Ok((radiance, DVec3::splat(transmittance)));
+    }
+
+    // Scan the reusable stack in place, then undo the crossings instead of cloning it.
+    media.reserve(boundaries.len());
+    let mut mesh_entry = if media.is_empty() {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    let mut mesh_exit = 0.0_f64;
+    let mut event_index = 0;
+    while event_index < boundaries.len() && boundaries[event_index].0 <= max_distance {
+        let distance = boundaries[event_index].0;
+        let was_inside = !media.is_empty();
+        while event_index < boundaries.len() && boundaries[event_index].0 == distance {
+            toggle_mesh_medium(media, &boundaries[event_index].1);
+            event_index += 1;
+        }
+        if was_inside && media.is_empty() {
+            mesh_exit = distance;
+        } else if !was_inside && !media.is_empty() {
+            mesh_entry = mesh_entry.min(distance);
+        }
+    }
+    if !media.is_empty() {
+        mesh_exit = max_distance;
+    }
+    let scanned_events = event_index;
+    for (_, medium) in boundaries[..scanned_events].iter().rev() {
+        toggle_mesh_medium(media, medium);
+    }
+    let mut voxel_entry = f64::INFINITY;
+    let mut voxel_exit = 0.0_f64;
+    let mut minimum_step = f64::INFINITY;
+    for instance in transport
+        .volumes
+        .iter()
+        .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
+    {
+        let local_origin = instance.world_to_local.transform_point3(origin);
+        let local_direction = instance.world_to_local.transform_vector3(direction);
+        if let Some((entry, exit)) = intersect_volume_bounds(
+            local_origin,
+            local_direction,
+            instance.bounds_min,
+            instance.bounds_max,
+            max_distance,
+        ) {
+            voxel_entry = voxel_entry.min(entry);
+            voxel_exit = voxel_exit.max(exit);
+            minimum_step = minimum_step.min(volume_sampling_step(instance, local_direction));
+        }
+    }
+    let entry = mesh_entry.min(voxel_entry);
+    let exit = mesh_exit.max(voxel_exit);
+    if !entry.is_finite() || exit <= entry {
+        let (radiance, transmittance) = realtime_voxel_integral(
+            transport.doc,
+            transport.snapshot,
+            transport.images,
+            &transport.lights,
+            &transport.volumes,
+            origin,
+            direction,
+            max_distance,
+            transport.fallback,
+            rng,
+            include_sources,
+        )?;
+        return Ok((radiance, DVec3::splat(transmittance)));
+    }
+    let voxel_step = if minimum_step.is_finite() {
+        let span = voxel_exit - voxel_entry;
+        let count = (span / minimum_step).ceil().clamp(1.0, 64.0);
+        span / count
+    } else {
+        f64::INFINITY
+    };
+    let mesh_step = if mesh_entry.is_finite() && mesh_exit > mesh_entry {
+        (mesh_exit - mesh_entry) / 64.0
+    } else {
+        f64::INFINITY
+    };
+    let step = voxel_step.min(mesh_step).min((exit - entry) / 64.0);
+    let meters_per_unit = transport.meters_per_unit;
+    let ambient = if include_sources {
+        world_radiance(
+            transport.doc,
+            &transport.snapshot.scene_id,
+            transport.images,
+            -direction,
+            transport.fallback,
+        )?
+    } else {
+        DVec3::ZERO
+    };
+    let mut integrator = RealtimeMeshIntegrator {
+        query,
+        origin,
+        direction,
+        meters_per_unit,
+        ambient,
+        footprint,
+        voxel_entry,
+        voxel_exit,
+        step,
+        rng,
+        evaluator_workspace,
+        radiance: DVec3::ZERO,
+        transmittance: DVec3::ONE,
+    };
+    event_index = 0;
+    while event_index < boundaries.len() && boundaries[event_index].0 <= entry {
+        let distance = boundaries[event_index].0;
+        while event_index < boundaries.len() && boundaries[event_index].0 == distance {
+            toggle_mesh_medium(media, &boundaries[event_index].1);
+            event_index += 1;
+        }
+    }
+    let mut position = entry;
+    while position < exit {
+        let next_mesh_boundary = boundaries
+            .get(event_index)
+            .map_or(exit, |(distance, _)| *distance)
+            .min(exit);
+        let next_voxel_boundary = if voxel_entry.is_finite() && position < voxel_entry {
+            voxel_entry
+        } else if voxel_exit.is_finite() && position < voxel_exit {
+            voxel_exit
+        } else {
+            exit
+        };
+        let next = next_mesh_boundary.min(next_voxel_boundary);
+        integrator.integrate_interval(media.as_slice(), position, next)?;
+        while event_index < boundaries.len() && boundaries[event_index].0 == next {
+            toggle_mesh_medium(media, &boundaries[event_index].1);
+            event_index += 1;
+        }
+        position = next;
+    }
+    Ok((
+        integrator.radiance,
+        integrator.transmittance.clamp(DVec3::ZERO, DVec3::ONE),
+    ))
+}
+
+struct RealtimeMeshIntegrator<'a, 'v, 'r> {
+    query: RealtimeMeshQuery<'a, 'v>,
+    origin: DVec3,
+    direction: DVec3,
+    meters_per_unit: f64,
+    ambient: DVec3,
+    footprint: CameraFootprint,
+    voxel_entry: f64,
+    voxel_exit: f64,
+    step: f64,
+    rng: &'r mut Pcg32,
+    evaluator_workspace: &'r mut EvaluatorWorkspace,
+    radiance: DVec3,
+    transmittance: DVec3,
+}
+
+impl RealtimeMeshIntegrator<'_, '_, '_> {
+    fn integrate_interval(
+        &mut self,
+        media: &[MeshMedium],
+        start: f64,
+        end: f64,
+    ) -> Result<()> {
+        let length = end - start;
+        if length <= 0.0 {
+            return Ok(());
+        }
+        let steps = (length / self.step).ceil().clamp(1.0, 64.0) as usize;
+        let step = length / steps as f64;
+        let include_sources = self.query.scene.is_some();
+        let stack = stack_medium(media);
+        let mesh_extinction = stack.map_or(DVec3::ZERO, |medium| medium_extinction(&medium));
+        let mesh_emission = if include_sources {
+            stack.map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.volume_emission))
+        } else {
+            DVec3::ZERO
+        };
+        let mesh_scatter = if include_sources {
+            stack.map_or(DVec3::ZERO, |medium| DVec3::from_array(medium.volume_scatter))
+        } else {
+            DVec3::ZERO
+        };
+        for index in 0..steps {
+            let distance = start + (index as f64 + 0.5) * step;
+            let point = self.origin + self.direction * distance;
+            let mut voxel_extinction = 0.0;
+            let mut mesh_source = mesh_emission + self.ambient * mesh_scatter;
+            let mut voxel_source = DVec3::ZERO;
+            if (self.voxel_entry..=self.voxel_exit).contains(&distance) {
+                for instance in self
+                    .query
+                    .transport
+                    .volumes
+                    .iter()
+                    .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
+                {
+                    let density = volume_density_at(instance, point)?;
+                    let extinction = volume_extinction_density(instance, density);
+                    voxel_extinction += extinction;
+                    if include_sources {
+                        let scattering = if instance.scattering { extinction } else { 0.0 };
+                        voxel_source +=
+                            instance.emission + self.ambient * instance.albedo * scattering;
+                        if scattering > 0.0 {
+                            for light in &self.query.transport.lights {
+                                if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
+                                    continue;
+                                }
+                                let gain = light.volume_factor * light.volume_fade(point);
+                                if gain <= 0.0 {
+                                    continue;
+                                }
+                                let Some(sample) = sample_light(light, point, self.rng) else {
+                                    continue;
+                                };
+                                let visibility = march_volumes_with_budget(
+                                    &self.query.transport.volumes,
+                                    point,
+                                    sample.direction,
+                                    sample.distance,
+                                    Some(self.rng),
+                                    16,
+                                    RayKind::Shadow,
+                                )?;
+                                let phase =
+                                    instance.phase_density(self.direction.dot(sample.direction));
+                                voxel_source += instance.albedo
+                                    * sample.radiance
+                                    * (scattering * phase * visibility * gain);
+                            }
+                        }
+                    }
+                }
+            }
+            if mesh_scatter != DVec3::ZERO {
+                if let Some(scene) = self.query.scene {
+                    for light in &self.query.transport.lights {
+                        if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
+                            continue;
+                        }
+                        // EEVEE's `volume_factor` scales only direct in-scatter from this light.
+                        let gain = light.volume_factor * light.volume_fade(point);
+                        if gain <= 0.0 {
+                            continue;
+                        }
+                        let Some(sample) = sample_light(light, point, self.rng) else {
+                            continue;
+                        };
+                        if sample.radiance.max_element() <= 0.0 {
+                            continue;
+                        }
+                        let visibility = shadow_transmittance(
+                            scene,
+                            media,
+                            ShadowRay {
+                                point,
+                                normal: DVec3::ZERO,
+                                shading: DVec3::ZERO,
+                                direction: sample.direction,
+                                distance: sample.distance,
+                                footprint: self.footprint.at_distance(distance),
+                            },
+                            u32::MAX,
+                            self.rng,
+                            self.evaluator_workspace,
+                        )?;
+                        let cosine = self.direction.dot(sample.direction);
+                        let mut scatter = DVec3::ZERO;
+                        for medium in media {
+                            scatter += DVec3::from_array(medium.params.volume_scatter)
+                                * henyey_greenstein(cosine, medium.params.volume_anisotropy);
+                        }
+                        mesh_source += sample.radiance * visibility * scatter * gain;
+                    }
+                }
+            }
+            let extinction =
+                mesh_extinction + DVec3::splat(voxel_extinction * self.meters_per_unit);
+            let source = mesh_source + voxel_source * self.meters_per_unit;
+            let (attenuation_x, source_distance_x) =
+                homogeneous_segment_integral(extinction.x, step);
+            let (attenuation_y, source_distance_y) =
+                homogeneous_segment_integral(extinction.y, step);
+            let (attenuation_z, source_distance_z) =
+                homogeneous_segment_integral(extinction.z, step);
+            let attenuation = DVec3::new(attenuation_x, attenuation_y, attenuation_z);
+            let source_distance =
+                DVec3::new(source_distance_x, source_distance_y, source_distance_z);
+            self.radiance += self.transmittance * source * source_distance;
+            self.transmittance *= attenuation;
+        }
+        Ok(())
+    }
+}
 
 #[expect(
     clippy::too_many_arguments,
     reason = "the realtime volume integrator needs explicit world and scene state"
 )]
-fn realtime_volume_integral(
+fn realtime_voxel_integral(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     images: &BTreeMap<String, ImageData>,
@@ -1620,16 +2256,15 @@ fn realtime_volume_integral(
     max_distance: f64,
     environment: DVec3,
     rng: &mut Pcg32,
+    include_sources: bool,
 ) -> Result<(DVec3, f64)> {
-    let camera_volumes: Vec<VolumeInstance<'_>> = volumes
-        .iter()
-        .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
-        .cloned()
-        .collect();
     let mut entry = f64::INFINITY;
     let mut exit = 0.0_f64;
     let mut minimum_step = f64::INFINITY;
-    for instance in &camera_volumes {
+    for instance in volumes
+        .iter()
+        .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
+    {
         let local_origin = instance.world_to_local.transform_point3(origin);
         let local_direction = instance.world_to_local.transform_vector3(direction);
         if let Some((volume_entry, volume_exit)) = intersect_volume_bounds(
@@ -1653,7 +2288,11 @@ fn realtime_volume_integral(
     let meters_per_unit = volumes
         .first()
         .map_or(1.0, |instance| instance.meters_per_unit);
-    let ambient = world_radiance(doc, &snapshot.scene_id, images, -direction, environment)?;
+    let ambient = if include_sources {
+        world_radiance(doc, &snapshot.scene_id, images, -direction, environment)?
+    } else {
+        DVec3::ZERO
+    };
     let mut transmittance = 1.0;
     let mut radiance = DVec3::ZERO;
     for index in 0..step_count {
@@ -1661,43 +2300,48 @@ fn realtime_volume_integral(
         let point = origin + direction * distance;
         let mut extinction = 0.0;
         let mut source = DVec3::ZERO;
-        for instance in &camera_volumes {
+        for instance in volumes
+            .iter()
+            .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
+        {
             let density = volume_density_at(instance, point)?;
             let extinction_coefficient = volume_extinction_density(instance, density);
-            let scattering_coefficient = if instance.scattering {
-                extinction_coefficient
-            } else {
-                0.0
-            };
             extinction += extinction_coefficient;
-            source += instance.emission;
-            if instance.scattering {
-                source += ambient * instance.albedo * scattering_coefficient;
-                for light in lights {
-                    if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
-                        continue;
+            if include_sources {
+                let scattering_coefficient = if instance.scattering {
+                    extinction_coefficient
+                } else {
+                    0.0
+                };
+                source += instance.emission;
+                if instance.scattering {
+                    source += ambient * instance.albedo * scattering_coefficient;
+                    for light in lights {
+                        if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
+                            continue;
+                        }
+                        // EEVEE's volume in-scatter of a light is its power per class, `volume_factor`, times its influence.
+                        let gain = light.volume_factor * light.volume_fade(point);
+                        if gain <= 0.0 {
+                            continue;
+                        }
+                        let Some(sample) = sample_light(light, point, rng) else {
+                            continue;
+                        };
+                        let visibility = march_volumes_with_budget(
+                            volumes,
+                            point,
+                            sample.direction,
+                            sample.distance,
+                            Some(rng),
+                            16,
+                            RayKind::Shadow,
+                        )?;
+                        let phase = instance.phase_density(direction.dot(sample.direction));
+                        source += instance.albedo
+                            * sample.radiance
+                            * (scattering_coefficient * phase * visibility * gain);
                     }
-                    // EEVEE's volume in-scatter of a light is its power per class, `volume_factor`, times its influence.
-                    let gain = light.volume_factor * light.volume_fade(point);
-                    if gain <= 0.0 {
-                        continue;
-                    }
-                    let Some(sample) = sample_light(light, point, rng) else {
-                        continue;
-                    };
-                    let visibility = march_volumes_with_budget(
-                        volumes,
-                        point,
-                        sample.direction,
-                        sample.distance,
-                        Some(rng),
-                        16,
-                        RayKind::Shadow,
-                    )?;
-                    let phase = instance.phase_density(direction.dot(sample.direction));
-                    source += instance.albedo
-                        * sample.radiance
-                        * (scattering_coefficient * phase * visibility * gain);
                 }
             }
         }
@@ -1969,13 +2613,17 @@ fn trace_path(
     let mut diffuse_ancestor = false;
     // The volume stack: the media the path is inside, innermost last. It starts with the mesh media that contain the
     // camera (Cycles' `volume_stack_init`).
-    let mut media = camera_media(
+    let mut media = Vec::new();
+    let mut hit_media = Vec::new();
+    camera_media(
         doc,
         geometry,
         bvh,
         origin,
         images,
         footprint,
+        &mut media,
+        &mut hit_media,
         evaluator_workspace,
     )?;
     loop {
@@ -2493,12 +3141,13 @@ fn trace_path(
             );
             // The exit's volume is zero (`exit_params`), so the exit neither passes the path nor changes the stack.
             surface.media.clear();
+            surface.volume_boundary = false;
         } else if diffuse_ancestor {
             // A Burley closure falls back to diffuse after a diffuse bounce (Cycles' `bssrdf_setup` with
             // `PATH_RAY_DIFFUSE_ANCESTOR`). The random walk keeps its closure.
             surface.closures.disable_burley_subsurface();
         }
-        if !surface.media.is_empty() {
+        if surface.volume_boundary || !surface.media.is_empty() {
             // A medium surface passes the path and changes the volume stack: each of its volume closures enters the
             // medium of its object, or leaves the one it entered.
             for medium in &surface.media {
@@ -3114,25 +3763,35 @@ fn apply_hit_alpha(material: &Material, params: &mut BsdfParams) {
     };
 }
 
-/// The media a hit's Volume output bounds: one per volume closure that scatters or absorbs light, its coefficients
-/// weighted by the closure's weight, since Cycles sums the closures' coefficients (`volume_shader_eval`).
+/// The media a hit's Volume output bounds: one per closure that scatters, absorbs, or emits, its coefficients
+/// weighted by the closure's weight, since Cycles sums them (`volume_shader_eval`).
 fn surface_media(object_index: u32, volume: &[ShaderClosure]) -> Vec<MeshMedium> {
-    volume
-        .iter()
-        .enumerate()
-        .filter_map(|(closure, shader)| {
-            let weight = shader.weight;
-            let mut params = shader.params;
-            params.volume_scatter = params.volume_scatter.map(|value| weight * value);
-            params.volume_absorption = params.volume_absorption.map(|value| weight * value);
-            params.volume_emission = params.volume_emission.map(|value| weight * value);
-            params.has_medium().then_some(MeshMedium {
+    let mut media = Vec::new();
+    surface_media_into(object_index, volume, &mut media);
+    media
+}
+
+fn surface_media_into(
+    object_index: u32,
+    volume: &[ShaderClosure],
+    media: &mut Vec<MeshMedium>,
+) {
+    media.clear();
+    media.reserve(volume.len());
+    for (closure, shader) in volume.iter().enumerate() {
+        let weight = shader.weight;
+        let mut params = shader.params;
+        params.volume_scatter = params.volume_scatter.map(|value| weight * value);
+        params.volume_absorption = params.volume_absorption.map(|value| weight * value);
+        params.volume_emission = params.volume_emission.map(|value| weight * value);
+        if params.has_medium() {
+            media.push(MeshMedium {
                 object_index,
                 closure,
                 params,
-            })
-        })
-        .collect()
+            });
+        }
+    }
 }
 
 fn make_surface(
@@ -3237,6 +3896,7 @@ fn make_surface(
                     frame.geometric_normal,
                     frame.material.use_bump_map_correction,
                 ),
+                volume_boundary: frame.prepared.is_volume_only(),
                 media: surface_media(frame.triangle.object_index, &shading.volume),
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
@@ -3259,7 +3919,33 @@ fn shadow_hit(
     images: &BTreeMap<String, ImageData>,
     footprint: Option<f64>,
     evaluator_workspace: &mut EvaluatorWorkspace,
-) -> Result<(Vec<MeshMedium>, DVec3)> {
+) -> Result<(Vec<MeshMedium>, DVec3, bool)> {
+    let mut media = Vec::new();
+    let (transparency, volume_boundary) = shadow_hit_into(
+        doc,
+        geometry,
+        hit,
+        origin,
+        direction,
+        images,
+        footprint,
+        &mut media,
+        evaluator_workspace,
+    )?;
+    Ok((media, transparency, volume_boundary))
+}
+
+fn shadow_hit_into(
+    doc: &SceneDoc,
+    geometry: &TraceGeometry<'_>,
+    hit: BvhHit,
+    origin: DVec3,
+    direction: DVec3,
+    images: &BTreeMap<String, ImageData>,
+    footprint: Option<f64>,
+    media: &mut Vec<MeshMedium>,
+    evaluator_workspace: &mut EvaluatorWorkspace,
+) -> Result<(DVec3, bool)> {
     with_hit_frame(
         doc,
         geometry,
@@ -3288,10 +3974,9 @@ fn shadow_hit(
                         (closure.weight, params.alpha, transparent_tint(&params))
                     }),
             );
-            Ok((
-                surface_media(frame.triangle.object_index, &shading.volume),
-                transparency,
-            ))
+            let volume_boundary = frame.prepared.is_volume_only();
+            surface_media_into(frame.triangle.object_index, &shading.volume, media);
+            Ok((transparency, volume_boundary))
         },
     )
 }
@@ -3733,7 +4418,7 @@ fn shadow_transmittance(
             kind: Some(RayKind::Shadow),
         },
         |hit, origin| {
-            let (media, transparency) = match shadow_hit(
+            let (media, transparency, volume_boundary) = match shadow_hit(
                 doc,
                 geometry,
                 hit,
@@ -3752,7 +4437,7 @@ fn shadow_transmittance(
             if let Some(stack) = stack_medium(&shadow_media) {
                 transmittance *= medium_transmittance(&stack, hit.distance);
             }
-            if !media.is_empty() {
+            if volume_boundary || !media.is_empty() {
                 // A medium boundary passes the shadow ray and changes the volume stack, as it does for a path. It is not a
                 // transparent surface, so it does not count against the budget, and its opaque alpha does not block.
                 for medium in &media {
@@ -4823,7 +5508,10 @@ fn collect_volumes<'a>(
         let material = snapshot
             .slot_material(node_id, node, Some(data_block), 0)
             .and_then(|material_id| doc.materials.get(material_id));
-        let evaluated_material = if let Some(material) = material {
+        let prepared = material.map(|material| PreparedMaterial::new(material, &doc.node_groups));
+        let evaluated_material = if let (Some(material), Some(prepared)) =
+            (material, prepared.as_ref())
+        {
             let local_center = (bounds_min + bounds_max) * 0.5;
             let mut context = HitContext::new(&doc.node_groups)
                 .with_images(images)
@@ -4844,27 +5532,15 @@ fn collect_volumes<'a>(
             context.position = matrix.transform_point3(local_center);
             Some(evaluate_surface_with_workspace(
                 material,
-                &PreparedMaterial::new(material, &doc.node_groups),
+                prepared,
                 &context,
                 &mut evaluator_workspace,
             )?)
         } else {
             None
         };
-        let has_volume_output = material
-            .and_then(|material| material.node_tree.as_ref())
-            .and_then(|graph_id| doc.node_groups.get(graph_id))
-            .is_some_and(|group| {
-                group.nodes.iter().any(|(node_id, node)| {
-                    matches!(
-                        node.node_type.as_str(),
-                        "OutputMaterial" | "ShaderNodeOutputMaterial"
-                    ) && group
-                        .links
-                        .iter()
-                        .any(|link| link.to_node == *node_id && link.to_socket == "Volume")
-                })
-            });
+        let has_volume_output =
+            prepared.as_ref().is_some_and(PreparedMaterial::has_volume_output);
         let simple_volume = material.is_some_and(|material| {
             material.node_tree.is_none()
                 && material.volume_density.is_finite()
@@ -5125,14 +5801,16 @@ fn camera_media(
     origin: DVec3,
     images: &BTreeMap<String, ImageData>,
     footprint: CameraFootprint,
+    inside: &mut Vec<MeshMedium>,
+    hit_media: &mut Vec<MeshMedium>,
     evaluator_workspace: &mut EvaluatorWorkspace,
-) -> Result<Vec<MeshMedium>> {
+) -> Result<()> {
     let probe = DVec3::new(
         0.267_261_241_912_424_4,
         0.534_522_483_824_848_8,
         0.801_783_725_737_273_2,
     );
-    let mut inside: Vec<MeshMedium> = Vec::new();
+    inside.clear();
     let mut failure = None;
     bvh.walk_hits(
         geometry.triangles,
@@ -5145,7 +5823,7 @@ fn camera_media(
             kind: Some(RayKind::Camera),
         },
         |hit, hit_origin| {
-            let (media, _) = match shadow_hit(
+            match shadow_hit_into(
                 doc,
                 geometry,
                 hit,
@@ -5153,16 +5831,17 @@ fn camera_media(
                 probe,
                 images,
                 Some(footprint.at_distance(hit.distance)),
+                hit_media,
                 evaluator_workspace,
             ) {
-                Ok(shadow) => shadow,
+                Ok(_) => (),
                 Err(error) => {
                     failure = Some(error);
                     return false;
                 }
             };
-            for medium in &media {
-                toggle_mesh_medium(&mut inside, medium);
+            for medium in hit_media.iter() {
+                toggle_mesh_medium(inside, medium);
             }
             true
         },
@@ -5170,7 +5849,7 @@ fn camera_media(
     if let Some(error) = failure {
         return Err(error);
     }
-    Ok(inside)
+    Ok(())
 }
 
 /// The channel-mean scatter and extinction of a medium: the rates of Cycles' grey majorant transport.

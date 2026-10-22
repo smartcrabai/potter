@@ -126,6 +126,123 @@ fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
     Ok(())
 }
 
+/// A linked Volume output with no Surface stays transparent even when its sampled medium is zero.
+#[test]
+fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(root.path(), "eevee_volume_factor.py", EEVEE_SCRIPT)?;
+    let blend = root.path().join("volume_only_zero_density.blend");
+    run_blender_arguments(
+        &blender,
+        &script,
+        None,
+        &[
+            Path::new(EEVEE_RENDERS[0].0),
+            blend.as_path(),
+            Path::new("-"),
+            Path::new("-"),
+        ],
+    )?;
+    let (project, _) = import_blend(&blender, root.path(), "zero_density", &blend)?;
+    let scene = read_scene(&project)?;
+    let material = scene["materials"]
+        .as_object()
+        .ok_or("imported materials are missing")?
+        .values()
+        .find(|material| material["name"] == "Scatter")
+        .ok_or("the Scatter material is missing")?;
+    let graph_id = material["node_tree"]
+        .as_str()
+        .ok_or("the Scatter graph is missing")?;
+    let graph = scene["node_groups"]
+        .get(graph_id)
+        .ok_or("the Scatter graph data is missing")?;
+    let nodes = graph["nodes"]
+        .as_object()
+        .ok_or("the Scatter graph nodes are missing")?;
+    let (volume_node_id, volume_node) = nodes
+        .iter()
+        .find(|(_, node)| node["type"] == "ShaderNodeVolumeScatter")
+        .ok_or("the Volume Scatter node is missing")?;
+    let mut volume_inputs = volume_node["inputs"]
+        .as_object()
+        .cloned()
+        .ok_or("the Volume Scatter inputs are missing")?;
+    volume_inputs.insert("Density".to_owned(), json!(0.0));
+    let output_node_id = nodes
+        .iter()
+        .find(|(_, node)| {
+            matches!(
+                node["type"].as_str(),
+                Some("OutputMaterial" | "ShaderNodeOutputMaterial")
+            )
+        })
+        .map(|(id, _)| id.as_str())
+        .ok_or("the Material Output node is missing")?;
+    let surface_link = graph["links"]
+        .as_array()
+        .and_then(|links| {
+            links.iter().find(|link| {
+                link["to_node"].as_str() == Some(output_node_id)
+                    && link["to_socket"] == "Surface"
+            })
+        })
+        .ok_or("the transparent Surface link is missing")?;
+    let surface_link = [
+        surface_link["from_node"]
+            .as_str()
+            .ok_or("the Surface source node is missing")?,
+        surface_link["from_socket"]
+            .as_str()
+            .ok_or("the Surface source socket is missing")?,
+        surface_link["to_node"]
+            .as_str()
+            .ok_or("the Surface destination node is missing")?,
+        surface_link["to_socket"]
+            .as_str()
+            .ok_or("the Surface destination socket is missing")?,
+    ];
+    let active_scene = scene["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?;
+    let configured = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "graph.node_update", "graph": graph_id, "node_id": volume_node_id,
+             "set": {"inputs": volume_inputs}},
+            {"op": "graph.unlink", "graph": graph_id,
+             "from_node": surface_link[0], "from_socket": surface_link[1],
+             "to_node": surface_link[2], "to_socket": surface_link[3]},
+            {"op": "camera.create", "id": "camera_main",
+             "transform": {"translation": [0.0, 0.0, 10.0]},
+             "projection": "orthographic", "ortho_scale": ORTHO_SCALE},
+            {"op": "scene.update", "target": {"id": active_scene}, "set": {"camera": "camera_main"}},
+            {"op": "render.update", "target": {"id": active_scene},
+             "set": {"resolution_x": SIZE, "resolution_y": SIZE, "samples": 1, "seed": 0}}
+        ]),
+    )?;
+    assert_eq!(configured["ok"], true, "{configured}");
+    let volume_only = render_project(root.path(), &project, "volume_only")?;
+    let cube_id = native_oracle::node_id(&scene, "Cube")?;
+    let hidden = apply_operations(
+        &project,
+        root.path(),
+        json!([{"op": "node.update", "target": {"id": cube_id}, "set": {"visible": false}}]),
+    )?;
+    assert_eq!(hidden["ok"], true, "{hidden}");
+    let no_object = render_project(root.path(), &project, "no_object")?;
+    let difference = worst_difference(&plane_values(&volume_only), &plane_values(&no_object));
+    assert!(
+        difference <= POTTER_LINEAR_TOLERANCE,
+        "a zero-density Volume-only mesh changes the no-object image: {difference}"
+    );
+    Ok(())
+}
+
 /// The committed EEVEE render's red channel, one value per pixel in Blender's row order. A volume is grey, so one
 /// channel carries it.
 fn eevee_red(bytes: &[u8]) -> Result<Vec<f64>, Box<dyn Error>> {
@@ -202,10 +319,18 @@ fn render_potter(
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
+    render_project(root, &project, case)
+}
+
+fn render_project(
+    root: &Path,
+    project: &Path,
+    case: &str,
+) -> Result<ImageData, Box<dyn Error>> {
     let frames = root.join(format!("frames_{case}"));
     let rendered = pot()
         .arg("render")
-        .arg(&project)
+        .arg(project)
         .args(["--engine", "realtime", "--format", "exr", "--out"])
         .arg(&frames)
         .arg("--json")
@@ -215,16 +340,18 @@ fn render_potter(
         "{case}: realtime render failed: {}",
         String::from_utf8_lossy(&rendered.stdout)
     );
+    let image_id = format!("render_{case}");
     let loaded = apply_operations(
-        &project,
+        project,
         root,
-        json!([{"op": "image.load", "id": "render", "path": frames.join("frame_0001.exr").to_string_lossy()}]),
+        json!([{"op": "image.load", "id": image_id, "path": frames.join("frame_0001.exr").to_string_lossy()}]),
     )?;
     assert_eq!(loaded["ok"], true, "{loaded}");
-    let image: Image = serde_json::from_value(read_scene(&project)?["images"]["render"].clone())?;
+    let image: Image =
+        serde_json::from_value(read_scene(project)?["images"][image_id.as_str()].clone())?;
     Ok(load_image_data(
         &image,
-        &project,
+        project,
         ImageInterpolation::Closest,
     )?)
 }
