@@ -1373,6 +1373,7 @@ mod tests {
         )
         .unwrap();
         let modifier = Modifier {
+            baked_ocean_cache: None,
             id: Id::new("mirror").unwrap(),
             modifier_type: "mirror".to_owned(),
             name: "Mirror".to_owned(),
@@ -1447,6 +1448,7 @@ mod tests {
         .unwrap();
         let source_codes = corner_codes(&mesh).unwrap().unwrap();
         let modifier = Modifier {
+            baked_ocean_cache: None,
             id: Id::new("mirror").unwrap(),
             modifier_type: "mirror".to_owned(),
             name: "Mirror".to_owned(),
@@ -1502,6 +1504,7 @@ mod tests {
         let automatic = vec![CornerNormalCode::Auto; 3];
         write_codes(&mut mesh, Some(&automatic), NormalCodeOptions::default()).unwrap();
         let modifier = Modifier {
+            baked_ocean_cache: None,
             id: Id::new("mirror").unwrap(),
             modifier_type: "mirror".to_owned(),
             name: "Mirror".to_owned(),

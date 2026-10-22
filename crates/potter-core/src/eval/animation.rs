@@ -11,8 +11,8 @@ use serde_json::json;
 use crate::{
     error::{ErrorCode, PotError, Result},
     model::{
-        Extrapolation, FCurve, Id, Interpolation, NlaBlendType, NlaExtrapolation, NlaStrip, Node,
-        PoseBone, SceneDoc, Transform, normalize_rotation,
+        Action, Extrapolation, FCurve, Id, Interpolation, ModifierParameterBinding, NlaBlendType,
+        NlaExtrapolation, NlaStrip, Node, PoseBone, SceneDoc, Transform, normalize_rotation,
     },
 };
 
@@ -78,6 +78,337 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
     }
     Ok(transform)
 }
+/// Evaluate one ID-bound modifier scalar through the node's NLA tracks and active action.
+///
+/// The optional result distinguishes an unanimated property from an animated value equal to its
+/// base. Curve bindings are resolved at the Blender bridge boundary; this evaluator never parses
+/// modifier RNA paths or guesses identity from modifier names.
+///
+/// # Errors
+///
+/// Returns scene/evaluation errors for invalid curve indices, node/modifier bindings, F-Curves,
+/// NLA strips or non-finite results.
+pub(crate) fn animated_modifier_scalar(
+    node_id: &Id,
+    node: &Node,
+    doc: &SceneDoc,
+    modifier_id: &Id,
+    parameter: &str,
+    base_value: f64,
+    frame: f64,
+) -> Result<Option<f64>> {
+    if !frame.is_finite() || !base_value.is_finite() {
+        return Err(PotError::new(
+            ErrorCode::InvalidArgument,
+            "modifier animation frame and base value must be finite",
+        ));
+    }
+    let modifier = node
+        .modifiers
+        .iter()
+        .find(|modifier| &modifier.id == modifier_id)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "modifier animation target does not exist on its node",
+                json!({"node":node_id,"modifier":modifier_id,"parameter":parameter}),
+            )
+        })?;
+    if parameter.is_empty()
+        || modifier
+            .params
+            .get(parameter)
+            .or_else(|| {
+                crate::params::default_value(
+                    crate::params::ParameterFamily::Modifier,
+                    &modifier.modifier_type,
+                    parameter,
+                )
+            })
+            .and_then(serde_json::Value::as_f64)
+            .is_none()
+    {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "modifier animation binding must target a known scalar parameter",
+            json!({"node":node_id,"modifier":modifier_id,"parameter":parameter}),
+        ));
+    }
+    // Blender's NLA domain: a channel exists whenever an enabled track has a strip whose Action binds
+    // it, whatever the frame (`nla_eval_domain_strips`, anim_sys.cc:3229). Such a channel starts from its
+    // default and is written back even when no strip covers the frame (`nladata_flush_channels`).
+    let has_solo = node
+        .nla_tracks
+        .iter()
+        .any(|track| track.solo && !track.mute);
+    let mut in_nla_domain = false;
+    for track in node
+        .nla_tracks
+        .iter()
+        .filter(|track| !track.mute && (!has_solo || track.solo))
+    {
+        for strip in &track.strips {
+            let action = doc.actions.get(&strip.action).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "NLA strip action reference does not exist",
+                    json!({"action":strip.action,"strip":strip.id}),
+                )
+            })?;
+            if action.modifier_bindings.values().flatten().any(|binding| {
+                &binding.node == node_id
+                    && &binding.modifier == modifier_id
+                    && binding.parameter == parameter
+            }) {
+                in_nla_domain = true;
+            }
+        }
+    }
+    let nla_default = if in_nla_domain {
+        crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            &modifier.modifier_type,
+            parameter,
+        )
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "NLA-animated modifier parameter has no Blender default",
+                json!({"node":node_id,"modifier":modifier_id,"parameter":parameter}),
+            )
+        })?
+    } else {
+        base_value
+    };
+    let mut value = nla_default;
+    let mut animated = in_nla_domain;
+    for track in &node.nla_tracks {
+        if track.mute || (has_solo && !track.solo) {
+            continue;
+        }
+        for strip in &track.strips {
+            let Some(action_frame) = strip_action_frame(strip, frame)? else {
+                continue;
+            };
+            let action = doc.actions.get(&strip.action).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "NLA strip action reference does not exist",
+                    json!({"action":strip.action,"strip":strip.id}),
+                )
+            })?;
+            let assigned_slot = strip.action_slot.as_ref().or_else(|| {
+                if action.slots.len() == 1 {
+                    action.slots.first().map(|slot| &slot.id)
+                } else {
+                    None
+                }
+            });
+            let Some(sampled) = sample_modifier_scalar_action(
+                node_id,
+                doc,
+                &strip.action,
+                action,
+                modifier_id,
+                parameter,
+                assigned_slot,
+                action_frame,
+            )?
+            else {
+                continue;
+            };
+            let influence = strip_influence(strip, frame)?;
+            value = blend_scalar(value, sampled, nla_default, strip.blend_type, influence);
+            if !value.is_finite() {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "modifier animation evaluated to a non-finite scalar",
+                    json!({"action":strip.action,"modifier":modifier_id,"parameter":parameter,"frame":frame}),
+                ));
+            }
+            animated = true;
+        }
+    }
+    if let Some(action_id) = &node.action {
+        let action = doc.actions.get(action_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "node action reference does not exist",
+                json!({"action":action_id}),
+            )
+        })?;
+        let assigned_slot = action.active_slots.get(node_id).or_else(|| {
+            if action.slots.len() == 1 {
+                action.slots.first().map(|slot| &slot.id)
+            } else {
+                None
+            }
+        });
+        if let Some(sampled) = sample_modifier_scalar_action(
+            node_id,
+            doc,
+            action_id,
+            action,
+            modifier_id,
+            parameter,
+            assigned_slot,
+            frame,
+        )? {
+            value = sampled;
+            animated = true;
+        }
+    }
+    Ok(animated.then_some(value))
+}
+
+fn sample_modifier_scalar_action(
+    node_id: &Id,
+    doc: &SceneDoc,
+    action_id: &Id,
+    action: &Action,
+    modifier_id: &Id,
+    parameter: &str,
+    assigned_slot: Option<&Id>,
+    frame: f64,
+) -> Result<Option<f64>> {
+    if let Some(assigned_slot) = assigned_slot
+        && !action.slots.iter().any(|slot| &slot.id == assigned_slot)
+    {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "modifier animation assignment references a missing Action slot",
+            json!({"action":action_id,"action_slot":assigned_slot}),
+        ));
+    }
+    let mut sampled = None;
+    for (curve_index, bindings) in &action.modifier_bindings {
+        let index = usize::try_from(*curve_index).map_err(|_| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "modifier animation F-Curve index is invalid",
+                json!({"action":action_id,"curve_index":curve_index}),
+            )
+        })?;
+        let curve = action.fcurves.get(index).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "modifier animation binding refers to a missing F-Curve",
+                json!({"action":action_id,"curve_index":curve_index}),
+            )
+        })?;
+        if bindings.is_empty() {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "modifier animation F-Curve has an empty binding list",
+                json!({"action":action_id,"curve_index":curve_index}),
+            ));
+        }
+        for binding in bindings {
+            validate_modifier_parameter_binding(doc, action_id, action, *curve_index, binding)?;
+            if &binding.node != node_id
+                || &binding.modifier != modifier_id
+                || binding.parameter.as_str() != parameter
+            {
+                continue;
+            }
+            if binding.action_slot.as_ref() != assigned_slot {
+                if assigned_slot.is_none() && binding.action_slot.is_some() {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "modifier animation binding has no active Action-slot assignment",
+                        json!({"action":action_id,"curve_index":curve_index,"node":node_id,"action_slot":binding.action_slot}),
+                    ));
+                }
+                continue;
+            }
+            if curve.index != 0 {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "modifier scalar F-Curve must use component index zero",
+                    json!({"action":action_id,"curve_index":curve_index,"index":curve.index}),
+                ));
+            }
+            if let Some(value) = sample_curve(curve, frame)? {
+                sampled = Some(value);
+            }
+        }
+    }
+    Ok(sampled)
+}
+
+fn validate_modifier_parameter_binding(
+    doc: &SceneDoc,
+    action_id: &Id,
+    action: &Action,
+    curve_index: u32,
+    binding: &ModifierParameterBinding,
+) -> Result<()> {
+    let node = doc.nodes.get(&binding.node).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "modifier animation binding refers to a missing node",
+            json!({"action":action_id,"curve_index":curve_index,"node":binding.node}),
+        )
+    })?;
+    let modifier = node
+        .modifiers
+        .iter()
+        .find(|modifier| modifier.id == binding.modifier)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "modifier animation binding refers to a missing modifier",
+                json!({"action":action_id,"curve_index":curve_index,"node":binding.node,"modifier":binding.modifier}),
+            )
+        })?;
+    if binding.parameter.is_empty()
+        || modifier
+            .params
+            .get(&binding.parameter)
+            .or_else(|| {
+                crate::params::default_value(
+                    crate::params::ParameterFamily::Modifier,
+                    &modifier.modifier_type,
+                    &binding.parameter,
+                )
+            })
+            .and_then(serde_json::Value::as_f64)
+            .is_none()
+    {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "modifier animation binding must target a known scalar parameter",
+            json!({"action":action_id,"curve_index":curve_index,"modifier":binding.modifier,"parameter":binding.parameter}),
+        ));
+    }
+    let slot_is_assigned = match &binding.action_slot {
+        Some(slot_id) => {
+            let slot_exists = action.slots.iter().any(|slot| &slot.id == slot_id);
+            let active_assignment = action.active_slots.get(&binding.node) == Some(slot_id);
+            let nla_assignment = node.nla_tracks.iter().any(|track| {
+                track.strips.iter().any(|strip| {
+                    &strip.action == action_id && strip.action_slot.as_ref() == Some(slot_id)
+                })
+            });
+            slot_exists
+                && (active_assignment
+                    || nla_assignment
+                    || (action.slots.len() == 1
+                        && !action.active_slots.contains_key(&binding.node)
+                        && action.slots[0].node == binding.node))
+        }
+        None => action.slots.is_empty(),
+    };
+    if !slot_is_assigned {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "modifier animation binding does not match a slot assigned to its node",
+            json!({"action":action_id,"curve_index":curve_index,"node":binding.node,"action_slot":binding.action_slot}),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Default)]
 struct TransformChannels {
@@ -97,7 +428,12 @@ fn sample_action_transform(
     let mut euler = None;
     let mut quaternion = transform.rotation;
     let mut quaternion_modified = false;
-    for curve in &action.fcurves {
+    for (curve_index, curve) in action.fcurves.iter().enumerate() {
+        if u32::try_from(curve_index)
+            .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
+        {
+            continue;
+        }
         let Some(value) = sample_curve(curve, frame)? else {
             continue;
         };
@@ -268,6 +604,23 @@ fn strip_influence(strip: &NlaStrip, frame: f64) -> Result<f64> {
     }
 }
 
+/// Blender's `nla_blend_value` and `nla_combine_value` for one scalar channel (`NEC_MIX_ADD`).
+/// Replace and Add blend against the lower value. Combine adds the strip's offset from the channel's
+/// default, so an NLA stack over a channel at its default leaves the default untouched (`anim_sys.cc:1866`, `1890`).
+fn blend_scalar(
+    current: f64,
+    target: f64,
+    default: f64,
+    blend: NlaBlendType,
+    influence: f64,
+) -> f64 {
+    match blend {
+        NlaBlendType::Replace => current * (1.0 - influence) + target * influence,
+        NlaBlendType::Add => current + target * influence,
+        NlaBlendType::Combine => current + (target - default) * influence,
+    }
+}
+
 fn blend_transform(
     current: &mut Transform,
     sampled: &Transform,
@@ -277,15 +630,14 @@ fn blend_transform(
 ) -> Result<()> {
     for component in 0..3 {
         if channels.translation[component] {
-            let value = sampled.translation[component];
-            current.translation[component] = match blend {
-                NlaBlendType::Replace => {
-                    current.translation[component] * (1.0 - influence) + value * influence
-                }
-                NlaBlendType::Add | NlaBlendType::Combine => {
-                    current.translation[component] + value * influence
-                }
-            };
+            current.translation[component] = blend_scalar(
+                current.translation[component],
+                sampled.translation[component],
+                // Location's Blender default is 0, so COMBINE adds the strip's value unchanged.
+                0.0,
+                blend,
+                influence,
+            );
         }
         if channels.scale[component] {
             let value = sampled.scale[component];
@@ -803,11 +1155,15 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::model::{
-        Action, Extrapolation, FCurve, Id, Interpolation, Keyframe, NlaBlendType, NlaExtrapolation,
-        NlaStrip, Node, PoseBone, SceneDoc, Transform,
+        Action, ActionSlot, Extrapolation, FCurve, Id, Interpolation, Keyframe, Modifier,
+        ModifierParameterBinding, NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node,
+        PoseBone, SceneDoc, Transform,
     };
 
-    use super::{animated_pose_bones, animated_transform, sample_curve, strip_action_frame};
+    use super::{
+        animated_modifier_scalar, animated_pose_bones, animated_transform, sample_curve,
+        strip_action_frame,
+    };
 
     fn node(action: Option<Id>) -> Node {
         Node {
@@ -837,6 +1193,81 @@ mod tests {
             keyframes: keys,
             extrapolation,
         }
+    }
+
+    fn ocean_modifier(id: &Id) -> Modifier {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "type": "ocean",
+            "name": "Ocean",
+            "params": {"time": 0.5},
+        }))
+        .unwrap()
+    }
+
+    fn ocean_time_curve(start_value: f64, end_value: f64) -> FCurve {
+        FCurve {
+            path: "modifiers[\"Ocean\"].time".to_owned(),
+            index: 0,
+            keyframes: vec![
+                Keyframe {
+                    frame: 1.0,
+                    value: start_value,
+                    interpolation: Interpolation::Linear,
+                    ..Keyframe::default()
+                },
+                Keyframe {
+                    frame: 3.0,
+                    value: end_value,
+                    interpolation: Interpolation::Linear,
+                    ..Keyframe::default()
+                },
+            ],
+            extrapolation: Extrapolation::Constant,
+        }
+    }
+
+    fn ocean_modifier_binding(
+        node: &Id,
+        modifier: &Id,
+        action_slot: &Id,
+    ) -> ModifierParameterBinding {
+        ModifierParameterBinding {
+            node: node.clone(),
+            modifier: modifier.clone(),
+            parameter: "time".to_owned(),
+            action_slot: Some(action_slot.clone()),
+        }
+    }
+
+    fn ocean_time_action(
+        action_slot: &Id,
+        node: &Id,
+        bindings: Vec<ModifierParameterBinding>,
+        start_value: f64,
+        end_value: f64,
+    ) -> Action {
+        let active_slots = bindings
+            .iter()
+            .map(|binding| (binding.node.clone(), action_slot.clone()))
+            .collect();
+        Action {
+            name: "Ocean Time".to_owned(),
+            fcurves: vec![ocean_time_curve(start_value, end_value)],
+            slots: vec![ActionSlot {
+                id: action_slot.clone(),
+                node: node.clone(),
+                blender_identifier: None,
+            }],
+            active_slots,
+            modifier_bindings: std::collections::BTreeMap::from([(0, bindings)]),
+        }
+    }
+
+    fn ocean_node(action: Option<Id>, modifier_id: &Id) -> Node {
+        let mut node = node(action);
+        node.modifiers.push(ocean_modifier(modifier_id));
+        node
     }
 
     #[test]
@@ -930,6 +1361,375 @@ mod tests {
     }
 
     #[test]
+    fn active_action_samples_modifier_scalar_by_stable_identity() {
+        let node_id = Id::new("ocean_node").unwrap();
+        let modifier_id = Id::new("ocean_modifier").unwrap();
+        let action_id = Id::new("ocean_action").unwrap();
+        let slot_id = Id::new("ocean_slot").unwrap();
+        let subject = ocean_node(Some(action_id.clone()), &modifier_id);
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.nodes.insert(node_id.clone(), subject.clone());
+        doc.actions.insert(
+            action_id,
+            ocean_time_action(
+                &slot_id,
+                &node_id,
+                vec![ocean_modifier_binding(&node_id, &modifier_id, &slot_id)],
+                0.5,
+                2.5,
+            ),
+        );
+
+        assert_eq!(
+            animated_modifier_scalar(&node_id, &subject, &doc, &modifier_id, "time", 0.5, 2.0)
+                .unwrap(),
+            Some(1.5)
+        );
+        assert_eq!(
+            animated_transform(&subject, &doc, 2.0).unwrap().translation,
+            subject.transform.translation
+        );
+    }
+
+    #[test]
+    fn shared_action_slot_binds_one_curve_to_each_objects_modifier_id() {
+        let node_a_id = Id::new("ocean_node_a").unwrap();
+        let node_b_id = Id::new("ocean_node_b").unwrap();
+        let modifier_a_id = Id::new("ocean_modifier_a").unwrap();
+        let modifier_b_id = Id::new("ocean_modifier_b").unwrap();
+        let action_id = Id::new("ocean_action_shared").unwrap();
+        let slot_id = Id::new("ocean_slot_shared").unwrap();
+        let subject_a = ocean_node(Some(action_id.clone()), &modifier_a_id);
+        let subject_b = ocean_node(Some(action_id.clone()), &modifier_b_id);
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.nodes.insert(node_a_id.clone(), subject_a.clone());
+        doc.nodes.insert(node_b_id.clone(), subject_b.clone());
+        doc.actions.insert(
+            action_id,
+            ocean_time_action(
+                &slot_id,
+                &node_a_id,
+                vec![
+                    ocean_modifier_binding(&node_a_id, &modifier_a_id, &slot_id),
+                    ocean_modifier_binding(&node_b_id, &modifier_b_id, &slot_id),
+                ],
+                0.5,
+                2.5,
+            ),
+        );
+
+        assert_eq!(
+            animated_modifier_scalar(
+                &node_a_id,
+                &subject_a,
+                &doc,
+                &modifier_a_id,
+                "time",
+                0.5,
+                2.0,
+            )
+            .unwrap(),
+            Some(1.5)
+        );
+        assert_eq!(
+            animated_modifier_scalar(
+                &node_b_id,
+                &subject_b,
+                &doc,
+                &modifier_b_id,
+                "time",
+                0.5,
+                2.0,
+            )
+            .unwrap(),
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn active_action_slot_selects_only_its_modifier_curve() {
+        let node_a_id = Id::new("slot_node_a").unwrap();
+        let node_b_id = Id::new("slot_node_b").unwrap();
+        let modifier_a_id = Id::new("slot_modifier_a").unwrap();
+        let modifier_b_id = Id::new("slot_modifier_b").unwrap();
+        let action_id = Id::new("slot_action").unwrap();
+        let slot_a_id = Id::new("slot_a").unwrap();
+        let slot_b_id = Id::new("slot_b").unwrap();
+        let subject_a = ocean_node(Some(action_id.clone()), &modifier_a_id);
+        let subject_b = ocean_node(Some(action_id.clone()), &modifier_b_id);
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.nodes.insert(node_a_id.clone(), subject_a.clone());
+        doc.nodes.insert(node_b_id.clone(), subject_b.clone());
+        doc.actions.insert(
+            action_id,
+            Action {
+                name: "Slot-specific Ocean Time".to_owned(),
+                fcurves: vec![ocean_time_curve(0.5, 2.5), ocean_time_curve(0.5, 4.5)],
+                slots: vec![
+                    ActionSlot {
+                        id: slot_a_id.clone(),
+                        node: node_a_id.clone(),
+                        blender_identifier: Some("OBJECT_A".to_owned()),
+                    },
+                    ActionSlot {
+                        id: slot_b_id.clone(),
+                        node: node_b_id.clone(),
+                        blender_identifier: Some("OBJECT_B".to_owned()),
+                    },
+                ],
+                active_slots: std::collections::BTreeMap::from([
+                    (node_a_id.clone(), slot_a_id.clone()),
+                    (node_b_id.clone(), slot_b_id.clone()),
+                ]),
+                modifier_bindings: std::collections::BTreeMap::from([
+                    (
+                        0,
+                        vec![ocean_modifier_binding(
+                            &node_a_id,
+                            &modifier_a_id,
+                            &slot_a_id,
+                        )],
+                    ),
+                    (
+                        1,
+                        vec![ocean_modifier_binding(
+                            &node_b_id,
+                            &modifier_b_id,
+                            &slot_b_id,
+                        )],
+                    ),
+                ]),
+            },
+        );
+
+        assert_eq!(
+            animated_modifier_scalar(
+                &node_a_id,
+                &subject_a,
+                &doc,
+                &modifier_a_id,
+                "time",
+                0.5,
+                2.0,
+            )
+            .unwrap(),
+            Some(1.5)
+        );
+        assert_eq!(
+            animated_modifier_scalar(
+                &node_b_id,
+                &subject_b,
+                &doc,
+                &modifier_b_id,
+                "time",
+                0.5,
+                2.0,
+            )
+            .unwrap(),
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn modifier_scalar_nla_reuses_native_frame_influence_and_blend_rules() {
+        for (blend_type, expected) in [
+            // Blender's default for Ocean time is 1.0 (DNA_modifier_types.h:1480), so the NLA stack starts there,
+            // not at the stored 0.5. The strip value at frame 2 is 2.0 and its influence 0.5.
+            (NlaBlendType::Replace, 1.5),
+            (NlaBlendType::Add, 2.0),
+            (NlaBlendType::Combine, 1.5),
+        ] {
+            let node_id = Id::new("ocean_nla_node").unwrap();
+            let modifier_id = Id::new("ocean_nla_modifier").unwrap();
+            let action_id = Id::new("ocean_nla_action").unwrap();
+            let slot_id = Id::new("ocean_nla_slot").unwrap();
+            let mut subject = ocean_node(None, &modifier_id);
+            subject.nla_tracks.push(NlaTrack {
+                id: Id::new("ocean_nla_track").unwrap(),
+                name: "Ocean Time".to_owned(),
+                mute: false,
+                solo: false,
+                strips: vec![NlaStrip {
+                    id: Id::new("ocean_nla_strip").unwrap(),
+                    action: action_id.clone(),
+                    action_slot: Some(slot_id.clone()),
+                    frame_start: 1.0,
+                    frame_end: 3.0,
+                    action_frame_start: 1.0,
+                    action_frame_end: 3.0,
+                    scale: 1.0,
+                    repeat: 1.0,
+                    blend_type,
+                    influence: 0.5,
+                    extrapolation: NlaExtrapolation::Nothing,
+                    blend_in: 0.0,
+                    blend_out: 0.0,
+                }],
+            });
+            let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+            doc.nodes.insert(node_id.clone(), subject.clone());
+            let mut nla_action = ocean_time_action(
+                &slot_id,
+                &node_id,
+                vec![ocean_modifier_binding(&node_id, &modifier_id, &slot_id)],
+                1.5,
+                2.5,
+            );
+            nla_action.active_slots.clear();
+            doc.actions.insert(action_id, nla_action);
+
+            assert_eq!(
+                animated_modifier_scalar(&node_id, &subject, &doc, &modifier_id, "time", 0.5, 2.0,)
+                    .unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    /// The NLA value of Ocean `time` at each frame, as Blender 5.2.2 writes it. The committed generator
+    /// (`tests/fixtures/ocean_parity/generate_nla_time.py`) runs the scene in Blender and records the value
+    /// the modifier holds after `frame_set`. Each case rebuilds the same node, strip and Action, and checks
+    /// `animated_modifier_scalar` at every frame. A case with no NLA strip keeps the stored `time`.
+    #[test]
+    fn ocean_time_nla_matches_blender_522_oracle() -> Result<(), Box<dyn std::error::Error>> {
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/ocean_parity/nla_time_oracle.json"
+        ))?;
+        assert_eq!(oracle["format"], "potter-ocean-nla-time-oracle");
+        assert_eq!(oracle["default_time"].as_f64(), Some(1.0));
+        let cases = oracle["cases"]
+            .as_array()
+            .ok_or("oracle cases are missing")?;
+        assert!(!cases.is_empty(), "the Blender oracle has no cases");
+        for case in cases {
+            let name = case["name"].as_str().ok_or("oracle case has no name")?;
+            let stored = case["stored_time"]
+                .as_f64()
+                .ok_or("stored time is missing")?;
+            // `ocean_node` stores time 0.5, so the oracle's stored time must be that value.
+            assert_eq!(stored, 0.5, "{name}: stored time");
+            let node_id = Id::new(format!("oracle_{name}"))?;
+            let modifier_id = Id::new("oracle_ocean")?;
+            let action_id = Id::new(format!("oracle_action_{name}"))?;
+            let slot_id = Id::new(format!("oracle_slot_{name}"))?;
+            let mut subject = ocean_node(None, &modifier_id);
+            let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+            if let Some(strip) = case["strip"].as_object() {
+                let keys = case["keys"].as_array().ok_or("oracle keys are missing")?;
+                assert_eq!(keys.len(), 2, "{name}: two keys");
+                assert_eq!(
+                    keys[0]["frame"].as_f64(),
+                    Some(1.0),
+                    "{name}: first key frame"
+                );
+                assert_eq!(
+                    keys[1]["frame"].as_f64(),
+                    Some(3.0),
+                    "{name}: second key frame"
+                );
+                let first_value = keys[0]["value"]
+                    .as_f64()
+                    .ok_or("first key value is missing")?;
+                let second_value = keys[1]["value"]
+                    .as_f64()
+                    .ok_or("second key value is missing")?;
+                let number = |field: &str| {
+                    strip[field]
+                        .as_f64()
+                        .ok_or_else(|| format!("{name}: strip {field} is missing"))
+                };
+                assert_eq!(strip["extrapolation"], "NOTHING", "{name}: extrapolation");
+                let blend_type = match strip["blend_type"].as_str() {
+                    Some("REPLACE") => NlaBlendType::Replace,
+                    Some("ADD") => NlaBlendType::Add,
+                    Some("COMBINE") => NlaBlendType::Combine,
+                    other => return Err(format!("{name}: unknown blend type {other:?}").into()),
+                };
+                subject.nla_tracks.push(NlaTrack {
+                    id: Id::new(format!("oracle_track_{name}"))?,
+                    name: "Ocean Time".to_owned(),
+                    mute: false,
+                    solo: false,
+                    strips: vec![NlaStrip {
+                        id: Id::new(format!("oracle_strip_{name}"))?,
+                        action: action_id.clone(),
+                        action_slot: Some(slot_id.clone()),
+                        frame_start: number("frame_start")?,
+                        frame_end: number("frame_end")?,
+                        action_frame_start: number("action_frame_start")?,
+                        action_frame_end: number("action_frame_end")?,
+                        scale: 1.0,
+                        repeat: 1.0,
+                        blend_type,
+                        influence: number("influence")?,
+                        extrapolation: NlaExtrapolation::Nothing,
+                        blend_in: 0.0,
+                        blend_out: 0.0,
+                    }],
+                });
+                let mut action = ocean_time_action(
+                    &slot_id,
+                    &node_id,
+                    vec![ocean_modifier_binding(&node_id, &modifier_id, &slot_id)],
+                    first_value,
+                    second_value,
+                );
+                action.active_slots.clear();
+                doc.actions.insert(action_id, action);
+            }
+            doc.nodes.insert(node_id.clone(), subject.clone());
+            let expected = case["expected_by_frame"]
+                .as_object()
+                .ok_or("expected values are missing")?;
+            assert_eq!(expected.len(), 7, "{name}: frames 0 to 6");
+            for (frame_text, value) in expected {
+                let frame: f64 = frame_text.parse()?;
+                let expected = value.as_f64().ok_or("expected value is not numeric")?;
+                let actual = animated_modifier_scalar(
+                    &node_id,
+                    &subject,
+                    &doc,
+                    &modifier_id,
+                    "time",
+                    stored,
+                    frame,
+                )?
+                .unwrap_or(stored);
+                assert!(
+                    (actual - expected).abs() <= 1.0e-6,
+                    "{name} frame {frame}: Potter {actual} vs Blender 5.2.2 {expected}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_modifier_curve_is_an_error_not_a_static_fallback() {
+        let node_id = Id::new("ocean_unbound_node").unwrap();
+        let modifier_id = Id::new("ocean_unbound_modifier").unwrap();
+        let action_id = Id::new("ocean_unbound_action").unwrap();
+        let subject = ocean_node(Some(action_id.clone()), &modifier_id);
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.nodes.insert(node_id.clone(), subject.clone());
+        doc.actions.insert(
+            action_id,
+            Action {
+                name: "Unbound Ocean Time".to_owned(),
+                slots: Vec::new(),
+                active_slots: std::collections::BTreeMap::new(),
+                fcurves: vec![ocean_time_curve(0.5, 2.5)],
+                modifier_bindings: std::collections::BTreeMap::from([(0, Vec::new())]),
+            },
+        );
+
+        assert!(
+            animated_modifier_scalar(&node_id, &subject, &doc, &modifier_id, "time", 0.5, 2.0)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn constant_and_linear_interpolation_match_their_exact_definitions() {
         let keys = vec![
             Keyframe {
@@ -977,6 +1777,7 @@ mod tests {
             let strip = NlaStrip {
                 id: Id::new("strip").unwrap(),
                 action: Id::new("action").unwrap(),
+                action_slot: None,
                 frame_start: 1.0,
                 frame_end: 11.0,
                 action_frame_start: 1.0,

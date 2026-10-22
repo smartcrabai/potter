@@ -1,0 +1,27 @@
+{
+  "tint": [0.2, 0.8, 0.4],
+  "measured_by": "measure_realtime_transparent_tint_spread.py: EEVEE 5.2.2, 64 by 64 frame, 16 samples, the 9 by 9 patch mean, over 8 shifts of the whole scene along y (k * 0.0001, k = 1..8). Each shift is an independent realisation of EEVEE's dither noise.",
+  "methods": {
+    "BLENDED": {
+      "eevee_patch_mean": [0.199951171875, 0.7998046875, 0.39990234375],
+      "eevee_sigma": 0.0,
+      "tolerance": 0.000244140625,
+      "derivation": "EEVEE's value is the same at every shift (sigma 0). The EXR is half-float; for values in [0.5, 1) the rounding error is at most 2^-12 = 0.000244140625. The test asserts Potter against this mean with that bound alone."
+    },
+    "MIX": {
+      "eevee_patch_mean": [0.0999755859375, 0.39990234375, 0.199951171875],
+      "eevee_sigma": 0.0,
+      "tolerance": 0.000244140625,
+      "derivation": "A Mix Shader at Fac 0.5 of the Transparent pane (Color TINT) and an opaque black Principled, rendered BLENDED. The opaque closure passes nothing, so EEVEE sums the transmittance to 0.5 * TINT (`eevee_nodetree_lib.bsl.hh`, closure_eval(ClosureTransparency), weighted by the closure weights), and the pane shows that over the radiance-1 backdrop: (0.1, 0.4, 0.2). EEVEE's value is the same at every one of the 8 shifts (sigma 0). The half-float rounding bound of the EXR for these values is at most 2^-13; the test uses 2^-12, the bound BLENDED uses, as a margin. Potter's weighted sum (`render/scene.rs` surface_tint) gives the same 0.5 * TINT by hand (`weighted_tint` tests)."
+    },
+    "DITHERED": {
+      "exact_channel_mean": 0.4666666666666666,
+      "eevee_patch_mean_over_shifts": 0.4762264298804012,
+      "eevee_sigma": 0.0020656468108460084,
+      "eevee_standard_error": 0.000730316433742789,
+      "eevee_offset_from_exact": 0.009559763213734584,
+      "recorded_gap": "Not asserted by the test. EEVEE's dithered mean is 0.00956 above the Color's channel mean, 13 standard errors, so the offset is systematic and not noise. Matching it needs Potter's realtime sampler to model EEVEE's per-sample hashed test and film filter; a tolerance would only fit Potter's output.",
+      "mechanism": "From EEVEE 5.2.2 source. The depth prepass discards a fragment when average(T) > threshold (eevee_surf_depth.bsl.hh 76-85). The threshold is the Wyman-McGuire hashed alpha test on the fragment position, with alpha_hash_scale 0.1 for final renders (eevee_transparency.bsl.hh; eevee_pipeline.cc 781), jittered per sample by a base-7 Halton value at sample+1 (eevee_sampling.cc 194). The film sums the samples with a Gaussian fit to Blackman-Harris of radius 1.5 (eevee_film_shared.hh 129; eevee_film.cc 680-800), with sub-pixel jitter from base-2/3 Halton. An offline model with those rules, outside Potter, gives 0.4785 over the same 8 shifts. Without the film filter the hash model gives 0.4871, which is ruled out."
+    }
+  }
+}

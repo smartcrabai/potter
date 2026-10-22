@@ -2523,6 +2523,7 @@ mod tests {
             show_render: true,
             params: Map::new(),
             binding_data: Some(binding_data),
+            baked_ocean_cache: None,
             runtime: ModifierRuntime::default(),
         })
     }
@@ -2915,6 +2916,7 @@ mod tests {
         binding_data: Option<Value>,
     ) -> Result<Modifier, Box<dyn std::error::Error>> {
         Ok(Modifier {
+            baked_ocean_cache: None,
             id: Id::new("surface_edge_test")?,
             modifier_type: "surface_deform".to_owned(),
             name: "Surface Edge Test".to_owned(),
