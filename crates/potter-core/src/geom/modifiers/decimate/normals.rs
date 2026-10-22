@@ -106,20 +106,6 @@ fn mesh_face_normal(points: &[Vec3]) -> Vec3 {
     n
 }
 
-/// `safe_acos_approx` (`BLI_math_base.hh`): a polynomial approximation of `acos` with clamping.
-#[expect(
-    clippy::excessive_precision,
-    reason = "Blender's literal, kept bit-exact"
-)]
-fn safe_acos_approx(x: f32) -> f32 {
-    let f = x.abs();
-    let m = if f < 1.0 { 1.0 - (1.0 - f) } else { 1.0 };
-    let a = (1.0 - m).sqrt()
-        * (std::f32::consts::FRAC_PI_2
-            + m * (-0.213_300_989_f32 + m * (0.077_980_478_f32 + m * -0.021_640_95_f32)));
-    if x < 0.0 { std::f32::consts::PI - a } else { a }
-}
-
 /// Vertex normals as `normals_calc_verts` (`mesh_normals.cc`) produces them, which
 /// `BKE_mesh_to_bmesh_ex` copies into `v->no`. Each vertex sums its incident Mesh face normals
 /// (ascending face index) weighted by `safe_acos_approx` of the angle between the two edges.
@@ -159,7 +145,7 @@ pub(super) fn vertex_normals(points: &[[f32; 3]], faces: &[Vec<usize>]) -> Vec<[
                 let next = points[face[(k + 1) % len]];
                 let dir_prev = normalize_divide(sub(prev, p));
                 let dir_next = normalize_divide(sub(next, p));
-                let factor = safe_acos_approx(dot(dir_prev, dir_next));
+                let factor = crate::geom::normals::float_safe_acos_approx(dot(dir_prev, dir_next));
                 for (a, n) in acc.iter_mut().zip(face_normals[fi]) {
                     *a += n * factor;
                 }

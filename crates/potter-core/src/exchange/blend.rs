@@ -24,17 +24,18 @@ use crate::{
     model::{
         Action, ActionSlot, ArmatureData, Bone, CameraData, CameraProjection, Collection,
         Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveHandleType,
-        CurvePoint, CurveSpline, CurveSplineType, DataBlock, Driver, DriverType, DriverVariable,
-        DriverVariableType, Extrapolation, FCurve, ForceField, ForceFieldType, GreasePencilData,
-        GreasePencilFrame, GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image,
-        ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library,
-        LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
-        Material, MaterialLink, Modifier, ModifierParameterBinding, MovieClip, MovieTracking,
-        NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, Profile, RayKind,
-        RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
-        RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint,
-        TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer,
-        ViewportDisplay, VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
+        CurvePoint, CurveSpline, CurveSplineType, DEFAULT_FILTER_WIDTH, DataBlock, Driver,
+        DriverType, DriverVariable, DriverVariableType, Extrapolation, FCurve, ForceField,
+        ForceFieldType, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
+        GreasePencilStroke, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
+        Interpolation, Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty,
+        LibraryStatus, LightData, LightType, Material, MaterialLink, Modifier,
+        ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
+        NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind, RayVisibility,
+        Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene,
+        SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData,
+        TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer, ViewportDisplay,
+        VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -2982,6 +2983,17 @@ fn build_imported_graph(
                 8,
             ))
             .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
+            pixel_filter_type: match render
+                .get("pixel_filter_type")
+                .and_then(Value::as_str)
+                .unwrap_or("BLACKMAN_HARRIS")
+            {
+                "BOX" => PixelFilterType::Box,
+                "GAUSSIAN" => PixelFilterType::Gaussian,
+                "BLACKMAN_HARRIS" => PixelFilterType::BlackmanHarris,
+                _ => return Err(invalid_intermediate("render pixel_filter_type is unknown")),
+            },
+            filter_width: number_field(&render, "filter_width", DEFAULT_FILTER_WIDTH),
             dicing_rate: number_field(&render, "dicing_rate", 1.0),
             filter_glossy: number_field(&render, "filter_glossy", 1.0),
             preview_dicing_rate: number_field(&render, "preview_dicing_rate", 8.0),

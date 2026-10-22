@@ -75,6 +75,7 @@ pub(super) fn assemble(
         faces: Vec::with_capacity(topology.faces.len()),
         corners: Some(Vec::new()),
         source_vertices: None,
+        ..Default::default()
     };
     for ((&position, sample), &normal) in topology
         .positions

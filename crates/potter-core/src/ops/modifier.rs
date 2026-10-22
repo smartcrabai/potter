@@ -1566,10 +1566,7 @@ fn evaluate_modifier_output(
                     purpose: crate::eval::EvaluationPurpose::Preview,
                     project_root: engine.asset_root,
                     cache_directory: engine.cache_directory,
-                    material_slot_count: Some(crate::model::material_slot_count(
-                        object_material_count,
-                        material_slots.len(),
-                    )),
+                    material_slot_count,
                 },
                 |_, modifier| modifier.enabled,
                 texture_seed,
@@ -1668,12 +1665,7 @@ fn evaluate_modifier_output(
                             "custom modifier callback received an unexpected type",
                         )),
                     };
-                    result.map(|()| {
-                        Some(crate::model::material_slot_count(
-                            object_material_count,
-                            material_slots.len(),
-                        ))
-                    })
+                    result.map(|()| material_slot_count)
                 },
                 animated_parameter,
             )?;
