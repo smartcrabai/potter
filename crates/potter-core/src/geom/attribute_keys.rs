@@ -33,6 +33,7 @@ const INTERNAL_KEYS: &[&str] = &[
     "shade_smooth",
     "skin_radii",
     "skin_roots",
+    "texture_space",
     "uv_layers",
     crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES,
     "vertex_groups",
