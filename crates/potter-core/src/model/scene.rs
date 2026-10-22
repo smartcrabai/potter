@@ -1177,6 +1177,43 @@ pub struct GreasePencilPoint {
     pub time: f64,
 }
 
+/// Cycles' film pixel filter (`intern/cycles/scene/film.h`, `FilterType`). Blender's default is
+/// Blackman-Harris, serialized as Blender's enum identifiers (`BOX`, `GAUSSIAN`, `BLACKMAN_HARRIS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PixelFilterType {
+    #[serde(rename = "BOX")]
+    Box,
+    #[serde(rename = "GAUSSIAN")]
+    Gaussian,
+    #[serde(rename = "BLACKMAN_HARRIS")]
+    BlackmanHarris,
+}
+
+/// Blender's `filter_width` default (`properties.py`): 1.5 pixels.
+pub const DEFAULT_FILTER_WIDTH: f64 = 1.5;
+/// Blender's `filter_width` RNA range. Blender stores the value as float32, so the lower bound is
+/// `0.01_f32` widened: a `.blend` holding the clamped minimum reads back as this value exactly.
+pub const FILTER_WIDTH_MIN: f64 = 0.01_f32 as f64;
+pub const FILTER_WIDTH_MAX: f64 = 10.0;
+
+fn default_pixel_filter_type() -> PixelFilterType {
+    PixelFilterType::BlackmanHarris
+}
+
+/// serde's `skip_serializing_if` passes a reference. The predicates are generic so that the
+/// by-reference signature needs no lint suppression for a small `Copy` type.
+fn is_default_pixel_filter_type<T: PartialEq<PixelFilterType>>(value: &T) -> bool {
+    PartialEq::eq(value, &PixelFilterType::BlackmanHarris)
+}
+
+fn default_filter_width() -> f64 {
+    DEFAULT_FILTER_WIDTH
+}
+
+fn is_default_filter_width<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64((*value).into(), DEFAULT_FILTER_WIDTH)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenderSettings {
@@ -1204,6 +1241,18 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_filter_glossy"
     )]
     pub filter_glossy: f64,
+    /// Cycles' `pixel_filter_type` (`scene/film.h`). Omitted when equal to Blender's default.
+    #[serde(
+        default = "default_pixel_filter_type",
+        skip_serializing_if = "is_default_pixel_filter_type"
+    )]
+    pub pixel_filter_type: PixelFilterType,
+    /// Cycles' `filter_width` in pixels, Blender's RNA range 0.01..=10. Omitted at Blender's default.
+    #[serde(
+        default = "default_filter_width",
+        skip_serializing_if = "is_default_filter_width"
+    )]
+    pub filter_width: f64,
     pub film_transparent: bool,
     /// Blender's `render.filter_size` (`scene.r.gauss`, `rna_scene.cc`): the reconstruction radius, in pixels, of
     /// EEVEE's film (`eevee_film.cc`). Realtime Beauty uses it; Solid and the path tracer do not.
@@ -1247,6 +1296,12 @@ impl RenderSettings {
                 "Cycles adaptive dicing settings are outside Blender RNA ranges",
             ));
         }
+        if !(FILTER_WIDTH_MIN..=FILTER_WIDTH_MAX).contains(&self.filter_width) {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "Cycles filter_width is outside Blender RNA range 0.01..=10",
+            ));
+        }
         Ok(())
     }
 }
@@ -1263,6 +1318,8 @@ impl Default for RenderSettings {
             volume_bounces: 0,
             transparent_max_bounces: 8,
             filter_glossy: 1.0,
+            pixel_filter_type: PixelFilterType::BlackmanHarris,
+            filter_width: DEFAULT_FILTER_WIDTH,
             film_transparent: false,
             filter_size: default_filter_size(),
             engine: "path".to_owned(),

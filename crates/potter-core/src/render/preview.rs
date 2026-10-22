@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::{
+    pixel_filter::PixelFilter,
     raster::{
         Camera, CameraEngine, DepthOfField, Mode, Projection, RasterOutput, StereoMode,
         SurfaceShader, ViewBasis, WorldRadiance, projection_for_camera, rasterize_wireframe,
@@ -222,6 +223,7 @@ pub fn render_previews(
                 scene.render.volume_bounces,
                 scene.render.transparent_max_bounces,
                 false,
+                &PixelFilter::new(scene.render.pixel_filter_type, scene.render.filter_width),
                 &images,
             )?
         } else {
@@ -402,6 +404,7 @@ pub(crate) fn render_camera_frame(
             scene.render.volume_bounces,
             scene.render.transparent_max_bounces,
             film_transparent,
+            &PixelFilter::new(scene.render.pixel_filter_type, scene.render.filter_width),
             &images,
         )?
     } else {
