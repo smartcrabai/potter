@@ -1591,7 +1591,7 @@
       "blender_type": "COLLISION",
       "params": {},
       "potter_settings": {
-        "thickness": 0.01
+        "thickness_outer": 0.01
       },
       "potter_type": "collision"
     },
@@ -1607,8 +1607,8 @@
       "blender_type": "FLUID",
       "params": {},
       "potter_settings": {
-        "resolution": 4,
-        "type": "liquid"
+        "domain_type": "LIQUID",
+        "resolution_max": 4
       },
       "potter_type": "fluid"
     },
@@ -1648,7 +1648,7 @@
       "blender_type": "SOFT_BODY",
       "params": {},
       "potter_settings": {
-        "goal_strength": 0.7
+        "goal_default": 0.7
       },
       "potter_type": "soft_body"
     },

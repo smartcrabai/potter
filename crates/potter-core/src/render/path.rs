@@ -17,16 +17,17 @@ use crate::{
     image::{ImageData, ImageInterpolation},
     model::{Id, LightType, Material, SceneDoc, VolumeSampling},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
-        SubsurfaceMethod, SurfaceShading, equirectangular_uv, evaluate_displacement_with_workspace,
-        evaluate_surface_with_workspace, heaviest, height_gradient,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitFootprint, HitUvLayers, PreparedMaterial,
+        ShaderClosure, SubsurfaceMethod, SurfaceShading, equirectangular_uv,
+        evaluate_displacement_with_workspace, evaluate_surface_with_workspace, heaviest,
+        height_gradient, make_orthonormals,
     },
 };
 
 use super::principled_bsdf::{
-    GlassSample, Layers, base_color, continuous_density, diffuse_coefficient,
-    evaluate as evaluate_bsdf, layers_at, lobe_probabilities, make_orthonormals, sample_glass,
-    sheen_coefficient, specular_eta, subsurface_closure_weight,
+    GlassSample, Layers, base_color, continuous_density, continuous_lobes, diffuse_coefficient,
+    evaluate as evaluate_bsdf, layers_at, lobe_probabilities, sample_glass, sheen_coefficient,
+    specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -472,9 +473,16 @@ impl Closures {
         let closure = &self.items[index];
         match sample_lobes(&closure.params, &closure.layers, geometric, rng) {
             LobeDraw::Absorbed => Reflection::Absorbed,
-            LobeDraw::Delta { direction, weight } => Reflection::Delta {
+            LobeDraw::Delta {
+                direction,
+                weight,
+                pdf,
+                mis_weight,
+            } => Reflection::Delta {
                 direction,
                 weight: weight * self.selection_total,
+                pdf,
+                mis_weight,
             },
             LobeDraw::Subsurface { weight, method } => Reflection::Subsurface {
                 weight: weight * self.selection_total,
@@ -490,6 +498,50 @@ impl Closures {
                 }
             }
         }
+    }
+
+    /// The closures after Cycles' glossy blur (`bsdf_microfacet_blur`, `kernel/closure/bsdf_microfacet.h`). The blur raises
+    /// only the microfacet alpha: each specular and coat roughness becomes `sqrt(max(roughness², blur_alpha))`, which
+    /// drives the sampling distribution. The closure keeps its setup layers, so its multiscatter energy stays at the
+    /// original roughness (Cycles' `energy_scale` is computed once at setup and the blur does not recompute it).
+    fn blurred(&self, blur_alpha: f64) -> Self {
+        let items = self
+            .items
+            .iter()
+            .map(|closure| {
+                let mut params = closure.params;
+                params.roughness = blurred_roughness(params.roughness, blur_alpha);
+                params.coat_roughness = blurred_roughness(params.coat_roughness, blur_alpha);
+                HitClosure {
+                    weight: closure.weight,
+                    params,
+                    layers: closure.layers,
+                }
+            })
+            .collect();
+        Self::new(items, self.smooth, self.geometric, self.bump_correction)
+    }
+
+    /// Cycles' average of the closures' squared roughness that `bsdf_widen_dD` takes (`_surface_shader_bsdf_eval_mis`,
+    /// `kernel/integrator/surface_shader.h`): each closure's continuous lobes at `wo`, the direction the path leaves along,
+    /// weighted by its selection weight and pdf, with a singular draw's `singular_weight` added to the total with zero
+    /// roughness. A singular lobe has no density and no roughness, so it is left out, as Cycles' singular eval is zero.
+    fn average_roughness_squared(&self, wo: DVec3, singular_weight: f64) -> f64 {
+        let mut total = singular_weight;
+        let mut weighted = 0.0;
+        for closure in &self.items {
+            let reflect = closure.reflect_weight();
+            if reflect <= 0.0 {
+                continue;
+            }
+            for lobe in continuous_lobes(&closure.params, &closure.layers, wo) {
+                if lobe.roughness_squared > 0.0 {
+                    total += reflect * lobe.weight;
+                    weighted += reflect * lobe.weight * lobe.roughness_squared;
+                }
+            }
+        }
+        if total > 0.0 { weighted / total } else { 0.0 }
     }
 
     /// Cycles' falling back to diffuse after a diffuse bounce (`bssrdf_setup` with `PATH_RAY_DIFFUSE_ANCESTOR`): a
@@ -541,6 +593,119 @@ struct Surface {
     element_index: u32,
     /// The triangle the hit lies on, which a random walk entering through it must not hit first (`ray.self.prim`).
     triangle_index: usize,
+    /// The hit's camera footprint, Cycles' `sd->dP`: the bump's screen differentials, and the footprint of the
+    /// shadow and light rays from this vertex (which carry `dP` unchanged, with no `dD`).
+    footprint: f64,
+}
+
+/// Cycles' compact camera ray differentials (`kernel/camera/camera.h`): `dP`, the change of the ray origin, and `dD`,
+/// the change of its direction, per raster pixel. A path's footprint at a hit is `ray.dP + t · ray.dD` (Cycles'
+/// `differential_transfer_compact`, `kernel/util/differential.h`), with `t` the distance from the ray origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CameraFootprint {
+    dp: f64,
+    dd: f64,
+}
+
+impl CameraFootprint {
+    /// The footprint at distance `t` along a ray that carries this differential (`sd->dP`).
+    fn at_distance(self, t: f64) -> f64 {
+        self.dp + t * self.dd
+    }
+}
+
+/// The camera footprint of the sample (`sample_x`, `sample_y`) of pixel (`x`, `y`), whose centre ray is `centre` (from
+/// `ray_for_sample`, so the caller's ray is not computed twice). It is the compact lengths of the origin and direction
+/// changes to the rays one pixel to the right and one pixel down, as Cycles' pinhole branch takes them
+/// (`dD = normalize(D + dx) - normalize(D)`, compacted by `differential_make_compact` at `differential_scale` 1).
+/// A perspective camera has `dP = 0` and an orthographic camera `dD = 0`. Panoramic, fisheye and depth-of-field
+/// cameras use the same finite difference rather than Cycles' per-projection formulas, and a one-pixel-wide or
+/// one-pixel-high image has no neighbour along that axis, which contributes nothing.
+fn camera_footprint(
+    frame: &CameraFrame,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    sample_x: f64,
+    sample_y: f64,
+    (origin, direction): (DVec3, DVec3),
+) -> Result<CameraFootprint> {
+    let direction = direction.normalize_or_zero();
+    let right = if x + 1 < width {
+        x + 1
+    } else {
+        x.saturating_sub(1)
+    };
+    let down = if y + 1 < height {
+        y + 1
+    } else {
+        y.saturating_sub(1)
+    };
+    let mut dp = 0.0;
+    let mut dd = 0.0;
+    for (neighbour_x, neighbour_y) in [(right, y), (x, down)] {
+        if let Some((neighbour_origin, neighbour_direction)) = ray_for_sample_in_frame(
+            frame,
+            camera,
+            width,
+            height,
+            neighbour_x,
+            neighbour_y,
+            sample_x,
+            sample_y,
+        )? {
+            dp += (neighbour_origin - origin).length();
+            dd += (neighbour_direction.normalize_or_zero() - direction).length();
+        }
+    }
+    Ok(CameraFootprint {
+        dp: 0.5 * dp,
+        dd: 0.5 * dd,
+    })
+}
+
+/// The scene's Filter Glossy (`cycles.blur_glossy`, Blender 1.0 by default), unclamped: the glossy blur reads it as
+/// `1 / filter_glossy`, and the widening clamps it to one.
+fn filter_glossy(doc: &SceneDoc) -> f64 {
+    doc.scenes
+        .get(&doc.active_scene)
+        .map_or(0.0, |scene| scene.render.filter_glossy)
+}
+
+/// The glossy blur's `alpha` (Cycles' `blur_roughness`, `kernel/integrator/surface_shader.h`,
+/// `surface_shader_prepare_closures`): after a bounce whose sampled pdf is `min_ray_pdf`, `blur_pdf` is
+/// `filter_glossy · min_ray_pdf` and the microfacet closures are blurred to `sqrt(1 - blur_pdf) / 2` when that is
+/// below one. A Filter Glossy of zero disables the blur (Cycles stores `FLT_MAX` for it).
+fn glossy_blur_alpha(filter_glossy: f64, min_ray_pdf: f64) -> Option<f64> {
+    if filter_glossy <= 0.0 {
+        return None;
+    }
+    let blur_pdf = min_ray_pdf / filter_glossy;
+    (blur_pdf < 1.0).then(|| (1.0 - blur_pdf).sqrt() * 0.5)
+}
+
+/// A microfacet lobe's roughness after the glossy blur: Cycles' `bsdf_microfacet_blur` sets `alpha = max(blur, alpha)`
+/// with alpha the squared roughness (`kernel/closure/bsdf_microfacet.h`), so the roughness is the root of that.
+fn blurred_roughness(roughness: f64, blur_alpha: f64) -> f64 {
+    roughness.powi(2).max(blur_alpha).sqrt()
+}
+
+/// The filter glossy widening scale of the scene, Cycles' `differential_widen_scale = min(1, filter_glossy)`
+/// (`intern/cycles/scene/integrator.cpp`). Blender's Filter Glossy (`cycles.blur_glossy`) defaults to 1.0.
+fn filter_glossy_widen_scale(doc: &SceneDoc) -> f64 {
+    filter_glossy(doc).clamp(0.0, 1.0)
+}
+
+/// Cycles' `bsdf_widen_dD` (`kernel/closure/bsdf.h`): `dD` widens to `scale · sqrt(avg roughness²)` when that is
+/// larger, and keeps its value for a zero average, as a singular bounce has.
+fn widen_ray_dd(ray_dd: f64, scale: f64, average_roughness_squared: f64) -> f64 {
+    if average_roughness_squared > 0.0 {
+        ray_dd.max(scale * average_roughness_squared.sqrt())
+    } else {
+        ray_dd
+    }
 }
 
 /// The result of a reflective draw of the closure set. `Continuous` carries its throughput weight, the mixture density
@@ -557,6 +722,10 @@ enum Reflection {
     Delta {
         direction: DVec3,
         weight: DVec3,
+        /// The lobe mixture's pdf of the draw (`min_ray_pdf`).
+        pdf: f64,
+        /// Cycles' singular pdf for the widening average, `1e6 · branch · share`.
+        mis_weight: f64,
     },
     Subsurface {
         weight: DVec3,
@@ -944,6 +1113,17 @@ fn render_rows(
                             bounces,
                             left_origin,
                             left_direction,
+                            camera_footprint(
+                                left_frame,
+                                left_camera,
+                                job.width,
+                                job.height,
+                                x,
+                                y,
+                                sample_x,
+                                sample_y,
+                                (left_origin, left_direction),
+                            )?,
                             job.environment,
                             &mut left_rng,
                             &mut evaluator_workspace,
@@ -956,6 +1136,17 @@ fn render_rows(
                             bounces,
                             right_origin,
                             right_direction,
+                            camera_footprint(
+                                right_frame,
+                                right_camera,
+                                job.width,
+                                job.height,
+                                x,
+                                y,
+                                sample_x,
+                                sample_y,
+                                (right_origin, right_direction),
+                            )?,
                             job.environment,
                             &mut right_rng,
                             &mut evaluator_workspace,
@@ -976,6 +1167,17 @@ fn render_rows(
                             bounces,
                             origin,
                             direction,
+                            camera_footprint(
+                                frame,
+                                camera,
+                                job.width,
+                                job.height,
+                                x,
+                                y,
+                                sample_x,
+                                sample_y,
+                                (origin, direction),
+                            )?,
                             job.environment,
                             &mut rng,
                             &mut evaluator_workspace,
@@ -1407,8 +1609,7 @@ fn realtime_volume_integral(
         ) {
             entry = entry.min(volume_entry);
             exit = exit.max(volume_exit);
-            minimum_step = minimum_step
-                .min(instance.voxel_size / local_direction.length().max(f64::MIN_POSITIVE) * 0.5);
+            minimum_step = minimum_step.min(volume_sampling_step(instance, local_direction));
         }
     }
     if !entry.is_finite() || exit <= entry {
@@ -1522,12 +1723,16 @@ struct ShadowRay {
     shading: DVec3,
     direction: DVec3,
     distance: f64,
+    /// The camera footprint at the ray's origin (Cycles' `sd->dP`, which a shadow ray carries unchanged).
+    footprint: f64,
 }
 
 /// A volume scatter's receiver: its point, the incoming direction, its phase function, the per-light weights of the direct
 /// light, and the environment along the incoming direction.
 struct VolumeSite<'a> {
     point: DVec3,
+    /// The scatter's camera footprint (Cycles' volume `sd->dP`), carried by its shadow rays.
+    footprint: f64,
     incoming: DVec3,
     phase: &'a PhaseMixture,
     light_weights: &'a [f64],
@@ -1667,6 +1872,7 @@ fn trace_path(
     bounces: Bounces,
     mut origin: DVec3,
     mut direction: DVec3,
+    footprint: CameraFootprint,
     environment: DVec3,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
@@ -1696,6 +1902,16 @@ fn trace_path(
     // (`intern/cycles/kernel/integrator/path_state.h`, the FIXME at `path_state_next`).
     let transparent_cap = transparent_max_bounces.max(1);
     let mut volume_bounds = 0u32;
+    // The ray differentials of the path: `ray_dp` is the compact `ray.dP` and `ray_dd` the compact `ray.dD` (Cycles'
+    // `INTEGRATOR_STATE(ray, dP)` and `dD`). A hit's footprint is `ray_dp + t · ray_dd`, and a surface bounce keeps that
+    // footprint as the next ray's `dP`, widening `dD` only by the filter glossy scale.
+    let mut ray_dp = footprint.dp;
+    let mut ray_dd = footprint.dd;
+    let widen_scale = filter_glossy_widen_scale(doc);
+    let blur_glossy = filter_glossy(doc);
+    // The smallest sampled pdf so far on this path (Cycles' `path.min_ray_pdf`, `FLT_MAX` at the start of a path and
+    // lowered by each BSDF and phase sample, `shade_surface.h` and `shade_volume.h`). It drives the glossy blur.
+    let mut min_ray_pdf = f64::MAX;
     // Cycles' `volume_bounce` limit (`path_state_next`): `volume_bounces + 1` scatter vertices take direct light.
     let volume_limit = volume_bounces.saturating_add(1);
     let mut volume_scatters = 0u32;
@@ -1716,7 +1932,15 @@ fn trace_path(
     let mut diffuse_ancestor = false;
     // The volume stack: the media the path is inside, innermost last. It starts with the mesh media that contain the
     // camera (Cycles' `volume_stack_init`).
-    let mut media = camera_media(doc, geometry, bvh, origin, images, evaluator_workspace)?;
+    let mut media = camera_media(
+        doc,
+        geometry,
+        bvh,
+        origin,
+        images,
+        footprint,
+        evaluator_workspace,
+    )?;
     loop {
         let hit = match exit_hit.take() {
             Some(exit) => Some(exit),
@@ -1801,6 +2025,7 @@ fn trace_path(
                     &media,
                     light,
                     sample_point,
+                    ray_dp + distance * ray_dd,
                     budget,
                     rng,
                     evaluator_workspace,
@@ -1867,12 +2092,14 @@ fn trace_path(
                     distance,
                     segment_scatter_pdf(Some(grid), Some(&medium), distance),
                 );
+                let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
                 radiance += throughput
                     * direct_volume_lighting(
                         scene,
                         &media,
                         &VolumeSite {
                             point: event.point,
+                            footprint: event_footprint,
                             incoming: direction,
                             phase: &phase,
                             light_weights: &weights,
@@ -1894,6 +2121,8 @@ fn trace_path(
                     sample_volume_continuation(direction, anisotropy, &phase, rng);
                 direction = next_direction;
                 origin = event.point + direction * RAY_EPSILON;
+                ray_dp = event_footprint;
+                min_ray_pdf = min_ray_pdf.min(phase_pdf);
                 previous = Scatter::Volume(phase_pdf);
                 bounce += 1;
                 continue;
@@ -1927,12 +2156,14 @@ fn trace_path(
                     event_distance,
                     segment_scatter_pdf(Some(grid), Some(&medium), event_distance),
                 );
+                let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
                 radiance += throughput
                     * direct_volume_lighting(
                         scene,
                         &media,
                         &VolumeSite {
                             point: event.point,
+                            footprint: event_footprint,
                             incoming: direction,
                             phase: &phase,
                             light_weights: &weights,
@@ -1954,6 +2185,8 @@ fn trace_path(
                     sample_volume_continuation(direction, anisotropy, &phase, rng);
                 direction = next_direction;
                 origin = event.point + direction * RAY_EPSILON;
+                ray_dp = event_footprint;
+                min_ray_pdf = min_ray_pdf.min(phase_pdf);
                 previous = Scatter::Volume(phase_pdf);
                 bounce += 1;
                 continue;
@@ -2006,12 +2239,14 @@ fn trace_path(
                     event_distance - grid.entry,
                     segment_scatter_pdf(Some(grid), None, event_distance),
                 );
+                let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
                 radiance += throughput
                     * direct_volume_lighting(
                         scene,
                         &media,
                         &VolumeSite {
                             point: event.point,
+                            footprint: event_footprint,
                             incoming: direction,
                             phase: &phase,
                             light_weights: &weights,
@@ -2033,6 +2268,8 @@ fn trace_path(
                     sample_volume_continuation(direction, anisotropy, &phase, rng);
                 direction = next_direction;
                 origin = event.point + direction * RAY_EPSILON;
+                ray_dp = event_footprint;
+                min_ray_pdf = min_ray_pdf.min(phase_pdf);
                 previous = Scatter::Volume(phase_pdf);
                 bounce += 1;
                 continue;
@@ -2063,12 +2300,14 @@ fn trace_path(
                         distance,
                         segment_scatter_pdf(None, Some(&medium), distance),
                     );
+                    let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
                     radiance += throughput
                         * direct_volume_lighting(
                             scene,
                             &media,
                             &VolumeSite {
                                 point: event.point,
+                                footprint: event_footprint,
                                 incoming: direction,
                                 phase: &phase,
                                 light_weights: &weights,
@@ -2090,6 +2329,8 @@ fn trace_path(
                         sample_volume_continuation(direction, anisotropy, &phase, rng);
                     direction = next_direction;
                     origin = event.point + direction * RAY_EPSILON;
+                    ray_dp = event_footprint;
+                    min_ray_pdf = min_ray_pdf.min(phase_pdf);
                     previous = Scatter::Volume(phase_pdf);
                     bounce += 1;
                     continue;
@@ -2108,6 +2349,9 @@ fn trace_path(
             };
             radiance += throughput * light.radiance * weight;
             origin += direction * (light.distance + RAY_EPSILON);
+            // The origin moves past the light, so the footprint grows by the distance skipped: `dP + t · dD` measured
+            // from the old origin is `dP' + t' · dD` from the new one, with `dP' = dP + skipped · dD`.
+            ray_dp += (light.distance + RAY_EPSILON) * ray_dd;
             // A light is a transparent pass in Cycles (`integrate_light_forward`): it spends the
             // transparent budget, and the path ends at the cap, after the emission above.
             transparent_bounce += 1;
@@ -2133,6 +2377,7 @@ fn trace_path(
             escaped = true;
             break;
         };
+        let footprint_here = ray_dp + hit.distance * ray_dd;
         let mut surface = make_surface(
             doc,
             geometry,
@@ -2140,8 +2385,14 @@ fn trace_path(
             origin,
             direction,
             images,
+            footprint_here,
             evaluator_workspace,
         )?;
+        // Cycles' glossy blur (`surface_shader_prepare_closures`) runs before the hit is shaded, so the direct light, the
+        // bounce and the widening all see the blurred closures.
+        if let Some(blur_alpha) = glossy_blur_alpha(blur_glossy, min_ray_pdf) {
+            surface.closures = surface.closures.blurred(blur_alpha);
+        }
         if let Some(entry) = exit_entry.take() {
             // The exit of a subsurface entry is a diffuse surface (`subsurface_shader_data_setup`), not the material it
             // hits. Cycles shades it along the exit hit's own normal: `subsurface_disk` sets the probe ray to `Ng[hit]`,
@@ -2186,6 +2437,8 @@ fn trace_path(
             if volume_bounds > VOLUME_BOUNDS_MAX {
                 break;
             }
+            // As a transparent pass, the origin moves to the surface, so its footprint is the surface's.
+            ray_dp = surface.footprint;
             origin = offset_origin(surface.point, direction, surface.geometric_normal);
             continue;
         }
@@ -2221,6 +2474,9 @@ fn trace_path(
                 throughput *= multiplier;
                 transparent_bounce += 1;
                 terminate_on_next_surface |= transparent_bounce >= transparent_cap;
+                // Cycles keeps `ray.P` and `dP` through a transparent pass and lets `t` grow: moving the origin to the
+                // surface with `dP` set to the surface's footprint gives the same footprint at every later hit.
+                ray_dp = surface.footprint;
                 origin = offset_origin(surface.point, direction, surface.geometric_normal);
             }
             Some(Pick::Reflect(index)) => {
@@ -2254,6 +2510,10 @@ fn trace_path(
                         _ => intrinsic_normal(geometry, exit.hit.triangle_index)
                             .is_some_and(|normal| normal.dot(exit.direction) < 0.0),
                     };
+                    // Cycles' `subsurface_bounce` (`kernel/integrator/subsurface.h`, lines 90-91): the exit ray carries the
+                    // entry's footprint as its `dP`, and a zero `dD`.
+                    ray_dp = surface.footprint;
+                    ray_dd = 0.0;
                     throughput = exit.throughput;
                     origin = exit.origin;
                     direction = exit.direction;
@@ -2265,6 +2525,12 @@ fn trace_path(
                 if bounce >= max_bounces {
                     break;
                 }
+                // Cycles' singular pdf for the widening average, `1e6 · branch · share`, carried from the draw; a
+                // continuous draw has none.
+                let singular_weight = match draw {
+                    Reflection::Delta { mis_weight, .. } => mis_weight,
+                    _ => 0.0,
+                };
                 let (next_direction, weight) = match draw {
                     Reflection::Continuous {
                         direction,
@@ -2273,6 +2539,7 @@ fn trace_path(
                         diffuse,
                     } => {
                         diffuse_ancestor |= diffuse;
+                        min_ray_pdf = min_ray_pdf.min(pdf);
                         previous = Scatter::Surface(MisVertex {
                             bsdf_pdf: pdf,
                             normal: surface.normal,
@@ -2280,7 +2547,13 @@ fn trace_path(
                         });
                         (direction, weight)
                     }
-                    Reflection::Delta { direction, weight } => {
+                    Reflection::Delta {
+                        direction,
+                        weight,
+                        pdf,
+                        ..
+                    } => {
+                        min_ray_pdf = min_ray_pdf.min(pdf);
                         previous = Scatter::Delta(surface.point);
                         (direction, weight)
                     }
@@ -2298,6 +2571,17 @@ fn trace_path(
                     }
                     throughput /= survival;
                 }
+                // Cycles' `bsdf_widen_dD` after a non-transparent bounce (`kernel/closure/bsdf.h`): the next ray carries the
+                // hit's footprint as `dP`, and `dD` widens to `widen_scale · sqrt(avg roughness²)` when that is larger.
+                ray_dp = surface.footprint;
+                ray_dd = widen_ray_dd(
+                    ray_dd,
+                    widen_scale,
+                    surface.closures.average_roughness_squared(
+                        next_direction.normalize_or_zero(),
+                        singular_weight,
+                    ),
+                );
                 direction = next_direction.normalize_or_zero();
                 origin = offset_origin(surface.point, direction, surface.geometric_normal);
                 bounce += 1;
@@ -2338,6 +2622,8 @@ fn write_center_passes(
     output: &mut RasterOutput,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<()> {
+    // The camera's frame is built once for the pass, as the render builds each eye's frame once.
+    let frame = camera_frame(camera, width, height)?;
     for y in 0..height {
         for x in 0..width {
             let index = usize::try_from(y)
@@ -2351,7 +2637,8 @@ fn write_center_passes(
                     )
                 })?;
             // A pixel with no ray has no volume to attenuate, so its path-pass value stands.
-            let Some((origin, direction)) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?
+            let Some((origin, direction)) =
+                ray_for_sample_in_frame(&frame, camera, width, height, x, y, 0.5, 0.5)?
             else {
                 continue;
             };
@@ -2370,6 +2657,17 @@ fn write_center_passes(
                 }
                 continue;
             };
+            let footprint = camera_footprint(
+                &frame,
+                camera,
+                width,
+                height,
+                x,
+                y,
+                0.5,
+                0.5,
+                (origin, direction),
+            )?;
             let surface = make_surface(
                 doc,
                 geometry,
@@ -2377,6 +2675,7 @@ fn write_center_passes(
                 origin,
                 direction,
                 images,
+                footprint.at_distance(hit.distance),
                 evaluator_workspace,
             )?;
             if surface.closures.coverage <= 0.0 {
@@ -2552,6 +2851,7 @@ pub(super) fn hit_params(
         origin,
         direction,
         images,
+        None,
         |frame| {
             let mut shading = evaluate_surface_with_workspace(
                 frame.material,
@@ -2589,6 +2889,7 @@ fn with_hit_frame<T>(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    footprint: Option<f64>,
     body: impl FnOnce(&HitFrame<'_>) -> Result<T>,
 ) -> Result<T> {
     let triangle = geometry.triangles.get(hit.triangle_index).ok_or_else(|| {
@@ -2675,6 +2976,13 @@ fn with_hit_frame<T>(
         uv_layers,
         &mut tables,
     )?;
+    let context = match footprint {
+        Some(dp) => context.with_footprint(HitFootprint {
+            dp,
+            geometric_normal,
+        }),
+        None => context,
+    };
     body(&HitFrame {
         point,
         shadow_point,
@@ -2732,98 +3040,109 @@ fn make_surface(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    footprint: f64,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
     let triangle_index = hit.triangle_index;
-    with_hit_frame(doc, geometry, hit, origin, direction, images, |frame| {
-        let shading = evaluate_surface_with_workspace(
-            frame.material,
-            frame.prepared,
-            &frame.context,
-            evaluator_workspace,
-        )?;
-        // A displacement height field perturbs every closure's normal, as Cycles' bump displaces `sd->N` before
-        // the closures are built.
-        let gradient = if shading.displacement_height != 0.0
-            && frame.material.displacement_method != "displacement"
-        {
-            Some(height_gradient(&frame.context, frame.normal, |sample| {
-                evaluate_displacement_with_workspace(
-                    frame.material,
-                    frame.prepared,
-                    sample,
-                    evaluator_workspace,
-                )
-            })?)
-        } else {
-            None
-        };
-        // Cycles' bump from displacement writes the bumped normal into `sd->N` before the closures are built
-        // (`scene/shader_graph.cpp`, `bump_from_displacement`), so the shading-side test and the diffuse smoothing
-        // measure against the bumped normal, not the undisplaced one.
-        let smooth = match gradient {
-            Some(shift) => {
-                let bumped = (frame.normal - shift).normalize_or_zero();
-                let bumped = if bumped == DVec3::ZERO {
-                    frame.normal
-                } else {
-                    bumped
-                };
-                if bumped.dot(-direction) < 0.0 {
-                    -bumped
-                } else {
-                    bumped
-                }
-            }
-            None => frame.normal,
-        };
-        let mut items = Vec::with_capacity(shading.closures.len());
-        for closure in shading
-            .closures
-            .iter()
-            .filter(|closure| closure.weight > 0.0)
-        {
-            let mut params = closure.params;
-            apply_hit_alpha(frame.material, &mut params);
-            params.back_facing = frame.back_facing;
-            let perturbed = gradient.map_or(params.normal, |shift| params.normal - shift);
-            let mut normal = if perturbed.is_finite() {
-                perturbed.normalize_or_zero()
+    with_hit_frame(
+        doc,
+        geometry,
+        hit,
+        origin,
+        direction,
+        images,
+        Some(footprint),
+        |frame| {
+            let shading = evaluate_surface_with_workspace(
+                frame.material,
+                frame.prepared,
+                &frame.context,
+                evaluator_workspace,
+            )?;
+            // A displacement height field perturbs every closure's normal, as Cycles' bump displaces `sd->N` before
+            // the closures are built.
+            let gradient = if shading.displacement_height != 0.0
+                && frame.material.displacement_method != "displacement"
+            {
+                Some(height_gradient(&frame.context, frame.normal, |sample| {
+                    evaluate_displacement_with_workspace(
+                        frame.material,
+                        frame.prepared,
+                        sample,
+                        evaluator_workspace,
+                    )
+                })?)
             } else {
-                frame.normal
+                None
             };
-            if normal.dot(-direction) < 0.0 {
-                normal = -normal;
+            // Cycles' bump from displacement writes the bumped normal into `sd->N` before the closures are built
+            // (`scene/shader_graph.cpp`, `bump_from_displacement`), so the shading-side test and the diffuse smoothing
+            // measure against the bumped normal, not the undisplaced one.
+            let smooth = match gradient {
+                Some(shift) => {
+                    let bumped = (frame.normal - shift).normalize_or_zero();
+                    let bumped = if bumped == DVec3::ZERO {
+                        frame.normal
+                    } else {
+                        bumped
+                    };
+                    if bumped.dot(-direction) < 0.0 {
+                        -bumped
+                    } else {
+                        bumped
+                    }
+                }
+                None => frame.normal,
+            };
+            let mut items = Vec::with_capacity(shading.closures.len());
+            for closure in shading
+                .closures
+                .iter()
+                .filter(|closure| closure.weight > 0.0)
+            {
+                let mut params = closure.params;
+                apply_hit_alpha(frame.material, &mut params);
+                params.back_facing = frame.back_facing;
+                let perturbed = gradient.map_or(params.normal, |shift| params.normal - shift);
+                let mut normal = if perturbed.is_finite() {
+                    perturbed.normalize_or_zero()
+                } else {
+                    frame.normal
+                };
+                if normal.dot(-direction) < 0.0 {
+                    normal = -normal;
+                }
+                params.normal = normal;
+                items.push(HitClosure::new(
+                    closure.weight,
+                    &params,
+                    -direction,
+                    frame.geometric_normal,
+                    frame.material.use_bump_map_correction,
+                ));
             }
-            params.normal = normal;
-            items.push(HitClosure::new(
-                closure.weight,
-                &params,
-                -direction,
-                frame.geometric_normal,
-                frame.material.use_bump_map_correction,
-            ));
-        }
-        // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
-        let normal = heaviest(&items, |closure| closure.weight)
-            .map_or(frame.normal, |closure| closure.params.normal);
-        Ok(Surface {
-            point: frame.point,
-            normal,
-            geometric_normal: frame.geometric_normal,
-            shadow_point: frame.shadow_point,
-            closures: Closures::new(
-                items,
-                smooth,
-                frame.geometric_normal,
-                frame.material.use_bump_map_correction,
-            ),
-            media: surface_media(frame.triangle.object_index, &shading.volume),
-            object_index: frame.triangle.object_index,
-            element_index: frame.triangle.element_index,
-            triangle_index,
-        })
-    })
+            // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
+            let normal = heaviest(&items, |closure| closure.weight)
+                .map_or(frame.normal, |closure| closure.params.normal);
+            Ok(Surface {
+                point: frame.point,
+                normal,
+                geometric_normal: frame.geometric_normal,
+                shadow_point: frame.shadow_point,
+                closures: Closures::new(
+                    items,
+                    smooth,
+                    frame.geometric_normal,
+                    frame.material.use_bump_map_correction,
+                ),
+                media: surface_media(frame.triangle.object_index, &shading.volume),
+                object_index: frame.triangle.object_index,
+                element_index: frame.triangle.element_index,
+                triangle_index,
+                footprint,
+            })
+        },
+    )
 }
 
 /// The media and shadow transparency of one hit, which is all a shadow ray or the camera's medium probe reads from it.
@@ -2836,33 +3155,43 @@ fn shadow_hit(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    footprint: Option<f64>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(Vec<MeshMedium>, DVec3)> {
-    with_hit_frame(doc, geometry, hit, origin, direction, images, |frame| {
-        let shading = evaluate_surface_with_workspace(
-            frame.material,
-            frame.prepared,
-            &frame.context,
-            evaluator_workspace,
-        )?;
-        // The closures `make_surface` keeps (weight above zero), with alpha after the material's alpha mode, as `Closures::new`
-        // reads them.
-        let transparency = shadow_transparency(
-            shading
-                .closures
-                .iter()
-                .filter(|closure| closure.weight > 0.0)
-                .map(|closure| {
-                    let mut params = closure.params;
-                    apply_hit_alpha(frame.material, &mut params);
-                    (closure.weight, params.alpha, transparent_tint(&params))
-                }),
-        );
-        Ok((
-            surface_media(frame.triangle.object_index, &shading.volume),
-            transparency,
-        ))
-    })
+    with_hit_frame(
+        doc,
+        geometry,
+        hit,
+        origin,
+        direction,
+        images,
+        footprint,
+        |frame| {
+            let shading = evaluate_surface_with_workspace(
+                frame.material,
+                frame.prepared,
+                &frame.context,
+                evaluator_workspace,
+            )?;
+            // The closures `make_surface` keeps (weight above zero), with alpha after the material's alpha mode, as `Closures::new`
+            // reads them.
+            let transparency = shadow_transparency(
+                shading
+                    .closures
+                    .iter()
+                    .filter(|closure| closure.weight > 0.0)
+                    .map(|closure| {
+                        let mut params = closure.params;
+                        apply_hit_alpha(frame.material, &mut params);
+                        (closure.weight, params.alpha, transparent_tint(&params))
+                    }),
+            );
+            Ok((
+                surface_media(frame.triangle.object_index, &shading.volume),
+                transparency,
+            ))
+        },
+    )
 }
 
 pub(super) fn object_for_index(
@@ -2919,6 +3248,7 @@ fn direct_lighting(
                 shading: closures.smooth,
                 direction: sample.direction,
                 distance: sample.distance,
+                footprint: surface.footprint,
             },
             transparent_budget,
             rng,
@@ -2960,6 +3290,7 @@ fn direct_lighting(
                 shading: closures.smooth,
                 direction,
                 distance: f64::INFINITY,
+                footprint: surface.footprint,
             },
             transparent_budget,
             rng,
@@ -2996,6 +3327,7 @@ fn direct_volume_lighting(
             media,
             light,
             site.point,
+            site.footprint,
             transparent_budget,
             rng,
             evaluator_workspace,
@@ -3024,6 +3356,7 @@ fn direct_volume_lighting(
                 shading: DVec3::ZERO,
                 direction,
                 distance: f64::INFINITY,
+                footprint: site.footprint,
             },
             transparent_budget,
             rng,
@@ -3217,6 +3550,7 @@ fn volume_light_nee(
     media: &[MeshMedium],
     light: &PointLight,
     point: DVec3,
+    footprint: f64,
     transparent_budget: u32,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
@@ -3236,6 +3570,7 @@ fn volume_light_nee(
             shading: DVec3::ZERO,
             direction: sample.direction,
             distance: sample.distance,
+            footprint,
         },
         transparent_budget,
         rng,
@@ -3268,6 +3603,7 @@ fn shadow_transmittance(
         shading,
         direction,
         distance,
+        footprint,
     } = ray;
     let mut transparent_hits = 0u32;
     let mut blocked = false;
@@ -3294,6 +3630,7 @@ fn shadow_transmittance(
                 origin,
                 direction,
                 images,
+                Some(footprint),
                 evaluator_workspace,
             ) {
                 Ok(shadow) => shadow,
@@ -3751,6 +4088,11 @@ enum LobeDraw {
     Delta {
         direction: DVec3,
         weight: DVec3,
+        /// The lobe mixture's pdf of the draw, Cycles' `bsdf_pdf` of a singular closure: its `1e6` weight plus the
+        /// other lobes' densities at `direction`. It lowers `min_ray_pdf`.
+        pdf: f64,
+        /// Cycles' singular pdf and sample weight for the widening average, `1e6 · branch · share`.
+        mis_weight: f64,
     },
     Subsurface {
         weight: DVec3,
@@ -3775,8 +4117,9 @@ fn sample_lobes(
     // branch without one. Every method is evaluated, so the branch needs no method check.
     if choice < probabilities.subsurface {
         let method = params.subsurface_method;
-        let weight = subsurface_closure_weight(params, normal, view, layers.lower)
-            / probabilities.subsurface.max(1.0e-8);
+        let weight =
+            subsurface_closure_weight(params, layers.energy_roughness, normal, view, layers.lower)
+                / probabilities.subsurface.max(1.0e-8);
         return LobeDraw::Subsurface { weight, method };
     }
     let transmission_end = probabilities.subsurface + probabilities.transmission;
@@ -3784,7 +4127,16 @@ fn sample_lobes(
         let rands = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
         return match sample_glass(params, layers, geometric, probabilities.transmission, rands) {
             GlassSample::Absorbed => LobeDraw::Absorbed,
-            GlassSample::Singular { direction, weight } => LobeDraw::Delta { direction, weight },
+            GlassSample::Singular {
+                direction,
+                weight,
+                mis_weight,
+            } => LobeDraw::Delta {
+                direction,
+                weight,
+                pdf: mis_weight + continuous_density(params, layers, direction),
+                mis_weight,
+            },
             GlassSample::Rough { direction } => LobeDraw::Continuous {
                 direction,
                 diffuse: false,
@@ -4628,6 +4980,7 @@ fn camera_media(
     bvh: &Bvh,
     origin: DVec3,
     images: &BTreeMap<String, ImageData>,
+    footprint: CameraFootprint,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Vec<MeshMedium>> {
     let probe = DVec3::new(
@@ -4651,6 +5004,7 @@ fn camera_media(
                 hit_origin,
                 probe,
                 images,
+                Some(footprint.at_distance(hit.distance)),
                 evaluator_workspace,
             ) {
                 Ok(shadow) => shadow,
@@ -4823,8 +5177,7 @@ fn voxel_grid(
         ) {
             entry = entry.min(volume_entry);
             exit = exit.max(volume_exit);
-            let local_speed = local_direction.length().max(f64::MIN_POSITIVE);
-            minimum_step = minimum_step.min(instance.voxel_size / local_speed * 0.5);
+            minimum_step = minimum_step.min(volume_sampling_step(instance, local_direction));
             stochastic |= instance.scattering
                 && instance.albedo.max_element() > 0.0
                 && instance.extinction_scale > 0.0;
@@ -5158,6 +5511,22 @@ fn instance_density_checked(instance: &VolumeInstance<'_>, local_position: DVec3
     }
 }
 
+/// The largest step, in meters along a volume-local direction, that moves the sampled index by at most half a voxel. The
+/// index speed is the norm of the local direction in index space, so an affine grid's skew and anisotropic scale count;
+/// a decoded VDB has no index matrix and steps by its voxel size.
+fn volume_sampling_step(instance: &VolumeInstance<'_>, local_direction: DVec3) -> f64 {
+    match instance.index_from_local {
+        Some(index_from_local) => {
+            let index_speed = index_from_local
+                .transform_vector3(local_direction)
+                .length()
+                .max(f64::MIN_POSITIVE);
+            0.5 / index_speed
+        }
+        None => instance.voxel_size / local_direction.length().max(f64::MIN_POSITIVE) * 0.5,
+    }
+}
+
 fn march_volumes(
     volumes: &[VolumeInstance<'_>],
     origin: DVec3,
@@ -5250,9 +5619,8 @@ fn march_volumes_with_budget(
             }
             continue;
         }
-        let local_speed = local_direction.length().max(f64::MIN_POSITIVE);
-        let step_world =
-            (instance.voxel_size / local_speed * 0.5).max(segment_length / step_budget as f64);
+        let step_world = volume_sampling_step(instance, local_direction)
+            .max(segment_length / step_budget as f64);
         let steps = (segment_length / step_world)
             .ceil()
             .clamp(1.0, step_budget as f64) as usize;

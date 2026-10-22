@@ -70,6 +70,10 @@ pub struct SceneDoc {
     pub libraries: Registry<Library>,
     #[serde(default)]
     pub compatibility: Map<String, Value>,
+    /// Loss ids (`feature_id`) that an `--allow-lossy` import reported and the user accepted. Evaluation
+    /// does not refuse the settings they name; it warns and leaves them unevaluated.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub accepted_losses: BTreeSet<String>,
     #[serde(default)]
     pub history: HistoryState,
 }
@@ -140,6 +144,7 @@ impl SceneDoc {
             resources: Registry::new(),
             libraries: Registry::new(),
             compatibility: Map::new(),
+            accepted_losses: BTreeSet::new(),
             avatar: None,
             history: HistoryState::default(),
         }
@@ -1192,6 +1197,13 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_transparent_max_bounces"
     )]
     pub transparent_max_bounces: u32,
+    /// Blender's Filter Glossy (`scene.cycles.blur_glossy`): the widening of the ray differentials after a bounce,
+    /// which bump nodes read. Omitted when equal to Blender's default of 1.0.
+    #[serde(
+        default = "default_filter_glossy",
+        skip_serializing_if = "is_default_filter_glossy"
+    )]
+    pub filter_glossy: f64,
     pub film_transparent: bool,
     pub engine: String,
     pub use_sequencer: bool,
@@ -1253,6 +1265,7 @@ impl Default for RenderSettings {
             max_bounces: 4,
             volume_bounces: 0,
             transparent_max_bounces: 8,
+            filter_glossy: 1.0,
             film_transparent: false,
             engine: "path".to_owned(),
             use_sequencer: false,
@@ -2337,6 +2350,18 @@ fn is_default_transparent_max_bounces(value: &u32) -> bool {
 
 fn default_transparent_max_bounces() -> u32 {
     8
+}
+
+fn default_filter_glossy() -> f64 {
+    1.0
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_filter_glossy(value: &f64) -> bool {
+    value.to_bits() == 1.0_f64.to_bits()
 }
 
 #[expect(
