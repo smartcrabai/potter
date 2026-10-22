@@ -252,16 +252,6 @@ fn sharp_boundary(topology: &Topology, smooth: &[bool]) -> Vec<(usize, usize)> {
     edges
 }
 
-/// Converts a vector in one already-computed fan space to its canonical stored code. Zero is an
-/// explicit zero vector, never the automatic code.
-fn encode_vector_in_space(space: &clnor::Space, vector: DVec3) -> clnor::CornerNormalCode {
-    if vector == DVec3::ZERO {
-        return clnor::CornerNormalCode::ExplicitZero;
-    }
-    let [first, second] = space.encode(vector.as_vec3());
-    clnor::CornerNormalCode::from_pair([first as i16, second as i16])
-}
-
 /// Applies Blender's loop-local hardening writes without re-encoding other fan corners.
 fn write_hardened_codes(
     codes: &mut [clnor::CornerNormalCode],
@@ -274,7 +264,7 @@ fn write_hardened_codes(
                 clnor::CornerNormalCode::Auto
             } else {
                 let fan = fans.fan_of[corner];
-                encode_vector_in_space(&fans.spaces[fan], *normal)
+                clnor::encode_vector_in_space(&fans.spaces[fan], *normal)
             };
         }
     }
@@ -363,10 +353,7 @@ mod tests {
 
     use crate::geom::clnor::{self, CornerNormalCode};
 
-    use super::{
-        Kind, Topology, encode_vector_in_space, harden_normals, sharp_boundary,
-        write_hardened_codes,
-    };
+    use super::{Kind, Topology, harden_normals, sharp_boundary, write_hardened_codes};
 
     /// A source square `[0, 1, 2, 3]` in the plane `z = 0` and a strip `[0, 1, 4, 3]` below its edge
     /// `3 -> 0`. The strip's corners 0 and 2 are its LONG loops.
@@ -484,7 +471,7 @@ mod tests {
             CornerNormalCode::Authored([21, 22]),
             CornerNormalCode::Authored([31, 32]),
         ];
-        let expected = encode_vector_in_space(&fans.spaces[fans.fan_of[0]], DVec3::X);
+        let expected = clnor::encode_vector_in_space(&fans.spaces[fans.fan_of[0]], DVec3::X);
         write_hardened_codes(
             &mut codes,
             &fans,

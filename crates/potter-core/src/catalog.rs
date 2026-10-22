@@ -496,13 +496,19 @@ pub fn feature_catalog() -> Value {
             &["modifier.create"],
             [true, true, true, true, true, false, false],
         ),
-        supported(
-            "modifier.bevel",
-            "Bevel modifier",
-            "BEVEL",
-            &["modifier.create"],
-            [true, true, true, true, true, false, false],
-        ),
+        {
+            let mut row = supported(
+                "modifier.bevel",
+                "Bevel modifier",
+                "BEVEL",
+                &["modifier.create"],
+                [true, true, true, true, true, false, false],
+            );
+            row["reason"] = json!(
+                "Ports Blender 5.2.2's BMesh bevel (boundary, profile, rings, vmesh, shading) and evaluates every affect mode, segment count, and option. Parity is gated by the Blender 5.2.2 corpus in `tests/modifier_bevel_uv.rs`: every case matches Blender except those in its `KNOWN_GAPS` table, which records the differing columns and cause (clamped and non-planar corner normals, vertex-mode odd-segment corner snaps, clamped vertex weights). `mesh.bevel` still uses the older edit path."
+            );
+            row
+        },
         supported(
             "modifier.decimate",
             "Decimate modifier",

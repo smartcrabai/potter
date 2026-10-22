@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
 
 use super::bevel_boundary::{
-    AngleKind, BoundProfile, Front, PRO_CIRCLE_R, PRO_LINE_R, PRO_SQUARE_IN_R, PRO_SQUARE_R,
-    internal_invariant, isect_line_line,
+    AngleKind, BoundProfile, EPSILON, EPSILON_ANG, EPSILON_SQ, Front, PRO_CIRCLE_R, PRO_LINE_R,
+    PRO_SQUARE_IN_R, PRO_SQUARE_R, internal_invariant, isect_line_line,
 };
 use super::bevel_shading::Kind;
 use super::{Mesh, Polygon, build_mesh_with_edge_identity};
@@ -32,9 +32,6 @@ use crate::geom::{
     },
 };
 
-const BEVEL_EPSILON: f64 = 1.0e-6;
-const BEVEL_EPSILON_SQ: f64 = 1.0e-12;
-const BEVEL_EPSILON_ANG: f64 = 2.0 * PI / 180.0;
 const CIRCLE_FULLNESS: [f64; 11] = [
     0.0, 0.559, 0.642, 0.551, 0.646, 0.624, 0.646, 0.619, 0.647, 0.639, 0.647,
 ];
@@ -284,7 +281,7 @@ fn unit_square_map(va: DVec3, vmid: DVec3, vb: DVec3) -> Option<[DVec3; 3]> {
         return None;
     }
     let angle = va_vmid.cross(vb_vmid).length().atan2(va_vmid.dot(vb_vmid));
-    if (angle - PI).abs() <= BEVEL_EPSILON_ANG {
+    if (angle - PI).abs() <= EPSILON_ANG {
         return None;
     }
     Some([vmid - va, vmid - vb, va + vb - vmid])
@@ -994,7 +991,7 @@ pub(super) fn general_vmesh(
     }
     boundverts_center *= 1.0 / n_bndv as f64;
     let center_direction = vertex - boundverts_center;
-    if center_direction.length_squared() > BEVEL_EPSILON_SQ {
+    if center_direction.length_squared() > EPSILON_SQ {
         if custom {
             let negative_fullest = boundverts_center * 2.0 - vertex;
             vm0.put(
@@ -1113,7 +1110,7 @@ fn vmesh_nearly_parallel(a: DVec3, b: DVec3) -> bool {
         let difference = vmesh_f32_length(vmesh_f32_sub(a, opposite)) * 0.5;
         f64::from(std::f32::consts::PI - 2.0_f32 * (difference as f32).clamp(-1.0, 1.0).asin())
     };
-    let epsilon = f64::from(2.0_f32 * std::f32::consts::PI / 180.0_f32);
+    let epsilon = EPSILON_ANG;
     angle.abs() < epsilon || (f64::from(std::f32::consts::PI) - angle).abs() < epsilon
 }
 
@@ -1221,10 +1218,10 @@ fn move_weld_profile_planes(
     if length != 0.0 && (length1 != 0.0 || length2 != 0.0) {
         let dot1 = vmesh_f32_dot(normal, normal1).abs();
         let dot2 = vmesh_f32_dot(normal, normal2).abs();
-        if (dot1 - 1.0).abs() > BEVEL_EPSILON {
+        if (dot1 - 1.0).abs() > EPSILON {
             first.plane_no = normal;
         }
-        if (dot2 - 1.0).abs() > BEVEL_EPSILON {
+        if (dot2 - 1.0).abs() > EPSILON {
             second.plane_no = normal;
         }
     }
@@ -1316,7 +1313,7 @@ fn unit_square_frame(va: DVec3, vmid: DVec3, vb: DVec3) -> Option<[DVec3; 4]> {
         return None;
     }
     let angle = va_vmid.cross(vb_vmid).length().atan2(va_vmid.dot(vb_vmid));
-    if (angle - PI).abs() <= BEVEL_EPSILON_ANG {
+    if (angle - PI).abs() <= EPSILON_ANG {
         return None;
     }
     let normal = vb_vmid.cross(va_vmid).normalize_or_zero();

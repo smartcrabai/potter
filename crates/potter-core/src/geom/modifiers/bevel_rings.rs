@@ -11,7 +11,8 @@ use glam::DVec3;
 
 use super::Polygon;
 use super::bevel_boundary::{
-    EdgeHalf, Front, MeshKind, PRO_LINE_R, PRO_SQUARE_IN_R, PRO_SQUARE_R, internal_invariant,
+    EPSILON, EPSILON_ANG, EPSILON_BIG, EdgeHalf, Front, MeshKind, PRO_LINE_R, PRO_SQUARE_IN_R,
+    PRO_SQUARE_R, internal_invariant,
 };
 use super::bevel_shading::Kind;
 use super::bevel_vmesh::{
@@ -21,11 +22,6 @@ use super::bevel_vmesh::{
 };
 use crate::error::Result;
 use crate::geom::edge_key;
-
-/// Blender's `BEVEL_EPSILON`.
-const EPSILON: f64 = 1.0e-6;
-/// Blender's `BEVEL_EPSILON_BIG`.
-const EPSILON_BIG: f64 = 1.0e-4;
 
 /// Per-bevel facts beyond the front end that the topology reads.
 pub(super) struct Context {
@@ -302,6 +298,15 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
         let seg = self.front.p.seg;
+        // Blender creates each profile edge with `BM_edge_create(..., bv->edges[0].e, ...)`, so each copies
+        // that edge's attributes (bmesh_bevel.cc:6436-6444).
+        let first_edge = *self
+            .bev(vertex)?
+            .edges
+            .first()
+            .ok_or_else(|| internal_invariant("two-edge vertex has an edge"))?;
+        let source = self.front.edges[first_edge].edge_id;
+        let (sharp, seam) = self.front.input_edge_flags_by_id(source);
         let mut previous = self
             .id(vertex, 0, 0, 0)?
             .ok_or_else(|| internal_invariant("two-edge profile start defined"))?;
@@ -310,6 +315,8 @@ impl<'a> Builder<'a> {
                 .id(vertex, 0, 0, k)?
                 .ok_or_else(|| internal_invariant("two-edge profile point defined"))?;
             self.loose.push([previous, current]);
+            self.emission
+                .set_edge_state(previous, current, sharp, seam, Some(source));
             previous = current;
         }
         Ok(())
@@ -334,23 +341,18 @@ impl<'a> Builder<'a> {
                 let first = face[index];
                 let second = face[(index + 1) % face.len()];
                 vertex_has_face[first] = true;
-                if !front.p.affect_vertices {
-                    face_edges.insert(edge_key(first, second));
-                }
+                face_edges.insert(edge_key(first, second));
             }
         }
-        let wire_edges = if front.p.affect_vertices {
-            Vec::new()
-        } else {
-            let mut wire_edges = vec![Vec::new(); front.verts.len()];
-            for &(first, second) in &front.geo.edge_order {
-                if !face_edges.contains(&edge_key(first, second)) {
-                    wire_edges[first].push((first, second));
-                    wire_edges[second].push((first, second));
-                }
+        // Blender's `bv->wire_edges` (bmesh_bevel.cc:6861, 7103) are the edges with no face, collected for
+        // every beveled vertex in both affect modes.
+        let mut wire_edges = vec![Vec::new(); front.verts.len()];
+        for &(first, second) in &front.geo.edge_order {
+            if !face_edges.contains(&edge_key(first, second)) {
+                wire_edges[first].push((first, second));
+                wire_edges[second].push((first, second));
             }
-            wire_edges
-        };
+        }
         Self {
             front,
             polygons,
@@ -528,6 +530,9 @@ impl<'a> Builder<'a> {
             return Ok(None);
         }
         let point = self.points[vertex].as_vec3();
+        // Blender takes the first triple whose outer edges line up (`bmesh_bevel.cc:4358-4370`) and stops
+        // there; the face-plane check below then decides, once, rather than moving on to later triples.
+        let mut found = None;
         for index in 0..count {
             let next = (index + 1) % count;
             let next_next = (index + 2) % count;
@@ -551,20 +556,22 @@ impl<'a> Builder<'a> {
             if dir1.length_squared() == 0.0 || dir3.length_squared() == 0.0 {
                 continue;
             }
-            if dir1.dot(dir3).clamp(-1.0, 1.0).acos() >= 2.0_f32 * std::f32::consts::PI / 180.0_f32
-            {
-                continue;
+            if dir1.dot(dir3).clamp(-1.0, 1.0).acos() < EPSILON_ANG as f32 {
+                found = Some((bev.ring[index], dir1));
+                break;
             }
-            if bev.edges.iter().any(|id| {
-                self.front.edges[*id].fnext.is_some_and(|face| {
-                    dir1.dot(self.front.geo.face_normals[face].as_vec3()).abs() > EPSILON_BIG as f32
-                })
-            }) {
-                continue;
-            }
-            return Ok(Some(bev.ring[index]));
         }
-        Ok(None)
+        let Some((pipe, dir1)) = found else {
+            return Ok(None);
+        };
+        if bev.edges.iter().any(|id| {
+            self.front.edges[*id].fnext.is_some_and(|face| {
+                dir1.dot(self.front.geo.face_normals[face].as_vec3()).abs() > EPSILON_BIG as f32
+            })
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(pipe))
     }
 
     /// Blender's `build_square_in_vmesh`: only profile cells remain, with the inward-square
@@ -2019,8 +2026,6 @@ pub(super) fn bevel_output(
             }
         }
     }
-    if !front.p.affect_vertices {
-        builder.reattach_wires()?;
-    }
+    builder.reattach_wires()?;
     Ok((builder.emission, builder.loose))
 }

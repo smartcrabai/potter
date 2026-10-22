@@ -26,12 +26,14 @@ pub(super) fn internal_invariant(message: &'static str) -> PotError {
     PotError::new(ErrorCode::InternalError, message)
 }
 
-/// Blender's `BEVEL_EPSILON`.
-const EPSILON: f64 = 1.0e-6_f32 as f64;
+/// Blender's `BEVEL_EPSILON`, rounded to binary32 as Blender's float code uses it.
+pub(super) const EPSILON: f64 = 1.0e-6_f32 as f64;
 /// Blender's `BEVEL_EPSILON_BIG`.
 pub(super) const EPSILON_BIG: f64 = 1.0e-4_f32 as f64;
+/// Blender's `BEVEL_EPSILON_SQ`.
+pub(super) const EPSILON_SQ: f64 = 1.0e-12_f32 as f64;
 /// Blender's `BEVEL_EPSILON_ANG` (2 degrees).
-const EPSILON_ANG: f64 = (2.0_f32 * std::f32::consts::PI / 180.0_f32) as f64;
+pub(super) const EPSILON_ANG: f64 = (2.0_f32 * std::f32::consts::PI / 180.0_f32) as f64;
 /// Blender's `BEVEL_SMALL_ANG` (10 degrees).
 const SMALL_ANG: f64 = (10.0_f32 * std::f32::consts::PI / 180.0_f32) as f64;
 /// Blender's `BEVEL_GOOD_ANGLE`.
@@ -106,10 +108,6 @@ pub(super) struct Params {
     pub pro_super_r: f64,
     /// The authored curve when `profile_type == CUSTOM`.
     pub custom: Option<CurveProfile>,
-    /// Blender's `offset_adjust` decision for EDGES.
-    pub offset_adjust: bool,
-    /// Blender's odd-segment VERTICES condition.
-    pub affect_vertices_odd: bool,
     /// `affect == VERTICES`.
     pub affect_vertices: bool,
     pub loop_slide: bool,
@@ -121,6 +119,19 @@ pub(super) struct Params {
     pub mark_sharp: bool,
     /// `use_clamp_overlap`: clamp the offset to avoid geometry collisions.
     pub limit_offset: bool,
+}
+
+impl Params {
+    /// Blender's `offset_adjust` for EDGES: a width-adjust pass unless the offset is a leg slide.
+    fn offset_adjust(&self) -> bool {
+        !self.affect_vertices
+            && !matches!(self.offset_type, OffsetType::Percent | OffsetType::Absolute)
+    }
+
+    /// Blender's odd-segment VERTICES condition.
+    fn affect_vertices_odd(&self) -> bool {
+        self.affect_vertices && self.seg % 2 == 1
+    }
 }
 
 /// Input geometry and selection, in mesh point indices.
@@ -526,7 +537,7 @@ impl Front {
             front.limit_offset(&vertices)?;
         }
         front.build_all(&vertices, true)?;
-        if front.p.offset_adjust {
+        if front.p.offset_adjust() {
             front.adjust_offsets(&vertices)?;
         }
         if front.p.custom.is_some() {
@@ -548,9 +559,6 @@ impl Front {
         p.offset = f64::from(p.offset as f32);
         p.profile = f64::from(p.profile as f32);
         p.spread = f64::from(p.spread as f32);
-        p.offset_adjust = !p.affect_vertices
-            && !matches!(p.offset_type, OffsetType::Percent | OffsetType::Absolute);
-        p.affect_vertices_odd = p.affect_vertices && p.seg % 2 == 1;
         p.pro_super_r = super_r_of(p.profile);
         if p.vmesh_method == VmeshMethod::Cutoff {
             p.miter_outer = MiterKind::Sharp;
@@ -645,7 +653,7 @@ impl Front {
             self.bounds[id].sharp_len = 0;
             any |= flag;
         }
-        if self.p.affect_vertices_odd
+        if self.p.affect_vertices_odd()
             && !any
             && let Some(seam_vertices) = &self.geo.seam_vertices
         {
@@ -2201,7 +2209,8 @@ impl Front {
             pro.super_r = self.p.pro_super_r;
             let other = self.edges[e].other;
             pro.proj_dir = f32_normalize(f32_sub(v, self.point(other)));
-            pro.middle = self.project_to_edge(self.edges[e].vert, other, start, end);
+            let (first, second) = self.geo.edge_order[self.edges[e].edge_id];
+            pro.middle = self.project_to_edge(first, second, start, end);
             pro.start = start;
             pro.end = end;
             let mut d1 = f32_normalize(f32_sub(pro.middle, start));
@@ -2863,10 +2872,13 @@ fn loop_index(face: &[usize], a: usize, b: usize) -> Option<usize> {
     })
 }
 
-/// Blender's `dist_squared_to_plane_v3` for a plane given by a point and a unit normal.
+/// Blender's `dist_squared_to_plane_v3` (`math_geom.cc:487-493`): the side is divided by the plane normal's
+/// squared length, so a zero normal gives NaN, which fails every `<` test, as in Blender.
 fn dist_squared_to_plane(co: DVec3, plane_co: DVec3, plane_no: DVec3) -> f64 {
-    let d = plane_no.dot(co - plane_co);
-    d * d
+    let len_sq = plane_no.length_squared();
+    let side = plane_no.dot(co - plane_co);
+    let fac = side / len_sq;
+    len_sq * (fac * fac)
 }
 
 /// The profile points of `pro` for `ns` segments, projected onto the profile plane.
@@ -2954,25 +2966,6 @@ fn solve_least_squares(n: usize, rows: &[(Vec<(usize, f64)>, f64)]) -> Vec<f64> 
         .collect()
 }
 
-fn safe_acos_approx(value: f32) -> f32 {
-    let absolute = value.abs();
-    let magnitude = if absolute < 1.0 {
-        1.0 - (1.0 - absolute)
-    } else {
-        1.0
-    };
-    let angle = (1.0 - magnitude).sqrt()
-        * (std::f32::consts::FRAC_PI_2
-            + magnitude
-                * (-0.213_300_99_f32
-                    + magnitude * (0.077_980_48_f32 + magnitude * -0.021_640_95_f32)));
-    if value < 0.0 {
-        std::f32::consts::PI - angle
-    } else {
-        angle
-    }
-}
-
 /// Blender's angle-weighted mesh vertex normals, used when an edge side has no face.
 fn vertex_normals(geo: &Geometry) -> Vec<DVec3> {
     let mut normals = vec![DVec3::ZERO; geo.points.len()];
@@ -2983,7 +2976,8 @@ fn vertex_normals(geo: &Geometry) -> Vec<DVec3> {
             let next = vertices[(index + 1) % vertices.len()];
             let dir_prev = f32_normalize(f32_sub(geo.points[previous], geo.points[vertex]));
             let dir_next = f32_normalize(f32_sub(geo.points[next], geo.points[vertex]));
-            let factor = safe_acos_approx(f32_dot(dir_prev, dir_next) as f32);
+            let factor =
+                crate::geom::normals::float_safe_acos_approx(f32_dot(dir_prev, dir_next) as f32);
             normals[vertex] = f32_add(
                 normals[vertex],
                 f32_mul(geo.face_normals[face], f64::from(factor)),

@@ -885,10 +885,20 @@ small_cube_vertices = [tuple(component * 1e-4 for component in vertex) for verte
 wire_cube_vertices = cube_vertices + [
     (0, -1, -1), (0.5, -1, -1), (-1, -0.5, 0), (-1, 0.5, 0),
 ]
+# A free vertex joined to the cube corner (1, 1, 1) by one wire. The corner is beveled in both EDGES mode
+# (edge (2, 6) carries bevel weight) and VERTICES mode (even vertices carry vertex weight), so Blender moves
+# the wire onto the new boundary point nearest the free end (bmesh_bevel.cc:8426).
+wire_corner_vertices = cube_vertices + [(2, 2, 2)]
+# Edge -> (bevel_weight, sharp) for each wire added after the cube's own edges.
+WIRE_EDGES = {
+    'cube_wire_vertices': {(8, 9): (0.0, False), (10, 11): (0.0, False)},
+    'cube_wire_corner': {(6, 8): (1.0, True)},
+}
 shape_inputs.update({
     'cube_review': (cube_vertices, cube_faces),
     'small_cube': (small_cube_vertices, cube_faces),
     'cube_wire_vertices': (wire_cube_vertices, cube_faces),
+    'cube_wire_corner': (wire_corner_vertices, cube_faces),
 })
 
 # Allocate review-only objects after the established rows to keep their Blender mesh state stable.
@@ -896,24 +906,30 @@ for shape_name, custom_normals in (
     ('cube_review', True),
     ('small_cube', True),
     ('cube_wire_vertices', False),
+    ('cube_wire_corner', False),
 ):
     vertices, faces = shape_inputs[shape_name]
     objects[shape_name], inputs[shape_name] = make_object(
         shape_name, vertices, faces, custom_normals)
-    if shape_name == 'cube_wire_vertices':
+    if shape_name in WIRE_EDGES:
         import bmesh
         mesh = objects[shape_name].data
         bm = bmesh.new()
         try:
             bm.from_mesh(mesh)
             bm.verts.ensure_lookup_table()
-            for first, second in ((8, 9), (10, 11)):
+            for first, second in WIRE_EDGES[shape_name]:
                 bm.edges.new((bm.verts[first], bm.verts[second]))
             bm.to_mesh(mesh)
         finally:
             bm.free()
         mesh.update()
         weight_attr = mesh.attributes.get('bevel_weight_edge')
+        for edge in mesh.edges:
+            wire = WIRE_EDGES[shape_name].get(edge_key(*edge.vertices))
+            if wire is not None:
+                weight_attr.data[edge.index].value = wire[0]
+                edge.use_edge_sharp = wire[1]
         inputs[shape_name]['edges'] = [
             {
                 'vertices': list(edge.vertices),
@@ -954,6 +970,9 @@ assert all(any(abs(component) == 1 for component in vertex) for vertex in wire_v
 assert {edge_key(8, 9), edge_key(10, 11)} <= {
     edge_key(*edge['vertices']) for edge in inputs['cube_wire_vertices']['edges']
 }
+assert all(8 not in face for face in shape_inputs['cube_wire_corner'][1])
+assert edge_key(6, 8) in {edge_key(*edge['vertices']) for edge in inputs['cube_wire_corner']['edges']}
+assert len(inputs['cube_wire_corner']['edges']) == 13
 
 cases.extend([
     evaluate(objects['cube_review'], 'cube_review', 'cube_review_fstr_affected_reconstructed_s2', {
@@ -972,6 +991,12 @@ cases.extend([
     }),
     evaluate(objects['cube_wire_vertices'], 'cube_wire_vertices', 'cube_wire_vertices_s3', {
         'segments': 3, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
+    }),
+    evaluate(objects['cube_wire_corner'], 'cube_wire_corner', 'cube_wire_corner_edges_s3', {
+        'segments': 3, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET',
+    }),
+    evaluate(objects['cube_wire_corner'], 'cube_wire_corner', 'cube_wire_corner_vertices_s2', {
+        'segments': 2, 'profile': 0.5, 'affect': 'VERTICES', 'offset_type': 'OFFSET',
     }),
     evaluate(objects['cube'], 'cube', 'cube_material_override_lower_bound_s2', {
         'segments': 2, 'profile': 0.5, 'affect': 'EDGES', 'offset_type': 'OFFSET', 'material': -1,

@@ -5897,12 +5897,6 @@ fn bevel(mesh: &Mesh, modifier: &Modifier, context: ModifierEvaluationContext<'_
         profile,
         pro_super_r: bevel_boundary::super_r_of(profile),
         custom,
-        offset_adjust: !affect_vertices
-            && !matches!(
-                offset_type,
-                bevel_boundary::OffsetType::Percent | bevel_boundary::OffsetType::Absolute
-            ),
-        affect_vertices_odd: affect_vertices && segments % 2 == 1,
         affect_vertices,
         loop_slide,
         miter_outer,
@@ -5925,12 +5919,10 @@ fn bevel(mesh: &Mesh, modifier: &Modifier, context: ModifierEvaluationContext<'_
     };
     let (emission, created_edges) =
         bevel_rings::bevel_output(&front, &source_points, &source_polygons, &context)?;
+    // Blender's `bevel_reattach_wires` replaces every wire at a beveled vertex, in both affect modes, so a
+    // source wire with a beveled end is dropped here and its reattached copy is in `created_edges`.
     let mut loose = loose_edges(mesh)?;
-    if !affect_vertices {
-        loose.retain(|[first, second]| {
-            front.verts[*first].is_none() && front.verts[*second].is_none()
-        });
-    }
+    loose.retain(|[first, second]| front.verts[*first].is_none() && front.verts[*second].is_none());
     loose.extend(created_edges);
     let (mut result, kinds) = bevel_vmesh::finish(
         mesh,

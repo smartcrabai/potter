@@ -12,7 +12,8 @@
 //! Tolerances:
 //! - positions, group weights and UVs: 1e-6 absolute. The oracle stores binary32 values and Potter
 //!   computes in binary64, so the comparison is against the binary32 rounding of Blender's output.
-//! - corner normals: [`NORMAL_TOLERANCE`], the bound on Blender's 16-bit custom-normal codes.
+//! - corner normals: two 16-bit custom-normal code steps (see [`normal_tolerance`]). Blender's values are
+//!   decoded codes and Potter writes its normals as codes, so each side is quantised to one step.
 //! - topology, edge and face flags, material indices and face strength: exact.
 //!
 //! The UV-layer evaluation tests at the end of this file check that bevel on `uv_layers` evaluates
@@ -37,11 +38,27 @@ const ORACLE: &str = include_str!("fixtures/bevel_parity_oracle.json");
 const POSITION_TOLERANCE: f64 = 1.0e-6;
 const WEIGHT_TOLERANCE: f64 = 1.0e-6;
 const UV_TOLERANCE: f64 = 1.0e-6;
-/// Blender's setter can snap restored normals to a different reference direction; this fixture
-/// bound validates that probe only and is not the Potter-versus-Blender comparison tolerance.
-const BLENDER_RESTORE_ERROR_LIMIT: f64 = 0.014_238_2;
-/// Corner normals must agree within the measured codec-level residual, not the setter's snap limit.
-const NORMAL_TOLERANCE: f64 = 2.0e-4;
+
+/// Corner normals agree within two custom-normal code steps.
+fn normal_tolerance(oracle: &Value) -> TestResult<f64> {
+    Ok(2.0 * code_step(oracle)?)
+}
+
+/// Blender's `code_step_radians` (`π / 32767`) from the oracle's measured `normal_quantization`.
+fn code_step(oracle: &Value) -> TestResult<f64> {
+    oracle["normal_quantization"]["code_step_radians"]
+        .as_f64()
+        .ok_or_else(|| "normal_quantization.code_step_radians must be a number".into())
+}
+
+/// The restore bound: a stored value re-stored decodes within the trigonometric snap threshold plus one
+/// code step (the oracle generator raises if a restore exceeds it).
+fn restore_error_limit(oracle: &Value) -> TestResult<f64> {
+    let threshold = oracle["normal_quantization"]["trigo_threshold_angle_radians"]
+        .as_f64()
+        .ok_or("normal_quantization.trigo_threshold_angle_radians must be a number")?;
+    Ok(threshold + code_step(oracle)?)
+}
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -54,12 +71,13 @@ fn every_bevel_oracle_case_matches_blender_geometry_and_attributes() -> TestResu
         oracle["float_encoding"],
         json!("little-endian IEEE-754 binary32 hex")
     );
+    let restore_limit = restore_error_limit(&oracle)?;
     let measured = oracle["normal_quantization"]["stored_restore_max_angle_error_radians"]
         .as_f64()
         .ok_or("normal_quantization.stored_restore_max_angle_error_radians must be a number")?;
     assert!(
-        measured <= BLENDER_RESTORE_ERROR_LIMIT,
-        "measured custom-normal restore error {measured} exceeds its probe bound {BLENDER_RESTORE_ERROR_LIMIT}"
+        measured <= restore_limit,
+        "measured custom-normal restore error {measured} exceeds the codec bound {restore_limit}"
     );
     let cases = oracle["cases"]
         .as_array()
@@ -70,21 +88,32 @@ fn every_bevel_oracle_case_matches_blender_geometry_and_attributes() -> TestResu
     );
 
     let reports: Vec<CaseReport> = cases.iter().map(|case| run_case(&oracle, case)).collect();
-    print_table(&reports);
+    print_table(&reports, normal_tolerance(&oracle)?);
 
     let mut unexplained = Vec::new();
     for report in &reports {
         let columns = report.differing_columns();
-        match KNOWN_GAPS.iter().find(|gap| gap.case == report.name) {
-            Some(gap) if columns != gap.columns => unexplained.push(format!(
-                "{}: differs in {columns:?}, recorded gap is {:?} ({}); fixed or changed, so update KNOWN_GAPS",
-                report.name, gap.columns, gap.cause
+        match (known_gap(&report.name), columns.is_empty()) {
+            (Some(gap), _) if matches_gap(&columns, gap) => {}
+            (Some(gap), _) => {
+                let measured = if columns.is_empty() {
+                    "no difference".to_owned()
+                } else {
+                    describe(&columns)
+                };
+                unexplained.push(format!(
+                    "{}: measured [{measured}], recorded [{}] ({}); fixed or changed, so update KNOWN_GAPS",
+                    report.name,
+                    describe(gap.columns),
+                    gap.cause
+                ));
+            }
+            (None, false) => unexplained.push(format!(
+                "{}: differs in [{}] and is not a recorded gap",
+                report.name,
+                describe(&columns)
             )),
-            None if !columns.is_empty() => unexplained.push(format!(
-                "{}: differs in {columns:?} and is not a recorded gap",
-                report.name
-            )),
-            _ => {}
+            (None, true) => {}
         }
     }
     for gap in KNOWN_GAPS {
@@ -103,113 +132,309 @@ fn every_bevel_oracle_case_matches_blender_geometry_and_attributes() -> TestResu
     .into())
 }
 
-/// A measured divergence from Blender 5.2.2 that is not yet fixed. `columns` are the comparison columns
-/// that still differ, and the test asserts they stay exactly that: a fix or a regression both fail until
-/// the entry is updated or removed.
+/// One comparison column that differs from Blender: its name, how many rows differ, and the largest error
+/// among them. `max` is `None` for a column with no error magnitude (counts and flags).
+#[derive(Clone, Copy, Debug)]
+struct GapColumn {
+    name: &'static str,
+    bad: usize,
+    max: Option<f64>,
+}
+
+/// A measured divergence from Blender 5.2.2 that is not yet fixed. `columns` are the differing columns as
+/// measured when the gap was recorded. The test requires the same column names and row counts, and maxima
+/// within 0.1% (the corpus is deterministic, so this only absorbs printing precision), so a fix, a
+/// regression, or a changed error fails until the entry is updated.
 struct KnownGap {
     case: &'static str,
-    columns: &'static [&'static str],
+    columns: &'static [GapColumn],
     cause: &'static str,
 }
 
-/// Every corpus case that still differs from Blender, with the columns and a one-line cause.
+/// Every corpus case that still differs from Blender, with the measured columns and a one-line cause.
 const KNOWN_GAPS: &[KnownGap] = &[
     KnownGap {
         case: "cube_s2_p100_vertices_absolute",
-        columns: &["nrm"],
+        columns: &[GapColumn {
+            name: "nrm",
+            bad: 95,
+            max: Some(0.8792),
+        }],
         cause: "flat faces of non-planar clamped quads: Blender's corner normal is neither the Newell nor the diagonal normal of the output positions",
     },
     KnownGap {
         case: "clamp_large_offset_on",
-        columns: &["nrm"],
+        columns: &[GapColumn {
+            name: "nrm",
+            bad: 59,
+            max: Some(0.2779),
+        }],
         cause: "same non-planar flat-face normal source as cube_s2_p100_vertices_absolute",
     },
     KnownGap {
         case: "clamp_small_width_on",
-        columns: &["nrm"],
-        cause: "normal residual 2.7e-4 above tolerance 2e-4 on clamped width corners; not analysed",
+        columns: &[GapColumn {
+            name: "nrm",
+            bad: 40,
+            max: Some(2.701e-4),
+        }],
+        cause: "2.7e-4 is 2.8 code steps, above the two-step bound; not analysed (the codec's snap bound is larger)",
     },
     KnownGap {
         case: "clamp_small_width_off",
-        columns: &["nrm"],
-        cause: "normal residual 2.7e-4 above tolerance 2e-4 on clamped width corners; not analysed",
+        columns: &[GapColumn {
+            name: "nrm",
+            bad: 40,
+            max: Some(2.701e-4),
+        }],
+        cause: "2.7e-4 is 2.8 code steps, above the two-step bound; not analysed (the codec's snap bound is larger)",
     },
     KnownGap {
         case: "cube_s5_p80_vertices_offset",
-        columns: &["nrm"],
-        cause: "normal residual 4.2e-4 above tolerance 2e-4 on vertex-mode 80% offset corners; not analysed",
+        columns: &[GapColumn {
+            name: "nrm",
+            bad: 56,
+            max: Some(4.189e-4),
+        }],
+        cause: "4.2e-4 is 4.4 code steps, above the two-step bound; vertex-mode 80% offset corners, not analysed",
     },
     KnownGap {
         case: "oblique_prism_s4_p80",
-        columns: &["nrm"],
-        cause: "normal residual 2.9e-4 above tolerance 2e-4; not analysed",
+        columns: &[GapColumn {
+            name: "nrm",
+            bad: 10,
+            max: Some(2.880e-4),
+        }],
+        cause: "2.9e-4 is 3.0 code steps, above the two-step bound; not analysed",
     },
     KnownGap {
         case: "clamp_large_offset_off",
-        columns: &["wgt"],
+        columns: &[GapColumn {
+            name: "wgt",
+            bad: 13,
+            max: Some(0.5100),
+        }],
         cause: "vertex weight 0.51 at clamped corners; not analysed",
     },
     KnownGap {
         case: "clamp_large_width_off",
-        columns: &["wgt"],
+        columns: &[GapColumn {
+            name: "wgt",
+            bad: 8,
+            max: Some(0.1585),
+        }],
         cause: "vertex weight 0.16 at clamped corners; not analysed",
     },
     KnownGap {
         case: "cube_s3_p25_vertices_absolute",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 10,
+                max: Some(1.067e-2),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 5,
+                max: Some(2.223e-2),
+            },
+        ],
         cause: "vertex-mode odd-segment corner snaps onto a different input edge at the same vertex than Blender (localized by per-writer dump; not fixed)",
     },
     KnownGap {
         case: "cube_s5_p25_vertices_width",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 10,
+                max: Some(7.415e-3),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 5,
+                max: Some(1.545e-2),
+            },
+        ],
         cause: "same vertex-mode corner snap as cube_s3_p25_vertices_absolute",
     },
     KnownGap {
         case: "nonmanifold_three_faces_s5_p0",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 2,
+                max: Some(5.686e-2),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 8,
+                max: Some(1.649e-2),
+            },
+        ],
         cause: "vertex-mode corner snap, four points no corner writes, and a vertex UV blend no single face reproduces",
     },
     KnownGap {
         case: "pentagonal_pyramid_s3_adj_vertices",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 8,
+                max: Some(1.070e-2),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 22,
+                max: Some(6.060e-3),
+            },
+        ],
         cause: "vertex-mode odd-segment corners, the cube_s3_p25 family; not localized per case",
     },
     KnownGap {
         case: "pentagonal_pyramid_s3_cutoff_vertices",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 8,
+                max: Some(1.070e-2),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 22,
+                max: Some(6.060e-3),
+            },
+        ],
         cause: "vertex-mode odd-segment corners, the cube_s3_p25 family; not localized per case",
     },
     KnownGap {
         case: "hexagonal_pyramid_s3_adj_vertices",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 8,
+                max: Some(1.051e-2),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 20,
+                max: Some(5.644e-3),
+            },
+        ],
         cause: "vertex-mode odd-segment corners, the cube_s3_p25 family; not localized per case",
     },
     KnownGap {
         case: "hexagonal_pyramid_s3_cutoff_vertices",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 8,
+                max: Some(1.051e-2),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 20,
+                max: Some(5.644e-3),
+            },
+        ],
         cause: "vertex-mode odd-segment corners, the cube_s3_p25 family; not localized per case",
     },
     KnownGap {
         case: "irregular_octahedron_s3_adj_vertices",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 4,
+                max: Some(7.976e-4),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 12,
+                max: Some(2.796e-3),
+            },
+        ],
         cause: "vertex-mode odd-segment corners, the cube_s3_p25 family; not localized per case",
     },
     KnownGap {
         case: "irregular_octahedron_s3_cutoff_vertices",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 4,
+                max: Some(7.976e-4),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 12,
+                max: Some(2.796e-3),
+            },
+        ],
         cause: "vertex-mode odd-segment corners, the cube_s3_p25 family; not localized per case",
     },
     KnownGap {
         case: "hexagonal_pyramid_mark_sharp_vertices_s3",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 8,
+                max: Some(1.051e-2),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 20,
+                max: Some(5.644e-3),
+            },
+        ],
         cause: "vertex-mode odd-segment corners, the cube_s3_p25 family; not localized per case",
     },
     KnownGap {
         case: "open_fan_vertices_cutoff_s3",
-        columns: &["wgt", "uv"],
+        columns: &[
+            GapColumn {
+                name: "wgt",
+                bad: 10,
+                max: Some(1.276e-2),
+            },
+            GapColumn {
+                name: "uv",
+                bad: 28,
+                max: Some(1.120e-2),
+            },
+        ],
         cause: "vertex-mode odd-segment corners, the cube_s3_p25 family; not localized per case",
     },
 ];
+
+/// The recorded gap for `name`, if the corpus has one.
+fn known_gap(name: &str) -> Option<&'static KnownGap> {
+    KNOWN_GAPS.iter().find(|gap| gap.case == name)
+}
+
+/// Whether `columns` are exactly a recorded gap's columns: same names and row counts, maxima within 0.1%.
+fn matches_gap(columns: &[GapColumn], gap: &KnownGap) -> bool {
+    columns.len() == gap.columns.len()
+        && columns.iter().zip(gap.columns).all(|(actual, recorded)| {
+            actual.name == recorded.name
+                && actual.bad == recorded.bad
+                && match (actual.max, recorded.max) {
+                    (None, None) => true,
+                    (Some(actual), Some(recorded)) => {
+                        (actual - recorded).abs() <= 1e-3 * recorded.abs()
+                    }
+                    _ => false,
+                }
+        })
+}
+
+/// The columns as `name bad max`, for failure messages.
+fn describe(columns: &[GapColumn]) -> String {
+    columns
+        .iter()
+        .map(|column| match column.max {
+            Some(max) => format!("{} {} max {max:.4e}", column.name, column.bad),
+            None => format!("{} {}", column.name, column.bad),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Runs one case. Errors and panics become a failing report rather than aborting the run.
 fn run_case(oracle: &Value, case: &Value) -> CaseReport {
@@ -243,7 +468,12 @@ fn compare_case(oracle: &Value, case: &Value, name: &str) -> TestResult<CaseRepo
     let expected = expected_mesh(&case["output"])?;
     let actual = actual_mesh(&evaluated, &expected.group_names)?;
 
-    compare(name, &canonicalize(&expected), &actual)
+    compare(
+        name,
+        &canonicalize(&expected),
+        &actual,
+        normal_tolerance(oracle)?,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -861,34 +1091,38 @@ impl CaseReport {
         }
     }
 
-    /// The comparison columns that differ from Blender, in table order. A case that errors or has the wrong
-    /// vertex count reports `error` or `count`.
-    fn differing_columns(&self) -> Vec<&'static str> {
+    /// The comparison columns that differ from Blender, in table order, with their row counts and maxima. A
+    /// case that errors or has the wrong vertex count reports `error` or `count`.
+    fn differing_columns(&self) -> Vec<GapColumn> {
         if self.error.is_some() {
-            return vec!["error"];
+            return vec![GapColumn {
+                name: "error",
+                bad: 1,
+                max: None,
+            }];
         }
         let mut columns = Vec::new();
         if self.expected_vertices != self.actual_vertices {
-            columns.push("count");
+            columns.push(GapColumn {
+                name: "count",
+                bad: self.expected_vertices.abs_diff(self.actual_vertices),
+                max: None,
+            });
         }
-        for (name, bad) in [
-            ("pos", self.position_bad),
-            ("wgt", self.weight_bad),
-            ("uv", self.uv_bad),
-            ("nrm", self.normal_bad),
-            ("ring", self.ring_bad),
-            ("edge", self.edge_bad),
-            ("flag", self.flag_bad),
+        for (name, bad, max) in [
+            ("pos", self.position_bad, Some(self.position_max)),
+            ("wgt", self.weight_bad, Some(self.weight_max)),
+            ("uv", self.uv_bad, Some(self.uv_max)),
+            ("nrm", self.normal_bad, Some(self.normal_max)),
+            ("ring", self.ring_bad, None),
+            ("edge", self.edge_bad, None),
+            ("flag", self.flag_bad, None),
         ] {
             if bad > 0 {
-                columns.push(name);
+                columns.push(GapColumn { name, bad, max });
             }
         }
         columns
-    }
-
-    fn failed(&self) -> bool {
-        !self.differing_columns().is_empty()
     }
 }
 
@@ -1799,7 +2033,12 @@ fn match_vertices(
     Ok(matching)
 }
 
-fn compare(name: &str, expected: &CanonMesh, actual: &RawMesh) -> TestResult<CaseReport> {
+fn compare(
+    name: &str,
+    expected: &CanonMesh,
+    actual: &RawMesh,
+    normal_tolerance: f64,
+) -> TestResult<CaseReport> {
     let mut report = CaseReport::new(name, expected.vertices.len(), actual.vertices.len());
     let matching = match_vertices(expected, actual, &mut report)?;
 
@@ -1907,7 +2146,7 @@ fn compare(name: &str, expected: &CanonMesh, actual: &RawMesh) -> TestResult<Cas
                 }
                 let normal = max_abs_difference(expected_corner.normal, actual_corner.normal);
                 report.normal_max = report.normal_max.max(normal);
-                if normal > NORMAL_TOLERANCE {
+                if normal > normal_tolerance {
                     report.normal_bad += 1;
                 }
             }
@@ -1917,9 +2156,9 @@ fn compare(name: &str, expected: &CanonMesh, actual: &RawMesh) -> TestResult<Cas
     Ok(report)
 }
 
-fn print_table(reports: &[CaseReport]) {
+fn print_table(reports: &[CaseReport], normal_tolerance: f64) {
     println!(
-        "bevel oracle: {} cases; tolerances: position/weight/uv {POSITION_TOLERANCE:e}, normal {NORMAL_TOLERANCE}",
+        "bevel oracle: {} cases; tolerances: position/weight/uv {POSITION_TOLERANCE:e}, normal {normal_tolerance:e}",
         reports.len()
     );
     println!(
@@ -1943,10 +2182,14 @@ fn print_table(reports: &[CaseReport]) {
             println!("{:<52} ERROR {error}", report.name);
             continue;
         }
-        let status = match (report.failed(), report.ambiguous) {
-            (false, _) => "ok".to_owned(),
-            (true, 0) => "FAIL".to_owned(),
-            (true, count) => format!("FAIL ambiguous={count}"),
+        let columns = report.differing_columns();
+        let status = match (columns.is_empty(), report.ambiguous) {
+            (true, _) => "ok".to_owned(),
+            (false, _) if known_gap(&report.name).is_some_and(|gap| matches_gap(&columns, gap)) => {
+                "gap".to_owned()
+            }
+            (false, 0) => "FAIL".to_owned(),
+            (false, count) => format!("FAIL ambiguous={count}"),
         };
         println!(
             "{:<52} {:>4}/{:<4} {:>7} {:>10.3e} {:>7} {:>10.3e} {:>7} {:>10.3e} {:>7} {:>10.3e} {:>5} {:>5} {:>5}  {status}",
