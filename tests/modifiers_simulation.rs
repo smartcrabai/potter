@@ -672,12 +672,12 @@ fn assert_ordered_mesh_matches_blender(
     }
 }
 
-/// The first evaluated vertex of `object_id` at `frame`, for recorded-gap checks on one coordinate.
-fn snapshot_first_vertex(
+/// The evaluated mesh of `object_id` at `frame`, reused as the CLI/apply round-trip baseline.
+fn snapshot_mesh(
     document: &potter_core::model::SceneDoc,
     object_id: &str,
     frame: f64,
-) -> Result<[f64; 3], Box<dyn Error>> {
+) -> Result<potter_core::geom::Mesh, Box<dyn Error>> {
     let id = potter_core::model::Id::new(object_id.to_owned())?;
     let snapshot = potter_core::eval::Snapshot::evaluate(
         document,
@@ -686,16 +686,11 @@ fn snapshot_first_vertex(
             ..potter_core::eval::EvaluationContext::default()
         },
     )?;
-    let mesh = snapshot
+    Ok(snapshot
         .meshes
         .get(&id)
-        .ok_or("evaluated particle mesh is missing")?;
-    Ok(mesh
-        .vertices
-        .first()
-        .ok_or("evaluated mesh has no vertices")?
-        .co
-        .to_array())
+        .ok_or("evaluated particle mesh is missing")?
+        .clone())
 }
 
 fn assert_snapshot_mesh_matches_blender(
@@ -1548,7 +1543,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
             Ok(nearest)
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    assert_eq!(cube_face_owners, [0, 0, 0, 0, 0, 1]);
+    assert_eq!(cube_face_owners, [0, 0, 0, 0, 1, 1]);
     let blender_cube_face_owners: Vec<usize> =
         serde_json::from_value(blender["cube_face_owners"].clone())?;
     assert_eq!(
@@ -1585,7 +1580,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         })
         .collect::<Vec<_>>();
     let blender_cube_masks: Vec<usize> = serde_json::from_value(blender["cube_cut_masks"].clone())?;
-    assert_eq!(cube_masks, [10, 5, 5, 0, 5, 0]);
+    assert_eq!(cube_masks, [12, 3, 5, 5, 0, 0]);
     assert_eq!(
         cube_masks, blender_cube_masks,
         "face split masks must match Blender's particle-owner classification",
@@ -1614,7 +1609,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         &blender["cube_explode_mesh"],
         "edge-cut cube Explode",
     );
-    assert_eq!(cube_explode.faces.len(), 10);
+    assert_eq!(cube_explode.faces.len(), 12);
     assert_eq!(
         cube_explode.faces.len(),
         blender["cube_explode_face_count"],
@@ -2098,8 +2093,15 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         .as_str()
         .ok_or("particle modifier ID is missing")?;
     let typed_document: potter_core::model::SceneDoc = serde_json::from_value(document.clone())?;
-    // Recorded gap: native child-instance frame 1 row 0 x differs from Blender by +0.25; cause unconfirmed.
-    let potter_first = snapshot_first_vertex(&typed_document, &instancer_id, 1.0)?;
+    // These committed Blender offsets remain the only recorded differences; use the pre-apply Potter
+    // snapshots as strict baselines for the CLI, apply, export, and reimport paths.
+    let potter_frame_one = snapshot_mesh(&typed_document, &instancer_id, 1.0)?;
+    let potter_first = potter_frame_one
+        .vertices
+        .first()
+        .ok_or("frame-one particle mesh has no vertices")?
+        .co
+        .to_array();
     assert_recorded_gap(
         "native child-instance frame 1 corner data row 0 x",
         potter_first[0],
@@ -2108,9 +2110,22 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
             .ok_or("Blender frame-1 x")?,
         0.25,
     );
+    let mut expected_frame_one = blender_frame_one.clone();
+    expected_frame_one["positions"][0][0] = json!(potter_first[0]);
+    assert_ordered_mesh_matches_blender(
+        &potter_frame_one,
+        &expected_frame_one,
+        "Potter pre-apply frame 1",
+    );
+    let potter_frame_two = snapshot_mesh(&typed_document, &instancer_id, 2.0)?;
+    let potter_second = potter_frame_two
+        .vertices
+        .first()
+        .ok_or("frame-two particle mesh has no vertices")?
+        .co
+        .to_array();
     // Recorded gap: native child-instance frame 2 row 0 x differs by +0.39 (measured in CI on 0643cd36);
     // cause unconfirmed.
-    let potter_second = snapshot_first_vertex(&typed_document, &instancer_id, 2.0)?;
     assert_recorded_gap(
         "native child-instance frame 2 corner data row 0 x",
         potter_second[0],
@@ -2118,6 +2133,13 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
             .as_f64()
             .ok_or("Blender frame-2 x")?,
         0.39,
+    );
+    let mut expected_frame_two = blender_frame_two.clone();
+    expected_frame_two["positions"][0][0] = json!(potter_second[0]);
+    assert_ordered_mesh_matches_blender(
+        &potter_frame_two,
+        &expected_frame_two,
+        "Potter pre-apply frame 2",
     );
     let assert_cli_mesh = |actual: &Value, expected: &Value, context: &str| {
         let geometry = &actual["result"]["items"][0]["evaluated_geometry"];
@@ -2133,8 +2155,8 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
     };
     let frame_one = inspect(&project, &instancer_id, "1")?;
     let frame_two = inspect(&project, &instancer_id, "2")?;
-    assert_cli_mesh(&frame_one, blender_frame_one, "Potter CLI frame 1");
-    assert_cli_mesh(&frame_two, blender_frame_two, "Potter CLI frame 2");
+    assert_cli_mesh(&frame_one, &expected_frame_one, "Potter CLI frame 1");
+    assert_cli_mesh(&frame_two, &expected_frame_two, "Potter CLI frame 2");
     assert_ne!(
         frame_one["result"]["items"][0]["evaluated_geometry"]["positions"],
         frame_two["result"]["items"][0]["evaluated_geometry"]["positions"],
@@ -2158,7 +2180,7 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         &typed_applied_document,
         &instancer_id,
         1.0,
-        blender_frame_one,
+        &expected_frame_one,
         "applied particle corner data",
     )?;
     assert_eq!(
@@ -2174,7 +2196,7 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         "applying the particle modifier must persist its evaluated mesh and remove the stack entry",
     );
     let applied = inspect(&project, &instancer_id, "1")?;
-    assert_cli_mesh(&applied, blender_frame_one, "applied particle mesh");
+    assert_cli_mesh(&applied, &expected_frame_one, "applied particle mesh");
 
     let exported = root.join("particle_cli_roundtrip.blend");
     let mut export = pot();
@@ -2220,10 +2242,10 @@ with open(output, 'w', encoding='utf-8') as handle:
     assert_eq!(reopened["modifier_count"], 0);
     assert_numeric_rows(
         &reopened["positions"],
-        &blender_frame_one["positions"],
+        &expected_frame_one["positions"],
         "reopened Blender mesh",
     );
-    assert_eq!(reopened["faces"], blender_frame_one["faces"]);
+    assert_eq!(reopened["faces"], expected_frame_one["faces"]);
 
     let reimport_project = root.join("particle-reimport-project");
     initialize(&reimport_project)?;
@@ -2275,12 +2297,12 @@ with open(output, 'w', encoding='utf-8') as handle:
         &typed_reimported_document,
         &reimported_instancer_id,
         1.0,
-        blender_frame_one,
+        &expected_frame_one,
         "reimported applied corner data",
     )?;
     assert_cli_mesh(
         &after_reimport,
-        blender_frame_one,
+        &expected_frame_one,
         "Potter reimported applied mesh",
     );
     let _ = blender_output;
@@ -5098,7 +5120,7 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
             })
             .count()
     };
-    assert_eq!(unborn_count(0), 3, "primary particle system unborn count",);
+    assert_eq!(unborn_count(0), 3, "primary particle system unborn count");
     assert_eq!(
         unborn_count(1),
         999,
