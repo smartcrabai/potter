@@ -3,18 +3,16 @@
 //! Each test point casts Blender's six rays. A hit is decided by Blender's float test
 //! (`isect_ray_tri_epsilon_v3`), and each hit counts the orientation of the ray origin against the
 //! hit triangle (Blender `orient3d`, decided exactly by `robust` on the double vertex positions).
-//! Candidate triangles come from one [`bvh::TriBvh`] per classification, plus a per-ray list of
-//! triangles whose float test is too ill-conditioned to trust box culling.
-
-#[path = "raycast/bvh.rs"]
-mod bvh;
+//! Candidate triangles are the leaves of one [`KdopTree`] per classification (`geom::bvh`, Blender's
+//! k-DOP tree, `BLI_bvhtree_new(…, FLT_EPSILON, 4, 6)`); every leaf the ray walk returns goes through the
+//! float test, as in Blender's `test_tri_inside_shapes`.
 
 use glam::DVec3;
 use robust::{Coord3D, orient3d};
 
 use super::super::imesh::{Arena, Tri};
 use super::{BoolOp, apply_bool_op, patches::find_patches, topology::Topology};
-use bvh::TriBvh;
+use crate::geom::bvh::{Bounds, KdopTree, Ray, RayHit, kdop_bounds};
 
 /// Blender `FLT_EPSILON`: slack on the barycentric bounds of `isect_ray_tri_epsilon_v3`.
 const RAY_EPSILON: f32 = f32::EPSILON;
@@ -31,17 +29,6 @@ const RAYS: [[f32; 3]; 6] = [
     [RA, RB, R1],
     [-RA, -RB, -R1],
 ];
-
-/// Box padding of the BVH, as a fraction of the largest extent `L` of the triangles.
-///
-/// The float test's hit point is off the exact one by about `k * f32::EPSILON * |origin - v0| * c`,
-/// where `c` is the triangle's condition (see [`is_ill_conditioned`]) and `k` counts rounding
-/// steps. With `c <= MAX_CONDITION` and `|origin - v0| <= 4 L`, that is at most `k * 4.9e-4 * L`,
-/// so this padding covers every `k <= 20`.
-const BOX_PAD_FRACTION: f64 = 1.0e-2;
-
-/// Largest condition of a triangle for which the BVH is trusted to cull it for a ray.
-const MAX_CONDITION: f64 = 1024.0;
 
 /// Blender's non-PWN classification: float ray/triangle hits with robust orientation parity.
 pub(super) fn raycast_boolean(
@@ -70,46 +57,28 @@ pub(super) fn raycast_boolean(
     }
 }
 
-/// The float triangles of one classification, with the BVH and conditioning data for the six rays.
+/// The float triangles of one classification, with the BVH the six rays walk.
 struct RayIndex {
     float_tris: Vec<[[f32; 3]; 3]>,
-    bvh: TriBvh,
-    /// Bit `r` is set when triangle `t` is ill-conditioned for `RAYS[r]`.
-    ill_conditioned: Vec<u8>,
-    /// Triangles that are ill-conditioned for `RAYS[r]`. They are tested for that ray directly,
-    /// because box culling cannot bound their float test.
-    always_tested: Vec<Vec<usize>>,
+    bvh: KdopTree,
 }
 
 impl RayIndex {
-    /// Builds the BVH over the padded triangle boxes and classifies every triangle for every ray.
+    /// Builds the BVH over the triangle boxes.
     ///
-    /// Cost: O(T log T) for the BVH, O(6 T) for the conditioning test.
+    /// The tree is Blender's `BLI_bvhtree_new(tot, FLT_EPSILON, 4, 6)` (`mesh_boolean.cc`, raycast tree):
+    /// `tree_type` 4 and six bound entries, with the boxes inflated by `FLT_EPSILON` (`create_kdop_hull`,
+    /// `bvhtree_node_inflate`). No Potter padding is added.
+    ///
+    /// Cost: O(T log T).
     fn new(float_tris: Vec<[[f32; 3]; 3]>) -> Self {
-        let bounds: Vec<(DVec3, DVec3)> = float_tris.iter().map(triangle_bounds).collect();
-        let (lo, hi) = bounds.iter().fold(
-            (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
-            |(lo, hi), &(min, max)| (lo.min(min), hi.max(max)),
-        );
-        let largest_extent = (hi - lo).max_element().max(0.0);
-        let bvh = TriBvh::new(&bounds, BOX_PAD_FRACTION * largest_extent);
-
-        let mut ill_conditioned = vec![0_u8; float_tris.len()];
-        let mut always_tested = vec![Vec::new(); RAYS.len()];
-        for (ray, &direction) in RAYS.iter().enumerate() {
-            let direction = to_dvec3(direction);
-            for (t, tri) in float_tris.iter().enumerate() {
-                if is_ill_conditioned(tri, direction) {
-                    ill_conditioned[t] |= 1 << ray;
-                    always_tested[ray].push(t);
-                }
-            }
-        }
+        let leaf_bounds: Vec<Bounds> = float_tris
+            .iter()
+            .map(|tri| kdop_bounds(tri, f32::EPSILON, 6))
+            .collect();
         Self {
             float_tris,
-            bvh,
-            ill_conditioned,
-            always_tested,
+            bvh: KdopTree::new(leaf_bounds, 4, 6),
         }
     }
 }
@@ -118,22 +87,18 @@ fn to_dvec3(v: [f32; 3]) -> DVec3 {
     DVec3::new(f64::from(v[0]), f64::from(v[1]), f64::from(v[2]))
 }
 
-fn triangle_bounds(tri: &[[f32; 3]; 3]) -> (DVec3, DVec3) {
-    let [a, b, c] = tri.map(to_dvec3);
-    (a.min(b).min(c), a.max(b).max(c))
-}
-
-/// Whether the float test of Blender's `isect_ray_tri_epsilon_v3` for `tri` and `direction` is too
-/// ill-conditioned for box culling: `|a| * MAX_CONDITION <= |d| |e1| |e2|`, with
-/// `a = dot(e1, d x e2)` the pivot of the test. Degenerate triangles (`a = 0`) are included.
-///
-/// Computed in f64 from the f32 vertices, so it is exact up to the rounding of the differences.
-fn is_ill_conditioned(tri: &[[f32; 3]; 3], direction: DVec3) -> bool {
-    let [v0, v1, v2] = tri.map(to_dvec3);
-    let e1 = v1 - v0;
-    let e2 = v2 - v0;
-    let pivot = direction.dot(e2.cross(e1)).abs();
-    pivot * MAX_CONDITION <= direction.length() * e1.length() * e2.length()
+/// Blender `BLI_bvhtree_ray_cast`'s leaf walk over the classification's tree: appends to `leaves`
+/// every triangle whose `FLT_EPSILON`-inflated box the ray `origin + s * direction`, `s >= 0`, crosses. The
+/// walk is unbounded (`RayHit::open`), as Blender's `BLI_bvhtree_ray_cast_all` is, and the callback only
+/// records leaves, so no leaf is pruned by a hit found earlier.
+fn bvh_leaves(index: &RayIndex, origin: [f32; 3], direction: [f32; 3], leaves: &mut Vec<usize>) {
+    let mut hit = RayHit::open();
+    index.bvh.ray_cast(
+        origin,
+        direction,
+        &mut hit,
+        &mut |leaf: usize, _ray: &Ray, _hit: &mut RayHit| leaves.push(leaf),
+    );
 }
 
 fn raycast_tris_boolean(
@@ -234,10 +199,9 @@ fn raycast_test_remove(
     }
 }
 
-/// Reused buffers of one classification: the BVH query stack and candidates, and the per-shape
+/// Reused buffers of one classification: the BVH leaf list of the current ray, and the per-shape
 /// orientation parity of the current ray.
 struct RayScratch {
-    stack: Vec<usize>,
     hits: Vec<usize>,
     hit_parity: Vec<i32>,
 }
@@ -245,7 +209,6 @@ struct RayScratch {
 impl RayScratch {
     fn new(nshapes: usize) -> Self {
         Self {
-            stack: Vec::new(),
             hits: Vec::new(),
             hit_parity: vec![0; nshapes],
         }
@@ -264,10 +227,7 @@ struct TestRay {
 /// offset interior point of triangle `test_index` that count as inside shape `j`. The test
 /// triangle's own shape is 1.
 ///
-/// Cost per call: six BVH queries, each O(log T + k) for k returned candidates, then one float
-/// test per candidate and per triangle that is ill-conditioned for that ray. The second term is
-/// g, the ill-conditioned count of the ray: near zero for well-shaped meshes, but up to T for a
-/// mesh of degenerate faces.
+/// Cost per call: six BVH queries, each O(log T + k) for k returned leaves, then one float test per leaf.
 fn test_tri_inside_shapes(
     arena: &Arena,
     tris: &[Tri],
@@ -297,7 +257,7 @@ fn test_tri_inside_shapes(
     let origin_exact = to_dvec3(origin);
     inside.fill(0.0);
 
-    for (ray_index, &direction) in RAYS.iter().enumerate() {
+    for &direction in &RAYS {
         let ray = TestRay {
             origin,
             origin_exact,
@@ -305,18 +265,8 @@ fn test_tri_inside_shapes(
         };
         scratch.hit_parity.fill(0);
         scratch.hits.clear();
-        index.bvh.ray_candidates(
-            origin_exact,
-            to_dvec3(direction),
-            &mut scratch.stack,
-            &mut scratch.hits,
-        );
-        let ray_bit = 1_u8 << ray_index;
-        let bvh_candidates = scratch
-            .hits
-            .iter()
-            .filter(|&&t| (index.ill_conditioned[t] & ray_bit) == 0);
-        for &t in bvh_candidates.chain(index.always_tested[ray_index].iter()) {
+        bvh_leaves(index, origin, direction, &mut scratch.hits);
+        for &t in &scratch.hits {
             if let Some(parity) = ray_parity(arena, tris, index, t, &ray) {
                 scratch.hit_parity[shape_fn(tris[t].orig)] += parity;
             }
@@ -434,7 +384,7 @@ fn flipped(tri: Tri) -> Tri {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_ill_conditioned, orient3d_sign, ray_intersects_triangle};
+    use super::{RAYS, RayIndex, bvh_leaves, orient3d_sign, ray_intersects_triangle};
     use glam::DVec3;
 
     #[test]
@@ -472,12 +422,74 @@ mod tests {
         assert_eq!(orient3d_sign(a, b, c, DVec3::new(0.25, 0.25, 0.0)), 0);
     }
 
+    /// Whether the ray `origin + s * direction`, `s >= 0`, crosses the box of `tri` grown by `grow` on every
+    /// side, in f64 slab arithmetic.
+    fn box_crossed(tri: &[[f32; 3]; 3], origin: [f32; 3], direction: [f32; 3], grow: f64) -> bool {
+        let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        for axis in 0..3 {
+            let min = tri
+                .iter()
+                .map(|v| f64::from(v[axis]))
+                .fold(f64::INFINITY, f64::min)
+                - grow;
+            let max = tri
+                .iter()
+                .map(|v| f64::from(v[axis]))
+                .fold(f64::NEG_INFINITY, f64::max)
+                + grow;
+            let (o, d) = (f64::from(origin[axis]), f64::from(direction[axis]));
+            if d == 0.0 {
+                if o < min || o > max {
+                    return false;
+                }
+                continue;
+            }
+            let (t1, t2) = ((min - o) / d, (max - o) / d);
+            lo = lo.max(t1.min(t2));
+            hi = hi.min(t1.max(t2));
+        }
+        lo <= hi && hi >= 0.0
+    }
+
+    /// The tree walk visits exactly the triangles whose boxes (`FLT_EPSILON` inflated, as Blender's
+    /// `BLI_bvhtree_new(…, 4, 6)`) the ray crosses. Boxes grown by `1e-5` are far outside the inflation, so
+    /// the oracle is robust to the f32 rounding of the tree's slab tests.
     #[test]
-    fn well_shaped_triangles_are_not_ill_conditioned_and_degenerate_ones_are() {
-        let direction = DVec3::new(0.998_702_5, 0.049_935_1, 0.009_987_0);
-        let good = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
-        let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
-        assert!(!is_ill_conditioned(&good, direction));
-        assert!(is_ill_conditioned(&flat, direction));
+    fn tree_walk_visits_every_box_the_ray_crosses() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1_u64 << 24) as f32
+        };
+        let tris: Vec<[[f32; 3]; 3]> = (0..400)
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    [next() * 4.0 - 2.0, next() * 4.0 - 2.0, next() * 4.0 - 2.0]
+                })
+            })
+            .collect();
+        let index = RayIndex::new(tris.clone());
+        let mut leaves = Vec::new();
+        let mut crossed_checked = 0_usize;
+        for _ in 0..200 {
+            let origin = [next() * 4.0 - 2.0, next() * 4.0 - 2.0, next() * 4.0 - 2.0];
+            for &direction in &RAYS {
+                leaves.clear();
+                bvh_leaves(&index, origin, direction, &mut leaves);
+                for (t, tri) in tris.iter().enumerate() {
+                    let visited = leaves.contains(&t);
+                    if box_crossed(tri, origin, direction, 0.0) {
+                        crossed_checked += 1;
+                        assert!(visited, "triangle {t} box is crossed but was not visited");
+                    }
+                    if !box_crossed(tri, origin, direction, 1.0e-5) {
+                        assert!(!visited, "triangle {t} box is not crossed but was visited");
+                    }
+                }
+            }
+        }
+        assert!(crossed_checked > 1000, "the fixture must cross many boxes");
     }
 }

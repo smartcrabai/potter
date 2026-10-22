@@ -17,7 +17,7 @@
 
 use crate::{
     error::{PotError, Result},
-    geom::bvh::{KdopTree, Ray, RayHit, Vec3, cross, dot, normalize, sub},
+    geom::bvh::{KdopTree, Ray, RayHit, Vec3, cross, dot, kdop_bounds, normalize, sub},
 };
 
 /// `isect_mdef.lambda` before the ray test (`meshdeform_ray_tree_intersect`).
@@ -98,17 +98,20 @@ impl CageRayCache {
                 "mesh deform cage triangles do not match its polygons",
             ));
         }
-        // Leaf `i` of the tree is corner triangle `i`.
-        let leaf_bv: Vec<[f32; 6]> = corner_tris
+        // Mesh Deform binds on `mdb->bvhdata = cagemesh->bvh_corner_tris()` (`meshlaplacian.cc:1596-1597`),
+        // whose tree is `create_tree_from_tris` (`bvhutils.cc:510-520`): `bvhtree_new_common`
+        // (`bvhutils.cc:431-436`) = `BLI_bvhtree_new(n, 0.0, 2, 6)`, the epsilon clamped to `FLT_EPSILON`
+        // (`BLI_kdopbvh.cc:870`), with each corner triangle inserted as three points. Leaf `i` is corner triangle `i`.
+        let leaf_bv: Vec<_> = corner_tris
             .iter()
-            .map(|t| KdopTree::leaf_bounds_for_triangle([points[t[0]], points[t[1]], points[t[2]]]))
+            .map(|t| kdop_bounds(&[points[t[0]], points[t[1]], points[t[2]]], f32::EPSILON, 6))
             .collect();
         Ok(Self {
             points: points.to_vec(),
             corner_tris,
             tri_face,
             face_normals,
-            tree: KdopTree::from_leaf_bounds(&leaf_bv),
+            tree: KdopTree::new(leaf_bv, 2, 6),
         })
     }
 
