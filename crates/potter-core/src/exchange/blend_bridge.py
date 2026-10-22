@@ -2435,6 +2435,7 @@ def dump_scene(scene):
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
                 "film_transparent": bool(scene.render.film_transparent),
+                "filter_size": float(scene.render.filter_size),
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
                 "engine_native": render_engine,
                 "dicing_rate": float(getattr(cycles, "dicing_rate", 1.0)),
@@ -7202,6 +7203,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene.render.resolution_y = int(render.get("resolution_y", 1080))
         scene.render.resolution_percentage = int(render.get("resolution_percentage", 100))
         scene.render.film_transparent = bool(render.get("film_transparent", False))
+        scene.render.filter_size = float(render.get("filter_size", 1.5))
         scene.render.use_sequencer = bool(render.get("use_sequencer", False))
         available_engines = {
             item.identifier

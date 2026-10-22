@@ -426,6 +426,13 @@ fn empty_geometry_realtime_render_writes_a_frame_without_triangles() -> TestResu
     let directory = tempdir()?;
     let scene = empty_body_scene(directory.path())?;
     add_camera(&scene, directory.path(), 2)?;
+    // One sample, explicitly: the test checks that a frame is written for an empty mesh, not the film's reconstruction.
+    apply(
+        &scene,
+        directory.path(),
+        3,
+        &json!([{"op": "render.update", "target": {"id": "scene_main"}, "set": {"samples": 1}}]),
+    )?;
     let out = directory.path().join("render");
     let envelope = run_ok(&[
         "render",

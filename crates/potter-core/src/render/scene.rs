@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{OnceCell, RefCell},
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
@@ -25,6 +25,7 @@ use crate::{
     },
 };
 
+use super::world_probe::WorldProbe;
 use super::{
     bvh::{Bvh, BvhHit},
     light_model::{
@@ -851,8 +852,8 @@ pub(super) fn extract_geometry(
                         }];
                         shade(
                             doc, snapshot, center, center, normal, normal, &closures, mode, None,
-                            images,
-                        )?
+                            None,
+                        )
                     };
                     let triangle = Triangle {
                         positions,
@@ -1813,6 +1814,8 @@ pub(super) struct SceneShader<'a> {
     /// The camera's view space, in which Solid's studio lights are fixed.
     view: ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
+    /// The render's world probe, built by the first Beauty shade that needs it (`world_probe`).
+    world_probe: OnceCell<Option<WorldProbe>>,
 }
 
 /// The per-pixel shader for `mode`, or `None` when the raster outputs unlit or per-triangle colour.
@@ -1838,6 +1841,7 @@ pub(super) fn surface_shader<'a>(
         mode,
         view,
         evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
+        world_probe: OnceCell::new(),
     }))
 }
 
@@ -1932,8 +1936,8 @@ impl SurfaceShader for SceneShader<'_> {
             closures,
             self.mode,
             shadow,
-            self.images,
-        )?;
+            self.world_probe()?,
+        );
         occluders.finish()?;
         Ok(SurfaceSample {
             color,
@@ -1962,6 +1966,26 @@ fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
 }
 
 impl SceneShader<'_> {
+    /// The render's world probe: the world's radiance at every texel of a cube map. It is built once, by the first
+    /// shade that reads it, because the world does not change within a render (`LightProbeModule::sync_world`,
+    /// `eevee_lightprobe.cc`). `None` when the scene has no world.
+    fn world_probe(&self) -> Result<Option<&WorldProbe>> {
+        if self.world_probe.get().is_none() {
+            let world = self
+                .doc
+                .scenes
+                .get(&self.snapshot.scene_id)
+                .and_then(|scene| scene.world.as_ref())
+                .and_then(|id| self.doc.worlds.get(id));
+            let probe = world
+                .map(|world| WorldProbe::build(world, &self.doc.node_groups, self.images))
+                .transpose()?;
+            // The cell is empty here, so `set` cannot fail.
+            let _ = self.world_probe.set(probe);
+        }
+        Ok(self.world_probe.get().and_then(Option::as_ref))
+    }
+
     /// The material graph evaluated at `hit`, so vertex colors and textures shade the surface.
     fn graph_shading(
         &self,
@@ -2348,18 +2372,15 @@ fn shade(
     closures: &[ShaderClosure],
     mode: Mode,
     shadow: ShadowContext<'_>,
-    images: &BTreeMap<String, ImageData>,
-) -> Result<[f64; 4]> {
+    world: Option<&WorldProbe>,
+) -> [f64; 4] {
     let opaque = opaque_share(closures);
     if !matches!(mode, Mode::Beauty) {
         let albedo = heaviest(closures, |closure| closure.weight)
             .map_or(DVec3::ZERO, |closure| base_albedo(&closure.params));
-        return Ok([albedo.x, albedo.y, albedo.z, opaque]);
+        return [albedo.x, albedo.y, albedo.z, opaque];
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
-    let world = scene
-        .and_then(|value| value.world.as_ref())
-        .and_then(|id| doc.worlds.get(id));
     // The camera is the view for the lobes and the environment; without one, the normal.
     let view = scene
         .and_then(|scene| scene.camera.as_ref())
@@ -2371,9 +2392,7 @@ fn shade(
         .filter(|direction| direction.length_squared() > f64::EPSILON)
         .unwrap_or(normal);
     // The diffuse environment depends on the normal alone, so every closure shares it.
-    let diffuse_environment = world
-        .map(|world| prefiltered_world(world, &doc.node_groups, images, normal, 1.0))
-        .transpose()?;
+    let diffuse_environment = world.map(|world| prefiltered_world(world, normal, 1.0));
     // A closure's reflective share is its weight times its alpha. The raster composite multiplies a straight colour
     // by the opaque share (`render/raster.rs`, `composite_sample`), so the premultiplied sums are divided by it below.
     let mut reflected = DVec3::ZERO;
@@ -2397,8 +2416,7 @@ fn shade(
             let lower = shading.lower();
             lobes += albedo * diffuse_environment * (1.0 - metallic) * lower;
             let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
-            let specular_environment =
-                prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
+            let specular_environment = prefiltered_world(world, reflection, roughness);
             let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
             let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
             lobes += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
@@ -2447,21 +2465,17 @@ fn shade(
     };
     let reflected = reflected.max(DVec3::ZERO).min(DVec3::splat(1.0));
     let result = reflected + emitted;
-    Ok([result.x, result.y, result.z, opaque])
+    [result.x, result.y, result.z, opaque]
 }
 
-fn prefiltered_world(
-    world: &crate::model::World,
-    groups: &crate::model::Registry<crate::graph::NodeGroup>,
-    images: &BTreeMap<String, ImageData>,
-    axis: DVec3,
-    roughness: f64,
-) -> Result<DVec3> {
+/// The world's filtered radiance along `axis` for `roughness`: five taps spread over a lobe of that roughness, read from
+/// the render's world probe. The taps used to evaluate the World node graph, once per tap per shaded sample.
+fn prefiltered_world(world: &WorldProbe, axis: DVec3, roughness: f64) -> DVec3 {
     const FILTER_OFFSETS: [[f64; 2]; 5] =
         [[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
     let axis = axis.normalize_or_zero();
     if axis == DVec3::ZERO {
-        return Ok(DVec3::ZERO);
+        return DVec3::ZERO;
     }
     let tangent = if axis.z.abs() < 0.999 {
         axis.cross(DVec3::Z).normalize_or_zero()
@@ -2474,9 +2488,9 @@ fn prefiltered_world(
     for offset in FILTER_OFFSETS {
         let direction = (axis + tangent * (spread * offset[0]) + bitangent * (spread * offset[1]))
             .normalize_or_zero();
-        irradiance += crate::shader::evaluate_world(world, groups, images, direction)?;
+        irradiance += world.radiance(direction);
     }
-    Ok(irradiance / 5.0)
+    irradiance / 5.0
 }
 
 #[expect(
