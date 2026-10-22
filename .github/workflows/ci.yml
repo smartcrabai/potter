@@ -56,6 +56,7 @@ jobs:
           key: blender-${{ env.BLENDER_VERSION }}-linux-x64
 
       - name: Install Blender
+        id: install_blender
         shell: bash
         run: |
           sudo apt-get update
@@ -73,7 +74,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install_blender.outcome == 'success' }}
         shell: bash
         env:
           POTTER_REQUIRE_BLENDER: "1"
