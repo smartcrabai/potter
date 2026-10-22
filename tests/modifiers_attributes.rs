@@ -2918,6 +2918,17 @@ fn weighted_normal_mesh(sharp_edge: bool) -> Result<Mesh, Box<dyn Error>> {
         vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 4]],
     )?;
     mesh.faces[2].material_index = 1;
+    // The Blender oracle smooths every face (`polygon.use_smooth = True`); a missing shade_smooth
+    // is flat in Potter (geom/normals.rs `smooth_face_flags`).
+    let smooth = mesh
+        .faces
+        .iter()
+        .map(|face| (format!("f{}", face.id), json!(true)))
+        .collect::<serde_json::Map<_, _>>();
+    mesh.attributes.insert(
+        "shade_smooth".to_owned(),
+        json!({"domain":"face","type":"bool","values":smooth}),
+    );
     if sharp_edge {
         let edge = mesh
             .edges

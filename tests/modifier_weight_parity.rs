@@ -126,6 +126,7 @@ result["edit_mask_invert"] = read_group(edit, "A")
 edit_modifier.mask_vertex_group = "Missing Mask"
 edit_modifier.mask_constant = 0.5
 result["edit_missing_mask"] = read_group(edit, "A")
+edit_modifier.invert_mask_vertex_group = False
 edit_modifier.mask_vertex_group = "Mask"
 edit_modifier.mask_constant = -0.5
 result["edit_mask_negative_constant"] = read_group(edit, "A")
@@ -1572,11 +1573,13 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
         String::from_utf8_lossy(&initialized.stdout)
     );
 
+    // Potter stores image rows top-down, while the Blender oracle lists them bottom-up, so the
+    // same 2x2 image is passed to `image.set_pixels` with its rows swapped.
     let pixels = json!([
-        [0.05, 0.15, 0.8, 0.2],
-        [0.35, 0.6, 0.1, 0.4],
         [0.9, 0.25, 0.45, 0.7],
-        [0.65, 0.85, 0.3, 1.0]
+        [0.65, 0.85, 0.3, 1.0],
+        [0.05, 0.15, 0.8, 0.2],
+        [0.35, 0.6, 0.1, 0.4]
     ]);
     let mut operations = vec![
         json!({"op":"image.create","id":"mask","name":"MaskImage","width":2,"height":2,"colorspace":"linear","fill_color":[0.0,0.0,0.0,1.0]}),

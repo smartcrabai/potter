@@ -588,7 +588,12 @@ fn vertex_mapping_families_match_blender_with_asymmetric_transforms() -> Result<
             &AttributeLayerSelection::default(),
         )?;
         let error = max_error(&json!(group_weights(&actual, "A")), &expected[mapping])?;
-        assert!(error < 2.0e-4, "{mapping} max error {error}");
+        assert!(
+            error < 2.0e-4,
+            "{mapping} max error {error}; actual={}, expected={}",
+            json!(group_weights(&actual, "A")),
+            expected[mapping]
+        );
     }
     let mut no_transform_destination =
         Mesh::from_positions_and_faces(destination_positions.to_vec(), vec![vec![0, 1, 2]])?;
@@ -1544,7 +1549,12 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
             &color_values(&point_actual, name),
             &expected["POINT_COLOR"][name],
         )?;
-        assert!(error < 1.0e-6, "point color layer {name} max error {error}");
+        assert!(
+            error < 1.0e-6,
+            "point color layer {name} max error {error}; actual={}, expected={}",
+            color_values(&point_actual, name),
+            expected["POINT_COLOR"][name]
+        );
     }
     let mut corner_destination = destination.clone();
     set_color_layer(
@@ -2131,7 +2141,8 @@ fn uv_island_selection_and_precision_match_blender() -> Result<(), Box<dyn Error
         let error = max_error(&values, &expected[key])?;
         assert!(
             error < 2.0e-4,
-            "islands_precision={precision} max error {error}"
+            "islands_precision={precision} max error {error}; actual={values}, expected={}",
+            expected[key]
         );
         if precision == 0.0 {
             expected_precision_zero = Some(values);
@@ -3002,6 +3013,7 @@ def make_object(name):
     obj=bpy.data.objects.new(name,mesh); bpy.context.collection.objects.link(obj)
     return obj
 source=make_object('Source'); destination=make_object('Destination')
+destination.data.attributes.new(name='sharp_edge',type='BOOLEAN',domain='EDGE')
 source_sharp=source.data.attributes.get('sharp_edge')
 if source_sharp is None: source_sharp=source.data.attributes.new('sharp_edge','BOOLEAN','EDGE')
 shared=next(edge.index for edge in source.data.edges if set(edge.vertices)=={0,1})
