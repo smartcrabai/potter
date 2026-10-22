@@ -6,11 +6,14 @@ render is repeated for `seeds` seeds at a fixed sample count with adaptive sampl
 off. For each seed the mean RGB of the central patch is recorded, so the test can use Blender's own
 seed-to-seed spread as its tolerance.
 
-Arguments after `--`: blend_out, json_out, scenario, samples, seeds.
+Arguments after `--`: blend_out, json_out, scenario, samples, seeds, frame.
   scenario: which lights and world the scene has. `point`, `rect`, and `sun` are one light and no
             world; `world` is the world alone; `all` has the point, the rectangle, the sun, and the world.
+  frame:    square frame size in pixels (32 for the reference, 16 for the runtime-reduced scene). The
+            camera's focal length scales with 32 / frame, so a 16 px frame covers the central half of
+            the 32 px frame's view with the same pixel grid. The patch is the central 16 × 16 pixels.
 
-The patch grid must match `PATCH` in `tests/native_metal_sphere_lights.rs`.
+The committed reference (`metal_sphere_lights_reference.json`) is the 32 px frame at 1024 samples.
 """
 
 import json
@@ -21,10 +24,11 @@ import sys
 import bpy
 from mathutils import Vector
 
-blend_out, json_out, scenario, samples, seeds = sys.argv[sys.argv.index("--") + 1:][:5]
+blend_out, json_out, scenario, samples, seeds, frame = sys.argv[sys.argv.index("--") + 1:][:6]
 SCENARIO = scenario
 SAMPLES = int(samples)
 SEEDS = int(seeds)
+FRAME = int(frame)
 LIGHTS = {
     "point": ["point"],
     "rect": ["rect"],
@@ -36,11 +40,11 @@ if SCENARIO not in LIGHTS:
     raise SystemExit(f"unknown scenario {SCENARIO}")
 USE_WORLD = SCENARIO in ("world", "all")
 
-WIDTH = 32
-HEIGHT = 32
-# Texel centres of the central 16×16 block, texels 8..23 of 32. The block is symmetric under a row
-# flip, so its mean does not depend on whether the renderer's row 0 is the top or the bottom.
-PATCH = [(index + 0.5) / WIDTH for index in range(8, 24)]
+WIDTH = FRAME
+HEIGHT = FRAME
+# Texel centres of the central 16×16 block. The block is symmetric under a row flip, so its mean does
+# not depend on whether the renderer's row 0 is the top or the bottom.
+PATCH = [(index + 0.5) / WIDTH for index in range(WIDTH // 2 - 8, WIDTH // 2 + 8)]
 
 ROUGHNESS = 0.3
 BASE = (0.9, 0.55, 0.25, 1.0)
@@ -122,6 +126,8 @@ for kind in LIGHTS[SCENARIO]:
         aim(obj, (-1.0, 0.5, 0.0))
 
 camera_data = bpy.data.cameras.new("Camera")
+# The 32 px reference has the default 50 mm lens; a smaller frame zooms by 32 / frame.
+camera_data.lens = 50.0 * 32 / FRAME
 camera = bpy.data.objects.new("Camera", camera_data)
 scene.collection.objects.link(camera)
 camera.location = (0.0, -4.0, 0.0)
