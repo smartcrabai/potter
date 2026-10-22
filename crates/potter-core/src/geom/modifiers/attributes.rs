@@ -129,11 +129,6 @@ pub(crate) fn evaluate_with_texture_context(
     subject_layer_selection: &AttributeLayerSelection,
     rng: &mut crate::blender_rng::BlenderRng,
 ) -> Result<Mesh> {
-    if subject_name.is_empty() {
-        return Err(PotError::invalid_argument(
-            "attribute modifier evaluation requires a subject name",
-        ));
-    }
     if modifier.modifier_type == "data_transfer"
         && (modifier.params.get("object").is_none_or(Value::is_null)
             || operands.get("object").is_some_and(Vec::is_empty))
@@ -145,8 +140,7 @@ pub(crate) fn evaluate_with_texture_context(
     {
         return Ok(mesh.clone());
     }
-    let texture_weights =
-        texture_mask_weights(mesh, modifier, operands, texture, texture_mapping, rng)?;
+    let texture_weights = texture_mask_weights(mesh, modifier, texture, texture_mapping, rng)?;
     match modifier.modifier_type.as_str() {
         "vertex_weight_edit" => {
             vertex_weight_edit(mesh, modifier, texture_weights.as_ref(), subject_name)

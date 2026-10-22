@@ -79,21 +79,15 @@ pub(super) fn data_transfer(
         return Ok(mesh.clone());
     };
     let use_transform = boolean(modifier, "use_object_transform")?;
-    let (source_to_destination_f32, destination_to_source_f32) = if use_transform {
-        let matrices = source
+    // Blender's `local2target` (destination to source) maps points and normals alike.
+    let destination_to_source_f32 = if use_transform {
+        source
             .blender_matrices_f32
             .as_ref()
-            .ok_or_else(|| invalid(modifier, "object", "source Blender f32 transform matrices"))?;
-        let local_to_subject = matrices
-            .local_to_subject
-            .ok_or_else(|| invalid(modifier, "object", "source local-to-subject f32 transform"))?;
-        let subject_to_local = matrices
-            .subject_to_local
-            .ok_or_else(|| invalid(modifier, "object", "source subject-to-local f32 transform"))?;
-        (local_to_subject, subject_to_local)
+            .and_then(|matrices| matrices.subject_to_local)
+            .ok_or_else(|| invalid(modifier, "object", "source subject-to-local f32 transform"))?
     } else {
-        let identity = glam::Mat4::IDENTITY.to_cols_array();
-        (identity, identity)
+        glam::Mat4::IDENTITY.to_cols_array()
     };
     let use_vertices = boolean(modifier, "use_vert_data")?;
     let use_edges = boolean(modifier, "use_edge_data")?;
@@ -175,7 +169,6 @@ pub(super) fn data_transfer(
     let mapping_context = TransferMapContext::new(
         &source.mesh,
         mesh,
-        source_to_destination_f32,
         destination_to_source_f32,
         max_distance,
         ray_radius,
@@ -255,61 +248,36 @@ pub(super) fn data_transfer(
                 "SHARP_EDGE" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
-                    modifier,
                     "sharp",
                     edge_mapping,
-                    factor,
-                    mix_mode,
-                    mask_weights.as_ref(),
-                    invert_mask,
                     &mapping_context,
                 )?,
                 "SEAM" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
-                    modifier,
                     "seam",
                     edge_mapping,
-                    factor,
-                    mix_mode,
-                    mask_weights.as_ref(),
-                    invert_mask,
                     &mapping_context,
                 )?,
                 "CREASE" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
-                    modifier,
                     "crease_edge",
                     edge_mapping,
-                    factor,
-                    mix_mode,
-                    mask_weights.as_ref(),
-                    invert_mask,
                     &mapping_context,
                 )?,
                 "BEVEL_WEIGHT_EDGE" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
-                    modifier,
                     "bevel_weight_edge",
                     edge_mapping,
-                    factor,
-                    mix_mode,
-                    mask_weights.as_ref(),
-                    invert_mask,
                     &mapping_context,
                 )?,
                 "FREESTYLE_EDGE" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
-                    modifier,
                     "freestyle_edge",
                     edge_mapping,
-                    factor,
-                    mix_mode,
-                    mask_weights.as_ref(),
-                    invert_mask,
                     &mapping_context,
                 )?,
                 _ => {
@@ -331,7 +299,6 @@ pub(super) fn data_transfer(
                     modifier,
                     loop_mapping,
                     factor,
-                    mix_mode,
                     mask_weights.as_ref(),
                     invert_mask,
                     &mapping_context,
@@ -378,8 +345,6 @@ pub(super) fn data_transfer(
                     "shade_smooth",
                     "shade_smooth",
                     polygon_mapping,
-                    factor,
-                    mix_mode,
                     &mapping_context,
                 )?,
                 "FREESTYLE_FACE" => transfer_typed_attribute(
@@ -389,8 +354,6 @@ pub(super) fn data_transfer(
                     "freestyle_face",
                     "freestyle_face",
                     polygon_mapping,
-                    factor,
-                    mix_mode,
                     &mapping_context,
                 )?,
                 _ => {
@@ -582,6 +545,11 @@ fn transfer_vertex_groups(
             else {
                 continue;
             };
+            // A source vertex carries the group when it has an entry, whatever its weight (deform.cc:1229).
+            let has_source = mapped.0.iter().any(|(source_index, _)| {
+                let source_id = source.vertices[*source_index].id;
+                source_weights.contains_key(&format!("v{source_id}"))
+            });
             let source_value = mapped
                 .0
                 .iter()
@@ -595,10 +563,13 @@ fn transfer_vertex_groups(
                 })
                 .sum::<f64>();
             let key = format!("v{}", vertex.id);
-            let prior = destination_weights
-                .get(&key)
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
+            let existing = destination_weights.get(&key).and_then(Value::as_f64);
+            // Blender creates a membership only when a source has the group (deform.cc:1249-1258), and
+            // ABOVE_THRESHOLD leaves a destination vertex without the group alone (deform.cc:1241-1243).
+            if existing.is_none() && (!has_source || mix_mode == "ABOVE_THRESHOLD") {
+                continue;
+            }
+            let prior = existing.unwrap_or(0.0);
             let mut mask = mask_weights.map_or(1.0, |weights| {
                 weights.get(&vertex.id).copied().unwrap_or(0.0)
             });
@@ -665,25 +636,9 @@ fn transfer_vertex_attribute(
             let Some(source_value) = weighted_vertex_value(source, source_values, &mapped) else {
                 continue;
             };
-            let key = format!("v{}", vertex.id);
-            if name == "bevel_weight_vert"
-                && let Some(source_value) = source_value.as_f64()
-            {
-                let prior = output.get(&key).and_then(Value::as_f64).unwrap_or(0.0);
-                let mask = transfer_mask_weight(mask_weights, vertex.id, invert_mask);
-                output.insert(
-                    key,
-                    json!(blend_attribute(
-                        prior,
-                        source_value,
-                        factor * mask,
-                        mix_mode,
-                        modifier
-                    )?),
-                );
-            } else {
-                output.insert(key, source_value);
-            }
+            // CD_PROP_FLOAT has no `copyvalue`, so Blender's mix copies the interpolated source value
+            // (`CustomData_data_mix_value`, customdata.cc:3914-3919): mix mode, factor and mask do not apply.
+            output.insert(format!("v{}", vertex.id), source_value);
         }
         if let Some(source_fields) = source_attribute.as_object()
             && source_fields.contains_key("values")
@@ -752,22 +707,7 @@ fn transfer_vertex_attribute(
             })
             .collect::<Vec<_>>();
         if let Some(value) = weighted_values(&samples) {
-            if name == "bevel_weight_vert"
-                && let Some(source_value) = value.as_f64()
-            {
-                let prior = output.get(index).and_then(Value::as_f64).unwrap_or(0.0);
-                let mask =
-                    transfer_mask_weight(mask_weights, destination.vertices[index].id, invert_mask);
-                output[index] = json!(blend_attribute(
-                    prior,
-                    source_value,
-                    factor * mask,
-                    mix_mode,
-                    modifier,
-                )?);
-            } else {
-                output[index] = value;
-            }
+            output[index] = value;
         }
     }
     if let Some(layers) = destination
@@ -784,13 +724,8 @@ fn transfer_vertex_attribute(
 fn transfer_edge_attribute(
     destination: &mut Mesh,
     source: &Mesh,
-    modifier: &Modifier,
     name: &str,
     mapping: &str,
-    factor: f64,
-    mix_mode: &str,
-    mask_weights: Option<&BTreeMap<u32, f64>>,
-    invert_mask: bool,
     mapping_context: &TransferMapContext<'_>,
 ) -> Result<()> {
     let intrinsic_flag = matches!(name, "sharp" | "seam");
@@ -879,21 +814,9 @@ fn transfer_edge_attribute(
         if !has_source {
             continue;
         }
+        // A float layer without `copyvalue` takes the interpolated source as-is (see the vertex path).
         let value = if float_attribute {
-            let prior = array_output
-                .as_ref()
-                .and_then(|values| values.get(destination_index))
-                .and_then(Value::as_f64)
-                .or_else(|| output.get(&key).and_then(Value::as_f64))
-                .unwrap_or(0.0);
-            let mask = transfer_edge_mask_weight(edge, mask_weights, invert_mask);
-            json!(blend_attribute(
-                prior,
-                scalar_source,
-                factor * mask,
-                mix_mode,
-                modifier
-            )?)
+            json!(scalar_source)
         } else {
             Value::Bool(bool_source)
         };
@@ -928,27 +851,12 @@ fn transfer_edge_attribute(
     Ok(())
 }
 
-fn transfer_edge_mask_weight(
-    edge: &Edge,
-    mask_weights: Option<&BTreeMap<u32, f64>>,
-    invert: bool,
-) -> f64 {
-    let Some(weights) = mask_weights else {
-        return 1.0;
-    };
-    let [first, second] = edge.vertices;
-    let weight = halved(
-        weights.get(&first).copied().unwrap_or(0.0) + weights.get(&second).copied().unwrap_or(0.0),
-    );
-    if invert { 1.0 - weight } else { weight }
-}
 fn transfer_uv(
     destination: &mut Mesh,
     source: &Mesh,
     modifier: &Modifier,
     mapping: &str,
     factor: f64,
-    _mix_mode: &str,
     mask_weights: Option<&BTreeMap<u32, f64>>,
     invert_mask: bool,
     mapping_context: &TransferMapContext<'_>,
@@ -1153,11 +1061,10 @@ fn transfer_typed_attribute(
     source_name: &str,
     destination_name: &str,
     mapping: &str,
-    _factor: f64,
-    _mix_mode: &str,
     mapping_context: &TransferMapContext<'_>,
 ) -> Result<()> {
-    let domain = if source_name == "shade_smooth" {
+    let is_smooth = source_name == "shade_smooth";
+    let domain = if is_smooth {
         "face"
     } else {
         source
@@ -1184,9 +1091,9 @@ fn transfer_typed_attribute(
                     && attribute.get("domain").and_then(Value::as_str) == Some("FACE")
             })
         });
-    let destination_exists = destination_name == "shade_smooth"
-        || destination.attributes.contains_key(destination_name)
-        || blender_index.is_some();
+    // The modifier never creates a layer (`use_create = false`): a destination without the layer is left alone.
+    let destination_exists =
+        destination.attributes.contains_key(destination_name) || blender_index.is_some();
     if !destination_exists {
         return Ok(());
     }
@@ -1217,14 +1124,24 @@ fn transfer_typed_attribute(
             .iter()
             .filter_map(|(source_index, weight)| {
                 let source_face = source.faces.get(*source_index)?;
-                Some((
-                    source_face_value(source, source_name, *source_index, source_face.id)?,
-                    *weight,
-                ))
+                let value = source_face_value(source, source_name, *source_index, source_face.id)?;
+                // Blender transfers the `sharp_face` flag with an OR (customdata.cc layerInterp_propbool), so
+                // SMOOTH transfers the inverse of the smooth flag.
+                let value = if is_smooth {
+                    Value::Bool(!value.as_bool()?)
+                } else {
+                    value
+                };
+                Some((value, *weight))
             })
             .collect::<Vec<_>>();
         let Some(value) = weighted_values(&samples) else {
             continue;
+        };
+        let value = if is_smooth {
+            Value::Bool(!value.as_bool().unwrap_or(false))
+        } else {
+            value
         };
         output.insert(format!("f{}", face.id), value.clone());
         if let Some(array) = array_output.as_mut()
@@ -1233,7 +1150,7 @@ fn transfer_typed_attribute(
             *slot = value;
         }
     }
-    if source_name == "shade_smooth" {
+    if is_smooth {
         destination.attributes.insert(
             "shade_smooth".to_owned(),
             json!({"domain":"face","type":"bool","values":output}),
@@ -1439,7 +1356,6 @@ struct EdgeProjectionWorkspace {
 }
 struct TransferMapContext<'a> {
     source: &'a Mesh,
-    source_to_destination_f32: [f32; 16],
     destination_to_source_f32: [f32; 16],
     source_positions: Vec<DVec3>,
     source_vertex_indices: BTreeMap<u32, usize>,
@@ -1472,7 +1388,6 @@ impl<'a> TransferMapContext<'a> {
     fn new(
         source: &'a Mesh,
         destination: &Mesh,
-        source_to_destination_f32: [f32; 16],
         destination_to_source_f32: [f32; 16],
         max_distance: f64,
         ray_radius: f64,
@@ -1593,7 +1508,6 @@ impl<'a> TransferMapContext<'a> {
         };
         Ok(Self {
             source,
-            source_to_destination_f32,
             destination_to_source_f32,
             source_positions,
             source_vertex_indices,
@@ -1616,7 +1530,8 @@ impl<'a> TransferMapContext<'a> {
             destination_layer_selection,
             selected_bones,
             deforming_bones,
-            poly_rng: RefCell::new(BlenderRng::seed_random(0)),
+            // mesh_remap.cc:2080 `BLI_rng_new(0)`: direct seeding, not the hashed `seed_random`.
+            poly_rng: RefCell::new(BlenderRng::seed(0)),
             poly_face_map_cache: RefCell::new(BTreeMap::new()),
             poly_projection: RefCell::new(PolyProjectionWorkspace::default()),
             edge_projection: RefCell::new(EdgeProjectionWorkspace::default()),
@@ -1631,12 +1546,14 @@ impl<'a> TransferMapContext<'a> {
         .as_dvec3()
     }
 
+    /// Blender's `local2target` (destination to source) carries normals too (`BLI_space_transform_apply_normal`,
+    /// `MOD_datatransfer.cc` setup `BLI_SPACE_TRANSFORM_SETUP(space_transform, ctx->object, ob_source)`).
     fn normal_to_source(&self, normal: DVec3) -> DVec3 {
-        Self::blender_apply_normal_f32(&self.source_to_destination_f32, normal)
+        Self::blender_apply_normal_f32(&self.destination_to_source_f32, normal)
     }
 
     fn normal_to_destination(&self, normal: DVec3) -> DVec3 {
-        Self::blender_invert_normal_f32(&self.source_to_destination_f32, normal)
+        Self::blender_invert_normal_f32(&self.destination_to_source_f32, normal)
     }
 
     fn source_corner_normal(&self, face_index: usize, corner: usize) -> Option<DVec3> {
@@ -2171,17 +2088,22 @@ fn mapped_edge_sources(
             nearest_edge(context, midpoint).map(|(index, _, _)| MappedSources(vec![(index, 1.0)]))
         }
         "VERT_NEAREST" => {
-            let source_vertex = [
-                nearest_vertex(context, first)?,
-                nearest_vertex(context, second)?,
+            // mesh_remap.cc:739-745: an end without a source vertex scores FLT_MAX, so only the other end's
+            // source edges can win, and the edge still maps from that end.
+            let nearest = [
+                nearest_vertex(context, first)
+                    .map(|index| (index, context.source_positions[index].distance(first))),
+                nearest_vertex(context, second)
+                    .map(|index| (index, context.source_positions[index].distance(second))),
             ];
-            let first_distance = context.source_positions[source_vertex[0]].distance(first);
-            let second_distance = context.source_positions[source_vertex[1]].distance(second);
             let mut best: Option<(usize, f64)> = None;
-            for (source_index, hit_distance, other_destination) in [
-                (source_vertex[0], first_distance, second_destination),
-                (source_vertex[1], second_distance, first_destination),
+            for (end, other_destination) in [
+                (nearest[0], second_destination),
+                (nearest[1], first_destination),
             ] {
+                let Some((source_index, hit_distance)) = end else {
+                    continue;
+                };
                 for &edge_index in &context.source_vertex_edges[source_index] {
                     let Some(candidate) = context.source.edges.get(edge_index) else {
                         continue;
@@ -2240,6 +2162,26 @@ fn mapped_edge_sources(
     }
 }
 
+/// The destination normal a loop mapping compares against. NEAREST_POLYNOR always uses the face normal
+/// (mesh_remap.cc:1454, :1502); the other mappings use the corner normal when the mesh has one.
+fn loop_destination_normal(
+    context: &TransferMapContext<'_>,
+    destination: &Mesh,
+    face: &Face,
+    face_index: usize,
+    corner: usize,
+    mapping: &str,
+) -> DVec3 {
+    let face_normal =
+        destination_face_normal(destination, face, &context.destination_vertex_indices);
+    if mapping == "NEAREST_POLYNOR" {
+        return face_normal;
+    }
+    context
+        .destination_corner_normal(face_index, corner)
+        .unwrap_or(face_normal)
+}
+
 fn mapped_loop_sources(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
@@ -2276,11 +2218,14 @@ fn mapped_loop_sources(
     let vertex_index = *context.destination_vertex_indices.get(&vertex_id)?;
     let vertex = destination.vertices.get(vertex_index)?;
     let point = context.point_to_source(vertex.co);
-    let destination_normal = context
-        .destination_corner_normal(destination_face_index, destination_corner)
-        .unwrap_or_else(|| {
-            destination_face_normal(destination, face, &context.destination_vertex_indices)
-        });
+    let destination_normal = loop_destination_normal(
+        context,
+        destination,
+        face,
+        destination_face_index,
+        destination_corner,
+        mapping,
+    );
     if matches!(mapping, "NEAREST_NORMAL" | "NEAREST_POLYNOR") {
         let nearest = nearest_vertex(context, point)?;
         let use_loop_normal = mapping == "NEAREST_NORMAL";
@@ -2511,15 +2456,14 @@ fn loop_candidate_for_island(
     let vertex_index = *context.destination_vertex_indices.get(&vertex_id)?;
     let destination_vertex = destination.vertices.get(vertex_index)?;
     let point = context.point_to_source(destination_vertex.co);
-    let destination_normal = context
-        .destination_corner_normal(destination_face_index, destination_corner)
-        .unwrap_or_else(|| {
-            destination_face_normal(
-                destination,
-                destination_face,
-                &context.destination_vertex_indices,
-            )
-        });
+    let destination_normal = loop_destination_normal(
+        context,
+        destination,
+        destination_face,
+        destination_face_index,
+        destination_corner,
+        mapping,
+    );
     if matches!(mapping, "NEAREST_NORMAL" | "NEAREST_POLYNOR") {
         let island = graph.islands.get(island_index)?;
         let nearest_vertex = island
@@ -3799,70 +3743,25 @@ fn face_normal_at(
     })
 }
 
+/// The destination vertex normals, as Blender's `normals_calc_verts` (`geom::normals::vertex_normals`).
 fn vertex_normals(mesh: &Mesh, vertex_indices: &BTreeMap<u32, usize>) -> Vec<DVec3> {
-    let mut incident = vec![Vec::<(usize, usize)>::new(); mesh.vertices.len()];
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        for (corner, vertex_id) in face.vertices.iter().enumerate() {
-            let Some(&vertex_index) = vertex_indices.get(vertex_id) else {
-                continue;
-            };
-            if incident[vertex_index]
-                .last()
-                .is_none_or(|(prior_face, _)| *prior_face != face_index)
-            {
-                incident[vertex_index].push((face_index, corner));
-            }
-        }
-    }
-    let face_normals = mesh
+    let points = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect::<Vec<_>>();
+    let faces = mesh
         .faces
         .iter()
-        .map(|face| destination_face_normal(mesh, face, vertex_indices).as_vec3())
+        .map(|face| {
+            face.vertices
+                .iter()
+                .filter_map(|id| vertex_indices.get(id).copied())
+                .collect::<Vec<usize>>()
+        })
         .collect::<Vec<_>>();
-    let mut normals = vec![glam::Vec3::ZERO; mesh.vertices.len()];
-    for (vertex_index, vertex) in mesh.vertices.iter().enumerate() {
-        let position = vertex.co.as_vec3();
-        if incident[vertex_index].is_empty() {
-            normals[vertex_index] = position.normalize_or_zero();
-            continue;
-        }
-        let mut normal = glam::Vec3::ZERO;
-        for &(face_index, corner) in &incident[vertex_index] {
-            let face = &mesh.faces[face_index];
-            let count = face.vertices.len();
-            let previous_id = face.vertices[(corner + count - 1) % count];
-            let next_id = face.vertices[(corner + 1) % count];
-            let Some(previous_index) = vertex_indices.get(&previous_id).copied() else {
-                continue;
-            };
-            let Some(next_index) = vertex_indices.get(&next_id).copied() else {
-                continue;
-            };
-            let Some(previous) = mesh
-                .vertices
-                .get(previous_index)
-                .map(|vertex| vertex.co.as_vec3())
-            else {
-                continue;
-            };
-            let Some(next) = mesh
-                .vertices
-                .get(next_index)
-                .map(|vertex| vertex.co.as_vec3())
-            else {
-                continue;
-            };
-            let direction_previous = (previous - position).normalize_or_zero();
-            let direction_next = (next - position).normalize_or_zero();
-            let angle = direction_previous
-                .dot(direction_next)
-                .clamp(-1.0, 1.0)
-                .acos();
-            normal += face_normals[face_index] * angle;
-        }
-        normals[vertex_index] = normal.normalize_or_zero();
-    }
-    normals.into_iter().map(glam::Vec3::as_dvec3).collect()
+    let face_slices = faces.iter().map(Vec::as_slice).collect::<Vec<&[usize]>>();
+    crate::geom::normals::vertex_normals(&points, &face_slices)
 }
 
 fn face_loop_starts(mesh: &Mesh) -> Vec<usize> {
@@ -3964,10 +3863,10 @@ fn weighted_values(samples: &[(Value, f64)]) -> Option<Value> {
 
 fn source_edge_value(source: &Mesh, name: &str, index: usize, edge_id: u32) -> Option<Value> {
     if matches!(name, "sharp" | "seam") {
-        let value = source
-            .attributes
-            .get(name)
-            .and_then(|attribute| attribute.get("values"))
+        // A source without the layer has no value to transfer, so the destination keeps its flags (data_transfer.cc:958-986).
+        let attribute = source.attributes.get(name)?;
+        let value = attribute
+            .get("values")
             .and_then(Value::as_object)
             .and_then(|values| values.get(&format!("e{edge_id}")))
             .and_then(Value::as_bool)
@@ -4416,34 +4315,7 @@ fn blend_normal(first: DVec3, second: DVec3, factor: f64, mode: &str) -> DVec3 {
         _ => second,
     }
     .normalize_or_zero();
-    slerp_normal(first.normalize_or_zero(), target, factor.clamp(0.0, 1.0))
-}
-
-fn slerp_normal(first: DVec3, second: DVec3, factor: f64) -> DVec3 {
-    let dot = first.dot(second).clamp(-1.0, 1.0);
-    if dot < -1.0 + f64::from(f32::EPSILON) {
-        let absolute = first.abs();
-        let orthogonal = if absolute.x > absolute.y && absolute.x > absolute.z {
-            DVec3::new(-first.y - first.z, first.x, first.x)
-        } else if absolute.y > absolute.z {
-            DVec3::new(first.y, -first.x - first.z, first.y)
-        } else {
-            DVec3::new(first.z, first.z, -first.x - first.y)
-        }
-        .normalize_or_zero();
-        return if factor < 0.5 {
-            slerp_normal(first, orthogonal, factor * 2.0)
-        } else {
-            slerp_normal(orthogonal, second, (factor - 0.5) * 2.0)
-        };
-    }
-    let angle = dot.acos();
-    if !angle.is_finite() || angle.abs() < 1.0e-8 {
-        return first.lerp(second, factor).normalize_or_zero();
-    }
-    let sin_angle = angle.sin();
-    (first * (((1.0 - factor) * angle).sin() / sin_angle)
-        + second * ((factor * angle).sin() / sin_angle))
+    super::normals::slerp_safe(first.normalize_or_zero(), target, factor.clamp(0.0, 1.0))
         .normalize_or_zero()
 }
 

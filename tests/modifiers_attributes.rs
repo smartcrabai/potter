@@ -12,7 +12,7 @@ use potter_core::{
             evaluate_modifiers,
         },
     },
-    image::{ImageData, ImageInterpolation},
+    image::{ImageData, ImageInterpolation, Precision},
     model::{CameraData, Modifier, SceneDoc, TextureCoordinateMapping},
 };
 use serde_json::{Value, json};
@@ -250,7 +250,8 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<dyn Error>> {
+fn uv_warp_on_mesh_without_uv_layers_returns_mesh_unchanged() -> Result<(), Box<dyn Error>> {
+    // MOD_uvwarp.cc:140-142 returns the mesh when it has no UV maps; UV Warp creates no layer.
     let mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     let result = evaluate_modifiers(
@@ -261,16 +262,9 @@ fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<
         )?],
         "AttributeTest",
     )?;
-    assert_eq!(result.attributes["uv_layers"]["active"], json!("UVMap"));
-    assert_eq!(result.attributes["uv_layers"]["render"], json!("UVMap"));
-    assert_eq!(
-        result.attributes["uv_layers"]["layers"][0]["name"],
-        json!("UVMap")
-    );
-    assert_eq!(
-        result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
-        json!([[0.25, 0.5], [0.25, 0.5], [0.25, 0.5]])
-    );
+    assert!(result.attributes.get("uv_layers").is_none());
+    assert_eq!(result.vertices.len(), mesh.vertices.len());
+    assert_eq!(result.faces.len(), mesh.faces.len());
     Ok(())
 }
 
@@ -3459,6 +3453,110 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
             (weight - expected).abs() < 1.0e-6,
             "mask weight {weight} differs from Blender {expected}"
         );
+    }
+    Ok(())
+}
+
+/// The 2x2 8-bit sRGB straight-alpha PNG the Blender probe `tests/fixtures/attribute_mask/byte_png_mask_probe.py`
+/// builds, as Potter's loaded image: linear colour (`srgb: true`) and straight alpha, rows top-down.
+fn byte_png_mask_image() -> ImageData {
+    ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage {
+            precision: Precision::Byte,
+            straight_alpha: true,
+            ..potter_core::image::ImageStorage::default()
+        },
+        width: 2,
+        height: 2,
+        pixels: vec![
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.215_860_500_113_899_26, 0.0, 0.250_980_392_156_862_74],
+            [
+                0.215_860_500_113_899_26,
+                0.051_269_458_370_440_1,
+                0.014_443_843_596_092_545,
+                0.501_960_784_313_725_5,
+            ],
+            [
+                0.577_580_440_429_650_6,
+                0.577_580_440_429_650_6,
+                0.577_580_440_429_650_6,
+                1.0,
+            ],
+        ],
+        tiles: BTreeMap::new(),
+        interpolation: ImageInterpolation::Closest,
+        srgb: true,
+        udim: false,
+    }
+}
+
+#[test]
+fn vertex_weight_edit_byte_png_mask_matches_blender_channels() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe (`byte_png_mask_probe.expected.json`): an 8-bit straight-alpha PNG texel is
+    // premultiplied on read and divided by alpha after filtering (texture_image.cc:78-81, :276-281). The RED
+    // channel of an sRGB image is read in linear light (MOD_weightvg_util.cc:164, texture_procedural.cc);
+    // INT reads the stored values.
+    let expected: Value = serde_json::from_str(include_str!(
+        "fixtures/attribute_mask/byte_png_mask_probe.expected.json"
+    ))?;
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        named_uv_layers(
+            "UVMap",
+            [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]],
+        ),
+    );
+    mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({"A": {"v0": 0.5, "v1": 0.5, "v2": 0.5, "v3": 0.5}}),
+    );
+    for channel in ["INT", "RED"] {
+        let edit = modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A",
+                "falloff_type":"SHARP",
+                "normalize":false,
+                "mask_texture":"image_mask",
+                "mask_tex_use_channel":channel,
+                "mask_tex_mapping":"UV",
+                "mask_tex_uv_layer":"UVMap"
+            }),
+        )?;
+        let texture = ResolvedTexture::from_image(byte_png_mask_image());
+        let result = evaluate_with_context(
+            &mesh,
+            &edit,
+            &BTreeMap::new(),
+            Some(&texture),
+            Some(&TextureCoordinateMapping {
+                subject_to_world_f32: DMat4::IDENTITY.to_cols_array().map(|value| value as f32),
+                world_to_mapping_f32: None,
+            }),
+            DMat4::IDENTITY,
+            "TestObject",
+            &AttributeLayerSelection::default(),
+        )?;
+        let weights = vertex_weights(&result, "A")?;
+        let expected_weights = expected[channel]
+            .as_array()
+            .ok_or("Blender probe weights are missing")?;
+        assert_eq!(weights.len(), expected_weights.len());
+        for (weight, expected) in weights.iter().zip(expected_weights) {
+            let expected = expected
+                .as_f64()
+                .ok_or("Blender probe weight is not a number")?;
+            assert!(
+                (weight - expected).abs() < 1.0e-4,
+                "{channel} byte PNG mask weight {weight} differs from Blender {expected}"
+            );
+        }
     }
     Ok(())
 }

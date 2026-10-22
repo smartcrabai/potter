@@ -526,23 +526,15 @@ pub(super) fn uv_warp(
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
 ) -> Result<Mesh> {
-    let mut store = crate::geom::uv_layers::read(mesh);
+    let store = crate::geom::uv_layers::read(mesh);
     let requested_layer = string(modifier, "uv_layer")?;
     // MOD_uvwarp.cc:190-193: a named layer the mesh lacks falls back to the active layer.
     let named_index = (!requested_layer.is_empty())
         .then(|| store.index_of(requested_layer))
         .flatten();
-    let layer_index = if let Some(index) = named_index.or_else(|| active_uv_layer_index(&store)) {
-        index
-    } else {
-        // Blender creates `UVMap`, which is both active and render, on a mesh without layers.
-        store.layers.push(crate::geom::uv_layers::UvLayer::new(
-            "UVMap",
-            vec![None; mesh.faces.len()],
-        ));
-        store.active = Some("UVMap".to_owned());
-        store.render = Some("UVMap".to_owned());
-        0
+    // MOD_uvwarp.cc:140-142: a mesh without UV maps is returned unchanged, and no layer is created.
+    let Some(layer_index) = named_index.or_else(|| active_uv_layer_index(&store)) else {
+        return Ok(mesh.clone());
     };
     let matrix = if let Some(columns) = modifier.runtime.uv_warp_matrix {
         flatten_runtime_matrix(columns)

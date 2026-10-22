@@ -3171,3 +3171,136 @@ fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<d
     );
     Ok(())
 }
+
+#[test]
+fn rotated_source_normal_projection_matches_blender() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe (`tests/fixtures/data_transfer/rotated_normal_probe.py`): the destination normal is +X,
+    // so the projection ray is cast along the source-space direction that `local2target` (destination to source)
+    // gives. A source rotated +30 and -30 degrees about Z then projects to different weights; the probe records both.
+    let expected: Value = serde_json::from_str(include_str!(
+        "fixtures/data_transfer/rotated_normal_probe.expected.json"
+    ))?;
+    let plus: Vec<f64> = serde_json::from_value(expected["plus_30"].clone())?;
+    let minus: Vec<f64> = serde_json::from_value(expected["minus_30"].clone())?;
+    assert_eq!(plus.len(), 3);
+    assert!(
+        plus.iter()
+            .zip(&minus)
+            .any(|(first, second)| (first - second).abs() > 1.0e-3),
+        "the probe's two rotations must give different weights to be a discriminating oracle"
+    );
+    let mut source = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(0.0, -1.0, -1.0),
+            DVec3::new(0.0, 1.0, -1.0),
+            DVec3::new(0.0, 1.0, 1.0),
+            DVec3::new(0.0, -1.0, 1.0),
+        ],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    set_group(&mut source, "A", &[0.0, 1.0, 1.0, 0.0]);
+    let source_world =
+        DMat4::from_translation(DVec3::X) * DMat4::from_rotation_z(30.0_f64.to_radians());
+    let mut source_operand = operand(source, DMat4::IDENTITY, &["A"], Some(0));
+    source_operand.blender_matrices_f32 = Some(SceneOperandMatricesF32 {
+        world: None,
+        local_to_subject: Some(source_world.to_cols_array().map(|value| value as f32)),
+        subject_to_local: Some(
+            source_world
+                .inverse()
+                .to_cols_array()
+                .map(|value| value as f32),
+        ),
+    });
+    let mut source_operands = BTreeMap::new();
+    source_operands.insert("object".to_owned(), vec![source_operand]);
+    let mut destination = Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(0.0, 0.05, 0.05),
+            DVec3::new(0.0, 0.3, 0.05),
+            DVec3::new(0.0, 0.05, 0.25),
+        ],
+        vec![vec![0, 1, 2]],
+    )?;
+    set_group(&mut destination, "A", &[0.2, 0.3, 0.4]);
+    let transfer = modifier(
+        "data_transfer",
+        &json!({
+            "object":"source","use_object_transform":true,"use_vert_data":true,
+            "data_types_verts":["VGROUP_WEIGHTS"],"vert_mapping":"POLYINTERP_VNORPROJ",
+            "mix_mode":"REPLACE","mix_factor":1.0,"use_max_distance":true,
+            "max_distance":10.0,"ray_radius":0.01
+        }),
+    )?;
+    let actual = evaluate_with_context(
+        &destination,
+        &transfer,
+        &source_operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    for (weight, expected) in group_weights(&actual, "A").iter().zip(&plus) {
+        assert!(
+            (weight - expected).abs() < 1.0e-4,
+            "rotated source weight {weight} differs from Blender {expected}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn bevel_weight_vertex_transfer_takes_the_source_value_whatever_the_mix_factor()
+-> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe (`tests/fixtures/data_transfer/bevel_weight_mix_probe.py`): a float layer without copyvalue
+    // is replaced by the interpolated source, so mix_factor 0.5 still gives 1.0 (customdata.cc, mix_value).
+    let expected: Value = serde_json::from_str(include_str!(
+        "fixtures/data_transfer/bevel_weight_mix_probe.expected.json"
+    ))?;
+    let expected_values: Vec<f64> = serde_json::from_value(expected["bevel_weight_vert"].clone())?;
+    let positions = vec![DVec3::ZERO, DVec3::X, DVec3::Y];
+    let weighted = |value: f64| json!({"domain":"point","type":"float","values":{"v0":value,"v1":value,"v2":value}});
+    let mut source = Mesh::from_positions_and_faces(positions.clone(), vec![vec![0, 1, 2]])?;
+    source
+        .attributes
+        .insert("bevel_weight_vert".to_owned(), weighted(1.0));
+    let mut destination = Mesh::from_positions_and_faces(positions, vec![vec![0, 1, 2]])?;
+    destination
+        .attributes
+        .insert("bevel_weight_vert".to_owned(), weighted(0.0));
+    let source_operands = BTreeMap::from([(
+        "object".to_owned(),
+        vec![operand(source, DMat4::IDENTITY, &[], None)],
+    )]);
+    let transfer = modifier(
+        "data_transfer",
+        &json!({
+            "object":"source","use_object_transform":true,"use_vert_data":true,
+            "data_types_verts":["BEVEL_WEIGHT_VERT"],"vert_mapping":"NEAREST",
+            "mix_mode":"REPLACE","mix_factor":0.5
+        }),
+    )?;
+    let actual = evaluate_with_context(
+        &destination,
+        &transfer,
+        &source_operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "destination",
+        &AttributeLayerSelection::default(),
+    )?;
+    let values = &actual.attributes["bevel_weight_vert"]["values"];
+    for (index, expected) in expected_values.iter().enumerate() {
+        let actual = values[format!("v{index}")]
+            .as_f64()
+            .ok_or("bevel weight missing")?;
+        assert!(
+            (actual - expected).abs() < 1.0e-6,
+            "bevel weight v{index} {actual} differs from Blender {expected}"
+        );
+    }
+    Ok(())
+}

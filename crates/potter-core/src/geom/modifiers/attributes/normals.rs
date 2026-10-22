@@ -249,7 +249,7 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
             normal: Vec3::ZERO,
             current_value: 0.0,
             loops_num: 0,
-            current_strength: 0,
+            current_strength: FACE_STRENGTH_WEAK,
         });
         if face_influence && strength < item.current_strength {
             continue;
@@ -350,6 +350,10 @@ struct WeightedModePair {
     value: f32,
     index: usize,
 }
+
+/// Blender's `FACE_STRENGTH_WEAK` (`bmesh_operators.hh`): every weighted-normal item starts here, so a face with
+/// the WEAK strength still contributes (`MOD_weighted_normal.cc:227`, `:232`).
+const FACE_STRENGTH_WEAK: i32 = -16384;
 
 struct WeightedItem {
     normal: Vec3,
@@ -812,7 +816,7 @@ fn radial_normal(position: DVec3, target_origin: DVec3, size: DVec3) -> DVec3 {
     DVec3::new(x / a2, y / b2, z / c2).normalize_or_zero()
 }
 
-fn slerp_safe(from: DVec3, to: DVec3, factor: f64) -> DVec3 {
+pub(super) fn slerp_safe(from: DVec3, to: DVec3, factor: f64) -> DVec3 {
     let cosine = from.dot(to).clamp(-1.0, 1.0);
     if cosine < -1.0 + f32::EPSILON as f64 {
         let axis = from.abs().max_element();

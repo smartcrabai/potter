@@ -12,20 +12,10 @@ use crate::blender_rng::BlenderRng;
 pub(super) fn texture_mask_weights(
     mesh: &Mesh,
     modifier: &Modifier,
-    operands: &BTreeMap<String, Vec<SceneOperand>>,
     texture: Option<&crate::geom::ResolvedTexture>,
     texture_mapping: Option<&crate::model::TextureCoordinateMapping>,
     rng: &mut crate::blender_rng::BlenderRng,
 ) -> Result<Option<BTreeMap<u32, f64>>> {
-    if modifier.modifier_type == "vertex_weight_proximity"
-        && (optional_string(modifier, "target")?.is_none()
-            || operands
-                .get("target")
-                .and_then(|objects| objects.first())
-                .is_none())
-    {
-        return Ok(None);
-    }
     let Some(texture_id) = modifier.params.get("mask_texture") else {
         return Ok(None);
     };
@@ -75,10 +65,15 @@ pub(super) fn texture_mask_weights(
                     0.0
                 }
             }
-            _ => texture_channel(
-                [sample.rgb[0], sample.rgb[1], sample.rgb[2], sample.alpha],
-                channel,
-            ),
+            // Blender's `do_color_manage` is set for every non-INT channel (MOD_weightvg_util.cc:164).
+            _ => {
+                let rgb = if texture.linearises_rgb() {
+                    sample.rgb.map(crate::color::srgb_to_linear)
+                } else {
+                    sample.rgb
+                };
+                texture_channel([rgb[0], rgb[1], rgb[2], sample.alpha], channel)
+            }
         };
         weights.insert(vertex.id, value);
     }
@@ -96,21 +91,22 @@ fn texture_coordinates(
     uv_layer: &str,
     texture_mapping: Option<&crate::model::TextureCoordinateMapping>,
 ) -> Result<Vec<DVec3>> {
-    if mapping == "UV" {
-        let uv_coordinates = vertex_uv_coordinates(mesh, modifier, uv_layer)?;
+    if mapping == "UV"
+        && let Some(uv_coordinates) = vertex_uv_coordinates(mesh, modifier, uv_layer)?
+    {
+        // MOD_util.cc:125-130: a loose vertex, which no face gives a UV, keeps the zeroed coordinate.
         return Ok(mesh
             .vertices
             .iter()
             .map(|vertex| {
-                uv_coordinates
-                    .get(&vertex.id)
-                    .copied()
-                    .map_or(vertex.co, |uv| {
-                        DVec3::new(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.0)
-                    })
+                uv_coordinates.get(&vertex.id).map_or(DVec3::ZERO, |uv| {
+                    DVec3::new(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.0)
+                })
             })
             .collect());
     }
+    // MOD_util.cc:120-121: a mesh without UV maps samples LOCAL coordinates.
+    let mapping = if mapping == "UV" { "LOCAL" } else { mapping };
     let texture_mapping = texture_mapping.ok_or_else(|| {
         invalid(
             modifier,
@@ -132,15 +128,16 @@ fn texture_coordinates(
         .collect())
 }
 
+/// The UV of each vertex from the first face that uses it (MOD_util.cc), or `None` for a mesh without UV maps.
 fn vertex_uv_coordinates(
     mesh: &Mesh,
     modifier: &Modifier,
     requested_layer: &str,
-) -> Result<BTreeMap<u32, DVec2>> {
+) -> Result<Option<BTreeMap<u32, DVec2>>> {
     let store = crate::geom::uv_layers::read(mesh);
     let layers = store.layers;
     if layers.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(None);
     }
     let active_layer = store
         .active
@@ -153,24 +150,24 @@ fn vertex_uv_coordinates(
         active_layer
     };
     let Some(layer) = layers.iter().find(|layer| layer.name == layer_name) else {
-        return Ok(BTreeMap::new());
+        return Ok(None);
     };
-    let mut coordinates = mesh
+    let vertex_ids = mesh
         .vertices
         .iter()
-        .map(|vertex| (vertex.id, DVec2::ZERO))
-        .collect::<BTreeMap<_, _>>();
-    let mut assigned = std::collections::BTreeSet::new();
+        .map(|vertex| vertex.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut coordinates = BTreeMap::new();
     for (face_index, face) in mesh.faces.iter().enumerate() {
         for (corner, vertex_id) in face.vertices.iter().enumerate() {
-            if !coordinates.contains_key(vertex_id) {
+            if !vertex_ids.contains(vertex_id) {
                 return Err(invalid(
                     modifier,
                     "mask_tex_uv_layer",
                     "a mesh with valid face vertices",
                 ));
             }
-            if !assigned.insert(*vertex_id) {
+            if coordinates.contains_key(vertex_id) {
                 continue;
             }
             let uv = layer
@@ -183,8 +180,9 @@ fn vertex_uv_coordinates(
             coordinates.insert(*vertex_id, DVec2::from_array(uv));
         }
     }
-    Ok(coordinates)
+    Ok(Some(coordinates))
 }
+
 fn texture_channel(color: [f64; 4], channel: &str) -> f64 {
     let [red, green, blue, alpha] = color;
     let maximum = red.max(green).max(blue);

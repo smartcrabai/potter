@@ -379,6 +379,19 @@ fn weighted_normal_cases() -> Result<Vec<Value>, Box<dyn Error>> {
         &smooth.clone(),
         None,
     ));
+    // MOD_weighted_normal.cc:227 starts every item at FACE_STRENGTH_WEAK (-16384), so faces that are all WEAK still
+    // count: with equal strengths the influence filter keeps every face (check_item_face_strength, :106-120).
+    cases.push(parameter_case(
+        "FACE_AREA_all_weak_face_influence",
+        "WEIGHTED_NORMAL",
+        &json!({"mode":"FACE_AREA","weight":50,"thresh":0.01,"use_face_influence":true}),
+        None,
+        &json!({}),
+        Some(&[-16384, -16384, -16384, -16384, -16384]),
+        &[],
+        &smooth.clone(),
+        None,
+    ));
     cases.push(parameter_case(
         "FACE_AREA_WITH_ANGLE_strength_keep_sharp",
         "WEIGHTED_NORMAL",
@@ -1037,7 +1050,12 @@ fn weighted_normal_uses_blenders_ranked_weight_curve() -> Result<(), Box<dyn Err
     )?;
     let normals = potter_core::geom::corner_normal_vectors(&result)?;
     let actual = normals[0];
-    let expected = DVec3::new(1.0 / 15.0, 0.0, 2.0).normalize();
+    // Blender 5.2.2 probe (`tests/fixtures/data_transfer/weighted_normal_ranked_probe.py`): the corner normal.
+    let probe: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/data_transfer/weighted_normal_ranked_probe.expected.json"
+    ))?;
+    let blender: Vec<f64> = serde_json::from_value(probe["corner0"].clone())?;
+    let expected = DVec3::new(blender[0], blender[1], blender[2]);
     assert!(
         actual.angle_between(expected) < 2.0e-4,
         "expected {expected:?}, got {actual:?}"
