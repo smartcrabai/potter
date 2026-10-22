@@ -3722,6 +3722,7 @@ mod tests {
         record["image"] = json!(image_id);
         doc.resources.insert(texture_id.clone(), record);
         let modifier = Modifier {
+            baked_ocean_cache: None,
             id: Id::new("texture_consumer".to_owned())?,
             modifier_type: "DISPLACE".to_owned(),
             name: "Texture consumer".to_owned(),

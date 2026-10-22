@@ -1345,6 +1345,7 @@ impl Evaluator<'_> {
             show_render: true,
             params: Map::from_iter([("levels".to_owned(), json!(level))]),
             binding_data: None,
+            baked_ocean_cache: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
         let mesh = evaluate_modifiers(&geometry.mesh, &[modifier], self.subject_name)?;

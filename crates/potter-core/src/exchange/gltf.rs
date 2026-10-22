@@ -8022,6 +8022,7 @@ pub(crate) fn import_indexed(
                 show_render: true,
                 params,
                 binding_data: None,
+                baked_ocean_cache: None,
                 runtime: crate::model::ModifierRuntime::default(),
             });
         }

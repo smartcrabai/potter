@@ -238,7 +238,7 @@ pub(crate) fn import(file: &Path, scene_id: String) -> Result<ImportedGraph> {
             Action {
                 name: "BVH Motion".to_owned(),
                 fcurves,
-                slots: Vec::new(),
+                ..Action::default()
             },
         );
     }

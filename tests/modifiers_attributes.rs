@@ -45,6 +45,7 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
             .ok_or("modifier params must be an object")?
             .clone(),
         binding_data: None,
+        baked_ocean_cache: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     })
 }
