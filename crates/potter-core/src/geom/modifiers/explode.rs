@@ -1258,11 +1258,11 @@ mod tests {
             // particle quaternion's own f32 construction error, which is not yet counted. The 1e-12
             // is Potter's f64 error.
             let bound = 221.0 * f64::from(f32::EPSILON) + 1.0e-12;
+            let error = (vertex.co - DVec3::from_array(expected)).abs().max_element();
             assert!(
-                (vertex.co - DVec3::from_array(expected))
-                    .abs()
-                    .max_element()
-                    <= bound
+                error <= bound,
+                "vertex {:?} differs from {expected:?} by {error:e}, bound {bound:e}",
+                vertex.co
             );
         }
         assert_eq!(output.faces.len(), expected_faces.len());

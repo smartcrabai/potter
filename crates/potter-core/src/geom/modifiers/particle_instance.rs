@@ -733,7 +733,11 @@ mod tests {
             assert!((color[0] - 0.401_977_87).abs() < 1.0e-7);
         }
         for color in &value.values[..4] {
-            assert!((color[0] - 0.610_495_75).abs() < 1.0e-7);
+            assert!(
+                (color[0] - 0.610_495_75).abs() < 1.0e-7,
+                "value colour {} differs from 0.61049575",
+                color[0]
+            );
         }
         for color in &value.values[4..] {
             assert!((color[0] - 0.258_182_91).abs() < 1.0e-7);
