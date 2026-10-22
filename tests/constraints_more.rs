@@ -2,7 +2,7 @@ use std::{error::Error, fs, io, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
-    eval::{EvaluationContext, EvaluationSession, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, EvaluationSession, Snapshot},
     model::{Id, ReconstructedPoint, SceneDoc, TrackingMarker},
     ops,
     tracking::{CameraModel, CameraObservation},
@@ -2264,6 +2264,12 @@ for frame in (4,3):
     sequence[str(frame)]={"matrix":matrix(owner),"vertices":positions(receiver)}
 assert sequence["4"]["matrix"] != sequence["3"]["matrix"]
 assert sequence["4"]["vertices"] != sequence["3"]["vertices"]
+cache.filepath = os.path.join(root,"seq.0002.abc")
+from_two = {}
+for frame in (2,3):
+    scene.frame_set(frame); bpy.context.view_layer.update()
+    from_two[str(frame)]={"matrix":matrix(owner),"vertices":positions(receiver)}
+cache.filepath = os.path.join(root,"seq.0004.abc")
 missing_cache_path=os.path.join(root,"seq.0003.abc")
 bpy.ops.cachefile.open(filepath=missing_cache_path)
 missing_cache=bpy.data.cache_files[-1]; missing_cache.is_sequence=True
@@ -2278,7 +2284,7 @@ fresh_modifier.cache_file=missing_cache; fresh_modifier.object_path=object_path;
 scene.frame_set(3); bpy.context.view_layer.update()
 fresh_missing={"matrix":matrix(fresh_owner),"vertices":positions(fresh_receiver)}
 with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f:
-    json.dump({"sequence":sequence,"fresh_missing":fresh_missing},f)
+    json.dump({"sequence":sequence,"from_two":from_two,"fresh_missing":fresh_missing},f)
 "#;
     let script_path = root.join("make_transform_sequence.py");
     fs::write(&script_path, script)?;
@@ -2294,6 +2300,8 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
     );
     let pattern = root.join("seq.####.abc");
     let (_directory, project_path) = project(&json!([
+        {"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,4.0]},"projection":"orthographic","ortho_scale":3.0},
+        {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
         {"op":"node.create","id":"owner","kind":"empty","transform":{"translation":[3.0,5.0,7.0],"rotation_deg":[11.459_156,-17.188_734,22.918_312],"scale":[1.5,2.0,0.75]}},
         {"op":"node.create","id":"receiver","kind":"plane","params":{"size":2.0}},
         {"op":"resource.pack","id":"cache","uri":pattern,"kind":"alembic","sequence":{"start":1,"end":2}},
@@ -2308,18 +2316,35 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
         "uri":root.join("seq.0004.abc"),"kind":"alembic","hash":digest,"packed":true,
         "bytes":serde_json::to_value(frame4)?
     });
+    document["scenes"]["scene_main"]["render"]["resolution_x"] = json!(64);
+    document["scenes"]["scene_main"]["render"]["resolution_y"] = json!(64);
+    document["scenes"]["scene_main"]["render"]["resolution_percentage"] = json!(100);
+    document["scenes"]["scene_main"]["render"]["samples"] = json!(1);
     fs::write(
         project_path.join("scene.json"),
         serde_json::to_vec_pretty(&document)?,
     )?;
     let document: SceneDoc = serde_json::from_slice(&fs::read(project_path.join("scene.json"))?)?;
     let oracle: Value = serde_json::from_slice(&fs::read(output_path)?)?;
+    let mut fresh_frame4_session = EvaluationSession::default();
+    let fresh_frame4 = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(4.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut fresh_frame4_session,
+    )?;
     let mut session = EvaluationSession::default();
-    for frame in [4.0, 3.0] {
+    for (index, frame) in [4.0, 3.0].into_iter().enumerate() {
         let snapshot = Snapshot::evaluate_with_cache_session(
             &document,
             &EvaluationContext {
                 frame: Some(frame),
+                purpose: EvaluationPurpose::Render,
                 ..EvaluationContext::default()
             },
             Some(&project_path),
@@ -2335,6 +2360,12 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
             ) < 1.0e-5,
             "Transform Cache differs at frame {frame}"
         );
+        if index == 0 {
+            assert_eq!(
+                snapshot.evaluation_hash, fresh_frame4.evaluation_hash,
+                "evaluating the same selected archive fresh and warm must keep its key stable"
+            );
+        }
         let mesh = snapshot
             .meshes
             .get(&Id::new("receiver")?)
@@ -2345,6 +2376,7 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
         &document,
         &EvaluationContext {
             frame: Some(3.0),
+            purpose: EvaluationPurpose::Render,
             ..EvaluationContext::default()
         },
         Some(&project_path),
@@ -2356,6 +2388,7 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
         &document,
         &EvaluationContext {
             frame: Some(3.0),
+            purpose: EvaluationPurpose::Render,
             ..EvaluationContext::default()
         },
         Some(&project_path),
@@ -2379,6 +2412,77 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
         .get(&Id::new("receiver")?)
         .ok_or_else(|| io::Error::other("fresh missing-frame receiver mesh is missing"))?;
     assert_mesh_positions_match(mesh, &oracle["fresh_missing"]["vertices"])?;
+
+    let mut from_two_session = EvaluationSession::default();
+    let _ = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(2.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut from_two_session,
+    )?;
+    let from_two_missing = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(3.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut from_two_session,
+    )?;
+    let from_two_oracle = &oracle["from_two"]["3"];
+    assert!(
+        max_matrix_error(
+            DMat4::from_cols_array(&from_two_missing.nodes[&Id::new("owner")?].world_matrix),
+            blender_matrix(&from_two_oracle["matrix"])?
+        ) < 1.0e-5,
+        "a gap after frame 2 must sample the retained frame-2 archive"
+    );
+    assert_ne!(
+        retained_missing.evaluation_hash, from_two_missing.evaluation_hash,
+        "different retained archives at frame 3 must produce distinct evaluation keys"
+    );
+
+    let render_output = project_path.join("render-cache-sequence");
+    let render = pot()
+        .arg("render")
+        .arg(&project_path)
+        .args([
+            "--frames",
+            "2:3",
+            "--camera",
+            "camera_main",
+            "--engine",
+            "realtime",
+            "--format",
+            "png",
+            "--out",
+        ])
+        .arg(&render_output)
+        .arg("--json")
+        .output()?;
+    assert!(
+        render.status.success(),
+        "sequence CLI render failed: {}",
+        String::from_utf8_lossy(&render.stdout)
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(render_output.join("render.manifest.json"))?)?;
+    assert_eq!(
+        manifest["frames"][1]["evaluation_hash"],
+        from_two_missing.evaluation_hash
+    );
+    assert!(
+        manifest["frames"][1]["hash"].as_str().is_some(),
+        "rendered missing-frame artifact has a content hash"
+    );
+    assert!(render_output.join("frame_0003.png").is_file());
     Ok(())
 }
 #[test]

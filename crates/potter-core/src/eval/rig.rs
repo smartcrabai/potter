@@ -8,7 +8,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
-    sync::Arc,
 };
 
 use glam::{DMat3, DMat4, DQuat, DVec3, EulerRot, Mat3, Mat4};
@@ -4768,22 +4767,13 @@ fn transform_cache_matrix(
     {
         // A missing path does not replace Blender's selected CacheFile reader; keep that archive and sample it at
         // the current sequence frame. With no reader selected yet, Blender leaves the owner matrix unchanged.
-        if let crate::eval::CacheSequenceRead::Available(bytes, hash) =
-            crate::eval::read_cache_sequence_resource(resource, project_root, sequence_time)?
-        {
-            let selected_frame = num_traits::ToPrimitive::to_i32(&sequence_time.trunc())
-                .ok_or_else(|| {
-                    evaluation_error("Transform Cache sequence frame is outside int32 range")
-                })?;
-            session.cache_file_archives.insert(
-                resource_id.clone(),
-                crate::eval::SelectedCacheFileArchive {
-                    frame: selected_frame,
-                    bytes: Arc::new(bytes),
-                    hash: Arc::from(hash),
-                },
-            );
-        }
+        let _ = crate::eval::select_cache_sequence_archive(
+            &resource_id,
+            resource,
+            project_root,
+            sequence_time,
+            session,
+        )?;
         let Some(reader) = session.cache_file_archives.get(&resource_id) else {
             return Ok(None);
         };

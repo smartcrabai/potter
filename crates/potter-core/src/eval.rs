@@ -103,7 +103,7 @@ impl EvaluationSession {
                 .map(|(resource_id, archive)| {
                     (
                         resource_id.to_string(),
-                        json!({"frame":archive.frame,"hash":archive.hash.as_ref()}),
+                        json!({"frame":archive.frame,"hash":archive.hash.as_ref(),"source":archive.source_identity.as_ref()}),
                     )
                 })
                 .collect(),
@@ -114,6 +114,7 @@ impl EvaluationSession {
 #[derive(Debug)]
 pub(crate) struct SelectedCacheFileArchive {
     pub(crate) frame: i32,
+    pub(crate) source_identity: Arc<str>,
     pub(crate) bytes: Arc<Vec<u8>>,
     pub(crate) hash: Arc<str>,
 }
@@ -1129,23 +1130,6 @@ impl Snapshot {
                 }
             }
         }
-        let mut evaluation_key = json!({
-            "engine": EVALUATION_ENGINE,
-            "build_identity": crate::BUILD_IDENTITY,
-            "simulation_engine": crate::sim::SOLVER_VERSION,
-            "scene_hash": scene_hash,
-            "scene_id": scene_id,
-            "view_layer": view_layer,
-            "purpose": context.purpose,
-            "frame": frame,
-            "adaptive_render": context.adaptive_render,
-            "cache_file_archives": session.cache_file_archive_identity(),
-        });
-        if let Some(prefix) = modifier_prefix {
-            evaluation_key["modifier_prefix"] =
-                json!({"node_id":prefix.node_id,"keep":prefix.keep});
-        }
-        let evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
         let mut volume_data = if mesh_evaluation_order.is_empty() {
             BTreeMap::new()
         } else {
@@ -2220,6 +2204,23 @@ impl Snapshot {
                     .filter_map(|id| matrices.get(id).copied().map(|matrix| (id.clone(), matrix)))
                     .collect()
             });
+        let mut evaluation_key = json!({
+            "engine": EVALUATION_ENGINE,
+            "build_identity": crate::BUILD_IDENTITY,
+            "simulation_engine": crate::sim::SOLVER_VERSION,
+            "scene_hash": scene_hash,
+            "scene_id": scene_id,
+            "view_layer": view_layer,
+            "purpose": context.purpose,
+            "frame": frame,
+            "adaptive_render": context.adaptive_render,
+            "cache_file_archives": session.cache_file_archive_identity(),
+        });
+        if let Some(prefix) = modifier_prefix {
+            evaluation_key["modifier_prefix"] =
+                json!({"node_id":prefix.node_id,"keep":prefix.keep});
+        }
+        let evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
         Ok(Self {
             scene_id,
             view_layer,
@@ -3257,35 +3258,14 @@ fn apply_mesh_sequence_cache_modifier(
                     )
                 })?,
         };
-        match read_cache_sequence_resource(resource, project_root, requested_frame)? {
-            CacheSequenceRead::Available(bytes, digest) => {
-                let selected_frame = num_traits::ToPrimitive::to_i32(&requested_frame.trunc())
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::InvalidArgument,
-                            "Mesh Sequence Cache frame is outside int32 sequence range",
-                            json!({"modifier_id":modifier.id,"frame":requested_frame}),
-                        )
-                    })?;
-                let selected = SelectedCacheFileArchive {
-                    frame: selected_frame,
-                    bytes: Arc::new(bytes),
-                    hash: Arc::from(digest),
-                };
-                session
-                    .cache_file_archives
-                    .insert(resource_id.clone(), selected);
-                let selected = session
-                    .cache_file_archives
-                    .get(&resource_id)
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InternalError,
-                            "selected cache archive disappeared",
-                        )
-                    })?;
-                (Arc::clone(&selected.bytes), Arc::clone(&selected.hash))
-            }
+        match select_cache_sequence_archive(
+            &resource_id,
+            resource,
+            project_root,
+            requested_frame,
+            session,
+        )? {
+            CacheSequenceRead::Available(bytes, digest) => (bytes, digest),
             CacheSequenceRead::Missing { frame, reason } => {
                 if let Some(selected) = session.cache_file_archives.get(&resource_id) {
                     (Arc::clone(&selected.bytes), Arc::clone(&selected.hash))
@@ -3316,8 +3296,88 @@ fn apply_mesh_sequence_cache_modifier(
 }
 
 pub(crate) enum CacheSequenceRead {
-    Available(Vec<u8>, String),
+    Available(Arc<Vec<u8>>, Arc<str>),
     Missing { frame: i32, reason: &'static str },
+}
+
+/// Reuses a reader for the same selected source, otherwise attempts the requested frame.
+pub(crate) fn select_cache_sequence_archive(
+    resource_id: &Id,
+    resource: &Value,
+    project_root: Option<&Path>,
+    requested_frame: f64,
+    session: &mut EvaluationSession,
+) -> Result<CacheSequenceRead> {
+    let frame = num_traits::ToPrimitive::to_i32(&requested_frame.trunc()).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "Mesh Sequence Cache frame is outside int32 sequence range",
+            json!({"frame":requested_frame}),
+        )
+    })?;
+    let source_identity = cache_sequence_source_identity(resource, frame);
+    if let Some(source_identity) = &source_identity
+        && let Some(selected) = session.cache_file_archives.get(resource_id)
+        && selected.frame == frame
+        && selected.source_identity.as_ref() == source_identity
+    {
+        return Ok(CacheSequenceRead::Available(
+            Arc::clone(&selected.bytes),
+            Arc::clone(&selected.hash),
+        ));
+    }
+    match read_cache_sequence_resource(resource, project_root, requested_frame)? {
+        CacheSequenceRead::Available(bytes, hash) => {
+            let source_identity = source_identity.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "available cache sequence frame has no source identity",
+                )
+            })?;
+            let selected = SelectedCacheFileArchive {
+                frame,
+                source_identity: Arc::from(source_identity),
+                bytes,
+                hash,
+            };
+            session
+                .cache_file_archives
+                .insert(resource_id.clone(), selected);
+            let selected = session
+                .cache_file_archives
+                .get(resource_id)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "selected cache archive disappeared",
+                    )
+                })?;
+            Ok(CacheSequenceRead::Available(
+                Arc::clone(&selected.bytes),
+                Arc::clone(&selected.hash),
+            ))
+        }
+        missing @ CacheSequenceRead::Missing { .. } => Ok(missing),
+    }
+}
+
+fn cache_sequence_source_identity(resource: &Value, frame: i32) -> Option<String> {
+    let frame_record = resource.get("sequence_frames")?.get(frame.to_string())?;
+    let identity = json!({
+        "resource_uri": resource.get("uri")?,
+        "resource_kind": resource.get("kind")?,
+        "resource_packed": resource.get("packed")?,
+        "sequence_start": resource.get("sequence_start"),
+        "sequence_end": resource.get("sequence_end"),
+        "frame": frame,
+        "frame_uri": frame_record.get("uri")?,
+        "frame_kind": frame_record.get("kind")?,
+        "frame_packed": frame_record.get("packed")?,
+        "frame_hash": frame_record.get("hash")?,
+    });
+    Some(crate::hash::sha256(
+        &crate::hash::canonicalize(&identity).ok()?,
+    ))
 }
 
 pub(crate) fn read_cache_sequence_resource(
@@ -3526,7 +3586,10 @@ pub(crate) fn read_cache_sequence_resource(
         &format!("{uri}:{frame}"),
         project_root,
     ) {
-        Ok((bytes, digest)) => Ok(CacheSequenceRead::Available(bytes, digest)),
+        Ok((bytes, digest)) => Ok(CacheSequenceRead::Available(
+            Arc::new(bytes),
+            Arc::from(digest),
+        )),
         Err(error)
             if !packed_sequence
                 && error.code == ErrorCode::DependencyMissing
