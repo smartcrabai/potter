@@ -3962,6 +3962,9 @@ fn build_imported_graph(
                         invalid_intermediate("modifier references an unknown node group")
                     })?;
                     params.insert("node_group".to_owned(), json!(group_id.as_str()));
+                    if let Some(group) = doc.node_groups.get(group_id) {
+                        rekey_nodes_bakes(&mut params, group);
+                    }
                 }
                 if crate::params::type_spec(crate::params::ParameterFamily::Modifier, &model_type)
                     .is_some()
@@ -9346,10 +9349,27 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
     losses
 }
 
-/// Facts the bridge reports for a Geometry Nodes modifier's Blender bakes. Data-blocks are not remapped by Potter, and a bake
-/// node without a Potter id has no node to carry its settings. Blender 5.2.2 exposes no RNA for a bake's packed payload
-/// (`NodesModifierBake` has no `packed`, `bake_size`, or baked-state property), so every bake whose effective target is
-/// PACKED is reported: it may carry a packed payload Potter cannot read.
+/// Re-keys a modifier's bake settings from Blender bake node names, which is how the bridge keys them, to the
+/// imported node IDs. Names are unique within a node tree, so each entry maps to one node. An entry whose name
+/// names no node of the group is dropped; the bridge reports such a bake as unmapped.
+fn rekey_nodes_bakes(params: &mut Map<String, Value>, group: &NodeGroup) {
+    let Some(bakes) = params.get("bakes").and_then(Value::as_object) else {
+        return;
+    };
+    let rekeyed = bakes
+        .iter()
+        .filter_map(|(name, settings)| {
+            let (node_id, _) = group.nodes.iter().find(|(_, node)| node.name == *name)?;
+            Some((node_id.as_str().to_owned(), settings.clone()))
+        })
+        .collect::<Map<String, Value>>();
+    params.insert("bakes".to_owned(), Value::Object(rekeyed));
+}
+
+/// Facts the bridge reports for a Geometry Nodes modifier's Blender bakes. Data-blocks are not remapped by Potter,
+/// and a bake with no node has no settings to carry. Blender 5.2.2 exposes no RNA for a bake's packed payload
+/// (`NodesModifierBake` has no `packed`, `bake_size`, or baked-state property), so every bake whose effective target
+/// is PACKED is reported: it may carry a packed payload Potter cannot read.
 fn nodes_bake_import_losses(modifier: &Value) -> Vec<Loss> {
     let name = modifier.get("name").and_then(Value::as_str);
     let properties = modifier.get("properties");
@@ -9411,9 +9431,7 @@ fn nodes_bake_import_losses(modifier: &Value) -> Vec<Loss> {
         losses.push(loss(
             "blender.modifier.nodes_bake_unmapped",
             name,
-            &format!(
-                "Blender bake node {bake} has no Potter node id, so its settings are not kept"
-            ),
+            &format!("Blender bake {bake} has no bake node, so its settings are not kept"),
         ));
     }
     losses

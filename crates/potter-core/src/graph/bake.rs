@@ -81,6 +81,49 @@ pub(crate) fn same_bake_frame(first: f64, second: f64) -> bool {
     (first - second).abs() <= NODE_BAKE_FRAME_EPSILON
 }
 
+/// The stored frames a bake reads at `frame`: the frame itself, or else the nearest stored frame on
+/// each side, skipping frames that `load` reports missing. Blender reads one cached frame, or
+/// interpolates between the cached frames around the current one (`MOD_nodes.cc`, `read_single` and
+/// `read_interpolated`); outside the cached range the nearest cached frame is used. Only the frames
+/// returned are read, so one evaluation decodes at most two frames. `frames` must be ascending.
+pub(crate) fn bake_frame_window(
+    frames: &[f64],
+    frame: f64,
+    mut load: impl FnMut(usize) -> Result<Option<NodeBakeFrame>>,
+) -> Result<Vec<NodeBakeFrame>> {
+    let pivot = frames.partition_point(|&stored| stored < frame && !same_bake_frame(stored, frame));
+    if frames
+        .get(pivot)
+        .is_some_and(|&stored| same_bake_frame(stored, frame))
+    {
+        if let Some(exact) = load(pivot)? {
+            return Ok(vec![exact]);
+        }
+        return nearest_stored_frames(frames, pivot, pivot + 1, &mut load);
+    }
+    nearest_stored_frames(frames, pivot, pivot, &mut load)
+}
+
+/// The nearest loadable frame before `before_end` and the nearest loadable frame from `after_start`.
+fn nearest_stored_frames(
+    frames: &[f64],
+    before_end: usize,
+    after_start: usize,
+    load: &mut impl FnMut(usize) -> Result<Option<NodeBakeFrame>>,
+) -> Result<Vec<NodeBakeFrame>> {
+    let mut window = Vec::with_capacity(2);
+    if let Some(found) = (0..before_end)
+        .rev()
+        .find_map(|index| load(index).transpose())
+    {
+        window.push(found?);
+    }
+    if let Some(found) = (after_start..frames.len()).find_map(|index| load(index).transpose()) {
+        window.push(found?);
+    }
+    Ok(window)
+}
+
 fn bake_attribute_element_count(mesh: &Mesh, domain: &str) -> Option<usize> {
     match domain {
         "POINT" => Some(mesh.vertices.len()),

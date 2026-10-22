@@ -3475,6 +3475,10 @@ fn same_mesh_topology(first: &Mesh, second: &Mesh) -> bool {
 
 fn mix_mesh_attributes(first: &mut Mesh, second: &Mesh, factor: f64) {
     for (name, first_attribute) in &mut first.attributes {
+        // Blender never blends the persistent `id` attribute (mix_geometries.cc, `names.remove("id")`).
+        if name == "id" {
+            continue;
+        }
         let Some(second_attribute) = second.attributes.get(name) else {
             continue;
         };
@@ -3520,7 +3524,18 @@ fn mix_mesh_attributes(first: &mut Mesh, second: &Mesh, factor: f64) {
 
 fn mix_json_value(first: &Value, second: &Value, factor: f64) -> Value {
     match (first, second) {
+        (Value::Bool(first), Value::Bool(second)) => {
+            // Blender's bool `mix2`: true once the blend reaches one half (BKE_attribute_math.hh).
+            let blend = (1.0 - factor) * f64::from(u8::from(*first))
+                + factor * f64::from(u8::from(*second));
+            json!(blend >= 0.5)
+        }
         (Value::Number(first), Value::Number(second)) => {
+            if let (Some(first), Some(second)) = (first.as_i64(), second.as_i64()) {
+                // Blender's int `mix2` rounds the blend, so integers never become fractions.
+                let blend = (1.0 - factor) * first as f64 + factor * second as f64;
+                return json!(blend.round() as i64);
+            }
             let first = first.as_f64().unwrap_or(0.0);
             let second = second.as_f64().unwrap_or(0.0);
             json!(first + (second - first) * factor)

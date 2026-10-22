@@ -371,24 +371,13 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             "--node must identify a GeometryNodeBake node",
         ));
     }
-    let mut bake_settings = old_config
+    // The modifier's `bakes` entry is the only source of bake settings: Blender keeps them on the
+    // modifier (`NodesModifierBake`), and a Bake node can be shared by objects with different settings.
+    let bake_settings = old_config
         .as_ref()
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    for key in [
-        "bake_mode",
-        "bake_target",
-        "use_custom_simulation_frame_range",
-        "frame_start",
-        "frame_end",
-        "use_custom_path",
-        "directory",
-    ] {
-        if let Some(value) = bake_node.properties.get(key) {
-            bake_settings.insert(key.to_owned(), value.clone());
-        }
-    }
     let bake_settings = Value::Object(bake_settings);
     crate::graph::validate_node_bake_settings(&bake_settings)?;
     if args.pack {
@@ -442,20 +431,27 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     )?;
     let requested_bake_target = effective_node_bake_target(modifier, Some(&bake_settings))?;
     let mut bake_target = requested_bake_target;
-    let mut bake_directory = effective_node_bake_directory(modifier, Some(&bake_settings))?;
+    let custom_path = bake_settings
+        .get("use_custom_path")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     // Blender `bake_simulation_validate_paths` fills an empty modifier directory with its default
-    // before a DISK bake. Without a location the bake is packed instead
-    // (object_bake_simulation.cc:1005-1009).
+    // before a DISK bake (object_bake_simulation.cc:755-778). A custom path that is empty has no
+    // location, and the bake is packed instead (get_node_bake_path, object_bake_simulation.cc:1005-1009).
     let mut default_directory = None;
-    if bake_target == "DISK" && bake_directory.is_empty() {
-        match default_modifier_bake_directory(project.path(), &object.name, &modifier.name) {
-            Some(directory) => {
-                bake_directory.clone_from(&directory);
-                default_directory = Some(directory);
-            }
-            None => bake_target = "PACKED",
+    let mut resolved_directory = effective_node_bake_directory(modifier, Some(&bake_settings))?;
+    if bake_target == "DISK" && resolved_directory.is_none() && !custom_path {
+        if let Some(directory) =
+            default_modifier_bake_directory(project.path(), &object.name, &modifier.name)
+        {
+            resolved_directory = Some(directory.clone());
+            default_directory = Some(directory);
         }
     }
+    if bake_target == "DISK" && resolved_directory.is_none() {
+        bake_target = "PACKED";
+    }
+    let bake_directory = resolved_directory.unwrap_or_default();
     let selected_view_layer = args
         .context
         .view_layer
@@ -571,10 +567,6 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         config
             .entry("bake_target".to_owned())
             .or_insert_with(|| json!("INHERIT"));
-        if bake_target != requested_bake_target {
-            // Packed fallback: the stored target must match the packed storage.
-            config.insert("bake_target".to_owned(), json!(bake_target));
-        }
         if mode == NodeBakeMode::Animation && args.frames.is_some() {
             config.insert("use_custom_simulation_frame_range".to_owned(), json!(true));
             config.insert("frame_start".to_owned(), json!(whole_frame(frames[0])?));
@@ -719,7 +711,13 @@ fn pack_node_bake(
             "only a disk Bake-node cache can be packed",
         ));
     }
-    let bake_directory = effective_node_bake_directory(modifier, Some(bake_settings))?;
+    let bake_directory =
+        effective_node_bake_directory(modifier, Some(bake_settings))?.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidOperation,
+                "a disk Bake-node cache has no directory to pack from",
+            )
+        })?;
     let frame_entries = config
         .get("frames")
         .and_then(Value::as_array)
@@ -828,14 +826,7 @@ fn pack_node_bake(
 
     let mut candidate = doc.clone();
     candidate.resources.insert(resource_id.clone(), resource);
-    update_node_bake_state(
-        &mut candidate,
-        target,
-        modifier_id,
-        node_id,
-        next_config,
-        "PACKED",
-    )?;
+    update_node_bake_state(&mut candidate, target, modifier_id, node_id, next_config)?;
     candidate.validate()?;
     let scene = project.restore(
         candidate,
@@ -982,14 +973,7 @@ fn unpack_node_bake(
         crate::graph::validate_node_bake_config(&next_config)?;
 
         let mut candidate = doc.clone();
-        update_node_bake_state(
-            &mut candidate,
-            target,
-            modifier_id,
-            node_id,
-            next_config,
-            "DISK",
-        )?;
+        update_node_bake_state(&mut candidate, target, modifier_id, node_id, next_config)?;
         remove_unreferenced_node_bake_resource(&mut candidate, Some(&config));
         candidate.validate()?;
         Ok(candidate)
@@ -1024,36 +1008,7 @@ fn update_node_bake_state(
     modifier_id: &Id,
     node_id: &Id,
     config: Value,
-    bake_target: &str,
 ) -> Result<()> {
-    let mut node_properties = ["use_custom_path", "directory"]
-        .into_iter()
-        .filter_map(|key| {
-            config
-                .get(key)
-                .cloned()
-                .map(|value| (key.to_owned(), value))
-        })
-        .collect::<Vec<_>>();
-    node_properties.push(("bake_target".to_owned(), json!(bake_target)));
-    let node_group_id = doc
-        .nodes
-        .get(target)
-        .and_then(|object| {
-            object
-                .modifiers
-                .iter()
-                .find(|modifier| modifier.id == *modifier_id)
-        })
-        .and_then(|modifier| modifier.params.get("node_group"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "node-bake group disappeared"))?;
-    let node_group_id = Id::new(node_group_id.to_owned()).map_err(|_| {
-        PotError::new(
-            ErrorCode::InternalError,
-            "node-bake group ID became invalid",
-        )
-    })?;
     {
         let modifier = doc
             .nodes
@@ -1078,14 +1033,6 @@ fn update_node_bake_state(
             )
         })?;
         bakes.insert(node_id.to_string(), config);
-    }
-    let bake_node = doc
-        .node_groups
-        .get_mut(&node_group_id)
-        .and_then(|group| group.nodes.get_mut(node_id))
-        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Bake node disappeared"))?;
-    for (key, value) in node_properties {
-        bake_node.properties.insert(key, value);
     }
     Ok(())
 }
@@ -1266,30 +1213,25 @@ fn effective_node_bake_target(
 fn effective_node_bake_directory(
     modifier: &crate::model::Modifier,
     config: Option<&Value>,
-) -> Result<String> {
+) -> Result<Option<String>> {
+    // `None` means the bake has no location on disk (get_node_bake_path returns no path).
     if config
         .and_then(|config| config.get("use_custom_path"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return config
+        return Ok(config
             .and_then(|config| config.get("directory"))
             .and_then(Value::as_str)
             .filter(|directory| !directory.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidArgument,
-                    "custom node-bake disk directory is empty",
-                )
-            });
+            .map(str::to_owned));
     }
     Ok(modifier
         .params
         .get("bake_directory")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned())
+        .filter(|directory| !directory.is_empty())
+        .map(str::to_owned))
 }
 fn node_bake_unpack_directory(
     method: NodeBakeUnpackMethod,

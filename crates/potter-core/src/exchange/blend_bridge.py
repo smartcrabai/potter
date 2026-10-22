@@ -671,7 +671,8 @@ def tree_dump(tree):
                 socket_type = POTTER_TO_BLENDER_NODE_SOCKET_TYPE.get(
                     socket_key, getattr(item, "bl_socket_idname", "") or
                     (bake_type if bake_type.startswith("NodeSocket") else ""))
-                entry = {"id": "Item_%d" % index,
+                # The item's socket identifier is its persistent ID; positions change when items are removed.
+                entry = {"id": node.inputs[index].identifier,
                          "name": item.name, "socket_type": socket_type}
                 if hasattr(item, "is_attribute"):
                     entry["is_attribute"] = bool(item.is_attribute)
@@ -1568,16 +1569,19 @@ def _nodes_bake_potter_id(bake):
 
 
 def _nodes_bakes_dump(modifier):
-    """Settings of every Blender bake entry keyed by the Potter id of its bake node, and the facts Potter cannot keep."""
+    """Settings of every Blender bake entry keyed by the name of its bake node, and the facts Potter cannot keep.
+
+    The name is the key because it exists on every node, including nodes of files Potter did not write. Names are
+    unique within a node tree; the importer maps each name to the imported node ID."""
     bakes = {}
     data_blocks = []
     unmapped = []
     for bake in modifier.bakes:
-        potter_id = _nodes_bake_potter_id(bake)
-        if potter_id is None:
-            unmapped.append(bake.node.name if bake.node is not None else "bake %d" % bake.bake_id)
+        if bake.node is None:
+            unmapped.append("bake %d" % bake.bake_id)
             continue
-        bakes[potter_id] = {
+        node_name = bake.node.name
+        bakes[node_name] = {
             "bake_mode": bake.bake_mode,
             "bake_target": bake.bake_target,
             "use_custom_path": bool(bake.use_custom_path),
@@ -1587,7 +1591,7 @@ def _nodes_bakes_dump(modifier):
             "frame_end": int(bake.frame_end),
         }
         if len(bake.data_blocks):
-            data_blocks.append(potter_id)
+            data_blocks.append(node_name)
     return bakes, {"data_blocks": data_blocks, "unmapped": unmapped}
 
 
@@ -4598,6 +4602,32 @@ def _resolve_deferred_id_assignments(id_lookup):
             raise ValueError("%s references unavailable ID %s" % (owner, reference))
         _set_required(block, key, candidate, owner)
     DEFERRED_ID_ASSIGNMENTS.clear()
+# Blender's bake item enum for each Potter socket key (the values bake_items.new accepts).
+BLENDER_BAKE_ITEM_TYPES = {
+    "geometry": "GEOMETRY", "float": "FLOAT", "integer": "INT", "boolean": "BOOLEAN",
+    "vector": "VECTOR", "rotation": "ROTATION", "color": "RGBA", "matrix": "MATRIX", "string": "STRING",
+}
+
+
+def _restore_bake_items(node, items, owner):
+    """Rebuild a Bake node's items in order. Blender assigns each item a fresh socket identifier, so
+    the saved identifier of each item is mapped to its new one and returned for link resolution."""
+    socket_keys = {socket: key for key, socket in POTTER_TO_BLENDER_NODE_SOCKET_TYPE.items()}
+    while len(node.bake_items):
+        node.bake_items.remove(node.bake_items[0])
+    identifiers = {}
+    for position, entry in enumerate(items):
+        key = socket_keys.get(entry.get("socket_type"), entry.get("socket_type"))
+        enum = BLENDER_BAKE_ITEM_TYPES.get(key)
+        if enum is None:
+            raise ValueError("%s has a bake item with unsupported socket type %s" % (owner, entry.get("socket_type")))
+        item = node.bake_items.new(enum, entry.get("name", ""))
+        if "is_attribute" in entry:
+            item.is_attribute = bool(entry["is_attribute"])
+        if "attribute_domain" in entry:
+            item.attribute_domain = entry["attribute_domain"]
+        identifiers[entry.get("id")] = node.inputs[position].identifier
+    return identifiers
 
 def _restore_node_tree(tree, raw, id_lookup, owner):
     if raw.get("name"):
@@ -4622,6 +4652,8 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
                                      (owner, entry.get("name", ""))) from error
     tree.nodes.clear()
     nodes = {}
+    # Saved socket identifiers of Bake items, per node name, mapped to the identifiers Blender assigned.
+    identifier_remaps = {}
     for source in raw.get("nodes", []):
         try:
             node = tree.nodes.new(blender_node_type(source["type"], tree.bl_rna.identifier))
@@ -4633,6 +4665,9 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
         if source.get("location") is not None:
             node.location = source["location"]
         node_properties = dict(source.get("properties", {}))
+        if node.bl_idname == "GeometryNodeBake" and "bake_items" in node_properties:
+            identifier_remaps[node.name] = _restore_bake_items(
+                node, node_properties.pop("bake_items") or [], owner)
         simple_material = node_properties.pop("potter_simple_material", False) is True
         node_color = node_properties.get("color")
         if node_color is not None and (not isinstance(node_color, list) or len(node_color) != 3):
@@ -4646,8 +4681,10 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             custom_properties["potter_simple_material"] = True
         set_props(node, custom_properties)
         for socket_source in source.get("inputs", []):
+            identifier = identifier_remaps.get(node.name, {}).get(
+                socket_source.get("identifier"), socket_source.get("identifier"))
             socket = next((value for value in node.inputs
-                           if value.identifier == socket_source.get("identifier")), None)
+                           if value.identifier == identifier), None)
             if socket is None:
                 socket = next((value for value in node.inputs
                                if value.name == socket_source.get("name")), None)
@@ -4664,13 +4701,17 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
         to_node = nodes.get(source.get("to_node"))
         if from_node is None or to_node is None:
             raise ValueError("%s has a link to an unavailable node" % owner)
+        from_identifier = identifier_remaps.get(from_node.name, {}).get(
+            source.get("from_socket"), source.get("from_socket"))
+        to_identifier = identifier_remaps.get(to_node.name, {}).get(
+            source.get("to_socket"), source.get("to_socket"))
         from_socket = next((value for value in from_node.outputs
-                            if value.identifier == source.get("from_socket")), None)
+                            if value.identifier == from_identifier), None)
         if from_socket is None:
             from_socket = next((value for value in from_node.outputs
                                 if value.name == source.get("from_socket")), None)
         to_socket = next((value for value in to_node.inputs
-                          if value.identifier == source.get("to_socket")), None)
+                          if value.identifier == to_identifier), None)
         if to_socket is None:
             to_socket = next((value for value in to_node.inputs
                               if value.name == source.get("to_socket")), None)
