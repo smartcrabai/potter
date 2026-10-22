@@ -1140,6 +1140,8 @@ pub(crate) fn rasterize_wireframe(
         // Wire is never a film Beauty render, so no film filter applies.
         0.0,
         None,
+        &[],
+        None,
     )?;
     let mut output = rasterize_with_lines(
         triangles,
@@ -1153,6 +1155,8 @@ pub(crate) fn rasterize_wireframe(
         1,
         0,
         0.0,
+        None,
+        &[],
         None,
     )?;
     let frame = camera_frame(camera, width, height)?;
@@ -3620,6 +3624,7 @@ mod visibility_tests {
         hit_opacity, intersect_triangle, nearest_visible_hit, prepare_triangles,
         ray_for_pixel_in_frame,
     };
+    use crate::error::Result;
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
     use crate::render::bvh::Bvh;
