@@ -1798,11 +1798,8 @@ fn attach_native_packed_bake_states(
         };
         let bake_ids = bake_losses
             .get("bake_ids")
-            .and_then(Value::as_object)
+            .and_then(Value::as_array)
             .ok_or_else(|| invalid_intermediate("node-bake IDs are missing from bake metadata"))?;
-        if bake_ids.is_empty() {
-            continue;
-        }
         let source_file = bake_losses
             .get("source_file")
             .and_then(Value::as_str)
@@ -1852,52 +1849,82 @@ fn attach_native_packed_bake_states(
         };
         let bake_ids = bake_losses
             .get("bake_ids")
-            .and_then(Value::as_object)
+            .and_then(Value::as_array)
             .ok_or_else(|| invalid_intermediate("node-bake IDs are missing from bake metadata"))?;
+        let source_file = bake_losses
+            .get("source_file")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_intermediate("Bake source-file identity is missing"))?;
+        let source = fs::canonicalize(source_file).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                "could not resolve Blender source for packed Bake metadata",
+                json!({"file":source_file,"cause":error.to_string()}),
+            )
+        })?;
+        let states = states_by_source
+            .get(&source)
+            .ok_or_else(|| invalid_intermediate("Bake source state was not indexed"))?;
+        let owner_name = bake_losses
+            .get("owner_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_intermediate("Bake owner identity is missing"))?;
+        let modifier_name = modifier
+            .get("blender_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_intermediate("Blender modifier name is missing"))?;
+        let mut reported_ids = BTreeSet::new();
         let mut packed_payloads = Vec::new();
-        if !bake_ids.is_empty() {
-            let source_file = bake_losses
-                .get("source_file")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_intermediate("Bake source-file identity is missing"))?;
-            let source = fs::canonicalize(source_file).map_err(|error| {
-                PotError::with_details(
+        let mut packed_unmapped_ids = Vec::new();
+        for entry in bake_ids {
+            let bake_id = entry
+                .get("bake_id")
+                .and_then(Value::as_i64)
+                .and_then(|id| i32::try_from(id).ok())
+                .ok_or_else(|| invalid_intermediate("Bake ID is invalid"))?;
+            if !reported_ids.insert(bake_id) {
+                return Err(invalid_intermediate("duplicate Bake ID in bridge metadata"));
+            }
+            let node_name = match entry.get("node_name") {
+                Some(Value::String(name)) => Some(name.as_str()),
+                Some(Value::Null) => None,
+                _ => return Err(invalid_intermediate("Bake node name is invalid")),
+            };
+            let key = (owner_name.to_owned(), modifier_name.to_owned(), bake_id);
+            if !states.bake_ids.contains(&key) {
+                return Err(PotError::with_details(
                     ErrorCode::ImportFailed,
-                    "could not resolve Blender source for packed Bake metadata",
-                    json!({"file":source_file,"cause":error.to_string()}),
-                )
-            })?;
-            let states = states_by_source
-                .get(&source)
-                .ok_or_else(|| invalid_intermediate("Bake source state was not indexed"))?;
-            let owner_name = bake_losses
-                .get("owner_name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_intermediate("Bake owner identity is missing"))?;
-            let modifier_name = modifier
-                .get("blender_name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_intermediate("Blender modifier name is missing"))?;
-            for (node_name, raw_id) in bake_ids {
-                let bake_id = raw_id
-                    .as_i64()
-                    .and_then(|id| i32::try_from(id).ok())
-                    .ok_or_else(|| invalid_intermediate("Bake ID is invalid"))?;
-                let key = (owner_name.to_owned(), modifier_name.to_owned(), bake_id);
-                if !states.bake_ids.contains(&key) {
-                    return Err(PotError::with_details(
-                        ErrorCode::ImportFailed,
-                        "Blender Bake IDs differ between RNA and serialized SDNA",
-                        json!({"file":source.display().to_string(),"object":owner_name,
-                            "modifier":modifier_name,"node":node_name,"bake_id":bake_id}),
-                    ));
-                }
-                if states.packed.contains(&key) {
-                    packed_payloads.push(node_name.clone());
+                    "Blender Bake IDs differ between RNA and serialized SDNA",
+                    json!({"file":source.display().to_string(),"object":owner_name,
+                        "modifier":modifier_name,"node":node_name,"bake_id":bake_id}),
+                ));
+            }
+            if states.packed.contains(&key) {
+                if let Some(node_name) = node_name {
+                    packed_payloads.push(node_name.to_owned());
+                } else {
+                    packed_unmapped_ids.push(bake_id);
                 }
             }
         }
+        let source_ids = states
+            .bake_ids
+            .iter()
+            .filter(|(object, blender_modifier, _)| {
+                object == owner_name && blender_modifier == modifier_name
+            })
+            .map(|(_, _, bake_id)| *bake_id)
+            .collect::<BTreeSet<_>>();
+        if source_ids != reported_ids {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "Blender Bake ID list is incomplete between RNA and serialized SDNA",
+                json!({"file":source.display().to_string(),"object":owner_name,
+                    "modifier":modifier_name}),
+            ));
+        }
         bake_losses.insert("packed_payloads".to_owned(), json!(packed_payloads));
+        bake_losses.insert("packed_unmapped_ids".to_owned(), json!(packed_unmapped_ids));
     }
     Ok(())
 }
@@ -9560,6 +9587,21 @@ fn nodes_bake_import_losses(modifier: &Value) -> Vec<Loss> {
             name,
             &format!(
                 "Blender bake {bake} has packed data that Potter cannot read because Blender exposes no RNA for it; the bake is re-evaluated live"
+            ),
+        ));
+    }
+    for bake_id in bake_losses
+        .get("packed_unmapped_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+    {
+        losses.push(loss(
+            "blender.modifier.nodes_bake_packed",
+            name,
+            &format!(
+                "Blender bake ID {bake_id} has packed data that Potter cannot read because Blender exposes no RNA for it; the bake is re-evaluated live"
             ),
         ));
     }
@@ -18614,6 +18656,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
                 }},
                 "bake_losses": {
                     "packed_payloads": ["bake_main", "bake_disk"],
+                    "packed_unmapped_ids": [42],
                     "data_blocks": ["bake_main"],
                     "unmapped": ["Bake.001"]
                 }
@@ -18631,6 +18674,10 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert_eq!(
             bake_losses,
             [
+                (
+                    "blender.modifier.nodes_bake_packed".to_owned(),
+                    Some("Geo".to_owned())
+                ),
                 (
                     "blender.modifier.nodes_bake_packed".to_owned(),
                     Some("Geo".to_owned())

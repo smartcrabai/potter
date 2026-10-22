@@ -1684,7 +1684,7 @@ def _nodes_bakes_dump(modifier):
     The name is the key because it exists on every node, including nodes of files Potter did not write. Names are
     unique within a node tree; the importer maps each name to the imported node ID."""
     bakes = {}
-    bake_ids = {}
+    bake_ids = []
     data_blocks = []
     unmapped = []
     owner = modifier.id_data
@@ -1692,9 +1692,8 @@ def _nodes_bakes_dump(modifier):
     source_file = _library_resolved_path(library) if library else bpy.path.abspath(bpy.data.filepath)
     for bake in modifier.bakes:
         if bake.node is None:
-            unmapped_name = "bake %d" % bake.bake_id
-            unmapped.append(unmapped_name)
-            bake_ids[unmapped_name] = int(bake.bake_id)
+            unmapped.append("bake %d" % bake.bake_id)
+            bake_ids.append({"bake_id": int(bake.bake_id), "node_name": None})
             continue
         node_name = bake.node.name
         bakes[node_name] = {
@@ -1706,7 +1705,7 @@ def _nodes_bakes_dump(modifier):
             "frame_start": int(bake.frame_start),
             "frame_end": int(bake.frame_end),
         }
-        bake_ids[node_name] = int(bake.bake_id)
+        bake_ids.append({"bake_id": int(bake.bake_id), "node_name": node_name})
         if len(bake.data_blocks):
             data_blocks.append(node_name)
     return bakes, {
