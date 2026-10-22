@@ -14,6 +14,8 @@
 //!
 //! Potter's absolute specular is not compared with EEVEE here: no mirror of Potter's Principled energy tables exists yet, so
 //! only the factor and the disc's effect are bounded.
+//! EEVEE's diffuse base is the committed macOS arm64 render (`fixtures/native_oracle/eevee_macos/`; see its
+//! `MANIFEST.json`), not a live render, so the test has no platform term.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -28,7 +30,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{error::Error, fs, path::Path};
+use std::{error::Error, path::Path};
 
 use native_oracle::{
     TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
@@ -36,11 +38,16 @@ use native_oracle::{
 };
 use potter_core::image::{ImageData, ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
-use serde_json::{Value, json};
+use serde_json::json;
 use tempfile::tempdir;
 
-/// Blender 5.2.2 EEVEE oracle: the factor and disc scenes, the saved `.blend`, and every pixel.
+/// The oracle's script: it saves each scene's `.blend` and, given `-` for the render paths, stops before rendering.
 const EEVEE_SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_light_factors.py");
+
+/// The committed macOS arm64 EEVEE render of the diffuse base, as little-endian f32 RGB rows bottom-up
+/// (`fixtures/native_oracle/eevee_macos/`, made by Blender 5.2.2 on macOS; see its `MANIFEST.json`).
+const EEVEE_DIFFUSE_BASE: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/factors_diffuse_base.f32le");
 
 const SIZE: u32 = 128;
 const ORTHO_SCALE: f64 = 12.0;
@@ -77,8 +84,6 @@ fn realtime_light_factors_and_sun_disc_match_eevee() -> TestResult {
     let mut eevee_diffuse = Vec::new();
     for case in CASES {
         let blend = root.path().join(format!("{case}.blend"));
-        let eevee_exr = root.path().join(format!("{case}.exr"));
-        let oracle_json = root.path().join(format!("{case}.json"));
         run_blender_arguments(
             &blender,
             &script,
@@ -86,13 +91,12 @@ fn realtime_light_factors_and_sun_disc_match_eevee() -> TestResult {
             &[
                 Path::new(case),
                 blend.as_path(),
-                eevee_exr.as_path(),
-                oracle_json.as_path(),
+                Path::new("-"),
+                Path::new("-"),
             ],
         )?;
-        let oracle: Value = serde_json::from_slice(&fs::read(&oracle_json)?)?;
         if case == "diffuse_base" {
-            eevee_diffuse = oracle_values(&oracle)?;
+            eevee_diffuse = eevee_rgb(EEVEE_DIFFUSE_BASE)?;
         }
         let data = render_potter(&blender, root.path(), case, &blend)?;
         potter.push((case, plane_values(&data)));
@@ -176,13 +180,35 @@ fn oracle_positions() -> Vec<[f64; 2]> {
         .collect()
 }
 
-fn oracle_values(oracle: &Value) -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
-    oracle["samples"]
-        .as_array()
-        .ok_or("the EEVEE samples are missing")?
-        .iter()
-        .map(|sample_value| triple(&sample_value["rgb"]))
-        .collect()
+/// The committed EEVEE render's RGB values, one `[f64; 3]` per pixel in Blender's row order, which is `oracle_positions`' order.
+fn eevee_rgb(bytes: &[u8]) -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
+    let pixel_count = (SIZE * SIZE) as usize;
+    if bytes.len() != pixel_count * 12 {
+        return Err(format!(
+            "the EEVEE fixture holds {} bytes, expected {}",
+            bytes.len(),
+            pixel_count * 12
+        )
+        .into());
+    }
+    let channel = |index: usize| {
+        let at = index * 4;
+        f64::from(f32::from_le_bytes([
+            bytes[at],
+            bytes[at + 1],
+            bytes[at + 2],
+            bytes[at + 3],
+        ]))
+    };
+    Ok((0..pixel_count)
+        .map(|pixel| {
+            [
+                channel(pixel * 3),
+                channel(pixel * 3 + 1),
+                channel(pixel * 3 + 2),
+            ]
+        })
+        .collect())
 }
 
 fn scaled(values: &[[f64; 3]], factor: f64) -> Vec<[f64; 3]> {
@@ -270,15 +296,4 @@ fn render_potter(
         &project,
         ImageInterpolation::Closest,
     )?)
-}
-
-fn triple(value: &Value) -> Result<[f64; 3], Box<dyn Error>> {
-    let items = value.as_array().ok_or("an RGB is not an array")?;
-    let channel = |index: usize| {
-        items
-            .get(index)
-            .and_then(Value::as_f64)
-            .ok_or("an RGB channel is missing")
-    };
-    Ok([channel(0)?, channel(1)?, channel(2)?])
 }

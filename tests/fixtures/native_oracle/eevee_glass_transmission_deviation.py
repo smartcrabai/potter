@@ -1,19 +1,17 @@
-"""Deviation of EEVEE's glass pixels from the transmission model, from the `GLASS_PX` lines of a test log.
+"""Model bound of the glass transmission test: the transmission model against the committed macOS arm64 EEVEE render
+(`eevee_macos/glass_transmission.f32le`), over every interior pixel of each sphere.
 
-`tests/realtime_glass_transmission.rs` prints, for every checked pixel, the EEVEE value of the platform that rendered the
-oracle and Potter's value (`GLASS_SPHERE name` opens a sphere's lines, then `GLASS_PX uv_u uv_v eevee_rgb potter_rgb max`).
-This script predicts each pixel with the transmission model (`eevee_glass_direct_mirror.py`'s `glass_split`, with the
-orthographic view EEVEE uses) and reports, per sphere and channel, the largest and mean of |EEVEE - model| over the same
-interior pixels. Run it on the log of a CI run to measure the platform difference, and on the local Blender to measure the
-model's own bound.
+The model is `eevee_glass_direct_mirror.py`'s `glass_split` at the uniform white world (radiance 1), with the thickness
+squared (two events): `reflectance + transmittance²` per channel, the tint `sqrt(Base Color)`. The test's tolerance per
+sphere is the largest deviation printed here, rounded up.
 
-Usage: python3 eevee_glass_transmission_deviation.py <log> [--table <f32le>]
+Usage: python3 eevee_glass_transmission_deviation.py [--table <f32le>]
 """
 
 import importlib.util
 import math
-import re
 import sys
+from array import array
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -24,23 +22,23 @@ spec.loader.exec_module(mirror)
 IOR = 1.45
 F0 = ((IOR - 1.0) / (IOR + 1.0)) ** 2
 ORTHO_SCALE = 7.6
+SIZE = 96
+INTERIOR = 0.75
+FIXTURE = HERE / "eevee_macos" / "glass_transmission.f32le"
 # The oracle's spheres: centre along X, roughness, and Base Color (the transmission tint is its square root).
 SPHERES = {
     "clear": (-2.4, 0.0, (1.0, 1.0, 1.0)),
     "tinted": (0.0, 0.0, (0.9, 0.5, 0.2)),
     "rough": (2.4, 0.5, (1.0, 1.0, 1.0)),
 }
-LINE = re.compile(r"^GLASS_PX (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+)$")
-HEADER = re.compile(r"^GLASS_SPHERE (\w+)$")
 
 
 def model(name, u, v):
-    """The model's RGB at the uniform white world (radiance 1), with the thickness squared (two events)."""
+    """The model's RGB at the uniform white world, or `None` outside the sphere."""
     centre, roughness, base = SPHERES[name]
-    world_x = (u - 0.5) * ORTHO_SCALE
-    world_y = (v - 0.5) * ORTHO_SCALE
-    x = world_x - centre
-    r2 = x * x + world_y * world_y
+    x = (u - 0.5) * ORTHO_SCALE - centre
+    y = (v - 0.5) * ORTHO_SCALE
+    r2 = x * x + y * y
     if r2 >= 1.0:
         return None
     nv = math.sqrt(1.0 - r2)
@@ -52,54 +50,42 @@ def model(name, u, v):
     return values
 
 
-def parse(lines):
-    """`(sphere, uv, eevee rgb, potter rgb)` for every pixel line, in log order."""
-    sphere = None
-    rows = []
-    for line in lines:
-        header = HEADER.match(line.strip())
-        if header:
-            sphere = header.group(1)
-            continue
-        pixel = LINE.match(line.strip())
-        if pixel and sphere is not None:
-            values = [float(value) for value in pixel.groups()]
-            rows.append((sphere, (values[0], values[1]), values[2:5], values[5:8]))
-    return rows
-
-
 def main(argv):
-    if len(argv) < 2:
-        raise SystemExit(__doc__)
-    if "--table" in argv:
-        mirror.TABLES = mirror.Tables(Path(argv[argv.index("--table") + 1]))
-    else:
-        mirror.TABLES = mirror.Tables(mirror.DEFAULT_TABLE)
-    rows = parse(Path(argv[1]).read_text(encoding="utf-8").splitlines())
-    for name in SPHERES:
+    mirror.TABLES = mirror.Tables(Path(argv[argv.index("--table") + 1]) if "--table" in argv else mirror.DEFAULT_TABLE)
+    raw = FIXTURE.read_bytes()
+    if len(raw) != SIZE * SIZE * 12:
+        raise SystemExit(f"{FIXTURE.name} holds {len(raw)} bytes, expected {SIZE * SIZE * 12}")
+    eevee = array("f")
+    eevee.frombytes(raw)
+    scale = SIZE / ORTHO_SCALE
+    for name, (centre_x, _, _) in SPHERES.items():
+        centre_px = (centre_x + ORTHO_SCALE / 2.0) * scale
         worst = [0.0, 0.0, 0.0]
         total = [0.0, 0.0, 0.0]
         count = 0
         worst_at = None
-        for sphere, (u, v), eevee, _ in rows:
-            if sphere != name:
-                continue
-            predicted = model(name, u, v)
-            if predicted is None:
-                continue
-            count += 1
-            for channel in range(3):
-                error = abs(eevee[channel] - predicted[channel])
-                total[channel] += error
-                if error > worst[channel]:
-                    worst[channel] = error
-                    worst_at = (u, v, channel)
-        if count == 0:
-            print(f"{name}: no pixels")
-            continue
+        for row in range(SIZE):
+            for column in range(SIZE):
+                dx = (column + 0.5 - centre_px) / scale
+                dy = (row + 0.5 - SIZE / 2.0) / scale
+                if math.hypot(dx, dy) > INTERIOR:
+                    continue
+                u = (column + 0.5) / SIZE
+                v = (row + 0.5) / SIZE
+                predicted = model(name, u, v)
+                start = (row * SIZE + column) * 3
+                wanted = eevee[start : start + 3]
+                count += 1
+                for channel in range(3):
+                    error = abs(wanted[channel] - predicted[channel])
+                    total[channel] += error
+                    if error > worst[channel]:
+                        worst[channel] = error
+                        worst_at = (u, v, channel)
         print(
             f"{name}: pixels {count}  max |EEVEE - model| {[round(w, 5) for w in worst]}  "
-            f"mean {[round(t / count, 6) for t in total]}  worst at uv {worst_at[:2]} channel {worst_at[2]}"
+            f"mean {[round(t / count, 6) for t in total]}  worst at uv ({worst_at[0]:.6f}, {worst_at[1]:.6f}) "
+            f"channel {worst_at[2]}"
         )
 
 

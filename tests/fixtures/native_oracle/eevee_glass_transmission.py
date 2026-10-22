@@ -91,6 +91,9 @@ scene.render.image_settings.color_depth = "32"
 scene.render.filepath = exr_out
 
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
+# `-` as the EXR path saves the scene and stops: the tests import the .blend and compare with the committed EEVEE render.
+if exr_out == "-":
+    sys.exit(0)
 bpy.ops.render.render(write_still=True)
 
 result = bpy.data.images.load(exr_out, check_existing=False)

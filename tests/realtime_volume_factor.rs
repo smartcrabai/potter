@@ -12,6 +12,9 @@
 //! The absolute in-scatter is not compared with EEVEE: Potter's realtime volume is a single-scatter model with Cycles'
 //! light radiance, which differs from EEVEE's volume light (`point_radiance_get`) for area and sun lights.
 //!
+//! EEVEE's three renders are the committed macOS arm64 renders (`fixtures/native_oracle/eevee_macos/`; see its
+//! `MANIFEST.json`), not live renders, so the test has no platform term.
+//!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
 #[path = "common/blender_checked.rs"]
@@ -25,7 +28,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{error::Error, fs, path::Path};
+use std::{error::Error, path::Path};
 
 use native_oracle::{
     TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
@@ -33,11 +36,27 @@ use native_oracle::{
 };
 use potter_core::image::{ImageData, ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
-use serde_json::{Value, json};
+use serde_json::json;
 use tempfile::tempdir;
 
-/// Blender 5.2.2 EEVEE oracle: the scatterer with its light's factor, the saved `.blend`, and every pixel.
+/// The oracle's script: it saves each case's `.blend` and, given `-` for the render paths, stops before rendering.
 const EEVEE_SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_volume_factor.py");
+
+/// The three cases with their committed macOS arm64 EEVEE renders, as little-endian f32 RGB rows bottom-up.
+const EEVEE_RENDERS: [(&str, &[u8]); 3] = [
+    (
+        "volume_base",
+        include_bytes!("fixtures/native_oracle/eevee_macos/volume_volume_base.f32le"),
+    ),
+    (
+        "volume_zero",
+        include_bytes!("fixtures/native_oracle/eevee_macos/volume_volume_zero.f32le"),
+    ),
+    (
+        "volume_half",
+        include_bytes!("fixtures/native_oracle/eevee_macos/volume_volume_half.f32le"),
+    ),
+];
 
 const SIZE: u32 = 96;
 const ORTHO_SCALE: f64 = 3.0;
@@ -56,10 +75,8 @@ fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
     let script = write_script(root.path(), "eevee_volume_factor.py", EEVEE_SCRIPT)?;
     let mut eevee = Vec::new();
     let mut potter = Vec::new();
-    for case in ["volume_base", "volume_zero", "volume_half"] {
+    for (case, eevee_bytes) in EEVEE_RENDERS {
         let blend = root.path().join(format!("{case}.blend"));
-        let eevee_exr = root.path().join(format!("{case}.exr"));
-        let oracle_json = root.path().join(format!("{case}.json"));
         run_blender_arguments(
             &blender,
             &script,
@@ -67,12 +84,11 @@ fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
             &[
                 Path::new(case),
                 blend.as_path(),
-                eevee_exr.as_path(),
-                oracle_json.as_path(),
+                Path::new("-"),
+                Path::new("-"),
             ],
         )?;
-        let oracle: Value = serde_json::from_slice(&fs::read(&oracle_json)?)?;
-        eevee.push(oracle_values(&oracle)?);
+        eevee.push(eevee_red(eevee_bytes)?);
         let data = render_potter(&blender, root.path(), case, &blend)?;
         potter.push(plane_values(&data));
     }
@@ -110,20 +126,29 @@ fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
     Ok(())
 }
 
-/// Every pixel's red channel, in the oracle's row order. A volume is grey, so one channel carries it.
-fn oracle_values(oracle: &Value) -> Result<Vec<f64>, Box<dyn Error>> {
-    oracle["samples"]
-        .as_array()
-        .ok_or("the EEVEE samples are missing")?
-        .iter()
-        .map(|sample_value| {
-            sample_value["rgb"]
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(Value::as_f64)
-                .ok_or_else(|| "an RGB red channel is missing".into())
+/// The committed EEVEE render's red channel, one value per pixel in Blender's row order. A volume is grey, so one
+/// channel carries it.
+fn eevee_red(bytes: &[u8]) -> Result<Vec<f64>, Box<dyn Error>> {
+    let pixel_count = (SIZE * SIZE) as usize;
+    if bytes.len() != pixel_count * 12 {
+        return Err(format!(
+            "the EEVEE fixture holds {} bytes, expected {}",
+            bytes.len(),
+            pixel_count * 12
+        )
+        .into());
+    }
+    Ok((0..pixel_count)
+        .map(|pixel| {
+            let at = pixel * 12;
+            f64::from(f32::from_le_bytes([
+                bytes[at],
+                bytes[at + 1],
+                bytes[at + 2],
+                bytes[at + 3],
+            ]))
         })
-        .collect()
+        .collect())
 }
 
 /// Potter's red channel at the oracle's pixel centres, in the same order (row by row, bottom row first).

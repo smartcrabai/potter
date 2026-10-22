@@ -1,19 +1,24 @@
-//! Realtime Beauty transmission over a coloured, non-uniform world, against Blender 5.2.2's EEVEE with default settings.
+//! Realtime Beauty transmission over a coloured, non-uniform world, against Blender 5.2.2's EEVEE with default settings,
+//! on macOS arm64.
 //!
 //! `fixtures/native_oracle/eevee_glass_world.py` renders three glass spheres (IOR 1.45, Transmission 1) under an
 //! Environment Texture whose colour depends only on elevation: red-heavy at the top, blue-heavy at the bottom. The
 //! spheres are a clear one, a tinted one (Base Color (0.9, 0.5, 0.2)) and a rough one (Roughness 0.5). Off-centre pixels
 //! see the world at tilted directions, so the reflected and refracted probe directions, the sphere thickness and the
-//! probe's blur all decide them. The spheres are imported from the saved `.blend`, rendered by
-//! `pot render --engine realtime`, and every pixel whose centre lies within 0.75 of a sphere's radius is compared with
-//! EEVEE's pixel at the same UV.
+//! probe's blur all decide them. The spheres are imported from the `.blend` that the same script saves (its save-only
+//! mode, with `-` for the render paths; the environment EXR it writes is the one the `.blend` references), and
+//! `pot render --engine realtime` renders them.
 //!
-//! The tolerance is derived from the model (the Python mirror of `eevee_transmission.rs` over the same pixels): the
-//! median deviation of the clear and rough spheres is 0.0017 and 0.0026, and the worst is 0.0105 (clear) and 0.0099
-//! (rough). The worst pixels sit on a 5-bit truncation step of the probe's blue channel (a world value of 0.7498 is
-//! captured as 0.734), where EEVEE truncates its texels and the model truncates each sample, so the bound is that worst
-//! deviation rounded up to 0.0125. The same mirror with the probe straight through gives a worst deviation of 0.050, and
-//! with the single-event (thin) probe 0.035, so the bound separates a wrong probe direction from the truncation noise.
+//! EEVEE's pixels are the committed macOS arm64 render (`fixtures/native_oracle/eevee_macos/`, made by Blender 5.2.2 on
+//! macOS; see its `MANIFEST.json`), not a live render, so the test has no platform term. Every pixel whose centre lies
+//! within 0.75 of a sphere's radius is compared with the committed pixel at the same UV.
+//!
+//! The tolerance per sphere is the model bound alone: the largest deviation of the Python mirror of the transmission model
+//! over the world (`fixtures/native_oracle/eevee_glass_world_mirror.py`) from the committed render, rounded up. Those are
+//! clear 0.01049 (bound 1.1e-2), tinted 0.00233 (2.4e-3) and rough 0.00990 (1.0e-2). The worst pixels of the clear and
+//! rough spheres sit on a 5-bit truncation step of the probe's blue channel, where EEVEE and the model both truncate.
+//! The same mirror with the probe straight through gives a worst deviation of 0.050, and with the single-event (thin)
+//! probe 0.035, so the bounds separate a wrong probe direction from the truncation noise.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -28,7 +33,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{error::Error, fs};
+use std::{error::Error, path::Path};
 
 use native_oracle::{
     TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
@@ -36,21 +41,30 @@ use native_oracle::{
 };
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
-use serde_json::{Value, json};
+use serde_json::json;
 use tempfile::tempdir;
 
-/// Largest allowed deviation from EEVEE's pixel (see the module docs).
-const TOLERANCE: f64 = 1.25e-2;
-
-/// Blender 5.2.2 EEVEE oracle: the three spheres, the saved `.blend`, the environment EXR and the interior pixels.
+/// The oracle's script: it writes the environment EXR and saves the scene's `.blend`, then stops before rendering when
+/// the render paths are `-`.
 const EEVEE_SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_glass_world.py");
 
-/// The spheres, by the names `eevee_glass_transmission.py` writes into its JSON.
-const SPHERES: [&str; 3] = ["clear", "tinted", "rough"];
+/// The committed macOS arm64 EEVEE render, as little-endian f32 RGB (rows bottom-up, as Blender stores them).
+const EEVEE_WORLD: &[u8] = include_bytes!("fixtures/native_oracle/eevee_macos/glass_world.f32le");
+
+/// The spheres, as `eevee_glass_world.py` places them: name, centre X, and the largest allowed deviation from EEVEE's
+/// pixel (see the module docs: the model bound, rounded up).
+const SPHERES: [(&str, f64, f64); 3] = [
+    ("clear", -2.4, 1.1e-2),
+    ("tinted", 0.0, 2.4e-3),
+    ("rough", 2.4, 1.0e-2),
+];
 
 /// The render size and orthographic scale the oracle uses, so Potter's pixel grid is EEVEE's.
 const SIZE: u32 = 96;
 const ORTHO_SCALE: f64 = 7.6;
+
+/// The interior radius of a sphere, in units of its radius (`INTERIOR` in the oracle).
+const INTERIOR: f64 = 0.75;
 
 #[test]
 fn realtime_glass_world_transmission_matches_eevee() -> TestResult {
@@ -60,8 +74,6 @@ fn realtime_glass_world_transmission_matches_eevee() -> TestResult {
     let root = tempdir()?;
     let script = write_script(root.path(), "eevee_glass_world.py", EEVEE_SCRIPT)?;
     let blend = root.path().join("glass_world.blend");
-    let eevee_exr = root.path().join("eevee_glass_world.exr");
-    let oracle_json = root.path().join("eevee_glass_world.json");
     let environment = root.path().join("environment.exr");
     run_blender_arguments(
         &blender,
@@ -69,12 +81,11 @@ fn realtime_glass_world_transmission_matches_eevee() -> TestResult {
         None,
         &[
             blend.as_path(),
-            eevee_exr.as_path(),
-            oracle_json.as_path(),
+            Path::new("-"),
+            Path::new("-"),
             environment.as_path(),
         ],
     )?;
-    let oracle: Value = serde_json::from_slice(&fs::read(&oracle_json)?)?;
 
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let scene = read_scene(&project)?;
@@ -117,23 +128,68 @@ fn realtime_glass_world_transmission_matches_eevee() -> TestResult {
 
     let image: Image = serde_json::from_value(read_scene(&project)?["images"]["render"].clone())?;
     let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
-    for name in SPHERES {
-        let worst = worst_deviation(&data, &oracle["spheres"][name])?;
+    let eevee = eevee_rgb(EEVEE_WORLD)?;
+    // Every sphere is measured before any assertion, so one failure does not hide the others' numbers.
+    let mut results = Vec::new();
+    for (name, centre_x, tolerance) in SPHERES {
+        results.push((
+            name,
+            tolerance,
+            worst_deviation(&data, &eevee, sphere_centre_px(centre_x))?,
+        ));
+    }
+    for (name, tolerance, worst) in results {
         assert!(
-            worst.deviation <= TOLERANCE,
-            "{name} sphere: Potter realtime {:?} differs from EEVEE {:?} by {} at uv {:?} (tolerance {TOLERANCE})",
+            worst.max <= tolerance,
+            "{name} sphere: Potter realtime {:?} differs from EEVEE {:?} by {} at uv {:?} (tolerance {tolerance})",
             worst.actual,
             worst.wanted,
-            worst.deviation,
+            worst.max,
             worst.uv,
         );
     }
     Ok(())
 }
 
-/// The largest per-channel deviation of Potter's realtime pixels from EEVEE's over one sphere's interior samples.
+/// The committed EEVEE render's RGB values, one `[f64; 3]` per pixel in Blender's row order.
+fn eevee_rgb(bytes: &[u8]) -> Result<Vec<[f64; 3]>, Box<dyn Error>> {
+    let pixel_count = (SIZE * SIZE) as usize;
+    if bytes.len() != pixel_count * 12 {
+        return Err(format!(
+            "the EEVEE fixture holds {} bytes, expected {}",
+            bytes.len(),
+            pixel_count * 12
+        )
+        .into());
+    }
+    let channel = |index: usize| {
+        let at = index * 4;
+        f64::from(f32::from_le_bytes([
+            bytes[at],
+            bytes[at + 1],
+            bytes[at + 2],
+            bytes[at + 3],
+        ]))
+    };
+    Ok((0..pixel_count)
+        .map(|pixel| {
+            [
+                channel(pixel * 3),
+                channel(pixel * 3 + 1),
+                channel(pixel * 3 + 2),
+            ]
+        })
+        .collect())
+}
+
+/// A sphere's centre in pixels along X, as the oracle computes it: `(x + ORTHO_SCALE / 2) * SIZE / ORTHO_SCALE`.
+fn sphere_centre_px(centre_x: f64) -> f64 {
+    (centre_x + ORTHO_SCALE / 2.0) * f64::from(SIZE) / ORTHO_SCALE
+}
+
+/// The largest per-channel deviation of Potter's realtime pixels from EEVEE's over one sphere's interior pixels.
 struct Deviation {
-    deviation: f64,
+    max: f64,
     uv: [f64; 2],
     actual: [f64; 3],
     wanted: [f64; 3],
@@ -141,67 +197,50 @@ struct Deviation {
 
 fn worst_deviation(
     data: &potter_core::image::ImageData,
-    sphere: &Value,
+    eevee: &[[f64; 3]],
+    centre_px: f64,
 ) -> Result<Deviation, Box<dyn Error>> {
-    let samples = sphere["samples"]
-        .as_array()
-        .ok_or("the EEVEE samples are missing")?;
-    if samples.len() < 100 {
-        return Err(format!(
-            "only {} interior samples; the oracle needs more",
-            samples.len()
-        )
-        .into());
-    }
+    let size = f64::from(SIZE);
+    let scale = size / ORTHO_SCALE;
     let mut worst = Deviation {
-        deviation: 0.0,
+        max: 0.0,
         uv: [0.0; 2],
         actual: [0.0; 3],
         wanted: [0.0; 3],
     };
-    for sample_value in samples {
-        let uv = pair(&sample_value["uv"])?;
-        let wanted = triple(&sample_value["rgb"])?;
-        let rgba = sample(data, uv, false);
-        let actual = [rgba[0], rgba[1], rgba[2]];
-        let deviation = actual
-            .iter()
-            .zip(wanted)
-            .map(|(a, w)| (a - w).abs())
-            .fold(0.0_f64, f64::max);
-        if deviation > worst.deviation {
-            worst = Deviation {
-                deviation,
-                uv,
-                actual,
-                wanted,
-            };
+    let mut count = 0_usize;
+    for row in 0..SIZE {
+        for column in 0..SIZE {
+            let dx = (f64::from(column) + 0.5 - centre_px) / scale;
+            let dy = (f64::from(row) + 0.5 - size / 2.0) / scale;
+            if (dx * dx + dy * dy).sqrt() > INTERIOR {
+                continue;
+            }
+            count += 1;
+            let uv = [
+                (f64::from(column) + 0.5) / size,
+                (f64::from(row) + 0.5) / size,
+            ];
+            let wanted = eevee[(row * SIZE + column) as usize];
+            let rgba = sample(data, uv, false);
+            let actual = [rgba[0], rgba[1], rgba[2]];
+            let deviation = actual
+                .iter()
+                .zip(wanted)
+                .map(|(a, w)| (a - w).abs())
+                .fold(0.0_f64, f64::max);
+            if deviation > worst.max {
+                worst = Deviation {
+                    max: deviation,
+                    uv,
+                    actual,
+                    wanted,
+                };
+            }
         }
     }
+    if count < 100 {
+        return Err(format!("only {count} interior pixels; the oracle needs more").into());
+    }
     Ok(worst)
-}
-
-fn pair(value: &Value) -> Result<[f64; 2], Box<dyn Error>> {
-    let items = value.as_array().ok_or("a UV is not an array")?;
-    Ok([
-        items
-            .first()
-            .and_then(Value::as_f64)
-            .ok_or("UV u is missing")?,
-        items
-            .get(1)
-            .and_then(Value::as_f64)
-            .ok_or("UV v is missing")?,
-    ])
-}
-
-fn triple(value: &Value) -> Result<[f64; 3], Box<dyn Error>> {
-    let items = value.as_array().ok_or("an RGB is not an array")?;
-    let channel = |index: usize| {
-        items
-            .get(index)
-            .and_then(Value::as_f64)
-            .ok_or("an RGB channel is missing")
-    };
-    Ok([channel(0)?, channel(1)?, channel(2)?])
 }
