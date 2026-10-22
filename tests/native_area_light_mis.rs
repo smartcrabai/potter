@@ -43,7 +43,7 @@ const PATCH: [f64; 8] = [
 ];
 /// Samples per pixel and seeds, the same for Blender and Potter.
 const SAMPLES: u32 = 256;
-const SEEDS: u32 = 4;
+const SEEDS: u32 = 16;
 /// Standard errors of the combined means that the difference may span.
 const SIGMAS: f64 = 3.0;
 
