@@ -1779,6 +1779,7 @@ pub(super) fn mask(
         source_vertices: None,
         faces: face_origins,
         corners: Some(corner_origins),
+        ..Default::default()
     };
     build_mesh(points, polygons, edges, &origin, mesh)
 }
