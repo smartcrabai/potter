@@ -1751,29 +1751,154 @@ pub fn import_blend(file: &Path, blender: Option<&Path>) -> Result<ImportedGraph
                 return Err(PotError::io(&error));
             }
         };
-        let mut native_bindings =
-            super::blend_dna::read_modifier_bindings(&original).map_err(|error| {
-                PotError::with_details(
-                    ErrorCode::ImportFailed,
-                    format!("could not read native Blender modifier bind data: {error}"),
-                    json!({"file": file.display().to_string()}),
-                )
-            })?;
-        let mut native_multires = super::blend_dna::read_multires_displacements(&original)
-            .map_err(|error| {
-                PotError::with_details(
-                    ErrorCode::ImportFailed,
-                    format!("could not read native Blender multires data: {error}"),
-                    json!({"file": file.display().to_string()}),
-                )
-            })?;
+        let native_metadata = super::blend_dna::read_native_metadata(&original).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                format!("could not read native Blender modifier, multires, and Bake metadata: {error}"),
+                json!({"file": file.display().to_string()}),
+            )
+        })?;
+        let mut native_bindings = native_metadata.modifier_bindings;
+        let mut native_multires = native_metadata.multires_displacements;
         load_external_multires(&raw, &mut native_multires, file)?;
         attach_native_multires(&mut raw, &mut native_multires)?;
         attach_native_target_vertices(&mut raw, &mut native_bindings)?;
+        attach_native_packed_bake_states(&mut raw, file, &native_metadata.node_bakes)?;
         build_imported_graph(&raw, file, original, &native_bindings)
     })();
     cleanup(&[script, output]);
     operation
+}
+
+fn attach_native_packed_bake_states(
+    raw: &mut Value,
+    main_file: &Path,
+    main_states: &super::blend_dna::NativeBakeStates,
+) -> Result<()> {
+    let main_source = fs::canonicalize(main_file).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::ImportFailed,
+            "could not resolve the Blender source file for packed Bake metadata",
+            json!({"file":main_file.display().to_string(),"cause":error.to_string()}),
+        )
+    })?;
+    let Some(objects) = raw.get("objects").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut states_by_source = BTreeMap::from([(main_source.clone(), main_states.clone())]);
+    let mut library_sources = BTreeSet::new();
+    for modifier in objects
+        .iter()
+        .filter_map(|object| object.get("modifiers").and_then(Value::as_array))
+        .flatten()
+    {
+        let Some(bake_losses) = modifier.get("bake_losses") else {
+            continue;
+        };
+        let bake_ids = bake_losses
+            .get("bake_ids")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_intermediate("node-bake IDs are missing from bake metadata"))?;
+        if bake_ids.is_empty() {
+            continue;
+        }
+        let source_file = bake_losses
+            .get("source_file")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_intermediate("Bake source-file identity is missing"))?;
+        let source = fs::canonicalize(source_file).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                "could not resolve Blender library source for packed Bake metadata",
+                json!({"file":source_file,"cause":error.to_string()}),
+            )
+        })?;
+        if source != main_source {
+            library_sources.insert(source);
+        }
+    }
+    for source in library_sources {
+        let bytes = fs::read(&source).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                "could not read Blender library for packed Bake metadata",
+                json!({"file":source.display().to_string(),"cause":error.to_string()}),
+            )
+        })?;
+        let states = super::blend_dna::read_node_bake_states(&bytes).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                format!("could not read Blender library Bake metadata: {error}"),
+                json!({"file":source.display().to_string()}),
+            )
+        })?;
+        states_by_source.insert(source, states);
+    }
+
+    let Some(objects) = raw.get_mut("objects").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for modifier in objects
+        .iter_mut()
+        .filter_map(|object| object.get_mut("modifiers").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let Some(bake_losses) = modifier
+            .get_mut("bake_losses")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let bake_ids = bake_losses
+            .get("bake_ids")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_intermediate("node-bake IDs are missing from bake metadata"))?;
+        let mut packed_payloads = Vec::new();
+        if !bake_ids.is_empty() {
+            let source_file = bake_losses
+                .get("source_file")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_intermediate("Bake source-file identity is missing"))?;
+            let source = fs::canonicalize(source_file).map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    "could not resolve Blender source for packed Bake metadata",
+                    json!({"file":source_file,"cause":error.to_string()}),
+                )
+            })?;
+            let states = states_by_source
+                .get(&source)
+                .ok_or_else(|| invalid_intermediate("Bake source state was not indexed"))?;
+            let owner_name = bake_losses
+                .get("owner_name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_intermediate("Bake owner identity is missing"))?;
+            let modifier_name = modifier
+                .get("blender_name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_intermediate("Blender modifier name is missing"))?;
+            for (node_name, raw_id) in bake_ids {
+                let bake_id = raw_id
+                    .as_i64()
+                    .and_then(|id| i32::try_from(id).ok())
+                    .ok_or_else(|| invalid_intermediate("Bake ID is invalid"))?;
+                let key = (owner_name.to_owned(), modifier_name.to_owned(), bake_id);
+                if !states.bake_ids.contains(&key) {
+                    return Err(PotError::with_details(
+                        ErrorCode::ImportFailed,
+                        "Blender Bake IDs differ between RNA and serialized SDNA",
+                        json!({"file":source.display().to_string(),"object":owner_name,
+                            "modifier":modifier_name,"node":node_name,"bake_id":bake_id}),
+                    ));
+                }
+                if states.packed.contains(&key) {
+                    packed_payloads.push(node_name.clone());
+                }
+            }
+        }
+        bake_losses.insert("packed_payloads".to_owned(), json!(packed_payloads));
+    }
+    Ok(())
 }
 
 fn attach_native_target_vertices(
@@ -9403,9 +9528,8 @@ fn rekey_nodes_bakes(params: &mut Map<String, Value>, group: &NodeGroup) {
     params.insert("bakes".to_owned(), Value::Object(rekeyed));
 }
 
-/// Facts the bridge reports for a Geometry Nodes modifier's Blender bakes. Data-block references are not remapped by
-/// Potter. Since Blender exposes no RNA for `NodesModifierBake.packed`, the bridge inspects each bake in a disposable
-/// Blender process and reports only packed entries with metadata files.
+/// Facts from Blender's modifier and validated SDNA metadata for Bake nodes. Data-block references are not remapped by
+/// Potter; packed state is matched by source library, object, modifier, and the nested node ID.
 fn nodes_bake_import_losses(modifier: &Value) -> Vec<Loss> {
     let name = modifier.get("name").and_then(Value::as_str);
     let mut losses = Vec::new();

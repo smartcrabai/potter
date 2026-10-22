@@ -11,7 +11,6 @@ import ctypes
 import json
 import math
 import os
-import subprocess
 import shutil
 import sys
 import tempfile
@@ -1569,98 +1568,6 @@ def _nodes_bake_potter_id(bake):
     return potter_id if isinstance(potter_id, str) else None
 
 
-_NODE_BAKE_PACKED_PAYLOADS = None
-
-
-def _node_bake_packed_payloads():
-    """Probe packed state in a disposable Blender process; `bake.packed` has no RNA."""
-    global _NODE_BAKE_PACKED_PAYLOADS
-    if _NODE_BAKE_PACKED_PAYLOADS is not None:
-        return _NODE_BAKE_PACKED_PAYLOADS
-    if not bpy.data.filepath:
-        raise ValueError("Cannot inspect packed Bake data for an unsaved Blender file")
-    script = r"""
-import bpy, json
-packed = []
-for obj in list(bpy.data.objects):
-    for modifier in list(obj.modifiers):
-        if modifier.type != "NODES":
-            continue
-        for bake in modifier.bakes:
-            if bake.node is None:
-                continue
-            key = (obj.name, modifier.name, bake.node.name)
-            # The operator polls for an editable active object; use an unhidden local copy.
-            probe_obj = obj.copy()
-            bpy.context.scene.collection.objects.link(probe_obj)
-            if bpy.data.objects.get(probe_obj.name) is None or probe_obj.library is not None:
-                raise RuntimeError("copied Bake object is not linked and local")
-            probe_obj.hide_viewport = False
-            probe_obj.hide_render = False
-            probe_obj.hide_set(False)
-            try:
-                probe_modifier = probe_obj.modifiers.get(modifier.name)
-                if probe_modifier is None or probe_modifier.id_data.name != probe_obj.name:
-                    raise RuntimeError("copied object has no valid node modifier")
-                probe_bake = next(
-                    (entry for entry in probe_modifier.bakes if entry.bake_id == bake.bake_id),
-                    None)
-                if (probe_bake is None or probe_bake.node is None
-                        or probe_bake.node.name != bake.node.name):
-                    raise RuntimeError("copied modifier has no matching Bake node")
-                with bpy.context.temp_override(
-                        object=probe_obj,
-                        active_object=probe_obj,
-                        selected_objects=[probe_obj],
-                        selected_editable_objects=[probe_obj]):
-                    if not bpy.ops.object.geometry_node_bake_unpack_single.poll():
-                        raise RuntimeError("copied Bake object is not editable in Blender context")
-                    # PF_REMOVE frees only the copy's packed state and never writes packed member paths.
-                    result = bpy.ops.object.geometry_node_bake_unpack_single(
-                        session_uid=probe_obj.session_uid,
-                        modifier_name=probe_modifier.name,
-                        bake_id=probe_bake.bake_id,
-                        method="REMOVE")
-                if result == {"FINISHED"}:
-                    packed.append(key)
-                elif result != {"CANCELLED"}:
-                    raise RuntimeError("unexpected Bake payload probe result: %s" % result)
-            finally:
-                bpy.data.objects.remove(probe_obj, do_unlink=True)
-print("POTTER_PACKED_BAKES=" + json.dumps(packed))
-"""
-    output = subprocess.run(
-        [
-            bpy.app.binary_path,
-            "-b",
-            "--disable-autoexec",
-            bpy.data.filepath,
-            "--python-exit-code",
-            "1",
-            "--python-expr",
-            script,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if output.returncode != 0:
-        raise ValueError("Blender packed-bake inspection failed: %s" % output.stderr)
-    errors = [
-        line for line in (output.stdout + "\n" + output.stderr).splitlines()
-        if line.startswith("Error:")
-    ]
-    if errors:
-        raise ValueError("Blender packed-bake inspection failed: %s" % "; ".join(errors))
-    result = next(
-        (line[len("POTTER_PACKED_BAKES:"):] for line in output.stdout.splitlines()
-         if line.startswith("POTTER_PACKED_BAKES:")),
-        None,
-    )
-    if result is None:
-        raise ValueError("Blender packed-bake inspection returned no state")
-    _NODE_BAKE_PACKED_PAYLOADS = {tuple(entry) for entry in json.loads(result)}
-    return _NODE_BAKE_PACKED_PAYLOADS
 
 
 
@@ -1670,12 +1577,17 @@ def _nodes_bakes_dump(modifier):
     The name is the key because it exists on every node, including nodes of files Potter did not write. Names are
     unique within a node tree; the importer maps each name to the imported node ID."""
     bakes = {}
-    packed_payloads = []
+    bake_ids = {}
     data_blocks = []
     unmapped = []
+    owner = modifier.id_data
+    library = owner.library
+    source_file = _library_resolved_path(library) if library else bpy.path.abspath(bpy.data.filepath)
     for bake in modifier.bakes:
         if bake.node is None:
-            unmapped.append("bake %d" % bake.bake_id)
+            unmapped_name = "bake %d" % bake.bake_id
+            unmapped.append(unmapped_name)
+            bake_ids[unmapped_name] = int(bake.bake_id)
             continue
         node_name = bake.node.name
         bakes[node_name] = {
@@ -1687,12 +1599,13 @@ def _nodes_bakes_dump(modifier):
             "frame_start": int(bake.frame_start),
             "frame_end": int(bake.frame_end),
         }
-        if (modifier.id_data.name, modifier.name, node_name) in _node_bake_packed_payloads():
-            packed_payloads.append(node_name)
+        bake_ids[node_name] = int(bake.bake_id)
         if len(bake.data_blocks):
             data_blocks.append(node_name)
     return bakes, {
-        "packed_payloads": packed_payloads,
+        "owner_name": owner.name,
+        "source_file": source_file,
+        "bake_ids": bake_ids,
         "data_blocks": data_blocks,
         "unmapped": unmapped,
     }

@@ -1840,6 +1840,7 @@ with bpy.data.libraries.load(library, link=False) as (data_from, data_to):
     data_to.objects = ["Cube"]
 local = data_to.objects[0]
 bpy.context.scene.collection.objects.link(local)
+assert local.library is None
 local.name = "HiddenLocalBake"
 local.hide_viewport = True
 local.hide_set(True)
@@ -1847,6 +1848,7 @@ with bpy.data.libraries.load(library, link=True) as (data_from, data_to):
     data_to.objects = ["Cube"]
 linked = data_to.objects[0]
 bpy.context.scene.collection.objects.link(linked)
+assert linked.library is not None
 bpy.ops.wm.save_as_mainfile(filepath=blend)
 "#;
     run_ok(

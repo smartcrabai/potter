@@ -1,6 +1,6 @@
 use std::io::Read;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     mem::size_of,
 };
 
@@ -53,43 +53,63 @@ fn json_grid_sample_count(raw: Option<&Value>) -> Result<u128, String> {
         })
 }
 
-/// Read native bound-data fields from Blender's serialized modifier structs.
-///
-/// Pointer-valued members in the returned JSON retain their serialized old-address value;
-/// pointers to bind payload arrays are expanded in place to native JSON arrays.
-pub(crate) fn read_modifier_bindings(
-    bytes: &[u8],
-) -> Result<BTreeMap<(String, String), Value>, String> {
-    let decompressed;
-    let bytes = if bytes.starts_with(b"BLENDER") {
-        bytes
-    } else if bytes.starts_with(&ZSTD_MAGIC) {
-        decompressed = decompress_blend(bytes)?;
-        decompressed.as_slice()
-    } else {
-        return Err("input is neither a Blender file nor a zstd-compressed Blender file".into());
-    };
-
-    let file = BlendFile::parse(bytes)?;
-    file.read_bindings()
+#[derive(Clone)]
+pub(crate) struct NativeBakeStates {
+    pub(crate) bake_ids: BTreeSet<(String, String, i32)>,
+    pub(crate) packed: BTreeSet<(String, String, i32)>,
 }
+
+pub(crate) struct NativeBlendMetadata {
+    pub(crate) modifier_bindings: BTreeMap<(String, String), Value>,
+    pub(crate) multires_displacements: BTreeMap<String, Value>,
+    pub(crate) node_bakes: NativeBakeStates,
+}
+
+/// Parse the main file's native import metadata from one checked SDNA/BHead pass.
+pub(crate) fn read_native_metadata(bytes: &[u8]) -> Result<NativeBlendMetadata, String> {
+    with_blend_bytes(bytes, |bytes| {
+        let file = BlendFile::parse(bytes)?;
+        let (modifier_bindings, bake_ids, packed) = file.read_modifier_metadata(true)?;
+        Ok(NativeBlendMetadata {
+            modifier_bindings,
+            multires_displacements: file.read_multires_displacements()?,
+            node_bakes: NativeBakeStates { bake_ids, packed },
+        })
+    })
+}
+
+/// Read Bake IDs from a source library file using its own SDNA schema.
+pub(crate) fn read_node_bake_states(bytes: &[u8]) -> Result<NativeBakeStates, String> {
+    with_blend_bytes(bytes, |bytes| {
+        let file = BlendFile::parse(bytes)?;
+        file.read_modifier_metadata(false)
+            .map(|(_, bake_ids, packed)| NativeBakeStates { bake_ids, packed })
+    })
+}
+
+fn with_blend_bytes<T>(
+    bytes: &[u8],
+    read: impl FnOnce(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    if bytes.starts_with(b"BLENDER") {
+        read(bytes)
+    } else if bytes.starts_with(&ZSTD_MAGIC) {
+        let decompressed = decompress_blend(bytes)?;
+        read(&decompressed)
+    } else {
+        Err("input is neither a Blender file nor a zstd-compressed Blender file".into())
+    }
+}
+
 /// Read native Mesh corner displacement layers from Blender DNA.
 ///
 /// Results are keyed by Blender Mesh datablock name. Blender 5.2 stores corner data in
 /// `corner_data`, and `face_offset_indices` maps face order to corner ranges; face `i` becomes
 /// Potter face ID `f{i + 1}`.
 pub(crate) fn read_multires_displacements(bytes: &[u8]) -> Result<BTreeMap<String, Value>, String> {
-    let decompressed;
-    let bytes = if bytes.starts_with(b"BLENDER") {
-        bytes
-    } else if bytes.starts_with(&ZSTD_MAGIC) {
-        decompressed = decompress_blend(bytes)?;
-        decompressed.as_slice()
-    } else {
-        return Err("input is neither a Blender file nor a zstd-compressed Blender file".into());
-    };
-
-    BlendFile::parse(bytes)?.read_multires_displacements()
+    with_blend_bytes(bytes, |bytes| {
+        BlendFile::parse(bytes)?.read_multires_displacements()
+    })
 }
 /// Patch Blender's already-allocated `MDisps`, `GridPaintMask`, and hidden buffers in place.
 ///
@@ -1175,7 +1195,17 @@ impl<'a> BlendFile<'a> {
         })
     }
 
-    fn read_bindings(&self) -> Result<BTreeMap<(String, String), Value>, String> {
+    fn read_modifier_metadata(
+        &self,
+        include_bindings: bool,
+    ) -> Result<
+        (
+            BTreeMap<(String, String), Value>,
+            BTreeSet<(String, String, i32)>,
+            BTreeSet<(String, String, i32)>,
+        ),
+        String,
+    > {
         let Some(object_struct) = self.schema.struct_index("Object") else {
             return Err("Blender DNA schema does not contain Object".into());
         };
@@ -1185,6 +1215,8 @@ impl<'a> BlendFile<'a> {
             ("LaplacianDeformModifierData", ModifierKind::Laplacian),
         ];
         let mut output = BTreeMap::new();
+        let mut node_bake_ids = BTreeSet::new();
+        let mut packed_node_bakes = BTreeSet::new();
         for block in &self.blocks {
             if block.sdna_index >= self.schema.structs.len()
                 || self.schema.structs[block.sdna_index].type_index
@@ -1274,7 +1306,19 @@ impl<'a> BlendFile<'a> {
                     let type_name = self.schema.type_names
                         [self.schema.structs[modifier_struct].type_index]
                         .as_str();
-                    let payload = if type_name == "CorrectiveSmoothModifierData" {
+                    if type_name == "NodesModifierData" {
+                        self.append_packed_node_bake_states(
+                            &object_name,
+                            &modifier_name,
+                            modifier_struct,
+                            modifier_offset,
+                            &mut node_bake_ids,
+                            &mut packed_node_bakes,
+                        )?;
+                    }
+                    let payload = if !include_bindings {
+                        None
+                    } else if type_name == "CorrectiveSmoothModifierData" {
                         self.read_corrective_payload(modifier_struct, modifier_offset)?
                     } else if let Some((_, kind)) = modifier_structs
                         .iter()
@@ -1317,7 +1361,192 @@ impl<'a> BlendFile<'a> {
                 }
             }
         }
-        Ok(output)
+        Ok((output, node_bake_ids, packed_node_bakes))
+    }
+
+    fn append_packed_node_bake_states(
+        &self,
+        object_name: &str,
+        modifier_name: &str,
+        modifier_struct: usize,
+        modifier_offset: usize,
+        bake_ids: &mut BTreeSet<(String, String, i32)>,
+        packed_node_bakes: &mut BTreeSet<(String, String, i32)>,
+    ) -> Result<(), String> {
+        let Some(bake_count) = self.schema.integer_at_path(
+            self.bytes,
+            modifier_struct,
+            modifier_offset,
+            &["bakes_num"],
+            self.header.endian,
+        )?
+        else {
+            return Ok(());
+        };
+        if bake_count < 0 {
+            return Err("Blender node modifier has a negative bake count".into());
+        }
+        let bake_count =
+            usize::try_from(bake_count).map_err(|_| "Blender bake count exceeds limits")?;
+        if bake_count > MAX_ARRAY_ELEMENTS {
+            return Err("Blender node modifier bake count exceeds limits".into());
+        }
+        if bake_count == 0 {
+            return Ok(());
+        }
+        let bake_pointer = self.schema.pointer_at_path(
+            self.bytes,
+            modifier_struct,
+            modifier_offset,
+            &["bakes"],
+            self.header.endian,
+            self.header.pointer_size,
+        )?;
+        let bake_struct = self
+            .schema
+            .struct_index("NodesModifierBake")
+            .ok_or_else(|| "Blender DNA schema has no NodesModifierBake".to_owned())?;
+        let bakes = self.read_checked_struct_array(bake_pointer, bake_count, bake_struct)?;
+        for bake in bakes {
+            let raw_bake_id = bake
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| "Blender node-bake ID is invalid".to_owned())?;
+            let bake_id =
+                i32::try_from(raw_bake_id).map_err(|_| "Blender node-bake ID exceeds i32")?;
+            let key = (object_name.to_owned(), modifier_name.to_owned(), bake_id);
+            if !bake_ids.insert(key.clone()) {
+                return Err("duplicate Blender node-bake ID for an object modifier".into());
+            }
+            if bake_ids.len() > MAX_BOUND_MODIFIERS {
+                return Err("Blender node-bake ID result exceeds the entry limit".into());
+            }
+            let packed_pointer = bake
+                .get("packed")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "Blender packed-bake pointer is invalid".to_owned())?;
+            if packed_pointer == 0 {
+                continue;
+            }
+            let packed_struct = self
+                .schema
+                .struct_index("NodesModifierPackedBake")
+                .ok_or_else(|| "Blender DNA schema has no NodesModifierPackedBake".to_owned())?;
+            let packed = self.read_checked_struct_array(packed_pointer, 1, packed_struct)?;
+            let packed = &packed[0];
+            let meta_count = packed
+                .get("meta_files_num")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| "Blender packed-bake metadata count is invalid".to_owned())?;
+            if meta_count < 0 {
+                return Err("Blender packed-bake metadata count is negative".into());
+            }
+            let meta_count = usize::try_from(meta_count)
+                .map_err(|_| "Blender packed-bake metadata count exceeds limits")?;
+            if meta_count > MAX_ARRAY_ELEMENTS {
+                return Err("Blender packed-bake metadata count exceeds limits".into());
+            }
+            // Blender's `try_find_baked_data` treats a packed record without metadata files as empty.
+            if meta_count == 0 {
+                continue;
+            }
+            let meta_pointer = packed
+                .get("meta_files")
+                .and_then(Value::as_u64)
+                .filter(|pointer| *pointer != 0)
+                .ok_or_else(|| "Blender packed-bake metadata pointer is null".to_owned())?;
+            let bake_file_struct = self
+                .schema
+                .struct_index("NodesModifierBakeFile")
+                .ok_or_else(|| "Blender DNA schema has no NodesModifierBakeFile".to_owned())?;
+            if self
+                .schema
+                .field(bake_file_struct, "packed_file")
+                .is_none_or(|field| !field.pointer)
+            {
+                return Err("Blender DNA bake file has no packed_file pointer".into());
+            }
+            let meta_files =
+                self.read_checked_struct_array(meta_pointer, meta_count, bake_file_struct)?;
+            let packed_file_struct = self
+                .schema
+                .struct_index("PackedFile")
+                .ok_or_else(|| "Blender DNA schema has no PackedFile".to_owned())?;
+            let mut has_metadata_bytes = false;
+            for meta_file in meta_files {
+                let packed_file_pointer = meta_file
+                    .get("packed_file")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "Blender packed-bake file pointer is invalid".to_owned())?;
+                if packed_file_pointer == 0 {
+                    continue;
+                }
+                let packed_file =
+                    self.read_checked_struct_array(packed_file_pointer, 1, packed_file_struct)?;
+                let packed_file = &packed_file[0];
+                let size = packed_file
+                    .get("size")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "Blender packed-file size is invalid".to_owned())?;
+                if size < 0 {
+                    return Err("Blender packed-file size is negative".into());
+                }
+                let size =
+                    usize::try_from(size).map_err(|_| "Blender packed-file size exceeds limits")?;
+                if size == 0 {
+                    continue;
+                }
+                let data_pointer = packed_file
+                    .get("data")
+                    .and_then(Value::as_u64)
+                    .filter(|pointer| *pointer != 0)
+                    .ok_or_else(|| "Blender packed-file data pointer is null".to_owned())?;
+                self.resolve(data_pointer, size)?;
+                has_metadata_bytes = true;
+            }
+            if !has_metadata_bytes {
+                continue;
+            }
+            if packed_node_bakes.len() >= MAX_BOUND_MODIFIERS {
+                return Err("Blender packed Bake result exceeds the entry limit".into());
+            }
+            packed_node_bakes.insert(key);
+        }
+        Ok(())
+    }
+
+    fn read_checked_struct_array(
+        &self,
+        pointer: u64,
+        count: usize,
+        struct_index: usize,
+    ) -> Result<Vec<Value>, String> {
+        if count > MAX_ARRAY_ELEMENTS {
+            return Err("Blender structure array exceeds the element limit".into());
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let size = self
+            .schema
+            .structs
+            .get(struct_index)
+            .ok_or_else(|| "Blender structure index is invalid".to_owned())?
+            .size;
+        if size == 0 {
+            return Err("zero-sized Blender structure array element".into());
+        }
+        let byte_count = size
+            .checked_mul(count)
+            .ok_or_else(|| "Blender structure array byte size overflow".to_owned())?;
+        let (block, offset) = self.resolve(pointer, byte_count)?;
+        if block.sdna_index != struct_index {
+            return Err("Blender structure array has a mismatched SDNA type".into());
+        }
+        if (offset - block.data_offset) % size != 0 {
+            return Err("Blender structure-array pointer is misaligned".into());
+        }
+        self.read_struct_array(pointer, count, struct_index)
     }
 
     fn read_multires_displacements(&self) -> Result<BTreeMap<String, Value>, String> {
