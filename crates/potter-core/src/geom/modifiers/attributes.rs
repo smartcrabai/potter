@@ -772,12 +772,10 @@ fn cache_frame_at_time(
     Ok(cache_float(f64::from(lower)) + (time - previous_time) / range)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Blender stores Mesh Cache times and selection factors as f32"
-)]
+/// Blender stores Mesh Cache times and selection factors as f32. Every caller passes a count or a time that
+/// fits, so the narrowing is the rounding Blender applies; an out-of-range value would be NaN here.
 fn cache_float(value: f64) -> f32 {
-    value as f32
+    num_traits::ToPrimitive::to_f32(&value).unwrap_or(f32::NAN)
 }
 
 fn select_cache_frame(frame: f32, count: usize, interpolate: bool) -> (usize, usize, f32) {
@@ -786,12 +784,8 @@ fn select_cache_frame(frame: f32, count: usize, interpolate: bool) -> (usize, us
     let frame = frame.clamp(0.0, last_frame);
     let floor = frame.floor();
     let index_frame = if interpolate { floor } else { frame.round() };
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the finite, clamped cache frame is bounded by its signed 32-bit file header"
-    )]
-    let first = index_frame as usize;
+    // `frame` is clamped to `[0, last_frame]`, so `index_frame` is finite and non-negative and always converts.
+    let first = num_traits::ToPrimitive::to_usize(&index_frame).unwrap_or(last_index);
     if !interpolate || first == last_index {
         return (first, first, 0.0);
     }

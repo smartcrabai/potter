@@ -595,7 +595,7 @@ fn upgrade_v6(value: &mut Value) {
     value["schema_version"] = json!(7);
 }
 
-/// Upgrades a schema-version-7 scene document to version 8. Mesh Sequence Cache's CacheFile fields moved from the
+/// Upgrades a schema-version-7 scene document to version 8. `mesh_sequence_cache`'s `CacheFile` fields moved from the
 /// referenced resource's `cache_file` record into the modifier params: `is_sequence`, `velocity_name` and
 /// `velocity_unit` are copied from it when the params do not already set them. The `scale` param is removed, since
 /// Blender applies `CacheFile.scale` only through a Transform Cache constraint.
@@ -1807,7 +1807,7 @@ mod tests {
         assert_eq!(scene, before);
     }
 
-    /// Schema 7 kept a Mesh Sequence Cache's CacheFile fields on the resource and an unused `scale` param on the
+    /// Schema 7 kept a Mesh Sequence Cache's `CacheFile` fields on the resource and an unused `scale` param on the
     /// modifier. The upgrade copies the fields into the params (an explicit param wins), drops `scale`, and leaves
     /// other modifier types alone.
     #[test]
@@ -1873,7 +1873,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 7);
+        assert_eq!(parsed.doc.schema_version, 8);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -1962,7 +1962,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(7);
+        expected["schema_version"] = json!(8);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -2000,7 +2000,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 7);
+        assert_eq!(migrated.schema_version, 8);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -2504,7 +2504,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 7);
+        assert_eq!(record.snapshot.schema_version, 8);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -2571,7 +2571,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 7);
+        assert_eq!(record.snapshot.schema_version, 8);
         let history_mesh = record
             .snapshot
             .data_blocks

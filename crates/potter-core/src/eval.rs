@@ -3227,21 +3227,13 @@ pub(crate) fn read_cache_sequence_resource(
     project_root: Option<&Path>,
     requested_frame: f64,
 ) -> Result<CacheSequenceRead> {
-    if !requested_frame.is_finite()
-        || requested_frame.trunc() < f64::from(i32::MIN)
-        || requested_frame.trunc() > f64::from(i32::MAX)
-    {
-        return Err(PotError::with_details(
+    let frame = num_traits::ToPrimitive::to_i32(&requested_frame.trunc()).ok_or_else(|| {
+        PotError::with_details(
             ErrorCode::InvalidArgument,
             "Mesh Sequence Cache frame is outside int32 sequence range",
             json!({"frame":requested_frame}),
-        ));
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the finite frame has been checked against the int32 range"
-    )]
-    let frame = requested_frame.trunc() as i32;
+        )
+    })?;
     let uri = resource
         .get("uri")
         .and_then(Value::as_str)

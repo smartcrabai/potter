@@ -1,9 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fs::{self, OpenOptions},
-    io::Write,
-    path::PathBuf,
-};
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use serde_json::{Map, Value, json};
 
@@ -495,128 +490,19 @@ fn unpack_sequence(
     Ok(true)
 }
 
+/// Writes each unpacked frame, as `unpack` writes a single file: the parent folder is created and each frame is written
+/// with `fs::write`. A failure stops at that frame; frames already written are left in place.
 fn publish_sequence_outputs(outputs: &[(PathBuf, Vec<u8>)]) -> Result<()> {
-    let parent = outputs
-        .first()
-        .and_then(|(path, _)| path.parent())
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| PotError::io(&error))?;
-    let staging = parent.join(format!(".potter-sequence-unpack-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&staging).map_err(|error| PotError::io(&error))?;
-    let mut preserve_staging = false;
-    let result = (|| -> Result<()> {
-        let mut staged = Vec::with_capacity(outputs.len());
-        for (index, (_, bytes)) in outputs.iter().enumerate() {
-            let path = staging.join(format!("frame-{index}.tmp"));
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|error| PotError::io(&error))?;
-            file.write_all(bytes)
-                .and_then(|()| file.sync_all())
-                .map_err(|error| PotError::io(&error))?;
-            staged.push(path);
-        }
-
-        let mut published = Vec::<(PathBuf, Option<PathBuf>, bool)>::with_capacity(outputs.len());
-        for (index, (destination, _)) in outputs.iter().enumerate() {
-            let backup = match fs::symlink_metadata(destination) {
-                Ok(metadata) if metadata.is_file() => {
-                    let backup = staging.join(format!("backup-{index}"));
-                    if let Err(error) = fs::rename(destination, &backup) {
-                        let rollback_errors = rollback_sequence_outputs(&published);
-                        preserve_staging = !rollback_errors.is_empty();
-                        return Err(PotError::with_details(
-                            ErrorCode::IoError,
-                            error.to_string(),
-                            json!({
-                                "path":destination,
-                                "rollback_errors":rollback_errors,
-                                "staging_path":staging,
-                            }),
-                        ));
-                    }
-                    Some(backup)
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Ok(_) => {
-                    let rollback_errors = rollback_sequence_outputs(&published);
-                    preserve_staging = !rollback_errors.is_empty();
-                    return Err(PotError::with_details(
-                        ErrorCode::InvalidArgument,
-                        "sequence unpack destination changed to a non-file during publication",
-                        json!({
-                            "path":destination,
-                            "rollback_errors":rollback_errors,
-                            "staging_path":staging,
-                        }),
-                    ));
-                }
-                Err(error) => {
-                    let rollback_errors = rollback_sequence_outputs(&published);
-                    preserve_staging = !rollback_errors.is_empty();
-                    return Err(PotError::with_details(
-                        ErrorCode::IoError,
-                        error.to_string(),
-                        json!({
-                            "path":destination,
-                            "rollback_errors":rollback_errors,
-                            "staging_path":staging,
-                        }),
-                    ));
-                }
-            };
-            published.push((destination.clone(), backup, false));
-            if let Err(error) = fs::rename(&staged[index], destination) {
-                let rollback_errors = rollback_sequence_outputs(&published);
-                preserve_staging = !rollback_errors.is_empty();
-                return Err(PotError::with_details(
-                    ErrorCode::IoError,
-                    error.to_string(),
-                    json!({
-                        "path":destination,
-                        "rollback_errors":rollback_errors,
-                        "staging_path":staging,
-                    }),
-                ));
-            }
-            if let Some((_, _, was_published)) = published.last_mut() {
-                *was_published = true;
-            }
-        }
-        if let Ok(directory) = fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
-        Ok(())
-    })();
-    if !preserve_staging {
-        let _ = fs::remove_dir_all(&staging);
-    }
-    result
-}
-
-fn rollback_sequence_outputs(published: &[(PathBuf, Option<PathBuf>, bool)]) -> Vec<String> {
-    let mut errors = Vec::new();
-    for (destination, backup, was_published) in published.iter().rev() {
-        if *was_published
-            && let Err(error) = fs::remove_file(destination)
-            && error.kind() != std::io::ErrorKind::NotFound
+    for (path, bytes) in outputs {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
         {
-            errors.push(format!("remove {}: {error}", destination.display()));
+            fs::create_dir_all(parent).map_err(|error| PotError::io_at(&error, parent))?;
         }
-        if let Some(backup) = backup
-            && let Err(error) = fs::rename(backup, destination)
-        {
-            errors.push(format!(
-                "restore {} from {}: {error}",
-                destination.display(),
-                backup.display()
-            ));
-        }
+        fs::write(path, bytes).map_err(|error| PotError::io_at(&error, path))?;
     }
-    errors
+    Ok(())
 }
 
 fn resolve_path(uri: &str) -> PathBuf {
