@@ -2565,7 +2565,7 @@ fn glass_environment(
     )?;
     // TEMPORARY DIAGNOSTIC (remove with the glass_world investigation): the rough sphere's centre pixel of the glass world
     // test, identified by its reflection direction (about (-0.118, 0.073, 0.990) for uv (0.807, 0.505)).
-    if closures.reflection_roughness == 0.5
+    if (closures.reflection_roughness - 0.5).abs() < 1.0e-9
         && (closures.reflection_direction - DVec3::new(-0.1184, 0.0726, 0.9903)).length() < 0.02
     {
         eprintln!(
@@ -2817,6 +2817,17 @@ fn area_visible_fraction(
             0.0,
         );
         visible_weight += sample.weight * visibility;
+        // TEMPORARY DIAGNOSTIC (remove with the area_above investigation): the area samples at the glass DIAG pixel.
+        if (point - DVec3::new(-2.0979, -0.0396, 0.9517)).length() < 0.001 {
+            eprintln!(
+                "AREA_DIAG sample_dir={:?} distance={:.4} weight={:.4e} visibility={visibility:.4} shadow_point={shadow_point:?} geometric={geometric:?} has_map={} has_shadow={}",
+                sample.direction,
+                sample.distance,
+                sample.weight,
+                point_shadow.is_some(),
+                shadow.is_some(),
+            );
+        }
     }
     if total_weight <= 0.0 || visible_weight <= 0.0 {
         return 0.0;

@@ -1536,7 +1536,7 @@ pub(super) fn composite_realtime_volumes(
                 &mut rng,
             )?;
             // TEMPORARY DIAGNOSTIC (remove with the volume_factor investigation): the centre pixel's in-scatter terms.
-            if x == width / 2 && y == height / 2 {
+            if volume_radiance.max_element() > 0.0 && (x + y) % 4 == 0 {
                 eprintln!(
                     "VOLUME_DIAG lights={} volumes={} factors={:?} radiance={volume_radiance:?} transmittance={transmittance:.4} \
                      fallback={fallback:?} max_distance={max_distance:.4} origin={origin:?} direction={direction:?}",
