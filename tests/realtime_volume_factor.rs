@@ -266,6 +266,9 @@ fn realtime_volumetric_shadow_setting_changes_render() -> TestResult {
 
 #[test]
 fn realtime_sun_volume_shadow_matches_homogeneous_slab_integral() -> TestResult {
+    const DENSITY: f64 = 0.5;
+    const THICKNESS: f64 = 1.0;
+    const SHADOW_STEPS: u32 = 64;
     let root = tempdir()?;
     let project = root.path().join("project");
     pot_json(|command| {
@@ -310,9 +313,6 @@ fn realtime_sun_volume_shadow_matches_homogeneous_slab_integral() -> TestResult 
     assert_eq!(enabled["ok"], true, "{enabled}");
     let shadowed = render_project(root.path(), &project, "slab_shadowed")?;
 
-    const DENSITY: f64 = 0.5;
-    const THICKNESS: f64 = 1.0;
-    const SHADOW_STEPS: u32 = 64;
     let step = THICKNESS / f64::from(SHADOW_STEPS);
     let camera_step_transmittance = (-DENSITY * step).exp();
     let source_distance = (1.0 - camera_step_transmittance) / DENSITY;
