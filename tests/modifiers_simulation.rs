@@ -5003,17 +5003,14 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
     assert_eq!(child_settings["child_percent"], 2);
     assert_eq!(child_settings["rendered_child_count"], 2);
 
-    // Known gaps (not asserted here): `b_alive` and `e_dead` use children, and Potter counts
-    // `child_percent` as children per parent. Blender's viewport count is `child_percent` percent of
-    // the total particles (`totchild = totpart * child_percent / 100`, rounded down), which is 0 for
-    // 2 parents and 2 percent. Blender 5.2.2 measured 1 face for `b_alive` and 0 for `e_dead` at
-    // frame 1 on this fixture (/tmp/scout-unborn/probe.json); Potter gives 3 and 6. Cause:
-    // `sim/particles.rs` `child_percent` handling, and `rendered_child_count` is unused for render.
+    // Child counts are recorded gaps below. Blender 5.2.2's viewport gives `child_percent` percent of the
+    // total particles (`totchild = totpart * child_percent / 100`, rounded down), which is 0 for 2 parents
+    // and 2 percent; Potter gives children per parent. Values come from the committed oracle
+    // tests/fixtures/particle_child_counts/blender_expected.json (generate.py).
     for (object, frame, expected_faces) in [
         ("c_secondary", "1", 1),
         // use_children is off, so these count the two parent particles only: one alive and one
-        // unborn at frame 1. Blender 5.2.2 measured 1 face (show_unborn off) and 2 faces (show_unborn
-        // on) with this fixture (/tmp/scout-unborn/probe.json).
+        // unborn at frame 1. The committed oracle gives 1 face (show_unborn off) and 2 (show_unborn on).
         ("d_no_unborn", "1", 1),
         ("g_with_unborn", "1", 2),
         ("f_exploder", "1", 6),
@@ -5024,17 +5021,42 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
             "{object} at frame {frame}: {response}",
         );
     }
-    // Recorded gap (child counts, see the CHANGELOG): Potter gives 3 faces for `b_alive` at frame 1,
-    // where Blender 5.2.2's viewport gives 1 (child_percent 2 of 2 parents rounds to 0 children). Measured
-    // in /tmp/scout-unborn/probe.json. A fix to the child count must make this a parity assertion.
-    let b_alive = inspect(&scene, "b_alive", "1")?;
+    // Recorded gaps (child counts, see the CHANGELOG). Blender 5.2.2's values come from the committed
+    // oracle tests/fixtures/particle_child_counts/blender_expected.json (generate.py). Blender's viewport
+    // gives `child_percent` percent of the total (0 children for 2 parents), where Potter gives children
+    // per parent. A fix to the child count must turn these into parity assertions.
+    let child_oracle: Value = serde_json::from_str(include_str!(
+        "fixtures/particle_child_counts/blender_expected.json"
+    ))?;
+    assert!(
+        child_oracle["blender_version"]
+            .as_str()
+            .is_some_and(|version| version.starts_with("5.2.2")),
+        "the child-count oracle must come from Blender 5.2.2"
+    );
+    let potter_face_count = |object: &str, frame: &str| -> Result<f64, Box<dyn Error>> {
+        let response = inspect(&scene, object, frame)?;
+        Ok(
+            response["result"]["items"][0]["evaluated_geometry"]["face_count"]
+                .as_f64()
+                .ok_or("Potter face count")?,
+        )
+    };
     assert_recorded_gap(
         "b_alive frame 1 face count",
-        b_alive["result"]["items"][0]["evaluated_geometry"]["face_count"]
+        potter_face_count("b_alive", "1")?,
+        child_oracle["faces"]["1"]["b_alive"]
             .as_f64()
-            .ok_or("Potter b_alive face count")?,
-        1.0,
-        2.0,
+            .ok_or("oracle b_alive")?,
+        3.0 - 1.0,
+    );
+    assert_recorded_gap(
+        "e_dead frame 3 face count",
+        potter_face_count("e_dead", "3")?,
+        child_oracle["faces"]["3"]["e_dead"]
+            .as_f64()
+            .ok_or("oracle e_dead")?,
+        6.0 - 2.0,
     );
 
     let bake_output = run(
