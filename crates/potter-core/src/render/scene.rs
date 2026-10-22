@@ -21,7 +21,8 @@ use crate::{
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
         SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace,
-        evaluate_surface_with_workspace, fill_color_layers, heaviest, record_unevaluated_inputs,
+        evaluate_surface_with_workspace, fill_color_layers, heaviest, make_orthonormals,
+        record_unevaluated_inputs,
     },
 };
 
@@ -39,7 +40,7 @@ use super::{
     path::{hit_params, object_for_index},
     principled_bsdf::{
         Layers, coat_coefficient, diffuse_coefficient, layers as principled_layers,
-        make_orthonormals, sheen_coefficient, specular_coefficient,
+        sheen_coefficient, specular_coefficient,
     },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, Triangle, ViewBasis,
