@@ -78,6 +78,8 @@ jobs:
         shell: bash
         env:
           POTTER_REQUIRE_BLENDER: "1"
+          # Test artifacts stay optimized; DWARF is unnecessary for ~200 test executables.
+          CARGO_PROFILE_TEST_DEBUG: "0"
         run: cargo test --workspace --all-features --no-fail-fast
 
   vrm-consumer:
