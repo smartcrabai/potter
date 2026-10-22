@@ -7823,7 +7823,8 @@ mod tests {
         let is_warped = |uv: &[f64; 2]| {
             warped
                 .iter()
-                .any(|want| (want[0] - uv[0]).abs() < 1e-9 && (want[1] - uv[1]).abs() < 1e-9)
+                // UV Warp computes in f32 (MOD_uvwarp.cc), so compare at f32 precision.
+                .any(|want| (want[0] - uv[0]).abs() < 1e-6 && (want[1] - uv[1]).abs() < 1e-6)
         };
         let layers = uv_layers::read_layers(&out);
         assert_eq!(layers.len(), 1);

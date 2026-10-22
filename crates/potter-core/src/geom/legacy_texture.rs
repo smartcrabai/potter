@@ -1623,6 +1623,15 @@ fn image_pixel(
     Ok(texel)
 }
 
+/// Blender premultiplies every texel before filtering, whatever the source format.
+fn premultiplied(texel: [f32; 4]) -> [f32; 3] {
+    [
+        texel[0] * texel[3],
+        texel[1] * texel[3],
+        texel[2] * texel[3],
+    ]
+}
+
 #[derive(Clone, Copy, Default)]
 struct ImageFilterRect {
     min_x: f32,
@@ -1788,7 +1797,7 @@ fn sample_filter_rect(
     }
     if start_x == end_x && start_y == end_y {
         let texel = image_pixel(pixels, width, height_i, start_y, start_x, settings)?;
-        return Ok(([texel[0], texel[1], texel[2]], texel[3]));
+        return Ok((premultiplied(texel), texel[3]));
     }
     let mut rgb_sum = [0.0_f32; 3];
     let mut alpha_sum = 0.0_f32;
@@ -1807,7 +1816,7 @@ fn sample_filter_rect(
         }
         if start_x == end_x {
             let texel = image_pixel(pixels, width, height_i, row, start_x, settings)?;
-            let rgb = [texel[0], texel[1], texel[2]];
+            let rgb = premultiplied(texel);
             for channel in 0..3 {
                 rgb_sum[channel] += row_weight * rgb[channel];
             }
@@ -1826,7 +1835,7 @@ fn sample_filter_rect(
                 }
                 if weight > 0.0 {
                     let texel = image_pixel(pixels, width, height_i, row, column, settings)?;
-                    let rgb = [texel[0], texel[1], texel[2]];
+                    let rgb = premultiplied(texel);
                     for channel in 0..3 {
                         rgb_sum[channel] += weight * rgb[channel];
                     }
@@ -2064,7 +2073,7 @@ fn sample_image(
         )?
     } else {
         let texel = image_pixel(pixels, width, height_i, y, x, settings)?;
-        ([texel[0], texel[1], texel[2]], texel[3], 1.0)
+        (premultiplied(texel), texel[3], 1.0)
     };
     rgb = rgb.map(|value| value * coverage);
     let tint = if alpha_active {
