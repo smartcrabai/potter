@@ -858,6 +858,7 @@ impl Snapshot {
             world_matrix_ids,
             modifier_prefix,
             driver_values,
+            bake_capture,
         )?;
         snapshot.warnings.splice(0..0, accepted_warnings);
         Ok(snapshot)
@@ -875,6 +876,7 @@ impl Snapshot {
         world_matrix_ids: Option<&BTreeSet<Id>>,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+        bake_capture: Option<&(Id, Id, String)>,
     ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
