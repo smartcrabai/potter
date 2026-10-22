@@ -43,6 +43,10 @@ TYPE_IDENTIFIERS = {
 
 # "type.prop" -> reason. Listed properties are explicitly reported but never fail the check.
 EXCEPTIONS = {
+    "bevel.custom_profile": (
+        "Blender's CurveProfilePoint exposes location and handle types only, not handle positions, "
+        "so the table default's handle positions cannot be sampled at runtime."
+    ),
     "mesh_sequence_cache.frame_offset": (
         "Blender's MeshSequenceCacheModifier does not expose frame_offset as an RNA "
         "property, so the table default cannot be sampled at runtime."

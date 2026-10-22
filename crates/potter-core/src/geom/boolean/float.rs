@@ -1068,6 +1068,7 @@ fn float_output_origin(
             .map(|poly| usize::try_from(poly.orig).ok())
             .collect(),
         corners: Some(corners),
+        ..Default::default()
     })
 }
 

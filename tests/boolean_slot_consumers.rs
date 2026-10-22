@@ -153,3 +153,57 @@ fn float_boolean_with_itself_as_object_is_unchanged() -> TestResult {
     ensure_eq(&mesh.faces.len(), &6, "face count")?;
     Ok(())
 }
+
+#[test]
+fn boolean_transfer_pool_clamps_downstream_bevel_material_override() -> TestResult {
+    let mut doc = apply(&[
+        json!({"op":"material.create","id":"m_host","base_color":[0.9,0.05,0.02,1.0]}),
+        json!({"op":"material.create","id":"m_cut","base_color":[0.02,0.1,0.9,1.0]}),
+        json!({"op":"material.create","id":"m_unused","base_color":[0.1,0.8,0.2,1.0]}),
+        json!({"op":"node.create","id":"host","kind":"box","params":{"size":2.0},"material":"m_host"}),
+        json!({"op":"node.create","id":"cutter","kind":"box","params":{"size":1.0},"transform":{"translation":[1.5,0.0,0.0]},"material":"m_cut"}),
+        json!({"op":"modifier.create","target":{"id":"host"},"id":"bool","type":"boolean","params":{"object":"cutter","operation":"UNION","solver":"EXACT","material_mode":"TRANSFER"}}),
+        json!({"op":"modifier.create","target":{"id":"host"},"id":"bevel","type":"bevel","params":{"width":0.1,"material":32767}}),
+    ])?;
+    let host_data = doc
+        .nodes
+        .get(&Id::new("host".to_owned())?)
+        .and_then(|node| node.data.as_ref())
+        .ok_or("host data is missing")?
+        .clone();
+    doc.data_blocks
+        .get_mut(&host_data)
+        .ok_or("host data block is missing")?
+        .materials = vec![Some(Id::new("m_host".to_owned())?)];
+    let cutter_data = doc
+        .nodes
+        .get(&Id::new("cutter".to_owned())?)
+        .and_then(|node| node.data.as_ref())
+        .ok_or("cutter data is missing")?
+        .clone();
+    doc.data_blocks
+        .get_mut(&cutter_data)
+        .ok_or("cutter data block is missing")?
+        .materials = vec![
+        Some(Id::new("m_cut".to_owned())?),
+        Some(Id::new("m_unused".to_owned())?),
+    ];
+    let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+    let host_id = Id::new("host".to_owned())?;
+    let slot_count = snapshot
+        .nodes
+        .get(&host_id)
+        .ok_or("host node is missing")?
+        .materials
+        .len();
+    assert_eq!(slot_count, 3);
+    let mesh = snapshot
+        .meshes
+        .get(&host_id)
+        .ok_or("host mesh is missing")?;
+    assert!(mesh.faces.iter().any(|face| face.material_index == 2));
+    for face in &mesh.faces {
+        assert!(usize::try_from(face.material_index)? < slot_count);
+    }
+    Ok(())
+}

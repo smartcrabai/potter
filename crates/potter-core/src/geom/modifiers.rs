@@ -26,12 +26,12 @@ use super::clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput, settl
 use super::color_layers::{self, ColorDomain};
 use super::triangulate::{NgonMethod, QuadMethod, triangulate_mesh};
 use super::{
-    Edge, Face, Mesh, MeshError, ORIGINDEX_ATTRIBUTE, Vertex, clear_origindex, edge_key,
+    Edge, Face, Mesh, MeshError, ORIGINDEX_ATTRIBUTE, Vertex, edge_key,
     normals::{corner_normals, safe_acos_approx, sharp_edge_flags},
     origindex_values,
     provenance::{
-        Origin, edge_flags, mean_value_corners, remap_attributes_staged,
-        remap_attributes_with_basis, remap_attributes_with_edges,
+        Origin, edge_flags, remap_attributes_staged, remap_attributes_with_basis,
+        remap_attributes_with_edge_identity, remap_attributes_with_edges,
     },
     set_origindex, uv_layers,
 };
@@ -40,6 +40,9 @@ mod adaptive_dicing;
 mod adaptive_mesh;
 mod advanced;
 pub mod attributes;
+mod bevel_boundary;
+mod bevel_profile;
+mod bevel_rings;
 mod bevel_shading;
 mod bevel_vmesh;
 mod decimate;
@@ -71,7 +74,7 @@ pub(crate) const OPTIMAL_DISPLAY_EDGES: &str = "subdivision_optimal_edges";
 mod subdivision_uv;
 use subdivision_limit::Samples;
 type Polygon = (Vec<usize>, u32);
-type BevelEdgeFacesWithMaterial = BTreeMap<(usize, usize), Vec<(usize, usize, usize, u32)>>;
+type BevelEdgeFacesWithMaterial = BTreeMap<(usize, usize), Vec<(usize, usize, usize, u32, usize)>>;
 /// Merged points, polygons, and edges, with the input element each output point and polygon came from.
 struct MergedGeometry {
     points: Vec<DVec3>,
@@ -678,7 +681,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             "multires" => subdivision(&evaluated, modifier, context)?,
             "solidify" => solidify::solidify(&evaluated, modifier, context)?,
             "triangulate" => triangulate(&evaluated, modifier)?,
-            "bevel" => bevel(&evaluated, modifier)?,
+            "bevel" => bevel(&evaluated, modifier, context)?,
             "decimate" => without_custom_normals(decimate(&evaluated, modifier)?),
             "weld" => weld(&evaluated, modifier)?,
             "displace" => displace_textured(
@@ -819,59 +822,6 @@ pub fn evaluate_modifiers_with_groups_at_frame(
             ..ModifierEvaluationContext::default()
         },
         |_, _, _| Ok(None),
-    )
-}
-
-/// The `modifier.bevel.uv_profile` rejection for a bevel on UV layers whose beveled corners the
-/// vertex-mesh construction does not cover; `rejections` lists them (never empty).
-fn bevel_uv_profile_error(
-    modifier: &Modifier,
-    mesh: &Mesh,
-    profile: f64,
-    rejections: &[bevel_vmesh::CornerRejection],
-) -> PotError {
-    let rejected: Vec<Value> = rejections
-        .iter()
-        .map(|rejection| {
-            json!({
-                "vertex_id": mesh.vertices[rejection.vertex].id,
-                "valence": rejection.valence,
-                "selected_edges": rejection.selected,
-                "reason": rejection.reason,
-            })
-        })
-        .collect();
-    let (parameter, message) = if bevel_vmesh::profile_super_r(profile)
-        == bevel_vmesh::PRO_SQUARE_IN_R
-    {
-        (
-            "profile",
-            "bevel with UV layers does not support profile 0 (square inward) on EDGES; use a profile above 0"
-                .to_owned(),
-        )
-    } else {
-        let detail = rejections.first().map_or_else(String::new, |worst| {
-            format!(
-                "; corner at vertex {} has valence {} / selected {} edges: {}",
-                mesh.vertices[worst.vertex].id, worst.valence, worst.selected, worst.reason
-            )
-        });
-        (
-            "segments",
-            format!(
-                "bevel with UV layers supports only three-edge cube-like corners with every edge selected{detail}"
-            ),
-        )
-    };
-    PotError::with_details(
-        ErrorCode::UnsupportedFeature,
-        message,
-        json!({
-            "feature_id": "modifier.bevel.uv_profile",
-            "modifier_id": modifier.id,
-            "parameter": parameter,
-            "rejected_corners": rejected,
-        }),
     )
 }
 
@@ -1436,6 +1386,23 @@ fn build_mesh_with_corner_order(
     validated(&result)?;
     Ok(result)
 }
+
+/// [`build_mesh`] whose edges inherit from `edge_identity`, one source vertex per output point; see
+/// [`remap_attributes_with_edge_identity`].
+fn build_mesh_with_edge_identity(
+    points: Vec<DVec3>,
+    polygons: Vec<Polygon>,
+    loose_edges: Vec<[usize; 2]>,
+    origin: &Origin,
+    edge_identity: Option<&[usize]>,
+    source: &Mesh,
+) -> Result<Mesh> {
+    let mut result = build_topology(points, polygons, loose_edges)?;
+    remap_attributes_with_edge_identity(source, &mut result, origin, edge_identity)?;
+    validated(&result)?;
+    Ok(result)
+}
+
 fn mark_generated_faces_smooth(mesh: &mut Mesh, generated: &[usize]) {
     if generated.is_empty() {
         return;
@@ -2189,6 +2156,7 @@ fn array(
             .map(|(&polygon, &generated)| (!generated).then(|| source_face(polygon)))
             .collect(),
         corners: Some(corners),
+        ..Default::default()
     };
     let passes: Vec<usize> = polygon_sources
         .iter()
@@ -5527,221 +5495,34 @@ fn mesh_attribute_values(mesh: &Mesh, name: &str) -> Option<Vec<Value>> {
         .cloned()
 }
 #[expect(
-    clippy::float_cmp,
-    reason = "exact profile exponents select Blender's straight and circular profiles"
-)]
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "bevel segment counts are bounded by 64"
-)]
-// Blender's BMesh bevel modifier distributes superellipse profile samples by chord length.
-#[expect(
     clippy::too_many_lines,
-    reason = "the profile sampler mirrors Blender's special cases and iterative chord solver"
+    reason = "bevel parses its settings, selects beveled elements, then runs the front end, topology, and shading"
 )]
-fn bevel_profile_coordinates(segments: usize, exponent: f64) -> Vec<(f64, f64)> {
-    let mut coordinates = vec![(0.0, 0.0); segments + 1];
-    if segments == 0 {
-        return coordinates;
-    }
-    if exponent == 0.0 {
-        let half = segments / 2;
-        if segments.is_multiple_of(2) {
-            for index in 0..=half {
-                let y = 1.0 - index as f64 / half.max(1) as f64;
-                coordinates[index] = (0.0, y);
-                coordinates[segments - index] = (y, 0.0);
-            }
-        } else {
-            let step = 1.0 / (half as f64 + std::f64::consts::FRAC_1_SQRT_2);
-            for index in 0..=half {
-                let y = 1.0 - index as f64 * step;
-                coordinates[index] = (0.0, y);
-                coordinates[segments - index] = (y, 0.0);
-            }
-        }
-        return coordinates;
-    }
-    if exponent >= 10_000.0 {
-        let half = segments / 2;
-        if segments.is_multiple_of(2) {
-            for index in 0..=half {
-                let x = index as f64 / half.max(1) as f64;
-                coordinates[index] = (x, 1.0);
-                coordinates[segments - index] = (1.0, x);
-            }
-        } else {
-            let step = 1.0 / (half as f64 + std::f64::consts::FRAC_1_SQRT_2);
-            for index in 0..=half {
-                let x = index as f64 * step;
-                coordinates[index] = (x, 1.0);
-                coordinates[segments - index] = (1.0, x);
-            }
-        }
-        return coordinates;
-    }
-    if exponent == 1.0 {
-        for (index, coordinate) in coordinates.iter_mut().enumerate() {
-            let fraction = index as f64 / segments as f64;
-            *coordinate = (fraction, 1.0 - fraction);
-        }
-        return coordinates;
-    }
-    if exponent == 2.0 {
-        for (index, coordinate) in coordinates.iter_mut().enumerate() {
-            let angle = index as f64 / segments as f64 * std::f64::consts::FRAC_PI_2;
-            *coordinate = (angle.sin(), angle.cos());
-        }
-        return coordinates;
-    }
-
-    let rbig = exponent > 1.0;
-    let midpoint_x = if rbig {
-        0.5_f64.powf(1.0 / exponent)
-    } else {
-        1.0 - 0.5_f64.powf(1.0 / exponent)
-    };
-    let last_unique_index = segments.div_ceil(2) - 1;
-    for (index, coordinate) in coordinates
-        .iter_mut()
-        .enumerate()
-        .take(last_unique_index + 1)
-    {
-        let x = index as f64 * midpoint_x / segments as f64 * 2.0;
-        *coordinate = (x, superellipse_y(x, exponent, rbig));
-    }
-    coordinates[0].1 = 1.0;
-
-    for _ in 0..10 {
-        let mut distance_sum = 0.0;
-        let mut minimum_distance = 2.0_f64;
-        let mut maximum_distance = 0.0_f64;
-        for index in 0..last_unique_index {
-            let (first_x, first_y) = coordinates[index];
-            let (second_x, second_y) = coordinates[index + 1];
-            let distance = (second_x - first_x).hypot(second_y - first_y);
-            distance_sum += distance;
-            maximum_distance = maximum_distance.max(distance);
-            minimum_distance = minimum_distance.min(distance);
-        }
-        let average_distance = if segments % 2 == 1 {
-            let (x, y) = coordinates[last_unique_index];
-            distance_sum += std::f64::consts::FRAC_1_SQRT_2 * (y - x);
-            distance_sum / (last_unique_index as f64 + 0.5)
-        } else {
-            let (x, y) = coordinates[last_unique_index];
-            distance_sum += (x - midpoint_x).hypot(y - midpoint_x);
-            distance_sum / (last_unique_index as f64 + 1.0)
-        };
-        if maximum_distance - average_distance <= 1.0e-7
-            && minimum_distance - average_distance >= 1.0e-7
-        {
-            break;
-        }
-        for index in 1..=last_unique_index {
-            let x = superellipse_chord_endpoint(
-                coordinates[index - 1].0,
-                average_distance,
-                exponent,
-                rbig,
-            );
-            coordinates[index] = (x, superellipse_y(x, exponent, rbig));
-        }
-    }
-    if segments.is_multiple_of(2) {
-        coordinates[last_unique_index + 1] = (midpoint_x, midpoint_x);
-    }
-    for index in last_unique_index + 1..=segments {
-        let (x, y) = coordinates[segments - index];
-        coordinates[index] = (y, x);
-    }
-    coordinates
-}
-
-fn superellipse_y(x: f64, exponent: f64, rbig: bool) -> f64 {
-    if rbig {
-        (1.0 - x.powf(exponent)).powf(1.0 / exponent)
-    } else {
-        1.0 - (1.0 - (1.0 - x).powf(exponent)).powf(1.0 / exponent)
-    }
-}
-
-fn superellipse_chord_endpoint(x: f64, distance: f64, exponent: f64, rbig: bool) -> f64 {
-    let y = superellipse_y(x, exponent, rbig);
-    let minimum_x = (x + std::f64::consts::FRAC_1_SQRT_2 * distance).min(1.0);
-    let maximum_x = (x + distance).min(1.0);
-    let minimum_error =
-        (minimum_x - x).hypot(superellipse_y(minimum_x, exponent, rbig) - y) - distance;
-    let maximum_error =
-        (maximum_x - x).hypot(superellipse_y(maximum_x, exponent, rbig) - y) - distance;
-    let mut x_new =
-        maximum_x - maximum_error * (maximum_x - minimum_x) / (maximum_error - minimum_error);
-    let mut minimum_x = minimum_x;
-    let mut maximum_x = maximum_x;
-    let mut minimum_error = minimum_error;
-    let mut maximum_error = maximum_error;
-    let mut updated_upper = true;
-
-    for _ in 0..10 {
-        let new_error = (x_new - x).hypot(superellipse_y(x_new, exponent, rbig) - y) - distance;
-        if new_error.abs() < 1.0e-13 {
-            break;
-        }
-        if new_error < 0.0 {
-            minimum_x = x_new;
-            minimum_error = new_error;
-            x_new = if updated_upper {
-                maximum_x
-                    - maximum_error * (maximum_x - minimum_x) / (maximum_error - minimum_error)
-            } else {
-                (maximum_error / 2.0 * minimum_x - minimum_error * maximum_x)
-                    / (maximum_error / 2.0 - minimum_error)
-            };
-            updated_upper = false;
-        } else {
-            maximum_x = x_new;
-            maximum_error = new_error;
-            x_new = if updated_upper {
-                (maximum_error * minimum_x - minimum_error / 2.0 * maximum_x)
-                    / (maximum_error - minimum_error / 2.0)
-            } else {
-                maximum_x
-                    - maximum_error * (maximum_x - minimum_x) / (maximum_error - minimum_error)
-            };
-            updated_upper = true;
-        }
-    }
-    x_new
-}
-
-fn bevel_profile_point(start: DVec3, end: DVec3, middle: DVec3, x: f64, y: f64) -> DVec3 {
-    start * (1.0 - x) + end * (1.0 - y) + middle * (x + y - 1.0)
-}
-
-fn bevel_profile_middle(start: DVec3, end: DVec3, edge_start: DVec3, edge_end: DVec3) -> DVec3 {
-    let edge_direction = (edge_end - edge_start).normalize_or_zero();
-    let profile_direction = (end - start).normalize_or_zero();
-    let cosine = edge_direction.dot(profile_direction);
-    let denominator = 1.0 - cosine * cosine;
-    let offset = edge_start - start;
-    let distance_along_edge = if denominator.abs() > 1.0e-12 {
-        (cosine * profile_direction.dot(offset) - edge_direction.dot(offset)) / denominator
-    } else {
-        ((start + end) * 0.5 - edge_start).dot(edge_direction)
-    };
-    edge_start + edge_direction * distance_along_edge
-}
-#[expect(
-    clippy::too_many_lines,
-    reason = "bevel builds the face, edge-profile, and corner patches in one topology pass"
-)]
-fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
+fn bevel(mesh: &Mesh, modifier: &Modifier, context: ModifierEvaluationContext<'_>) -> Result<Mesh> {
     validated(mesh)?;
-    let width = number_param(modifier, "width")?;
+    let offset_type = bevel_choice(
+        modifier,
+        "offset_type",
+        "OFFSET",
+        &[
+            ("OFFSET", bevel_boundary::OffsetType::Offset),
+            ("WIDTH", bevel_boundary::OffsetType::Width),
+            ("DEPTH", bevel_boundary::OffsetType::Depth),
+            ("PERCENT", bevel_boundary::OffsetType::Percent),
+            ("ABSOLUTE", bevel_boundary::OffsetType::Absolute),
+        ],
+        "OFFSET, WIDTH, DEPTH, PERCENT, or ABSOLUTE",
+    )?;
+    let width_param = if offset_type == bevel_boundary::OffsetType::Percent {
+        "width_pct"
+    } else {
+        "width"
+    };
+    let width = number_param(modifier, width_param)?;
     if width < 0.0 {
         return Err(invalid_parameter(
             modifier,
-            "width",
+            width_param,
             "a non-negative finite number",
         ));
     }
@@ -5764,10 +5545,14 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "NONE, ANGLE, WEIGHT, or VGROUP",
         ));
     }
-    let affect = string_param(modifier, "affect")?.to_ascii_uppercase();
-    if !matches!(affect.as_str(), "EDGES" | "VERTICES") {
-        return Err(invalid_parameter(modifier, "affect", "EDGES or VERTICES"));
-    }
+    let affect_vertices = match string_param(modifier, "affect")?
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "EDGES" => false,
+        "VERTICES" => true,
+        _ => return Err(invalid_parameter(modifier, "affect", "EDGES or VERTICES")),
+    };
     let profile = number_param(modifier, "profile")?;
     if !(0.0..=1.0).contains(&profile) {
         return Err(invalid_parameter(
@@ -5780,45 +5565,97 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let loop_slide = bool_param(modifier, "loop_slide")?;
     let harden_normals = bool_param(modifier, "harden_normals")?;
     let mark_sharp = bool_param(modifier, "mark_sharp")?;
-    // Blender's mark_seam copies the input's seams onto the new rungs (check_edge_data_seam_sharp_edges),
-    // so it changes nothing on a mesh without seams.
-    let input_seam = edge_flags(mesh, "seam").contains(&true);
-    if bool_param(modifier, "mark_seam")? && input_seam {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "bevel mark_seam on a mesh with seam edges is not supported",
-            json!({
-                "feature_id": "modifier.bevel.mark_seam",
-                "modifier_id": modifier.id,
-            }),
+    let mark_seam = bool_param(modifier, "mark_seam")?;
+    let custom =
+        match string_param_with_expected(modifier, "profile_type", "SUPERELLIPSE or CUSTOM")?
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "SUPERELLIPSE" => None,
+            "CUSTOM" => Some(bevel_profile::CurveProfile::from_param(parameter_value(
+                modifier,
+                "custom_profile",
+            ))?),
+            _ => {
+                return Err(invalid_parameter(
+                    modifier,
+                    "profile_type",
+                    "SUPERELLIPSE or CUSTOM",
+                ));
+            }
+        };
+    let miter_outer = bevel_choice(
+        modifier,
+        "miter_outer",
+        "MITER_SHARP",
+        &[
+            ("MITER_SHARP", bevel_boundary::MiterKind::Sharp),
+            ("MITER_PATCH", bevel_boundary::MiterKind::Patch),
+            ("MITER_ARC", bevel_boundary::MiterKind::Arc),
+        ],
+        "MITER_SHARP, MITER_PATCH, or MITER_ARC",
+    )?;
+    let miter_inner = bevel_choice(
+        modifier,
+        "miter_inner",
+        "MITER_SHARP",
+        &[
+            ("MITER_SHARP", bevel_boundary::MiterKind::Sharp),
+            ("MITER_ARC", bevel_boundary::MiterKind::Arc),
+        ],
+        "MITER_SHARP or MITER_ARC",
+    )?;
+    let spread = number_param(modifier, "spread")?;
+    if spread < 0.0 {
+        return Err(invalid_parameter(
+            modifier,
+            "spread",
+            "a non-negative finite number",
         ));
     }
-    let offset_type = string_param(modifier, "offset_type")?.to_ascii_uppercase();
+    let vmesh_method = bevel_choice(
+        modifier,
+        "vmesh_method",
+        "ADJ",
+        &[
+            ("ADJ", bevel_boundary::VmeshMethod::Adj),
+            ("CUTOFF", bevel_boundary::VmeshMethod::Cutoff),
+        ],
+        "ADJ or CUTOFF",
+    )?;
+    let face_strength_mode = string_param_with_expected(
+        modifier,
+        "face_strength_mode",
+        "FSTR_NONE, FSTR_NEW, FSTR_AFFECTED, or FSTR_ALL",
+    )?
+    .to_ascii_uppercase();
     if !matches!(
-        offset_type.as_str(),
-        "OFFSET" | "WIDTH" | "DEPTH" | "PERCENT"
+        face_strength_mode.as_str(),
+        "FSTR_NONE" | "FSTR_NEW" | "FSTR_AFFECTED" | "FSTR_ALL"
     ) {
         return Err(invalid_parameter(
             modifier,
-            "offset_type",
-            "OFFSET, WIDTH, DEPTH, or PERCENT",
+            "face_strength_mode",
+            "FSTR_NONE, FSTR_NEW, FSTR_AFFECTED, or FSTR_ALL",
         ));
     }
+    let material_slot_count = context
+        .material_slot_count
+        .unwrap_or_else(|| contextless_material_slot_count(mesh));
+    let material_upper_bound = i64::try_from(material_slot_count)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(1);
+    let material = match parameter_value(modifier, "material") {
+        None => -1,
+        Some(value) => value
+            .as_i64()
+            .filter(|value| (-1..=32767).contains(value))
+            .map(|value| value.clamp(-1, material_upper_bound))
+            .ok_or_else(|| {
+                invalid_parameter(modifier, "material", "an integer from -1 through 32767")
+            })?,
+    };
 
-    // harden_normals needs the single-edge bevel. mark_sharp only marks rungs of input sharp edges
-    // (mark_sharp_rungs), so it needs that bevel only when the input has sharp edges.
-    let input_sharp = sharp_edge_flags(mesh)?.contains(&true);
-    let single_edge_bevel = affect == "EDGES" && segments == 1;
-    if (harden_normals || (mark_sharp && input_sharp)) && !single_edge_bevel {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "bevel harden_normals and mark_sharp on sharp edges are evaluated for single-segment EDGES bevels only",
-            json!({
-                "feature_id": "modifier.bevel.shading_segments",
-                "modifier_id": modifier.id,
-            }),
-        ));
-    }
     let source_points = positions(mesh);
     let source_polygons = polygons(mesh)?;
     if source_polygons.is_empty() {
@@ -5827,18 +5664,19 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let mut face_normals = Vec::with_capacity(source_polygons.len());
     let mut edge_faces: BevelEdgeFacesWithMaterial = BTreeMap::new();
     for (face_index, (face, material)) in source_polygons.iter().enumerate() {
-        let mut normal = DVec3::ZERO;
-        for (first, second) in cyclic_pairs(face) {
-            normal += source_points[*first].cross(source_points[*second]);
+        let mut normal = glam::Vec3::ZERO;
+        for (corner, (first, second)) in cyclic_pairs(face).enumerate() {
+            normal += source_points[*first]
+                .as_vec3()
+                .cross(source_points[*second].as_vec3());
             edge_faces
                 .entry(edge_key(*first, *second))
                 .or_default()
-                .push((face_index, *first, *second, *material));
+                .push((face_index, *first, *second, *material, corner));
         }
-        face_normals.push(normal.normalize_or_zero());
+        face_normals.push(normal.normalize_or_zero().as_dvec3());
     }
 
-    let mut selected_edges = HashSet::new();
     let angle_limit = number_param(modifier, "angle_limit")?;
     if !(0.0..=std::f64::consts::PI).contains(&angle_limit) {
         return Err(invalid_parameter(
@@ -5847,23 +5685,58 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             "an angle from 0 through pi",
         ));
     }
-    let weight_attribute_name = if limit_method == "VGROUP" {
-        modifier.params.get("vertex_group").and_then(Value::as_str)
-    } else if affect == "VERTICES" {
-        modifier
-            .params
-            .get("vertex_weight")
-            .and_then(Value::as_str)
-            .or(Some("bevel_weight_vert"))
+    let angle_threshold = (angle_limit as f32 + 0.000_000_175_f32).cos();
+    let weight_attribute_name = if limit_method == "WEIGHT" {
+        Some(if affect_vertices {
+            string_param(modifier, "vertex_weight")?
+        } else {
+            string_param(modifier, "edge_weight")?
+        })
     } else {
-        modifier
-            .params
-            .get("edge_weight")
-            .and_then(Value::as_str)
-            .or(Some("bevel_weight_edge"))
+        None
     };
     let weight_attribute = weight_attribute_name.and_then(|name| mesh_attribute_values(mesh, name));
-    let weight_attribute = weight_attribute.as_deref();
+    let bevel_weight = |index: usize| {
+        weight_attribute
+            .as_ref()
+            .and_then(|weights| weights.get(index))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32
+    };
+    let vertex_group_weights = if limit_method == "VGROUP" {
+        let group_name = match parameter_value(modifier, "vertex_group") {
+            None => "",
+            Some(value) => value.as_str().ok_or_else(|| {
+                invalid_parameter(modifier, "vertex_group", "a vertex-group name")
+            })?,
+        };
+        (!group_name.is_empty())
+            .then(|| {
+                mesh.attributes
+                    .get("vertex_groups")
+                    .and_then(Value::as_object)
+                    .and_then(|groups| groups.get(group_name))
+                    .and_then(Value::as_object)
+            })
+            .flatten()
+    } else {
+        None
+    };
+    let invert_vertex_group = bool_param(modifier, "invert_vertex_group")?;
+    let vertex_group_weight = |vertex: usize| {
+        let Some(weights) = vertex_group_weights else {
+            return 1.0_f32;
+        };
+        let weight = weights
+            .get(&format!("v{}", mesh.vertices[vertex].id))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        if invert_vertex_group {
+            1.0 - weight
+        } else {
+            weight
+        }
+    };
     let vertex_id_indices = id_indices(mesh);
     let edge_id_indices: HashMap<_, _> = mesh
         .edges
@@ -5879,74 +5752,47 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             )
         })
         .collect();
+
+    let mut selected_edges = HashSet::new();
     let mut selected_vertices = HashSet::new();
-    for (edge, sides) in &edge_faces {
-        if sides.len() != 2 {
-            continue;
+    if affect_vertices {
+        for vertex in 0..mesh.vertices.len() {
+            let selected = if limit_method == "WEIGHT" {
+                bevel_weight(vertex) != 0.0
+            } else {
+                vertex_group_weight(vertex) >= 0.5
+            };
+            if selected {
+                selected_vertices.insert(vertex);
+            }
         }
-        let mut selected = match limit_method.as_str() {
-            "NONE" => true,
-            "ANGLE" => face_normals[sides[0].0].dot(face_normals[sides[1].0]) < angle_limit.cos(),
-            "WEIGHT" => {
-                if affect == "VERTICES" {
-                    false
-                } else {
-                    edge_id_indices
-                        .get(edge)
-                        .and_then(|index| weight_attribute.and_then(|weights| weights.get(*index)))
-                        .and_then(Value::as_f64)
-                        .is_some_and(|value| value > 0.0)
+    } else {
+        for (edge, sides) in &edge_faces {
+            if sides.len() != 2 {
+                continue;
+            }
+            let selected = match limit_method.as_str() {
+                "NONE" => true,
+                "ANGLE" => {
+                    face_normals[sides[0].0]
+                        .as_vec3()
+                        .dot(face_normals[sides[1].0].as_vec3())
+                        < angle_threshold
                 }
+                "WEIGHT" => edge_id_indices
+                    .get(edge)
+                    .is_some_and(|index| bevel_weight(*index) != 0.0),
+                "VGROUP" => {
+                    vertex_group_weight(edge.0) >= 0.5 && vertex_group_weight(edge.1) >= 0.5
+                }
+                _ => false,
+            };
+            if selected {
+                selected_edges.insert(*edge);
             }
-            "VGROUP" => {
-                let first = weight_attribute
-                    .and_then(|weights| weights.get(sides[0].1))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                let second = weight_attribute
-                    .and_then(|weights| weights.get(sides[0].2))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                first >= 0.5 && second >= 0.5
-            }
-            _ => false,
-        };
-        if affect == "VERTICES" {
-            if selected && !matches!(limit_method.as_str(), "WEIGHT" | "VGROUP") {
-                selected_vertices.insert(edge.0);
-                selected_vertices.insert(edge.1);
-            }
-            selected = false;
-        }
-        if selected {
-            selected_edges.insert(*edge);
         }
     }
-    if affect == "VERTICES" {
-        match limit_method.as_str() {
-            "NONE" => {
-                for (face, _) in &source_polygons {
-                    selected_vertices.extend(face.iter().copied());
-                }
-            }
-            "WEIGHT" | "VGROUP" => {
-                for (vertex, _) in mesh.vertices.iter().enumerate() {
-                    let weight = weight_attribute
-                        .and_then(|weights| weights.get(vertex))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let selected = if limit_method == "VGROUP" {
-                        weight >= 0.5
-                    } else {
-                        weight > 0.0
-                    };
-                    if selected {
-                        selected_vertices.insert(vertex);
-                    }
-                }
-            }
-            _ => {}
-        }
+    if affect_vertices {
         if selected_vertices.is_empty() {
             return Ok(mesh.clone());
         }
@@ -5954,825 +5800,230 @@ fn bevel(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         return Ok(mesh.clone());
     }
 
-    if affect == "VERTICES" {
-        return bevel_vertices(
-            mesh,
-            &source_points,
-            &source_polygons,
-            &selected_vertices,
-            width,
-            segments,
-            profile,
-            clamp_overlap,
-            loop_slide,
-            &offset_type,
-        );
-    }
-    if segments > 1 {
-        let mut vertex_edge_counts = vec![(0_usize, 0_usize); source_points.len()];
-        for edge in edge_faces.keys() {
-            for vertex in [edge.0, edge.1] {
-                vertex_edge_counts[vertex].0 += 1;
-                if selected_edges.contains(edge) {
-                    vertex_edge_counts[vertex].1 += 1;
-                }
-            }
-        }
-        if let Some((vertex_index, (incident_edges, selected_edges))) = vertex_edge_counts
-            .iter()
-            .enumerate()
-            .find(|(_, (incident, selected))| *incident >= 4 && *selected >= 2)
-        {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                "Bevel vertex meshes with four or more incident edges and multiple beveled edges are not evaluated",
-                json!({
-                    "feature_id":"modifier.bevel.high_valence_vertex_mesh",
-                    "modifier_id":modifier.id,
-                    "vertex_id":mesh.vertices.get(vertex_index).map(|vertex|vertex.id),
-                    "incident_edges":incident_edges,
-                    "selected_edges":selected_edges
-                }),
-            ));
-        }
-    }
-    let exponent = if profile <= 0.0 {
-        0.0
-    } else if profile >= 0.95 {
-        1.0e4
-    } else {
-        (-2.0_f64.ln() / profile.sqrt().ln()).clamp(0.0, 1.0e4)
-    };
-    let profile_coordinates = bevel_profile_coordinates(segments, exponent);
-    let mut points = Vec::new();
-    let mut point_vertices = Vec::new();
-    let mut face_corner = HashMap::new();
-    let mut corner_width = HashMap::new();
-    for (face_index, (face, _)) in source_polygons.iter().enumerate() {
-        for (corner, vertex) in face.iter().copied().enumerate() {
-            let previous = face[(corner + face.len() - 1) % face.len()];
-            let next = face[(corner + 1) % face.len()];
-            let incoming_key = edge_key(previous, vertex);
-            let outgoing_key = edge_key(vertex, next);
-            let incoming_selected = selected_edges.contains(&incoming_key);
-            let outgoing_selected = selected_edges.contains(&outgoing_key);
-            let vertex_selected = selected_vertices.contains(&vertex);
-            let mut amount = width;
-            let corner_angle = (source_points[previous] - source_points[vertex])
-                .normalize_or_zero()
-                .dot((source_points[next] - source_points[vertex]).normalize_or_zero())
-                .clamp(-1.0, 1.0)
-                .acos()
-                .max(1.0e-6);
-            let shorter_edge = source_points[vertex]
-                .distance(source_points[previous])
-                .min(source_points[vertex].distance(source_points[next]));
-            if !loop_slide && (incoming_selected || outgoing_selected || vertex_selected) {
-                amount /= (corner_angle * 0.5).sin().max(1.0e-6);
-            }
-            if offset_type == "PERCENT" {
-                amount *= shorter_edge / 100.0;
-            } else if offset_type == "WIDTH" || offset_type == "DEPTH" {
-                let angle = (source_points[previous] - source_points[vertex])
-                    .normalize_or_zero()
-                    .dot((source_points[next] - source_points[vertex]).normalize_or_zero())
-                    .clamp(-1.0, 1.0)
-                    .acos()
-                    .max(1.0e-6);
-                if offset_type == "WIDTH" {
-                    amount *= (angle * 0.5).sin();
-                } else {
-                    amount /= (angle * 0.5).sin().max(1.0e-6);
-                }
-            }
-            if clamp_overlap {
-                amount = amount.min(shorter_edge * 0.49);
-            }
-            corner_width.insert((face_index, vertex), amount);
-            let inward_incoming = face_normals[face_index]
-                .cross((source_points[vertex] - source_points[previous]).normalize_or_zero());
-            let inward_outgoing = face_normals[face_index]
-                .cross((source_points[next] - source_points[vertex]).normalize_or_zero());
-            let mut point = source_points[vertex];
-            if incoming_selected && outgoing_selected {
-                let denominator = 1.0 + inward_incoming.dot(inward_outgoing);
-                if denominator.abs() > 1.0e-12 {
-                    point += (inward_incoming + inward_outgoing) * (amount / denominator);
-                } else {
-                    point += inward_incoming * amount;
-                }
-            } else if incoming_selected {
-                point += inward_incoming * amount;
-            } else if outgoing_selected {
-                point += inward_outgoing * amount;
-            }
-            let index = points.len();
-            points.push(point);
-            // shortcut: corner vertices take one source vertex; Blender blends the bevel stencil of several corners, upgrade with those coefficients
-            point_vertices.push(vertex);
-            face_corner.insert((face_index, vertex), index);
-        }
-    }
-
-    // Blender's square profile also uses its even-segment corner mesh (`square_out_adj_vmesh`) for
-    // two segments, which the generic path below does not build.
-    let square_two_segments =
-        segments == 2 && bevel_vmesh::profile_super_r(profile) == bevel_vmesh::PRO_SQUARE_R;
-    if affect == "EDGES" && (segments > 2 || square_two_segments) {
-        let bound_of = |face: usize, vertex: usize| points[face_corner[&(face, vertex)]];
-        match bevel_vmesh::bevel_edges(
-            mesh,
-            segments,
-            bevel_vmesh::profile_super_r(profile),
-            &source_points,
-            &source_polygons,
-            &selected_edges,
-            &bound_of,
-        ) {
-            Ok(emission) => {
-                return bevel_vmesh::finish(mesh, &source_polygons, emission, loose_edges(mesh)?);
-            }
-            Err(rejections) if uv_layers::has_uv_layers(mesh) => {
-                return Err(bevel_uv_profile_error(modifier, mesh, profile, &rejections));
-            }
-            Err(_) => {}
-        }
-    }
-    // Two segments on UV layers: the old path's UV rules are verified only for cube-like corners.
-    if affect == "EDGES" && segments == 2 && uv_layers::has_uv_layers(mesh) {
-        let bound_of = |face: usize, vertex: usize| points[face_corner[&(face, vertex)]];
-        let rejections = bevel_vmesh::cube_corner_rejections(
-            &source_points,
-            &source_polygons,
-            &selected_edges,
-            &bound_of,
-            bevel_vmesh::profile_super_r(profile),
-        );
-        if !rejections.is_empty() {
-            return Err(bevel_uv_profile_error(modifier, mesh, profile, &rejections));
-        }
-    }
-    let mut output_polygons = Vec::new();
-    let mut face_sources = Vec::new();
-    // Blender's smooth-flag source of each output face (`bevel_shading`), kept apart from the
-    // interpolation source so corner data still blends from the face it came from.
-    let mut shade_sources = Vec::new();
-    let blender_order = bevel_shading::blender_edge_order(&source_polygons);
-    for (face_index, (face, material)) in source_polygons.iter().enumerate() {
-        face_sources.push(Some(face_index));
-        shade_sources.push(Some(face_index));
-        output_polygons.push((
-            face.iter()
-                .map(|vertex| face_corner[&(face_index, *vertex)])
-                .collect(),
-            *material,
-        ));
-    }
-    let mut profile_points: HashMap<((usize, usize), usize, usize), usize> = HashMap::new();
-    // Blender evaluates each bevel loop's UV at the edge's middle point (profile loops) or at the
-    // center projected onto the incoming edge (corner-center loops); these are the query points.
-    let mut profile_uv_points: HashMap<usize, DVec3> = HashMap::new();
-    let mut uv_queries: HashMap<(usize, usize), DVec3> = HashMap::new();
-    let mut uv_face_overrides: HashMap<usize, usize> = HashMap::new();
-    if affect == "EDGES" {
-        for (edge, sides) in &edge_faces {
-            if !selected_edges.contains(edge) || sides.len() != 2 {
-                continue;
-            }
-            let [side_a, side_b] = [sides[0], sides[1]];
-            for vertex in [edge.0, edge.1] {
-                let a = face_corner[&(side_a.0, vertex)];
-                let b = face_corner[&(side_b.0, vertex)];
-                let p = source_points[vertex];
-                let other = if edge.0 == vertex { edge.1 } else { edge.0 };
-                let middle = bevel_profile_middle(points[a], points[b], p, source_points[other]);
-                for (segment, &(x, y)) in profile_coordinates
-                    .iter()
-                    .enumerate()
-                    .take(segments)
-                    .skip(1)
-                {
-                    let index = points.len();
-                    points.push(bevel_profile_point(points[a], points[b], middle, x, y));
-                    point_vertices.push(vertex);
-                    profile_points.insert((*edge, vertex, segment), index);
-                    profile_uv_points.insert(index, middle);
-                }
-            }
-            let point_at = |vertex: usize, side: usize, segment: usize| {
-                if segment == 0 {
-                    face_corner[&(sides[side].0, vertex)]
-                } else if segment == segments {
-                    face_corner[&(sides[1 - side].0, vertex)]
-                } else {
-                    profile_points[&(*edge, vertex, segment)]
-                }
+    // Bevel continuity checks span every loop math layer, while UV merging stays per-FLOAT2 layer.
+    let float2_layers = bevel_vmesh::source_float2_layers(mesh);
+    let loop_math_layers = bevel_vmesh::source_loop_math_layers(mesh, &float2_layers);
+    let source_loop_topology =
+        (affect_vertices && segments % 2 == 1 && loop_math_layers.has_math_layers)
+            .then(|| bevel_vmesh::source_bmesh_loops(mesh, &source_polygons))
+            .transpose()?;
+    let seam_edges: HashSet<(usize, usize)> = edge_faces
+        .iter()
+        .filter_map(|(edge, sides)| {
+            let seam = match sides.len() {
+                2 => bevel_vmesh::edge_is_seam(
+                    &loop_math_layers,
+                    &source_polygons,
+                    sides,
+                    edge.0,
+                    edge.1,
+                ),
+                count => count == 1 || (count > 2 && loop_math_layers.has_loop_layers),
             };
-            let (before, after) = bevel_shading::strip_faces(*edge, side_a, side_b);
-            // Pieces keep side A's layout (the UV overrides index them so). A piece whose `before`
-            // face is side B runs the other way round, as Blender's strip does.
-            let reversed = before != side_a.0;
-            for segment in 0..segments {
-                let (start, end) = *edge;
-                let material = side_a.3;
-                // The strip's second half takes its loop UVs from the far face, as Blender does.
-                if 2 * segment >= segments {
-                    uv_face_overrides.insert(output_polygons.len(), side_b.0);
-                }
-                face_sources.push(Some(side_a.0));
-                let before_relative = if reversed {
-                    segments - 1 - segment
-                } else {
-                    segment
-                };
-                shade_sources.push(Some(bevel_shading::strip_face_for_segment(
-                    before,
-                    after,
-                    segments,
-                    before_relative,
-                )));
-                let mut corners = vec![
-                    point_at(start, 0, segment),
-                    point_at(end, 0, segment),
-                    point_at(end, 0, segment + 1),
-                    point_at(start, 0, segment + 1),
-                ];
-                if reversed {
-                    corners.reverse();
-                }
-                output_polygons.push((corners, material));
-            }
+            seam.then_some(*edge)
+        })
+        .collect();
+    let seam_vertices = source_loop_topology.as_ref().map(|topology| {
+        let mut contiguous = bevel_vmesh::loop_vertices_contiguous(
+            &loop_math_layers,
+            &source_polygons,
+            source_points.len(),
+            topology,
+        );
+        for flag in &mut contiguous {
+            *flag = !*flag;
         }
-    }
-
-    // Blender's loops are rebuilt from the strips and corners emitted so far (see `bevel_shading`).
-    let corner_start = output_polygons.len();
-    let input_sharp: HashSet<(usize, usize)> = super::normals::sharp_edge_flags(mesh)?
-        .into_iter()
-        .zip(&mesh.edges)
-        .filter(|(flag, _)| *flag)
-        .map(|(_, edge)| {
-            edge_key(
+        contiguous
+    });
+    let edge_order: Vec<(usize, usize)> = mesh
+        .edges
+        .iter()
+        .map(|edge| {
+            (
                 vertex_id_indices[&edge.vertices[0]],
                 vertex_id_indices[&edge.vertices[1]],
             )
         })
         .collect();
-    let sharp_points = if mark_sharp {
-        bevel_shading::mark_sharp_rungs(
-            &edge_faces,
-            &selected_edges,
-            &input_sharp,
-            &face_corner,
-            source_points.len(),
-        )
-    } else {
-        Vec::new()
-    };
-    let input_custom = clnor::corner_codes(mesh)?.is_some();
-    let mut incident_faces = vec![Vec::new(); source_points.len()];
-    for (face_index, (face, material)) in source_polygons.iter().enumerate() {
-        for (corner, vertex) in face.iter().copied().enumerate() {
-            incident_faces[vertex].push((face_index, corner, *material));
-        }
-    }
-    for (vertex, faces) in incident_faces.iter().enumerate() {
-        let affected = if affect == "VERTICES" {
-            selected_vertices.contains(&vertex)
-        } else {
-            edge_faces.iter().any(|(edge, _)| {
-                selected_edges.contains(edge) && (edge.0 == vertex || edge.1 == vertex)
-            })
-        };
-        if !affected || faces.len() < 3 {
-            continue;
-        }
-        let mut corner_center = source_points[vertex];
-        if affect == "EDGES"
-            && faces.len() == 3
-            && selected_edges
-                .iter()
-                .filter(|edge| edge.0 == vertex || edge.1 == vertex)
-                .count()
-                == 3
-        {
-            let mut normal_sum = DVec3::ZERO;
-            for (face_index, _, _) in faces {
-                normal_sum += face_normals[*face_index];
-            }
-            let amount = faces
-                .iter()
-                .map(|(face_index, _, _)| corner_width[&(*face_index, vertex)])
-                .sum::<f64>()
-                / faces.len() as f64;
-            // Blender's corner center lies on the superellipsoid of exponent e (e=2: sphere).
-            let displacement = amount * (1.0 - 3.0_f64.powf(-1.0 / exponent));
-            corner_center -= normal_sum * displacement;
-        } else {
-            let corners = faces
-                .iter()
-                .map(|(face_index, _, _)| points[face_corner[&(*face_index, vertex)]])
-                .fold(DVec3::ZERO, |sum, point| sum + point);
-            corner_center = corners / faces.len() as f64;
-        }
-        if affect == "VERTICES" || segments == 1 {
-            let boundary_faces: Vec<usize> =
-                faces.iter().map(|(face_index, _, _)| *face_index).collect();
-            let boundary: Vec<usize> = boundary_faces
-                .iter()
-                .map(|face_index| face_corner[&(*face_index, vertex)])
-                .collect();
-            let boundary =
-                bevel_shading::orient_corner(vertex, &boundary_faces, boundary, &edge_faces);
-            if boundary.len() >= 3 {
-                face_sources.push(Some(faces[0].0));
-                shade_sources.push(Some(
-                    bevel_shading::corner_source(
-                        vertex,
-                        &blender_order,
-                        &edge_faces,
-                        &selected_edges,
-                    )
-                    .unwrap_or(faces[0].0),
-                ));
-                output_polygons.push((boundary, faces[0].2));
-            }
-            continue;
-        }
-        let center_index = points.len();
-        // shortcut: corner vertices take one source vertex; Blender blends the bevel stencil of several corners, upgrade with those coefficients
-        points.push(corner_center);
-        point_vertices.push(vertex);
-        for (face_index, corner, material) in faces {
-            let face = &source_polygons[*face_index].0;
-            let previous = face[(*corner + face.len() - 1) % face.len()];
-            let next = face[(*corner + 1) % face.len()];
-            let mut patch = vec![face_corner[&(*face_index, vertex)]];
-            let outgoing_edge = edge_key(vertex, next);
-            let incoming_edge = edge_key(previous, vertex);
-            if affect == "EDGES" && selected_edges.contains(&outgoing_edge) {
-                patch.extend(
-                    (1..segments).map(|segment| profile_points[&(outgoing_edge, vertex, segment)]),
-                );
-            }
-            let center_corner = patch.len();
-            patch.push(center_index);
-            if affect == "EDGES" && selected_edges.contains(&incoming_edge) {
-                patch.extend(
-                    (1..segments)
-                        .rev()
-                        .map(|segment| profile_points[&(incoming_edge, vertex, segment)]),
-                );
-            }
-            let incoming = (source_points[previous] - source_points[vertex]).normalize_or_zero();
-            uv_queries.insert(
-                (output_polygons.len(), center_corner),
-                source_points[vertex]
-                    + incoming * (corner_center - source_points[vertex]).dot(incoming),
-            );
-            face_sources.push(Some(*face_index));
-            shade_sources.push(Some(*face_index));
-            output_polygons.push((patch, *material));
-        }
-    }
-    if output_polygons.is_empty() {
-        return Ok(mesh.clone());
-    }
-    // Blender interpolates each bevel loop from its source face at the loop's query point.
-    let mut query_points = Vec::new();
-    let mut query_polygons = Vec::with_capacity(output_polygons.len());
-    for (polygon, (vertices, _)) in output_polygons.iter().enumerate() {
-        let mut ids = Vec::with_capacity(vertices.len());
-        for (corner, vertex) in vertices.iter().copied().enumerate() {
-            ids.push(query_points.len());
-            query_points.push(
-                uv_queries
-                    .get(&(polygon, corner))
-                    .or_else(|| profile_uv_points.get(&vertex))
-                    .copied()
-                    .unwrap_or(points[vertex]),
-            );
-        }
-        query_polygons.push(ids);
-    }
-    let uv_sources: Vec<Option<usize>> = face_sources
-        .iter()
-        .enumerate()
-        .map(|(polygon, source)| match uv_face_overrides.get(&polygon) {
-            Some(face) => Some(*face),
-            None => *source,
-        })
-        .collect();
-    let corners = mean_value_corners(
-        mesh,
-        &query_points,
-        query_polygons
+    let edge_weight = (limit_method == "WEIGHT" && !affect_vertices).then(|| {
+        selected_edges
             .iter()
-            .zip(&uv_sources)
-            .map(|(ids, source)| (ids.as_slice(), *source)),
-    );
-    let mut origin = Origin::copies(point_vertices.iter().copied().map(Some), shade_sources);
-    origin.corners = Some(corners);
-    let source_count = source_polygons.len();
-    let kinds: Vec<bevel_shading::Kind> = (0..output_polygons.len())
-        .map(|polygon| {
-            if polygon < source_count {
-                bevel_shading::Kind::Source
-            } else if polygon < corner_start {
-                bevel_shading::Kind::Strip
-            } else {
-                bevel_shading::Kind::Corner
-            }
-        })
-        .collect();
-    let mut result = build_mesh(points, output_polygons, loose_edges(mesh)?, &origin, mesh)?;
-    clear_origindex(&mut result);
+            .map(|edge| {
+                let weight = edge_id_indices
+                    .get(edge)
+                    .map_or(0.0, |index| bevel_weight(*index) as f64);
+                (*edge, weight)
+            })
+            .collect()
+    });
+    let vertex_weight = if affect_vertices {
+        if limit_method == "WEIGHT" {
+            Some(
+                selected_vertices
+                    .iter()
+                    .map(|vertex| (*vertex, bevel_weight(*vertex) as f64))
+                    .collect(),
+            )
+        } else if limit_method == "VGROUP" {
+            vertex_group_weights.map(|weights| {
+                selected_vertices
+                    .iter()
+                    .map(|vertex| {
+                        let weight = weights
+                            .get(&format!("v{}", mesh.vertices[*vertex].id))
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0) as f32;
+                        (*vertex, f64::from(weight))
+                    })
+                    .collect()
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let sharp_flags = sharp_edge_flags(mesh)?;
+    let seam_flags = edge_flags(mesh, "seam");
+    let input_edge_flags = sharp_flags.into_iter().zip(seam_flags).collect::<Vec<_>>();
+
+    let geometry = bevel_boundary::Geometry {
+        points: source_points.clone(),
+        polygons: source_polygons.clone(),
+        face_normals,
+        seam_edges,
+        seam_vertices,
+        input_edge_flags,
+        selected_edges,
+        edge_order,
+        selected_vertices,
+        edge_weight,
+        vertex_weight,
+    };
+    let params = bevel_boundary::Params {
+        offset: width,
+        offset_type,
+        seg: segments,
+        profile,
+        pro_super_r: bevel_boundary::super_r_of(profile),
+        custom,
+        affect_vertices,
+        loop_slide,
+        miter_outer,
+        miter_inner,
+        spread,
+        vmesh_method,
+        mark_seam,
+        mark_sharp,
+        limit_offset: clamp_overlap,
+    };
+    let front = bevel_boundary::Front::build(params, geometry)?;
+    let material_override = (material >= 0).then_some(material as u32);
+    let components = (!float2_layers.is_empty() && segments % 2 == 1)
+        .then(|| bevel_vmesh::face_components(&source_points, &source_polygons, &loop_math_layers))
+        .transpose()?;
+    let context = bevel_rings::Context {
+        components,
+        has_math_layers: !float2_layers.is_empty(),
+        material: material_override,
+    };
+    let (emission, created_edges) =
+        bevel_rings::bevel_output(&front, &source_points, &source_polygons, &context)?;
+    // Blender's `bevel_reattach_wires` replaces every wire at a beveled vertex, in both affect modes, so a
+    // source wire with a beveled end is dropped here and its reattached copy is in `created_edges`.
+    let mut loose = loose_edges(mesh)?;
+    loose.retain(|[first, second]| front.verts[*first].is_none() && front.verts[*second].is_none());
+    loose.extend(created_edges);
+    let (mut result, kinds) = bevel_vmesh::finish(
+        mesh,
+        &source_polygons,
+        emission,
+        loose,
+        &float2_layers,
+        source_loop_topology.as_ref(),
+    )?;
     bevel_shading::shade_output(
         &mut result,
         &kinds,
-        &sharp_points,
         harden_normals,
-        input_custom,
+        clnor::corner_codes(mesh)?.is_some(),
     )?;
+    apply_bevel_face_strength(&mut result, &face_strength_mode, &kinds)?;
     Ok(result)
 }
-/// Boundary point of a VERTICES bevel on the edge from `vertex` to `neighbor`, seen from the face
-/// corner `previous, vertex, next`: the offset along that edge, as a point and as its fraction of
-/// the edge.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the boundary point depends on each bevel setting and on the face corner"
-)]
-fn vertex_bevel_edge_point(
-    source_points: &[DVec3],
-    vertex: usize,
-    previous: usize,
-    next: usize,
-    neighbor: usize,
-    width: f64,
-    offset_type: &str,
-    loop_slide: bool,
-    clamp_overlap: bool,
-) -> (DVec3, f64) {
-    let edge_length = source_points[vertex].distance(source_points[neighbor]);
-    let mut amount = if offset_type == "PERCENT" {
-        edge_length * width / 100.0
-    } else {
-        width
-    };
-    let other = if neighbor == previous { next } else { previous };
-    let angle = (source_points[other] - source_points[vertex])
-        .normalize_or_zero()
-        .dot((source_points[neighbor] - source_points[vertex]).normalize_or_zero())
-        .clamp(-1.0, 1.0)
-        .acos();
-    if offset_type == "WIDTH" {
-        amount *= (angle * 0.5).sin();
-    } else if offset_type == "DEPTH" {
-        amount /= (angle * 0.5).sin().max(1.0e-6);
+
+/// Reads a string parameter as one of `choices`, case-insensitively.
+fn bevel_choice<T: Copy>(
+    modifier: &Modifier,
+    name: &str,
+    default: &str,
+    choices: &[(&str, T)],
+    expected: &str,
+) -> Result<T> {
+    let text = match parameter_value(modifier, name) {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| invalid_parameter(modifier, name, expected))?,
+        None => default,
     }
-    if !loop_slide {
-        amount /= (angle * 0.5).sin().max(1.0e-6);
-    }
-    if clamp_overlap {
-        amount = amount.min(edge_length * 0.49);
-    }
-    let fraction = amount / edge_length.max(f64::EPSILON);
-    (
-        source_points[vertex].lerp(source_points[neighbor], fraction),
-        fraction,
-    )
-}
-#[expect(
-    clippy::too_many_lines,
-    reason = "vertex bevel shares edge offsets between original faces and fills each corner patch"
-)]
-#[expect(
-    clippy::manual_midpoint,
-    reason = "matches Blender's float evaluation order for parity"
-)]
-fn bevel_vertices(
-    mesh: &Mesh,
-    source_points: &[DVec3],
-    source_polygons: &[Polygon],
-    selected_vertices: &HashSet<usize>,
-    width: f64,
-    segments: usize,
-    profile: f64,
-    clamp_overlap: bool,
-    loop_slide: bool,
-    offset_type: &str,
-) -> Result<Mesh> {
-    if segments > 2 {
-        let mut edge_point = |vertex: usize, previous: usize, next: usize, neighbor: usize| {
-            vertex_bevel_edge_point(
-                source_points,
-                vertex,
-                previous,
-                next,
-                neighbor,
-                width,
-                offset_type,
-                loop_slide,
-                clamp_overlap,
-            )
-            .0
-        };
-        if let Some(emission) = bevel_vmesh::bevel_vertices(
-            mesh,
-            segments,
-            bevel_vmesh::profile_super_r(profile),
-            profile,
-            source_points,
-            source_polygons,
-            selected_vertices,
-            &mut edge_point,
-        ) {
-            return bevel_vmesh::finish(mesh, source_polygons, emission, loose_edges(mesh)?);
-        }
-    }
-    let exponent = if profile <= 0.0 {
-        1.0e4
-    } else {
-        (-2.0_f64.ln() / profile.sqrt().ln()).clamp(0.0, 1.0e4)
-    };
-    let mut points = source_points.to_vec();
-    // shortcut: corner vertices take one source vertex; Blender blends the bevel stencil of several corners, upgrade with those coefficients
-    let mut point_origins: Vec<Vec<(usize, f64)>> = (0..source_points.len())
-        .map(|vertex| vec![(vertex, 1.0)])
-        .collect();
-    let mut edge_points = HashMap::new();
-    let mut patch_graph = vec![HashMap::<usize, Vec<usize>>::new(); source_points.len()];
-    let mut corner_sectors = vec![Vec::new(); source_points.len()];
-    let mut output_polygons = Vec::with_capacity(source_polygons.len());
-    let mut face_sources = Vec::with_capacity(source_polygons.len());
-    let mut uv_queries: HashMap<(usize, usize), DVec3> = HashMap::new();
-    let mut uv_face_overrides: HashMap<usize, usize> = HashMap::new();
-    for (face_index, (face, material)) in source_polygons.iter().enumerate() {
-        let mut output_face = Vec::with_capacity(face.len() * (segments + 1));
-        for (corner, vertex) in face.iter().copied().enumerate() {
-            if !selected_vertices.contains(&vertex) {
-                output_face.push(vertex);
-                continue;
-            }
-            let previous = face[(corner + face.len() - 1) % face.len()];
-            let next = face[(corner + 1) % face.len()];
-            let mut edge_point = |neighbor: usize| {
-                let key = (edge_key(vertex, neighbor), vertex);
-                *edge_points.entry(key).or_insert_with(|| {
-                    let (point, fraction) = vertex_bevel_edge_point(
-                        source_points,
-                        vertex,
-                        previous,
-                        next,
-                        neighbor,
-                        width,
-                        offset_type,
-                        loop_slide,
-                        clamp_overlap,
-                    );
-                    let index = points.len();
-                    points.push(point);
-                    let bounded = fraction.clamp(0.0, 1.0);
-                    point_origins.push(blend_weights([
-                        (vertex, 1.0 - bounded),
-                        (neighbor, bounded),
-                    ]));
-                    index
-                })
-            };
-            let incoming = edge_point(previous);
-            let outgoing = edge_point(next);
-            let incoming_width = points[incoming].distance(source_points[vertex]);
-            let outgoing_width = points[outgoing].distance(source_points[vertex]);
-            let previous_direction =
-                (source_points[previous] - source_points[vertex]).normalize_or_zero();
-            let next_direction = (source_points[next] - source_points[vertex]).normalize_or_zero();
-            let arc_center = source_points[vertex]
-                + previous_direction * incoming_width
-                + next_direction * outgoing_width;
-            let start = (points[incoming] - arc_center).normalize_or_zero();
-            let end = (points[outgoing] - arc_center).normalize_or_zero();
-            let angle = start.dot(end).clamp(-1.0, 1.0).acos();
-            let radius = (points[incoming].distance(arc_center)
-                + points[outgoing].distance(arc_center))
-                * 0.5;
-            let mut arc_points = Vec::with_capacity(segments.saturating_sub(1));
-            for segment in 1..segments {
-                let t = segment as f64 / segments as f64;
-                let mapped = t.powf(2.0 / exponent);
-                let direction = if angle < 1.0e-8 {
-                    start
-                } else {
-                    (start * (angle * (1.0 - mapped)).sin() + end * (angle * mapped).sin())
-                        / angle.sin()
-                };
-                let index = points.len();
-                points.push(arc_center + direction * radius);
-                let origin = blend_weights(
-                    point_origins[incoming]
-                        .iter()
-                        .map(|&(source, weight)| (source, weight * (1.0 - t)))
-                        .chain(
-                            point_origins[outgoing]
-                                .iter()
-                                .map(|&(source, weight)| (source, weight * t)),
-                        ),
-                );
-                point_origins.push(origin);
-                arc_points.push(index);
-            }
-            output_face.push(incoming);
-            output_face.extend(arc_points.iter().copied());
-            output_face.push(outgoing);
-            patch_graph[vertex]
-                .entry(incoming)
-                .or_default()
-                .push(outgoing);
-            patch_graph[vertex]
-                .entry(outgoing)
-                .or_default()
-                .push(incoming);
-            corner_sectors[vertex].push((incoming, arc_points, outgoing, *material, face_index));
-        }
-        face_sources.push(Some(face_index));
-        output_polygons.push((output_face, *material));
-    }
-    let circle_fullness = [
-        0.0, 0.559, 0.642, 0.551, 0.646, 0.624, 0.646, 0.619, 0.647, 0.639, 0.647,
-    ];
-    for (vertex, graph) in patch_graph.iter().enumerate() {
-        if graph.len() < 3 || graph.values().any(|neighbors| neighbors.len() != 2) {
-            continue;
-        }
-        let Some(start) = graph.keys().copied().min() else {
-            continue;
-        };
-        let Some(mut current) = graph[&start].iter().copied().min() else {
-            continue;
-        };
-        let mut boundary = vec![start];
-        let mut previous = start;
-        for _ in 0..=graph.len() {
-            if current == start {
-                break;
-            }
-            if boundary.contains(&current) {
-                break;
-            }
-            boundary.push(current);
-            let Some(next) = graph[&current]
-                .iter()
-                .copied()
-                .find(|neighbor| *neighbor != previous)
-            else {
-                break;
-            };
-            previous = current;
-            current = next;
-        }
-        if current != start || boundary.len() != graph.len() {
-            continue;
-        }
-        if segments == 1 {
-            let sector = corner_sectors[vertex].first();
-            let material = sector.map_or(0, |sector| sector.3);
-            face_sources.push(sector.map(|sector| sector.4));
-            output_polygons.push((boundary, material));
-            continue;
-        }
-        let mut normal_sum = DVec3::ZERO;
-        for (face, _) in source_polygons {
-            if face.contains(&vertex) {
-                normal_sum += decimate::decimate_face_normal(source_points, face);
-            }
-        }
-        let amount = boundary
-            .iter()
-            .map(|point| points[*point].distance(source_points[vertex]))
-            .sum::<f64>()
-            / boundary.len() as f64;
-        let fullness = if (profile - 0.5).abs() < 1.0e-6 && segments <= circle_fullness.len() {
-            circle_fullness[segments - 1]
-        } else if segments.is_multiple_of(2) {
-            (2.4506 * profile - 0.000_003 * segments as f64 - 0.6266).max(0.0)
-        } else {
-            (2.3635 * profile + 0.000_152 * segments as f64 - 0.6060).max(0.0)
-        };
-        let center = source_points[vertex] - normal_sum * (amount * fullness * 0.301_073_345);
-        let center_index = points.len();
-        points.push(center);
-        point_origins.push(vec![(vertex, 1.0)]);
-        for (incoming, arc_points, outgoing, material, source) in &corner_sectors[vertex] {
-            if segments == 2 {
-                // Blender fills each edge-end point with one quad through the center, spanning the
-                // arcs of the two faces that meet there. Its loop UVs come from the face where the
-                // point is outgoing, and its center loop from the center projected onto that edge.
-                if let Some(other) = corner_sectors[vertex]
-                    .iter()
-                    .find(|other| other.2 == *incoming)
-                {
-                    let edge_direction =
-                        (points[*incoming] - source_points[vertex]).normalize_or_zero();
-                    let along =
-                        edge_direction * (center - source_points[vertex]).dot(edge_direction);
-                    uv_queries.insert((output_polygons.len(), 2), source_points[vertex] + along);
-                    uv_face_overrides.insert(output_polygons.len(), other.4);
-                    face_sources.push(Some(*source));
-                    output_polygons.push((
-                        vec![*incoming, arc_points[0], center_index, other.1[0]],
-                        *material,
-                    ));
-                }
-            } else {
-                let mut boundary = Vec::with_capacity(arc_points.len() + 2);
-                boundary.push(*incoming);
-                boundary.extend(arc_points.iter().copied());
-                boundary.push(*outgoing);
-                for pair in boundary.windows(2) {
-                    face_sources.push(Some(*source));
-                    output_polygons.push((vec![pair[0], pair[1], center_index], *material));
-                }
-            }
-        }
-    }
-    let loose = loose_edges(mesh)?;
-    let mut used = vec![false; points.len()];
-    for (face, _) in &output_polygons {
-        for vertex in face {
-            used[*vertex] = true;
-        }
-    }
-    for [first, second] in &loose {
-        used[*first] = true;
-        used[*second] = true;
-    }
-    let mut query_points = Vec::new();
-    let mut query_polygons = Vec::with_capacity(output_polygons.len());
-    for (polygon, (vertices, _)) in output_polygons.iter().enumerate() {
-        let mut ids = Vec::with_capacity(vertices.len());
-        for (corner, vertex) in vertices.iter().copied().enumerate() {
-            ids.push(query_points.len());
-            query_points.push(
-                uv_queries
-                    .get(&(polygon, corner))
-                    .copied()
-                    .unwrap_or(points[vertex]),
-            );
-        }
-        query_polygons.push(ids);
-    }
-    let mut remap = vec![0; points.len()];
-    let mut compact_points = Vec::with_capacity(points.len());
-    let mut compact_origins = Vec::with_capacity(points.len());
-    for ((index, point), origin) in points.into_iter().enumerate().zip(point_origins) {
-        if used[index] {
-            remap[index] = compact_points.len();
-            compact_points.push(point);
-            compact_origins.push(origin);
-        }
-    }
-    for (face, _) in &mut output_polygons {
-        for vertex in face {
-            *vertex = remap[*vertex];
-        }
-    }
-    let compact_loose = loose
-        .into_iter()
-        .map(|[first, second]| [remap[first], remap[second]])
-        .collect();
-    // Blender interpolates each bevel loop from its source face at the loop's query point.
-    let uv_sources: Vec<Option<usize>> = face_sources
+    .to_ascii_uppercase();
+    choices
         .iter()
-        .enumerate()
-        .map(|(polygon, source)| match uv_face_overrides.get(&polygon) {
-            Some(face) => Some(*face),
-            None => *source,
-        })
-        .collect();
-    let corners = mean_value_corners(
-        mesh,
-        &query_points,
-        query_polygons
-            .iter()
-            .zip(&uv_sources)
-            .map(|(ids, source)| (ids.as_slice(), *source)),
-    );
-    let origin = Origin {
-        vertices: compact_origins,
-        source_vertices: None,
-        faces: face_sources,
-        corners: Some(corners),
-    };
-    let mut result = build_mesh(
-        compact_points,
-        output_polygons,
-        compact_loose,
-        &origin,
-        mesh,
-    )?;
-    clear_origindex(&mut result);
-    Ok(result)
+        .find(|(label, _)| *label == text)
+        .map(|(_, value)| *value)
+        .ok_or_else(|| invalid_parameter(modifier, name, expected))
+}
+
+fn apply_bevel_face_strength(
+    mesh: &mut Mesh,
+    mode: &str,
+    kinds: &[bevel_shading::Kind],
+) -> Result<()> {
+    if mode == "FSTR_NONE" {
+        return Ok(());
+    }
+    let name = "__mod_weightednormals_faceweight";
+    if !mesh.attributes.contains_key(name) {
+        mesh.attributes.insert(
+            name.to_owned(),
+            json!({"domain":"face","type":"int","values":{}}),
+        );
+    }
+    let attribute = mesh.attributes.get_mut(name).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "face strength attribute was just inserted or already exists",
+        )
+    })?;
+    let values = attribute
+        .get_mut("values")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidArgument,
+                "face strength attribute values must be an object",
+            )
+        })?;
+    for face in &mesh.faces {
+        values
+            .entry(format!("f{}", face.id))
+            .or_insert_with(|| json!(0));
+    }
+    for (face, kind) in mesh.faces.iter().zip(kinds) {
+        let strength = match kind {
+            bevel_shading::Kind::Source if mode == "FSTR_ALL" || mode == "FSTR_AFFECTED" => {
+                Some(16_384)
+            }
+            bevel_shading::Kind::Original if mode == "FSTR_ALL" => Some(16_384),
+            bevel_shading::Kind::Strip if mode != "FSTR_NONE" => Some(0),
+            bevel_shading::Kind::Corner if mode != "FSTR_NONE" => Some(-16_384),
+            _ => None,
+        };
+        if let Some(strength) = strength {
+            values.insert(format!("f{}", face.id), json!(strength));
+        }
+    }
+    Ok(())
 }
 
 fn decimate(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
@@ -6883,6 +6134,7 @@ fn decimate_compact(
         source_vertices,
         faces: origin.faces,
         corners: origin.corners,
+        ..Default::default()
     };
     // The edges take Blender's pool order before the provenance remap writes the edge-indexed data.
     let mut result = build_topology(compact_points, polygons, loose)?;
@@ -7024,6 +6276,7 @@ fn weld(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             .map(|(&face, &generated)| (!generated).then_some(face))
             .collect(),
         corners: Some(corner_origins),
+        ..Default::default()
     };
     let mut result = build_mesh(merged.points, merged.polygons, merged.edges, &origin, mesh)?;
     mark_generated_faces_smooth(&mut result, &generated_face_indices);
@@ -7529,7 +6782,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        error::{ErrorCode, PotError},
+        error::ErrorCode,
+        eval::ModifierEvaluationContext,
         geom::{
             BoxParams, Mesh,
             uv_layers::{self, UvLayer},
@@ -7538,9 +6792,9 @@ mod tests {
     };
 
     use super::{
-        array_chunk_elements, check_evaluation_memory_budget, check_subdivision_budget,
+        array_chunk_elements, bevel, check_evaluation_memory_budget, check_subdivision_budget,
         contextless_material_slot_count, edge_pairs, evaluate_modifiers,
-        evaluated_curve_path_length, loose_edges,
+        evaluate_modifiers_with_scene_context, evaluated_curve_path_length, loose_edges,
     };
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
@@ -8490,16 +7744,8 @@ mod tests {
         }
     }
 
-    fn refused_feature(error: &PotError) -> Option<&str> {
-        error
-            .details
-            .get("feature_id")
-            .and_then(serde_json::Value::as_str)
-    }
-
-    /// Each typed refusal is raised where Blender acts, and each stays silent where Blender does
-    /// nothing (`mirror bisect` on an unmirrored axis, `mark_seam` without seams, `mark_sharp`
-    /// without sharp edges).
+    /// `mirror bisect` is refused only on a mirrored axis, where Blender acts. On an unmirrored
+    /// axis it stays silent, as Blender does.
     #[test]
     fn shading_refusals_name_their_feature_only_where_blender_acts() {
         let mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
@@ -8513,77 +7759,6 @@ mod tests {
             "TestObject",
         )
         .unwrap();
-
-        let mut seamed = mesh.clone();
-        let first_edge = seamed.edges[0].id;
-        let mut seam_values = serde_json::Map::new();
-        seam_values.insert(format!("e{first_edge}"), json!(true));
-        seamed.attributes.insert(
-            "seam".to_owned(),
-            json!({"domain": "edge", "type": "bool", "values": seam_values}),
-        );
-        let error = evaluate_modifiers(
-            &seamed,
-            &[with_params(
-                "bevel",
-                json!({"width": 0.1, "mark_seam": true}),
-            )],
-            "TestObject",
-        )
-        .unwrap_err();
-        assert_eq!(refused_feature(&error), Some("modifier.bevel.mark_seam"));
-        evaluate_modifiers(
-            &mesh,
-            &[with_params(
-                "bevel",
-                json!({"width": 0.1, "mark_seam": true}),
-            )],
-            "TestObject",
-        )
-        .unwrap();
-
-        let error = evaluate_modifiers(
-            &mesh,
-            &[with_params(
-                "bevel",
-                json!({"width": 0.1, "segments": 2, "harden_normals": true}),
-            )],
-            "TestObject",
-        )
-        .unwrap_err();
-        assert_eq!(
-            refused_feature(&error),
-            Some("modifier.bevel.shading_segments")
-        );
-        evaluate_modifiers(
-            &mesh,
-            &[with_params(
-                "bevel",
-                json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
-            )],
-            "TestObject",
-        )
-        .unwrap();
-
-        let mut sharp = mesh.clone();
-        let key = format!("e{}", sharp.edges[0].id);
-        sharp.attributes.insert(
-            "sharp".to_owned(),
-            json!({"domain": "edge", "type": "bool", "values": {key: true}}),
-        );
-        let error = evaluate_modifiers(
-            &sharp,
-            &[with_params(
-                "bevel",
-                json!({"width": 0.1, "segments": 2, "mark_sharp": true}),
-            )],
-            "TestObject",
-        )
-        .unwrap_err();
-        assert_eq!(
-            refused_feature(&error),
-            Some("modifier.bevel.shading_segments")
-        );
     }
 
     #[test]
@@ -8598,6 +7773,78 @@ mod tests {
         assert_eq!(result.faces.len(), 26);
         assert_eq!(result.vertices.len(), 24);
         assert!(result.validate().is_ok());
+    }
+
+    #[test]
+    fn bevel_material_override_clamps_to_evaluated_slot_count() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        for face in &mut mesh.faces {
+            face.material_index = 5;
+        }
+        let modifier = with_params("bevel", json!({"width": 0.1, "material": 32767}));
+        let result = bevel(
+            &mesh,
+            &modifier,
+            ModifierEvaluationContext {
+                material_slot_count: Some(2),
+                ..ModifierEvaluationContext::default()
+            },
+        )
+        .unwrap();
+        assert!(result.faces.iter().any(|face| face.material_index == 1));
+        assert!(
+            result
+                .faces
+                .iter()
+                .filter(|face| face.material_index != 5)
+                .all(|face| face.material_index == 1)
+        );
+    }
+
+    #[test]
+    fn scene_callback_refreshes_material_slot_count_before_bevel() {
+        let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
+        for face in &mut mesh.faces {
+            face.material_index = 5;
+        }
+        let modifiers = [
+            modifier(true, "lattice"),
+            with_params("bevel", json!({"width": 0.1, "material": 32767})),
+        ];
+        let result = evaluate_modifiers_with_scene_context(
+            mesh,
+            &modifiers,
+            &std::collections::BTreeMap::new(),
+            1.0,
+            "TestObject",
+            DMat4::IDENTITY,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            ModifierEvaluationContext {
+                material_slot_count: Some(6),
+                ..ModifierEvaluationContext::default()
+            },
+            |_, modifier| modifier.enabled,
+            super::TextureSeed::new(crate::eval::EvaluationPurpose::Preview, 0, "TestObject"),
+            None,
+            |_, modifier, _, _, _| {
+                assert_eq!(modifier.modifier_type, "lattice");
+                Ok(Some(2))
+            },
+            |_, _, _| Ok(None),
+        )
+        .unwrap()
+        .mesh;
+        assert!(result.faces.iter().any(|face| face.material_index == 1));
+        assert!(
+            result
+                .faces
+                .iter()
+                .filter(|face| face.material_index != 5)
+                .all(|face| face.material_index == 1)
+        );
     }
 
     #[test]
