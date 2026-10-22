@@ -526,7 +526,7 @@ pub(super) fn uv_warp(
     modifier: &Modifier,
     operands: &BTreeMap<String, Vec<SceneOperand>>,
 ) -> Result<Mesh> {
-    let store = crate::geom::uv_layers::read(mesh);
+    let mut store = crate::geom::uv_layers::read(mesh);
     let requested_layer = string(modifier, "uv_layer")?;
     // MOD_uvwarp.cc:190-193: a named layer the mesh lacks falls back to the active layer.
     let named_index = (!requested_layer.is_empty())
