@@ -613,8 +613,6 @@ pub(super) fn extract_geometry(
                 .map(|layer| layer.name.clone())
                 .collect(),
             color_layer_indices: carried,
-            color_render_layers: BTreeMap::new(),
-            color_available_masks: BTreeMap::new(),
             thickness,
             material_colors: MaterialColors::default(),
             world_to_local: object_inverse(matrix),
