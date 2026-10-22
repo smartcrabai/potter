@@ -1,0 +1,14 @@
+{
+  "blender": "Blender 5.2.2 LTS (hash d13f752e3b9c, built 2026-09-15 01:49:19)",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "generated_by": "tests/fixtures/native_oracle/eevee_world_background.py (rendered on macOS), then export_eevee_fixture.py; the scripts above are the versions that rendered them",
+  "scripts": {
+    "eevee_world_background.py": "3dfbc770812ece43429906a7d0425c9e32ef12d101701af8ab56b04f3591e29b",
+    "export_eevee_fixture.py": "214d2ab63f343f7e59af8eaa7752217f7b26b574696e9c21b0518279ddd55606"
+  },
+  "fixtures": {
+    "world_background_node_black.f32le": 49152,
+    "world_background_node_colour.f32le": 49152
+  }
+}
