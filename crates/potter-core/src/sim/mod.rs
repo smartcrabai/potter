@@ -1667,7 +1667,8 @@ mod tests {
         moving.velocity = [1.0, 2.0, 3.0];
         let heading = DVec3::new(1.0, 2.0, 3.0).normalize();
         let oriented = DQuat::from_array(particle_state(moving, 0).rotation);
-        assert!((oriented * DVec3::X - heading).length() < 1.0e-12);
+        // The orientation is Blender's f32 `vec_to_quat`, so local +X matches the heading to f32.
+        assert!((oriented * DVec3::X - heading).length() < 1.0e-6);
         let stationary = particle_state(
             particle_for_state(
                 ParticlePathInterpolation::HairCache,

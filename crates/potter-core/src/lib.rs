@@ -7,6 +7,7 @@
     )
 )]
 
+mod blender_f32;
 mod blender_rng;
 pub(crate) const BUILD_IDENTITY: &str = env!("POTTER_BUILD_IDENTITY");
 

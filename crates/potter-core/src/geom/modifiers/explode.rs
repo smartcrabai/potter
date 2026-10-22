@@ -4,10 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use glam::{DMat4, DQuat, DVec3};
+use glam::{DMat4, DVec3};
 use serde_json::{Map, Value};
 
 use crate::{
+    blender_f32,
     blender_rng::BlenderRng,
     geom::{
         Edge, Face, Mesh, Vertex,
@@ -86,6 +87,8 @@ pub fn explode(
         .ok_or_else(|| invalid("particle_uv must be a string"))?;
 
     let inverse_world = target_world.inverse();
+    let world32 = blender_f32::mat4(target_world);
+    let inverse32 = blender_f32::mat4(inverse_world);
     let vertex_indices: BTreeMap<u32, usize> = mesh
         .vertices
         .iter()
@@ -232,13 +235,22 @@ pub fn explode(
                 let id = take_id(&mut output.next_id.vertex)?;
                 let co = if let Some(index) = particle.filter(|_| !unborn) {
                     let state = parents[index];
-                    let world_position = target_world.transform_point3(point_position(point));
-                    let relative = world_position - DVec3::from_array(state.birth_position);
-                    let rotation = DQuat::from_array(state.rotation)
-                        * DQuat::from_array(state.birth_rotation).conjugate();
-                    let size = if use_size { state.size } else { 1.0 };
-                    inverse_world.transform_point3(
-                        DVec3::from_array(state.position) + rotation * relative * size,
+                    let size = use_size.then_some(state.size as f32);
+                    DVec3::from_array(
+                        blender_f32::explode_fragment(
+                            blender_f32::vec3(point_position(point).to_array()),
+                            (&world32, &inverse32),
+                            (
+                                blender_f32::vec3(state.birth_position),
+                                blender_f32::quat_from_xyzw(state.birth_rotation),
+                            ),
+                            (
+                                blender_f32::vec3(state.position),
+                                blender_f32::quat_from_xyzw(state.rotation),
+                            ),
+                            size,
+                        )
+                        .map(f64::from),
                     )
                 } else {
                     point_position(point)

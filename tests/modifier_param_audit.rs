@@ -406,23 +406,33 @@ fn scenario_geometry<'a>(results: &'a BTreeMap<String, Value>, id: &str, state: 
         .expect("Blender scenario result is missing")
 }
 
-/// Blender evaluates each vertex in f32 through a chain (explode fragment placement, particle
-/// instance transforms). Potter computes in f64 and is compared after rounding to f32. The chain
-/// magnitude M is the largest value Blender carries through that chain, reported by the Blender
-/// runner as `chain_magnitude`.
+/// Blender evaluates the explode fragment and the particle orientation in f32; Potter mirrors both
+/// (`crates/potter-core/src/blender_f32.rs`), so on a platform whose libm matches Blender's the
+/// evaluated geometry is bit-identical. The only remaining term is libm: `acosf`, `sinf`, `cosf`,
+/// `atan2f` (each within 1 ulp, [INFERENCE] for macOS and glibc), while `sqrtf` and division are
+/// correctly rounded. `chain_magnitude` is the largest value Blender carries through the chain.
 ///
-/// NOT DERIVED. `F32_CHAIN_ROUNDINGS` (12 half-ulps of M) was chosen to cover the measured
-/// differences; it is not a worst-case bound. The explode edge-cut vertex path, from
-/// `MOD_explode.cc` (v5.2.2) lines 1000-1017, has these f32 operations: `sub_v3` (exact for the
-/// fixture's cube corners), `sub_qt_qtqt` (28 roundings: 16 products, 12 add/sub, `math_rotation_c.cc`),
-/// `mul_qt_v3` (41 roundings: 20 in the first stage, 21 in the second, `math_rotation_c.cc:77`),
-/// `add_v3` (3 roundings), and
-/// `mul_m4_v3` with identity matrices (exact). A first-order worst-case analysis with Cauchy-Schwarz
-/// magnitudes gives 221 ulp(1) per coordinate. Randomized f32 emulation reaches 4.96 ulp(1). The
-/// explode measurement is 6 ulp on the CI (Linux) Blender and 4 ulp on macOS arm64, so it is within
-/// the derived path bound. The particle quaternion's own f32 construction error is not yet counted,
-/// so no complete bound exists yet; this constant should be replaced by a per-scenario derivation.
-const F32_CHAIN_ROUNDINGS: f64 = 12.0;
+/// Derivation for the explode edge-cut fixture (`vec_to_quat` in f32, six libm calls): perturbing
+/// each call's result by one f32 ulp and propagating through the explode chain gives first-order
+/// sensitivities of 2 (acos), 4 (sin of phi), 2 (cos of phi), 2 (atan2), 4 (cos of twist), and 4
+/// (sin of twist) ulp(1), summing to 18 ulp(1). The audit generates Blender on CI Linux, so this
+/// covers the Linux and macOS libm difference.
+const EXPLODE_LIBM_ULPS: f64 = 18.0;
+
+/// Particle Instance and the other modifiers do not yet have an f32 mirror, so their chain is
+/// compared at 6 ulps of `chain_magnitude`. This value is NOT DERIVED: it was chosen to cover the
+/// measured differences (the old 12 half-ulps) and must be replaced by a derivation when those
+/// chains are mirrored.
+const UNDERIVED_CHAIN_ULPS: f64 = 6.0;
+
+/// The bound in f32 ulps of the chain magnitude for a scenario's modifier.
+fn bound_ulps(modifier: &str) -> f64 {
+    if modifier == "explode" {
+        EXPLODE_LIBM_ULPS
+    } else {
+        UNDERIVED_CHAIN_ULPS
+    }
+}
 
 /// `value` rounded to f32, by parsing its shortest decimal form. This avoids an `as` cast, which the
 /// workspace's pedantic clippy rejects. It equals the nearest f32 except in rare double-rounding
@@ -437,11 +447,11 @@ fn f32_ulp(value: f32) -> f64 {
     f64::from(f32::from_bits(magnitude.to_bits() + 1) - magnitude)
 }
 
-/// Compares evaluated geometry at f32 precision: vertices match by position within the chain bound
-/// (`F32_CHAIN_ROUNDINGS` half-ulps of Blender's `chain_magnitude`), each used once, and faces
+/// Compares evaluated geometry at f32 precision: vertices match by position within `bound_ulps` f32
+/// ulps of Blender's `chain_magnitude` (each used once), and faces
 /// compare as vertex sets under that matching, so storage order is ignored. Returns `None` when
 /// they match, otherwise a dump of both sides in storage order for the CI log.
-fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
+fn geometry_mismatch(potter: &Value, blender: &Value, bound_ulps: f64) -> Option<String> {
     let counts = |geometry: &Value| {
         ["vertex_count", "edge_count", "face_count"].map(|key| geometry[key].as_u64())
     };
@@ -481,7 +491,7 @@ fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
         .collect();
     let blender_points = points(blender);
     let scale = blender["chain_magnitude"].as_f64().unwrap();
-    let tolerance = F32_CHAIN_ROUNDINGS * 0.5 * f32_ulp(f32_of(scale));
+    let tolerance = bound_ulps * f32_ulp(f32_of(scale));
     let mut matches =
         counts(potter) == counts(blender) && potter_points.len() == blender_points.len();
     let mut matched = vec![None; potter_points.len()];
@@ -539,9 +549,10 @@ fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
     })
 }
 
-/// Fails with both sides' geometry when Potter's evaluated geometry differs from Blender's.
-fn assert_scenario_matches(id: &str, potter: &Value, blender: &Value) {
-    let mismatch = geometry_mismatch(potter, blender);
+/// Fails with both sides' geometry when Potter's evaluated geometry differs from Blender's by more
+/// than `bound_ulps` f32 ulps of the chain magnitude.
+fn assert_scenario_matches(id: &str, potter: &Value, blender: &Value, bound_ulps: f64) {
+    let mismatch = geometry_mismatch(potter, blender, bound_ulps);
     assert!(
         mismatch.is_none(),
         "{id}: Potter differs from Blender\n{}",
@@ -598,7 +609,7 @@ fn f_modifier_parameter_scenarios_match_blender() {
                     geometry_signature(&potter_case),
                     "{id}: Potter fixture is inactive"
                 );
-                assert_scenario_matches(id, &potter_case, blender_case);
+                assert_scenario_matches(id, &potter_case, blender_case, bound_ulps(modifier));
             }
             "inert" => {
                 assert_eq!(
@@ -611,7 +622,12 @@ fn f_modifier_parameter_scenarios_match_blender() {
                     geometry_signature(&potter_case),
                     "{id}: expected Potter no-op"
                 );
-                assert_scenario_matches(id, &potter_baseline, blender_baseline);
+                assert_scenario_matches(
+                    id,
+                    &potter_baseline,
+                    blender_baseline,
+                    bound_ulps(modifier),
+                );
             }
             expectation => panic!("{id}: unknown scenario expectation {expectation}"),
         }
@@ -654,7 +670,7 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
                     geometry_signature(&potter_case),
                     "{id}: Potter fixture is inactive"
                 );
-                assert_scenario_matches(id, &potter_case, blender_case);
+                assert_scenario_matches(id, &potter_case, blender_case, bound_ulps(modifier));
             }
             "inert" => {
                 assert_eq!(
@@ -667,7 +683,12 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
                     geometry_signature(&potter_case),
                     "{id}: expected Potter no-op"
                 );
-                assert_scenario_matches(id, &potter_baseline, blender_baseline);
+                assert_scenario_matches(
+                    id,
+                    &potter_baseline,
+                    blender_baseline,
+                    bound_ulps(modifier),
+                );
             }
             "known_gap" => {
                 let owner = scenario["owner"]
@@ -683,7 +704,7 @@ fn modifier_parameter_scenarios_match_blender_or_record_real_gaps() {
                     "{id}: the tested Blender parameter is inactive"
                 );
                 assert!(
-                    geometry_mismatch(&potter_case, blender_case).is_some(),
+                    geometry_mismatch(&potter_case, blender_case, bound_ulps(modifier)).is_some(),
                     "{id}: recorded parity gap has been fixed; update the scenario inventory"
                 );
                 assert_eq!(

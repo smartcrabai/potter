@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
+    blender_f32,
     blender_rng::{BlenderRng, psys_frand},
     error::{ErrorCode, PotError, Result},
     geom::{Mesh, normals::geometric_vertex_normals},
@@ -714,9 +715,8 @@ fn simulate_with_lifecycle(
                 };
                 (sample.position, sample.normal)
             };
-            let normal = normal_transform
-                .transform_vector3(local_normal)
-                .normalize_or_zero();
+            let transformed_normal = normal_transform.transform_vector3(local_normal);
+            let normal = transformed_normal.normalize_or_zero();
             // A birth without a normal adds no normal velocity: Blender's normal stays zero for a grid cell
             // and for a face left zeroed by an empty distribution. Only a vertex falls back to +Z.
             let direction = if normal.length_squared() > 0.0 {
@@ -732,8 +732,19 @@ fn simulate_with_lifecycle(
                 random.signed() * random_velocity.z,
             );
             let start = world.transform_point3(local_position);
+            // Blender's vertex birth velocity is `normalize(normal) * normal_factor` in f32
+            // (`blender_f32::vertex_birth_velocity`). Other emitters keep the f64 direction.
+            let normal_velocity = if from_vertex && normal.length_squared() > 0.0 {
+                let mirrored = blender_f32::vertex_birth_velocity(
+                    blender_f32::vec3(transformed_normal.to_array()),
+                    speed as f32,
+                );
+                DVec3::from_array(mirrored.map(f64::from))
+            } else {
+                direction * speed
+            };
             let velocity =
-                direction * speed + world.transform_vector3(initial_velocity + local_random);
+                normal_velocity + world.transform_vector3(initial_velocity + local_random);
             if !start.is_finite() || !velocity.is_finite() {
                 return Err(invalid("particle emission produced a non-finite value"));
             }
@@ -1637,32 +1648,13 @@ pub(super) fn sample_path(
         rotation: rotation.to_array(),
     })
 }
-/// Blender's default `PART_ROT_VEL` particle orientation (`particle_system.cc`):
-/// `vec_to_quat(-(-velocity), OB_POSX, OB_POSZ)`, so local +X follows the velocity and the
-/// twist about X keeps local +Z as upward as possible. Zero velocity keeps the identity.
+/// Blender's default `PART_ROT_VEL` particle orientation (`particle_system.cc`): `vec_to_quat`
+/// in f32 (`blender_f32::velocity_orientation`), so local +X follows the velocity and the twist
+/// about X keeps local +Z as upward as possible. Zero velocity keeps the identity.
 pub(super) fn blender_velocity_orientation(velocity: [f64; 3]) -> [f64; 4] {
-    const EPSILON: f64 = 1.0e-4;
-    let tvec = DVec3::from_array(velocity);
-    let length = tvec.length();
-    if !(length.is_finite() && length > 0.0) {
-        return DQuat::IDENTITY.to_array();
-    }
-    let mut nor = DVec3::new(0.0, -tvec.z, tvec.y);
-    if tvec.y.abs() + tvec.z.abs() < EPSILON {
-        nor.y = 1.0;
-    }
-    let swing = DQuat::from_axis_angle(nor.normalize(), (tvec.x / length).clamp(-1.0, 1.0).acos());
-    // Blender reads the Z column of the swing (`mat[2]`) to pick the twist.
-    let up = swing * DVec3::Z;
-    let twist_angle = -0.5 * up.y.atan2(up.z);
-    let (sin, cos) = twist_angle.sin_cos();
-    let twist = DQuat::from_xyzw(
-        tvec.x * sin / length,
-        tvec.y * sin / length,
-        tvec.z * sin / length,
-        cos,
-    );
-    (twist * swing).to_array()
+    blender_f32::quat_to_xyzw(blender_f32::velocity_orientation(blender_f32::vec3(
+        velocity,
+    )))
 }
 
 fn emitter_root_frame(
