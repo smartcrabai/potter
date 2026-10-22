@@ -1105,7 +1105,8 @@ fn render_rows(
                 let mut rng = Pcg32::for_sample(job.seed, x, y, sample_index);
                 let filter_u = rng.next_f64();
                 let filter_v = rng.next_f64();
-                let (sample_x, sample_y) = job.pixel_filter.sample(sample_index, filter_u, filter_v);
+                let (sample_x, sample_y) =
+                    job.pixel_filter.sample(sample_index, filter_u, filter_v);
                 let (radiance, alpha) = if job.anaglyph {
                     let (left_camera, left_frame) = &job.eyes[0];
                     let (right_camera, right_frame) = &job.eyes[1];
