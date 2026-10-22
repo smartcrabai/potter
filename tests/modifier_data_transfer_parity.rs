@@ -353,23 +353,20 @@ fn set_custom_normal_codes(mesh: &mut Mesh, raw_codes: &Value) -> Result<(), Box
 }
 
 /// Blender's edge indices differ from Potter's, so per-edge values are matched by sorted vertex pair.
-const SOURCE_EDGE_CREASES: [((u32, u32), f64); 4] =
-    [((0, 3), 0.1), ((0, 1), 0.3), ((1, 2), 0.5), ((2, 3), 0.7)];
-
 fn sorted_pair(vertices: [u32; 2]) -> (u32, u32) {
     (vertices[0].min(vertices[1]), vertices[0].max(vertices[1]))
 }
 
-/// The source quad's crease values, in Potter's edge order.
-fn source_edge_creases(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
+/// One value per edge of `mesh`, in Potter's edge order, looked up by sorted vertex pair.
+fn pair_values(mesh: &Mesh, by_pair: &[((u32, u32), Value)]) -> Result<Value, Box<dyn Error>> {
     let mut values = Vec::with_capacity(mesh.edges.len());
     for edge in &mesh.edges {
         let key = sorted_pair(edge.vertices);
-        let (_, value) = SOURCE_EDGE_CREASES
+        let (_, value) = by_pair
             .iter()
             .find(|(pair, _)| *pair == key)
-            .ok_or("source edge has no crease")?;
-        values.push(json!(value));
+            .ok_or("edge has no value for its vertex pair")?;
+        values.push(value.clone());
     }
     Ok(Value::Array(values))
 }
@@ -2456,7 +2453,15 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         ],
         vec![vec![0, 1, 2, 3]],
     )?;
-    let source_creases = source_edge_creases(&source)?;
+    let source_creases = pair_values(
+        &source,
+        &[
+            ((0, 3), json!(0.1)),
+            ((0, 1), json!(0.3)),
+            ((1, 2), json!(0.5)),
+            ((2, 3), json!(0.7)),
+        ],
+    )?;
     set_blender_attribute(&mut source, "crease_edge", "EDGE", "FLOAT", &source_creases)?;
     let mut operands = BTreeMap::new();
     operands.insert(
@@ -2745,14 +2750,23 @@ def mesh(name, source):
     obj=bpy.data.objects.new(name,data); bpy.context.collection.objects.link(obj)
     specifications=(
         ('bevel_weight_vert','FLOAT','POINT',[0.1,0.3,0.5,0.7] if source else [0.8,0.6,0.4,0.2]),
-        ('crease_edge','FLOAT','EDGE',[0.1,0.3,0.5,0.7] if source else [0.0]*4),
-        ('bevel_weight_edge','FLOAT','EDGE',[0.2,0.4,0.6,0.8] if source else [0.0]*4),
-        ('freestyle_edge','BOOLEAN','EDGE',[False,True,False,True] if source else [False]*4),
         ('freestyle_face','BOOLEAN','FACE',[True] if source else [False]),
     )
     for name,type,domain,values in specifications:
         attribute=data.attributes.get(name) or data.attributes.new(name=name,type=type,domain=domain)
         for item,value in zip(attribute.data,values): item.value=value
+    edge_specifications=(
+        ('crease_edge','FLOAT',{(0,3):0.1,(0,1):0.3,(1,2):0.5,(2,3):0.7}),
+        ('bevel_weight_edge','FLOAT',{(0,3):0.2,(0,1):0.4,(1,2):0.6,(2,3):0.8}),
+        ('freestyle_edge','BOOLEAN',{(0,3):False,(0,1):True,(1,2):False,(2,3):True}),
+    )
+    for name,kind,by_pair in edge_specifications:
+        attribute=data.attributes.get(name) or data.attributes.new(name=name,type=kind,domain='EDGE')
+        for edge in data.edges:
+            if source:
+                attribute.data[edge.index].value=by_pair[tuple(sorted(edge.vertices))]
+            else:
+                attribute.data[edge.index].value=False if kind=='BOOLEAN' else 0.0
     data.polygons[0].use_smooth=source
     if source:
         for edge in data.edges:
@@ -2787,6 +2801,8 @@ for data_type,domain in (
               'BEVEL_WEIGHT_EDGE':'bevel_weight_edge','FREESTYLE_EDGE':'freestyle_edge',
               'FREESTYLE_FACE':'freestyle_face'}[data_type]
         values=[item.value for item in output.attributes[name].data]
+    if domain=='EDGE':
+        values={'%d-%d'%tuple(sorted(edge.vertices)): value for edge,value in zip(output.edges,values)}
     result[data_type]=values
     evaluated.to_mesh_clear()
 with open(os.path.join(root,'attribute-domains-oracle.json'),'w') as f: json.dump(result,f)
@@ -2821,27 +2837,36 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
         "float",
         &json!([0.1, 0.3, 0.5, 0.7]),
     )?;
-    set_domain_attribute(
-        &mut source,
-        "crease_edge",
-        "edge",
-        "float",
-        &json!([0.1, 0.3, 0.5, 0.7]),
+    let crease = pair_values(
+        &source,
+        &[
+            ((0, 3), json!(0.1)),
+            ((0, 1), json!(0.3)),
+            ((1, 2), json!(0.5)),
+            ((2, 3), json!(0.7)),
+        ],
     )?;
-    set_domain_attribute(
-        &mut source,
-        "bevel_weight_edge",
-        "edge",
-        "float",
-        &json!([0.2, 0.4, 0.6, 0.8]),
+    set_domain_attribute(&mut source, "crease_edge", "edge", "float", &crease)?;
+    let bevel = pair_values(
+        &source,
+        &[
+            ((0, 3), json!(0.2)),
+            ((0, 1), json!(0.4)),
+            ((1, 2), json!(0.6)),
+            ((2, 3), json!(0.8)),
+        ],
     )?;
-    set_domain_attribute(
-        &mut source,
-        "freestyle_edge",
-        "edge",
-        "bool",
-        &json!([false, true, false, true]),
+    set_domain_attribute(&mut source, "bevel_weight_edge", "edge", "float", &bevel)?;
+    let freestyle = pair_values(
+        &source,
+        &[
+            ((0, 3), json!(false)),
+            ((0, 1), json!(true)),
+            ((1, 2), json!(false)),
+            ((2, 3), json!(true)),
+        ],
     )?;
+    set_domain_attribute(&mut source, "freestyle_edge", "edge", "bool", &freestyle)?;
     set_domain_attribute(
         &mut source,
         "freestyle_face",
@@ -2934,6 +2959,12 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
             "destination",
             &AttributeLayerSelection::default(),
         )?;
+        let expected_values = match data_type {
+            "SHARP_EDGE" | "SEAM" | "CREASE" | "BEVEL_WEIGHT_EDGE" | "FREESTYLE_EDGE" => {
+                pair_expected(&destination, &expected[data_type])?
+            }
+            _ => expected[data_type].clone(),
+        };
         let actual_values = match data_type {
             "SHARP_EDGE" => domain_attribute_values(&actual, "sharp"),
             "SEAM" => domain_attribute_values(&actual, "seam"),
@@ -2948,10 +2979,10 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
             data_type,
             "BEVEL_WEIGHT_VERT" | "CREASE" | "BEVEL_WEIGHT_EDGE"
         ) {
-            let error = max_error(&actual_values, &expected[data_type])?;
+            let error = max_error(&actual_values, &expected_values)?;
             assert!(error < 1.0e-6, "{data_type} max error {error}");
         } else {
-            assert_eq!(actual_values, expected[data_type], "{data_type}");
+            assert_eq!(actual_values, expected_values, "{data_type}");
         }
     }
     Ok(())
