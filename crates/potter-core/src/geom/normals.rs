@@ -11,9 +11,9 @@
 //! normal, a corner whose fan cancels gets the zero vector, and a zero-length edge contributes a
 //! right angle to its corner.
 
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, HashSet};
 
-use glam::{DMat3, DMat4, DVec3};
+use glam::{DMat3, DMat4, DVec3, Vec3};
 use serde_json::{Map, Value, json};
 
 use super::clnor::{self, CornerNormalCode, NormalCodeOptions, SetterInput};
@@ -76,6 +76,28 @@ pub(crate) fn export_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<ExportN
 /// Returns the errors of [`export_normals`].
 pub(crate) fn corner_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
     shading_normals(mesh, positions).map(|shading| shading.corners)
+}
+
+/// Blender's `Mesh::vert_normals()`: each vertex's angle-weighted sum of its faces' geometric
+/// normals, computed in f32 as Blender computes it. Shading flags and custom normals never change
+/// it, so Shrinkwrap projects along it even on meshes that carry custom normals.
+///
+/// # Errors
+///
+/// Returns an error for invalid topology, or non-finite or mis-sized positions.
+pub(crate) fn geometric_vertex_normals(mesh: &Mesh, positions: &[DVec3]) -> Result<Vec<DVec3>> {
+    check_shading_input(mesh, positions)?;
+    let index_by_id: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    Ok(float_normals(mesh, positions, &index_by_id)?
+        .vertices
+        .into_iter()
+        .map(Vec3::as_dvec3)
+        .collect())
 }
 
 /// Corner and flat normals agree within this distance, matching the importers.
@@ -160,25 +182,27 @@ fn shade(
     let sharp_edges = sharp_edge_keys(mesh)?;
     let smooth = smooth_face_flags(mesh)?;
 
-    let mut offsets = Vec::with_capacity(mesh.faces.len());
-    let mut corner_total = 0_usize;
-    for face in &mesh.faces {
-        offsets.push(corner_total);
-
-        corner_total += face.vertices.len();
-    }
     // Blender's POINT domain: all faces smooth, no sharp edge, no custom-normal layer. The custom-normal
     // setter never uses it: its corner normals come from `normals_calc_corners` (fans) on every mesh.
     let point_domain = point_domain_allowed
         && custom_codes.is_none()
         && sharp_edges.is_empty()
         && smooth.iter().all(|smooth| *smooth);
+    if point_domain {
+        return point_domain_shading(mesh, positions, &index_by_id, smooth);
+    }
 
-    // Face normals, corner angles, and the angle-weighted sum of every face at each vertex.
-    // Blender's vertex normal sums all faces and ignores shading flags.
+    let mut offsets = Vec::with_capacity(mesh.faces.len());
+    let mut corner_total = 0_usize;
+    for face in &mesh.faces {
+        offsets.push(corner_total);
+        corner_total += face.vertices.len();
+    }
+
+    // Face normals and corner angles for the fans. Blender's vertex normals sum all faces and ignore
+    // shading flags, so they come from `float_normals`.
     let mut face_normals = Vec::with_capacity(mesh.faces.len());
     let mut corner_angles = vec![0.0_f64; corner_total];
-    let mut geometric_sums = vec![DVec3::ZERO; mesh.vertices.len()];
     for (face_index, face) in mesh.faces.iter().enumerate() {
         let indices = face
             .vertices
@@ -195,31 +219,14 @@ fn shade(
             .iter()
             .map(|index| positions[*index])
             .collect::<Vec<_>>();
-        let normal = face_normal(&points);
-        face_normals.push(normal);
-        for (corner, index) in indices.iter().enumerate() {
-            let angle = corner_angle(&points, corner);
-            corner_angles[offsets[face_index] + corner] = angle;
-            geometric_sums[*index] += normal * angle;
+        face_normals.push(face_normal(&points));
+        for corner in 0..indices.len() {
+            corner_angles[offsets[face_index] + corner] = corner_angle(&points, corner);
         }
     }
     let mut parent: Vec<usize> = (0..corner_total).collect();
-    if point_domain {
-        let mut first_corner_at = HashMap::<u32, usize>::new();
-        for (face_index, face) in mesh.faces.iter().enumerate() {
-            for (corner, id) in face.vertices.iter().enumerate() {
-                let index = offsets[face_index] + corner;
-                match first_corner_at.entry(*id) {
-                    Entry::Occupied(first) => union(&mut parent, *first.get(), index),
-                    Entry::Vacant(slot) => {
-                        slot.insert(index);
-                    }
-                }
-            }
-        }
-    } else {
-        join_smooth_fans(mesh, &offsets, &sharp_edges, &smooth, &mut parent);
-    }
+    join_smooth_fans(mesh, &offsets, &sharp_edges, &smooth, &mut parent);
+
     let roots: Vec<usize> = (0..corner_total)
         .map(|corner| find(&mut parent, corner))
         .collect();
@@ -256,13 +263,14 @@ fn shade(
     }
 
     // Blender uses its corner-to-vertex mixer for an allocated custom-normal layer; meshes without
-    // that layer keep the geometric angle-weighted sums above.
+    // that layer keep Blender's float vertex normals.
     let vertices = if custom_codes.is_some() {
         clnor::mix_corner_normals_to_vertices(mesh, positions, &corners)?
     } else {
-        geometric_sums
+        float_normals(mesh, positions, &index_by_id)?
+            .vertices
             .into_iter()
-            .map(DVec3::normalize_or_zero)
+            .map(Vec3::as_dvec3)
             .collect()
     };
     let data_smooth = mesh
@@ -281,6 +289,166 @@ fn shade(
         data_smooth,
         vertices,
     })
+}
+
+/// Blender's POINT domain: each corner takes its vertex's float normal, the angle-weighted sum over
+/// every face at that vertex. Nothing can split the fan, so no fans are built.
+fn point_domain_shading(
+    mesh: &Mesh,
+    positions: &[DVec3],
+    index_by_id: &HashMap<u32, usize>,
+    smooth: Vec<bool>,
+) -> Result<Shading> {
+    let normals = float_normals(mesh, positions, index_by_id)?;
+    let mut start = 0;
+    let data_smooth = mesh
+        .faces
+        .iter()
+        .zip(&normals.faces)
+        .map(|(face, flat_normal)| {
+            let end = start + face.vertices.len();
+            let differs = normals.corners[start..end]
+                .iter()
+                .any(|corner| !close(corner.as_dvec3(), flat_normal.as_dvec3()));
+            start = end;
+            differs
+        })
+        .collect();
+    Ok(Shading {
+        corners: normals.corners.into_iter().map(Vec3::as_dvec3).collect(),
+        smooth,
+        data_smooth,
+        vertices: normals.vertices.into_iter().map(Vec3::as_dvec3).collect(),
+    })
+}
+
+/// Blender's float normals (`normals_calc_faces` and `normals_calc_verts`), computed in f32 as
+/// Blender's `float3` is. Shading flags and custom normals never change them.
+struct FloatNormals {
+    /// One normal per face, in `mesh.faces` order.
+    faces: Vec<Vec3>,
+    /// One normal per face corner, flattened in `mesh.faces` order.
+    corners: Vec<Vec3>,
+    /// One normal per vertex, indexed like `mesh.vertices`.
+    vertices: Vec<Vec3>,
+}
+
+fn float_normals(
+    mesh: &Mesh,
+    positions: &[DVec3],
+    index_by_id: &HashMap<u32, usize>,
+) -> Result<FloatNormals> {
+    let points: Vec<Vec3> = positions.iter().map(|point| point.as_vec3()).collect();
+    let mut faces = Vec::with_capacity(mesh.faces.len());
+    let mut corner_vertices = Vec::new();
+    let mut sums = vec![Vec3::ZERO; mesh.vertices.len()];
+    let mut has_faces = vec![false; mesh.vertices.len()];
+    for face in &mesh.faces {
+        let indices = face
+            .vertices
+            .iter()
+            .map(|id| {
+                index_by_id.get(id).copied().ok_or_else(|| {
+                    mesh_error(&MeshError::InvalidTopology(
+                        "face references a missing vertex",
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let face_points: Vec<Vec3> = indices.iter().map(|index| points[*index]).collect();
+        let normal = float_face_normal(&face_points);
+        faces.push(normal);
+        let count = indices.len();
+        for (corner, &vertex) in indices.iter().enumerate() {
+            let current = face_points[corner];
+            let to_previous = float_normalize(face_points[(corner + count - 1) % count] - current);
+            let to_next = float_normalize(face_points[(corner + 1) % count] - current);
+            let factor = float_safe_acos_approx(float_dot(to_previous, to_next));
+            sums[vertex] += normal * factor;
+            has_faces[vertex] = true;
+        }
+        corner_vertices.extend(indices);
+    }
+    // A vertex without faces takes its own direction, as Blender's `normals_calc_verts` does.
+    let vertices: Vec<Vec3> = sums
+        .into_iter()
+        .zip(has_faces)
+        .zip(&points)
+        .map(|((sum, has_face), point)| float_normalize(if has_face { sum } else { *point }))
+        .collect();
+    let corners = corner_vertices
+        .iter()
+        .map(|vertex| vertices[*vertex])
+        .collect();
+    Ok(FloatNormals {
+        faces,
+        corners,
+        vertices,
+    })
+}
+
+/// Blender's `normal_calc_ngon`: Newell's method from the last vertex, normalized by `normalize_v3`,
+/// which multiplies by the reciprocal length. A zero-area face takes the unit Z normal.
+fn float_face_normal(points: &[Vec3]) -> Vec3 {
+    let normal = float_newell(points);
+    let length_squared = float_dot(normal, normal);
+    if length_squared > 1.0e-35_f32 {
+        normal * (1.0 / length_squared.sqrt())
+    } else {
+        Vec3::Z
+    }
+}
+
+/// Newell's sum over the polygon edges, starting from the last vertex, before normalisation
+/// (`add_newell_cross_v3_v3v3` in `normal_calc_ngon` and `cross_poly_v3`).
+fn float_newell(points: &[Vec3]) -> Vec3 {
+    let Some(&last) = points.last() else {
+        return Vec3::ZERO;
+    };
+    let mut normal = Vec3::ZERO;
+    let mut previous = last;
+    for &current in points {
+        normal.x += (previous.y - current.y) * (previous.z + current.z);
+        normal.y += (previous.z - current.z) * (previous.x + current.x);
+        normal.z += (previous.x - current.x) * (previous.y + current.y);
+        previous = current;
+    }
+    normal
+}
+
+/// Blender's `math::normalize`: each component is divided by the length, and a vector at or below
+/// the `1e-35` squared-length threshold becomes zero.
+fn float_normalize(vector: Vec3) -> Vec3 {
+    let length_squared = float_dot(vector, vector);
+    if length_squared > 1.0e-35_f32 {
+        let length = length_squared.sqrt();
+        Vec3::new(vector.x / length, vector.y / length, vector.z / length)
+    } else {
+        Vec3::ZERO
+    }
+}
+
+/// Blender's `dot_v3v3`, summed left to right in f32.
+fn float_dot(left: Vec3, right: Vec3) -> f32 {
+    left.x * right.x + left.y * right.y + left.z * right.z
+}
+
+/// Blender's `safe_acos_approx` in f32. The constants are Blender's literals at their f32 values.
+fn float_safe_acos_approx(x: f32) -> f32 {
+    let magnitude = x.abs();
+    let m = if magnitude < 1.0 {
+        1.0 - (1.0 - magnitude)
+    } else {
+        1.0
+    };
+    let acos = (1.0 - m).sqrt()
+        * (std::f32::consts::FRAC_PI_2
+            + m * (-0.213_300_99_f32 + m * (0.077_980_48_f32 + m * -0.021_640_95_f32)));
+    if x < 0.0 {
+        std::f32::consts::PI - acos
+    } else {
+        acos
+    }
 }
 
 /// Corner normals per face for render shading. `None` marks a flat face, whose triangles keep
@@ -506,6 +674,98 @@ pub(crate) fn smooth_face_flags(mesh: &Mesh) -> Result<Vec<bool>> {
         .collect()
 }
 
+/// Field of the `shade_smooth` attribute that records Blender's `sharp_face` attribute as present.
+/// `use_smooth` on every face keeps that attribute (all false); `shade_smooth()` removes it. Shrinkwrap
+/// reads the difference, so the importer, the operator and the exporter keep the field in step.
+pub(crate) const SHARP_FACE_PRESENT: &str = "sharp_face_present";
+
+/// Blender's `sharp_face` lookup for the normal domain and the Shrinkwrap projection: `None` when the
+/// attribute is absent (every face smooth), otherwise one flag per face in `mesh.faces` order, `true`
+/// when sharp. With a flat face the attribute exists, so it is derived from `shade_smooth`; with every
+/// face smooth, its presence is the recorded `SHARP_FACE_PRESENT` field.
+pub(crate) fn sharp_face_flags(mesh: &Mesh) -> Result<Option<Vec<bool>>> {
+    let smooth = smooth_face_flags(mesh)?;
+    if smooth.iter().all(|smooth| *smooth) {
+        // The presence flag is a field of the `shade_smooth` attribute object, beside `values`
+        // (`record_sharp_face`), not a key inside its per-face values.
+        let present = mesh
+            .attributes
+            .get("shade_smooth")
+            .and_then(Value::as_object)
+            .and_then(|fields| fields.get(SHARP_FACE_PRESENT))
+            .and_then(Value::as_bool)
+            == Some(true);
+        return Ok(present.then(|| vec![false; smooth.len()]));
+    }
+    Ok(Some(smooth.iter().map(|smooth| !smooth).collect()))
+}
+
+/// Records that Blender's `sharp_face` attribute exists on `mesh` after a write that creates or updates
+/// it through the attribute API: `rna_MeshPolygon_use_smooth_set` (`lookup_or_add_for_write`), an
+/// attribute write, and a generator that always calls `lookup_or_add` (`MOD_screw.cc` `sharp_faces`).
+/// The flag lives on the `shade_smooth` attribute, so a mesh without that attribute is all flat and
+/// already has the Blender attribute through its flat faces.
+pub(crate) fn record_sharp_face(mesh: &mut Mesh) {
+    if let Some(fields) = mesh
+        .attributes
+        .get_mut("shade_smooth")
+        .and_then(Value::as_object_mut)
+    {
+        fields.insert(SHARP_FACE_PRESENT.to_owned(), json!(true));
+    }
+}
+
+/// Settles the presence of `sharp_face` after an edit operator rebuilt the mesh through `BMesh`. Blender's
+/// `BM_mesh_bm_to_me` writes `sharp_face` only when some face is not smooth (`bmesh_mesh_convert.cc`,
+/// `need_sharp_face |= !smooth`), so an all-smooth result has no record of it.
+pub(crate) fn settle_sharp_face(mesh: &mut Mesh) -> Result<()> {
+    if smooth_face_flags(mesh)?.iter().all(|smooth| *smooth)
+        && let Some(fields) = mesh
+            .attributes
+            .get_mut("shade_smooth")
+            .and_then(Value::as_object_mut)
+    {
+        fields.remove(SHARP_FACE_PRESENT);
+    }
+    Ok(())
+}
+
+/// Blender's `Mesh::normals_domain` (`mesh_normals.cc`): which elements carry the corner normals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NormalDomain {
+    Point,
+    Face,
+    Corner,
+}
+
+/// Blender's `Mesh::normals_domain`: a custom normal layer wins; all sharp faces or all sharp edges give
+/// the Face domain; no sharp face and no sharp edge give Point; anything mixed is Corner.
+pub(crate) fn normals_domain(mesh: &Mesh) -> Result<NormalDomain> {
+    if mesh.faces.is_empty() {
+        return Ok(NormalDomain::Point);
+    }
+    if mesh.attributes.contains_key("custom_normal") {
+        return Ok(NormalDomain::Corner);
+    }
+    let faces = sharp_face_flags(mesh)?;
+    if faces
+        .as_ref()
+        .is_some_and(|flags| flags.iter().all(|flag| *flag))
+    {
+        return Ok(NormalDomain::Face);
+    }
+    let edges = sharp_edge_flags(mesh)?;
+    if !edges.is_empty() && edges.iter().all(|flag| *flag) {
+        return Ok(NormalDomain::Face);
+    }
+    let faces_smooth = faces.is_none_or(|flags| flags.iter().all(|flag| !flag));
+    if faces_smooth && edges.iter().all(|flag| !flag) {
+        Ok(NormalDomain::Point)
+    } else {
+        Ok(NormalDomain::Corner)
+    }
+}
+
 /// Per edge: the `sharp` flag, in `mesh.edges` order. A missing attribute is unsharp.
 pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
     let values = attribute_values(mesh, "sharp", "edge", "bool")?;
@@ -513,6 +773,258 @@ pub(crate) fn sharp_edge_flags(mesh: &Mesh) -> Result<Vec<bool>> {
         .iter()
         .map(|edge| flag(values, &format!("e{}", edge.id)))
         .collect()
+}
+
+/// Blender's `BM_face_calc_normal` (`bmesh_polygon.cc`): `normal_tri_v3` and `normal_quad_v3` for
+/// triangles and quads, and `bm_face_calc_poly_normal` for other sizes. That polygon normal is the
+/// normalised Newell sum with no fallback, so a zero-area n-gon has the zero normal (unlike the mesh
+/// normal, `normal_calc_ngon`, which takes +Z). Edit-mode operators read these normals.
+pub(crate) fn bmesh_face_normal(points: &[Vec3]) -> Vec3 {
+    match points {
+        [v1, v2, v3] => float_normalize(float_cross(*v1 - *v2, *v2 - *v3)),
+        [v1, v2, v3, v4] => float_normalize(float_cross(*v1 - *v3, *v2 - *v4)),
+        _ => float_normalize(float_newell(points)),
+    }
+}
+
+/// The cross product in the expanded f32 form of `normal_tri_v3` and `normal_quad_v3`.
+fn float_cross(left: Vec3, right: Vec3) -> Vec3 {
+    Vec3::new(
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x,
+    )
+}
+
+/// Indexed topology for the angle rules: corners and edge endpoints refer to vertex indices.
+struct AngleTopology {
+    faces: Vec<Vec<usize>>,
+    edges: Vec<[usize; 2]>,
+    edge_of: HashMap<(usize, usize), usize>,
+    points: Vec<Vec3>,
+}
+
+fn unordered(first: usize, second: usize) -> (usize, usize) {
+    (first.min(second), first.max(second))
+}
+
+fn angle_topology(mesh: &Mesh) -> Result<AngleTopology> {
+    let index_of = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<HashMap<_, _>>();
+    let vertex_index = |id: u32| -> Result<usize> {
+        index_of.get(&id).copied().ok_or_else(|| {
+            mesh_error(&MeshError::InvalidTopology(
+                "face or edge references a missing vertex",
+            ))
+        })
+    };
+    let faces = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| vertex_index(*id))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let edges = mesh
+        .edges
+        .iter()
+        .map(|edge| -> Result<[usize; 2]> {
+            Ok([
+                vertex_index(edge.vertices[0])?,
+                vertex_index(edge.vertices[1])?,
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let edge_of = edges
+        .iter()
+        .enumerate()
+        .map(|(index, [first, second])| (unordered(*first, *second), index))
+        .collect::<HashMap<_, _>>();
+    let points = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.as_vec3())
+        .collect();
+    Ok(AngleTopology {
+        faces,
+        edges,
+        edge_of,
+        points,
+    })
+}
+
+impl AngleTopology {
+    /// Blender's mesh face normals (`normals_calc_faces`: `normal_calc_ngon` for every size).
+    fn face_normals(&self) -> Vec<Vec3> {
+        self.faces
+            .iter()
+            .map(|face| {
+                float_face_normal(
+                    &face
+                        .iter()
+                        .map(|&index| self.points[index])
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    /// The edge index of each corner: the edge from a corner to the next corner of its face.
+    fn corner_edges(&self) -> Result<Vec<Vec<usize>>> {
+        self.faces
+            .iter()
+            .map(|face| {
+                (0..face.len())
+                    .map(|position| {
+                        let next = face[(position + 1) % face.len()];
+                        self.edge_of
+                            .get(&unordered(face[position], next))
+                            .copied()
+                            .ok_or_else(|| {
+                                mesh_error(&MeshError::InvalidTopology("face corner has no edge"))
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect()
+    }
+}
+
+/// What `mesh_edges_sharp_tag` records about an edge's first corner (Blender's `e2l[0]`).
+#[derive(Clone, Copy)]
+struct EdgeFirstCorner {
+    face: usize,
+    vertex: usize,
+    second: EdgeSecond,
+}
+
+/// The second slot of Blender's `e2l`: still unset, decided sharp, or a smooth corner.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeSecond {
+    Unset,
+    Invalid,
+    Smooth,
+}
+
+/// Blender's `Mesh.sharp_from_angle_set` edge rule (`rna_mesh_api.cc`, `mesh_edges_sharp_tag` in
+/// `blenkernel/intern/mesh_normals.cc`). `sharp_faces` is empty when every face is smooth. `sharp_edges`
+/// holds the current flags and is updated in place: an edge becomes sharp when its two faces' normals
+/// differ by more than `angle` (`dot < cos(angle)`, f32). A caller handles `angle >= pi` and `angle == 0`.
+pub(crate) fn sharp_edges_from_angle(
+    mesh: &Mesh,
+    sharp_faces: &[bool],
+    sharp_edges: &mut [bool],
+    angle: f32,
+) -> Result<()> {
+    let topology = angle_topology(mesh)?;
+    if sharp_edges.len() != topology.edges.len()
+        || (!sharp_faces.is_empty() && sharp_faces.len() != topology.faces.len())
+    {
+        return Err(PotError::invalid_argument(
+            "sharp flags must match the mesh face and edge counts",
+        ));
+    }
+    if angle >= std::f32::consts::PI {
+        return Ok(());
+    }
+    let face_normals = topology.face_normals();
+    let corner_edges = topology.corner_edges()?;
+    let limit = angle.cos();
+    let mut first_corners: Vec<Option<EdgeFirstCorner>> = vec![None; topology.edges.len()];
+    for (face_index, face) in topology.faces.iter().enumerate() {
+        let smooth = sharp_faces.is_empty() || !sharp_faces[face_index];
+        for (position, &vertex) in face.iter().enumerate() {
+            let edge = corner_edges[face_index][position];
+            let current = first_corners[edge];
+            match current {
+                None => {
+                    first_corners[edge] = Some(EdgeFirstCorner {
+                        face: face_index,
+                        vertex,
+                        second: if smooth {
+                            EdgeSecond::Unset
+                        } else {
+                            EdgeSecond::Invalid
+                        },
+                    });
+                }
+                Some(mut first) if first.second == EdgeSecond::Unset => {
+                    let is_angle_sharp =
+                        float_dot(face_normals[first.face], face_normals[face_index]) < limit;
+                    if !smooth || sharp_edges[edge] || vertex == first.vertex || is_angle_sharp {
+                        first.second = EdgeSecond::Invalid;
+                        if is_angle_sharp {
+                            sharp_edges[edge] = true;
+                        }
+                    } else {
+                        first.second = EdgeSecond::Smooth;
+                    }
+                    first_corners[edge] = Some(first);
+                }
+                Some(mut first) if first.second == EdgeSecond::Smooth => {
+                    first.second = EdgeSecond::Invalid;
+                    sharp_edges[edge] = false;
+                    first_corners[edge] = Some(first);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Blender's `mesh.set_sharpness_by_angle` (`editmesh_set_sharpness_by_angle.cc`, edit mode) with
+/// `extend` off (its RNA default). A selected edge with exactly two faces (`BM_edge_loop_pair`) is sharp
+/// when its `BMesh` face normals (`BM_face_calc_normal`) have a dot at most `cos(angle)`. Returns the new
+/// flag per edge, or `None` when the edge keeps its flag.
+pub(crate) fn sharp_edges_by_face_angle(
+    mesh: &Mesh,
+    selected: &[bool],
+    angle: f32,
+) -> Result<Vec<Option<bool>>> {
+    let topology = angle_topology(mesh)?;
+    if selected.len() != topology.edges.len() {
+        return Err(PotError::invalid_argument(
+            "edge selection must match the mesh edge count",
+        ));
+    }
+    let corner_edges = topology.corner_edges()?;
+    let mut incident = vec![Vec::new(); topology.edges.len()];
+    for (face_index, edges) in corner_edges.iter().enumerate() {
+        for &edge in edges {
+            incident[edge].push(face_index);
+        }
+    }
+    let normals = topology
+        .faces
+        .iter()
+        .map(|face| {
+            bmesh_face_normal(
+                &face
+                    .iter()
+                    .map(|&index| topology.points[index])
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let limit = angle.cos();
+    Ok(incident
+        .iter()
+        .enumerate()
+        .map(|(edge, faces)| match faces.as_slice() {
+            [first, second] if selected[edge] => {
+                Some(float_dot(normals[*first], normals[*second]) <= limit)
+            }
+            _ => None,
+        })
+        .collect())
 }
 
 fn union(parent: &mut [usize], first: usize, second: usize) {
@@ -541,7 +1053,8 @@ fn mesh_error(error: &MeshError) -> PotError {
 /// remap them by element.
 pub(crate) const SHADING_ATTRIBUTES: [&str; 4] = ["shade_smooth", "sharp", "seam", "custom_normal"];
 
-/// Marks every face smooth, as a generator's `use_smooth_shade` does for the faces it creates.
+/// Marks every face smooth as `Mesh.shade_smooth()` does (`mesh_smooth_set(true)`, `mesh.cc`): the
+/// `sharp_face` attribute is removed, so no presence is recorded.
 pub(crate) fn shade_faces_smooth(mesh: &mut Mesh) {
     let values: Map<String, Value> = mesh
         .faces
@@ -607,9 +1120,20 @@ mod tests {
         mesh.vertices.iter().map(|vertex| vertex.co).collect()
     }
 
+    /// Blender stores normals as f32, so vectors compare at f32 epsilon; the axis-aligned and
+    /// unit expectations here are exact in f32 up to one rounding step.
     fn assert_vec_eq(actual: DVec3, expected: DVec3) {
         assert!(
-            actual.abs_diff_eq(expected, 1e-12),
+            actual.abs_diff_eq(expected, f64::from(f32::EPSILON)),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    /// Compares a Blender float normal at f32 epsilon; `expected` is the nearest f32 value.
+    fn assert_f32_vec_eq(actual: DVec3, expected: glam::Vec3) {
+        let actual = actual.as_vec3();
+        assert!(
+            (actual - expected).abs().max_element() <= f32::EPSILON,
             "expected {expected:?}, got {actual:?}"
         );
     }
@@ -647,7 +1171,9 @@ mod tests {
             for id in &face.vertices {
                 let corner = corners.next().expect("one normal per corner");
                 let vertex = mesh.vertex(*id).expect("vertex exists").co;
-                assert_vec_eq(*corner, vertex.normalize());
+                // Blender computes POINT vertex normals in float: the expected corner is the f32
+                // nearest to the exact diagonal (0.57735026 for a unit cube corner).
+                assert_f32_vec_eq(*corner, vertex.normalize().as_vec3());
             }
         }
         assert!(corners.next().is_none());
@@ -682,6 +1208,19 @@ mod tests {
         assert_vec_eq(normals[1], FACE_A_NORMAL);
         assert_vec_eq(normals[2], FACE_A_NORMAL);
         assert_vec_eq(normals[4], FACE_B_NORMAL);
+    }
+
+    #[test]
+    fn geometric_vertex_normals_ignore_custom_normals() {
+        let mut mesh = fold();
+        set_custom_vectors(&mut mesh, &[Some(-DVec3::Z); 8]);
+        let points = positions(&mesh);
+        let geometric = geometric_vertex_normals(&mesh, &points).expect("normals");
+        // Vertex 0 belongs only to face 0, so its geometric normal is that face's normal.
+        assert_vec_eq(geometric[0], FACE_A_NORMAL);
+        // Authored custom normals change the shading output but not Blender's vert_normals.
+        let shaded = export_normals(&mesh, &points).expect("normals").vertices;
+        assert_close(shaded[0], -DVec3::Z, CODEC_TOLERANCE);
     }
 
     /// Stores one vector per corner as the custom-normal layer (`None` is automatic). Authored

@@ -19,6 +19,10 @@ mod blender_file;
 
 use blender_file::blender_executable;
 
+/// Relative spread of the mean luminance over seeds 17-20, at the fixture's 32 spp and budget 4/4, for Blender and Potter.
+const BLENDER_SPREAD: f64 = 0.023;
+const POTTER_SPREAD: f64 = 0.020;
+
 const FIXTURE_SCRIPT: &str = r#"
 import bpy
 import json
@@ -116,6 +120,11 @@ scene.render.engine = "CYCLES"
 scene.cycles.device = "CPU"
 scene.cycles.samples = 32
 scene.cycles.seed = 17
+# Potter's surface budget is `max_bounces` (`RenderSettings::max_bounces`, crates/potter-core/src/model/scene.rs), set to 4
+# here. Volume scatter takes Cycles' own limit, `volume_bounces`, left at Blender's default of 0, which Potter's default
+# matches (`RenderSettings::volume_bounces`; intern/cycles/blender/sync.cpp:373, scene/integrator.cpp:227,
+# kernel/integrator/path_state.h:162). The reference therefore uses Blender's default scatter budget.
+scene.cycles.max_bounces = 4
 scene.view_settings.view_transform = "Standard"
 bpy.ops.wm.save_as_mainfile(
     filepath=os.path.join(root, "volume_no_material.blend"), relative_remap=True
@@ -537,10 +546,15 @@ fn compare_cycles_and_path_volume(
          relative error={relative_error:.1}%, screen-side deltas cycles={cycles_order:.5}, path={path_order:.5}",
         relative_error = relative_error * 100.0
     );
+    // Three noise floors of the comparison. Measured over four seeds (17-20) at the fixture's 32 spp and budget 4/4:
+    // Blender's mean luminance has a relative spread of 2.3 %, Potter's of 2.0 %, so the floor is sqrt(2.3² + 2.0²) = 3.05 %
+    // and the bound is 9.2 %. The per-seed relative errors (+6.9, +1.1, -0.05, +1.1 %) lie inside it.
+    let bound = 3.0 * (BLENDER_SPREAD * BLENDER_SPREAD + POTTER_SPREAD * POTTER_SPREAD).sqrt();
     assert!(
-        relative_error <= 0.25,
-        "Cycles/path mean VDB luminance differs by {percent:.1}% (>25%)",
-        percent = relative_error * 100.0
+        relative_error <= bound,
+        "Cycles/path mean VDB luminance differs by {percent:.1}% (>{bound_percent:.1}%)",
+        percent = relative_error * 100.0,
+        bound_percent = bound * 100.0
     );
     assert!(
         path_order * cycles_order > 0.0,
@@ -591,7 +605,7 @@ fn reads_blender_float_half_vector_tile_and_nonuniform_transform_grids()
     assert_close(f64::from(grid.sample_index([-2, 0, 1])), 1.25, 1.0e-6);
     assert_close(
         f64::from(grid.sample_index([10, 10, 10])),
-        f64::from(grid.tree.background),
+        grid.tree.background,
         1.0e-6,
     );
     assert_eq!(grid.active_bbox, Some(([-2, 0, 0], [0, 0, 1])));
@@ -631,7 +645,7 @@ fn reads_blender_float_half_vector_tile_and_nonuniform_transform_grids()
     assert_close(f64::from(tile_grid.sample_index([7, 7, 7])), 2.0, 1.0e-6);
     assert_close(
         f64::from(tile_grid.sample_index([8, 8, 8])),
-        f64::from(tile_grid.tree.background),
+        tile_grid.tree.background,
         1.0e-6,
     );
     assert_eq!(tile_grid.active_bbox, Some(([0, 0, 0], [7, 7, 7])));
@@ -769,6 +783,7 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
             "replace",
             "--base-revision",
             "0",
+            "--allow-lossy",
             "--blender",
             blender.to_str().unwrap(),
         ],

@@ -111,6 +111,13 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
     }
     let before = project.doc().clone();
     let mut candidate = imported.doc.clone();
+    if args.allow_lossy {
+        // The user accepted these losses: evaluation leaves the settings they name unevaluated (see
+        // `physics_support::without_accepted_losses`).
+        candidate
+            .accepted_losses
+            .extend(imported.losses.iter().map(|loss| loss.feature_id.clone()));
+    }
     let id_mappings = match args.mode {
         ImportMode::Replace => {
             candidate.scene_id.clone_from(&before.scene_id);
@@ -567,6 +574,17 @@ fn append_graph(
         for slot in &mut action.slots {
             if let Some(mapped) = node_map.get(&slot.node) {
                 slot.node.clone_from(mapped);
+            }
+        }
+        action.active_slots = std::mem::take(&mut action.active_slots)
+            .into_iter()
+            .map(|(node, slot)| (node_map.get(&node).cloned().unwrap_or(node), slot))
+            .collect();
+        for bindings in action.modifier_bindings.values_mut() {
+            for binding in bindings {
+                if let Some(mapped) = node_map.get(&binding.node) {
+                    binding.node.clone_from(mapped);
+                }
             }
         }
     }

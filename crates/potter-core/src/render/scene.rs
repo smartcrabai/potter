@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{OnceCell, RefCell},
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
@@ -11,35 +11,37 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationPurpose, Snapshot},
     geom::{
+        GeneratedCorners, GeneratedVertex, Mesh, TextureSpace,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         normals::{render_corner_normals, smooth_face_flags},
         uv_layers::{self, UvStore},
     },
     image::ImageData,
-    model::{Id, Material, SceneDoc},
+    model::{Id, Material, Node, RayKind, RayVisibility, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, dielectric_f0,
-        evaluate_displacement_with_workspace, evaluate_surface_with_workspace, fill_color_layers,
-        record_unevaluated_inputs,
+        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
+        SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace,
+        evaluate_surface_with_workspace, fill_color_layers, heaviest, record_unevaluated_inputs,
     },
 };
 
+use super::world_probe::WorldProbe;
 use super::{
-    bvh::{Bvh, BvhHit},
+    bvh::{Bvh, BvhHit, WalkRay},
     light_model::{
         area_irradiance_per_radiance, area_radiance, area_shape, area_visibility_samples,
         point_intensity, spot_attenuation,
     },
     path::{hit_params, object_for_index},
     principled_bsdf::{
-        Layers, coat_coefficient, diffuse_coefficient, layers as principled_layers,
-        sheen_coefficient, specular_coefficient,
+        Layers, layers as principled_layers, reflected_lobes_coefficient, without_subsurface,
     },
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
-        blend_corner_normals, blend_uv,
+        AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, Triangle, ViewBasis,
+        blend_color, blend_corner_normals, blend_uv,
     },
     studio,
+    wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
 };
 
 /// Most color layers one object carries, and one hit can read (Blender's per-mesh limit).
@@ -60,15 +62,60 @@ pub(super) struct ObjectRecord {
     /// Color layer names in layer order, matching `Triangle::layer_colors`. Not part of the output.
     #[serde(skip)]
     pub color_layers: Vec<String>,
-    /// Slot-specific render-color position keyed by `Triangle::material_index`.
+    /// Slot-specific render-color position and member color availability, per `Triangle::material_index`.
     #[serde(skip)]
-    pub color_render_layers: BTreeMap<usize, Option<usize>>,
-    /// Member color availability keyed by `Triangle::material_index`.
-    #[serde(skip)]
-    pub color_available_masks: BTreeMap<usize, Option<Arc<[u64]>>>,
+    pub material_colors: MaterialColors,
     /// Joined color registry indices, matching `color_layers`.
     #[serde(skip)]
     pub color_layer_indices: Vec<usize>,
+    /// Inverse of the evaluated world matrix; `None` when it is not finite, and the point then stays unchanged.
+    #[serde(skip)]
+    pub world_to_local: Option<DMat4>,
+}
+
+/// Color state per material of one object, keyed by `Triangle::material_index` and sorted by it, so a hit
+/// finds its entry by binary search. A material the object does not draw has no entry and reads as `None`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct MaterialColors {
+    entries: Vec<MaterialColor>,
+}
+
+#[derive(Clone, Debug)]
+struct MaterialColor {
+    material_index: usize,
+    render_layer: Option<usize>,
+    available_mask: Option<Arc<[u64]>>,
+}
+
+impl MaterialColors {
+    /// Records the entry of `material_index`; a later face of the same material replaces it.
+    fn insert(
+        &mut self,
+        material_index: usize,
+        render_layer: Option<usize>,
+        available_mask: Option<Arc<[u64]>>,
+    ) {
+        let entry = MaterialColor {
+            material_index,
+            render_layer,
+            available_mask,
+        };
+        match self
+            .entries
+            .binary_search_by_key(&material_index, |stored| stored.material_index)
+        {
+            Ok(position) => self.entries[position] = entry,
+            Err(position) => self.entries.insert(position, entry),
+        }
+    }
+
+    /// The color state of `material_index`, or `None` when the object does not draw that material.
+    fn get(&self, material_index: usize) -> Option<&MaterialColor> {
+        self.entries
+            .binary_search_by_key(&material_index, |stored| stored.material_index)
+            .ok()
+            .map(|position| &self.entries[position])
+    }
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -88,6 +135,10 @@ pub(super) struct ElementRecord {
 pub(super) struct Geometry {
     pub triangles: Vec<Triangle>,
     pub lines: Vec<Line>,
+    /// Mesh edges for the wireframe preview, each once; empty outside Wire.
+    pub wire_edges: Vec<WireEdge>,
+    /// Loose vertices of a mesh with no edges or faces, and point-cloud points, for the wireframe preview.
+    pub wire_points: Vec<WirePoint>,
     pub materials: Vec<Material>,
     pub prepared: Vec<PreparedMaterial>,
     pub objects: Vec<ObjectRecord>,
@@ -160,24 +211,30 @@ fn casts_transparent_shadow(material: &Material, prepared: &PreparedMaterial) ->
 }
 
 /// EEVEE's transparent shadow pass for one hit (`eevee_surf_shadow.bsl.hh`): a fragment is kept with probability
-/// `1 - transparency`, where `transparency` is the average of the transparent closures' weight. That weight is
-/// `(1 - alpha) * tint` (a Transparent BSDF's colour, or a Principled Alpha's `1 - alpha`), so the shadow ray passes
-/// with the same average. Refraction is no transparent closure (`closure_eval(ClosureTransparency)` is the only writer
+/// `1 - transparency`, where `transparency` is the sum over the closures of `weight × (1 - alpha) × tint`: the
+/// Transparent BSDF's colour, or a Principled Alpha's `1 - alpha` at white tint. The shadow ray passes with the same
+/// average. Refraction is no transparent closure (`closure_eval(ClosureTransparency)` is the only writer
 /// of `g_transmittance`), so glass casts an opaque shadow.
-/// A clip material passes the binarised alpha of `params`, as its visible surface does. This is a divergence, not
+/// A clip material passes the binarised alpha of its closures, as its visible surface does. This is a divergence, not
 /// parity: `blend_bridge.py` `_set_principled_values` exports a clip material as a DITHERED Principled with Alpha equal
 /// to its base alpha, so EEVEE's pass on that file is fractional (`1 - alpha` per fragment, stochastically), where
 /// Potter's realtime shadow is 0 or 1 per hit.
-fn transparent_shadow_pass(params: &BsdfParams) -> f64 {
-    let tint = params.transparent_tint;
-    ((1.0 - params.alpha.clamp(0.0, 1.0)) * (tint[0] + tint[1] + tint[2]) / 3.0).clamp(0.0, 1.0)
+fn transparent_shadow_pass(closures: &[ShaderClosure]) -> f64 {
+    closures
+        .iter()
+        .map(|closure| {
+            let tint = closure.params.transparent_tint;
+            let mean_tint = (tint[0] + tint[1] + tint[2]) / 3.0;
+            closure.weight * (1.0 - closure.params.alpha.clamp(0.0, 1.0)) * mean_tint
+        })
+        .sum::<f64>()
+        .clamp(0.0, 1.0)
 }
 
 /// Evaluates the transparent pass of the triangles a shadow ray hits. A failed evaluation is kept and reported by
 /// [`ShadowOccluders::finish`], because the light loops that ask for a pass return no `Result`.
 struct ShadowOccluders<'a> {
     doc: &'a SceneDoc,
-    snapshot: &'a Snapshot,
     geometry: &'a Geometry,
     images: &'a BTreeMap<String, ImageData>,
     workspace: &'a RefCell<EvaluatorWorkspace>,
@@ -187,14 +244,12 @@ struct ShadowOccluders<'a> {
 impl<'a> ShadowOccluders<'a> {
     fn new(
         doc: &'a SceneDoc,
-        snapshot: &'a Snapshot,
         geometry: &'a Geometry,
         images: &'a BTreeMap<String, ImageData>,
         workspace: &'a RefCell<EvaluatorWorkspace>,
     ) -> Self {
         Self {
             doc,
-            snapshot,
             geometry,
             images,
             workspace,
@@ -242,9 +297,8 @@ impl<'a> ShadowOccluders<'a> {
         if !prepared.is_some_and(|prepared| casts_transparent_shadow(material, prepared)) {
             return Ok(None);
         }
-        let params = hit_params(
+        let shading = hit_params(
             self.doc,
-            self.snapshot,
             self.geometry,
             hit,
             origin,
@@ -252,7 +306,7 @@ impl<'a> ShadowOccluders<'a> {
             self.images,
             &mut self.workspace.borrow_mut(),
         )?;
-        Ok(Some(transparent_shadow_pass(&params)))
+        Ok(Some(transparent_shadow_pass(&shading.closures)))
     }
 
     /// The first failed evaluation, if any shadow ray hit one.
@@ -277,10 +331,13 @@ fn ray_transmittance(
     let mut transmittance = 1.0;
     shadow.bvh.walk_hits(
         shadow.triangles,
-        origin,
-        direction,
-        SHADOW_EPSILON,
-        distance,
+        WalkRay {
+            origin,
+            direction,
+            epsilon: SHADOW_EPSILON,
+            remaining: distance,
+            kind: Some(RayKind::Shadow),
+        },
         |hit, origin| {
             match shadow
                 .occluders
@@ -359,6 +416,8 @@ pub(super) fn extract_geometry(
         std::collections::BTreeMap::<(Id, Option<usize>, Option<Arc<[u64]>>), usize>::new();
     let mut triangles = Vec::new();
     let mut lines = Vec::new();
+    let mut wire_edges = Vec::new();
+    let mut wire_points = Vec::new();
     let mut objects = Vec::new();
     let mut elements = Vec::new();
     let mut bounds: Option<(DVec3, DVec3)> = None;
@@ -372,6 +431,10 @@ pub(super) fn extract_geometry(
                 && !node.render_visible)
         {
             continue;
+        }
+        let ray_visibility = node.resolved_ray_visibility();
+        if !path_traced && matches!(mode, Mode::Beauty) {
+            ray_visibility_warnings(node_id, node, &mut warnings);
         }
         let data_block = node
             .data
@@ -524,6 +587,13 @@ pub(super) fn extract_geometry(
             .iter()
             .map(|&index| &color_store.layers[index])
             .collect();
+        // Blender's texture space is computed on the undeformed mesh (`BKE_mesh_eval_geometry` calls
+        // `BKE_mesh_texspace_calc` on the original), and modifiers copy it to their result. The data block's mesh is
+        // that original, so modifiers that rebuild or shrink the evaluated mesh do not move the texture space.
+        let undeformed = data_block.and_then(|data| data.mesh.as_ref()).or(mesh);
+        let texture_space = undeformed
+            .and_then(Mesh::manual_texture_space)
+            .unwrap_or_else(|| TextureSpace::automatic(undeformed.and_then(Mesh::bounds)));
         objects.push(ObjectRecord {
             index: object_index,
             node_id: node_id.clone(),
@@ -541,8 +611,8 @@ pub(super) fn extract_geometry(
                 .map(|layer| layer.name.clone())
                 .collect(),
             color_layer_indices: carried,
-            color_render_layers: BTreeMap::new(),
-            color_available_masks: BTreeMap::new(),
+            material_colors: MaterialColors::default(),
+            world_to_local: object_inverse(matrix),
         });
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
@@ -564,6 +634,26 @@ pub(super) fn extract_geometry(
                 .iter()
                 .map(|vertex| (vertex.id, vertex.co))
                 .collect();
+            // A collection instance's joined mesh carries each member's Generated per vertex, in its own texture space.
+            let generated_by_vertex: Option<std::collections::BTreeMap<u32, GeneratedVertex>> =
+                match snapshot.generated_vertices.get(node_id) {
+                    Some(table) => {
+                        if table.len() != mesh.vertices.len() {
+                            return Err(PotError::new(
+                                ErrorCode::InternalError,
+                                "collection instance Generated does not match its vertices",
+                            ));
+                        }
+                        Some(
+                            mesh.vertices
+                                .iter()
+                                .zip(table)
+                                .map(|(vertex, value)| (vertex.id, *value))
+                                .collect(),
+                        )
+                    }
+                    None => None,
+                };
             let mesh_triangles = mesh.tessellate().map_err(|error| {
                 PotError::with_details(
                     ErrorCode::EvaluationFailed,
@@ -580,6 +670,12 @@ pub(super) fn extract_geometry(
             );
             let mut triangle_offset = 0_usize;
             let mut corner_base = 0_usize;
+            let mesh_edge_pairs: Vec<[u32; 2]> = if matches!(mode, Mode::Wire) {
+                mesh.edges.iter().map(|edge| edge.vertices).collect()
+            } else {
+                Vec::new()
+            };
+            let mut wire_builder = WireEdgeBuilder::new(&mesh_edge_pairs);
             let vertex_slots: BTreeMap<u32, usize> = if carried_layers.is_empty() {
                 BTreeMap::new()
             } else {
@@ -600,6 +696,20 @@ pub(super) fn extract_geometry(
                 });
                 let uv_available_mask = binding.map(|binding| binding.uv.available_mask);
                 let face_corner_normals = face_normals[face_index].as_deref();
+                if matches!(mode, Mode::Wire) {
+                    let positions: Option<Vec<DVec3>> = face
+                        .vertices
+                        .iter()
+                        .map(|vertex_id| {
+                            vertex_positions
+                                .get(vertex_id)
+                                .map(|local| matrix.transform_point3(*local))
+                        })
+                        .collect();
+                    if let Some(positions) = positions {
+                        wire_builder.add_polygon(&face.vertices, &positions, face_corner_normals);
+                    }
+                }
                 // Corners are numbered across faces in order, as `color_layers::read` lays them
                 // out.
                 let face_corner_base = corner_base;
@@ -653,12 +763,11 @@ pub(super) fn extract_geometry(
                     let object = objects.last_mut().ok_or_else(|| {
                         PotError::new(ErrorCode::InternalError, "object record was not stored")
                     })?;
-                    object
-                        .color_render_layers
-                        .insert(material_index, slot_color_render);
-                    object
-                        .color_available_masks
-                        .insert(material_index, slot_color_mask);
+                    object.material_colors.insert(
+                        material_index,
+                        slot_color_render,
+                        slot_color_mask,
+                    );
                 }
                 let material = materials.get(material_index);
                 let prepared_material = prepared.get(material_index);
@@ -687,6 +796,7 @@ pub(super) fn extract_geometry(
                     })?;
                 for triangle in face_triangles {
                     let mut positions = [DVec3::ZERO; 3];
+                    let mut vertices = [GeneratedVertex::default(); 3];
                     let corners = triangle_corners(face, triangle);
                     let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
                     for (index, vertex_id) in triangle.iter().enumerate() {
@@ -697,7 +807,20 @@ pub(super) fn extract_geometry(
                             )
                         })?;
                         positions[index] = matrix.transform_point3(local);
+                        vertices[index] = match &generated_by_vertex {
+                            Some(table) => *table.get(vertex_id).ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "collection instance Generated is missing a vertex",
+                                )
+                            })?,
+                            None => texture_space.generated_vertex(local),
+                        };
                     }
+                    let generated = GeneratedCorners {
+                        corners: vertices.map(|vertex| vertex.generated),
+                        per_local: vertices[0].per_local,
+                    };
                     let uv = render_layer
                         .and_then(|index| layer_uvs.get(index).copied())
                         .unwrap_or([[0.0, 1.0]; 3]);
@@ -729,13 +852,18 @@ pub(super) fn extract_geometry(
                         base_color
                     } else {
                         let params = shading_params(material, base_color, normal, &shader_warnings);
+                        let closures = [ShaderClosure {
+                            weight: 1.0,
+                            params,
+                        }];
                         shade(
-                            doc, snapshot, center, center, normal, normal, &params, mode, None,
-                            images,
-                        )?
+                            doc, snapshot, center, center, normal, normal, &closures, mode, None,
+                            None,
+                        )
                     };
                     let triangle = Triangle {
                         positions,
+                        generated,
                         object_index,
                         element_index,
                         color,
@@ -776,6 +904,7 @@ pub(super) fn extract_geometry(
                         normals: corner_normals,
                         layer_colors,
                         lit_per_pixel,
+                        ray_mask: ray_visibility.mask(),
                     };
                     if let (Some(material), Some(prepared_material)) = (
                         material.filter(|material| {
@@ -812,6 +941,47 @@ pub(super) fn extract_geometry(
                     }
                 }
                 triangle_offset = face_triangle_end;
+            }
+            if matches!(mode, Mode::Wire) {
+                // Blender's overlay draws the face edges (mesh-edge order), then the loose edges (mesh order),
+                // then strokes and points. Loose edges have no facing and never hide.
+                let loose: Vec<WireEdge> = mesh
+                    .edges
+                    .iter()
+                    .filter(|edge| !wire_builder.contains(edge.vertices[0], edge.vertices[1]))
+                    .filter_map(|edge| {
+                        let local_a = vertex_positions.get(&edge.vertices[0])?;
+                        let local_b = vertex_positions.get(&edge.vertices[1])?;
+                        Some(WireEdge {
+                            start: matrix.transform_point3(*local_a),
+                            end: matrix.transform_point3(*local_b),
+                            normals: None,
+                            colour: [0.0; 3],
+                            wd: 0.0,
+                        })
+                    })
+                    .collect();
+                // The subdivision's optimal-display mask hides internal edges of subdivided faces (`wd = 1`).
+                let optimal = mesh
+                    .attributes
+                    .get(crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES)
+                    .and_then(|attribute| attribute.get("values"))
+                    .and_then(serde_json::Value::as_object);
+                let hidden: Vec<bool> = mesh
+                    .edges
+                    .iter()
+                    .map(|edge| {
+                        optimal.is_some_and(|values| {
+                            values
+                                .get(&format!("e{}", edge.id))
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(false)
+                        })
+                    })
+                    .collect();
+                wire_edges
+                    .extend(wire_builder.finish(|slot| hidden.get(slot).copied().unwrap_or(false)));
+                wire_edges.extend(loose);
             }
             let used_vertices: HashSet<u32> = mesh
                 .faces
@@ -879,6 +1049,17 @@ pub(super) fn extract_geometry(
                     ),
                     None => (position - extent, position + extent),
                 });
+                if matches!(mode, Mode::Wire) {
+                    // Loose vertices and point-cloud points are squares in the overlay (`wire_points`); a point
+                    // cloud's points also have spheres, which the object outline sees.
+                    wire_points.push(WirePoint {
+                        position,
+                        sphere: pointcloud.then_some(PointSphere {
+                            object_index,
+                            radius,
+                        }),
+                    });
+                }
                 lines.push(Line {
                     start: position,
                     end: position,
@@ -887,6 +1068,7 @@ pub(super) fn extract_geometry(
                     color,
                     object_index,
                     element_index,
+                    ray_mask: ray_visibility.mask(),
                 });
             }
         }
@@ -954,6 +1136,7 @@ pub(super) fn extract_geometry(
                         color: stroke.color,
                         object_index,
                         element_index,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
                 let stroke_element_index = u32::try_from(elements.len() + 1).map_err(|_| {
@@ -980,6 +1163,20 @@ pub(super) fn extract_geometry(
                     } else {
                         point_index + 1
                     };
+                    if matches!(mode, Mode::Wire) {
+                        // Grease Pencil strokes are drawn as their polyline (a zero-length segment draws nothing).
+                        let start = DVec3::from_array(stroke.points_world[point_index]);
+                        let end = DVec3::from_array(stroke.points_world[next_index]);
+                        if start != end {
+                            wire_edges.push(WireEdge {
+                                start,
+                                end,
+                                normals: None,
+                                colour: [0.0; 3],
+                                wd: 0.0,
+                            });
+                        }
+                    }
                     lines.push(Line {
                         start: DVec3::from_array(stroke.points_world[point_index]),
                         end: DVec3::from_array(stroke.points_world[next_index]),
@@ -988,6 +1185,7 @@ pub(super) fn extract_geometry(
                         color: stroke.color,
                         object_index,
                         element_index: stroke_element_index,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
             }
@@ -1063,6 +1261,7 @@ pub(super) fn extract_geometry(
                         color,
                         object_index,
                         element_index,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
             }
@@ -1071,6 +1270,8 @@ pub(super) fn extract_geometry(
     let mut geometry = Geometry {
         triangles,
         lines,
+        wire_edges,
+        wire_points,
         materials,
         prepared,
         objects,
@@ -1185,7 +1386,10 @@ impl PointShadowMap {
                 depth,
             });
         }
-        for triangle in triangles {
+        let casters = triangles
+            .iter()
+            .filter(|triangle| triangle.ray_mask & RayKind::Shadow.bit() != 0);
+        for triangle in casters {
             for face in &mut faces {
                 rasterize_shadow_triangle(face, position, triangle);
             }
@@ -1408,6 +1612,7 @@ fn subdivide_displaced(
         [0.0, 0.0, 1.0],
     ];
     let mut positions = [DVec3::ZERO; 6];
+    let mut generated = [DVec3::ZERO; 6];
     let mut uvs = [[0.0; 2]; 6];
     let mut layer_samples = vec![[[0.0; 2]; 6]; triangle.layer_uvs.len()];
     let mut color_samples = vec![[[0.0; 4]; 6]; triangle.layer_colors.len()];
@@ -1438,8 +1643,12 @@ fn subdivide_displaced(
             barycentric: weights,
             normal: sample_normal,
         };
-        let displacement = displacement(&sample)?;
-        positions[index] = point + sample_normal * displacement;
+        let height = displacement(&sample)?;
+        positions[index] = point + sample_normal * height;
+        // Cycles moves only positions and normals when it displaces (`mesh_displace.cpp`), so a sample keeps the
+        // Generated of its undisplaced point, blended from the parent corners.
+        let [first, second, third] = triangle.generated.corners;
+        generated[index] = first * weights[0] + second * weights[1] + third * weights[2];
         sample_normals[index] = sample_normal;
         uvs[index] = uv;
         for (table, corners) in layer_samples.iter_mut().zip(&triangle.layer_uvs) {
@@ -1453,6 +1662,10 @@ fn subdivide_displaced(
     Ok(indices.map(|corners| {
         let mut subtriangle = triangle.with_corners(
             corners.map(|vertex| positions[vertex]),
+            GeneratedCorners {
+                corners: corners.map(|vertex| generated[vertex]),
+                per_local: triangle.generated.per_local,
+            },
             corners.map(|vertex| uvs[vertex]),
             layer_samples
                 .iter()
@@ -1579,6 +1792,46 @@ fn world_face_normals(
     faces
 }
 
+/// Ray-visibility flags that realtime Beauty does not honour, one warning per flag switched away from
+/// Blender's default for a light. Blender's panel shows the flags each engine exposes
+/// (`scripts/startup/bl_ui/properties_object.py`, `OBJECT_PT_visibility`, EEVEE branch): a mesh has
+/// Camera, Shadow and Raycast, and a light has Camera, Diffuse, Glossy, Transmission and Volume Scatter.
+/// EEVEE has no mesh diffuse, glossy, transmission or volume flag, so realtime warns about none of
+/// those. A light's camera visibility shows its emitter in EEVEE (`eevee_light_shape_display`, which
+/// returns unless `visible_camera`; a headless EEVEE render shows the disc), and realtime draws no
+/// emitters. EEVEE applies a light's transmission and volume scatter to its power (`eevee_light.cc`,
+/// `transmission_visibility` and `volume_visibility`), and realtime does not. The path tracer honours
+/// every flag. A light's `visible_shadow` is stored without a warning: Blender reads it nowhere
+/// (Cycles' `light_object_visibility_flags`, EEVEE's `eevee_light.cc`).
+fn ray_visibility_warnings(node_id: &Id, node: &Node, warnings: &mut Vec<serde_json::Value>) {
+    const REALTIME_LIGHT: [(&str, RayKind); 3] = [
+        ("camera", RayKind::Camera),
+        ("transmission", RayKind::Transmission),
+        ("volume_scatter", RayKind::VolumeScatter),
+    ];
+    if node.kind != "light" {
+        return;
+    }
+    let visibility = node.resolved_ray_visibility();
+    let default = RayVisibility::default_for_kind(&node.kind);
+    for &(name, ray) in &REALTIME_LIGHT {
+        let value = visibility.allows(ray);
+        let expected = default.allows(ray);
+        if value == expected {
+            continue;
+        }
+        warnings.push(serde_json::json!({
+            "code": "UNSUPPORTED_FEATURE",
+            "feature_id": format!("object.ray_visibility.{name}"),
+            "node_id": node_id,
+            "message": format!(
+                "visible_{name} is {value}, which realtime Beauty does not honour for this {}; it renders as if visible_{name} were {expected}",
+                node.kind,
+            ),
+        }));
+    }
+}
+
 /// Principled inputs of a surface shaded with `material`: the path tracer's own construction
 /// (`BsdfParams::from_material`), with the surface colour `base` in place of the material's. An
 /// unmapped slot takes the default material's.
@@ -1615,6 +1868,8 @@ pub(super) struct SceneShader<'a> {
     /// The camera's view space, in which Solid's studio lights are fixed.
     view: ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
+    /// The render's world probe, built by the first Beauty shade that needs it (`world_probe`).
+    world_probe: OnceCell<Option<WorldProbe>>,
 }
 
 /// The per-pixel shader for `mode`, or `None` when the raster outputs unlit or per-triangle colour.
@@ -1640,22 +1895,26 @@ pub(super) fn surface_shader<'a>(
         mode,
         view,
         evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
+        world_probe: OnceCell::new(),
     }))
 }
 
 impl SurfaceShader for SceneShader<'_> {
-    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
-        let graph_params = if triangle.lit_per_pixel {
+        let graph_shading = if triangle.lit_per_pixel {
             material
                 .zip(prepared)
-                .map(|(material, prepared)| self.graph_params(triangle, material, prepared, hit))
+                .map(|(material, prepared)| self.graph_shading(triangle, material, prepared, hit))
                 .transpose()?
         } else {
             None
         };
-        let params = graph_params.unwrap_or_else(|| {
+        let fallback;
+        let closures: &[ShaderClosure] = if let Some(shading) = &graph_shading {
+            &shading.closures
+        } else {
             let alpha = material.map_or(1.0, |material| material.base_color[3]);
             let base = [
                 triangle.color[0],
@@ -1663,8 +1922,12 @@ impl SurfaceShader for SceneShader<'_> {
                 triangle.color[2],
                 alpha,
             ];
-            shading_params(material, base, hit.normal, &self.geometry.shader_warnings)
-        });
+            fallback = [ShaderClosure {
+                weight: 1.0,
+                params: shading_params(material, base, hit.normal, &self.geometry.shader_warnings),
+            }];
+            &fallback
+        };
         if matches!(self.mode, Mode::Solid) {
             // A back face is lit as its front: Workbench turns the normal toward the viewer
             // before it encodes it (`workbench_normal_encode`, `front_face`).
@@ -1676,6 +1939,8 @@ impl SurfaceShader for SceneShader<'_> {
             // Workbench shades a material with its viewport display values when it has them; Potter-native
             // materials have none and keep their own (`workbench_engine.cc` `get_material`).
             let viewport = material.and_then(|material| material.viewport_display.as_ref());
+            let dominant =
+                heaviest(closures, |closure| closure.weight).map(|closure| &closure.params);
             let (albedo, roughness, metallic) = match viewport {
                 Some(viewport) => (
                     DVec3::new(
@@ -1686,19 +1951,14 @@ impl SurfaceShader for SceneShader<'_> {
                     viewport.roughness,
                     viewport.metallic,
                 ),
-                None => (
-                    DVec3::new(
-                        params.base_color[0],
-                        params.base_color[1],
-                        params.base_color[2],
-                    ),
-                    params.roughness,
-                    params.metallic,
-                ),
+                None => dominant.map_or((DVec3::ZERO, 0.0, 0.0), |params| {
+                    (base_albedo(params), params.roughness, params.metallic)
+                }),
             };
             // Workbench's transparency reads the viewport alpha (`workbench_private.hh`, `Material::is_transparent`),
-            // not the node tree's; a Potter-native material has no viewport values and keeps its base alpha.
-            let alpha = viewport.map_or(params.alpha, |viewport| viewport.diffuse_color[3]);
+            // not the node tree's; a Potter-native material has no viewport values and keeps its opaque share.
+            let alpha =
+                viewport.map_or(opaque_share(closures), |viewport| viewport.diffuse_color[3]);
             let lit = studio::shade(
                 albedo,
                 roughness,
@@ -1706,11 +1966,10 @@ impl SurfaceShader for SceneShader<'_> {
                 self.view.to_view(facing),
                 self.view.to_view(hit.view),
             );
-            return Ok([lit.x, lit.y, lit.z, alpha]);
+            return Ok(SurfaceSample::opaque([lit.x, lit.y, lit.z, alpha]));
         }
         let occluders = ShadowOccluders::new(
             self.doc,
-            self.snapshot,
             self.geometry,
             self.images,
             &self.evaluator_workspace,
@@ -1728,25 +1987,67 @@ impl SurfaceShader for SceneShader<'_> {
             hit.shadow_point,
             hit.normal,
             hit.geometric,
-            &params,
+            closures,
             self.mode,
             shadow,
-            self.images,
-        )?;
+            self.world_probe()?,
+        );
         occluders.finish()?;
-        Ok(color)
+        Ok(SurfaceSample {
+            color,
+            transparent_tint: beauty_tint(material, surface_tint(closures)),
+        })
+    }
+}
+
+/// The transparent tint the Beauty composite applies to a surface. EEVEE keeps a Transparent closure's colour per channel
+/// only for a BLENDED material (`ForwardPipeline::use_colored_transparency`, `GPU_MATFLAG_TRANSPARENT_MAYBE_COLORED`).
+/// A DITHERED material stores one alpha, `1 - average(transmittance)` (`eevee_surf_deferred.bsl.hh`, `out_color.a`), so
+/// its tint is the channel mean. `alpha_mode` `blend` is BLENDED; `opaque` and `clip` are DITHERED
+/// (`blend_bridge.py`, `surface_render_method`).
+fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
+    // A transmittance is a fraction of the light: EEVEE clamps the Color at zero and saturates the result
+    // (`gpu_shader_material_transparent.glsl`, `eevee_surf_deferred.bsl.hh`), so a tint above one or below zero is cut to
+    // [0, 1] before it can amplify or invert the background.
+    let tint = tint.map(|channel| channel.clamp(0.0, 1.0));
+    match material {
+        Some(material) if material.alpha_mode != "blend" => {
+            let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
+            [mean; 3]
+        }
+        _ => tint,
     }
 }
 
 impl SceneShader<'_> {
+    /// The render's world probe: the world's radiance at every texel of a cube map. It is built once, by the first
+    /// shade that reads it, because the world does not change within a render (`LightProbeModule::sync_world`,
+    /// `eevee_lightprobe.cc`). `None` when the scene has no world.
+    fn world_probe(&self) -> Result<Option<&WorldProbe>> {
+        if self.world_probe.get().is_none() {
+            let world = self
+                .doc
+                .scenes
+                .get(&self.snapshot.scene_id)
+                .and_then(|scene| scene.world.as_ref())
+                .and_then(|id| self.doc.worlds.get(id));
+            let probe = world
+                .map(|world| WorldProbe::build(world, &self.doc.node_groups, self.images))
+                .transpose()?;
+            // The cell is empty here, so `set` cannot fail.
+            let _ = self.world_probe.set(probe);
+        }
+        Ok(self.world_probe.get().and_then(Option::as_ref))
+    }
+
     /// The material graph evaluated at `hit`, so vertex colors and textures shade the surface.
-    fn graph_params(
+    fn graph_shading(
         &self,
         triangle: &Triangle,
         material: &Material,
         prepared: &PreparedMaterial,
         hit: &SurfaceHit,
-    ) -> Result<BsdfParams> {
+    ) -> Result<SurfaceShading> {
         let object =
             object_for_index(&self.geometry.objects, triangle.object_index).ok_or_else(|| {
                 PotError::new(
@@ -1776,7 +2077,7 @@ impl SceneShader<'_> {
             triangle,
             HitPose {
                 point: hit.point,
-                object: object_space(self.snapshot, object, hit.point),
+                object: object_space(object, hit.point),
                 normal: hit.normal,
                 view: hit.view,
                 barycentric: hit.barycentric,
@@ -1989,10 +2290,8 @@ pub(super) fn layered_context<'a>(
     uv_layers: HitUvLayers<'a>,
     tables: &'a mut LayerTables<'a>,
 ) -> Result<HitContext<'a>> {
-    let available_mask = object
-        .color_available_masks
-        .get(&triangle.material_index)
-        .and_then(|mask| mask.as_deref());
+    let material_colors = object.material_colors.get(triangle.material_index);
+    let available_mask = material_colors.and_then(|colors| colors.available_mask.as_deref());
     let color_maps = fill_color_layers(
         &mut tables.color,
         object
@@ -2003,11 +2302,8 @@ pub(super) fn layered_context<'a>(
             .filter(|((_, source_layer), _)| source_has_color_layer(available_mask, **source_layer))
             .map(|((name, _), corners)| (name.as_str(), blend_color(corners, pose.barycentric))),
     )?;
-    let color_render = object
-        .color_render_layers
-        .get(&triangle.material_index)
-        .copied()
-        .flatten()
+    let color_render = material_colors
+        .and_then(|colors| colors.render_layer)
         .and_then(|index| triangle.layer_colors.get(index))
         .map(|corners| blend_color(corners, pose.barycentric));
     let mut context = HitContext::new(&doc.node_groups)
@@ -2019,7 +2315,7 @@ pub(super) fn layered_context<'a>(
         .with_color_layers(color_maps, color_render)
         .with_warnings(warnings);
     context.uv = uv_override.unwrap_or_else(|| blend_uv(&triangle.uv, pose.barycentric));
-    context.generated = pose.object;
+    context = context.with_generated_corners(triangle.generated, pose.barycentric);
     context.position = pose.point;
     context.object = pose.object;
     context.normal = pose.normal;
@@ -2028,23 +2324,21 @@ pub(super) fn layered_context<'a>(
 }
 
 /// `point` in the object's local space, through the inverse of its evaluated world matrix.
-pub(super) fn object_space(snapshot: &Snapshot, object: &ObjectRecord, point: DVec3) -> DVec3 {
-    let matrix = snapshot
-        .nodes
-        .get(&object.node_id)
-        .map_or(DMat4::IDENTITY, |node| {
-            DMat4::from_cols_array(&node.world_matrix)
-        });
-    let world_to_local = matrix.inverse();
-    if world_to_local
+pub(super) fn object_space(object: &ObjectRecord, point: DVec3) -> DVec3 {
+    match object.world_to_local {
+        Some(world_to_local) => world_to_local.transform_point3(point),
+        None => point,
+    }
+}
+
+/// The inverse of an evaluated world matrix, or `None` when that inverse is not finite.
+fn object_inverse(world_matrix: DMat4) -> Option<DMat4> {
+    let inverse = world_matrix.inverse();
+    inverse
         .to_cols_array()
         .iter()
         .all(|value| value.is_finite())
-    {
-        world_to_local.transform_point3(point)
-    } else {
-        point
-    }
+        .then_some(inverse)
 }
 /// Per-corner values for a triangle, or `None` when any corner is not on the face.
 fn corner_values<T: Copy>(values: &[T], corners: [Option<usize>; 3]) -> Option<[T; 3]> {
@@ -2066,6 +2360,58 @@ fn read_vertex_number(mesh: &crate::geom::Mesh, name: &str, vertex_id: u32) -> O
     value.is_finite().then_some(value)
 }
 
+/// The opaque share of a hit: each closure's weight times its alpha, summed and clamped to one.
+fn opaque_share(closures: &[ShaderClosure]) -> f64 {
+    closures
+        .iter()
+        .map(|closure| closure.weight * closure.params.alpha.clamp(0.0, 1.0))
+        .sum::<f64>()
+        .clamp(0.0, 1.0)
+}
+
+/// The transparent tint of a hit, as the composite applies it: a hit passes `(1 - opacity) * tint` of the light behind
+/// it. EEVEE accumulates every transparent closure into one transmittance, `g_transmittance += transmittance * weight`
+/// (`eevee_nodetree_lib.bsl.hh`, `closure_eval(ClosureTransparency)`), and Cycles sums the closures' transparent weights
+/// the same way. So a mix of closures passes `sum w (1 - alpha) tint`, and the tint is that over the pass chance.
+fn surface_tint(closures: &[ShaderClosure]) -> [f64; 3] {
+    weighted_tint(
+        closures.iter().map(|closure| {
+            (
+                closure.weight,
+                closure.params.alpha,
+                closure.params.transparent_tint,
+            )
+        }),
+        opaque_share(closures),
+    )
+}
+
+/// The tint for `(weight, alpha, tint)` closures that together have `opacity`: the summed transmittance
+/// `sum w (1 - alpha) tint` over the pass chance `1 - opacity`. A surface with no pass chance passes nothing, so its tint
+/// is white.
+fn weighted_tint(terms: impl Iterator<Item = (f64, f64, [f64; 3])>, opacity: f64) -> [f64; 3] {
+    let chance = 1.0 - opacity;
+    if chance <= 0.0 {
+        return [1.0; 3];
+    }
+    let mut transmittance = [0.0; 3];
+    for (weight, alpha, tint) in terms {
+        let passed = weight * (1.0 - alpha.clamp(0.0, 1.0));
+        for (sum, channel) in transmittance.iter_mut().zip(tint) {
+            *sum += passed * channel;
+        }
+    }
+    transmittance.map(|sum| sum / chance)
+}
+
+fn base_albedo(params: &BsdfParams) -> DVec3 {
+    DVec3::new(
+        params.base_color[0],
+        params.base_color[1],
+        params.base_color[2],
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "flat material shading consumes explicit evaluated surface and light values"
@@ -2077,27 +2423,18 @@ fn shade(
     shadow_point: DVec3,
     normal: DVec3,
     geometric: DVec3,
-    params: &BsdfParams,
+    closures: &[ShaderClosure],
     mode: Mode,
     shadow: ShadowContext<'_>,
-    images: &BTreeMap<String, ImageData>,
-) -> Result<[f64; 4]> {
-    let albedo = DVec3::new(
-        params.base_color[0],
-        params.base_color[1],
-        params.base_color[2],
-    );
-    let alpha = params.alpha;
+    world: Option<&WorldProbe>,
+) -> [f64; 4] {
+    let opaque = opaque_share(closures);
     if !matches!(mode, Mode::Beauty) {
-        return Ok([albedo.x, albedo.y, albedo.z, alpha]);
+        let albedo = heaviest(closures, |closure| closure.weight)
+            .map_or(DVec3::ZERO, |closure| base_albedo(&closure.params));
+        return [albedo.x, albedo.y, albedo.z, opaque];
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
-    let mut result = DVec3::ZERO;
-    // Reflectance weights the whole sum once, below, so the direct lobes take unit reflectance.
-    let lobe = BsdfParams {
-        reflectance: 1.0,
-        ..*params
-    };
     // The camera is the view for the lobes and the environment; without one, the normal.
     let view = scene
         .and_then(|scene| scene.camera.as_ref())
@@ -2108,77 +2445,92 @@ fn shade(
         })
         .filter(|direction| direction.length_squared() > f64::EPSILON)
         .unwrap_or(normal);
-    // The lobes' layers are set up once here for the camera view, shared by every light below.
-    let shading = principled_layers(&lobe, normal, view);
-    if let Some(world) = scene
-        .and_then(|value| value.world.as_ref())
-        .and_then(|id| doc.worlds.get(id))
-    {
-        let diffuse_environment = prefiltered_world(world, &doc.node_groups, images, normal, 1.0)?;
-        let metallic = params.metallic.clamp(0.0, 1.0);
-        let roughness = params.roughness.clamp(0.0, 1.0);
-        // The coat attenuates every layer below it, including the environment terms.
-        let lower = shading.lower();
-        result += albedo * diffuse_environment * (1.0 - metallic) * lower;
-        let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
-        let specular_environment =
-            prefiltered_world(world, &doc.node_groups, images, reflection, roughness)?;
-        let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
-        let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
-        result += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
-    }
-    for (id, light_node) in &doc.nodes {
-        let Some(light) = light_node
-            .data
-            .as_ref()
-            .and_then(|data_id| doc.data_blocks.get(data_id))
-            .and_then(|block| block.light.as_ref())
-        else {
-            continue;
+    // The diffuse environment depends on the normal alone, so every closure shares it.
+    let diffuse_environment = world.map(|world| prefiltered_world(world, normal, 1.0));
+    // A closure's reflective share is its weight times its alpha. The raster composite multiplies a straight colour
+    // by the opaque share (`render/raster.rs`, `composite_sample`), so the premultiplied sums are divided by it below.
+    let mut reflected = DVec3::ZERO;
+    let mut emitted = DVec3::ZERO;
+    for closure in closures {
+        let params = &closure.params;
+        let share = closure.weight * params.alpha.clamp(0.0, 1.0);
+        // Reflectance weights the whole sum once, below, so the lobes take unit reflectance.
+        let lobe = BsdfParams {
+            reflectance: 1.0,
+            ..*params
         };
-        let Some(evaluated) = snapshot.nodes.get(id) else {
-            continue;
-        };
-        let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
-        let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
-        result += light_contribution(
-            light,
-            matrix,
-            point,
-            shadow_point,
-            normal,
-            geometric,
-            &lobe,
-            &shading,
-            shadow,
-            point_shadow,
-        );
+        // The lobes' layers are set up once here for the camera view, shared by every light below.
+        let shading = principled_layers(&lobe, normal, view);
+        let albedo = base_albedo(params);
+        let mut lobes = DVec3::ZERO;
+        if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
+            let metallic = params.metallic.clamp(0.0, 1.0);
+            let roughness = params.roughness.clamp(0.0, 1.0);
+            // The coat attenuates every layer below it, including the environment terms.
+            let lower = shading.lower();
+            lobes += albedo * diffuse_environment * (1.0 - metallic) * lower;
+            let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
+            let specular_environment = prefiltered_world(world, reflection, roughness);
+            let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
+            let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
+            lobes += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
+        }
+        for (id, light_node) in &doc.nodes {
+            let Some(light) = light_node
+                .data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .and_then(|block| block.light.as_ref())
+            else {
+                continue;
+            };
+            let Some(evaluated) = snapshot.nodes.get(id) else {
+                continue;
+            };
+            let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+            let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+            lobes += light_contribution(
+                light,
+                matrix,
+                point,
+                shadow_point,
+                normal,
+                geometric,
+                &lobe,
+                &shading,
+                shadow,
+                point_shadow,
+                light_node.resolved_ray_visibility(),
+            );
+        }
+        // Reflectance weights every reflective closure (ambient, direct, environment); Emission has none.
+        reflected += lobes * (share * params.reflectance.clamp(0.0, 1.0));
+        // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
+        // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
+        // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
+        // intern/cycles/kernel/svm/closure.h:206-207).
+        emitted += DVec3::from_array(params.emission_color)
+            * (share * params.emission_strength * shading.lower());
     }
-    // In Beauty, reflectance weights every reflective closure (ambient, direct, environment).
-    let result = result * params.reflectance.clamp(0.0, 1.0);
-    let result = result.max(DVec3::ZERO).min(DVec3::splat(1.0));
-    // Emission sits outside the reflectance weight and the clamp: Cycles' `EmissionNode` emits
-    // NODE_CLOSURE_EMISSION unscaled (intern/cycles/scene/shader_nodes.cpp:3071-3098), and neither
-    // EEVEE nor Cycles clamps the strength (gpu_shader_material_principled.glsl:179,
-    // intern/cycles/kernel/svm/closure.h:206-207).
-    let emission =
-        DVec3::from_array(params.emission_color) * params.emission_strength * shading.lower();
-    let result = result + emission;
-    Ok([result.x, result.y, result.z, alpha])
+    // The straight colour is the premultiplied sum over the opaque share. With no opaque share nothing is visible.
+    let (reflected, emitted) = if opaque > 0.0 {
+        (reflected / opaque, emitted / opaque)
+    } else {
+        (DVec3::ZERO, DVec3::ZERO)
+    };
+    let reflected = reflected.max(DVec3::ZERO).min(DVec3::splat(1.0));
+    let result = reflected + emitted;
+    [result.x, result.y, result.z, opaque]
 }
 
-fn prefiltered_world(
-    world: &crate::model::World,
-    groups: &crate::model::Registry<crate::graph::NodeGroup>,
-    images: &BTreeMap<String, ImageData>,
-    axis: DVec3,
-    roughness: f64,
-) -> Result<DVec3> {
+/// The world's filtered radiance along `axis` for `roughness`: five taps spread over a lobe of that roughness, read from
+/// the render's world probe. The taps used to evaluate the World node graph, once per tap per shaded sample.
+fn prefiltered_world(world: &WorldProbe, axis: DVec3, roughness: f64) -> DVec3 {
     const FILTER_OFFSETS: [[f64; 2]; 5] =
         [[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
     let axis = axis.normalize_or_zero();
     if axis == DVec3::ZERO {
-        return Ok(DVec3::ZERO);
+        return DVec3::ZERO;
     }
     let tangent = if axis.z.abs() < 0.999 {
         axis.cross(DVec3::Z).normalize_or_zero()
@@ -2191,9 +2543,9 @@ fn prefiltered_world(
     for offset in FILTER_OFFSETS {
         let direction = (axis + tangent * (spread * offset[0]) + bitangent * (spread * offset[1]))
             .normalize_or_zero();
-        irradiance += crate::shader::evaluate_world(world, groups, images, direction)?;
+        irradiance += world.radiance(direction);
     }
-    Ok(irradiance / 5.0)
+    irradiance / 5.0
 }
 
 #[expect(
@@ -2211,6 +2563,7 @@ fn light_contribution(
     shading: &Layers,
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
+    lobes: RayVisibility,
 ) -> DVec3 {
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
@@ -2218,7 +2571,7 @@ fn light_contribution(
     match light.light_type {
         crate::model::LightType::Sun => {
             let toward_light = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
-            punctual_radiance(params, shading, toward_light, color, energy)
+            punctual_radiance(params, shading, toward_light, color, energy, lobes)
                 * visibility_for_light(
                     shadow,
                     point_shadow,
@@ -2238,6 +2591,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 point_intensity(energy) / distance_squared,
+                lobes,
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2263,6 +2617,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 (point_intensity(energy) / distance_squared) * falloff,
+                lobes,
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2306,11 +2661,12 @@ fn light_contribution(
             // Integrated Lambert irradiance is exact for rectangles and the visibility weight
             // scales it. The specular, sheen and coat lobes are evaluated towards the emitter centre.
             let toward_centre = (position - point).normalize_or_zero();
-            (diffuse_coefficient(params, shading)
-                + specular_coefficient(params, shading, toward_centre)
-                + sheen_coefficient(params, shading, toward_centre)
-                + coat_coefficient(params, shading, toward_centre))
-                * color
+            reflected_lobes_coefficient(
+                &without_subsurface(params),
+                shading,
+                toward_centre,
+                lobes.mask(),
+            ) * color
                 * (irradiance * visible_weight / total_weight)
         }
     }
@@ -2428,15 +2784,13 @@ fn punctual_radiance(
     light: DVec3,
     color: DVec3,
     intensity: f64,
+    lobes: RayVisibility,
 ) -> DVec3 {
     let normal_light_cosine = shading.normal.dot(light).max(0.0);
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    (diffuse_coefficient(params, shading)
-        + specular_coefficient(params, shading, light)
-        + sheen_coefficient(params, shading, light)
-        + coat_coefficient(params, shading, light))
+    reflected_lobes_coefficient(&without_subsurface(params), shading, light, lobes.mask())
         * color
         * (intensity * normal_light_cosine)
 }
@@ -2471,7 +2825,7 @@ mod shading_normal_tests {
         },
         graph::{GraphKind, GraphNode, NodeGroup},
         image::{ImageData, ImageInterpolation},
-        model::{Id, Material, MaterialLink, SceneDoc, ViewportDisplay},
+        model::{Id, Material, MaterialLink, RayVisibility, SceneDoc, ViewportDisplay},
         render::{
             light_model::{
                 AreaShape, area_irradiance_per_radiance, area_radiance, area_visibility_samples,
@@ -2846,17 +3200,19 @@ mod shading_normal_tests {
         )
         .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
         let point = triangle.positions.iter().copied().sum::<DVec3>() / 3.0;
-        let color = shader.shade(
-            triangle,
-            &SurfaceHit {
-                point,
-                shadow_point: point,
-                normal: DVec3::Z,
-                geometric: DVec3::Z,
-                barycentric: [1.0 / 3.0; 3],
-                view: DVec3::Z,
-            },
-        )?;
+        let color = shader
+            .shade(
+                triangle,
+                &SurfaceHit {
+                    point,
+                    shadow_point: point,
+                    normal: DVec3::Z,
+                    geometric: DVec3::Z,
+                    barycentric: [1.0 / 3.0; 3],
+                    view: DVec3::Z,
+                },
+            )?
+            .color;
         // No lights and no world: the hit returns its emission alone, as Cycles does. The old
         // Potter-only `albedo * 0.08` ambient fallback is gone.
         let expected_rgb = [0.7, 0.1, 0.2];
@@ -2929,6 +3285,7 @@ mod shading_normal_tests {
     fn source_triangle(positions: [DVec3; 3], normals: [DVec3; 3]) -> Triangle {
         Triangle {
             positions,
+            generated: crate::geom::GeneratedCorners::default(),
             object_index: 1,
             element_index: 1,
             color: [1.0; 4],
@@ -2941,6 +3298,7 @@ mod shading_normal_tests {
             normals: Some(normals),
             layer_colors: Vec::new(),
             lit_per_pixel: false,
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 
@@ -3289,5 +3647,91 @@ mod transparent_shadow_tests {
             ..blend
         };
         assert!(!casts(&blend_off));
+    }
+}
+
+#[cfg(test)]
+mod beauty_tint_tests {
+    use super::{beauty_tint, weighted_tint};
+    use crate::model::Material;
+
+    fn material(alpha_mode: &str) -> Material {
+        Material {
+            alpha_mode: alpha_mode.to_owned(),
+            ..Material::default()
+        }
+    }
+
+    #[test]
+    fn blended_material_keeps_each_channel() {
+        assert_eq!(
+            beauty_tint(Some(&material("blend")), [0.2, 0.8, 0.4]),
+            [0.2, 0.8, 0.4]
+        );
+    }
+
+    /// A DITHERED material takes the mean of the Color's channels: (0.2 + 0.8 + 0.4) / 3 on every channel.
+    #[test]
+    fn dithered_material_takes_the_channel_mean() {
+        let mean = (0.2 + 0.8 + 0.4) / 3.0;
+        for alpha_mode in ["opaque", "clip"] {
+            for channel in beauty_tint(Some(&material(alpha_mode)), [0.2, 0.8, 0.4]) {
+                assert!((channel - mean).abs() < 1.0e-12, "{alpha_mode}: {channel}");
+            }
+        }
+    }
+
+    /// Tints are clamped to [0, 1] first. BLENDED clamps each channel: 2 -> 1, -1 -> 0, 0.5 stays. DITHERED takes the
+    /// mean of the clamped channels: (1 + 0 + 0.5) / 3 = 0.5.
+    #[test]
+    fn tints_are_clamped_before_use() {
+        assert_eq!(
+            beauty_tint(Some(&material("blend")), [2.0, -1.0, 0.5]),
+            [1.0, 0.0, 0.5]
+        );
+        let dithered = beauty_tint(Some(&material("clip")), [2.0, -1.0, 0.5]);
+        assert!((dithered[0] - 0.5).abs() < 1.0e-12, "{dithered:?}");
+    }
+
+    #[test]
+    fn no_material_keeps_the_tint_clamped() {
+        assert_eq!(beauty_tint(None, [0.5, 1.5, -0.2]), [0.5, 1.0, 0.0]);
+    }
+
+    /// Mix(0.5) of a Transparent (colour (0.2, 0.8, 0.4)) and an opaque Principled. The transparent closure passes
+    /// 0.5 * tint, the opaque one passes nothing, so the surface's tint is the Transparent colour and the composite passes
+    /// `(1 - 0.5) * tint`: the transmittance EEVEE sums (`g_transmittance`) is `0.5 * tint`.
+    #[test]
+    fn mix_of_transparent_and_opaque_keeps_the_transparent_colour() {
+        let tint = [0.2, 0.8, 0.4];
+        let terms = [(0.5, 1.0, [1.0; 3]), (0.5, 0.0, tint)];
+        let opacity = 0.5;
+        let actual = weighted_tint(terms.into_iter(), opacity);
+        for (channel, expected) in tint.iter().enumerate() {
+            assert!((actual[channel] - expected).abs() < 1.0e-12, "{actual:?}");
+        }
+    }
+
+    /// Two transparent closures, weights 0.5 and 0.5, alphas 0 and 0.5, tints (0.2, 0.8, 0.4) and white. The passed
+    /// transmittance is 0.5 * (0.2, 0.8, 0.4) + 0.5 * 0.5 * (1, 1, 1) = (0.35, 0.65, 0.45), the opacity is
+    /// 0.5 * 0 + 0.5 * 0.5 = 0.25, so the tint is (0.35, 0.65, 0.45) / 0.75.
+    #[test]
+    fn weighted_sum_over_two_transparent_closures() {
+        let terms = [(0.5, 0.0, [0.2, 0.8, 0.4]), (0.5, 0.5, [1.0; 3])];
+        let actual = weighted_tint(terms.into_iter(), 0.25);
+        let expected = [0.35 / 0.75, 0.65 / 0.75, 0.45 / 0.75];
+        for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "channel {channel}: {actual}"
+            );
+        }
+    }
+
+    /// A surface that passes nothing (opacity 1) has no pass chance, so its tint is white.
+    #[test]
+    fn fully_opaque_surface_has_a_white_tint() {
+        let actual = weighted_tint([(1.0, 1.0, [0.2, 0.8, 0.4])].into_iter(), 1.0);
+        assert_eq!(actual, [1.0; 3]);
     }
 }

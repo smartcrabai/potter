@@ -5,7 +5,7 @@
 //! the standard `Tree_*_5_4_3` hierarchy and returns typed errors for other variants.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Read,
     sync::{Arc, LazyLock, Mutex},
 };
@@ -40,11 +40,76 @@ const BLOSC_MIN_ZSTD_WINDOW_BYTES: u64 = 1 << 20;
 static VDB_CACHE: LazyLock<Mutex<HashMap<String, Arc<VdbVolume>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// One lerp of `OpenVDB`'s `BoxSampler::trilinearInterpolation` (`openvdb/tools/Interpolation.h`):
+/// the `float` difference is multiplied by the `double` weight, the product is rounded to `float`,
+/// and it is added to the first value in `float`.
+pub(crate) fn box_sample_lerp(first: f32, second: f32, weight: f64) -> f32 {
+    let difference = second - first;
+    let step = (f64::from(difference) * weight) as f32;
+    first + step
+}
+
+/// A scalar that `BoxSampler` interpolates in its own precision: `float` for float grids and `double`
+/// for double grids (`openvdb/tools/Interpolation.h` is templated on the value type).
+pub(crate) trait BoxScalar: Copy {
+    /// One lerp: `first` moved toward `second` by `weight`, in this precision.
+    fn lerp(first: Self, second: Self, weight: f64) -> Self;
+    /// The value as `f64`, for storage in dense grids.
+    fn to_f64(self) -> f64;
+    /// The value rounded to this precision.
+    fn from_f64(value: f64) -> Self;
+}
+
+impl BoxScalar for f32 {
+    fn lerp(first: f32, second: f32, weight: f64) -> f32 {
+        box_sample_lerp(first, second, weight)
+    }
+
+    fn to_f64(self) -> f64 {
+        f64::from(self)
+    }
+
+    fn from_f64(value: f64) -> f32 {
+        value as f32
+    }
+}
+
+impl BoxScalar for f64 {
+    fn lerp(first: f64, second: f64, weight: f64) -> f64 {
+        first + (second - first) * weight
+    }
+
+    fn to_f64(self) -> f64 {
+        self
+    }
+
+    fn from_f64(value: f64) -> f64 {
+        value
+    }
+}
+
+/// `BoxSampler::sample`: the eight voxels around `coordinate` are interpolated along z, then y, then
+/// x, in the order Blender's `OpenVDB` build uses. `value_at` gives each voxel's value.
+pub(crate) fn box_sample_trilinear<T: BoxScalar>(
+    value_at: impl Fn([i64; 3]) -> T,
+    coordinate: DVec3,
+) -> T {
+    let lower = coordinate.floor();
+    let fraction = coordinate - lower;
+    let base = lower.to_array().map(|value| value as i64);
+    let value = |dx: i64, dy: i64, dz: i64| value_at([base[0] + dx, base[1] + dy, base[2] + dz]);
+    let along_z = |dx: i64, dy: i64| T::lerp(value(dx, dy, 0), value(dx, dy, 1), fraction.z);
+    let along_y = |dx: i64| T::lerp(along_z(dx, 0), along_z(dx, 1), fraction.y);
+    T::lerp(along_y(0), along_y(1), fraction.x)
+}
+
 /// Scalar or three-component values stored by a VDB tree.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VdbValue {
-    /// A scalar floating-point value.
+    /// A scalar single-precision floating-point value.
     Float(f32),
+    /// A scalar double-precision floating-point value.
+    Double(f64),
     /// A three-component floating-point value.
     Vec3([f32; 3]),
 }
@@ -53,15 +118,26 @@ impl VdbValue {
     fn magnitude(self) -> f32 {
         match self {
             Self::Float(value) => value,
+            Self::Double(value) => value as f32,
             Self::Vec3(value) => value[0].hypot(value[1]).hypot(value[2]),
         }
     }
 
-    fn component(self, component: usize) -> Option<f32> {
+    /// The value at full precision; a three-component value yields its magnitude.
+    fn scalar(self) -> f64 {
         match self {
-            Self::Float(value) if component == 0 => Some(value),
-            Self::Vec3(value) => value.get(component).copied(),
-            Self::Float(_) => None,
+            Self::Float(value) => f64::from(value),
+            Self::Double(value) => value,
+            Self::Vec3(_) => f64::from(self.magnitude()),
+        }
+    }
+
+    fn component(self, component: usize) -> Option<f64> {
+        match self {
+            Self::Float(value) if component == 0 => Some(f64::from(value)),
+            Self::Double(value) if component == 0 => Some(value),
+            Self::Vec3(value) => value.get(component).copied().map(f64::from),
+            Self::Float(_) | Self::Double(_) => None,
         }
     }
 }
@@ -81,12 +157,91 @@ pub struct VdbTransform {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VdbTree {
     /// Tree background value; vector backgrounds are represented by their magnitude.
-    pub background: f32,
+    pub background: f64,
     background_value: VdbValue,
     values: HashMap<IVec3, VdbValue>,
+    /// Index coordinates of the active voxels, from the leaf value masks (`OpenVDB` `isValueOn`).
+    active_voxels: HashSet<IVec3>,
     tiles: HashMap<(IVec3, i32), VdbTile>,
     /// Tight bounds of active voxels or active tiles in index space.
     pub active_bbox: Option<([i32; 3], [i32; 3])>,
+}
+
+impl VdbTree {
+    /// Index coordinates Blender treats as active: the active voxels plus every voxel of an active tile.
+    /// Inactive stored samples are not seeds, as `dilateActiveValues` visits only active values.
+    pub(crate) fn active_seeds(&self, limit: usize) -> Result<Vec<IVec3>> {
+        let mut seeds: Vec<IVec3> = self.active_voxels.iter().copied().collect();
+        for tile in self.tiles.values().filter(|tile| tile.active) {
+            let count = (0..3)
+                .try_fold(1_usize, |count, axis| {
+                    let extent =
+                        usize::try_from(i64::from(tile.max[axis]) - i64::from(tile.min[axis]) + 1)
+                            .ok()?;
+                    count.checked_mul(extent)
+                })
+                .ok_or_else(|| limit_error("VDB active tile voxel count overflow"))?;
+            if seeds
+                .len()
+                .checked_add(count)
+                .is_none_or(|total| total > limit)
+            {
+                return Err(limit_error(
+                    "VDB active voxels exceed the displacement budget",
+                ));
+            }
+            for z in tile.min[2]..=tile.max[2] {
+                for y in tile.min[1]..=tile.max[1] {
+                    for x in tile.min[0]..=tile.max[0] {
+                        seeds.push(IVec3::new(x, y, z));
+                    }
+                }
+            }
+        }
+        Ok(seeds)
+    }
+
+    /// A tree with this background whose voxels are `values`, all active, with tight active bounds.
+    /// Inactive tiles keep their values, as Blender's displaced copy keeps every inactive value; active
+    /// tiles are replaced by their voxels in `values`, which the displacement domain covers.
+    pub(crate) fn with_samples(&self, values: HashMap<IVec3, VdbValue>) -> Self {
+        let active_bbox =
+            values
+                .keys()
+                .fold(None, |bounds: Option<([i32; 3], [i32; 3])>, point| {
+                    let point = point.to_array();
+                    Some(match bounds {
+                        None => (point, point),
+                        Some((minimum, maximum)) => (
+                            [
+                                minimum[0].min(point[0]),
+                                minimum[1].min(point[1]),
+                                minimum[2].min(point[2]),
+                            ],
+                            [
+                                maximum[0].max(point[0]),
+                                maximum[1].max(point[1]),
+                                maximum[2].max(point[2]),
+                            ],
+                        ),
+                    })
+                });
+        let active_voxels = values.keys().copied().collect();
+        let tiles = self
+            .tiles
+            .iter()
+            .filter(|(_, tile)| !tile.active)
+            .map(|(key, tile)| (*key, *tile))
+            .collect();
+        Self {
+            background: self.background,
+            background_value: self.background_value,
+            values,
+            active_voxels,
+            tiles,
+            active_bbox,
+        }
+    }
 }
 
 /// An `OpenVDB` tile, whose value is constant over a power-of-two cube.
@@ -121,6 +276,7 @@ pub struct VdbGrid {
 
 impl VdbGrid {
     /// Return the value at an integer index, with the background outside active data.
+    /// Double-precision values are rounded to `f32` here; [`VdbGrid::sample_world`] keeps full precision.
     #[must_use]
     pub fn sample_index(&self, ijk: [i32; 3]) -> f32 {
         self.sample_value(IVec3::from_array(ijk)).magnitude()
@@ -128,27 +284,63 @@ impl VdbGrid {
 
     /// Return one scalar component at an integer index; scalar grids have component 0.
     #[must_use]
-    pub fn sample_index_component(&self, ijk: [i32; 3], component: usize) -> Option<f32> {
+    pub fn sample_index_component(&self, ijk: [i32; 3], component: usize) -> Option<f64> {
         self.sample_value(IVec3::from_array(ijk))
             .component(component)
+    }
+
+    /// Box-sample one component of the grid at a fractional index position, with the background
+    /// outside active data, as Blender's `BoxSampler::sample` does on a float grid.
+    pub(crate) fn sample_index_component_box(&self, index: DVec3, component: usize) -> f32 {
+        box_sample_trilinear(
+            |point| {
+                let value = self
+                    .sample_value(IVec3::from_array(point.map(|value| value as i32)))
+                    .component(component)
+                    .unwrap_or(0.0);
+                // Blender's float grid stores each sample as `float`; a double grid rounds here.
+                value as f32
+            },
+            index,
+        )
     }
 
     /// Trilinearly sample the grid in world coordinates.
     #[must_use]
     pub fn sample_world(&self, position: DVec3) -> f64 {
-        if !position.is_finite() {
-            return f64::from(self.tree.background);
-        }
         let index = self.transform.world_to_index.transform_point3(position);
+        Self::trilinear_index(index, self.tree.background, |point| {
+            self.sample_value(IVec3::from_array(point)).scalar()
+        })
+    }
+
+    /// Whether the grid stores scalar rather than three-component values.
+    #[must_use]
+    pub(crate) fn is_scalar(&self) -> bool {
+        !matches!(self.tree.background_value, VdbValue::Vec3(_))
+    }
+
+    /// Trilinearly sample a scalar grid at an index-space position at full precision. Returns
+    /// `None` for three-component grids, which have no scalar field.
+    #[must_use]
+    pub(crate) fn sample_index_scalar_linear(&self, index: DVec3) -> Option<f64> {
+        self.is_scalar().then(|| {
+            Self::trilinear_index(index, self.tree.background, |point| {
+                self.sample_value(IVec3::from_array(point)).scalar()
+            })
+        })
+    }
+
+    fn trilinear_index(index: DVec3, background: f64, sample: impl Fn([i32; 3]) -> f64) -> f64 {
         if !index.is_finite() {
-            return f64::from(self.tree.background);
+            return background;
         }
         let lower = [index.x.floor(), index.y.floor(), index.z.floor()];
         if lower
             .iter()
             .any(|value| *value < f64::from(i32::MIN) || *value >= f64::from(i32::MAX))
         {
-            return f64::from(self.tree.background);
+            return background;
         }
         let base = lower.map(|value| value as i32);
         let fraction = [index.x - lower[0], index.y - lower[1], index.z - lower[2]];
@@ -170,7 +362,47 @@ impl VdbGrid {
                     } else {
                         fraction[2]
                     });
-                    result += f64::from(self.sample_index(point)) * weight;
+                    result += sample(point) * weight;
+                }
+            }
+        }
+        result
+    }
+
+    /// Cubic B-spline sample of the grid in world coordinates, Cycles' tricubic interpolation over the four samples
+    /// per axis at offsets -1 to 2 (`kernel_image_interp_tricubic_nanovdb`). Inactive voxels are background.
+    #[must_use]
+    pub fn sample_world_cubic(&self, position: DVec3) -> f64 {
+        if !position.is_finite() {
+            return self.tree.background;
+        }
+        let index = self.transform.world_to_index.transform_point3(position);
+        if !index.is_finite() {
+            return self.tree.background;
+        }
+        let lower = index.floor();
+        if lower
+            .to_array()
+            .iter()
+            .any(|value| *value < f64::from(i32::MIN) + 1.0 || *value >= f64::from(i32::MAX) - 2.0)
+        {
+            return self.tree.background;
+        }
+        let base = lower.as_ivec3();
+        let fraction = index - lower;
+        let weight_x = super::volume::cubic_weights(fraction.x);
+        let weight_y = super::volume::cubic_weights(fraction.y);
+        let weight_z = super::volume::cubic_weights(fraction.z);
+        let mut result = 0.0_f64;
+        for (k, wz) in weight_z.iter().enumerate() {
+            for (j, wy) in weight_y.iter().enumerate() {
+                for (i, wx) in weight_x.iter().enumerate() {
+                    let point = [
+                        base.x + i as i32 - 1,
+                        base.y + j as i32 - 1,
+                        base.z + k as i32 - 1,
+                    ];
+                    result += f64::from(self.sample_index(point)) * wx * wy * wz;
                 }
             }
         }
@@ -180,26 +412,32 @@ impl VdbGrid {
     /// Return the world-space AABB enclosing the active index-space bounds.
     #[must_use]
     pub fn active_bbox_world(&self) -> Option<(DVec3, DVec3)> {
+        self.active_bbox_world_padded(DVec3::ZERO)
+    }
+
+    /// Return the world-space AABB enclosing the active index-space bounds grown by `pad` index voxels on each axis.
+    /// A sample near the active bounds reads its neighbours, so each axis pads by its own count (Cycles pads a volume's
+    /// mesh by one voxel for linear and two for cubic interpolation, `scene/volume.cpp`).
+    #[must_use]
+    pub fn active_bbox_world_padded(&self, pad: DVec3) -> Option<(DVec3, DVec3)> {
         let (minimum, maximum) = self.active_bbox?;
+        let low = DVec3::new(
+            f64::from(minimum[0]),
+            f64::from(minimum[1]),
+            f64::from(minimum[2]),
+        ) - pad;
+        let high = DVec3::new(
+            f64::from(maximum[0]),
+            f64::from(maximum[1]),
+            f64::from(maximum[2]),
+        ) + pad;
         let mut world_min = DVec3::splat(f64::INFINITY);
         let mut world_max = DVec3::splat(f64::NEG_INFINITY);
         for corner in 0..8 {
             let index = DVec3::new(
-                f64::from(if corner & 1 == 0 {
-                    minimum[0]
-                } else {
-                    maximum[0]
-                }),
-                f64::from(if corner & 2 == 0 {
-                    minimum[1]
-                } else {
-                    maximum[1]
-                }),
-                f64::from(if corner & 4 == 0 {
-                    minimum[2]
-                } else {
-                    maximum[2]
-                }),
+                if corner & 1 == 0 { low.x } else { high.x },
+                if corner & 2 == 0 { low.y } else { high.y },
+                if corner & 4 == 0 { low.z } else { high.z },
             );
             let world = self.transform.index_to_world.transform_point3(index);
             if !world.is_finite() {
@@ -403,6 +641,10 @@ impl<'a> Parser<'a> {
                 active_bbox: parent.active_bbox,
             });
         }
+        // `OpenVDB` keeps grid descriptors in a name-keyed map, so `readAllGridMetadata` (which Blender
+        // loads through) yields grids in name order, not file order. Stable, so duplicate names keep
+        // their file order.
+        grids.sort_by(|first, second| first.name.cmp(&second.name));
         Ok(VdbVolume {
             grids,
             uuid: self.uuid,
@@ -474,7 +716,7 @@ impl<'a> Parser<'a> {
                 block_pos,
                 end_pos,
             });
-            // OpenVDB stores each descriptor adjacent to its grid data; the next
+            // `OpenVDB` stores each descriptor adjacent to its grid data; the next
             // descriptor begins at this grid's end offset.
             self.cursor.position = end_pos;
         }
@@ -658,9 +900,10 @@ impl<'a> Parser<'a> {
                 .ok_or_else(|| limit_error("VDB root node count overflow"))?,
         )?;
         let mut tree = VdbTree {
-            background: background.magnitude(),
+            background: background.scalar(),
             background_value: background,
             values: HashMap::new(),
+            active_voxels: HashSet::new(),
             tiles: HashMap::new(),
             active_bbox: None,
         };
@@ -708,6 +951,7 @@ impl<'a> Parser<'a> {
                 let active = leaf.active[offset];
                 if active {
                     Self::include_active(&mut tree.active_bbox, coordinate, coordinate);
+                    tree.active_voxels.insert(IVec3::from_array(coordinate));
                 }
                 if active || value != background {
                     tree.values.insert(IVec3::from_array(coordinate), value);
@@ -991,7 +1235,7 @@ impl<'a> Parser<'a> {
             }
             Self::include_active(&mut tree.active_bbox, origin, max);
         }
-        if active || value.magnitude() != tree.background {
+        if active || value.scalar() != tree.background {
             self.total_tiles = self
                 .total_tiles
                 .checked_add(1)
@@ -1068,6 +1312,7 @@ impl<'a> Parser<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueKind {
     Float,
+    Double,
     Vec3,
 }
 
@@ -1076,6 +1321,7 @@ impl ValueKind {
         let bytes_per_component = if half { 2 } else { 4 };
         match self {
             Self::Float => Some(bytes_per_component),
+            Self::Double => (!half).then_some(8),
             Self::Vec3 => bytes_per_component.checked_mul(3),
         }
     }
@@ -1098,6 +1344,7 @@ fn grid_value_type(grid_type: &str) -> Result<ValueKind> {
     }
     match parts.get(1).copied() {
         Some("float") => Ok(ValueKind::Float),
+        Some("double") => Ok(ValueKind::Double),
         Some("vec3s") => Ok(ValueKind::Vec3),
         _ => Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -1417,6 +1664,14 @@ fn decode_value(bytes: &[u8], kind: ValueKind, half: bool) -> Result<VdbValue> {
     };
     match kind {
         ValueKind::Float => Ok(VdbValue::Float(component(0)?)),
+        ValueKind::Double => {
+            let bits: [u8; 8] = bytes
+                .get(..8)
+                .ok_or_else(|| import_error("VDB double value is truncated"))?
+                .try_into()
+                .map_err(|_| import_error("VDB double value is truncated"))?;
+            Ok(VdbValue::Double(f64::from_le_bytes(bits)))
+        }
         ValueKind::Vec3 => {
             let size = if half { 2 } else { 4 };
             Ok(VdbValue::Vec3([
@@ -1452,6 +1707,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 fn negate_value(value: VdbValue) -> VdbValue {
     match value {
         VdbValue::Float(value) => VdbValue::Float(-value),
+        VdbValue::Double(value) => VdbValue::Double(-value),
         VdbValue::Vec3(value) => VdbValue::Vec3(value.map(|component| -component)),
     }
 }
@@ -1831,7 +2087,49 @@ mod blosc_tests {
 }
 #[cfg(test)]
 mod sampling_tests {
+    #![expect(clippy::unwrap_used, reason = "small deterministic sampling fixtures")]
     use super::*;
+
+    #[test]
+    fn active_seeds_skip_inactive_samples_and_displaced_trees_keep_inactive_tiles() {
+        let active = IVec3::new(1, 1, 1);
+        let inactive_sample = IVec3::new(5, 5, 5);
+        let inactive_tile = VdbTile {
+            min: [64, 0, 0],
+            max: [71, 7, 7],
+            value: VdbValue::Float(-1.0),
+            active: false,
+        };
+        let active_tile = VdbTile {
+            min: [128, 0, 0],
+            max: [135, 7, 7],
+            value: VdbValue::Float(0.0),
+            active: true,
+        };
+        let tree = VdbTree {
+            background: 0.0,
+            background_value: VdbValue::Float(0.0),
+            values: HashMap::from([
+                (active, VdbValue::Float(1.0)),
+                (inactive_sample, VdbValue::Float(-2.0)),
+            ]),
+            active_voxels: HashSet::from([active]),
+            tiles: HashMap::from([
+                ((IVec3::new(64, 0, 0), 8), inactive_tile),
+                ((IVec3::new(128, 0, 0), 8), active_tile),
+            ]),
+            active_bbox: None,
+        };
+        let seeds = tree.active_seeds(usize::MAX).unwrap();
+        // One active voxel plus the eight-cubed voxels of the active tile; the inactive sample is not seeded.
+        assert_eq!(seeds.len(), 1 + 512);
+        assert!(seeds.contains(&active));
+        assert!(!seeds.contains(&inactive_sample));
+        // The displaced copy keeps the inactive tile and drops the active tile, whose voxels are values now.
+        let displaced = tree.with_samples(HashMap::from([(active, VdbValue::Float(1.0))]));
+        assert_eq!(displaced.tiles.len(), 1);
+        assert!(displaced.tiles.values().all(|tile| !tile.active));
+    }
 
     #[test]
     fn world_sampling_uses_sparse_voxel_background_outside_the_sphere() {
@@ -1846,10 +2144,12 @@ mod sampling_tests {
                 }
             }
         }
+        let active_voxels = values.keys().copied().collect();
         let tree = Arc::new(VdbTree {
             background: 0.0,
             background_value: VdbValue::Float(0.0),
             values,
+            active_voxels,
             tiles: HashMap::new(),
             active_bbox: Some(([2, 2, 2], [13, 13, 13])),
         });

@@ -1,0 +1,45 @@
+{
+ "blender": "5.2.2 LTS",
+ "samples": 256,
+ "density": 2.0,
+ "max_bounces": 0,
+ "volume_bounces": 0,
+ "cases": {
+  "emissive_cube_color0": {
+   "mean": [
+    0.432333,
+    0.432333,
+    0.432333
+   ],
+   "stderr": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  "emissive_cube_color05": {
+   "mean": [
+    0.564163,
+    0.564163,
+    0.564163
+   ],
+   "stderr": [
+    0.001561,
+    0.001561,
+    0.001561
+   ]
+  },
+  "emissive_cube_color1": {
+   "mean": [
+    0.695431,
+    0.695431,
+    0.695431
+   ],
+   "stderr": [
+    0.002854,
+    0.002854,
+    0.002854
+   ]
+  }
+ }
+}

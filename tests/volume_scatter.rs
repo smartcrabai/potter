@@ -56,6 +56,24 @@ fn luminance(pixels: &[u8], width: u32, x: u32, y: u32) -> Result<f64, Box<dyn E
     Ok(0.2126 * f64::from(rgb[0]) + 0.7152 * f64::from(rgb[1]) + 0.0722 * f64::from(rgb[2]))
 }
 
+/// The mean luminance of the 6 by 6 patch centred on the image's middle row, over the `columns`.
+fn patch_luminance(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    columns: std::ops::Range<u32>,
+) -> Result<f64, Box<dyn Error>> {
+    let mut total = 0.0;
+    let mut count = 0.0;
+    for x in columns {
+        for y in height / 2 - 3..height / 2 + 3 {
+            total += luminance(pixels, width, x, y)?;
+            count += 1.0;
+        }
+    }
+    Ok(total / count)
+}
+
 fn make_scattering_scene(root: &Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let scene = root.join("scene");
     pot(&["init", scene.to_str().ok_or("scene path is not UTF-8")?])?;
@@ -88,7 +106,7 @@ fn make_scattering_scene(root: &Path) -> Result<std::path::PathBuf, Box<dyn Erro
             {"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,6.0]},"projection":"orthographic","ortho_scale":5.0},
             {"op":"light.create","id":"sun_main","light_type":"sun","energy":20.0,"transform":{"rotation":[0.0,FRAC_1_SQRT_2,0.0,FRAC_1_SQRT_2]}},
             {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}},
-            {"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":32,"resolution_y":32,"samples":32,"seed":712,"max_bounces":4}}
+            {"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":32,"resolution_y":32,"samples":32,"seed":712,"max_bounces":4,"volume_bounces":4}}
         ]
     });
     let operations_path = root.join("operations.json");
@@ -166,8 +184,20 @@ fn scattering_cloud_is_lit_in_beauty_and_path_renders_are_seed_deterministic()
     );
     let (path_width, path_height, path_image) = png_pixels(&first_path)?;
     let path_center = luminance(&path_image, path_width, path_width / 2, path_height / 2)?;
-    let path_lit = luminance(&path_image, path_width, path_width / 2 + 4, path_height / 2)?;
-    let path_shadow = luminance(&path_image, path_width, path_width / 2 - 4, path_height / 2)?;
+    // A path render at 32 samples per pixel is noisy: one pixel per side flips with the random draws, so each side is
+    // the mean of a 6 by 6 patch, 4 to 8 columns from the centre.
+    let path_lit = patch_luminance(
+        &path_image,
+        path_width,
+        path_height,
+        path_width / 2 + 2..path_width / 2 + 8,
+    )?;
+    let path_shadow = patch_luminance(
+        &path_image,
+        path_width,
+        path_height,
+        path_width / 2 - 8..path_width / 2 - 2,
+    )?;
     let path_corner = luminance(&path_image, path_width, 0, 0)?;
     assert!(
         path_center > path_corner + 2.0,

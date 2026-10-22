@@ -1790,7 +1790,11 @@ fn validate_mesh_export_attributes(mesh: &Mesh, data_block: Option<&DataBlock>) 
             | "shade_smooth"
             | "sharp"
             | "color_layers"
-            | "custom_normal" => true,
+            | "custom_normal"
+            | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES
+            // glTF has no texture space: a stored one is a reported loss (`unwritten_attribute_losses`), so lossy export
+            // proceeds and strict export refuses through the loss report, as for other unwritten attributes.
+            | crate::geom::TEXTURE_SPACE_KEY => true,
             "blender_metadata" => value["custom_properties"]
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty),
@@ -3491,6 +3495,7 @@ pub(crate) fn unwritten_attribute_losses(mesh: &Mesh, owner: &str) -> Vec<Loss> 
                             | "sharp"
                             | "seam"
                             | "vertex_groups"
+                            | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES
                     ) || color_layer_storage_key(mesh, key)
                     {
                         continue;
@@ -8017,6 +8022,7 @@ pub(crate) fn import_indexed(
                 show_render: true,
                 params,
                 binding_data: None,
+                baked_ocean_cache: None,
                 runtime: crate::model::ModifierRuntime::default(),
             });
         }
@@ -8758,7 +8764,7 @@ fn weld_copies(
 }
 
 /// Whether morph NORMAL deltas disagree with normals derived from the morphed geometry.
-/// Runs after `shading::import_shading`, so `mesh` already carries the imported shading.
+/// Runs after `shading::import_shading_flags`, so `mesh` already carries the imported shading.
 /// `normals` and each target's NORMAL deltas hold one value per face corner in `mesh.faces` order.
 fn morph_normals_disagree(
     mesh: &Mesh,
@@ -15056,7 +15062,8 @@ mod tests {
             // A texture on the render layer reads `TexCoord.UV`, which is the hit's render `uv`. The renderer
             // sets it; without it the texture samples the (0, 0) default across the REPEAT seam.
             context.uv = [u, 0.25];
-            let params = crate::shader::evaluate_surface(material, &context)?;
+            let shading = crate::shader::evaluate_surface(material, &context)?;
+            let params = shading.dominant().ok_or("material has no closure")?;
             Ok((params.roughness, params.metallic))
         };
         let close = |actual: f64, expected: f64| (actual - expected).abs() < 1e-6;
@@ -15277,7 +15284,8 @@ mod tests {
                 .with_uv_layers(layers);
             // A graph texture on the render layer reads `TexCoord.UV`, the hit's render `uv`, as the renderer sets it.
             context.uv = [u, v];
-            let params = crate::shader::evaluate_surface(material, &context)?;
+            let shading = crate::shader::evaluate_surface(material, &context)?;
+            let params = shading.dominant().ok_or("material has no closure")?;
             Ok((params.roughness, params.metallic))
         };
         let mut native_images = BTreeMap::new();
@@ -15484,7 +15492,11 @@ mod tests {
                     .with_images(&images)
                     .with_uv_layers(layers);
                 context.uv = [s_u, s_v];
-                Ok(crate::shader::evaluate_surface(material, &context)?.base_color)
+                let shading = crate::shader::evaluate_surface(material, &context)?;
+                Ok(shading
+                    .dominant()
+                    .ok_or("material has no closure")?
+                    .base_color)
             };
             for s_u in grid {
                 for s_v in grid {
@@ -15585,7 +15597,11 @@ mod tests {
                 .with_images(&images)
                 .with_uv_layers(layers);
             context.uv = storage;
-            let actual = crate::shader::evaluate_surface(material, &context)?.base_color;
+            let shading = crate::shader::evaluate_surface(material, &context)?;
+            let actual = shading
+                .dominant()
+                .ok_or("material has no closure")?
+                .base_color;
             for channel in 0..3 {
                 let expected = r[2 + channel].as_f64().ok_or("colour is not a number")?;
                 let diff = (actual[channel] - expected).abs();

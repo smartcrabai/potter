@@ -14,6 +14,8 @@ mod sequence;
 mod studio;
 mod subsurface;
 mod subsurface_walk;
+mod wireframe;
+mod world_probe;
 
 pub use pick::pick;
 pub use preview::{PreviewRequest, render_previews};

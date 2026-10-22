@@ -51,7 +51,9 @@ pub(crate) use displacement::{
 mod mirror;
 pub(crate) mod multires;
 mod ocean;
-mod remesh_modes;
+pub(crate) use ocean::{OceanBakeImage, OceanBakeSequence, ocean_cache_directory};
+pub(crate) mod remesh_modes;
+pub(crate) mod shrinkwrap;
 pub mod simulation;
 mod skin;
 mod smoothing;
@@ -61,6 +63,11 @@ mod subdivision_loose;
 mod subdivision_normals;
 mod subdivision_order;
 mod subdivision_origin;
+
+/// The edge attribute of a Subdivision result marking its optimal-display edges (Blender's
+/// `subsurf_optimal_display_edges`): `true` for a subedge of a coarse edge, `false` for an internal edge.
+/// The wireframe overlay hides the `false` edges. Internal to evaluation, like `crease_edge`.
+pub(crate) const OPTIMAL_DISPLAY_EDGES: &str = "subdivision_optimal_edges";
 mod subdivision_uv;
 use subdivision_limit::Samples;
 type Polygon = (Vec<usize>, u32);
@@ -181,7 +188,8 @@ pub(crate) fn evaluate_modifiers_with_texture_seed_at_frame(
     frame: f64,
     subject_name: &str,
     texture_seed: TextureSeed<'_>,
-    material_slot_count: Option<usize>,
+    context: ModifierEvaluationContext<'_>,
+    modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_scene_context(
         evaluated,
@@ -194,14 +202,12 @@ pub(crate) fn evaluate_modifiers_with_texture_seed_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
-        ModifierEvaluationContext {
-            material_slot_count,
-            ..ModifierEvaluationContext::default()
-        },
+        context,
         |_, modifier| modifier.enabled,
         texture_seed,
         None,
         |_, modifier, _warnings, _, _texture_rng| Err(unsupported_modifier(modifier)),
+        modifier_parameter,
     )
 }
 
@@ -330,6 +336,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         Option<&[DVec3]>,
         &mut BlenderRng,
     ) -> Result<Option<usize>>,
+    modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_scene_context_and_normals(
         evaluated,
@@ -347,6 +354,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         texture_seed,
         adaptive_render,
         custom_modifier,
+        modifier_parameter,
     )
     .map(|(evaluation, _)| evaluation)
 }
@@ -373,6 +381,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
         Option<&[DVec3]>,
         &mut BlenderRng,
     ) -> Result<Option<usize>>,
+    mut modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
 ) -> Result<(ModifierEvaluation, Option<Vec<Option<DVec3>>>)> {
     let had_origindex = origindex_values(&evaluated).is_some();
     if !frame.is_finite() {
@@ -476,10 +485,12 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
         }
         let scene_operand_modifier = (matches!(
             modifier.modifier_type.as_str(),
-            "boolean" | "shrinkwrap" | "surface_deform" | "mesh_deform"
+            "boolean" | "surface_deform" | "mesh_deform"
         ) && ["object", "collection", "target"]
             .iter()
             .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)))
+            || (modifier.modifier_type == "shrinkwrap"
+                && modifier.params.get("target").is_some_and(Value::is_string))
             || (matches!(
                 modifier.modifier_type.as_str(),
                 "curve" | "hook" | "data_transfer"
@@ -542,8 +553,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                     | "particle_instance"
                     | "explode"
             )
-            || (modifier.modifier_type == "volume_to_mesh"
-                && modifier.params.get("object").is_some_and(Value::is_string))
+            || modifier.modifier_type == "volume_to_mesh"
             || scene_operand_modifier
         {
             adaptive_normals = None;
@@ -594,7 +604,18 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             continue;
         }
         if modifier.modifier_type == "mesh_to_volume" {
-            continue;
+            return Err(PotError::with_details(
+                ErrorCode::InvalidOperation,
+                "mesh_to_volume requires a volume Object; Blender cannot add it to a mesh Object",
+                json!({"modifier_id":modifier.id,"object_type":"mesh"}),
+            ));
+        }
+        if modifier.modifier_type == "volume_displace" {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidOperation,
+                "volume_displace requires a volume Object; Blender cannot add it to a mesh Object",
+                json!({"modifier_id":modifier.id,"object_type":"mesh"}),
+            ));
         }
         adaptive_normals = None;
         if modifier.modifier_type == "mesh_deform" && modifier.binding_data.is_none() {
@@ -676,7 +697,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                 owner_world_matrix,
                 object_world_matrices,
             )?,
-            "shrinkwrap" => advanced::shrinkwrap(&evaluated, modifier)?,
+            "shrinkwrap" => shrinkwrap::evaluate(&evaluated, modifier)?,
             "curve" => advanced::curve(&evaluated, modifier)?,
             "hook" => advanced::hook(&evaluated, modifier)?,
             "skin" => skin::skin_with_warnings(&evaluated, modifier, &mut warnings)?,
@@ -710,7 +731,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,
             "remesh" => remesh_modes::remesh_modifier(&evaluated, modifier)?,
-            "ocean" => ocean::ocean(&evaluated, modifier, frame, context)?,
+            "ocean" => ocean::ocean_with_parameter_evaluator(
+                &evaluated,
+                modifier,
+                frame,
+                context,
+                |parameter, base| modifier_parameter(modifier, parameter, base),
+            )?,
             _ => return Err(unsupported_modifier(modifier)),
         };
         let dropped: Vec<String> = attributes_before
@@ -787,7 +814,11 @@ pub fn evaluate_modifiers_with_groups_at_frame(
         frame,
         subject_name,
         TextureSeed::new(EvaluationPurpose::Preview, 0, subject_name),
-        material_slot_count,
+        ModifierEvaluationContext {
+            material_slot_count,
+            ..ModifierEvaluationContext::default()
+        },
+        |_, _, _| Ok(None),
     )
 }
 
@@ -856,7 +887,7 @@ fn unsupported_modifier(modifier: &Modifier) -> PotError {
     )
 }
 
-fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> PotError {
+pub(super) fn invalid_parameter(modifier: &Modifier, parameter: &str, expected: &str) -> PotError {
     let (name, pointer) = match parameter {
         "bind_data" | "binding_data" => ("binding_data", "/binding_data".to_owned()),
         _ => (parameter, format!("/params/{parameter}")),
@@ -1107,7 +1138,7 @@ fn mesh_error(error: &MeshError) -> PotError {
     )
 }
 
-fn validated(mesh: &Mesh) -> Result<()> {
+pub(super) fn validated(mesh: &Mesh) -> Result<()> {
     mesh.validate().map_err(|error| mesh_error(&error))
 }
 
@@ -1136,7 +1167,7 @@ fn schema_value<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a Value> {
     })
 }
 
-fn string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
+pub(super) fn string_param<'a>(modifier: &'a Modifier, name: &str) -> Result<&'a str> {
     string_param_with_expected(modifier, name, "a string")
 }
 
@@ -1174,7 +1205,7 @@ pub(super) fn bool_param(modifier: &Modifier, name: &str) -> Result<bool> {
         .ok_or_else(|| invalid_parameter(modifier, name, "a boolean"))
 }
 
-fn uint_param(modifier: &Modifier, name: &str) -> Result<u64> {
+pub(super) fn uint_param(modifier: &Modifier, name: &str) -> Result<u64> {
     schema_value(modifier, name)?
         .as_u64()
         .ok_or_else(|| invalid_parameter(modifier, name, "a non-negative integer"))
@@ -2510,6 +2541,15 @@ fn copy_keyed_value(cap: &Mesh, source: &mut Mesh, name: &str, from: &str, to: S
     if let Some(values) = target.get_mut("values").and_then(Value::as_object_mut) {
         values.insert(to, value.clone());
     }
+    // A cap's `sharp_face` is copied with its layer (Blender's CustomData copy), so the source has it too.
+    if let Some(present) = attribute.get(crate::geom::normals::SHARP_FACE_PRESENT)
+        && let Some(fields) = target.as_object_mut()
+    {
+        fields.insert(
+            crate::geom::normals::SHARP_FACE_PRESENT.to_owned(),
+            present.clone(),
+        );
+    }
 }
 
 /// The input mesh with its cap meshes appended: the provenance source of an array with caps.
@@ -3431,6 +3471,8 @@ fn subdivision_with_samples(
         &result,
     )?;
     let written = subdivision_origin::take_written(&mut result);
+    let optimal_display =
+        subdivision_origin::optimal_display_mask(modifier, &result, &order.edge_sources);
     remap_attributes_staged(
         mesh,
         &mut result,
@@ -3440,6 +3482,11 @@ fn subdivision_with_samples(
         &subdivision_origin::WRITTEN_KEYS,
     )?;
     subdivision_origin::restore_written(&mut result, written);
+    if let Some(mask) = optimal_display {
+        result
+            .attributes
+            .insert(OPTIMAL_DISPLAY_EDGES.to_owned(), mask);
+    }
     if !simple {
         // Catmull-Clark output carries no source indices (`subdivide_once`): the remap above reads the
         // input carrier and would re-attach it to weight-one vertices, so the clear is repeated here.
@@ -4855,6 +4902,72 @@ fn check_evaluation_memory_budget(
         ));
     }
     Ok(())
+}
+
+/// Positions of Shrinkwrap's coarse source vertices after `levels` uniform Catmull-Clark steps. Blender's
+/// `deform_coarse_vertices` writes each coarse vertex at its ptex corner, and Blender 5.2.2 gives the
+/// refined control vertex there (`project_no_axis_subsurf_level_{1,2,6}` agree to f32 precision), not
+/// the limit surface. The steps are the Subsurf level loop's refined path, with creases decaying per
+/// level; the coarse vertices stay first in every level.
+fn shrinkwrap_subdivision_positions(mesh: &Mesh, levels: u64) -> Result<Vec<DVec3>> {
+    validated(mesh)?;
+    let first_level_faces = mesh
+        .faces
+        .iter()
+        .try_fold(0_usize, |count, face| {
+            count.checked_add(face.vertices.len())
+        })
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "shrinkwrap subdivision face count overflows",
+            )
+        })?;
+    check_subdivision_budget(
+        first_level_faces,
+        mesh.vertices.len(),
+        mesh.edges.len(),
+        levels,
+        0,
+    )?;
+    let options = SubdivisionOptions {
+        preserve_corners: false,
+        use_creases: true,
+    };
+    let coarse_count = mesh.vertices.len();
+    let mut result = mesh.clone();
+    let mut source_polygons = polygons(&result)?;
+    let mut source_edges = loose_edges(&result)?;
+    let mut edge_creases =
+        subdivision_uv::Creases::from_values(edge_crease_values(&result, options.use_creases)?);
+    let mut vertex_creases = vertex_crease_sharpness(&result, options.use_creases)?;
+    for _ in 0..levels {
+        let position = subdivision_uv::Position::new(
+            &source_polygons,
+            &source_edges,
+            &edge_creases.sharpness,
+            result.vertices.len(),
+        );
+        let (next, _, next_creases) = subdivide_once(
+            &result,
+            options,
+            &position,
+            &source_polygons,
+            &source_edges,
+            &edge_creases,
+            &vertex_creases,
+            true,
+        )?;
+        edge_creases = next_creases;
+        vertex_creases = decay_vertex_creases(&vertex_creases, next.vertices.len());
+        result = next;
+        source_polygons = polygons(&result)?;
+        source_edges = loose_edges(&result)?;
+    }
+    Ok(result.vertices[..coarse_count]
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect())
 }
 
 const BLENDER_EDGE_CREASE_MAX_SHARPNESS: f64 = 10.0;
@@ -7432,6 +7545,7 @@ mod tests {
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
         Modifier {
+            baked_ocean_cache: None,
             id: Id::new("modifier_one").unwrap(),
             modifier_type: modifier_type.to_owned(),
             name: "Modifier".to_owned(),

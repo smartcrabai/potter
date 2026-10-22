@@ -70,6 +70,10 @@ pub struct SceneDoc {
     pub libraries: Registry<Library>,
     #[serde(default)]
     pub compatibility: Map<String, Value>,
+    /// Loss ids (`feature_id`) that an `--allow-lossy` import reported and the user accepted. Evaluation
+    /// does not refuse the settings they name; it warns and leaves them unevaluated.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub accepted_losses: BTreeSet<String>,
     #[serde(default)]
     pub history: HistoryState,
 }
@@ -119,7 +123,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 7,
+            schema_version: 8,
             scene_id,
             revision: 0,
             active_scene,
@@ -140,13 +144,14 @@ impl SceneDoc {
             resources: Registry::new(),
             libraries: Registry::new(),
             compatibility: Map::new(),
+            accepted_losses: BTreeSet::new(),
             avatar: None,
             history: HistoryState::default(),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 7 {
+        if self.schema_version != 8 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -1079,6 +1084,9 @@ pub struct NlaTrack {
 pub struct NlaStrip {
     pub id: Id,
     pub action: Id,
+    /// Action slot assigned to this strip; `None` only for single-slot or slotless Actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_slot: Option<Id>,
     pub frame_start: f64,
     pub frame_end: f64,
     pub action_frame_start: f64,
@@ -1113,6 +1121,9 @@ pub enum NlaExtrapolation {
 pub struct ActionSlot {
     pub id: Id,
     pub node: Id,
+    /// Blender `ActionSlot` identity, kept only to map linked Blender slots back to stable IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blender_identifier: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1212,12 +1223,24 @@ pub struct RenderSettings {
     pub samples: u32,
     pub seed: u32,
     pub max_bounces: u32,
+    /// Cycles' `volume_bounces`: a volume path takes `volume_bounces + 1` scatter vertices with direct light, and each
+    /// later segment only attenuates (`max_volume_bounce`, `intern/cycles/scene/integrator.cpp`). Omitted when equal to
+    /// Blender's default of 0.
+    #[serde(default, skip_serializing_if = "is_default_volume_bounces")]
+    pub volume_bounces: u32,
     /// Cycles' `transparent_max_bounces`. Omitted when equal to Blender's default of 8.
     #[serde(
         default = "default_transparent_max_bounces",
         skip_serializing_if = "is_default_transparent_max_bounces"
     )]
     pub transparent_max_bounces: u32,
+    /// Blender's Filter Glossy (`scene.cycles.blur_glossy`): the widening of the ray differentials after a bounce,
+    /// which bump nodes read. Omitted when equal to Blender's default of 1.0.
+    #[serde(
+        default = "default_filter_glossy",
+        skip_serializing_if = "is_default_filter_glossy"
+    )]
+    pub filter_glossy: f64,
     /// Cycles' `pixel_filter_type` (`scene/film.h`). Omitted when equal to Blender's default.
     #[serde(
         default = "default_pixel_filter_type",
@@ -1231,6 +1254,10 @@ pub struct RenderSettings {
     )]
     pub filter_width: f64,
     pub film_transparent: bool,
+    /// Blender's `render.filter_size` (`scene.r.gauss`, `rna_scene.cc`): the reconstruction radius, in pixels, of
+    /// EEVEE's film (`eevee_film.cc`). Realtime Beauty uses it; Solid and the path tracer do not.
+    #[serde(default = "default_filter_size")]
+    pub filter_size: f64,
     pub engine: String,
     pub use_sequencer: bool,
     pub audio_codec: String,
@@ -1288,10 +1315,13 @@ impl Default for RenderSettings {
             samples: 64,
             seed: 0,
             max_bounces: 4,
+            volume_bounces: 0,
             transparent_max_bounces: 8,
+            filter_glossy: 1.0,
             pixel_filter_type: PixelFilterType::BlackmanHarris,
             filter_width: DEFAULT_FILTER_WIDTH,
             film_transparent: false,
+            filter_size: default_filter_size(),
             engine: "path".to_owned(),
             use_sequencer: false,
             audio_codec: "wav".to_owned(),
@@ -1311,6 +1341,10 @@ impl Default for RenderSettings {
 
 fn default_shutter() -> f64 {
     0.5
+}
+
+fn default_filter_size() -> f64 {
+    1.5
 }
 
 fn default_motion_blur_samples() -> u32 {
@@ -1558,6 +1592,32 @@ fn default_volume_color() -> [f64; 3] {
     [0.5; 3]
 }
 
+/// Blender's `cycles.volume_sampling` for a material: distance, equiangular, or multiple importance sampling of
+/// both (Blender's default). A volume's direct light is sampled along its ray in the chosen way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeSampling {
+    Distance,
+    Equiangular,
+    #[default]
+    MultipleImportance,
+}
+
+/// Skips a volume setting in serde output when it is at its default, which is then read back as the default.
+fn is_serialised_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+/// Blender's `cycles.volume_interpolation` for a material: trilinear (Blender's default) or the cubic B-spline of
+/// Cycles' `kernel_image_interp_tricubic_nanovdb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeInterpolation {
+    #[default]
+    Linear,
+    Cubic,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct World {
@@ -1683,6 +1743,16 @@ impl Default for ForceField {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct OceanBakeCache {
+    pub frame_start: i32,
+    pub frame_end: i32,
+    /// Square EXR width in pixels (the modifier's render resolution squared).
+    pub resolution: u32,
+    pub manifest: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Modifier {
     pub id: Id,
     #[serde(rename = "type")]
@@ -1700,6 +1770,8 @@ pub struct Modifier {
     pub show_render: bool,
     #[serde(default)]
     pub params: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baked_ocean_cache: Option<OceanBakeCache>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[doc(hidden)]
     pub binding_data: Option<Value>,
@@ -1744,6 +1816,14 @@ pub struct ModifierRuntime {
     pub target_mesh: Option<Mesh>,
     #[doc(hidden)]
     pub target_to_subject: Option<[f64; 16]>,
+    /// Shrinkwrap `local2target`: the subject's object-local space in the target's, in f32.
+    #[doc(hidden)]
+    pub shrinkwrap_subject_to_target: Option<[f64; 16]>,
+    /// Shrinkwrap `local2target` for the auxiliary target, in f32.
+    #[doc(hidden)]
+    pub shrinkwrap_auxiliary_subject_to_target: Option<[f64; 16]>,
+    pub shrinkwrap_target_mesh: Option<Mesh>,
+    pub shrinkwrap_auxiliary_target_mesh: Option<Mesh>,
     /// Boolean operands in the subject's space (subject excluded), in Blender order.
     pub boolean_operands: Vec<crate::geom::boolean::BooleanOperand>,
     /// `inv(subject_world) * reference_world` (column-major) for Hook, Cast, Simple Deform origin,
@@ -1766,6 +1846,22 @@ pub struct Action {
     pub fcurves: Vec<FCurve>,
     #[serde(default)]
     pub slots: Vec<ActionSlot>,
+    /// Action slot assigned to each Object that uses this Action as its active Action.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub active_slots: BTreeMap<Id, Id>,
+    /// Scalar modifier-parameter bindings per flattened F-Curve index.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modifier_bindings: BTreeMap<u32, Vec<ModifierParameterBinding>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModifierParameterBinding {
+    pub node: Id,
+    pub modifier: Id,
+    pub parameter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_slot: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1825,6 +1921,156 @@ pub struct CapturedMatrixBasis {
 pub enum MaterialLink {
     Data,
     Object,
+}
+
+/// A Cycles ray class that Blender's object visibility gates (`PATH_RAY_*` in Cycles' kernel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RayKind {
+    Camera,
+    Diffuse,
+    Glossy,
+    Transmission,
+    VolumeScatter,
+    Shadow,
+}
+
+/// Blender's per-object ray visibility (`visible_camera`, `visible_diffuse`, ...): one bit per `RayKind`. Cycles masks
+/// each object with these bits and skips it for rays whose kind is switched off. Stored as the mask a triangle carries,
+/// and serialised as the six named flags (`{"camera": true, ...}`), all required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RayVisibility {
+    mask: u8,
+}
+
+impl Default for RayVisibility {
+    /// Every ray kind is on: Blender's default for an object that is not a light.
+    fn default() -> Self {
+        Self {
+            mask: RayKind::ALL_MASK,
+        }
+    }
+}
+
+impl RayVisibility {
+    /// Blender's flags for a new object of `kind`. Lights are hidden from camera rays
+    /// (`BKE_object_init`, object.cc:2177); every other object starts fully visible.
+    #[must_use]
+    pub fn default_for_kind(kind: &str) -> Self {
+        let mut visibility = Self::default();
+        if kind == "light" {
+            visibility.set(RayKind::Camera, false);
+        }
+        visibility
+    }
+
+    #[must_use]
+    pub fn allows(self, ray: RayKind) -> bool {
+        self.mask & ray.bit() != 0
+    }
+
+    /// Sets one flag.
+    pub fn set(&mut self, ray: RayKind, value: bool) {
+        if value {
+            self.mask |= ray.bit();
+        } else {
+            self.mask &= !ray.bit();
+        }
+    }
+
+    /// One bit per ray kind, the mask a triangle carries so a BVH query tests a single `u8`.
+    #[must_use]
+    pub const fn mask(self) -> u8 {
+        self.mask
+    }
+}
+
+impl serde::Serialize for RayVisibility {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(RayKind::ALL.len()))?;
+        for ray in RayKind::ALL {
+            map.serialize_entry(ray.name(), &self.allows(ray))?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RayVisibility {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let flags = BTreeMap::<String, bool>::deserialize(deserializer)?;
+        if let Some(unknown) = flags
+            .keys()
+            .find(|key| !RayKind::ALL.iter().any(|ray| ray.name() == key.as_str()))
+        {
+            return Err(D::Error::unknown_field(unknown, &RAY_NAMES));
+        }
+        let mut visibility = Self { mask: 0 };
+        for ray in RayKind::ALL {
+            let value = flags
+                .get(ray.name())
+                .copied()
+                .ok_or_else(|| D::Error::missing_field(ray.name()))?;
+            visibility.set(ray, value);
+        }
+        Ok(visibility)
+    }
+}
+
+/// The six flag names, as the error message lists the fields a `RayVisibility` takes.
+const RAY_NAMES: [&str; 6] = [
+    "camera",
+    "diffuse",
+    "glossy",
+    "transmission",
+    "volume_scatter",
+    "shadow",
+];
+
+impl RayKind {
+    /// Every ray kind, in the order of their bits.
+    pub const ALL: [Self; 6] = [
+        Self::Camera,
+        Self::Diffuse,
+        Self::Glossy,
+        Self::Transmission,
+        Self::VolumeScatter,
+        Self::Shadow,
+    ];
+    /// Every ray kind's bit: the mask of a surface that no ray kind hides (`RayVisibility::default`).
+    pub const ALL_MASK: u8 = (1 << 6) - 1;
+
+    /// The kind's bit in a ray mask (`PATH_RAY_*` in Cycles' kernel).
+    #[must_use]
+    pub const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
+    /// The kind's name in Potter's JSON, as `ray_visibility.camera`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Camera => "camera",
+            Self::Diffuse => "diffuse",
+            Self::Glossy => "glossy",
+            Self::Transmission => "transmission",
+            Self::VolumeScatter => "volume_scatter",
+            Self::Shadow => "shadow",
+        }
+    }
+
+    /// Blender's RNA property for the kind's visibility flag, as `visible_camera`.
+    #[must_use]
+    pub const fn rna_property(self) -> &'static str {
+        match self {
+            Self::Camera => "visible_camera",
+            Self::Diffuse => "visible_diffuse",
+            Self::Glossy => "visible_glossy",
+            Self::Transmission => "visible_transmission",
+            Self::VolumeScatter => "visible_volume_scatter",
+            Self::Shadow => "visible_shadow",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1888,6 +2134,10 @@ pub struct Node {
     pub constraints: Vec<Constraint>,
     #[serde(default)]
     pub drivers: Vec<Driver>,
+    /// Blender's object ray visibility. `None` means the default for the node's kind; see
+    /// [`Node::resolved_ray_visibility`]. Omitted from JSON when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ray_visibility: Option<RayVisibility>,
 }
 
 impl Default for Node {
@@ -1919,6 +2169,7 @@ impl Default for Node {
             pose: BTreeMap::new(),
             constraints: Vec::new(),
             drivers: Vec::new(),
+            ray_visibility: None,
         }
     }
 }
@@ -1973,6 +2224,13 @@ impl Node {
             self.materials.len(),
             data.map_or(0, |data| data.materials.len()),
         )
+    }
+
+    /// Blender's ray visibility for this node: the stored flags, or the default for its kind.
+    #[must_use]
+    pub fn resolved_ray_visibility(&self) -> RayVisibility {
+        self.ray_visibility
+            .unwrap_or_else(|| RayVisibility::default_for_kind(&self.kind))
     }
 
     /// Effective material for one indexed slot; out-of-range access clamps like Blender.
@@ -2222,6 +2480,26 @@ fn is_default_transparent_max_bounces(value: &u32) -> bool {
 
 fn default_transparent_max_bounces() -> u32 {
     8
+}
+
+fn default_filter_glossy() -> f64 {
+    1.0
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_filter_glossy(value: &f64) -> bool {
+    value.to_bits() == 1.0_f64.to_bits()
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes a reference"
+)]
+fn is_default_volume_bounces(value: &u32) -> bool {
+    *value == 0
 }
 
 #[expect(
@@ -2678,6 +2956,11 @@ pub struct Material {
     /// partly transparent shadow, as EEVEE's shadow pass does (`eevee_surf_shadow.bsl.hh`). Off, it casts an opaque one.
     #[serde(default = "default_true")]
     pub use_transparent_shadow: bool,
+    /// Blender's `cycles.use_bump_map_correction` (on by default, `intern/cycles/blender/addon/properties.py`): the shader
+    /// flag `SD_USE_BUMP_MAP_CORRECTION` (`scene/shader.cpp`) that enables the terminator corrections for bump-mapped
+    /// normals: the grazing diffuse smoothing and the lifted specular reflection (`kernel/closure/bsdf_util.h`).
+    #[serde(default = "default_true")]
+    pub use_bump_map_correction: bool,
     #[serde(default)]
     pub node_tree: Option<Id>,
     #[serde(default)]
@@ -2700,6 +2983,12 @@ pub struct Material {
     pub volume_color: [f64; 3],
     #[serde(default)]
     pub volume_anisotropy: f64,
+    /// Blender's `cycles.volume_sampling`: how a volume's direct light is sampled (Cycles' `volume_stack_sample_method`).
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
+    pub volume_sampling: VolumeSampling,
+    /// Blender's `cycles.volume_interpolation`: how a voxel volume's density is interpolated between its samples.
+    #[serde(default, skip_serializing_if = "is_serialised_default")]
+    pub volume_interpolation: VolumeInterpolation,
     /// Blender's viewport display values, which Solid shading reads. Set by `.blend` import; omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport_display: Option<ViewportDisplay>,
@@ -2719,6 +3008,7 @@ impl Default for Material {
             ior: default_ior(),
             double_sided: default_true(),
             use_transparent_shadow: default_true(),
+            use_bump_map_correction: default_true(),
             node_tree: None,
             base_color_texture: None,
             roughness_texture: None,
@@ -2730,6 +3020,8 @@ impl Default for Material {
             volume_density: 0.0,
             volume_color: default_volume_color(),
             volume_anisotropy: 0.0,
+            volume_sampling: VolumeSampling::default(),
+            volume_interpolation: VolumeInterpolation::default(),
             viewport_display: None,
         }
     }

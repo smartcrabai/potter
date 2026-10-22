@@ -32,7 +32,7 @@ pub enum CliCommand {
     Export(ExportArgs),
     #[command(about = "Render frames to an image sequence or movie.")]
     Render(RenderArgs),
-    #[command(about = "Bake simulation, texture, geometry, or animation data.")]
+    #[command(about = "Bake simulation, texture, geometry, animation, or ocean data.")]
     Bake(BakeArgs),
     #[command(about = "List and verify project assets.")]
     Assets(AssetsArgs),
@@ -231,11 +231,21 @@ pub struct BakeArgs {
     pub scene: PathBuf,
     #[arg(long, required = true, value_enum, help = "Data kind to bake.")]
     pub kind: BakeKind,
-    #[arg(long, help = "Target entity ID, when required by the bake kind.")]
+    #[arg(
+        long,
+        help = "Target Object or modifier ID, depending on the bake kind."
+    )]
     pub target: Option<String>,
-    #[arg(long, help = "Frame range as start:end[:step].")]
+    #[arg(
+        long,
+        help = "Frame range as start:end[:step] (Ocean uses modifier frame_start/end)."
+    )]
     pub frames: Option<String>,
-    #[arg(long, required = true, help = "Output directory.")]
+    #[arg(
+        long,
+        required = true,
+        help = "Output directory for baked data or the bake report."
+    )]
     pub out: PathBuf,
     #[arg(long, help = "Replace existing output files.")]
     pub overwrite: bool,
@@ -349,6 +359,7 @@ pub enum BakeKind {
     Texture,
     Geometry,
     Animation,
+    Ocean,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

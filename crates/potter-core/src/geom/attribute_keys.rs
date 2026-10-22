@@ -33,7 +33,9 @@ const INTERNAL_KEYS: &[&str] = &[
     "shade_smooth",
     "skin_radii",
     "skin_roots",
+    "texture_space",
     "uv_layers",
+    crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES,
     "vertex_groups",
 ];
 
@@ -99,6 +101,11 @@ mod tests {
         assert_eq!(user_name("color_layers"), None);
         assert_eq!(user_name("custom_normal"), None);
         assert_eq!(user_name("alembic_velocity"), None);
+        assert_eq!(
+            user_name(crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES),
+            None,
+            "the subdivision optimal-display mask is Potter's own store"
+        );
         assert_eq!(user_name("alembic_time_samples"), None);
         assert_eq!(user_name("user:color_layers"), Some("color_layers"));
         assert_eq!(user_name("Col"), Some("Col"));

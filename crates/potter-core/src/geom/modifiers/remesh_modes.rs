@@ -33,6 +33,19 @@ pub(super) fn remesh_modifier(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
     }
 }
 
+/// Blender's `BKE_mesh_remesh_voxel` (`blenkernel/intern/mesh_remesh_voxel.cc`) for the voxel-remesh
+/// operator (`object_remesh.cc`). `isovalue` is `voxel_size * 0.3` when the mesh reprojects its volume, which
+/// is the default. `None` is Blender's failure: the surface is empty. The caller applies the shading and the
+/// attribute reprojection.
+pub(crate) fn voxel_remesh_mesh(
+    mesh: &Mesh,
+    voxel_size: f32,
+    adaptivity: f32,
+    isovalue: f32,
+) -> Result<Option<Mesh>> {
+    voxel::remesh(mesh, voxel_size, adaptivity, isovalue, false)
+}
+
 fn voxel_remesh(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     let voxel_size = number_param(modifier, "voxel_size")?;
     if voxel_size <= 0.0 {
@@ -59,7 +72,11 @@ fn voxel_remesh(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         ));
     }
     let smooth_shade = bool_param(modifier, "use_smooth_shade")?;
-    voxel::remesh(mesh, voxel_size, adaptivity as f32, smooth_shade)
+    // The modifier extracts at isovalue 0 and keeps its input when the surface is empty.
+    Ok(
+        voxel::remesh(mesh, voxel_size, adaptivity as f32, 0.0, smooth_shade)?
+            .unwrap_or_else(|| mesh.clone()),
+    )
 }
 
 fn octree_remesh(mesh: &Mesh, modifier: &Modifier, mode: &str) -> Result<Mesh> {
@@ -154,6 +171,7 @@ mod tests {
                 "mode":"BLOCKS", "octree_depth":3, "scale":0.9
             }))?,
             binding_data: None,
+            baked_ocean_cache: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
         let result = remesh_modifier(&source, &modifier)?;

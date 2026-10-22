@@ -107,11 +107,11 @@ fn physics_operations_create_stack_entries_linked_to_their_settings() -> Result<
         &json!([
             {"op":"node.create","id":"body","kind":"box","params":{}},
             {"op":"physics.cloth.create","target":{"id":"body"},"settings":{"tension_stiffness":12.0}},
-            {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"goal_strength":0.7}},
+            {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"goal_default":0.7}},
             {"op":"physics.dynamic_paint.create","target":{"id":"body"},"settings":{"role":"canvas"}},
-            {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"type":"liquid","resolution":4}},
+            {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"domain_type":"LIQUID","resolution_max":4}},
             {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"rate":1.0,"lifetime":12.0}},
-            {"op":"physics.collision.create","target":{"id":"body"},"settings":{"thickness":0.01}}
+            {"op":"physics.collision.create","target":{"id":"body"},"settings":{"thickness_outer":0.01}}
         ]),
         0,
     )?;
@@ -1759,6 +1759,7 @@ with open(os.path.join(root, 'subdivision_expected.json'), 'w', encoding='utf-8'
             show_render: true,
             params,
             binding_data: None,
+            baked_ocean_cache: None,
             runtime: potter_core::model::ModifierRuntime::default(),
         };
         let mut doc =
@@ -2515,26 +2516,42 @@ baseline_evaluated.to_mesh_clear()
     let displaced = evaluated_volume(&document, &snapshot, "density")?;
     let baseline = evaluated_volume(&document, &snapshot, "baseline_volume")?;
     let inline_displaced = evaluated_volume(&document, &snapshot, "inline_density")?;
-    assert_eq!(
-        displaced.source,
-        potter_core::geom::volume::VolumeSource::Generated(
-            potter_core::geom::volume::VolumeGeneratedSource {
-                algorithm: "volume_displace_vdb".to_owned(),
-            },
-        )
+    // Blender displaces the VDB grids in place (`MOD_volume_displace.cc`), so the result stays a VDB
+    // archive with its grid name and value type, and its density is read back from the decoded grid.
+    assert!(
+        matches!(
+            displaced.source,
+            potter_core::geom::volume::VolumeSource::File(_)
+        ),
+        "displaced VDB keeps its file-backed source"
     );
-    let vdb_grid = displaced
-        .grids
-        .first()
-        .ok_or("displaced VDB grid is missing")?;
-    assert_eq!(vdb_grid.dims, [8, 7, 7]);
-    compare_density_samples(
-        "decoded VDB",
-        vdb_grid
-            .values
-            .as_deref()
-            .ok_or("displaced VDB samples are missing")?,
-    );
+    let displaced_vdb = displaced
+        .decoded_vdb
+        .as_ref()
+        .ok_or("displaced VDB archive is missing")?;
+    let baseline_vdb = baseline
+        .decoded_vdb
+        .as_ref()
+        .ok_or("baseline VDB archive is missing")?;
+    let displaced_density = displaced_vdb
+        .density_grid()
+        .ok_or("displaced VDB has no density grid")?;
+    let baseline_density = baseline_vdb
+        .density_grid()
+        .ok_or("baseline VDB has no density grid")?;
+    assert_eq!(displaced_density.name, baseline_density.name);
+    assert_eq!(displaced_density.value_type, baseline_density.value_type);
+    assert_eq!(displaced_density.transform, baseline_density.transform);
+    // Blender's 8x7x7 evaluation box: x in -2..=5 and y, z in -2..=4, with x fastest.
+    let mut vdb_samples = Vec::with_capacity(8 * 7 * 7);
+    for z in -2..5 {
+        for y in -2..5 {
+            for x in -2..6 {
+                vdb_samples.push(displaced_density.sample_index([x, y, z]));
+            }
+        }
+    }
+    compare_density_samples("decoded VDB", &vdb_samples);
     let inline_grid = inline_displaced
         .grids
         .first()

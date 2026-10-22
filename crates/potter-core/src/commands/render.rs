@@ -74,6 +74,7 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         || settings.samples == 0
         || settings.samples > 1_000_000
         || settings.max_bounces > 1024
+        || settings.volume_bounces > 1024
         || settings.transparent_max_bounces > 1024
     {
         return Err(PotError::new(
@@ -100,16 +101,8 @@ pub fn run(args: RenderArgs) -> Result<(Option<SceneInfo>, Value)> {
         .map_err(|_| PotError::new(ErrorCode::SceneInvalid, "render width exceeds limits"))?;
     let height = u32::try_from(height)
         .map_err(|_| PotError::new(ErrorCode::SceneInvalid, "render height exceeds limits"))?;
-    let samples = if engine == "realtime" {
-        1
-    } else {
-        settings.samples
-    };
-    let seed = if engine == "realtime" {
-        0
-    } else {
-        settings.seed
-    };
+    let samples = settings.samples;
+    let seed = settings.seed;
     let mut result = render_sequence(
         doc,
         &context,

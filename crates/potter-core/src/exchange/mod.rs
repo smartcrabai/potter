@@ -10,7 +10,7 @@ use crate::{
         Mesh, attribute_keys, color_layers,
         uv_layers::{self, UvLayer, UvStore},
     },
-    model::{DataBlock, Id, Node, SceneDoc, Transform, VertexGroup},
+    model::{DataBlock, Id, Node, RayKind, RayVisibility, SceneDoc, Transform, VertexGroup},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +73,9 @@ pub(crate) struct ExchangeMesh {
     /// Per face: whether a corner normal differs from the face's flat normal, in local space.
     /// Empty for imported meshes, where every face counts as flat.
     pub smooth: Vec<bool>,
+    /// Imported `sharp_face` flags, one per face in `faces` order, as the format's Blender reader creates
+    /// them. `None` when the reader creates no `sharp_face`, so every face stays smooth. Unused by exports.
+    pub sharp_faces: Option<Vec<bool>>,
     /// UV layers in mesh order: glTF `TEXCOORD_n` and Blender's layer order.
     pub uv_layers: Vec<ExchangeUvLayer>,
     /// Index into `uv_layers` of the active (edit target) layer. OBJ and PLY write this layer.
@@ -456,6 +459,7 @@ pub(crate) fn evaluated_meshes(
             normals: Some(shading.corners),
             vertex_normals: shading.vertices,
             smooth: shading.smooth,
+            sharp_faces: None,
             singular: shading::is_singular(matrix),
             mirrored: shading::is_mirrored(matrix),
             uv_layers: uv_layer_list,
@@ -524,6 +528,7 @@ pub(crate) fn mesh_attribute_losses(format: &str, mesh_id: &str, mesh: &Mesh) ->
                     | "custom_normal"
                     | "shade_smooth"
                     | "sharp"
+                    | crate::geom::modifiers::OPTIMAL_DISPLAY_EDGES
             ) || (format == "alembic" && key == "alembic_normals") =>
             {
                 continue;
@@ -1008,6 +1013,65 @@ pub(crate) fn render_visible_nodes(
     Ok(visible)
 }
 
+/// Blender's ray-visibility flags that differ from the default for the node's kind, as Blender's
+/// RNA names with their value (`visible_camera=false`). Empty when the node keeps the default.
+pub(crate) fn ray_visibility_differences(node: &Node) -> Vec<String> {
+    let visibility = node.resolved_ray_visibility();
+    let default = RayVisibility::default_for_kind(&node.kind);
+    RayKind::ALL
+        .into_iter()
+        .filter(|ray| visibility.allows(*ray) != default.allows(*ray))
+        .map(|ray| format!("{}={}", ray.rna_property(), visibility.allows(ray)))
+        .collect()
+}
+
+/// Loss entries for the Blender ray-visibility flags that `format` cannot store on the objects it
+/// writes. Node-tree formats write every node, hidden ones included; mesh formats write only the
+/// evaluated mesh nodes. The objects are still exported and only their flags are lost. SVG, PDF,
+/// and BVH carry no render state (they report no materials either), so they report nothing.
+pub(crate) fn ray_visibility_losses(
+    format: &str,
+    doc: &SceneDoc,
+    snapshot: &crate::eval::Snapshot,
+) -> Result<Vec<Loss>> {
+    let written = match format {
+        "glb" | "gltf" | "vrm" | "vrm0" | "usda" | "usdc" | "usd" | "usdz" | "fbx"
+        | "fbx-binary" | "alembic" => doc.nodes.keys().collect::<BTreeSet<_>>(),
+        "obj" | "ply" | "stl" => {
+            let visible = render_visible_nodes(doc, snapshot)?;
+            doc.nodes
+                .iter()
+                .filter(|(id, node)| {
+                    node.visible
+                        && node.render_visible
+                        && node.data.is_some()
+                        && visible.contains(*id)
+                        && snapshot.meshes.contains_key(*id)
+                })
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>()
+        }
+        _ => return Ok(Vec::new()),
+    };
+    Ok(doc
+        .nodes
+        .iter()
+        .filter(|(id, _)| written.contains(id))
+        .filter_map(|(id, node)| {
+            let differences = ray_visibility_differences(node);
+            (!differences.is_empty()).then(|| Loss {
+                feature_id: "object.ray_visibility".to_owned(),
+                data_id: Some(id.to_string()),
+                reason: format!(
+                    "{format} cannot store Blender ray visibility on `{id}`: {}",
+                    differences.join(", ")
+                ),
+                suggestion: Some("export as blend to keep ray visibility".to_owned()),
+            })
+        })
+        .collect())
+}
+
 pub(crate) fn graph_from_meshes(meshes: Vec<ExchangeMesh>, scene_id: String) -> Result<SceneDoc> {
     if meshes.is_empty() {
         return Err(PotError::new(
@@ -1046,13 +1110,17 @@ pub(crate) fn graph_from_meshes(meshes: Vec<ExchangeMesh>, scene_id: String) -> 
                     serde_json::json!({ "reason": error.to_string(), "data_id": data_id }),
                 )
             })?;
-        if let Some(normals) = &geometry.normals {
-            let normals = normals
+        let normals = geometry.normals.as_ref().map(|normals| {
+            normals
                 .iter()
                 .map(|normal| DVec3::from_array(*normal))
-                .collect::<Vec<_>>();
-            shading::import_shading(&mut mesh, &normals)?;
-        }
+                .collect::<Vec<_>>()
+        });
+        shading::import_reader_shading(
+            &mut mesh,
+            normals.as_deref(),
+            geometry.sharp_faces.as_deref(),
+        )?;
         import_uv_layers(
             &mut mesh,
             &geometry.uv_layers,
@@ -1302,6 +1370,7 @@ pub(crate) mod test_support {
             singular: false,
             vertex_normals: Vec::new(),
             smooth: vec![false],
+            sharp_faces: None,
             uv_layers: vec![
                 ExchangeUvLayer {
                     name: "UVMap".to_owned(),
@@ -1668,6 +1737,7 @@ mod tests {
                 kind: "mesh".to_owned(),
                 data: Some(data_id),
                 modifiers: vec![Modifier {
+                    baked_ocean_cache: None,
                     id: Id::new("mirror_modifier")?,
                     modifier_type: "mirror".to_owned(),
                     name: "Mirror".to_owned(),
@@ -1697,6 +1767,55 @@ mod tests {
                 2
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ray_visibility_losses_follow_what_each_format_stores() -> TestResult {
+        use crate::{
+            eval::{EvaluationContext, Snapshot},
+            model::{Id, RayKind, RayVisibility},
+        };
+
+        let mut doc = graph_from_meshes(
+            vec![triangle_with_layers()],
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        )?;
+        let node_id = doc
+            .collections
+            .get(&Id::from_static("collection_root"))
+            .and_then(|root| root.objects.first())
+            .cloned()
+            .ok_or("imported node missing")?;
+        let node = doc.nodes.get_mut(&node_id).ok_or("imported node missing")?;
+        let mut visibility = RayVisibility::default();
+        visibility.set(RayKind::Camera, false);
+        visibility.set(RayKind::Shadow, false);
+        node.ray_visibility = Some(visibility);
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        for format in ["obj", "ply", "stl", "glb", "usda", "fbx", "alembic"] {
+            let losses = super::ray_visibility_losses(format, &doc, &snapshot)?;
+            assert_eq!(losses.len(), 1, "{format} must report the flagged object");
+            assert_eq!(losses[0].data_id.as_deref(), Some(node_id.as_str()));
+            assert!(
+                losses[0]
+                    .reason
+                    .contains("visible_camera=false, visible_shadow=false"),
+                "{format} reason names the flags that are off"
+            );
+        }
+        for format in ["svg", "pdf", "bvh", "blend"] {
+            assert!(
+                super::ray_visibility_losses(format, &doc, &snapshot)?.is_empty(),
+                "{format} carries no render state"
+            );
+        }
+        doc.nodes
+            .get_mut(&node_id)
+            .ok_or("imported node missing")?
+            .ray_visibility = Some(RayVisibility::default());
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        assert!(super::ray_visibility_losses("glb", &doc, &snapshot)?.is_empty());
         Ok(())
     }
 

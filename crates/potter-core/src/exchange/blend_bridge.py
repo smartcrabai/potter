@@ -1546,7 +1546,7 @@ def _uv_layer_index(layers, attribute):
 MESH_HANDLED_KEYS = frozenset((
     "alembic_normals", "alembic_time_samples", "alembic_velocity", "blender_attributes", "blender_metadata", "blender_skin_vertices",
     "color_layers", "crease_edge", "custom_normal", "seam", "sharp", "shade_smooth", "skin_radii", "skin_roots",
-    "multires_displacement",
+    "multires_displacement", "subdivision_optimal_edges", "texture_space",
     "uv_layers",
     "vertex_groups",
 ))
@@ -1654,6 +1654,7 @@ def mesh_dump(mesh):
     return {"name": mesh.name_full, "potter_id": mesh.get("potter.id"),
             "library": library_reference(mesh), "vertices": vertices,
             "edges": edges, "polygons": polygons, "uv_layers": uv_layers, "uv_active": uv_active,
+            "sharp_face_present": mesh.attributes.get("sharp_face") is not None,
             "uv_render": uv_render, "materials": _material_names(mesh), "attributes": attrs,
             "color_active": _color_attribute_name(mesh, color_attributes.active_color_index),
             "color_render": _color_attribute_name(mesh, color_attributes.render_color_index),
@@ -1933,6 +1934,50 @@ def object_dump(obj):
             "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots"))}
 
 
+def _action_slot_assigned_objects(action, slot):
+    action_pointer = action.as_pointer()
+    slot_pointer = slot.as_pointer()
+    assigned = []
+    for obj in bpy.data.objects:
+        animation_data = obj.animation_data
+        if animation_data is None:
+            continue
+        active_action = animation_data.action
+        active_slot = getattr(animation_data, "action_slot", None)
+        if (active_action is not None and active_slot is not None
+                and active_action.as_pointer() == action_pointer
+                and active_slot.as_pointer() == slot_pointer):
+            assigned.append(obj)
+            continue
+        if any(
+                strip.action is not None
+                and strip.action.as_pointer() == action_pointer
+                and getattr(strip, "action_slot", None) is not None
+                and strip.action_slot.as_pointer() == slot_pointer
+                for track in animation_data.nla_tracks
+                for strip in track.strips):
+            assigned.append(obj)
+    return assigned
+
+
+def _modifier_bindings_for_fcurve(curve, slot, objects):
+    slot_identifier = getattr(slot, "identifier", None) or None
+    bindings = []
+    for obj in objects:
+        for modifier in obj.modifiers:
+            if modifier.type != "OCEAN":
+                continue
+            if modifier.path_from_id("time") == curve.data_path:
+                bindings.append({
+                    "node": obj.name_full,
+                    "modifier": modifier.name,
+                    "parameter": "time",
+                    "action_slot": slot_identifier,
+                })
+    return bindings
+
+
+
 def action_dump(action):
     slot_ids = _id_map(action, "potter.action_slot_ids_json")
     slots = []
@@ -1941,6 +1986,7 @@ def action_dump(action):
     try:
         for slot in action.slots:
             slot_curves = []
+            assigned_objects = _action_slot_assigned_objects(action, slot)
             for layer in action.layers:
                 for strip in layer.strips:
                     if strip.type != "KEYFRAME":
@@ -1951,7 +1997,10 @@ def action_dump(action):
                         channelbag = None
                     if channelbag is None:
                         continue
-                    bag_curves = [dump_fcurve(curve) for curve in channelbag.fcurves]
+                    bag_curves = [
+                        dict(dump_fcurve(curve), modifier_bindings=_modifier_bindings_for_fcurve(
+                            curve, slot, assigned_objects))
+                        for curve in channelbag.fcurves]
                     slot_curves.extend(bag_curves)
                     channelbags.append({"slot": getattr(slot, "identifier", ""),
                                         "layer": layer.name,
@@ -2378,14 +2427,17 @@ def dump_scene(scene):
                 "samples": samples,
                 "seed": seed,
                 "max_bounces": int(getattr(getattr(scene, "cycles", None), "max_bounces", 4)),
+                "volume_bounces": int(getattr(getattr(scene, "cycles", None), "volume_bounces", 0)),
                 "transparent_max_bounces": int(getattr(getattr(scene, "cycles", None), "transparent_max_bounces", 8)),
                 "pixel_filter_type": str(getattr(getattr(scene, "cycles", None), "pixel_filter_type", "BLACKMAN_HARRIS")),
                 "filter_width": float(getattr(getattr(scene, "cycles", None), "filter_width", 1.5)),
-                "filter_size": float(scene.render.filter_size),
+                "filter_glossy": float(getattr(getattr(scene, "cycles", None), "blur_glossy", 1.0)),
+                "volume_biased": bool(getattr(getattr(scene, "cycles", None), "volume_biased", False)),
                 "use_sequencer": bool(getattr(scene.render, "use_sequencer", False)),
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
                 "film_transparent": bool(scene.render.film_transparent),
+                "filter_size": float(scene.render.filter_size),
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
                 "engine_native": render_engine,
                 "dicing_rate": float(getattr(cycles, "dicing_rate", 1.0)),
@@ -2395,6 +2447,8 @@ def dump_scene(scene):
                 "dicing_camera": dicing_camera.name_full if dicing_camera else None,
                 "passes": _render_passes(scene),
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
+                "use_simplify": bool(scene.render.use_simplify),
+                "simplify_volumes": float(scene.render.simplify_volumes),
             },
             "use_compositing": bool(getattr(scene.render, "use_compositing", False)),
             "compositor": _scene_compositor(scene),
@@ -2403,6 +2457,10 @@ def dump_scene(scene):
             "display_shading": _display_shading_dump(scene),
             "markers": [{"name": marker.name, "frame": int(marker.frame)} for marker in scene.timeline_markers],
             "rigid_body_world": _rigid_body_world_dump(scene),
+            "volume_modifier_objects": [
+                obj.name_full for obj in scene.objects
+                if any(modifier.type in ("MESH_TO_VOLUME", "VOLUME_DISPLACE", "VOLUME_TO_MESH")
+                       for modifier in obj.modifiers)],
             "sequencer": _sequencer_dump(scene),
             "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
             "world": world_info, "custom_properties": custom_props(scene),
@@ -2537,6 +2595,7 @@ def material_dump(material):
             "transmission": transmission, "ior": ior,
             "double_sided": not bool(getattr(material, "use_backface_culling", False)),
             "use_transparent_shadow": bool(getattr(material, "use_transparent_shadow", True)),
+            "use_bump_map_correction": bool(getattr(getattr(material, "cycles", None), "use_bump_map_correction", True)),
             "use_backface_culling_shadow": bool(getattr(material, "use_backface_culling_shadow", False)),
             "alpha_mode": alpha_mode,
             "alpha_threshold": cutoff if alpha_mode == "clip" and cutoff is not None else float(material.alpha_threshold),
@@ -2658,6 +2717,16 @@ def _blender_id_pointer_type(block, key, current):
     except Exception:
         return None
     return None
+
+
+def _rna_writable(block, values):
+    # Potter's physics settings can hold keys that are not writable RNA properties of their block (`stiffness`,
+    # `use_collision`). Only the writable properties are set; the exporter reports the rest as losses.
+    if block is None:
+        return {}
+    properties = block.bl_rna.properties
+    return {key: value for key, value in values.items()
+            if properties.get(key) is not None and not properties[key].is_readonly}
 
 
 def set_rna(block, values, id_lookup=None, *, strict=False, owner=None):
@@ -3355,10 +3424,16 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         settings = node_properties.get(physics_property, {})
     else:
         settings = {}
+    dynamic_paint_role = settings.get("role") if kind == "dynamic_paint" else None
+    if kind == "dynamic_paint" and dynamic_paint_role is None:
+        ui_type = params.get("ui_type", getattr(modifier, "ui_type", "CANVAS"))
+        dynamic_paint_role = "brush" if ui_type == "BRUSH" else "canvas"
+    if kind == "dynamic_paint" and dynamic_paint_role not in ("brush", "canvas"):
+        raise ValueError("Dynamic Paint role must be brush or canvas")
     dynamic_paint_temporary_link = False
-    if kind == "dynamic_paint" and settings.get("role") in ("brush", "canvas"):
+    if kind == "dynamic_paint":
         dynamic_paint_temporary_link = _ensure_dynamic_paint_role(
-            modifier, obj, settings["role"])
+            modifier, obj, dynamic_paint_role)
     rna_params = dict(params)
     for parameter in (
         "projectors",
@@ -3390,6 +3465,8 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
     }
     _restore_modifier_id_references(modifier, rna_params, id_lookup, texture_lookup,
                                     lost_texture_ids)
+    if kind == "dynamic_paint":
+        modifier.ui_type = dynamic_paint_role.upper()
     if kind == "multires":
         total_levels = int(params.get("total_levels", modifier.total_levels))
         if not 0 <= total_levels <= 13:
@@ -3440,8 +3517,10 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         if kind in ("cloth", "soft_body", "collision"):
             settings_block = getattr(modifier, "settings", None)
         elif kind == "dynamic_paint":
-            settings_block = (getattr(modifier, "brush_settings", None)
-                              or getattr(modifier, "canvas_settings", None))
+            settings_name = "brush_settings" if dynamic_paint_role == "brush" else "canvas_settings"
+            settings_block = getattr(modifier, settings_name, None)
+            if settings_block is None:
+                raise ValueError("Dynamic Paint %s settings are missing" % dynamic_paint_role)
         elif kind == "fluid":
             settings_name = {
                 "DOMAIN": "domain_settings",
@@ -3453,13 +3532,15 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
             particle_system = getattr(modifier, "particle_system", None)
             settings_block = getattr(particle_system, "settings", None) if particle_system else None
         if settings_block is not None:
-            set_rna(settings_block, settings, id_lookup)
+            set_rna(settings_block, _rna_writable(settings_block, settings), id_lookup)
         if particle_system is not None and particle_seed is not None:
             particle_system.seed = int(particle_seed)
         if collision_settings is not None:
-            set_rna(getattr(modifier, "collision_settings", None),
-                    collision_settings, id_lookup)
+            collision_block = getattr(modifier, "collision_settings", None)
+            set_rna(collision_block, _rna_writable(collision_block, collision_settings), id_lookup)
         if canvas_surfaces:
+            if kind != "dynamic_paint" or dynamic_paint_role != "canvas":
+                raise ValueError("Dynamic Paint canvas surfaces require canvas role")
             canvas_settings = getattr(modifier, "canvas_settings", None)
             if canvas_settings is None:
                 raise ValueError("Dynamic Paint canvas settings are missing")
@@ -3478,10 +3559,10 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
                     surface_values = dict(surface_values)
                     surface_cache = surface_values.pop("point_cache", None)
                     surface = canvas_settings.canvas_surfaces[index]
-                    set_rna(surface, surface_values, id_lookup)
+                    set_rna(surface, _rna_writable(surface, surface_values), id_lookup)
                     if surface_cache:
                         cache_block = getattr(surface, "point_cache", None)
-                        set_rna(cache_block, surface_cache, id_lookup)
+                        set_rna(cache_block, _rna_writable(cache_block, surface_cache), id_lookup)
                         if surface_cache.get("is_baked"):
                             _bake_point_cache(obj, cache_block)
             finally:
@@ -3493,7 +3574,7 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         else:
             cache_block = getattr(modifier, "point_cache", None)
         if point_cache is not None:
-            set_rna(cache_block, point_cache, id_lookup)
+            set_rna(cache_block, _rna_writable(cache_block, point_cache), id_lookup)
             if point_cache.get("is_baked"):
                 _bake_point_cache(obj, cache_block)
     if dynamic_paint_temporary_link:
@@ -3839,6 +3920,13 @@ def _apply_native_shading(mesh, attributes, face_items, edge_items, edge_of):
     smooth = _native_values(attributes, "shade_smooth")
     for polygon, face in zip(mesh.polygons, face_items):
         polygon.use_smooth = bool(smooth.get("f%d" % face["id"], False))
+    # Setting `use_smooth` always leaves an all-false sharp_face attribute; shade_smooth() removes it, so
+    # without Potter's presence field an all-smooth mesh drops it.
+    shade = attributes.get("shade_smooth") or {}
+    if (not shade.get("sharp_face_present") and mesh.polygons
+            and all(polygon.use_smooth for polygon in mesh.polygons)
+            and mesh.attributes.get("sharp_face") is not None):
+        mesh.attributes.remove(mesh.attributes["sharp_face"])
     for field, key in (("use_edge_sharp", "sharp"), ("use_seam", "seam")):
         if attributes.get(key) is None:
             # Setting a flag creates Blender's sharp_edge / uv_seam attribute, so an absent layer stays absent.
@@ -4257,6 +4345,17 @@ def _apply_color_designation(mesh, attributes):
             raise ValueError("color layer %s is designated %s but mesh %s has no such layer"
                              % (reference, key, mesh.name))
         setattr(mesh.color_attributes, field, layer_names.index(reference))
+
+
+def _apply_texture_space(mesh, record):
+    """A mesh with a texture-space record has a manual texture space; without one it keeps the automatic bounds."""
+    if record is None:
+        return
+    mesh.use_auto_texspace = False
+    mesh.texspace_location = record["location"]
+    mesh.texspace_size = record["size"]
+
+
 def mesh_create(name, raw, block_id):
     mesh = bpy.data.meshes.new(name)
     attributes = raw.get("attributes", {})
@@ -4318,6 +4417,7 @@ def mesh_create(name, raw, block_id):
                              layer_names)
     _apply_blender_attributes(mesh, attributes, layer_names, layout, edge_of)
     _apply_multires_control_data(mesh, attributes, face_items, layout)
+    _apply_texture_space(mesh, attributes.get("texture_space"))
     _apply_color_designation(mesh, attributes)
     metadata = attributes.get("blender_metadata", {})
     set_props(mesh, metadata.get("custom_properties", {}))
@@ -5192,10 +5292,10 @@ def _canonical_drivers(doc, node, source_drivers):
     return result
 
 
-def _canonical_nla(doc, node, source_tracks):
+def _canonical_nla(doc, node, source_tracks, action_slot_refs_by_action_id):
     """Rebuild NLA tracks from the canonical potter graph; compatibility
     payload only fills properties the graph does not model."""
-    model = _nla_from_model(doc, node)
+    model = _nla_from_model(doc, node, action_slot_refs_by_action_id)
     compat_by_track = {item.get("name"): item for item in source_tracks or []}
     result = []
     for track in model:
@@ -5219,17 +5319,6 @@ def _canonical_nla(doc, node, source_tracks):
         result.append(merged_track)
     return result
 
-
-def _is_simple_principled_tree(tree_source):
-    nodes = (tree_source or {}).get("nodes", []) or []
-    types = [item.get("type") for item in nodes]
-    links = (tree_source or {}).get("links", []) or []
-    has_principled = "ShaderNodeBsdfPrincipled" in types
-    has_output = any(kind in ("OutputMaterial", "ShaderNodeOutputMaterial")
-                     for kind in types)
-    return (has_principled and has_output and links
-            and all(link.get("from_socket") == "BSDF"
-                    and link.get("to_socket") == "Surface" for link in links))
 
 
 def _set_object_solver_inverse(owner, constraint, owner_type, pose_bone=None,
@@ -6282,19 +6371,23 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
             raise ValueError("sequencer strips contain an unresolved input cycle or reference")
 
 
-def _canonical_fcurves(model_curves, source_curves, doc, include_unmatched=True):
+def _canonical_fcurves(model_curves, source_curves, doc, include_unmatched=True,
+                       include_indices=None, include_unmatched_indices=()):
     sources = {}
     for source in source_curves:
         key = (source.get("path"), int(source.get("index", 0)))
         sources.setdefault(key, []).append(source)
     result = []
-    for model in model_curves:
+    for curve_index, model in enumerate(model_curves):
+        if include_indices is not None and curve_index not in include_indices:
+            continue
         path = model.get("path", "")
         index = int(model.get("index", 0))
         key = (blender_animation_path(path, doc), index)
         candidates = sources.get(key, [])
         source = candidates.pop(0) if candidates else None
-        if source is None and not include_unmatched:
+        if (source is None and not include_unmatched
+                and curve_index not in include_unmatched_indices):
             continue
         curve = dict(source or {})
         curve["path"] = path
@@ -6335,8 +6428,64 @@ def _model_action_slot(doc, action_id, model_slot, flat_curves):
     }
 
 
-def _canonical_action_data(doc, item, source, action_id):
-    model_curves = item.get("fcurves", [])
+def _modifier_binding_path(doc, object_map, binding):
+    node_id = binding.get("node")
+    node = doc.get("nodes", {}).get(node_id)
+    obj = object_map.get(node_id)
+    if node is None or obj is None:
+        raise ValueError("Action modifier binding references missing node %s" % node_id)
+    modifier_id = binding.get("modifier")
+    modifier_source = next(
+        (modifier for modifier in node.get("modifiers", [])
+         if modifier.get("id") == modifier_id), None)
+    if modifier_source is None:
+        raise ValueError("Action modifier binding references missing modifier %s"
+                         % modifier_id)
+    modifier = obj.modifiers.get(modifier_source.get("name", ""))
+    if modifier is None:
+        raise ValueError("Action modifier binding cannot resolve modifier %s on node %s"
+                         % (modifier_id, node_id))
+    parameter = binding.get("parameter")
+    if not isinstance(parameter, str) or not parameter:
+        raise ValueError("Action modifier binding has no parameter")
+    try:
+        return modifier.path_from_id(parameter)
+    except Exception as error:
+        raise ValueError("cannot resolve Action modifier parameter %s on modifier %s"
+                         % (parameter, modifier_id)) from error
+
+
+def _canonical_action_data(doc, item, source, action_id, object_map):
+    model_curves = [dict(curve) for curve in item.get("fcurves", [])]
+    binding_slots = {}
+    for raw_index, bindings in item.get("modifier_bindings", {}).items():
+        try:
+            curve_index = int(raw_index)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Action modifier binding has invalid FCurve index %s"
+                             % raw_index) from error
+        if curve_index < 0 or curve_index >= len(model_curves):
+            raise ValueError("Action modifier binding references missing FCurve %s"
+                             % raw_index)
+        if not isinstance(bindings, list):
+            raise ValueError("Action FCurve %s modifier bindings are not a vector"
+                             % raw_index)
+        if not bindings:
+            continue
+        paths = [_modifier_binding_path(doc, object_map, binding)
+                 for binding in bindings]
+        if any(path != paths[0] for path in paths[1:]):
+            raise ValueError(
+                "Action FCurve %s cannot represent modifier bindings with different data paths"
+                % raw_index)
+        model_curves[curve_index]["path"] = paths[0]
+        slot_ids = {binding.get("action_slot") for binding in bindings
+                    if binding.get("action_slot") is not None}
+        if len(slot_ids) > 1:
+            raise ValueError(
+                "Action FCurve %s cannot represent modifier bindings assigned to multiple Action slots"
+                % raw_index)
+        binding_slots[curve_index] = next(iter(slot_ids), None)
     flat_curves = _canonical_fcurves(
         model_curves, source.get("fcurves", []), doc)
     slot_sources = [dict(slot) for slot in source.get("slots", [])]
@@ -6356,14 +6505,33 @@ def _canonical_action_data(doc, item, source, action_id):
     if not slot_sources and flat_curves:
         slot_sources = [{"identifier": "", "name": item["name"],
                          "target_type": "OBJECT", "fcurves": flat_curves}]
-    elif len(slot_sources) == 1:
+    slot_ids = {slot.get("potter_id") for slot in slot_sources}
+    missing_slots = {slot_id for slot_id in binding_slots.values()
+                     if slot_id is not None and slot_id not in slot_ids}
+    if missing_slots:
+        raise ValueError("Action modifier binding references missing Action slot %s"
+                         % next(iter(missing_slots)))
+    if len(slot_sources) == 1:
         slot_sources = [dict(slot_sources[0], fcurves=flat_curves)]
-    else:
-        slot_sources = [
-            dict(slot, fcurves=_canonical_fcurves(
-                model_curves, slot.get("fcurves", []), doc, include_unmatched=False))
-            for slot in slot_sources
-        ]
+    elif len(slot_sources) > 1:
+        restored_slots = []
+        for slot in slot_sources:
+            slot_id = slot.get("potter_id")
+            include_indices = {
+                index for index in range(len(model_curves))
+                if index not in binding_slots
+                or binding_slots[index] is None
+                or binding_slots[index] == slot_id}
+            include_unmatched_indices = {
+                index for index, binding_slot in binding_slots.items()
+                if binding_slot is not None and binding_slot == slot_id}
+            restored_slots.append(dict(
+                slot,
+                fcurves=_canonical_fcurves(
+                    model_curves, slot.get("fcurves", []), doc,
+                    include_unmatched=False, include_indices=include_indices,
+                    include_unmatched_indices=include_unmatched_indices)))
+        slot_sources = restored_slots
     return slot_sources, flat_curves
 
 
@@ -6410,6 +6578,17 @@ def _slot_matches(slots, reference):
     return None
 
 
+def _action_slot_reference(action_slot_refs_by_action_id, action_id, slot_id):
+    if slot_id is None:
+        return None
+    slot_source = next((source for source in action_slot_refs_by_action_id.get(action_id, [])
+                        if source.get("potter_id") == slot_id), None)
+    if slot_source is None:
+        raise ValueError("Action references missing slot ID %s" % slot_id)
+    return {key: slot_source[key] for key in ("identifier", "name", "target_type")
+            if key in slot_source}
+
+
 def _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup):
     if not tracks:
         return
@@ -6431,13 +6610,17 @@ def _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup):
             set_props(strip, source_strip.get("custom_properties", {}))
             slot_reference = source_strip.get("action_slot")
             action_slots = action_slots_by_name.get(action.name_full, [])
+            if slot_reference is None and len(action_slots) > 1:
+                raise ValueError(
+                    "NLA strip %s uses a multi-slot Action without a slot assignment"
+                    % strip.name)
             slot = _slot_matches(action_slots, slot_reference)
             if slot_reference and slot is None:
                 raise ValueError("NLA strip %s references missing Action slot" % strip.name)
             if slot is not None and hasattr(strip, "action_slot"):
                 strip.action_slot = slot
 
-def _nla_from_model(doc, node):
+def _nla_from_model(doc, node, action_slot_refs_by_action_id):
     actions = doc.get("actions", {})
     tracks = []
     for source_track in node.get("nla_tracks", []):
@@ -6449,7 +6632,7 @@ def _nla_from_model(doc, node):
             if action is None:
                 raise ValueError("NLA strip references missing action %s" %
                                  source_strip.get("action"))
-            track["strips"].append({
+            strip = {
                 "name": action.get("name", "Action"),
                 "action": action.get("name"),
                 "properties": {
@@ -6464,7 +6647,14 @@ def _nla_from_model(doc, node):
                     "extrapolation": source_strip.get("extrapolation", "hold").upper(),
                     "blend_in": source_strip.get("blend_in", 0.0),
                     "blend_out": source_strip.get("blend_out", 0.0),
-                }})
+                },
+            }
+            slot_reference = _action_slot_reference(
+                action_slot_refs_by_action_id, source_strip.get("action"),
+                source_strip.get("action_slot"))
+            if slot_reference is not None:
+                strip["action_slot"] = slot_reference
+            track["strips"].append(strip)
         tracks.append(track)
     return tracks
 
@@ -6517,11 +6707,18 @@ def _clip_cutoff(material):
     return float(compare.inputs[1].default_value)
 
 
-def _set_principled_values(material, item):
-    shader = next((node for node in material.node_tree.nodes
-                   if node.type == "BSDF_PRINCIPLED"), None)
-    if shader is None:
-        return
+def _generated_principled(tree):
+    """The Principled BSDF Potter generated in `tree`, marked by `_mark_generated_field_graph`, or None.
+
+    Only a generated Principled takes the Material's values on export. An authored graph is exported as it is: Potter
+    renders the graph's own inputs, so a Material value written into it would make the file differ from the render.
+    """
+    return next((node for node in tree.nodes
+                 if node.type == "BSDF_PRINCIPLED" and node.get("potter_simple_material") is True), None)
+
+
+def _set_principled_values(shader, item):
+    """Writes the Material's values into the Principled BSDF `shader`."""
     shader.inputs["Base Color"].default_value = item["base_color"]
     shader.inputs["Metallic"].default_value = item["metallic"]
     alpha = shader.inputs.get("Alpha")
@@ -6585,6 +6782,12 @@ def _material_field_values(material):
         "volume_density": 0.0,
         "volume_color": [0.5, 0.5, 0.5],
         "volume_anisotropy": 0.0,
+        "volume_sampling": {"DISTANCE": "distance", "EQUIANGULAR": "equiangular",
+                            "MULTIPLE_IMPORTANCE": "multiple_importance"}.get(
+            getattr(getattr(material, "cycles", None), "volume_sampling", "MULTIPLE_IMPORTANCE"),
+            "multiple_importance"),
+        "volume_interpolation": {"LINEAR": "linear", "CUBIC": "cubic"}.get(
+            getattr(getattr(material, "cycles", None), "volume_interpolation", "LINEAR"), "linear"),
     }
     output = _material_output(material.node_tree) if material.node_tree is not None else None
     if output is None:
@@ -7002,6 +7205,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene.render.resolution_y = int(render.get("resolution_y", 1080))
         scene.render.resolution_percentage = int(render.get("resolution_percentage", 100))
         scene.render.film_transparent = bool(render.get("film_transparent", False))
+        scene.render.filter_size = float(render.get("filter_size", 1.5))
         scene.render.use_sequencer = bool(render.get("use_sequencer", False))
         available_engines = {
             item.identifier
@@ -7021,10 +7225,12 @@ def export_doc(doc, target, pack, scene_hash, context):
             scene.render.ffmpeg.audio_codec = blender_audio_codec(render.get("audio_codec", "wav"))
         if engine == "CYCLES" and hasattr(scene, "cycles"):
             scene.cycles.max_bounces = int(render.get("max_bounces", 4))
+            scene.cycles.volume_bounces = int(render.get("volume_bounces", 0))
             if "transparent_max_bounces" in render:
                 scene.cycles.transparent_max_bounces = int(render["transparent_max_bounces"])
         scene.render.engine = engine
         if hasattr(scene, "cycles"):
+            scene.cycles.blur_glossy = float(render.get("filter_glossy", 1.0))
             scene.cycles.dicing_rate = float(render.get("dicing_rate", 1.0))
             scene.cycles.preview_dicing_rate = float(render.get("preview_dicing_rate", 8.0))
             scene.cycles.max_subdivisions = int(render.get("max_subdivisions", 12))
@@ -7346,12 +7552,19 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
-        _set_principled_values(mat, item)
+        fresh = next((node for node in mat.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if fresh is not None:
+            _set_principled_values(fresh, item)
         mat.roughness = viewport["roughness"] if viewport else item["roughness"]
         mat.metallic = viewport["metallic"] if viewport else item["metallic"]
         mat.use_backface_culling = not bool(item.get("double_sided", True))
         mat.use_transparent_shadow = bool(item.get("use_transparent_shadow", True))
+        mat.cycles.use_bump_map_correction = bool(item.get("use_bump_map_correction", True))
         mat.displacement_method = "DISPLACEMENT" if item.get("displacement_method") == "displacement" else "BUMP"
+        mat.cycles.volume_sampling = {"distance": "DISTANCE", "equiangular": "EQUIANGULAR"}.get(
+            item.get("volume_sampling"), "MULTIPLE_IMPORTANCE")
+        mat.cycles.volume_interpolation = {"linear": "LINEAR", "cubic": "CUBIC"}.get(
+            item.get("volume_interpolation"), "LINEAR")
         set_id(mat, material_id)
         source = compatibility_block(doc, "materials", "Material", material_id)
         set_props(mat, source.get("custom_properties", {}))
@@ -7498,13 +7711,17 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj.hide_render = not item.get("render_visible", True)
         obj.hide_select = not item.get("selectable", True)
         set_props(obj, item.get("properties", {}))
-        visibility_rna = {
+        hide_rna = {
             key: value for key, value in (metadata.get("rna_properties") or {}).items()
-            if key.startswith("visible_")
-            or (key.startswith("hide_")
-                and key not in ("hide_viewport", "hide_render", "hide_select"))
+            if key.startswith("hide_") and key not in ("hide_viewport", "hide_render", "hide_select")
         }
-        set_rna(obj, visibility_rna)
+        set_rna(obj, hide_rna)
+        ray_visibility = item.get("ray_visibility") or {}
+        for field, prop in (("camera", "visible_camera"), ("diffuse", "visible_diffuse"),
+                            ("glossy", "visible_glossy"), ("transmission", "visible_transmission"),
+                            ("volume_scatter", "visible_volume_scatter"), ("shadow", "visible_shadow")):
+            if field in ray_visibility:
+                setattr(obj, prop, bool(ray_visibility[field]))
         if item.get("tags"):
             obj["potter.tags"] = item["tags"]
 
@@ -7568,10 +7785,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         if tree_source:
             _restore_node_tree(material.node_tree, tree_source, id_lookup,
                                "Material shader tree %s" % material.name)
-            if (_is_simple_principled_tree(tree_source)
-                    or any(node.get("properties", {}).get("potter_simple_material") is True
-                           for node in tree_source.get("nodes", []))):
-                _set_principled_values(material, item)
+            generated = _generated_principled(material.node_tree)
+            if generated is not None:
+                _set_principled_values(generated, item)
         if item.get("owns_shader_graph") is True:
             _restore_material_field_nodes(material, item)
     for world_id, item in doc.get("worlds", {}).items():
@@ -7810,10 +8026,24 @@ def export_doc(doc, target, pack, scene_hash, context):
         slot_ids = _id_map(action, "potter.action_slot_ids_json")
         slots = list(action.slots)
         slot_sources = [
-            {"identifier": getattr(slot, "identifier", ""),
-             "name": getattr(slot, "name_display", getattr(slot, "name", "")),
-             "potter_id": slot_ids.get(getattr(slot, "identifier", ""))}
-            for slot in slots]
+            {
+                "identifier": getattr(slot, "identifier", ""),
+                "name": getattr(slot, "name_display", getattr(slot, "name", "")),
+                "target_type": getattr(slot, "target_id_type", ""),
+                "potter_id": slot_ids.get(getattr(slot, "identifier", "")),
+            }
+            for slot in slots
+        ]
+        model_slots = doc.get("actions", {}).get(action_id, {}).get("slots", [])
+        for slot_source in slot_sources:
+            if slot_source.get("potter_id"):
+                continue
+            slot_id = next((
+                model_slot.get("id") for model_slot in model_slots
+                if model_slot.get("blender_identifier") == slot_source.get("identifier")
+            ), None)
+            if slot_id:
+                slot_source["potter_id"] = slot_id
         action_map[action_id] = (action, slots, slot_sources)
         action_by_name[action.name_full] = action
         action_slots_by_name[action.name_full] = slots
@@ -7829,7 +8059,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         if source.get("fake_user"):
             action.use_fake_user = True
         slot_sources, flat_curves = _canonical_action_data(
-            doc, item, source, action_id)
+            doc, item, source, action_id, object_map)
         slot_ids = {}
         slots = []
         source_slot_refs = []
@@ -7841,11 +8071,13 @@ def export_doc(doc, target, pack, scene_hash, context):
             except Exception as error:
                 raise ValueError("cannot create Action slot %s (%s)" %
                                  (slot_name, target_type)) from error
+            slot_identifier = getattr(slot, "identifier", "")
+            slot_source = dict(slot_source, identifier=slot_identifier)
             slots.append(slot)
             source_slot_refs.append(slot_source)
             slot_id = slot_source.get("potter_id")
             if slot_id:
-                slot_ids[getattr(slot, "identifier", "")] = slot_id
+                slot_ids[slot_identifier] = slot_id
         if slot_ids:
             action["potter.action_slot_ids_json"] = json.dumps(slot_ids, sort_keys=True)
         action_slots_by_name[action.name_full] = slots
@@ -7866,6 +8098,10 @@ def export_doc(doc, target, pack, scene_hash, context):
         id_lookup[action.name_full] = action
         id_lookup[action_id] = action
     _resolve_deferred_id_assignments(id_lookup)
+    action_slot_refs_by_action_id = {
+        action_id: slot_refs
+        for action_id, (_action, _slots, slot_refs) in action_map.items()
+    }
     for data_id, data in doc.get("data_blocks", {}).items():
         shape = data.get("shape_keys") or {}
         action_id = shape.get("action")
@@ -7906,17 +8142,29 @@ def export_doc(doc, target, pack, scene_hash, context):
             action, slots, source_slot_refs = action_data
             obj.animation_data_create()
             obj.animation_data.action = action
-            reference = node.get("action_slot") or source_object.get("action_slot")
+            active_slot_id = (
+                (doc.get("actions", {}).get(action_id, {}).get("active_slots") or {}).get(node_id)
+                if action_id else None
+            )
+            reference = _action_slot_reference(
+                action_slot_refs_by_action_id, action_id, active_slot_id)
+            if reference is None and source_object.get("action") == action.name_full:
+                reference = source_object.get("action_slot")
             slot = None
             if reference:
                 slot = _slot_matches(slots, reference)
                 if slot is None:
                     raise ValueError("object %s references missing Action slot" % obj.name)
-            elif slots:
+            elif len(slots) == 1:
                 slot = slots[0]
+            elif len(slots) > 1:
+                raise ValueError(
+                    "object %s uses an Action with multiple slots but no slot assignment"
+                    % obj.name)
             if slot is not None:
                 obj.animation_data.action_slot = slot
-        tracks = _canonical_nla(doc, node, source_object.get("nla_tracks"))
+        tracks = _canonical_nla(
+            doc, node, source_object.get("nla_tracks"), action_slot_refs_by_action_id)
         _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup)
         hide_set_states = source_object.get("hide_set_by_view_layer") or {}
         restored_hide_set = False

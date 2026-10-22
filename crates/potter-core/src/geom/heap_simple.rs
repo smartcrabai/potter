@@ -17,6 +17,16 @@ impl<T: Copy> HeapSimple<T> {
         Self { tree: Vec::new() }
     }
 
+    /// `BLI_heapsimple_is_empty`.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tree.is_empty()
+    }
+
+    /// `BLI_heapsimple_top_value`: the smallest key. The heap must not be empty.
+    pub(crate) fn top_value(&self) -> f32 {
+        self.tree[0].0
+    }
+
     /// `BLI_heapsimple_insert` (`heapsimple_up`).
     pub(crate) fn insert(&mut self, value: f32, payload: T) {
         let mut index = self.tree.len();

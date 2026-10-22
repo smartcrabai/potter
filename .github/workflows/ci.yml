@@ -12,8 +12,8 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # About 16 minutes with warm caches; a hung Blender test should not hold the runner for 6 hours.
-    timeout-minutes: 45
+    # About 40 minutes (tests, then clippy) with warm caches; a hung Blender test should not hold the runner for 6 hours.
+    timeout-minutes: 75
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -68,15 +68,16 @@ jobs:
           "$HOME/blender/blender" --version
           echo "POTTER_BLENDER=$HOME/blender/blender" >> "$GITHUB_ENV"
 
-      - name: Run tests
-        shell: bash
-        env:
-          POTTER_REQUIRE_BLENDER: "1"
-        run: cargo test --workspace --all-features
-
       - name: Run clippy
         shell: bash
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          POTTER_REQUIRE_BLENDER: "1"
+        run: cargo test --workspace --all-features --no-fail-fast
 
   vrm-consumer:
     runs-on: ubuntu-latest

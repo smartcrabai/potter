@@ -129,6 +129,7 @@ fn mesh_for(variant: &Value) -> Mesh {
 fn modifier_for(variant: &Value) -> Modifier {
     let data = &variant["modifier"];
     Modifier {
+        baked_ocean_cache: None,
         id: Id::new("construction_parity").expect("static modifier ID"),
         modifier_type: data["type"]
             .as_str()
@@ -561,6 +562,7 @@ fn build_face_prefix_keeps_valid_custom_normal_corner_order() {
     );
 
     let modifier = Modifier {
+        baked_ocean_cache: None,
         id: Id::new("build_normal_prefix").expect("static modifier ID"),
         modifier_type: "build".to_owned(),
         name: "Build".to_owned(),
@@ -629,6 +631,7 @@ fn wireframe_material_offset_rejects_non_integer_values() {
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
             .expect("valid triangle");
     let modifier = Modifier {
+        baked_ocean_cache: None,
         id: Id::new("wireframe_non_integer_offset").expect("static modifier ID"),
         modifier_type: "wireframe".to_owned(),
         name: "Wireframe".to_owned(),

@@ -240,7 +240,7 @@ fn blender_transform_matrix(transform: &Transform) -> Option<BlenderMat4> {
 /// matrix in f32, in that order. The replica is used only where the evaluated world matrix is the
 /// f64 composition of the same parts (no animation, drivers, constraints or bone parents) and the
 /// f32 replica agrees with the f64 transform. Otherwise `None`.
-fn object_to_world(
+pub(crate) fn object_to_world(
     doc: &SceneDoc,
     node_id: &Id,
     world_matrices: &BTreeMap<Id, DMat4>,
@@ -483,6 +483,46 @@ pub(crate) fn operand_to_subject(
     let inverse = blender_invert_m4(&subject)?;
     let object = object_to_world(doc, object_id, world_matrices, 0)?;
     Some(dmat4_from_blender(&blender_mul_m4(&inverse, &object)))
+}
+
+/// Blender's Volume to Mesh transform (`MOD_volume_to_mesh.cc`): the carrier's float `world_to_object`
+/// times the volume's float `object_to_world`. `OpenVDB` copies the carrier's inverse and sets its
+/// bottom row to `(0, 0, 0, 1)` (`imat.setCol(3, ...)`), which only changes a non-affine rounding
+/// residue. The grid's own transform is applied by the extraction. `None` when either object has no
+/// exact replica or the carrier is not invertible; the caller then keeps its `f64` path.
+pub(crate) fn volume_to_carrier_f32(
+    doc: &SceneDoc,
+    carrier_id: &Id,
+    volume_id: &Id,
+    world_matrices: &BTreeMap<Id, DMat4>,
+) -> Option<DMat4> {
+    let carrier = object_to_world(doc, carrier_id, world_matrices, 0)?;
+    let mut carrier_inverse = blender_invert_m4(&carrier)?;
+    for column in carrier_inverse.iter_mut().take(3) {
+        column[3] = 0.0;
+    }
+    carrier_inverse[3][3] = 1.0;
+    let volume = object_to_world(doc, volume_id, world_matrices, 0)?;
+    Some(dmat4_from_blender(&blender_mul_m4(
+        &carrier_inverse,
+        &volume,
+    )))
+}
+
+/// Blender's f32 Shrinkwrap `local2target` (`BLI_space_transform_from_matrices`, `math_matrix_c.cc`):
+/// `invert(target_world) * subject_world`, the subject's object-local space mapped into the target's.
+/// `None` when either object has no exact replica or the target is not invertible; the caller then
+/// keeps its f64 path.
+pub(crate) fn shrinkwrap_subject_to_target(
+    doc: &SceneDoc,
+    subject_id: &Id,
+    target_id: &Id,
+    world_matrices: &BTreeMap<Id, DMat4>,
+) -> Option<DMat4> {
+    let subject = object_to_world(doc, subject_id, world_matrices, 0)?;
+    let target = object_to_world(doc, target_id, world_matrices, 0)?;
+    let inverse = blender_invert_m4(&target)?;
+    Some(dmat4_from_blender(&blender_mul_m4(&inverse, &subject)))
 }
 
 /// Blender `is_negative_m4`: sign of the upper 3x3 determinant after the f32 matrix boundary.

@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Aabb, CylinderParams, IcosphereParams, Mesh,
+        Aabb, CylinderParams, GeneratedVertex, IcosphereParams, Mesh, TextureSpace,
         concat::{Part, concatenate, concatenate_with_normals},
         modifiers::{AdaptiveRenderCamera, AdaptiveRenderContext},
         normals::SHADING_ATTRIBUTES,
@@ -258,6 +258,10 @@ pub struct Snapshot {
     /// Ephemeral local-space adaptive surface normals, aligned with each evaluated mesh's vertices.
     #[serde(skip)]
     pub(crate) adaptive_normals: BTreeMap<Id, Vec<Option<DVec3>>>,
+    /// Ephemeral Generated coordinates of each evaluated collection instance's joined mesh, aligned with its vertices:
+    /// each member's vertices keep the texture space of their own member.
+    #[serde(skip)]
+    pub(crate) generated_vertices: BTreeMap<Id, Vec<GeneratedVertex>>,
     /// Evaluated armature bone-head matrices in world space.
     #[serde(skip)]
     pub bone_matrices: BTreeMap<Id, BTreeMap<Id, [f64; 16]>>,
@@ -601,6 +605,7 @@ impl Snapshot {
                         snapshot.instance_paths.remove(node_id);
                         snapshot.slot_bindings.remove(node_id);
                         snapshot.adaptive_normals.remove(node_id);
+                        snapshot.generated_vertices.remove(node_id);
                         snapshot.strokes.remove(node_id);
                     }
                     return Ok((snapshot, node_errors));
@@ -794,6 +799,43 @@ impl Snapshot {
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
     ) -> Result<Self> {
+        // Settings that an accepted lossy import reported are not evaluated: evaluate a copy without them,
+        // and carry one warning per value.
+        let accepted = crate::physics_support::without_accepted_losses(doc);
+        let (doc, accepted_warnings) = match &accepted {
+            Some((copy, warnings)) => (copy, warnings.clone()),
+            None => (doc, Vec::new()),
+        };
+        let mut snapshot = Self::evaluate_gated_inner(
+            doc,
+            scene_hash,
+            simulation_scene_hash,
+            context,
+            modifier_context,
+            selected_nodes,
+            suppressed,
+            mesh_dependencies,
+            world_matrix_ids,
+            modifier_prefix,
+            driver_values,
+        )?;
+        snapshot.warnings.splice(0..0, accepted_warnings);
+        Ok(snapshot)
+    }
+
+    fn evaluate_gated_inner(
+        doc: &SceneDoc,
+        scene_hash: &str,
+        simulation_scene_hash: &str,
+        context: &EvaluationContext,
+        modifier_context: ModifierEvaluationContext<'_>,
+        selected_nodes: Option<&BTreeSet<Id>>,
+        suppressed: &BTreeSet<Id>,
+        mesh_dependencies: &ObjectMeshDependencies,
+        world_matrix_ids: Option<&BTreeSet<Id>>,
+        modifier_prefix: Option<ModifierPrefix<'_>>,
+        driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+    ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
             suppressed,
@@ -902,7 +944,23 @@ impl Snapshot {
         let mut paint_colors = BTreeMap::new();
         let mut paint_weights = BTreeMap::new();
         let simulation_cache_key = simulation.as_ref().map(|result| result.cache_key.clone());
+        let mut simulation_warnings = Vec::new();
         if let Some(simulation) = simulation {
+            simulation_warnings = simulation
+                .fluid_warnings
+                .into_iter()
+                .map(|warning| {
+                    PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        warning.message,
+                        json!({
+                            "feature_id": "physics.fluid_domain.emitter_inside_effector",
+                            "node_id": warning.node_id,
+                            "status": "not_supported",
+                        }),
+                    )
+                })
+                .collect();
             simulated_velocities = simulation.linear_velocities;
             deformed_vertices = simulation.deformed_vertices;
             fluid_surfaces = simulation.fluid_surfaces;
@@ -1039,6 +1097,7 @@ impl Snapshot {
         let mut nodes = BTreeMap::new();
         let mut meshes = BTreeMap::new();
         let mut adaptive_normals = BTreeMap::new();
+        let mut generated_vertices = BTreeMap::new();
         let mut instance_paths = BTreeMap::new();
         let mut slot_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
@@ -1320,6 +1379,17 @@ impl Snapshot {
                                         node_materials.len(),
                                     ))
                                 })
+                            },
+                            |modifier, parameter, base| {
+                                crate::eval::animation::animated_modifier_scalar(
+                                    id,
+                                    node,
+                                    doc,
+                                    &modifier.id,
+                                    parameter,
+                                    base,
+                                    frame,
+                                )
                             },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;
@@ -1638,6 +1708,17 @@ impl Snapshot {
                                     ))
                                 })
                             },
+                            |modifier, parameter, base| {
+                                crate::eval::animation::animated_modifier_scalar(
+                                    id,
+                                    node,
+                                    doc,
+                                    &modifier.id,
+                                    parameter,
+                                    base,
+                                    frame,
+                                )
+                            },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;
                     modifier_warnings.extend(
@@ -1663,6 +1744,18 @@ impl Snapshot {
                             json!({ "data": data_id }),
                         )
                     })?;
+                    // Volume To Mesh is a Mesh-only modifier: Blender's OB_VOLUME accepts only
+                    // modifiers with a geometry-set hook, and MOD_volume_to_mesh has none
+                    // (object.cc BKE_object_support_modifier_type_check).
+                    if let Some(modifier) = node.modifiers.iter().find(|modifier| {
+                        gate.is_active(id, modifier) && modifier.modifier_type == "volume_to_mesh"
+                    }) {
+                        return Err(PotError::with_details(
+                            ErrorCode::InvalidOperation,
+                            "volume_to_mesh modifier can only be used on mesh objects",
+                            json!({"node_id":id,"modifier_id":modifier.id}),
+                        ));
+                    }
                     let mut generated = None;
                     for modifier in node.modifiers.iter().filter(|modifier| {
                         gate.is_active(id, modifier) && modifier.modifier_type == "mesh_to_volume"
@@ -1703,19 +1796,34 @@ impl Snapshot {
                                     json!({"modifier_id":modifier.id,"object":object_id}),
                                 )
                             })?;
-                        let owner_inverse = matrix.inverse();
-                        if !owner_inverse.is_finite() {
+                        // Blender's `ctx->object->world_to_object() * object_to_convert->object_to_world()`
+                        // in single precision (`MOD_mesh_to_volume.cc`).
+                        let owner_f32 =
+                            crate::geom::blender_matrix::blender_matrix_from_f64(matrix);
+                        let Some(owner_inverse_f32) =
+                            crate::geom::blender_matrix::blender_invert_m4(&owner_f32)
+                        else {
                             return Err(PotError::with_details(
                                 ErrorCode::InvalidArgument,
                                 "mesh-to-volume owner transform is singular",
                                 json!({"modifier_id":modifier.id,"owner":id}),
                             ));
-                        }
-                        let operand_to_owner = owner_inverse * operand_matrix;
-                        let mut transformed = (*operand_mesh).clone();
-                        for vertex in &mut transformed.vertices {
-                            vertex.co = operand_to_owner.transform_point3(vertex.co);
-                        }
+                        };
+                        // `world_to_object(owner) * object_to_world(operand)` in float (`MOD_mesh_to_volume.cc`);
+                        // the exact replay of the operand's composition is used when it applies.
+                        let mesh_to_owner = match crate::geom::blender_matrix::operand_to_subject(
+                            doc, id, &object_id, &matrices,
+                        ) {
+                            Some(replayed) => {
+                                crate::geom::blender_matrix::blender_matrix_from_f64(replayed)
+                            }
+                            None => crate::geom::blender_matrix::blender_mul_m4(
+                                &owner_inverse_f32,
+                                &crate::geom::blender_matrix::blender_matrix_from_f64(
+                                    operand_matrix,
+                                ),
+                            ),
+                        };
                         // A parameter the modifier does not store takes its Blender default from the schema table.
                         let number = |parameter: &str| -> Result<f64> {
                             match modifier.params.get(parameter).and_then(Value::as_f64) {
@@ -1743,25 +1851,52 @@ impl Snapshot {
                                     )
                                 })?,
                         };
+                        // Blender returns the input volume unchanged when the voxel size is below 1e-5 or
+                        // the voxel amount is below 1 (`MOD_mesh_to_volume.cc`, `mesh_to_volume`).
                         let voxel_size = match resolution_mode {
-                            "VOXEL_SIZE" => number("voxel_size")?,
+                            "VOXEL_SIZE" => {
+                                let voxel_size = number("voxel_size")?;
+                                (voxel_size >= 1.0e-5).then_some(voxel_size)
+                            }
                             "VOXEL_AMOUNT" => {
                                 let amount = number("voxel_amount")?;
-                                let bounds = transformed.bounds().ok_or_else(|| {
+                                // Blender's `volume_compute_voxel_size` takes the operand's local bounds, not
+                                // the bounds of its transformed vertices (`MOD_mesh_to_volume.cc`).
+                                let bounds = operand_mesh.bounds().ok_or_else(|| {
                                     PotError::with_details(
                                         ErrorCode::InvalidArgument,
                                         "mesh-to-volume operand mesh is empty",
                                         json!({"modifier_id":modifier.id}),
                                     )
                                 })?;
-                                if !amount.is_finite() || amount <= 0.0 {
+                                // The schema's minimum is 0; an amount below 1 keeps the input volume (below).
+                                if !amount.is_finite() || amount < 0.0 {
                                     return Err(PotError::with_details(
                                         ErrorCode::InvalidArgument,
-                                        "mesh-to-volume voxel_amount must be positive",
+                                        "mesh-to-volume voxel_amount must be non-negative",
                                         json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
                                     ));
                                 }
-                                (bounds.size().length() / amount) as f32 as f64
+                                // Blender computes the diagonal between the transformed bounds corners and the
+                                // voxel size in single precision (`volume_compute_voxel_size`, float4x4 and
+                                // float3), then divides by max(1, amount) in single precision.
+                                (amount >= 1.0).then(|| {
+                                    let flat: [f32; 16] = std::array::from_fn(|index| {
+                                        mesh_to_owner[index / 4][index % 4]
+                                    });
+                                    let minimum =
+                                        crate::geom::blender_matrix::blender_transform_point_f32(
+                                            &flat,
+                                            bounds.min.as_vec3(),
+                                        );
+                                    let maximum =
+                                        crate::geom::blender_matrix::blender_transform_point_f32(
+                                            &flat,
+                                            bounds.max.as_vec3(),
+                                        );
+                                    let diagonal = (maximum - minimum).length();
+                                    f64::from(diagonal / (amount as f32).max(1.0))
+                                })
                             }
                             _ => {
                                 return Err(PotError::with_details(
@@ -1771,13 +1906,16 @@ impl Snapshot {
                                 ));
                             }
                         };
-                        generated = Some(crate::geom::volume::mesh_to_fog_volume(
-                            &transformed,
-                            voxel_size as f32 as f64,
-                            number("interior_band_width")?,
-                            number("density")?,
-                            true,
-                        )?);
+                        if let Some(voxel_size) = voxel_size {
+                            generated =
+                                Some(crate::geom::volume::mesh_to_fog_volume_with_transform(
+                                    operand_mesh,
+                                    &mesh_to_owner,
+                                    voxel_size as f32 as f64,
+                                    number("interior_band_width")?,
+                                    number("density")?,
+                                )?);
+                        }
                     }
                     if let Some(generated) = generated {
                         volume_data.insert(data_id.clone(), generated);
@@ -1969,6 +2107,7 @@ impl Snapshot {
                 paths,
                 bindings,
                 adaptive_normals: member_normals,
+                generated,
                 ..
             } = evaluate_collection_instance(
                 doc,
@@ -1983,6 +2122,7 @@ impl Snapshot {
             if !mesh.vertices.is_empty() {
                 slot_bindings.insert(id.clone(), bindings);
                 meshes.insert(id.clone(), mesh);
+                generated_vertices.insert(id.clone(), generated);
                 if let Some(normals) = member_normals {
                     adaptive_normals.insert(id.clone(), normals);
                 }
@@ -2019,6 +2159,7 @@ impl Snapshot {
             slot_bindings,
             meshes,
             adaptive_normals,
+            generated_vertices,
             strokes,
             volume_data,
             bone_matrices,
@@ -2029,7 +2170,10 @@ impl Snapshot {
             fluid_particles,
             paint_colors,
             paint_weights,
-            warnings: modifier_warnings,
+            warnings: simulation_warnings
+                .into_iter()
+                .chain(modifier_warnings)
+                .collect(),
         })
     }
 }
@@ -2577,28 +2721,23 @@ fn object_mesh_dependencies(
                 continue;
             }
             let parameters: &[&str] = match modifier.modifier_type.as_str() {
-                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" => &["object"],
-                "shrinkwrap" => {
-                    if modifier
-                        .params
-                        .get("target")
-                        .is_some_and(|value| !value.is_null())
-                    {
-                        &["target"]
-                    } else {
-                        &["object"]
-                    }
+                "data_transfer" | "mesh_deform" | "curve" | "mesh_to_volume" | "volume_to_mesh" => {
+                    &["object"]
                 }
+                "shrinkwrap" => &["target", "auxiliary_target"],
                 "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
                 "array" => &["start_cap", "end_cap"],
                 _ => &[],
             };
             for parameter in parameters {
-                add_mesh_operand_dependency(
-                    &mut dependencies.modifiers,
-                    owner_id,
-                    modifier.params.get(*parameter),
-                );
+                let value = modifier.params.get(*parameter);
+                // Blender disables a Shrinkwrap aimed at its own object: no dependency.
+                if modifier.modifier_type == "shrinkwrap"
+                    && value.and_then(serde_json::Value::as_str) == Some(owner_id.as_str())
+                {
+                    continue;
+                }
+                add_mesh_operand_dependency(&mut dependencies.modifiers, owner_id, value);
             }
         }
         if let Some(collection_id) = instance_collection_target(node)? {
@@ -2759,7 +2898,7 @@ pub(crate) fn resolve_modifier_object_operands(
         "boolean" | "curve" | "hook" | "data_transfer" | "mesh_deform" => &["object"],
         "uv_project" => &["projectors"],
         "uv_warp" | "warp" => &["object_from", "object_to"],
-        "shrinkwrap" => &["target", "object"],
+        "shrinkwrap" => &["target", "auxiliary_target"],
         "vertex_weight_edit" | "vertex_weight_mix" => &["mask_tex_map_object"],
         "vertex_weight_proximity" => &["target", "mask_tex_map_object"],
         "normal_edit" | "surface_deform" => &["target"],
@@ -3633,6 +3772,122 @@ fn select_particle_states(
         .collect()
 }
 
+/// Blender's Shrinkwrap projects onto a mesh target evaluated in the subject's space. A missing or
+/// self target, or a non-mesh target, leaves the subject unchanged; a self auxiliary target is
+/// ignored, and a non-mesh auxiliary target disables the modifier.
+fn apply_scene_shrinkwrap_modifier(
+    mesh: &mut Mesh,
+    modifier: &Modifier,
+    subject_id: &Id,
+    doc: &SceneDoc,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: &BTreeMap<Id, Mesh>,
+) -> Result<()> {
+    let Some(target_id) = shrinkwrap_object_reference(modifier, "target")? else {
+        return Ok(());
+    };
+    if target_id == *subject_id || !is_scene_mesh_object(modifier, doc, &target_id)? {
+        return Ok(());
+    }
+    let auxiliary_id =
+        shrinkwrap_object_reference(modifier, "auxiliary_target")?.filter(|id| id != subject_id);
+    if let Some(auxiliary_id) = &auxiliary_id
+        && !is_scene_mesh_object(modifier, doc, auxiliary_id)?
+    {
+        return Ok(());
+    }
+    let mut operands = resolve_modifier_object_operands(
+        modifier,
+        subject_id,
+        doc,
+        world_matrices,
+        evaluated_meshes,
+    )?;
+    let target = operands
+        .remove("target")
+        .and_then(|mut operands| operands.pop())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "shrinkwrap target mesh was not resolved",
+                json!({"modifier_id":modifier.id,"target":target_id}),
+            )
+        })?;
+    let mut resolved = modifier.clone();
+    resolved.params.remove("target");
+    resolved.params.remove("auxiliary_target");
+    let subject_to_target = crate::geom::blender_matrix::shrinkwrap_subject_to_target(
+        doc,
+        subject_id,
+        &target_id,
+        world_matrices,
+    )
+    .unwrap_or_else(|| target.local_to_subject.inverse());
+    resolved.runtime.shrinkwrap_subject_to_target = Some(subject_to_target.to_cols_array());
+    resolved.runtime.shrinkwrap_target_mesh = Some(target.mesh);
+    if let Some(auxiliary_id) = auxiliary_id {
+        let auxiliary = operands
+            .remove("auxiliary_target")
+            .and_then(|mut operands| operands.pop())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "shrinkwrap auxiliary target mesh was not resolved",
+                    json!({"modifier_id":modifier.id,"auxiliary_target":auxiliary_id}),
+                )
+            })?;
+        let subject_to_auxiliary = crate::geom::blender_matrix::shrinkwrap_subject_to_target(
+            doc,
+            subject_id,
+            &auxiliary_id,
+            world_matrices,
+        )
+        .unwrap_or_else(|| auxiliary.local_to_subject.inverse());
+        resolved.runtime.shrinkwrap_auxiliary_subject_to_target =
+            Some(subject_to_auxiliary.to_cols_array());
+        resolved.runtime.shrinkwrap_auxiliary_target_mesh = Some(auxiliary.mesh);
+    }
+    *mesh = crate::geom::modifiers::evaluate_modifiers(
+        mesh,
+        &[resolved],
+        scene_subject_name(doc, subject_id)?,
+    )?;
+    Ok(())
+}
+
+/// An object-reference parameter of a Shrinkwrap: `None` when the value is null or absent.
+fn shrinkwrap_object_reference(modifier: &Modifier, parameter: &str) -> Result<Option<Id>> {
+    match modifier.params.get(parameter) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Id::new(text.to_owned()).map(Some).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                error.message,
+                json!({"modifier_id":modifier.id,"parameter":parameter,"object":text}),
+            )
+        }),
+        Some(_) => Err(PotError::invalid_argument(format!(
+            "modifier `shrinkwrap` `{parameter}` must be an object ID"
+        ))),
+    }
+}
+
+fn is_scene_mesh_object(modifier: &Modifier, doc: &SceneDoc, object_id: &Id) -> Result<bool> {
+    let object = doc.nodes.get(object_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            format!("modifier operand object `{object_id}` was not found"),
+            json!({"modifier_id":modifier.id,"object":object_id}),
+        )
+    })?;
+    Ok(object.kind == "mesh"
+        && object
+            .data
+            .as_ref()
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .is_some_and(|data| data.data_type == "mesh"))
+}
+
 fn apply_generic_scene_mesh_operand_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -3648,15 +3903,9 @@ fn apply_generic_scene_mesh_operand_modifier(
         world_matrices,
         evaluated_meshes,
     )?;
-    let object_parameter =
-        if modifier.modifier_type == "shrinkwrap" && modifier.params.contains_key("target") {
-            "target"
-        } else {
-            "object"
-        };
     let mut combined = None;
     let mut curve_object_matrix = None;
-    for operand in operands.get(object_parameter).into_iter().flatten() {
+    for operand in operands.get("object").into_iter().flatten() {
         if modifier.modifier_type == "curve" && curve_object_matrix.is_none() {
             curve_object_matrix = Some(operand.local_to_subject.to_cols_array());
         }
@@ -3729,9 +3978,17 @@ pub(crate) fn apply_scene_operand_modifier(
         )?;
         return Ok(());
     }
-    if matches!(modifier.modifier_type.as_str(), "shrinkwrap" | "curve")
-        && !modifier.params.contains_key("collection")
-    {
+    if modifier.modifier_type == "shrinkwrap" {
+        return apply_scene_shrinkwrap_modifier(
+            mesh,
+            modifier,
+            subject_id,
+            doc,
+            world_matrices,
+            evaluated_meshes,
+        );
+    }
+    if modifier.modifier_type == "curve" && !modifier.params.contains_key("collection") {
         return apply_generic_scene_mesh_operand_modifier(
             mesh,
             modifier,
@@ -3743,34 +4000,20 @@ pub(crate) fn apply_scene_operand_modifier(
     }
     let mut object_ids = BTreeSet::new();
     let mut collection_id = None;
-    let object_parameter = if modifier.modifier_type == "shrinkwrap" {
-        "target"
-    } else {
-        "object"
-    };
-    if let Some(value) = modifier.params.get(object_parameter) {
+    if let Some(value) = modifier.params.get("object") {
         let text = value.as_str().ok_or_else(|| {
             PotError::invalid_argument(format!(
-                "modifier `{}` `{object_parameter}` must be an object ID",
+                "modifier `{}` `object` must be an object ID",
                 modifier.modifier_type
             ))
         })?;
         let object_id = Id::new(text).map_err(|_| {
             PotError::invalid_argument(format!(
-                "modifier `{}` `{object_parameter}` must be a valid object ID",
+                "modifier `{}` `object` must be a valid object ID",
                 modifier.modifier_type
             ))
         })?;
         object_ids.insert(object_id);
-    } else if modifier.modifier_type == "shrinkwrap"
-        && let Some(value) = modifier.params.get("object")
-    {
-        let text = value.as_str().ok_or_else(|| {
-            PotError::invalid_argument("shrinkwrap `object` must be an object ID")
-        })?;
-        object_ids.insert(Id::new(text).map_err(|_| {
-            PotError::invalid_argument("shrinkwrap `object` must be a valid object ID")
-        })?);
     }
     if let Some(value) = modifier.params.get("collection") {
         let text = value.as_str().ok_or_else(|| {
@@ -3800,7 +4043,7 @@ pub(crate) fn apply_scene_operand_modifier(
                 "modifier `{}` requires an object or collection operand",
                 modifier.modifier_type
             ),
-            json!({"modifier_id":modifier.id,"pointer":format!("/params/{object_parameter}")}),
+            json!({"modifier_id":modifier.id,"pointer":"/params/object"}),
         ));
     }
     let subject_world = world_matrices.get(subject_id).copied().ok_or_else(|| {
@@ -4605,6 +4848,78 @@ fn lattice_vertex_group_weights(
     ))
 }
 
+/// The Volume to Mesh resolution of a modifier: `resolution_mode`, with `voxel_size` or `voxel_amount`
+/// for the resampled modes (`MOD_volume_to_mesh.cc`).
+fn volume_to_mesh_resolution(
+    modifier: &Modifier,
+) -> Result<crate::geom::volume::VolumeToMeshResolution> {
+    let default = |parameter: &str| {
+        crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            parameter,
+        )
+        .cloned()
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                format!("volume_to_mesh default `{parameter}` is missing"),
+            )
+        })
+    };
+    let mode_value = match modifier.params.get("resolution_mode") {
+        Some(value) => value.clone(),
+        None => default("resolution_mode")?,
+    };
+    let mode = mode_value.as_str().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "volume_to_mesh resolution_mode must be a string",
+            json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+        )
+    })?;
+    Ok(match mode {
+        "GRID" => crate::geom::volume::VolumeToMeshResolution::Grid,
+        "VOXEL_SIZE" => {
+            let size = match modifier.params.get("voxel_size") {
+                Some(value) => value.as_f64(),
+                None => default("voxel_size")?.as_f64(),
+            }
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh voxel_size must be a number",
+                    json!({"modifier_id":modifier.id,"parameter":"voxel_size"}),
+                )
+            })?;
+            crate::geom::volume::VolumeToMeshResolution::VoxelSize(size)
+        }
+        "VOXEL_AMOUNT" => {
+            let amount = match modifier.params.get("voxel_amount") {
+                Some(value) => value.clone(),
+                None => default("voxel_amount")?,
+            }
+            .as_u64()
+            .and_then(|amount| u32::try_from(amount).ok())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh voxel_amount must be a non-negative integer",
+                    json!({"modifier_id":modifier.id,"parameter":"voxel_amount"}),
+                )
+            })?;
+            crate::geom::volume::VolumeToMeshResolution::VoxelAmount(amount)
+        }
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh resolution_mode must be GRID, VOXEL_SIZE, or VOXEL_AMOUNT",
+                json!({"modifier_id":modifier.id,"parameter":"resolution_mode"}),
+            ));
+        }
+    })
+}
+
 pub(crate) fn apply_volume_to_mesh_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -4707,15 +5022,96 @@ pub(crate) fn apply_volume_to_mesh_modifier(
             "volume_to_mesh source transform must be invertible",
         ));
     }
-    let volume_to_mesh = source_inverse * volume_world;
-    let mut extracted = crate::geom::volume::volume_to_mesh(volume, threshold)?;
-    for vertex in &mut extracted.vertices {
-        vertex.co = volume_to_mesh.transform_point3(vertex.co);
-        if !vertex.co.is_finite() {
-            return Err(PotError::invalid_argument(
-                "volume_to_mesh produced non-finite mesh coordinates",
-            ));
-        }
+    // `world_to_object(carrier) * object_to_world(volume)` in float (`MOD_volume_to_mesh.cc`); the exact
+    // replay applies when both objects have one, else the `f64` product is used.
+    let volume_to_mesh = crate::geom::blender_matrix::volume_to_carrier_f32(
+        doc,
+        source_node_id,
+        &volume_id,
+        matrices,
+    )
+    .unwrap_or_else(|| source_inverse * volume_world);
+    let grid_name = match modifier.params.get("grid_name") {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidArgument,
+                    "volume_to_mesh grid_name must be a string",
+                    json!({"modifier_id":modifier.id,"parameter":"grid_name"}),
+                )
+            })?
+            .to_owned(),
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "grid_name",
+        )
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("density")
+        .to_owned(),
+    };
+    let adaptivity = match modifier.params.get("adaptivity") {
+        Some(value) => value.as_f64().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh adaptivity must be a number",
+                json!({"modifier_id":modifier.id,"parameter":"adaptivity"}),
+            )
+        })?,
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "adaptivity",
+        )
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0),
+    };
+    // The output transform is applied inside the extraction, in double precision, before the single
+    // rounding to `float` that Blender's mesh positions carry (`MOD_volume_to_mesh.cc`).
+    let use_smooth_shade = match modifier.params.get("use_smooth_shade") {
+        Some(value) => value.as_bool().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "volume_to_mesh use_smooth_shade must be a boolean",
+                json!({"modifier_id":modifier.id,"parameter":"use_smooth_shade"}),
+            )
+        })?,
+        None => crate::params::default_value(
+            crate::params::ParameterFamily::Modifier,
+            "volume_to_mesh",
+            "use_smooth_shade",
+        )
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false),
+    };
+    let resolution = volume_to_mesh_resolution(modifier)?;
+    // Blender returns an empty mesh for a zero voxel size or voxel amount (`MOD_volume_to_mesh.cc`).
+    if match resolution {
+        crate::geom::volume::VolumeToMeshResolution::VoxelSize(size) => size <= 0.0,
+        crate::geom::volume::VolumeToMeshResolution::VoxelAmount(amount) => amount == 0,
+        crate::geom::volume::VolumeToMeshResolution::Grid => false,
+    } {
+        *mesh = Mesh::default();
+        return Ok(());
+    }
+    let extracted = crate::geom::volume::volume_to_mesh_placed(
+        volume,
+        threshold,
+        &grid_name,
+        adaptivity,
+        volume_to_mesh,
+        use_smooth_shade,
+        resolution,
+    )?;
+    if extracted
+        .vertices
+        .iter()
+        .any(|vertex| !vertex.co.is_finite())
+    {
+        return Err(PotError::invalid_argument(
+            "volume_to_mesh produced non-finite mesh coordinates",
+        ));
     }
     *mesh = extracted;
     Ok(())
@@ -4754,10 +5150,12 @@ fn instance_collection_target(node: &Node) -> Result<Option<Id>> {
 /// that instance alone.
 const INSTANCE_JOIN_FAILURE: &str = "collection_instance_join_failed";
 
-/// A collection member before joining: its mesh and member-local UV/color bindings.
+/// A collection member before joining: its mesh, its Generated per vertex (in its own texture space), and
+/// member-local UV/color bindings.
 struct CollectionMember<'a> {
     mesh: Cow<'a, Mesh>,
     matrix: DMat4,
+    generated: Vec<GeneratedVertex>,
     slots: Vec<SlotBinding>,
     adaptive_normals: Option<Cow<'a, [Option<DVec3>]>>,
     uv_names: Vec<String>,
@@ -4765,13 +5163,15 @@ struct CollectionMember<'a> {
     color_names: Vec<String>,
 }
 
-/// A joined collection instance and the source bindings/coverage to propagate through nesting.
+/// A joined collection instance and the source bindings/coverage to propagate through nesting. `generated` is
+/// aligned with `mesh.vertices`.
 struct CollectionEvaluation {
     mesh: Mesh,
     paths: Vec<Vec<Id>>,
     bindings: Vec<SlotBinding>,
     uv_coverage: Vec<u8>,
     adaptive_normals: Option<Vec<Option<DVec3>>>,
+    generated: Vec<GeneratedVertex>,
 }
 
 struct JoinedMemberBindings {
@@ -5002,6 +5402,7 @@ fn evaluate_collection_instance<'a>(
     let mut parts = Vec::with_capacity(members.len());
     let mut member_bindings = Vec::with_capacity(members.len());
     let mut slot_base = 0;
+    let mut generated = Vec::new();
     for member in members {
         let material_offset = u32::try_from(slot_base).map_err(|_| {
             PotError::new(
@@ -5010,6 +5411,14 @@ fn evaluate_collection_instance<'a>(
             )
         })?;
         let slot_count = member.slots.len();
+        if member.generated.len() != member.mesh.vertices.len() {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "collection member Generated does not match its vertices",
+            ));
+        }
+        // The join appends each member's vertices in order, so their Generated values join in the same order.
+        generated.extend(member.generated);
         parts.push(Part {
             mesh: member.mesh,
             matrix: member.matrix,
@@ -5038,6 +5447,12 @@ fn evaluate_collection_instance<'a>(
         concatenate(parts).map(|mesh| (mesh, None))
     }
     .map_err(|error| instance_join_error(error, instance_id))?;
+    if generated.len() != mesh.vertices.len() {
+        return Err(PotError::new(
+            ErrorCode::InternalError,
+            "collection instance Generated does not match its vertices",
+        ));
+    }
     let joined_uv_names = uv_layers::read_layers(&mesh)
         .into_iter()
         .map(|layer| layer.name)
@@ -5087,6 +5502,7 @@ fn evaluate_collection_instance<'a>(
         bindings,
         uv_coverage,
         adaptive_normals,
+        generated,
     })
 }
 
@@ -5176,6 +5592,7 @@ fn append_collection_geometry<'a>(
                 nested.paths,
                 nested.bindings,
                 nested.adaptive_normals.map(Cow::Owned),
+                nested.generated,
                 uv_names,
                 nested.uv_coverage,
                 color_names,
@@ -5204,6 +5621,18 @@ fn append_collection_geometry<'a>(
                     |evaluated| evaluated.materials.clone(),
                 );
                 let slots = member_slot_bindings(&materials, source_mesh, &uv_store, &color_names);
+                // Blender computes a member's texture space on its undeformed mesh, before its modifiers.
+                let undeformed = source_data
+                    .and_then(|data| data.mesh.as_ref())
+                    .unwrap_or(source_mesh);
+                let texture_space = undeformed
+                    .manual_texture_space()
+                    .unwrap_or_else(|| TextureSpace::automatic(undeformed.bounds()));
+                let generated: Vec<GeneratedVertex> = source_mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| texture_space.generated_vertex(vertex.co))
+                    .collect();
                 (
                     Cow::Borrowed(source_mesh),
                     vec![vec![object_id.clone()]],
@@ -5211,6 +5640,7 @@ fn append_collection_geometry<'a>(
                     adaptive_normals
                         .get(object_id)
                         .map(|normals| Cow::Borrowed(normals.as_slice())),
+                    generated,
                     uv_names,
                     uv_coverage,
                     color_names,
@@ -5222,6 +5652,7 @@ fn append_collection_geometry<'a>(
             nested_paths,
             slots,
             member_normals,
+            generated,
             uv_names,
             uv_coverage,
             color_names,
@@ -5239,6 +5670,7 @@ fn append_collection_geometry<'a>(
             members.push(CollectionMember {
                 mesh: nested_mesh,
                 matrix: source_matrix,
+                generated,
                 slots,
                 adaptive_normals: member_normals,
                 uv_names,
@@ -6215,6 +6647,13 @@ fn apply_volume_displace_modifier(
             json!({"node_id":volume_id}),
         )
     })?;
+    // Blender's `ctx->object->object_to_world()` is composed in float (`object.cc`); the exact
+    // replay is used when it applies, else the f64 world matrix is rounded.
+    let subject_world =
+        crate::geom::blender_matrix::object_to_world(doc, volume_id, world_matrices, 0)
+            .map_or(volume_world, |matrix| {
+                crate::geom::blender_matrix::dmat4_from_blender(&matrix)
+            });
     let texture_mapping = if texture_source.is_some()
         && params
             .get("strength")
@@ -6223,7 +6662,7 @@ fn apply_volume_displace_modifier(
     {
         texture_coordinate_mapping_with_parameters(
             modifier,
-            volume_world,
+            subject_world,
             doc,
             world_matrices,
             bone_pose_matrices,

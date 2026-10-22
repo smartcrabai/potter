@@ -34,6 +34,9 @@ codegen-units = 1
 lto = true
 strip = true
 
+[profile.test]
+opt-level = 2
+
 [lints]
 workspace = true
 
@@ -65,7 +68,7 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
   "webp",
 ] }
-jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "45ae2382fbb2e2c67ee73ec9a99fc45c07b6bfe2" }
+jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "59fa887c8dd9bb76f8216012e3ed5eaf1ab20f0f" }
 jsonschema = "=0.59.0"
 lz4_flex = "0.14"
 num-rational = "0.4.2"

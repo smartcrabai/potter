@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":7},
+        "schema_version":{"const":8},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -105,6 +105,7 @@ fn scene_schema() -> Value {
         "resources":{"type":"object","additionalProperties":{"type":"object","properties":{"storage":{"const":"inline"},"kind":{"type":"string"}},"allOf":[{"if":{"required":["storage"]},"then":{"required":["kind"],"allOf":[{"if":{"properties":{"kind":{"const":"legacy_texture"}},"required":["kind"]},"then":{"$ref":"#/$defs/legacy_texture_resource"}}]}}]}},
         "libraries":registry_schema("library"),
         "compatibility":{"type":"object"},
+        "accepted_losses":{"type":"array","items":{"type":"string"},"uniqueItems":true},
         "avatar":avatar_settings_schema(),
         "history":{"$ref":"#/$defs/history"}
     });
@@ -128,7 +129,8 @@ fn scene_schema() -> Value {
         "force_field":{"type":"object","properties":{"type":{"enum":["wind","vortex","force"]},"strength":{"type":"number"},"falloff":{"type":"number","minimum":0}},"additionalProperties":false},
         "collection":{"type":"object","required":["name","children","objects"],"properties":{"name":{"type":"string"},"children":{"type":"array","items":{"$ref":"#/$defs/id"}},"objects":{"type":"array","items":{"$ref":"#/$defs/id"}}},"additionalProperties":false},
         "transform":{"type":"object","required":["translation","rotation","scale","rotation_mode"],"properties":{"translation":{"$ref":"#/$defs/vec3"},"rotation":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"scale":{"$ref":"#/$defs/vec3"},"rotation_mode":{"type":"string"}},"additionalProperties":false},
-        "modifier":{"type":"object","required":["id","type","name","enabled","params"],"properties":{"id":{"$ref":"#/$defs/id"},"type":{"type":"string"},"name":{"type":"string"},"enabled":{"type":"boolean"},"show_viewport":{"type":"boolean"},"show_render":{"type":"boolean"},"params":{"type":"object"}},"additionalProperties":false},
+        "modifier":{"type":"object","required":["id","type","name","enabled","params"],"properties":{"id":{"$ref":"#/$defs/id"},"type":{"type":"string"},"name":{"type":"string"},"enabled":{"type":"boolean"},"show_viewport":{"type":"boolean"},"show_render":{"type":"boolean"},"params":{"type":"object"},"baked_ocean_cache":{"$ref":"#/$defs/ocean_bake_cache"}},"additionalProperties":false},
+        "ocean_bake_cache":{"type":"object","required":["frame_start","frame_end","resolution","manifest"],"properties":{"frame_start":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"frame_end":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"resolution":{"type":"integer","minimum":0,"maximum":u32::MAX},"manifest":{"type":"object","additionalProperties":{"type":"string"}}},"additionalProperties":false},
         "library":{"type":"object","required":["name","kind","uri","resolved_path","resource","hash","status","linked_ids","overrides","items","source_project"],"properties":{"name":{"type":"string"},"kind":{"enum":["potter_project","blend"]},"uri":{"type":"string"},"resolved_path":{"type":"string"},"resource":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"hash":{"type":"string"},"status":{"enum":["ok","missing","changed"]},"linked_ids":{"type":"object","propertyNames":{"enum":["nodes","data_blocks","materials","collections","actions","node_groups","worlds","resources"]},"additionalProperties":{"type":"array","items":{"$ref":"#/$defs/id"}}},"overrides":{"type":"array","items":{"$ref":"#/$defs/library_override"}},"items":{"type":"object","additionalProperties":{"type":"string"}},"source_project":{"type":["string","null"]}},"additionalProperties":false},
         "library_override":{"type":"object","required":["registry","id","reference_id","properties"],"properties":{"registry":{"type":"string"},"id":{"$ref":"#/$defs/id"},"reference_id":{"$ref":"#/$defs/id"},"properties":{"type":"array","items":{"$ref":"#/$defs/library_override_property"}}},"additionalProperties":false},
         "library_override_property":{"type":"object","required":["path","operation","value"],"properties":{"path":{"type":"string"},"operation":{"enum":["replace","insert_after","delete"]},"value":{}},"additionalProperties":false},
@@ -178,6 +180,9 @@ fn scene_schema() -> Value {
     root["$defs"]["node"]["properties"]["material_links"] = json!({
         "type":"array",
         "items":{"enum":["data","object"]}
+    });
+    root["$defs"]["node"]["properties"]["ray_visibility"] = json!({
+        "oneOf":[{"type":"null"},{"type":"object","required":["camera","diffuse","glossy","transmission","volume_scatter","shadow"],"properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false}]
     });
     root["$defs"]["captured_matrix_basis"] = json!({
         "type":"object",
@@ -312,11 +317,15 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["pixel_filter_type"] =
         json!({"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"],"default":"BLACKMAN_HARRIS"});
     render["properties"]["filter_width"] = json!({"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX,"default":crate::model::DEFAULT_FILTER_WIDTH});
+    render["properties"]["filter_size"] = json!({"type":"number","minimum":0,"maximum":500});
+    render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0,"maximum":10});
+    render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
 
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
     let material = &mut defs["material"];
     material["properties"]["use_transparent_shadow"] = json!({"type":"boolean"});
+    material["properties"]["use_bump_map_correction"] = json!({"type":"boolean"});
     material["required"] = json!([
         "name",
         "base_color",
@@ -344,6 +353,9 @@ fn complete_scene_schema(root: &mut Value) {
     material["properties"]["alpha_mode"] = json!({"enum":["opaque","blend","clip"]});
     material["properties"]["alpha_threshold"] = json!({"type":"number","minimum":0,"maximum":1});
     material["properties"]["displacement_method"] = json!({"enum":["bump","displacement"]});
+    material["properties"]["volume_sampling"] =
+        json!({"enum":["distance","equiangular","multiple_importance"]});
+    material["properties"]["volume_interpolation"] = json!({"enum":["linear","cubic"]});
     material["properties"]["displacement_scale"] = json!({"type":"number"});
     material["properties"]["displacement_midlevel"] =
         json!({"type":"number","minimum":0,"maximum":1});
@@ -991,6 +1003,7 @@ fn operation_contract(name: &str) -> OperationContract {
                 "roughness",
                 "double_sided",
                 "use_transparent_shadow",
+                "use_bump_map_correction",
                 "emission_color",
                 "emission_strength",
                 "transmission",
@@ -1003,6 +1016,8 @@ fn operation_contract(name: &str) -> OperationContract {
                 "volume_density",
                 "volume_color",
                 "volume_anisotropy",
+                "volume_sampling",
+                "volume_interpolation",
                 "displacement_scale",
                 "displacement_midlevel",
             ],
@@ -1210,7 +1225,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec!["op", "target"],
             "mesh object and edges",
             "shared|single_user for shared data",
-            json!({"angle":std::f64::consts::FRAC_PI_4}),
+            json!({"angle":std::f64::consts::FRAC_PI_6}),
         ),
         "mesh.set_custom_normals" => (
             vec!["target", "scope", "elements", "normals"],
@@ -1693,6 +1708,34 @@ fn operation_contract(name: &str) -> OperationContract {
             "camera object",
             "none",
             json!({"tags":[],"visible":true,"render_visible":true,"selectable":true,"projection":"perspective"}),
+        ),
+        "volume.create" => (
+            vec![
+                "id",
+                "name",
+                "data_id",
+                "grids",
+                "source",
+                "collection",
+                "transform",
+                "parent",
+                "parent_inverse",
+                "materials",
+                "visible",
+                "render_visible",
+                "selectable",
+            ],
+            vec!["op"],
+            "volume object",
+            "none",
+            json!({}),
+        ),
+        "volume.update" => (
+            vec!["target", "set"],
+            vec!["op", "target", "set"],
+            "volume object",
+            "none",
+            json!({}),
         ),
         "camera.update" => (
             vec!["target", "set"],
@@ -2188,6 +2231,8 @@ fn field_schema(operation: &str, field: &str) -> Value {
                 json!({"type":"number","minimum":0,"maximum":1})
             }
             "displacement_method" => json!({"enum":["bump","displacement"]}),
+            "volume_sampling" => json!({"enum":["distance","equiangular","multiple_importance"]}),
+            "volume_interpolation" => json!({"enum":["linear","cubic"]}),
             "volume_density" => json!({"type":"number","minimum":0}),
             "volume_color" => {
                 json!({"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3})
@@ -2426,6 +2471,7 @@ fn set_schema(operation: &str) -> Value {
             "transform":{"type":"object","properties":{"translation":vec_schema(3),"rotation_deg":vec_schema(3),"rotation":vec_schema(4),"scale":vec_schema(3)},"additionalProperties":false},
             "params":{"type":"object"},"materials":{"type":"array","items":{"oneOf":[id_schema(),{"type":"null"}]}},
             "visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},
+            "ray_visibility":{"type":"object","properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false},
             "action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}
         }),
         "shape_key.update" => json!({
@@ -2485,10 +2531,13 @@ fn set_schema(operation: &str) -> Value {
             "samples":{"type":"integer","minimum":1,"maximum":1_000_000},
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "volume_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
             "filter_width":{"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX},
+            "filter_glossy":{"type":"number","minimum":0,"maximum":10},
             "film_transparent":{"type":"boolean"},
+            "filter_size":{"type":"number","minimum":0,"maximum":500},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},
             "audio_codec":{"enum":["wav","flac"]},
@@ -2510,60 +2559,121 @@ fn physics_settings_schema(operation: &str) -> Value {
     json!({"type":"object","properties":properties,"additionalProperties":false})
 }
 
+/// Blender RNA settings that operation `system` accepts, typed from their generated defaults.
+///
+/// Every Blender name is listed, so a non-honoured value reaches ops, which refuses it with
+/// `UnsupportedFeature`. A type comes from the defaults only when every table that holds the name
+/// agrees on it. A `null` default says nothing about the type.
+fn blender_schema_properties(system: &str) -> Map<String, Value> {
+    const ROLE_TABLES: [&str; 8] = [
+        "fluid_domain",
+        "fluid_domain_liquid",
+        "fluid_flow",
+        "fluid_effector",
+        "dynamic_paint_canvas",
+        "dynamic_paint_surface",
+        "dynamic_paint_brush",
+        "point_cache",
+    ];
+    const DYNAMIC_PAINT_TABLES: [&str; 3] = [
+        "dynamic_paint_canvas",
+        "dynamic_paint_surface",
+        "dynamic_paint_brush",
+    ];
+    let tables: &[&str] = match system {
+        "cloth" => &["cloth"],
+        "soft_body" => &["soft_body"],
+        "collision" => &["collision"],
+        // Fluid takes every role's Blender names, as ops does. Dynamic paint takes only its own roles.
+        "fluid" => &ROLE_TABLES,
+        "dynamic_paint" => &DYNAMIC_PAINT_TABLES,
+        _ => &[],
+    };
+    let mut names = std::collections::BTreeSet::new();
+    let mut kinds = std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+    for table in tables {
+        for (name, default) in crate::physics_support::blender_properties(table)
+            .into_iter()
+            .flatten()
+        {
+            names.insert(name.as_str());
+            if let Some(kind) = json_type(default) {
+                kinds.entry(name.as_str()).or_default().insert(kind);
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let schema = match kinds.get(name) {
+                Some(types) if types.len() == 1 => json!({"type": types.iter().next().copied()}),
+                _ => json!({}),
+            };
+            (name.to_owned(), schema)
+        })
+        .collect()
+}
+
+fn json_type(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(_) => Some("number"),
+        Value::String(_) => Some("string"),
+        Value::Array(_) => Some("array"),
+        Value::Object(_) => Some("object"),
+        Value::Null => None,
+    }
+}
+
 fn physics_settings_properties(operation: &str) -> Value {
     let system = operation
         .strip_prefix("physics.")
         .and_then(|name| name.split_once('.'))
         .map(|(system, _)| system)
         .unwrap_or_default();
+    let mut properties = blender_schema_properties(system);
+    if let Value::Object(native) = physics_native_properties(system) {
+        properties.extend(native);
+    }
+    Value::Object(properties)
+}
+
+/// Potter-native and explicitly ranged settings of a physics system. They override the Blender names.
+fn physics_native_properties(system: &str) -> Value {
     match system {
         "cloth" => json!({
-            "stiffness":{"type":"number","minimum":0,"maximum":1},
-            "structural_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "shear_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "bend_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "air_drag":{"type":"number","minimum":0},"drag":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "substeps":{"type":"integer","minimum":1,"maximum":32},
-            "iterations":{"type":"integer","minimum":1,"maximum":64},
             "quality":{"type":"integer","minimum":1,"maximum":32},
-            "pin_group":{"type":"string","minLength":1},
-            "tension_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "compression_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "bending_stiffness":{"type":"number","minimum":0,"maximum":1},
+            "iterations":{"type":"integer","minimum":1,"maximum":64},
             "mass":{"type":"number","exclusiveMinimum":0},
             "air_damping":{"type":"number","minimum":0},
-            "vertex_group_mass":{"type":"string","minLength":1},
-            "use_collision":{"type":"boolean"},
-            "collision_distance":{"type":"number","minimum":0},
-            "use_self_collision":{"type":"boolean"},
-            "self_collision_distance":{"type":"number","minimum":0},
-            "distance_min":{"type":"number","minimum":0},
+            "tension_stiffness":{"type":"number","minimum":0},
+            "compression_stiffness":{"type":"number","minimum":0},
+            "shear_stiffness":{"type":"number","minimum":0},
+            "bending_stiffness":{"type":"number","minimum":0},
+            "bending_model":{"enum":["ANGULAR","LINEAR"]},
+            "vertex_group_mass":{"type":"string"},
+            "collision_settings":{"type":"object","properties":{
+                "use_collision":{"type":"boolean"},
+                "distance_min":{"type":"number","minimum":0},
+                "use_self_collision":{"type":"boolean"},
+                "self_distance_min":{"type":"number","minimum":0},
+                "collection":{"type":["string","null"]}
+            }}
         }),
         "soft_body" => json!({
-            "stiffness":{"type":"number","minimum":0,"maximum":1},
-            "edge_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "volume_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "goal_group":{"type":"string","minLength":1},
-            "vertex_group_goal":{"type":"string","minLength":1},
-            "goal_strength":{"type":"number","minimum":0,"maximum":1},
-            "goal_stiffness":{"type":"number","minimum":0,"maximum":1},
             "substeps":{"type":"integer","minimum":1,"maximum":32},
             "iterations":{"type":"integer","minimum":1,"maximum":64},
-            "quality":{"type":"integer","minimum":1,"maximum":32},
-            "air_drag":{"type":"number","minimum":0},"drag":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "restitution":{"type":"number","minimum":0,"maximum":1},
-            "goal_spring":{"type":"number","minimum":0,"maximum":1},
-            "goal_friction":{"type":"number","minimum":0,"maximum":1},
-            "goal_default":{"type":"number","minimum":0,"maximum":1},
-            "goal_min":{"type":"number"},
-            "goal_max":{"type":"number"},
             "mass":{"type":"number","exclusiveMinimum":0},
             "friction":{"type":"number","minimum":0},
             "speed":{"type":"number","minimum":0},
-            "plastic":{"type":"number","minimum":0,"maximum":1},
-            "bend":{"type":"number","minimum":0,"maximum":1},
+            "goal_spring":{"type":"number","minimum":0,"maximum":1},
+            "goal_default":{"type":"number","minimum":0,"maximum":1},
+            "goal_min":{"type":"number"},
+            "goal_max":{"type":"number"},
+            "use_goal":{"type":"boolean"},
+            "use_edges":{"type":"boolean"},
+            "vertex_group_goal":{"type":"string"},
+            "collision_collection":{"type":["string","null"]}
         }),
         "particle_emitter" => json!({
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
@@ -2587,40 +2697,54 @@ fn physics_settings_properties(operation: &str) -> Value {
             "child_radius":{"type":"number","minimum":0},
             "child_type":{"enum":["NONE","SIMPLE","INTERPOLATED"]},
             "frame_start":{"type":"number"},
-            "frame_end":{"type":"number"}
+            "frame_end":{"type":"number"},
+            "source":{"enum":["faces","vertices"]},
+            "velocity":vec_schema(3),
+            "normal_velocity":{"type":"number","minimum":0},
+            "render_as":{"enum":["points","object","hair_curves"]},
+            "instance_object":{"type":"string","minLength":1},
+            "hair_length":{"type":"number","exclusiveMinimum":0},
+            "start_frame":{"type":"number"},
+            "end_frame":{"type":"number"}
         }),
         "fluid" => json!({
-            "type":{"enum":["liquid","smoke","fire"]},
+            "domain_type":{"enum":["LIQUID","GAS"]},
+            "particle_radius":{"type":"number","minimum":0},
+            "resolution_max":{"type":"integer","minimum":1},
+            "cache_frame_start":{"type":"number"},
+            "cache_frame_end":{"type":"number"},
+            "effector_group":{"type":["string","null"]},
             "resolution":{"type":"integer","minimum":1,"maximum":10},
-            "particle_radius":{"type":"number","exclusiveMinimum":0},
             "smoothing_length":{"type":"number","exclusiveMinimum":0},
             "pressure_stiffness":{"type":"number","minimum":0},
             "viscosity":{"type":"number","minimum":0},
+            "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
+            "flow_type":{"enum":["SMOKE","LIQUID","FIRE","BOTH"]},
+            "flow_behavior":{"enum":["GEOMETRY","INFLOW","OUTFLOW"]},
+            "flow_source":{"enum":["PARTICLES","MESH"]},
+            "density":{"type":"number","minimum":0,"maximum":10},
             "inflow_rate":{"type":"number","minimum":0},
-            "seed":{"type":"integer","minimum":0,"maximum":u32::MAX}
+            "effector_type":{"enum":["COLLISION","GUIDE"]},
+            "use_effector":{"type":"boolean"}
         }),
         "dynamic_paint" => json!({
             "role":{"enum":["canvas","brush"]},
             "radius":{"type":"number","exclusiveMinimum":0},
             "color":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},
-            "strength":{"type":"number","minimum":0,"maximum":1},
+            "strength":{"type":"number","minimum":0},
             "brushes":{"type":"array","items":id_schema()},
-            "surface_format":{"enum":["color","weight"]}
+            "surface_format":{"enum":["color","weight"]},
+            "paint_color":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":4},
+            "paint_alpha":{"type":"number","minimum":0},
+            "paint_distance":{"type":"number","minimum":0}
         }),
         "collision" => json!({
-            "thickness":{"type":"number","minimum":0},
+            "use":{"type":"boolean"},
             "thickness_outer":{"type":"number","minimum":0},
             "thickness_inner":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "damping_factor":{"type":"number","minimum":0,"maximum":1},
-            "damping_random":{"type":"number","minimum":0,"maximum":1},
-            "permeability":{"type":"number","minimum":0,"maximum":1},
-            "stickiness":{"type":"number","minimum":0,"maximum":1},
-            "friction_factor":{"type":"number","minimum":0,"maximum":1},
-            "friction_random":{"type":"number","minimum":0,"maximum":1},
             "use_culling":{"type":"boolean"},
             "use_normal":{"type":"boolean"},
-            "use_particle_kill":{"type":"boolean"}
+            "cloth_friction":{"type":"number","minimum":0,"maximum":80}
         }),
         _ => json!({}),
     }
@@ -2635,6 +2759,7 @@ fn material_set_properties() -> Value {
         "roughness":{"type":"number","minimum":0,"maximum":1},
         "double_sided":{"type":"boolean"},
         "use_transparent_shadow":{"type":"boolean"},
+        "use_bump_map_correction":{"type":"boolean"},
         "emission_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "emission_strength":{"type":"number","minimum":0},
         "transmission":{"type":"number","minimum":0,"maximum":1},
@@ -2644,6 +2769,8 @@ fn material_set_properties() -> Value {
         "metallic_texture":nullable_texture_ref_schema(),
         "normal_texture":nullable_texture_ref_schema(),
         "displacement_method":{"enum":["bump","displacement"]},
+        "volume_sampling":{"enum":["distance","equiangular","multiple_importance"]},
+        "volume_interpolation":{"enum":["linear","cubic"]},
         "volume_density":{"type":"number","minimum":0},
         "volume_color":{"type":"array","items":{"type":"number","minimum":0},"minItems":3,"maxItems":3},
         "volume_anisotropy":{"type":"number","minimum":-0.999,"maximum":0.999},

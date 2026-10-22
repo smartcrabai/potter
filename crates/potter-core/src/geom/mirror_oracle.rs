@@ -455,6 +455,7 @@ fn mirror_codes_survive_reload_through_bisect_and_deformation() -> TestResult {
         ),
         None,
         |_, _, _, _, _| Ok(None),
+        |_, _, _| Ok(None),
     )?
     .mesh;
     let codes = super::clnor::corner_codes(&baked)?.ok_or("Mirror lost the code layer")?;
