@@ -10,4 +10,5 @@ pub use evaluator::{
 };
 pub(crate) use evaluator::{dielectric_f0, heaviest, make_orthonormals, record_unevaluated_inputs};
 pub(crate) use world::equirectangular_uv;
+pub use world::evaluate_world;
 pub(crate) use world::{WorldMixError, WorldMixMode, world_mix_mode};

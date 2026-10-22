@@ -9301,8 +9301,8 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                                     | "ShaderNodeMixRGB"
                                     | "ShaderNodeMixShader"
                                     | "ShaderNodeAddShader"
-                            ) => true,
-                            _ => false,
+                            ) => false,
+                            _ => true,
                         }
                     })
                 });
