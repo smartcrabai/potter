@@ -181,7 +181,7 @@ fn node_axes_are_set_validated_and_round_trip_through_blend() -> TestResult<()> 
     let imported = import_blend(&blend, Some(blender.as_path()))?;
     let imported_id = imported
         .id_mappings
-        .get(&format!("Object:{OBJECT}"))
+        .get(format!("Object:{OBJECT}"))
         .and_then(Value::as_str)
         .ok_or("Blender axis object ID mapping is missing")?;
     assert_eq!(
