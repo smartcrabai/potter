@@ -334,13 +334,7 @@ pub(crate) fn birth_values(
 
 /// Blender's `CLAMP(v, 0, 1)`: values above 1 or below 0 are pinned, and NaN is returned unchanged.
 fn clamp_unit(value: f64) -> f64 {
-    if value > 1.0 {
-        1.0
-    } else if value < 0.0 {
-        0.0
-    } else {
-        value
-    }
+    value.clamp(0.0, 1.0)
 }
 
 /// Blender's `CLAMP_WARP_PARTICLE_TEXTURE_POS`: a negative value wraps to `1 + value`, then clamps.
