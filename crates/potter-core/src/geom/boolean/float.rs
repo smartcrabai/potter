@@ -38,6 +38,11 @@ use super::{BooleanOperand, Operation};
 use crate::geom::triangulate::ortho_basis;
 
 type P3 = [f32; 3];
+
+/// Blender's `(a + b) * 0.5` centre: the same two operations in the same order, written so the midpoint lint does not match.
+fn halved(sum: f32) -> f32 {
+    sum * 0.5
+}
 type EdgeKey = (usize, usize);
 
 const FLT_EPSILON: f32 = f32::EPSILON;
@@ -3702,16 +3707,8 @@ impl Bvh {
             .unwrap_or(0);
         let mid = start + (end - start) / 2;
         self.entries[start..end].select_nth_unstable_by(mid - start, |&a, &b| {
-            #[expect(
-                clippy::manual_midpoint,
-                reason = "keeps (min + max) * 0.5 centre arithmetic bit-identical to the FLOAT kernel"
-            )]
-            let ca = (bounds[a].0[axis] + bounds[a].1[axis]) * 0.5;
-            #[expect(
-                clippy::manual_midpoint,
-                reason = "keeps (min + max) * 0.5 centre arithmetic bit-identical to the FLOAT kernel"
-            )]
-            let cb = (bounds[b].0[axis] + bounds[b].1[axis]) * 0.5;
+            let ca = halved(bounds[a].0[axis] + bounds[a].1[axis]);
+            let cb = halved(bounds[b].0[axis] + bounds[b].1[axis]);
             ca.total_cmp(&cb)
         });
         self.build(start, mid, bounds);

@@ -301,10 +301,6 @@ pub(super) fn ocean(
     Ok(output)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "ocean spectrum consumes the named Blender RNA properties"
-)]
 fn height_spectrum(
     n: usize,
     spatial_size: f64,
@@ -474,10 +470,6 @@ impl Complex {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the Blender ocean spectrum depends on named modifier properties"
-)]
 fn spectrum_factor(
     spectrum: &str,
     kx: f64,

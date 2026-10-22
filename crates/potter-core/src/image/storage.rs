@@ -723,7 +723,7 @@ fn decode_exr_with_image_user(
     let color_pass = is_exr_color_pass(channel_count, &channel_ids);
     let mut pixels = Vec::with_capacity(pixel_count);
     for index in 0..pixel_count {
-        let mut pixel = if channel_count == 1 {
+        let pixel = if channel_count == 1 {
             let value = exr_sample(pass.channels[0].channel, index)?;
             [value; 4]
         } else if channel_count == 3 || channel_count == 4 {

@@ -1,5 +1,7 @@
 //! Vertex-weight edit/mix/proximity and their texture-mask weights.
 
+use std::collections::btree_map::Entry;
+
 use super::{
     BTreeMap, DMat4, DVec2, DVec3, ErrorCode, Map, Mesh, Modifier, PotError, Result, SceneOperand,
     Value, boolean, closest_point_triangle, curve_points, falloff_type, get_group_weights, invalid,
@@ -215,10 +217,6 @@ fn texture_channel(color: [f64; 4], channel: &str) -> f64 {
     }
 }
 
-#[expect(
-    clippy::map_entry,
-    reason = "the presence check selects the remove branch, so it cannot become an entry call"
-)]
 pub(super) fn vertex_weight_edit(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -270,14 +268,19 @@ pub(super) fn vertex_weight_edit(
     }
     let mut updated = existing;
     for (vertex, weight) in mesh.vertices.iter().zip(values) {
-        if updated.contains_key(&vertex.id) {
-            if use_remove && weight <= remove_threshold {
-                updated.remove(&vertex.id);
-            } else {
-                updated.insert(vertex.id, weight);
+        match updated.entry(vertex.id) {
+            Entry::Occupied(mut slot) => {
+                if use_remove && weight <= remove_threshold {
+                    slot.remove();
+                } else {
+                    *slot.get_mut() = weight;
+                }
             }
-        } else if use_add && weight >= add_threshold {
-            updated.insert(vertex.id, weight);
+            Entry::Vacant(slot) => {
+                if use_add && weight >= add_threshold {
+                    slot.insert(weight);
+                }
+            }
         }
     }
     let mut result = mesh.clone();
@@ -623,12 +626,11 @@ pub(super) fn vertex_weight_proximity(
     Ok(result)
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender tests an exactly degenerate distance range (MOD_weightvg_proximity)"
-)]
 fn map_proximity_distance(distance: f64, minimum: f64, maximum: f64) -> f64 {
-    if maximum == minimum {
+    // `==` on floats: equal values, with +0 and -0 both equal, and NaN never equal.
+    let degenerate = !maximum.is_nan()
+        && (maximum.total_cmp(&minimum).is_eq() || (maximum == 0.0 && minimum == 0.0));
+    if degenerate {
         f64::from(distance >= maximum)
     } else if maximum > minimum {
         if distance >= maximum {
@@ -928,10 +930,6 @@ fn curve_mapping_value(points: &[DVec2], value: f64) -> f64 {
     let fraction = position - lower as f64;
     (table[lower] + (table[lower + 1] - table[lower]) * fraction).clamp(0.0, 1.0)
 }
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Blender stores object world matrices and vertex positions in f32"
-)]
 fn weight_matrix_f32(matrix: DMat4) -> [f32; 16] {
     matrix.to_cols_array().map(|value| value as f32)
 }

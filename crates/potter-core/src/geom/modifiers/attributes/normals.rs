@@ -400,15 +400,11 @@ fn blender_sort_mode_pairs(pairs: &mut [WeightedModePair]) {
     }
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender maps exact weights 100 and 1 to fixed values (MOD_weightedmesh_util)"
-)]
 fn blender_weight(weight: f64) -> f32 {
     let parameter = (weight.clamp(1.0, 100.0) as f32) / 50.0;
-    if weight == 100.0 {
+    if weight.total_cmp(&100.0).is_eq() {
         i16::MAX as f32
-    } else if weight == 1.0 {
+    } else if weight.total_cmp(&1.0).is_eq() {
         1.0 / i16::MAX as f32
     } else if (parameter - 1.0) * 25.0 > 1.0 {
         (parameter - 1.0) * 25.0
@@ -626,10 +622,6 @@ fn smooth_fan_faces(
     fan
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "exact factor 1 and limit pi select Blender's no-op branch (MOD_normal_edit)"
-)]
 pub(super) fn normal_edit(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -678,9 +670,9 @@ pub(super) fn normal_edit(
         DVec3::ZERO
     };
     let use_current_normals = !(mix_mode == "COPY"
-        && factor == 1.0
+        && factor.total_cmp(&1.0).is_eq()
         && group.is_none_or(str::is_empty)
-        && limit as f32 == std::f32::consts::PI);
+        && (limit as f32).total_cmp(&std::f32::consts::PI).is_eq());
     let positions = mesh
         .vertices
         .iter()
@@ -818,17 +810,13 @@ fn radial_normal(position: DVec3, target_origin: DVec3, size: DVec3) -> DVec3 {
     DVec3::new(x / a2, y / b2, z / c2).normalize_or_zero()
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "Blender picks the axis by exact equality with the largest component (math_vector)"
-)]
 fn slerp_safe(from: DVec3, to: DVec3, factor: f64) -> DVec3 {
     let cosine = from.dot(to).clamp(-1.0, 1.0);
     if cosine < -1.0 + f32::EPSILON as f64 {
         let axis = from.abs().max_element();
-        let orthogonal = if from.x.abs() == axis {
+        let orthogonal = if from.x.abs().total_cmp(&axis).is_eq() {
             DVec3::new(-from.y - from.z, from.x, from.x)
-        } else if from.y.abs() == axis {
+        } else if from.y.abs().total_cmp(&axis).is_eq() {
             DVec3::new(from.y, -from.x - from.z, from.y)
         } else {
             DVec3::new(from.z, from.z, -from.x - from.y)

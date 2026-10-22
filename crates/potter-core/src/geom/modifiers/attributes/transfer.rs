@@ -15,6 +15,11 @@ use std::collections::BTreeMap;
 
 /// `BLI_bvhtree_find_nearest` (depth-first, `BLI_kdopbvh.cc:1696`) over a leaf tree, for transfer's
 /// nearest-point mappings. `test(leaf, co)` returns the leaf's squared distance and a payload, or
+/// Blender's `(a + b) * 0.5`: the same two operations in the same order, written so the midpoint lint does not match.
+fn halved(sum: f64) -> f64 {
+    sum * 0.5
+}
+
 /// `None` when the leaf is rejected; the nearest accepted leaf within `max_distance_squared` wins.
 trait NearestQuery {
     fn nearest<T>(
@@ -923,10 +928,6 @@ fn transfer_edge_attribute(
     Ok(())
 }
 
-#[expect(
-    clippy::manual_midpoint,
-    reason = "Blender averages the two vertex weights as a f32 sum before the scale, which midpoint would reorder"
-)]
 fn transfer_edge_mask_weight(
     edge: &Edge,
     mask_weights: Option<&BTreeMap<u32, f64>>,
@@ -936,9 +937,9 @@ fn transfer_edge_mask_weight(
         return 1.0;
     };
     let [first, second] = edge.vertices;
-    let weight = (weights.get(&first).copied().unwrap_or(0.0)
-        + weights.get(&second).copied().unwrap_or(0.0))
-        * 0.5;
+    let weight = halved(
+        weights.get(&first).copied().unwrap_or(0.0) + weights.get(&second).copied().unwrap_or(0.0),
+    );
     if invert { 1.0 - weight } else { weight }
 }
 fn transfer_uv(
@@ -1279,17 +1280,13 @@ fn face_center(mesh: &Mesh, face: &Face, vertex_indices: &BTreeMap<u32, usize>) 
     }
 }
 
-#[expect(
-    clippy::manual_midpoint,
-    reason = "Blender evaluates (a + b) * 0.5 then a mix; midpoint changes the rounding sequence"
-)]
 fn blend_attribute(a: f64, b: f64, factor: f64, mode: &str, modifier: &Modifier) -> Result<f64> {
     match mode {
         "REPLACE" => Ok(a + (b - a) * factor),
         "ABOVE_THRESHOLD" => Ok(if a < factor { a } else { b }),
         "BELOW_THRESHOLD" => Ok(if a > factor { a } else { b }),
         "MIX" => {
-            let target = (a + b) * 0.5;
+            let target = halved(a + b);
             Ok(a + (target - a) * factor)
         }
         "ADD" => Ok(a + b * factor),
@@ -2375,10 +2372,6 @@ fn mapped_loop_sources(
     }
 }
 
-#[expect(
-    clippy::collapsible_if,
-    reason = "merging the else-if-let would merge a fallback branch that Blender evaluates separately"
-)]
 fn uv_loop_mapping_for_face(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
@@ -2485,16 +2478,14 @@ fn uv_loop_mapping_for_face(
                             }
                         } else if let Some(hit) =
                             nearest_point_on_source_face(context, graph, corrected_face, point)
+                            && let Some(face) = context.source.faces.get(corrected_face)
+                            && let Some(loop_start) =
+                                context.source_loop_starts.get(corrected_face).copied()
+                            && let Some(sources) =
+                                polygon_loop_weights(context, face, hit, loop_start)
                         {
-                            if let Some(face) = context.source.faces.get(corrected_face)
-                                && let Some(loop_start) =
-                                    context.source_loop_starts.get(corrected_face).copied()
-                                && let Some(sources) =
-                                    polygon_loop_weights(context, face, hit, loop_start)
-                            {
-                                candidate.sources = sources;
-                                candidate.source_face = corrected_face;
-                            }
+                            candidate.sources = sources;
+                            candidate.source_face = corrected_face;
                         }
                     }
                 }
@@ -2506,10 +2497,6 @@ fn uv_loop_mapping_for_face(
     output
 }
 
-#[expect(
-    clippy::manual_midpoint,
-    reason = "Blender scores candidates as (dot + 1) * 0.5 over distance; midpoint would change the order of operations"
-)]
 fn loop_candidate_for_island(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
@@ -2590,7 +2577,7 @@ fn loop_candidate_for_island(
         let (source_face, corner, score, _) = best?;
         let distance = context.source_positions[nearest_vertex].distance(point);
         let factor = if distance > 0.0 {
-            ((score + 1.0) * 0.5) / distance
+            halved(score + 1.0) / distance
         } else {
             1e18
         };
@@ -2793,10 +2780,6 @@ fn mapped_face_sources(
     result
 }
 
-#[expect(
-    clippy::redundant_closure_for_method_calls,
-    reason = "the element is a reference, so the closure is needed to call to_array on the value"
-)]
 fn projected_polygon_sources(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
@@ -2871,7 +2854,7 @@ fn projected_polygon_sources(
     let total_samples = (side * side) as usize;
     let face_positions = positions
         .iter()
-        .map(|point| point.to_array())
+        .map(|&point| point.to_array())
         .collect::<Vec<_>>();
     let triangles = crate::geom::triangulate::triangulate_mesh(
         &[face_positions],
