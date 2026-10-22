@@ -2316,12 +2316,6 @@ struct Layer {
 /// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
 /// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
 /// scalar composite of the layers. Returns the un-premultiplied colour and that alpha.
-fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
-    composite_layers_with_background(layers, background[3], || {
-        Ok([background[0], background[1], background[2]])
-    })
-    .expect("constant background evaluation cannot fail")
-}
 
 fn composite_layers_with_background(
     layers: impl IntoIterator<Item = Layer>,
@@ -3737,7 +3731,7 @@ mod visibility_tests {
         ray: Ray,
         frame: &CameraFrame,
         background: [f64; 4],
-    ) -> [f64; 4] {
+    ) -> Result<[f64; 4]> {
         let mut layers: Vec<(usize, Hit)> = Vec::new();
         for (index, triangle) in triangles.iter().enumerate() {
             let Some(hit) = intersect_triangle(triangle, ray, frame) else {
@@ -3753,7 +3747,7 @@ mod visibility_tests {
             layers.insert(at, (index, hit));
             layers.truncate(16);
         }
-        composite_layers(
+        composite_layers_with_background(
             layers.iter().map(|(index, _)| {
                 let triangle = &triangles[*index];
                 let color = triangle.source.color;
@@ -3763,7 +3757,8 @@ mod visibility_tests {
                     tint: [1.0; 3],
                 }
             }),
-            background,
+            background[3],
+            || Ok([background[0], background[1], background[2]]),
         )
     }
 
@@ -3817,7 +3812,8 @@ mod visibility_tests {
                 let ray = ray_for_pixel_in_frame(&frame, camera.position, SIZE, SIZE, x, y)
                     .expect("pixel ray")
                     .expect("the perspective test view has a ray");
-                let expected = scan_composite(&prepared, ray, &frame, BACKGROUND);
+                let expected = scan_composite(&prepared, ray, &frame, BACKGROUND)
+                    .expect("reference composite resolves");
                 let actual = composite_sample(
                     &prepared,
                     &visibility,
@@ -3838,7 +3834,14 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod composite_layer_tests {
-    use super::{Layer, composite_layers};
+    use super::{Layer, composite_layers_with_background};
+
+    fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
+        composite_layers_with_background(layers, background[3], || {
+            Ok([background[0], background[1], background[2]])
+        })
+        .expect("constant test background resolves")
+    }
 
     fn assert_close(actual: [f64; 4], expected: [f64; 4]) {
         for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
