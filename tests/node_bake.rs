@@ -1823,11 +1823,15 @@ modifier = obj.modifiers.new("GeometryNodes", "NODES")
 modifier.node_group = tree
 modifier.bake_target = "PACKED"
 bake = modifier.bakes[0]
+bake.use_custom_path = True
+bake.directory = "//must-not-extract"
 assert len(bake.data_blocks) == 0
 result = bpy.ops.object.geometry_node_bake_single(
     session_uid=obj.session_uid, modifier_name=modifier.name, bake_id=bake.bake_id)
 assert "FINISHED" in result
 assert len(bake.data_blocks) == 0
+obj.hide_viewport = True
+obj.hide_set(True)
 bpy.ops.wm.save_as_mainfile(filepath=blend)
 "#;
     run_ok(
@@ -1873,5 +1877,6 @@ bpy.ops.wm.save_as_mainfile(filepath=blend)
                     .any(|loss| loss["feature_id"] == "blender.modifier.nodes_bake_packed")
             })
     );
+    assert!(!directory.path().join("must-not-extract").exists());
     Ok(())
 }

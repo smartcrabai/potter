@@ -1573,78 +1573,89 @@ _NODE_BAKE_PACKED_PAYLOADS = None
 
 
 def _node_bake_packed_payloads():
-    """Detect actual packed payloads in a disposable Blender process; Blender exposes no RNA for `bake.packed`."""
+    """Probe packed state in a disposable Blender process; `bake.packed` has no RNA."""
     global _NODE_BAKE_PACKED_PAYLOADS
     if _NODE_BAKE_PACKED_PAYLOADS is not None:
         return _NODE_BAKE_PACKED_PAYLOADS
     if not bpy.data.filepath:
         raise ValueError("Cannot inspect packed Bake data for an unsaved Blender file")
-    root = tempfile.mkdtemp(prefix="potter-bake-packed-probe-")
     script = r"""
-import bpy, json, os, sys
-root = sys.argv[sys.argv.index("--") + 1]
+import bpy, json
 packed = []
-index = 0
-for obj in bpy.data.objects:
-    for modifier in obj.modifiers:
+for obj in list(bpy.data.objects):
+    for modifier in list(obj.modifiers):
         if modifier.type != "NODES":
             continue
         for bake in modifier.bakes:
             if bake.node is None:
                 continue
-            directory = os.path.join(root, str(index))
-            os.makedirs(directory, exist_ok=True)
-            original = (bake.bake_target, bake.use_custom_path, bake.directory)
-            bake.use_custom_path = True
-            bake.directory = directory
+            key = (obj.name, modifier.name, bake.node.name)
+            # The operator polls for an editable active object; use an unhidden local copy.
+            probe_obj = obj.copy()
+            bpy.context.scene.collection.objects.link(probe_obj)
+            probe_obj.hide_viewport = False
+            probe_obj.hide_render = False
+            probe_obj.hide_set(False)
             try:
-                with bpy.context.temp_override(object=obj, active_object=obj):
-                    bpy.ops.object.geometry_node_bake_unpack_single(
-                        session_uid=obj.session_uid,
-                        modifier_name=modifier.name,
-                        bake_id=bake.bake_id,
-                        method="WRITE_ORIGINAL")
-                metadata = os.path.join(directory, "meta")
-                if os.path.isdir(metadata) and os.listdir(metadata):
-                    packed.append((obj.name, modifier.name, bake.node.name))
+                probe_modifier = probe_obj.modifiers.get(modifier.name)
+                if probe_modifier is None:
+                    raise RuntimeError("copied object has no node modifier")
+                probe_bake = next(
+                    (entry for entry in probe_modifier.bakes if entry.bake_id == bake.bake_id),
+                    None)
+                if probe_bake is None:
+                    raise RuntimeError("copied modifier has no matching Bake node")
+                with bpy.context.temp_override(
+                        object=probe_obj,
+                        active_object=probe_obj,
+                        selected_objects=[probe_obj],
+                        selected_editable_objects=[probe_obj]):
+                    # PF_REMOVE frees only the copy's packed state and never writes packed member paths.
+                    result = bpy.ops.object.geometry_node_bake_unpack_single(
+                        session_uid=probe_obj.session_uid,
+                        modifier_name=probe_modifier.name,
+                        bake_id=probe_bake.bake_id,
+                        method="REMOVE")
+                if result == {"FINISHED"}:
+                    packed.append(key)
+                elif result != {"CANCELLED"}:
+                    raise RuntimeError("unexpected Bake payload probe result: %s" % result)
             finally:
-                bake.bake_target, bake.use_custom_path, bake.directory = original
-            index += 1
+                bpy.data.objects.remove(probe_obj, do_unlink=True)
 print("POTTER_PACKED_BAKES=" + json.dumps(packed))
 """
-    try:
-        output = subprocess.run(
-            [
-                bpy.app.binary_path,
-                "-b",
-                bpy.data.filepath,
-                "--python-exit-code",
-                "1",
-                "--python-expr",
-                script,
-                "--",
-                root,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if output.returncode != 0:
-            raise ValueError("Blender packed-bake inspection failed: %s" % output.stderr)
-        errors = [line for line in output.stdout.splitlines() if line.startswith("Error:")]
-        if errors:
-            raise ValueError("Blender packed-bake inspection failed: %s" % "; ".join(errors))
-        result = next(
-            (line[len("POTTER_PACKED_BAKES="):] for line in output.stdout.splitlines()
-             if line.startswith("POTTER_PACKED_BAKES=")),
-            None,
-        )
-        if result is None:
-            raise ValueError("Blender packed-bake inspection returned no state")
-        _NODE_BAKE_PACKED_PAYLOADS = {tuple(entry) for entry in json.loads(result)}
-        return _NODE_BAKE_PACKED_PAYLOADS
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+    output = subprocess.run(
+        [
+            bpy.app.binary_path,
+            "-b",
+            "--disable-autoexec",
+            bpy.data.filepath,
+            "--python-exit-code",
+            "1",
+            "--python-expr",
+            script,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if output.returncode != 0:
+        raise ValueError("Blender packed-bake inspection failed: %s" % output.stderr)
+    errors = [
+        line for line in (output.stdout + "\n" + output.stderr).splitlines()
+        if line.startswith("Error:")
+    ]
+    if errors:
+        raise ValueError("Blender packed-bake inspection failed: %s" % "; ".join(errors))
+    result = next(
+        (line[len("POTTER_PACKED_BAKES:"):] for line in output.stdout.splitlines()
+         if line.startswith("POTTER_PACKED_BAKES:")),
+        None,
+    )
+    if result is None:
+        raise ValueError("Blender packed-bake inspection returned no state")
+    _NODE_BAKE_PACKED_PAYLOADS = {tuple(entry) for entry in json.loads(result)}
+    return _NODE_BAKE_PACKED_PAYLOADS
 
 
 
