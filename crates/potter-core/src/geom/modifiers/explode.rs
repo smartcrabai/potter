@@ -328,7 +328,8 @@ pub fn explode(
     remap_attributes(mesh, &mut output, &origin)?;
     // Blender rebuilds Explode loops from legacy MFace data, so their custom-normal codes are Auto.
     if clnor::corner_codes(mesh)?.is_some() {
-        let automatic = vec![CornerNormalCode::Auto; clnor::corner_count(&output)];
+        let automatic =
+            vec![CornerNormalCode::Auto; output.faces.iter().map(|face| face.vertices.len()).sum()];
         clnor::write_codes(
             &mut output,
             Some(automatic.as_slice()),
