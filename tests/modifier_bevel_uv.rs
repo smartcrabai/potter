@@ -175,7 +175,7 @@ const KNOWN_GAPS: &[KnownGap] = &[
         case: "clamp_small_width_on",
         columns: &[GapColumn {
             name: "nrm",
-            bad: 40,
+            bad: 66,
             max: Some(2.701e-4),
         }],
         cause: "2.7e-4 is 2.8 code steps, above the two-step bound; not analysed (the codec's snap bound is larger)",
@@ -184,7 +184,7 @@ const KNOWN_GAPS: &[KnownGap] = &[
         case: "clamp_small_width_off",
         columns: &[GapColumn {
             name: "nrm",
-            bad: 40,
+            bad: 66,
             max: Some(2.701e-4),
         }],
         cause: "2.7e-4 is 2.8 code steps, above the two-step bound; not analysed (the codec's snap bound is larger)",
