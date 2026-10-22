@@ -561,3 +561,23 @@ pub(crate) fn blender_space_transform_f32(
     let forward = blender_multiply_m4(blender_inverse_m4(target), local);
     (forward, blender_inverse_m4(forward))
 }
+
+#[cfg(test)]
+mod inverse_tests {
+    use super::blender_inverse_m4;
+
+    #[test]
+    fn inverse_of_rotated_translated_world_matches_exact_inverse() {
+        let world = glam::DMat4::from_translation(glam::DVec3::new(5.0, 0.5, 0.5))
+            * glam::DMat4::from_rotation_y(std::f64::consts::FRAC_PI_2);
+        let matrix = world.to_cols_array().map(|value| value as f32);
+        let expected = world.inverse().to_cols_array().map(|value| value as f32);
+        let inverse = blender_inverse_m4(matrix);
+        for (index, (actual, expected)) in inverse.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1.0e-5,
+                "element {index}: inverse {inverse:?} differs from exact {expected:?}"
+            );
+        }
+    }
+}
