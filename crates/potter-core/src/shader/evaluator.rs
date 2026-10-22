@@ -685,20 +685,14 @@ fn evaluate_surface_inner(
             "shader graph has no OutputMaterial node",
         )
     })?;
-    let has_volume = group
-        .links
-        .iter()
-        .any(|link| link.to_node == *output && link.to_socket == "Volume");
-    let has_displacement = group
-        .links
-        .iter()
-        .any(|link| link.to_node == *output && link.to_socket == "Displacement");
+    let (has_volume, has_displacement) = prepared.output_feeds(graph_id, group, output);
     let mut evaluator = Evaluator {
         group,
         material,
         hit_ctx: *hit_ctx,
         workspace,
         alpha_linked_images: &prepared.alpha_linked_images,
+        links: prepared.link_index(graph_id, group),
     };
     let Value::Shader(surface) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
         return Err(eval_error("material surface output is not a shader"));
@@ -810,11 +804,8 @@ fn evaluate_displacement_inner(
     let Some(output) = active_output.or(fallback_output) else {
         return Ok(0.0);
     };
-    if !group
-        .links
-        .iter()
-        .any(|link| link.to_node == *output && link.to_socket == "Displacement")
-    {
+    let (_, has_displacement) = prepared.output_feeds(graph_id, group, output);
+    if !has_displacement {
         return Ok(0.0);
     }
     workspace.active.reserve(group.links.len());
@@ -824,6 +815,7 @@ fn evaluate_displacement_inner(
         hit_ctx: *hit_ctx,
         workspace,
         alpha_linked_images: &prepared.alpha_linked_images,
+        links: prepared.link_index(graph_id, group),
     };
     match evaluator.input(output, "Displacement", ValueKind::Vector)? {
         Value::Vector(displacement) => Ok(displacement.dot(hit_ctx.normal)),
@@ -1097,6 +1089,69 @@ pub struct PreparedMaterial {
     /// Whether EEVEE would compile the material as transparent (`GPU_MATFLAG_TRANSPARENT`), which decides whether its
     /// surfaces cast transparent shadows (see [`graph_is_transparent`]).
     transparent: bool,
+    /// The graph's incoming links by target node, and the output's incoming sockets (see [`LinkIndex`]).
+    links: LinkIndex,
+}
+
+/// The links of a shader graph, indexed once per material so that a socket read does not scan every link. It is only
+/// used for the graph it was built from (see [`PreparedMaterial::link_index`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LinkIndex {
+    /// The graph this index was built from; `None` when the material has no graph.
+    graph: Option<Id>,
+    /// The address and length of the graph's `links` buffer when the index was built. This is a guard, not a content
+    /// check: a buffer replaced by one of the same address and length, or a link rewritten in place, is not detected.
+    /// The crate does not keep a `PreparedMaterial` across document edits: each render prepares its materials from the
+    /// document it reads, so an index is never used against links it was not built from. The lookup also re-checks the
+    /// target node and socket of each candidate link.
+    links_address: usize,
+    link_count: usize,
+    /// For each target node, the indices into `NodeGroup::links` of its incoming links in link order. The first entry
+    /// matching a socket is the same link that a scan of all links finds first.
+    incoming: BTreeMap<Id, Vec<usize>>,
+    /// The output node that the two flags below describe.
+    output: Option<Id>,
+    /// Whether a link reaches the output's `Volume` socket.
+    has_volume: bool,
+    /// Whether a link reaches the output's `Displacement` socket.
+    has_displacement: bool,
+}
+
+impl LinkIndex {
+    fn new(graph_id: &Id, group: &NodeGroup, output: Option<&Id>) -> Self {
+        let mut incoming = BTreeMap::<Id, Vec<usize>>::new();
+        for (socket_index, link) in group.links.iter().enumerate() {
+            incoming
+                .entry(link.to_node.clone())
+                .or_default()
+                .push(socket_index);
+        }
+        let (has_volume, has_displacement) =
+            output.map_or((false, false), |output| scan_output_feeds(group, output));
+        Self {
+            graph: Some(graph_id.clone()),
+            links_address: group.links.as_ptr().addr(),
+            link_count: group.links.len(),
+            incoming,
+            output: output.cloned(),
+            has_volume,
+            has_displacement,
+        }
+    }
+}
+
+/// Whether a link reaches the `Volume` socket of `output`, and whether a link reaches its `Displacement` socket.
+fn scan_output_feeds(group: &NodeGroup, output: &Id) -> (bool, bool) {
+    (
+        group
+            .links
+            .iter()
+            .any(|link| link.to_node == *output && link.to_socket == "Volume"),
+        group
+            .links
+            .iter()
+            .any(|link| link.to_node == *output && link.to_socket == "Displacement"),
+    )
 }
 
 impl PreparedMaterial {
@@ -1105,18 +1160,23 @@ impl PreparedMaterial {
     /// (`blend_bridge.py` `_set_principled_values`), so it is transparent when that alpha is below one.
     #[must_use]
     pub fn new(material: &Material, node_groups: &Registry<NodeGroup>) -> Self {
-        let Some(group) = material
+        let Some((graph_id, group)) = material
             .node_tree
             .as_ref()
-            .and_then(|graph_id| node_groups.get(graph_id))
+            .and_then(|graph_id| node_groups.get(graph_id).map(|group| (graph_id, group)))
         else {
             return Self {
                 transparent: material.alpha_mode != "opaque" && material.base_color[3] < 1.0,
                 ..Self::default()
             };
         };
-        let Some(output) = Self::active_output(group) else {
-            return Self::default();
+        let output = Self::active_output(group);
+        let links = LinkIndex::new(graph_id, group, output);
+        let Some(output) = output else {
+            return Self {
+                links,
+                ..Self::default()
+            };
         };
         Self {
             alpha_linked_images: linked_alpha_image_nodes(group, output)
@@ -1124,6 +1184,29 @@ impl PreparedMaterial {
                 .cloned()
                 .collect(),
             transparent: graph_is_transparent(group, output),
+            links,
+        }
+    }
+
+    /// The index built from `group` when this material was prepared from that graph and its links buffer is the same
+    /// one, with the same length. `None`, as for a `PreparedMaterial::default()` or another graph, makes the evaluator
+    /// scan the links.
+    fn link_index(&self, graph_id: &Id, group: &NodeGroup) -> Option<&LinkIndex> {
+        let index = &self.links;
+        (index.graph.as_ref() == Some(graph_id)
+            && index.links_address == group.links.as_ptr().addr()
+            && index.link_count == group.links.len())
+        .then_some(index)
+    }
+
+    /// Whether a link reaches the `Volume` and the `Displacement` socket of `output` in `group`.
+    fn output_feeds(&self, graph_id: &Id, group: &NodeGroup, output: &Id) -> (bool, bool) {
+        match self
+            .link_index(graph_id, group)
+            .filter(|index| index.output.as_ref() == Some(output))
+        {
+            Some(index) => (index.has_volume, index.has_displacement),
+            None => scan_output_feeds(group, output),
         }
     }
 
@@ -1162,15 +1245,31 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared> {
     workspace: &'workspace mut EvaluatorWorkspace,
     /// The Alpha-linked Image Texture nodes of the material, from [`PreparedMaterial`].
     alpha_linked_images: &'prepared BTreeSet<Id>,
+    /// The incoming-link index of `group` from [`PreparedMaterial`]; `None` scans every link of the group.
+    links: Option<&'prepared LinkIndex>,
 }
 
 impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
-        let incoming =
-            self.group.links.iter().enumerate().find(|(_, link)| {
+        let group = self.group;
+        let incoming = match self.links {
+            Some(index) => {
+                index
+                    .incoming
+                    .get(node_id)
+                    .into_iter()
+                    .flatten()
+                    .find_map(|&socket_index| {
+                        let link = group.links.get(socket_index)?;
+                        (link.to_node == *node_id && socket_matches(&link.to_socket, socket))
+                            .then_some((socket_index, link))
+                    })
+            }
+            None => group.links.iter().enumerate().find(|(_, link)| {
                 link.to_node == *node_id && socket_matches(&link.to_socket, socket)
-            });
+            }),
+        };
         if let Some((socket_index, link)) = incoming {
             return self.output(&link.from_node, &link.from_socket, socket_index);
         }
