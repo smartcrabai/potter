@@ -505,15 +505,12 @@ fn geometry_mismatch(potter: &Value, blender: &Value, bound_ulps: f64) -> Option
                     !used[*other]
                         && (0..3).all(|axis| (point[axis] - candidate[axis]).abs() <= tolerance)
                 });
-            match found {
-                Some((other, _)) => {
-                    used[other] = true;
-                    matched[index] = Some(other);
-                }
-                None => {
-                    matches = false;
-                    break;
-                }
+            if let Some((other, _)) = found {
+                used[other] = true;
+                matched[index] = Some(other);
+            } else {
+                matches = false;
+                break;
             }
         }
     }

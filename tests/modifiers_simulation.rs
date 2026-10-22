@@ -1,3 +1,9 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test fixtures use fixed valid inputs"
+)]
+
 use std::{
     error::Error,
     fs,
@@ -1730,7 +1736,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let reopened_path = root.join("reopened_explode_cli.json");
     fs::write(
         &reopen_script,
-        r#"
+        r"
 import bpy, json, sys
 output = sys.argv[sys.argv.index('--') + 1]
 obj = bpy.data.objects['c_exploder']
@@ -1741,7 +1747,7 @@ result = {
 }
 with open(output, 'w', encoding='utf-8') as handle:
     json.dump(result, handle)
-"#,
+",
     )?;
     let mut reopen = Command::new(&blender_path);
     reopen
@@ -1788,7 +1794,7 @@ fn particle_instance_cli_frames_apply_export_reimport_preserves_track_axis()
     let expected_path = root.join("particle_cli_expected.json");
     fs::write(
         &fixture_script,
-        r#"
+        r"
 import bpy, json, os, sys
 from mathutils import Vector
 if tuple(bpy.app.version[:3]) != (5,2,2):
@@ -1926,7 +1932,7 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         'child_percent':settings.child_percent,
         'rendered_child_count':settings.rendered_child_count,
     }, output)
-"#,
+",
     )?;
     let mut create_fixture = Command::new(&blender_path);
     create_fixture
@@ -2111,7 +2117,7 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
     let reopened_path = root.join("reopened_particle_cli.json");
     fs::write(
         &reopen_script,
-        r#"
+        r"
 import bpy, json, sys
 output = sys.argv[sys.argv.index('--') + 1]
 obj = bpy.data.objects['ParticleInstancer']
@@ -2132,7 +2138,7 @@ finally:
     evaluated.to_mesh_clear()
 with open(output, 'w', encoding='utf-8') as handle:
     json.dump(result, handle)
-"#,
+",
     )?;
     let mut reopen = Command::new(&blender_path);
     reopen
@@ -2227,7 +2233,7 @@ fn particle_instance_baked_path_velocity_matches_blender() -> Result<(), Box<dyn
     let expected_path = root.join("particle_baked_path.json");
     fs::write(
         &fixture_script,
-        r#"
+        r"
 import bpy, json, math, os, sys
 if tuple(bpy.app.version[:3]) != (5,2,2):
     raise RuntimeError('baked particle path parity requires Blender 5.2.2')
@@ -2366,7 +2372,7 @@ with open(os.path.join(root, 'particle_baked_path.json'), 'w', encoding='utf-8')
         'mesh':evaluate_mesh(2),
     }, output)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_baked_path.blend'))
-"#,
+",
     )?;
     let mut create_fixture = Command::new(&blender_path);
     create_fixture
@@ -2481,7 +2487,7 @@ fn particle_instance_hair_lifecycle_matches_blender() -> Result<(), Box<dyn Erro
     let expected_path = root.join("particle_hair_lifecycle.json");
     fs::write(
         &fixture_script,
-        r#"
+        r"
 import bpy, json, os, sys
 if tuple(bpy.app.version[:3]) != (5,2,2):
     raise RuntimeError('Hair lifecycle parity requires Blender 5.2.2')
@@ -2556,7 +2562,7 @@ finally:
 with open(os.path.join(root, 'particle_hair_lifecycle.json'), 'w', encoding='utf-8') as output:
     json.dump({'particles':particles, 'mesh':expected_mesh}, output)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_hair_lifecycle.blend'))
-"#,
+",
     )?;
     let mut create_fixture = Command::new(&blender_path);
     create_fixture
@@ -2676,7 +2682,7 @@ fn particle_instance_hair_path_preserve_shape_randomness_and_corners_match_blend
     let expected_path = root.join("particle_hair_path.json");
     fs::write(
         &script,
-        r#"
+        r"
 import bpy, json, os, sys
 from mathutils import Matrix, Vector
 if tuple(bpy.app.version[:3]) != (5,2,2):
@@ -3047,7 +3053,7 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
         'hair_states':hair_states,
         'cases':cases,
     }, output)
-"#,
+",
     )?;
     let mut command = Command::new(&blender_path);
     command
@@ -3244,8 +3250,9 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
                     ("particle_system_index".to_owned(), json!(1)),
                     ("use_path".to_owned(), json!(true)),
                 ]),
+                baked_ocean_cache: None,
                 binding_data: None,
-                runtime: Default::default(),
+                runtime: potter_core::model::ModifierRuntime::default(),
             }],
             ..potter_core::model::Node::default()
         },
@@ -3642,7 +3649,7 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
     let reopened_path = root.join("reopened_particle_hair_path.json");
     fs::write(
         &reopen_script,
-        r#"
+        r"
 import bpy, json, sys
 output = sys.argv[sys.argv.index('--') + 1]
 obj = bpy.data.objects['hair_bspline_preserve']
@@ -3678,7 +3685,7 @@ result = {
 }
 with open(output, 'w', encoding='utf-8') as handle:
     json.dump(result, handle)
-"#,
+",
     )?;
     let mut reopen = Command::new(&blender_path);
     reopen

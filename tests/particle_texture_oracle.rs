@@ -1,6 +1,5 @@
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     reason = "Blender integration fixtures use fixed valid data"
 )]
 
@@ -203,8 +202,10 @@ fn particle_texture_influences_and_count_schedule_match_blender() -> Result<(), 
         let node_id = nodes
             .iter()
             .find(|(_, node)| node["name"] == name.as_str())
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| panic!("{name}: node is missing from the imported scene"));
+            .map_or_else(
+                || panic!("{name}: node is missing from the imported scene"),
+                |(id, _)| id.clone(),
+            );
         if let Some(explode) = case.get("explode") {
             // Explode cases compare the evaluated mesh counts of the imported node at the scene frame.
             let mut inspect = Command::new(env!("CARGO_BIN_EXE_pot"));
