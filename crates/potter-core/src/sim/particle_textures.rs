@@ -322,7 +322,30 @@ pub(crate) fn birth_values(
             }
         }
     }
+    // `psys_get_texture` ends with `CLAMP_WARP_PARTICLE_TEXTURE_POS` for time, life, and density
+    // (a negative value wraps to `1 + value`) and `CLAMP_PARTICLE_TEXTURE_POS` for size, all of
+    // them on the birth event (`PAMAP_INIT`). A NaN density passes through unchanged, as `CLAMP` does.
+    values.time = clamp_warp(values.time);
+    values.life = clamp_warp(values.life);
+    values.density = clamp_warp(values.density);
+    values.size = clamp_unit(values.size);
     Ok(values)
+}
+
+/// Blender's `CLAMP(v, 0, 1)`: values above 1 or below 0 are pinned, and NaN is returned unchanged.
+fn clamp_unit(value: f64) -> f64 {
+    if value > 1.0 {
+        1.0
+    } else if value < 0.0 {
+        0.0
+    } else {
+        value
+    }
+}
+
+/// Blender's `CLAMP_WARP_PARTICLE_TEXTURE_POS`: a negative value wraps to `1 + value`, then clamps.
+fn clamp_warp(value: f64) -> f64 {
+    clamp_unit(if value < 0.0 { 1.0 + value } else { value })
 }
 
 impl TextureSlot<'_> {
