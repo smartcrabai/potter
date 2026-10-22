@@ -328,6 +328,20 @@ fn ray_transmittance(
     distance: f64,
     opaque_blocks: bool,
 ) -> f64 {
+    if opaque_blocks && shadow.occluders.is_none() {
+        return if shadow.bvh.any_hit_where(
+            shadow.triangles,
+            origin,
+            direction,
+            SHADOW_EPSILON,
+            distance,
+            &|mask| mask & RayKind::Shadow.bit() != 0,
+        ) {
+            0.0
+        } else {
+            1.0
+        };
+    }
     let mut transmittance = 1.0;
     shadow.bvh.walk_hits(
         shadow.triangles,
