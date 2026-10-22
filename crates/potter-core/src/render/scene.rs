@@ -67,18 +67,63 @@ pub(super) struct ObjectRecord {
     /// Color layer names in layer order, matching `Triangle::layer_colors`. Not part of the output.
     #[serde(skip)]
     pub color_layers: Vec<String>,
-    /// Slot-specific render-color position keyed by `Triangle::material_index`.
+    /// Slot-specific render-color position and member color availability, per `Triangle::material_index`.
     #[serde(skip)]
-    pub color_render_layers: BTreeMap<usize, Option<usize>>,
-    /// Member color availability keyed by `Triangle::material_index`.
-    #[serde(skip)]
-    pub color_available_masks: BTreeMap<usize, Option<Arc<[u64]>>>,
+    pub material_colors: MaterialColors,
     /// Joined color registry indices, matching `color_layers`.
     #[serde(skip)]
     pub color_layer_indices: Vec<usize>,
     /// EEVEE's default refraction thickness of the object (`transmission_thickness`). Not part of the output.
     #[serde(skip)]
     pub thickness: f64,
+    /// Inverse of the evaluated world matrix; `None` when it is not finite, and the point then stays unchanged.
+    #[serde(skip)]
+    pub world_to_local: Option<DMat4>,
+}
+
+/// Color state per material of one object, keyed by `Triangle::material_index` and sorted by it, so a hit
+/// finds its entry by binary search. A material the object does not draw has no entry and reads as `None`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct MaterialColors {
+    entries: Vec<MaterialColor>,
+}
+
+#[derive(Clone, Debug)]
+struct MaterialColor {
+    material_index: usize,
+    render_layer: Option<usize>,
+    available_mask: Option<Arc<[u64]>>,
+}
+
+impl MaterialColors {
+    /// Records the entry of `material_index`; a later face of the same material replaces it.
+    fn insert(
+        &mut self,
+        material_index: usize,
+        render_layer: Option<usize>,
+        available_mask: Option<Arc<[u64]>>,
+    ) {
+        let entry = MaterialColor {
+            material_index,
+            render_layer,
+            available_mask,
+        };
+        match self
+            .entries
+            .binary_search_by_key(&material_index, |stored| stored.material_index)
+        {
+            Ok(position) => self.entries[position] = entry,
+            Err(position) => self.entries.insert(position, entry),
+        }
+    }
+
+    /// The color state of `material_index`, or `None` when the object does not draw that material.
+    fn get(&self, material_index: usize) -> Option<&MaterialColor> {
+        self.entries
+            .binary_search_by_key(&material_index, |stored| stored.material_index)
+            .ok()
+            .map(|position| &self.entries[position])
+    }
 }
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -198,7 +243,6 @@ fn transparent_shadow_pass(closures: &[ShaderClosure]) -> f64 {
 /// [`ShadowOccluders::finish`], because the light loops that ask for a pass return no `Result`.
 struct ShadowOccluders<'a> {
     doc: &'a SceneDoc,
-    snapshot: &'a Snapshot,
     geometry: &'a Geometry,
     images: &'a BTreeMap<String, ImageData>,
     workspace: &'a RefCell<EvaluatorWorkspace>,
@@ -208,14 +252,12 @@ struct ShadowOccluders<'a> {
 impl<'a> ShadowOccluders<'a> {
     fn new(
         doc: &'a SceneDoc,
-        snapshot: &'a Snapshot,
         geometry: &'a Geometry,
         images: &'a BTreeMap<String, ImageData>,
         workspace: &'a RefCell<EvaluatorWorkspace>,
     ) -> Self {
         Self {
             doc,
-            snapshot,
             geometry,
             images,
             workspace,
@@ -265,7 +307,6 @@ impl<'a> ShadowOccluders<'a> {
         }
         let shading = hit_params(
             self.doc,
-            self.snapshot,
             self.geometry,
             hit,
             origin,
@@ -575,6 +616,8 @@ pub(super) fn extract_geometry(
             color_render_layers: BTreeMap::new(),
             color_available_masks: BTreeMap::new(),
             thickness,
+            material_colors: MaterialColors::default(),
+            world_to_local: object_inverse(matrix),
         });
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
@@ -725,12 +768,11 @@ pub(super) fn extract_geometry(
                     let object = objects.last_mut().ok_or_else(|| {
                         PotError::new(ErrorCode::InternalError, "object record was not stored")
                     })?;
-                    object
-                        .color_render_layers
-                        .insert(material_index, slot_color_render);
-                    object
-                        .color_available_masks
-                        .insert(material_index, slot_color_mask);
+                    object.material_colors.insert(
+                        material_index,
+                        slot_color_render,
+                        slot_color_mask,
+                    );
                 }
                 let material = materials.get(material_index);
                 let prepared_material = prepared.get(material_index);
@@ -1882,7 +1924,6 @@ impl SurfaceShader for SceneShader<'_> {
         }
         let occluders = ShadowOccluders::new(
             self.doc,
-            self.snapshot,
             self.geometry,
             self.images,
             &self.evaluator_workspace,
@@ -1952,7 +1993,7 @@ impl SceneShader<'_> {
             triangle,
             HitPose {
                 point: hit.point,
-                object: object_space(self.snapshot, object, hit.point),
+                object: object_space(object, hit.point),
                 normal: hit.normal,
                 view: hit.view,
                 barycentric: hit.barycentric,
@@ -2185,10 +2226,8 @@ pub(super) fn layered_context<'a>(
     uv_layers: HitUvLayers<'a>,
     tables: &'a mut LayerTables<'a>,
 ) -> Result<HitContext<'a>> {
-    let available_mask = object
-        .color_available_masks
-        .get(&triangle.material_index)
-        .and_then(|mask| mask.as_deref());
+    let material_colors = object.material_colors.get(triangle.material_index);
+    let available_mask = material_colors.and_then(|colors| colors.available_mask.as_deref());
     let color_maps = fill_color_layers(
         &mut tables.color,
         object
@@ -2199,11 +2238,8 @@ pub(super) fn layered_context<'a>(
             .filter(|((_, source_layer), _)| source_has_color_layer(available_mask, **source_layer))
             .map(|((name, _), corners)| (name.as_str(), blend_color(corners, pose.barycentric))),
     )?;
-    let color_render = object
-        .color_render_layers
-        .get(&triangle.material_index)
-        .copied()
-        .flatten()
+    let color_render = material_colors
+        .and_then(|colors| colors.render_layer)
         .and_then(|index| triangle.layer_colors.get(index))
         .map(|corners| blend_color(corners, pose.barycentric));
     let mut context = HitContext::new(&doc.node_groups)
@@ -2224,23 +2260,21 @@ pub(super) fn layered_context<'a>(
 }
 
 /// `point` in the object's local space, through the inverse of its evaluated world matrix.
-pub(super) fn object_space(snapshot: &Snapshot, object: &ObjectRecord, point: DVec3) -> DVec3 {
-    let matrix = snapshot
-        .nodes
-        .get(&object.node_id)
-        .map_or(DMat4::IDENTITY, |node| {
-            DMat4::from_cols_array(&node.world_matrix)
-        });
-    let world_to_local = matrix.inverse();
-    if world_to_local
+pub(super) fn object_space(object: &ObjectRecord, point: DVec3) -> DVec3 {
+    match object.world_to_local {
+        Some(world_to_local) => world_to_local.transform_point3(point),
+        None => point,
+    }
+}
+
+/// The inverse of an evaluated world matrix, or `None` when that inverse is not finite.
+fn object_inverse(world_matrix: DMat4) -> Option<DMat4> {
+    let inverse = world_matrix.inverse();
+    inverse
         .to_cols_array()
         .iter()
         .all(|value| value.is_finite())
-    {
-        world_to_local.transform_point3(point)
-    } else {
-        point
-    }
+        .then_some(inverse)
 }
 /// Per-corner values for a triangle, or `None` when any corner is not on the face.
 fn corner_values<T: Copy>(values: &[T], corners: [Option<usize>; 3]) -> Option<[T; 3]> {
