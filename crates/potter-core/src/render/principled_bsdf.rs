@@ -15,7 +15,7 @@
 //! - `node_shader_bsdf_principled.cc`: the default distribution is `SHD_GLOSSY_MULTI_GGX`, so
 //!   energy preservation is enabled for the specular and metallic lobes.
 //!
-//! Estimator contract: `evaluate` is the continuous BSDF times reflectance: the diffuse, specular,
+//! Estimator contract: `evaluate_masked` is the continuous BSDF times reflectance: the diffuse, specular,
 //! sheen and coat lobes above the surface, and the glass lobe on both sides (its reflection above,
 //! its transmission below). `continuous_density` is the density of one closure's continuous directions, its lobe
 //! mixture, so `evaluate / density` is unbiased for that closure over its sampler's domain. `path.rs` mixes the closures
@@ -34,6 +34,7 @@ use super::principled_tables::{
     sheen_ltc,
 };
 use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
+use crate::model::RayKind;
 use crate::shader::{BsdfParams, dielectric_f0, make_orthonormals};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
@@ -197,20 +198,25 @@ fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> 
 }
 
 /// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times reflectance, less the
-/// share the subsurface closure takes. The raster preview has no subsurface closure, so it shades the lobe without
-/// that share (the realtime gap); the path tracer uses `evaluate`, which keeps it.
+/// share the subsurface closure takes. This is the lobe `evaluate_masked` uses, so the path tracer's direct light keeps the
+/// share. The raster preview has no subsurface closure and shades the lobe without it (`without_subsurface`).
 pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers) -> DVec3 {
-    let without_subsurface = BsdfParams {
-        subsurface_weight: 0.0,
-        ..*params
-    };
     diffuse_lobe(
-        &without_subsurface,
+        params,
         layers.energy_roughness,
         layers.normal,
         layers.view,
         layers.lower,
     )
+}
+
+/// The parameters with no subsurface closure, for the raster preview, which shades the diffuse lobe without the
+/// subsurface share (the realtime gap). The path tracer does not use this.
+pub(crate) fn without_subsurface(params: &BsdfParams) -> BsdfParams {
+    BsdfParams {
+        subsurface_weight: 0.0,
+        ..*params
+    }
 }
 
 /// The Lambert weight of the dielectric-layered diffuse lobe, before the 1/π and the albedo (Cycles' diffuse weight).
@@ -387,32 +393,28 @@ fn specular_lobe(
 /// Cycles' `CLOSURE_WEIGHT_CUTOFF`: a coat weight at or below it is not set up.
 const COAT_WEIGHT_CUTOFF: f64 = 1.0e-5;
 
-/// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator.
-pub(crate) fn evaluate(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
-    // The diffuse, sheen and coat lobes sit above the shading normal. The specular lobe checks its own, bent normal, so
-    // it is not gated by the shading normal, and the glass lobe takes both sides.
+/// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator, keeping only the lobes
+/// that a light's ray mask admits. Cycles drops a closure from a light's direct lighting when that light excludes its
+/// ray kind (`surface_shader.h`, `_surface_shader_exclude`). The diffuse, sheen and coat lobes sit above the shading
+/// normal, so they are gated on it. The specular lobe checks its own, bent normal, so it is not gated by the shading
+/// normal, and the glass lobe takes both sides. With every kind admitted (`RayKind::ALL_MASK`) this is the whole BSDF.
+pub(crate) fn evaluate_masked(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    ray_mask: u8,
+) -> DVec3 {
     let above_shading = if layers.normal.dot(light) > 0.0 {
-        diffuse_lobe(
-            params,
-            layers.energy_roughness,
-            layers.normal,
-            layers.view,
-            layers.lower,
-        ) + sheen_coefficient(params, layers, light)
-            + coat_coefficient(params, layers, light)
+        above_shading_coefficient(params, layers, light, ray_mask)
     } else {
         DVec3::ZERO
     };
-    above_shading
-        + specular_lobe(
-            params,
-            layers.energy_roughness,
-            layers.specular,
-            layers.view,
-            light,
-            layers.lower,
-        )
-        + glass_coefficient(params, layers, light)
+    let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
+        specular_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    above_shading + specular + glass_lobes_coefficient(params, layers, light, ray_mask)
 }
 
 /// The sheen lobe along `light`, times reflectance. It depends on the light, so an area light is
@@ -791,6 +793,61 @@ fn sheen_frame(normal: DVec3, view: DVec3) -> (DVec3, DVec3) {
         return make_orthonormals(normal);
     }
     (bitangent.cross(normal), bitangent)
+}
+
+/// The lobes above the shading normal that a ray mask admits, at `light`: diffuse and sheen on the `Diffuse` bit, the
+/// coat on the `Glossy` bit. Sheen is a diffuse-class closure (`CLOSURE_IS_BSDF_DIFFUSE`, `svm/types.h`), and the coat
+/// is a glossy GGX closure. The caller gates this on the light being above the shading normal, as `evaluate_masked` does.
+pub(crate) fn above_shading_coefficient(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    ray_mask: u8,
+) -> DVec3 {
+    let diffuse = if ray_mask & RayKind::Diffuse.bit() != 0 {
+        diffuse_coefficient(params, layers) + sheen_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    let coat = if ray_mask & RayKind::Glossy.bit() != 0 {
+        coat_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    diffuse + coat
+}
+
+/// The reflected lobes of `params` at `light` that a ray mask admits, without the glass lobe and without the shading-side
+/// gate: the realtime raster's reflective term, which shades the diffuse lobe without subsurface (`without_subsurface`).
+/// The caller gates it where the raster does.
+pub(crate) fn reflected_lobes_coefficient(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    ray_mask: u8,
+) -> DVec3 {
+    let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
+        specular_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    above_shading_coefficient(params, layers, light, ray_mask) + specular
+}
+
+/// The glass lobe towards `light`, kept where the light's ray mask admits glossy or transmission. A glass closure is
+/// both glossy and transmissive, so it is dropped only when the light excludes both kinds (`exclude_glass`). It takes
+/// both sides of the surface.
+pub(crate) fn glass_lobes_coefficient(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    ray_mask: u8,
+) -> DVec3 {
+    if ray_mask & (RayKind::Glossy.bit() | RayKind::Transmission.bit()) != 0 {
+        glass_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    }
 }
 
 /// The base colour clamped to 1 (Cycles' `clamped_base_color`, used by the F82 metal lobe).
@@ -2022,7 +2079,12 @@ mod single_bounce_tests {
                     * RADIUS
                     * RADIUS;
                 let weight = area * cos_emitter / (distance * distance) * radiance * cos_receiver;
-                total += evaluate(params, &layers(params, normal, view), direction) * weight;
+                total += evaluate_masked(
+                    params,
+                    &layers(params, normal, view),
+                    direction,
+                    RayKind::ALL_MASK,
+                ) * weight;
             }
         }
         total
