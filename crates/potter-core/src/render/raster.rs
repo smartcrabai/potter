@@ -634,7 +634,7 @@ fn sample_background(
     clippy::too_many_arguments,
     reason = "raster configuration is explicit at this low-level boundary"
 )]
-pub(crate) fn rasterize_with_samples(
+pub(super) fn rasterize_with_samples(
     triangles: &[Triangle],
     camera: &Camera,
     width: u32,
@@ -646,6 +646,7 @@ pub(crate) fn rasterize_with_samples(
     seed: u32,
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
+    prepared_materials: &[crate::shader::PreparedMaterial],
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
@@ -669,6 +670,7 @@ pub(crate) fn rasterize_with_samples(
             seed,
             filter_size,
             shader,
+            prepared_materials,
             volume_pass.as_deref_mut(),
         )?;
         let right_output = rasterize_with_samples(
@@ -683,6 +685,7 @@ pub(crate) fn rasterize_with_samples(
             seed,
             filter_size,
             shader,
+            prepared_materials,
             volume_pass.as_deref_mut(),
         )?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
@@ -811,8 +814,15 @@ pub(crate) fn rasterize_with_samples(
                     }
                     // The hit's distance along its ray places the point; its depth is a view-axis or panorama measure.
                     let point = center_ray.origin + center_ray.direction * hit.distance;
-                    let visibility =
-                        ambient_visibility(bvh, triangles, point, geometric, shading, 1.0);
+                    let visibility = ambient_visibility(
+                        bvh,
+                        triangles,
+                        prepared_materials,
+                        point,
+                        geometric,
+                        shading,
+                        1.0,
+                    );
                     ambient_occlusion[pixel_index] =
                         linear_color_to_f32([visibility, visibility, visibility, 1.0])[0];
                 }
@@ -961,7 +971,7 @@ pub(crate) fn rasterize_with_samples(
     clippy::too_many_arguments,
     reason = "line rasterization uses the same explicit configuration as triangle rasterization"
 )]
-pub(crate) fn rasterize_with_lines(
+pub(super) fn rasterize_with_lines(
     triangles: &[Triangle],
     lines: &[Line],
     camera: &Camera,
@@ -974,6 +984,7 @@ pub(crate) fn rasterize_with_lines(
     seed: u32,
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
+    prepared_materials: &[crate::shader::PreparedMaterial],
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     let mut volume_pass = volume_pass;
@@ -989,6 +1000,7 @@ pub(crate) fn rasterize_with_lines(
         seed,
         filter_size,
         shader,
+        prepared_materials,
         volume_pass.as_deref_mut(),
     )?;
     if lines.is_empty() {
@@ -1146,6 +1158,7 @@ pub(crate) fn rasterize_wireframe(
         // Wire is never a film Beauty render, so no film filter applies.
         0.0,
         None,
+        prepared_materials,
         None,
     )?;
     let mut output = rasterize_with_lines(
@@ -1161,6 +1174,7 @@ pub(crate) fn rasterize_wireframe(
         0,
         0.0,
         None,
+        prepared_materials,
         None,
     )?;
     let frame = camera_frame(camera, width, height)?;
@@ -1686,12 +1700,12 @@ fn is_valid_fov(fov: f64) -> bool {
     fov.is_finite() && fov > 0.0 && fov <= crate::model::FISHEYE_FOV_MAX
 }
 
-/// Fraction of the hemisphere above `shading` that is unoccluded at `point`. Occluders are filtered
-/// by shadow visibility, as Cycles' ambient occlusion is, so objects hidden from camera rays still
-/// occlude.
+/// Fraction of the hemisphere above `shading` that is unoccluded at `point`. Shadow-visible surfaces occlude as
+/// Cycles' ambient occlusion does, but a Volume-only material has no surface to block the ray.
 pub(crate) fn ambient_visibility(
     bvh: &super::bvh::Bvh,
     triangles: &[Triangle],
+    prepared_materials: &[crate::shader::PreparedMaterial],
     point: DVec3,
     geometric: DVec3,
     shading: DVec3,
@@ -1726,12 +1740,30 @@ pub(crate) fn ambient_visibility(
         } else {
             direction
         };
-        if bvh
-            .closest_hit_where(triangles, origin, direction, 1.0e-5, distance, &|mask| {
-                mask & RayKind::Shadow.bit() != 0
-            })
-            .is_none()
-        {
+        let mut occluded = false;
+        bvh.walk_hits(
+            triangles,
+            super::bvh::WalkRay {
+                origin,
+                direction,
+                epsilon: 1.0e-5,
+                remaining: distance,
+                kind: Some(RayKind::Shadow),
+            },
+            |hit, _| {
+                let triangle = &triangles[hit.triangle_index];
+                if prepared_materials
+                    .get(triangle.material_index)
+                    .is_some_and(crate::shader::PreparedMaterial::is_volume_only)
+                {
+                    true
+                } else {
+                    occluded = true;
+                    false
+                }
+            },
+        );
+        if !occluded {
             visible += 1;
         }
     }
@@ -2296,7 +2328,7 @@ fn composite_sample(
         let mut transmittance = DVec3::ONE;
         let mut alpha_transmittance = 1.0;
         let mut premultiplied = DVec3::ZERO;
-        let mut start_distance = 0.0;
+        let mut start_distance = volume_sample.near_distance;
         for visible_hit in hits.iter().take(hit_count).flatten() {
             let (radiance, segment_transmittance) =
                 volume_sample.integrate_segment(start_distance, visible_hit.hit.distance)?;
@@ -3199,6 +3231,7 @@ mod tests {
             0,
             1.5,
             None,
+            &[],
             None,
         )?;
         assert!(
@@ -3238,6 +3271,7 @@ mod tests {
             0,
             1.5,
             None,
+            &[],
             None,
         )?;
         let mut drawn = 0_usize;
@@ -3308,6 +3342,7 @@ mod line_tests {
             0,
             1.5,
             None,
+            &[],
             None,
         );
         assert!(output.is_ok());
@@ -3439,6 +3474,7 @@ mod smooth_shading_tests {
             0,
             1.5,
             shader,
+            &[],
             None,
         )
         .expect("triangle rasterizes")
@@ -3643,6 +3679,7 @@ mod smooth_shading_tests {
         let visibility = super::ambient_visibility(
             &bvh,
             std::slice::from_ref(&plane),
+            &[],
             DVec3::ZERO,
             DVec3::Z,
             DVec3::new(0.866, 0.0, 0.5),

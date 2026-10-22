@@ -1337,6 +1337,7 @@ impl Default for RenderSettings {
             audio_codec: "wav".to_owned(),
             passes: vec!["combined".to_owned()],
             cryptomatte_accurate: false,
+            eevee_light_threshold: default_light_threshold(),
             eevee_use_volumetric_shadows: false,
             motion_blur: false,
             shutter: default_shutter(),

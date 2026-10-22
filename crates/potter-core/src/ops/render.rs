@@ -30,6 +30,7 @@ const SET_FIELDS: &[&str] = &[
     "dicing_rate",
     "preview_dicing_rate",
     "max_subdivisions",
+    "offscreen_dicing_scale",
     "eevee_use_volumetric_shadows",
     "dicing_camera",
 ];

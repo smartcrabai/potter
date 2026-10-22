@@ -206,6 +206,7 @@ struct PointShadowMap {
 struct ShadowScene<'a> {
     bvh: &'a Bvh,
     triangles: &'a [Triangle],
+    prepared_materials: &'a [PreparedMaterial],
     point_maps: &'a BTreeMap<Id, PointShadowMap>,
     occluders: Option<&'a ShadowOccluders<'a>>,
 }
@@ -2021,6 +2022,7 @@ impl SurfaceShader for SceneShader<'_> {
         let shadow = self.geometry.shadows.as_ref().map(|shadows| ShadowScene {
             bvh: &shadows.bvh,
             triangles: self.geometry.triangles.as_slice(),
+            prepared_materials: &self.geometry.prepared,
             point_maps: &shadows.point_maps,
             occluders: shadows.transparent_casters.then_some(&occluders),
         });
@@ -2532,7 +2534,15 @@ fn shade(
         } else {
             geometric
         };
-        ambient_visibility(scene.bvh, scene.triangles, point, facing, normal, 1.0)
+        ambient_visibility(
+            scene.bvh,
+            scene.triangles,
+            scene.prepared_materials,
+            point,
+            facing,
+            normal,
+            1.0,
+        )
     });
     // A closure's reflective share is its weight times its alpha. The raster composite multiplies a straight colour
     // by the opaque share (`render/raster.rs`, `composite_sample`), so the premultiplied sums are divided by it below.

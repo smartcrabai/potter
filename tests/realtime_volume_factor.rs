@@ -111,34 +111,8 @@ fn realtime_volume_in_scatter_follows_the_light_volume_factor() -> TestResult {
         potter_zero_max <= POTTER_PIXEL_TOLERANCE,
         "Potter's zero-factor render keeps in-scatter: {potter_zero_max}"
     );
-    let eevee_base_max = eevee_base.iter().fold(0.0_f64, |a, b| a.max(*b));
-    let eevee_half_max = eevee_half.iter().fold(0.0_f64, |a, b| a.max(*b));
     let potter_base_max = potter_base.iter().fold(0.0_f64, |a, b| a.max(*b));
-    let potter_half_max = potter_half.iter().fold(0.0_f64, |a, b| a.max(*b));
     let potter_half_error = worst_difference(&potter_half, &scaled(&potter_base, 0.5));
-    let pixel_size = ORTHO_SCALE / f64::from(SIZE);
-    let interior_limit = 1.0 - pixel_size;
-    let mut eevee_interior_error = 0.0_f64;
-    let mut potter_interior_error = 0.0_f64;
-    let mut interior_pixels = 0;
-    for row in 0..SIZE {
-        for column in 0..SIZE {
-            let world_x = (f64::from(column) + 0.5) * pixel_size - ORTHO_SCALE * 0.5;
-            let world_y = (f64::from(row) + 0.5) * pixel_size - ORTHO_SCALE * 0.5;
-            if world_x.abs() > interior_limit || world_y.abs() > interior_limit {
-                continue;
-            }
-            let index = row as usize * SIZE as usize + column as usize;
-            eevee_interior_error =
-                eevee_interior_error.max((eevee_half[index] - eevee_base[index] * 0.5).abs());
-            potter_interior_error =
-                potter_interior_error.max((potter_half[index] - potter_base[index] * 0.5).abs());
-            interior_pixels += 1;
-        }
-    }
-    eprintln!(
-        "VOLUME_FACTOR_METRICS eevee_base_max={eevee_base_max} eevee_half_max={eevee_half_max} eevee_full={eevee_half_error} eevee_interior={eevee_interior_error} potter_base_max={potter_base_max} potter_half_max={potter_half_max} potter_full={potter_half_error} potter_interior={potter_interior_error} interior_pixels={interior_pixels}"
-    );
     assert!(
         potter_half_error <= NATIVE_HALF_TOLERANCE,
         "Potter's half-factor render differs from half its base: error {potter_half_error}"
@@ -293,7 +267,7 @@ fn realtime_volumetric_shadow_setting_matches_native_ab_response() -> TestResult
     Ok(())
 }
 
-/// A zero-density Volume-only mesh has no Beauty surface and casts no opaque shadow on a lit receiver.
+/// Volume-only meshes are not opaque Beauty or AO surfaces; zero-density emission remains visible, but only after clip_start.
 #[test]
 fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
@@ -374,7 +348,31 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
     let active_scene = scene["active_scene"]
         .as_str()
         .ok_or("active scene is missing")?;
-    let light_id = native_oracle::node_id(&scene, "Light")?;
+    let world_id = scene["scenes"]
+        .get(active_scene)
+        .and_then(|scene| scene["world"].as_str())
+        .ok_or("the active scene world is missing")?;
+    let world = scene["worlds"]
+        .get(world_id)
+        .ok_or("the active scene world data is missing")?;
+    let world_graph_id = world["node_tree"]
+        .as_str()
+        .ok_or("the active world graph is missing")?;
+    let world_graph = scene["node_groups"]
+        .get(world_graph_id)
+        .ok_or("the active world graph data is missing")?;
+    let background_nodes = world_graph["nodes"]
+        .as_object()
+        .ok_or("the active world graph nodes are missing")?;
+    let (background_node_id, background_node) = background_nodes
+        .iter()
+        .find(|(_, node)| node["type"] == "ShaderNodeBackground")
+        .ok_or("the active world Background node is missing")?;
+    let mut background_inputs = background_node["inputs"]
+        .as_object()
+        .cloned()
+        .ok_or("the world Background inputs are missing")?;
+    background_inputs.insert("Color".to_owned(), json!([0.4, 0.4, 0.4, 1.0]));
     let configured = apply_operations(
         &project,
         root.path(),
@@ -384,9 +382,10 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
             {"op": "graph.unlink", "graph": graph_id,
              "from_node": surface_link[0], "from_socket": surface_link[1],
              "to_node": surface_link[2], "to_socket": surface_link[3]},
+            {"op": "graph.node_update", "graph": world_graph_id,
+             "node_id": background_node_id, "set": {"inputs": background_inputs}},
             {"op": "node.create", "id": "receiver", "kind": "plane", "params": {"size": 4.0},
-             "transform": {"translation": [0.0, 0.0, -2.0]}},
-            {"op": "light.update", "target": {"id": light_id}, "set": {"shadow": true}},
+             "transform": {"translation": [0.0, 0.0, -1.5]}},
             {"op": "camera.create", "id": "camera_main",
              "transform": {"translation": [0.0, 0.0, 10.0]},
              "projection": "orthographic", "ortho_scale": ORTHO_SCALE},
@@ -415,6 +414,59 @@ fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
     assert!(
         difference <= POTTER_PIXEL_TOLERANCE,
         "a zero-density Volume-only mesh changes the no-object image: {difference}"
+    );
+    let emission_inputs = json!({
+        "Density": 0.0,
+        "Color": [0.0, 0.0, 0.0, 1.0],
+        "Emission Color": [1.0, 1.0, 1.0, 1.0],
+        "Emission Strength": 1.0,
+    });
+    let emission_graph = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "graph.node_add", "graph": graph_id, "id": "zero_density_emitter",
+             "type": "ShaderNodeVolumePrincipled", "inputs": emission_inputs},
+            {"op": "graph.unlink", "graph": graph_id,
+             "from_node": volume_node_id, "from_socket": "Volume",
+             "to_node": output_node_id, "to_socket": "Volume"},
+            {"op": "graph.link", "graph": graph_id,
+             "from_node": "zero_density_emitter", "from_socket": "Volume",
+             "to_node": output_node_id, "to_socket": "Volume"},
+            {"op": "node.update", "target": {"id": cube_id}, "set": {"visible": true}}
+        ]),
+    )?;
+    assert_eq!(emission_graph["ok"], true, "{emission_graph}");
+    let emitted = render_project(root.path(), &project, "zero_density_emission")?;
+    let emission_effect = worst_difference(&plane_values(&emitted), &no_object_values);
+    assert!(
+        emission_effect > 1.0e-3,
+        "a zero-density emissive mesh Volume closure contributes no radiance: {emission_effect}"
+    );
+
+    let clipped = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op": "camera.update", "target": {"id": "camera_main"}, "set": {"clip_start": 9.5}},
+            {"op": "node.update", "target": {"id": cube_id},
+             "set": {"transform": {"translation": [0.0, 0.0, 2.0]}}}
+        ]),
+    )?;
+    assert_eq!(clipped["ok"], true, "{clipped}");
+    let before_near = render_project(root.path(), &project, "volume_before_near_clip")?;
+    let hidden = apply_operations(
+        &project,
+        root.path(),
+        json!([{"op": "node.update", "target": {"id": cube_id}, "set": {"visible": false}}]),
+    )?;
+    assert_eq!(hidden["ok"], true, "{hidden}");
+    let near_background = render_project(root.path(), &project, "near_clip_background")?;
+    let near_difference =
+        worst_difference(&plane_values(&before_near), &plane_values(&near_background));
+    assert!(
+        near_difference <= POTTER_PIXEL_TOLERANCE,
+        "a zero-density emissive mesh before clip_start contributes radiance: {near_difference}"
     );
     Ok(())
 }

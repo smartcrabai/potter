@@ -708,6 +708,7 @@ fn rasterize_view(
             seed,
             filter_size,
             shader,
+            geometry.prepared.as_slice(),
             volume_pass,
         );
     }
