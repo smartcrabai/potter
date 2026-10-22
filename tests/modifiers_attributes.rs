@@ -1881,15 +1881,22 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         DVec3::new(2.0, -1.0, 0.0),
     );
     let proximity_target_world = DMat4::from_translation(DVec3::new(3.5, -1.0, 0.0));
-    let mut proximity_operands = BTreeMap::new();
-    proximity_operands.insert(
-        "target".to_owned(),
-        vec![scene_operand(
-            Mesh::default(),
-            proximity_subject_world.inverse() * proximity_target_world,
-            None,
-        )],
+    // OBJECT mode measures world-space origins (MOD_weightvgproximity.cc get_ob2ob_distance), so the
+    // target operand's world matrix is the target object's world transform, not its subject-relative one.
+    let mut target_operand = scene_operand(
+        Mesh::default(),
+        proximity_subject_world.inverse() * proximity_target_world,
+        None,
     );
+    if let Some(matrices) = target_operand.blender_matrices_f32.as_mut() {
+        matrices.world = Some(
+            proximity_target_world
+                .to_cols_array()
+                .map(|value| value as f32),
+        );
+    }
+    let mut proximity_operands = BTreeMap::new();
+    proximity_operands.insert("target".to_owned(), vec![target_operand]);
     let proximity = modifier(
         "vertex_weight_proximity",
         json!({"target":"target","vertex_group":"A","proximity_mode":"OBJECT","proximity_geometry":["VERTEX"],"min_dist":0.0,"max_dist":3.0,"normalize":false}),
