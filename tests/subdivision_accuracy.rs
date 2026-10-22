@@ -20,13 +20,19 @@ type EdgeRecords = BTreeMap<(usize, usize), Vec<(bool, bool, f64)>>;
 #[path = "common/blender_code_tolerance.rs"]
 mod blender_code_tolerance;
 use blender_code_tolerance::code_within_beta_step;
+#[path = "common/normal_codes.rs"]
+mod normal_codes;
+use normal_codes::is_auto_code;
 
 const ORACLE: &str = include_str!("fixtures/pr16_subdivision/oracle.json");
-/// One stored custom-normal code: `null` is Auto, otherwise an authored `[i64, i64]` pair. Auto
-/// matches only Auto; an authored pair must match alpha exactly and beta within one step.
+/// One stored custom-normal code: Auto (`[0, 0]`, or the legacy `null`), otherwise an authored `[i64, i64]` pair.
+/// Auto matches only Auto; an authored pair must match alpha exactly and beta within one step.
 fn codes_within_beta_step(actual: &Value, expected: &Value) -> bool {
     if actual == expected {
         return true;
+    }
+    if is_auto_code(actual) || is_auto_code(expected) {
+        return is_auto_code(actual) && is_auto_code(expected);
     }
     let pair = |value: &Value| -> Option<[i64; 2]> {
         let [first, second] = value.as_array()?.as_slice() else {

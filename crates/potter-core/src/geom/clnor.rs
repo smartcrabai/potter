@@ -1904,8 +1904,12 @@ mod tests {
                 .as_object()
                 .expect("rows")
                 .values()
-                .all(|row| row.as_array().expect("row").iter().all(Value::is_null)),
-            "[0, 0] becomes automatic"
+                .all(|row| row
+                    .as_array()
+                    .expect("row")
+                    .iter()
+                    .all(|code| *code == json!([0, 0]))),
+            "[0, 0] stays the automatic code"
         );
     }
 

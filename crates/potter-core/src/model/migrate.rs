@@ -2134,7 +2134,7 @@ mod tests {
         assert_eq!(attributes["custom_normal"]["type"], json!("normal_code"));
         assert_eq!(
             attributes["custom_normal"]["values"][face.as_str()],
-            json!([null, null, null])
+            json!([[0, 0], [0, 0], [0, 0]])
         );
         let kept: Vec<&str> = attributes["blender_attributes"]
             .as_array()
@@ -2190,8 +2190,8 @@ mod tests {
             .as_array()
             .ok_or("migrated custom normal row is missing")?;
         assert_eq!(corners[0], json!([16000, 0]));
-        assert_eq!(corners[1], Value::Null);
-        assert_eq!(corners[2], Value::Null);
+        assert_eq!(corners[1], json!([0, 0]));
+        assert_eq!(corners[2], json!([0, 0]));
         assert!(
             !attributes
                 .get("blender_attributes")
@@ -2231,7 +2231,7 @@ mod tests {
         );
         assert_eq!(
             migrated.attributes["custom_normal"]["values"][face.as_str()],
-            json!(["explicit_zero", null, null])
+            json!(["explicit_zero", [0, 0], [0, 0]])
         );
         Ok(())
     }
