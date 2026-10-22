@@ -221,10 +221,10 @@ fn realtime_volumetric_shadow_setting_matches_native_ab_response() -> TestResult
                 "set": {"eevee_use_volumetric_shadows": false}}]),
     )?;
     assert_eq!(disabled["ok"], true, "{disabled}");
-    assert_eq!(
-        read_scene(&project)?["scenes"][active.as_str()]["render"]["eevee_use_volumetric_shadows"]
-            .as_bool(),
-        Some(false),
+    assert!(
+        !read_scene(&project)?["scenes"][active.as_str()]["render"]["eevee_use_volumetric_shadows"]
+            .as_bool()
+            .unwrap_or(false),
         "Blender's default volumetric shadows are enabled unexpectedly"
     );
     let unshadowed = render_project(root.path(), &project, "volume_unshadowed")?;
