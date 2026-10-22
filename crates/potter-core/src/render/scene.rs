@@ -17,7 +17,7 @@ use crate::{
         uv_layers::{self, UvStore},
     },
     image::ImageData,
-    model::{Id, Material, SceneDoc},
+    model::{Id, Material, Node, RayKind, RayVisibility, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
         SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace,
@@ -28,7 +28,7 @@ use crate::{
 
 use super::world_probe::WorldProbe;
 use super::{
-    bvh::{Bvh, BvhHit},
+    bvh::{Bvh, BvhHit, WalkRay},
     eevee_ltc::Emitter,
     eevee_transmission::{
         self, GlassClosures, GlassLight, Thickness, irradiance_probe_radiance, probe_radiance,
@@ -40,8 +40,7 @@ use super::{
     },
     path::{hit_params, object_for_index},
     principled_bsdf::{
-        Layers, coat_coefficient, diffuse_coefficient, layers as principled_layers,
-        sheen_coefficient, specular_coefficient,
+        Layers, layers as principled_layers, reflected_lobes_coefficient, without_subsurface,
     },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, Triangle, ViewBasis,
@@ -341,10 +340,13 @@ fn ray_transmittance(
     let mut transmittance = 1.0;
     shadow.bvh.walk_hits(
         shadow.triangles,
-        origin,
-        direction,
-        SHADOW_EPSILON,
-        distance,
+        WalkRay {
+            origin,
+            direction,
+            epsilon: SHADOW_EPSILON,
+            remaining: distance,
+            kind: Some(RayKind::Shadow),
+        },
         |hit, origin| {
             match shadow
                 .occluders
@@ -438,6 +440,10 @@ pub(super) fn extract_geometry(
                 && !node.render_visible)
         {
             continue;
+        }
+        let ray_visibility = node.resolved_ray_visibility();
+        if !path_traced && matches!(mode, Mode::Beauty) {
+            ray_visibility_warnings(node_id, node, &mut warnings);
         }
         let data_block = node
             .data
@@ -909,6 +915,7 @@ pub(super) fn extract_geometry(
                         normals: corner_normals,
                         layer_colors,
                         lit_per_pixel,
+                        ray_mask: ray_visibility.mask(),
                     };
                     if let (Some(material), Some(prepared_material)) = (
                         material.filter(|material| {
@@ -1072,6 +1079,7 @@ pub(super) fn extract_geometry(
                     color,
                     object_index,
                     element_index,
+                    ray_mask: ray_visibility.mask(),
                 });
             }
         }
@@ -1139,6 +1147,7 @@ pub(super) fn extract_geometry(
                         color: stroke.color,
                         object_index,
                         element_index,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
                 let stroke_element_index = u32::try_from(elements.len() + 1).map_err(|_| {
@@ -1187,6 +1196,7 @@ pub(super) fn extract_geometry(
                         color: stroke.color,
                         object_index,
                         element_index: stroke_element_index,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
             }
@@ -1262,6 +1272,7 @@ pub(super) fn extract_geometry(
                         color,
                         object_index,
                         element_index,
+                        ray_mask: ray_visibility.mask(),
                     });
                 }
             }
@@ -1386,7 +1397,10 @@ impl PointShadowMap {
                 depth,
             });
         }
-        for triangle in triangles {
+        let casters = triangles
+            .iter()
+            .filter(|triangle| triangle.ray_mask & RayKind::Shadow.bit() != 0);
+        for triangle in casters {
             for face in &mut faces {
                 rasterize_shadow_triangle(face, position, triangle);
             }
@@ -1791,6 +1805,46 @@ fn world_face_normals(
         }));
     }
     faces
+}
+
+/// Ray-visibility flags that realtime Beauty does not honour, one warning per flag switched away from
+/// Blender's default for a light. Blender's panel shows the flags each engine exposes
+/// (`scripts/startup/bl_ui/properties_object.py`, `OBJECT_PT_visibility`, EEVEE branch): a mesh has
+/// Camera, Shadow and Raycast, and a light has Camera, Diffuse, Glossy, Transmission and Volume Scatter.
+/// EEVEE has no mesh diffuse, glossy, transmission or volume flag, so realtime warns about none of
+/// those. A light's camera visibility shows its emitter in EEVEE (`eevee_light_shape_display`, which
+/// returns unless `visible_camera`; a headless EEVEE render shows the disc), and realtime draws no
+/// emitters. EEVEE applies a light's transmission and volume scatter to its power (`eevee_light.cc`,
+/// `transmission_visibility` and `volume_visibility`), and realtime does not. The path tracer honours
+/// every flag. A light's `visible_shadow` is stored without a warning: Blender reads it nowhere
+/// (Cycles' `light_object_visibility_flags`, EEVEE's `eevee_light.cc`).
+fn ray_visibility_warnings(node_id: &Id, node: &Node, warnings: &mut Vec<serde_json::Value>) {
+    const REALTIME_LIGHT: [(&str, RayKind); 3] = [
+        ("camera", RayKind::Camera),
+        ("transmission", RayKind::Transmission),
+        ("volume_scatter", RayKind::VolumeScatter),
+    ];
+    if node.kind != "light" {
+        return;
+    }
+    let visibility = node.resolved_ray_visibility();
+    let default = RayVisibility::default_for_kind(&node.kind);
+    for &(name, ray) in &REALTIME_LIGHT {
+        let value = visibility.allows(ray);
+        let expected = default.allows(ray);
+        if value == expected {
+            continue;
+        }
+        warnings.push(serde_json::json!({
+            "code": "UNSUPPORTED_FEATURE",
+            "feature_id": format!("object.ray_visibility.{name}"),
+            "node_id": node_id,
+            "message": format!(
+                "visible_{name} is {value}, which realtime Beauty does not honour for this {}; it renders as if visible_{name} were {expected}",
+                node.kind,
+            ),
+        }));
+    }
 }
 
 /// Principled inputs of a surface shaded with `material`: the path tracer's own construction
@@ -2520,6 +2574,7 @@ fn shade(
                 &shading,
                 shadow,
                 point_shadow,
+                light_node.resolved_ray_visibility(),
             ) * influence;
             if let Some(glass) = &glass {
                 lobes += glass_direct_contribution(
@@ -2652,6 +2707,7 @@ fn light_contribution(
     shading: &Layers,
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
+    lobes: RayVisibility,
 ) -> DVec3 {
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
@@ -2669,6 +2725,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 light,
+                lobes,
             )
         }
         crate::model::LightType::Point => {
@@ -2682,6 +2739,7 @@ fn light_contribution(
                 color,
                 point_intensity(energy) / distance_squared,
                 LightFactors::of(light),
+                lobes,
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2707,6 +2765,7 @@ fn light_contribution(
                 color,
                 (point_intensity(energy) / distance_squared) * falloff,
                 LightFactors::of(light),
+                lobes,
             ) * visibility_for_light(
                 shadow,
                 point_shadow,
@@ -2740,8 +2799,20 @@ fn light_contribution(
             // Integrated Lambert irradiance is exact for rectangles, and the visibility weight scales it. The specular,
             // sheen and coat lobes are evaluated towards the emitter centre on the lit side.
             let toward_centre = (position - point).normalize_or_zero();
-            let (diffuse, specular) = reflective_classes(params, shading, toward_centre);
+            let params = without_subsurface(params);
             let factors = LightFactors::of(light);
+            let diffuse = reflected_lobes_coefficient(
+                &params,
+                shading,
+                toward_centre,
+                lobes.mask() & RayKind::Diffuse.bit(),
+            );
+            let specular = reflected_lobes_coefficient(
+                &params,
+                shading,
+                toward_centre,
+                lobes.mask() & RayKind::Glossy.bit(),
+            );
             (diffuse * factors.diffuse + specular * factors.specular) * front * color
         }
     }
@@ -3367,7 +3438,9 @@ fn sun_lighting(
     toward_light: DVec3,
     color: DVec3,
     light: &crate::model::LightData,
+    lobes: RayVisibility,
 ) -> DVec3 {
+    let params = without_subsurface(params);
     let energy = light.energy.max(0.0);
     let factors = LightFactors::of(light);
     let radius = sun_disc_radius(light.sun_angle);
@@ -3388,14 +3461,23 @@ fn sun_lighting(
         mean_visibility += visibility / SUN_DISC_SAMPLES as f64;
         let cosine = shading.normal.dot(sample);
         if cosine > 0.0 {
-            let lobe = specular_coefficient(params, shading, sample)
-                + coat_coefficient(params, shading, sample);
+            let lobe = reflected_lobes_coefficient(
+                &params,
+                shading,
+                sample,
+                lobes.mask() & RayKind::Glossy.bit(),
+            );
             specular += lobe * (weight * cosine * visibility);
         }
     }
     let cosine = shading.normal.dot(toward_light);
     let diffuse = if cosine > 0.0 {
-        reflective_classes(params, shading, toward_light).0 * (energy * cosine * mean_visibility)
+        reflected_lobes_coefficient(
+            &params,
+            shading,
+            toward_light,
+            lobes.mask() & RayKind::Diffuse.bit(),
+        ) * (energy * cosine * mean_visibility)
     } else {
         DVec3::ZERO
     };
@@ -3412,6 +3494,7 @@ fn punctual_radiance(
     color: DVec3,
     intensity: f64,
     factors: LightFactors,
+    lobes: RayVisibility,
 ) -> DVec3 {
     let normal_light_cosine = shading.normal.dot(light).abs();
     if normal_light_cosine <= 0.0 {
@@ -3421,7 +3504,19 @@ fn punctual_radiance(
     if shading.normal.dot(light) <= 0.0 {
         return DVec3::ZERO;
     }
-    let (diffuse, specular) = reflective_classes(params, shading, light);
+    let params = without_subsurface(params);
+    let diffuse = reflected_lobes_coefficient(
+        &params,
+        shading,
+        light,
+        lobes.mask() & RayKind::Diffuse.bit(),
+    );
+    let specular = reflected_lobes_coefficient(
+        &params,
+        shading,
+        light,
+        lobes.mask() & RayKind::Glossy.bit(),
+    );
     (diffuse * factors.diffuse + specular * factors.specular)
         * color
         * (intensity * normal_light_cosine)
@@ -3446,14 +3541,6 @@ impl LightFactors {
     }
 }
 
-/// The reflective lobes along `light` in EEVEE's two classes, before the light's factors: the diffuse class (the diffuse
-/// and sheen lobes, which EEVEE's sheen joins to the diffuse closure) and the specular class (the specular and coat lobes).
-fn reflective_classes(params: &BsdfParams, shading: &Layers, light: DVec3) -> (DVec3, DVec3) {
-    (
-        diffuse_coefficient(params, shading) + sheen_coefficient(params, shading, light),
-        specular_coefficient(params, shading, light) + coat_coefficient(params, shading, light),
-    )
-}
 
 #[cfg(test)]
 mod shading_normal_tests {
@@ -3485,7 +3572,7 @@ mod shading_normal_tests {
         },
         graph::{GraphKind, GraphNode, NodeGroup},
         image::{ImageData, ImageInterpolation},
-        model::{Id, Material, MaterialLink, SceneDoc, ViewportDisplay},
+        model::{Id, Material, MaterialLink, RayVisibility, SceneDoc, ViewportDisplay},
         render::{
             light_model::{
                 AreaShape, area_irradiance_per_radiance, area_radiance, area_visibility_samples,
@@ -3958,6 +4045,7 @@ mod shading_normal_tests {
             normals: Some(normals),
             layer_colors: Vec::new(),
             lit_per_pixel: false,
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 

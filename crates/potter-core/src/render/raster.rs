@@ -7,7 +7,7 @@ use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, Wire
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
 use crate::geom::GeneratedCorners;
-use crate::model::{CameraData, CameraProjection};
+use crate::model::{CameraData, CameraProjection, RayKind};
 
 /// A camera projection in Blender's units: angles in radians, lengths in millimetres.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -267,6 +267,8 @@ pub(crate) struct Triangle {
     /// Evaluates the material graph at each hit of a realtime Beauty triangle whose graph reads color layers or needs
     /// hit data. Every realtime Beauty hit is shaded per pixel regardless, flat triangles included.
     pub(crate) lit_per_pixel: bool,
+    /// The owning object's ray mask (one `RayKind` bit each); realtime Beauty filters primary rays.
+    pub(crate) ray_mask: u8,
 }
 
 impl Triangle {
@@ -294,6 +296,7 @@ impl Triangle {
             normals: self.normals,
             layer_colors,
             lit_per_pixel: self.lit_per_pixel,
+            ray_mask: self.ray_mask,
         }
     }
 
@@ -444,6 +447,8 @@ pub(crate) struct Line {
     pub(crate) color: [f64; 4],
     pub(crate) object_index: u32,
     pub(crate) element_index: u32,
+    /// Object ray mask; realtime Beauty leaves out lines hidden from camera rays.
+    pub(crate) ray_mask: u8,
 }
 
 #[derive(Debug)]
@@ -683,7 +688,7 @@ pub(crate) fn rasterize_with_samples(
         )
     })?;
     let frame = camera_frame(camera, width, height)?;
-    let prepared = prepare_triangles(triangles)?;
+    let prepared = prepare_triangles(triangles, mode)?;
     let visibility = super::bvh::Bvh::build_from_positions(
         prepared.iter().map(|triangle| triangle.source.positions),
     )?;
@@ -978,6 +983,9 @@ pub(crate) fn rasterize_with_lines(
                 ErrorCode::EvaluationFailed,
                 "evaluated stroke contains invalid geometry or color",
             ));
+        }
+        if matches!(mode, Mode::Beauty) && line.ray_mask & RayKind::Camera.bit() == 0 {
+            continue;
         }
         let Some(start) = project_world(camera, &frame, width, height, line.start) else {
             continue;
@@ -1643,6 +1651,9 @@ fn is_valid_fov(fov: f64) -> bool {
     fov.is_finite() && fov > 0.0 && fov <= crate::model::FISHEYE_FOV_MAX
 }
 
+/// Fraction of the hemisphere above `shading` that is unoccluded at `point`. Occluders are filtered
+/// by shadow visibility, as Cycles' ambient occlusion is, so objects hidden from camera rays still
+/// occlude.
 pub(crate) fn ambient_visibility(
     bvh: &super::bvh::Bvh,
     triangles: &[Triangle],
@@ -1681,7 +1692,9 @@ pub(crate) fn ambient_visibility(
             direction
         };
         if bvh
-            .closest_hit_two_sided(triangles, origin, direction, 1.0e-5, distance)
+            .closest_hit_where(triangles, origin, direction, 1.0e-5, distance, &|mask| {
+                mask & RayKind::Shadow.bit() != 0
+            })
             .is_none()
         {
             visible += 1;
@@ -2297,7 +2310,9 @@ fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4
     [color.x, color.y, color.z, alpha]
 }
 
-fn prepare_triangles(triangles: &[Triangle]) -> Result<Vec<PreparedTriangle>> {
+/// Primary-ray triangles. Realtime Beauty leaves out objects hidden from camera rays; the other
+/// modes draw every triangle, as the viewport does.
+fn prepare_triangles(triangles: &[Triangle], mode: Mode) -> Result<Vec<PreparedTriangle>> {
     let mut prepared = Vec::new();
     prepared.try_reserve_exact(triangles.len()).map_err(|_| {
         PotError::new(
@@ -2319,6 +2334,9 @@ fn prepare_triangles(triangles: &[Triangle]) -> Result<Vec<PreparedTriangle>> {
             return Err(PotError::invalid_argument(
                 "triangle positions and colors must be finite",
             ));
+        }
+        if matches!(mode, Mode::Beauty) && triangle.ray_mask & RayKind::Camera.bit() == 0 {
+            continue;
         }
         let edge1 = triangle.positions[1] - triangle.positions[0];
         let edge2 = triangle.positions[2] - triangle.positions[0];
@@ -3064,6 +3082,7 @@ mod tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 7,
             element_index: 0,
+            ray_mask: crate::model::RayVisibility::default().mask(),
         };
         let output = rasterize_with_lines(
             &[],
@@ -3100,6 +3119,7 @@ mod tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 7,
             element_index: 0,
+            ray_mask: crate::model::RayVisibility::default().mask(),
         };
         let output = rasterize_with_lines(
             &[],
@@ -3142,6 +3162,7 @@ mod tests {
 #[cfg(test)]
 mod line_tests {
     use super::{Camera, Line, Mode, Projection, StereoMode, rasterize_with_lines};
+    use crate::model::RayVisibility;
     use glam::DVec3;
 
     #[test]
@@ -3166,6 +3187,7 @@ mod line_tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 1,
             element_index: 2,
+            ray_mask: RayVisibility::default().mask(),
         };
         let output = rasterize_with_lines(
             &[],
@@ -3229,6 +3251,7 @@ mod smooth_shading_tests {
         SurfaceShader, Triangle, rasterize_with_samples,
     };
     use crate::error::Result;
+    use crate::model::RayVisibility;
 
     const SIZE: u32 = 64;
     /// Pixel (32, 32) has its centre at world (1/64, -1/64, 0) for this camera.
@@ -3287,6 +3310,7 @@ mod smooth_shading_tests {
             normals,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 
@@ -3542,11 +3566,12 @@ mod visibility_tests {
     use glam::DVec3;
 
     use super::{
-        AlphaMode, Camera, CameraFrame, Hit, Layer, PreparedTriangle, Projection, Ray, StereoMode,
-        Triangle, camera_frame, composite_layers, composite_sample, hit_opacity,
+        AlphaMode, Camera, CameraFrame, Hit, Layer, Mode, PreparedTriangle, Projection, Ray,
+        StereoMode, Triangle, camera_frame, composite_layers, composite_sample, hit_opacity,
         intersect_triangle, nearest_visible_hit, prepare_triangles, ray_for_pixel_in_frame,
     };
     use crate::float::equal_f64;
+    use crate::model::RayVisibility;
     use crate::render::bvh::Bvh;
 
     const SIZE: u32 = 48;
@@ -3576,6 +3601,7 @@ mod visibility_tests {
             normals: None,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 
@@ -3687,7 +3713,7 @@ mod visibility_tests {
 
     #[test]
     fn bounded_nearest_hit_matches_a_scan_of_every_triangle() {
-        let prepared = prepare_triangles(&tied_grid()).expect("grid prepares");
+        let prepared = prepare_triangles(&tied_grid(), Mode::Solid).expect("grid prepares");
         assert_eq!(
             prepared.len(),
             4 * GRID * GRID,
@@ -3723,7 +3749,7 @@ mod visibility_tests {
 
     #[test]
     fn translucent_composite_matches_a_scan_of_every_triangle() {
-        let prepared = prepare_triangles(&tied_grid()).expect("grid prepares");
+        let prepared = prepare_triangles(&tied_grid(), Mode::Solid).expect("grid prepares");
         let visibility =
             Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
                 .expect("visibility BVH builds");

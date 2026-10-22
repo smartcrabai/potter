@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":7},
+        "schema_version":{"const":8},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -180,6 +180,9 @@ fn scene_schema() -> Value {
     root["$defs"]["node"]["properties"]["material_links"] = json!({
         "type":"array",
         "items":{"enum":["data","object"]}
+    });
+    root["$defs"]["node"]["properties"]["ray_visibility"] = json!({
+        "oneOf":[{"type":"null"},{"type":"object","required":["camera","diffuse","glossy","transmission","volume_scatter","shadow"],"properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false}]
     });
     root["$defs"]["captured_matrix_basis"] = json!({
         "type":"object",
@@ -2480,6 +2483,7 @@ fn set_schema(operation: &str) -> Value {
             "transform":{"type":"object","properties":{"translation":vec_schema(3),"rotation_deg":vec_schema(3),"rotation":vec_schema(4),"scale":vec_schema(3)},"additionalProperties":false},
             "params":{"type":"object"},"materials":{"type":"array","items":{"oneOf":[id_schema(),{"type":"null"}]}},
             "visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},
+            "ray_visibility":{"type":"object","properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false},
             "action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}
         }),
         "shape_key.update" => json!({
