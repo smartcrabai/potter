@@ -12,7 +12,7 @@ use std::{collections::BTreeSet, path::Path};
 
 use serde_json::{Map, Value, json};
 
-use super::{Image, ImageAlphaMode, SceneDoc};
+use super::{Image, ImageAlphaMode, RayKind, RayVisibility, SceneDoc};
 use crate::{
     color::curve::{CurveMapping, CurvePoint, HandleType},
     error::{ErrorCode, PotError, Result},
@@ -202,7 +202,7 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 8, converting superseded modifier binds on
+/// Upgrades a scene document in place through schema version 9, converting superseded modifier binds on
 /// the way. `root` is the project directory that holds the document's image blobs and linked sources,
 /// which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
@@ -229,6 +229,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(7) {
         upgrade_v7(value);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(8) {
+        upgrade_v8(value);
     }
     Ok(warnings)
 }
@@ -595,11 +598,60 @@ fn upgrade_v6(value: &mut Value) {
     value["schema_version"] = json!(7);
 }
 
-/// Upgrades a schema-version-7 scene document to version 8. `mesh_sequence_cache`'s `CacheFile` fields moved from the
+/// Upgrades a schema-version-7 scene document to version 8. Version 7 kept Blender's `visible_*` object flags only in
+/// each node's opaque `blender_object_metadata.rna_properties` copy, which Potter does not render from. Each node moves
+/// its flags into the typed `ray_visibility`, from Blender's default for the node's kind, and the copy's flags are
+/// removed. A node whose flags equal the default keeps no `ray_visibility`.
+fn upgrade_v7(value: &mut Value) {
+    if let Some(nodes) = value.get_mut("nodes").and_then(Value::as_object_mut) {
+        for node in nodes.values_mut() {
+            upgrade_node_ray_visibility(node);
+        }
+    }
+    value["schema_version"] = json!(8);
+}
+
+fn upgrade_node_ray_visibility(node: &mut Value) {
+    let kind = node
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let Some(rna) = node
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("blender_object_metadata"))
+        .and_then(|metadata| metadata.get_mut("rna_properties"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let default = RayVisibility::default_for_kind(&kind);
+    let mut visibility = default;
+    let mut copied = false;
+    for ray in RayKind::ALL {
+        if let Some(flag) = rna
+            .remove(ray.rna_property())
+            .and_then(|flag| flag.as_bool())
+        {
+            visibility.set(ray, flag);
+            copied = true;
+        }
+    }
+    if !copied || visibility == default || node.get("ray_visibility").is_some() {
+        return;
+    }
+    let flags: Map<String, Value> = RayKind::ALL
+        .into_iter()
+        .map(|ray| (ray.name().to_owned(), json!(visibility.allows(ray))))
+        .collect();
+    node["ray_visibility"] = Value::Object(flags);
+}
+
+/// Upgrades a schema-version-8 scene document to version 9. `Mesh Sequence Cache`'s `CacheFile` fields moved from the
 /// referenced resource's `cache_file` record into the modifier params: `is_sequence`, `velocity_name` and
 /// `velocity_unit` are copied from it when the params do not already set them. The `scale` param is removed, since
 /// Blender applies `CacheFile.scale` only through a Transform Cache constraint.
-fn upgrade_v7(value: &mut Value) {
+fn upgrade_v8(value: &mut Value) {
     let cache_files: std::collections::BTreeMap<String, Map<String, Value>> = value
         .get("resources")
         .and_then(Value::as_object)
@@ -639,9 +691,8 @@ fn upgrade_v7(value: &mut Value) {
             }
         }
     }
-    value["schema_version"] = json!(8);
+    value["schema_version"] = json!(9);
 }
-
 fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Some(curve) = color.get_mut("curve") else {
         return Ok(());
@@ -1731,7 +1782,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1753,7 +1804,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -1773,7 +1824,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -1797,14 +1848,59 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_eight_scenes_pass_through_untouched() {
+    fn current_schema_nine_scenes_pass_through_untouched() {
         let mut scene = json!({
-            "schema_version": 8,
+            "schema_version": 9,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene, before);
+        assert_eq!(scene["schema_version"], json!(9));
+        assert_eq!(scene["materials"], before["materials"]);
+    }
+
+    #[test]
+    fn schema_seven_visibility_copies_move_into_ray_visibility() {
+        let copy = |flags: Value| json!({"blender_object_metadata": {"rna_properties": flags, "name": "obj"}});
+        let mut scene = json!({
+            "schema_version": 7,
+            "nodes": {
+                "cam_off": {"kind": "mesh", "properties": copy(json!({
+                    "visible_camera": false, "visible_diffuse": true, "visible_shadow": false
+                }))},
+                "light_default": {"kind": "light", "properties": copy(json!({
+                    "visible_camera": false, "visible_shadow": true
+                }))},
+                "light_camera_on": {"kind": "light", "properties": copy(json!({
+                    "visible_camera": true
+                }))},
+                "plain": {"kind": "mesh", "properties": {}}
+            }
+        });
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(9));
+        let nodes = &scene["nodes"];
+        assert_eq!(
+            nodes["cam_off"]["ray_visibility"],
+            json!({"camera": false, "diffuse": true, "glossy": true, "transmission": true,
+                   "volume_scatter": true, "shadow": false})
+        );
+        // A light's default already hides it from camera rays, so matching flags store nothing.
+        assert!(nodes["light_default"].get("ray_visibility").is_none());
+        assert_eq!(
+            nodes["light_camera_on"]["ray_visibility"]["camera"],
+            json!(true)
+        );
+        assert!(nodes["plain"].get("ray_visibility").is_none());
+        // The copies are gone, so the document has one source of visibility.
+        for name in ["cam_off", "light_default", "light_camera_on"] {
+            let rna = &nodes[name]["properties"]["blender_object_metadata"]["rna_properties"];
+            assert!(
+                rna.as_object()
+                    .is_some_and(|rna| rna.keys().all(|key| !key.starts_with("visible_"))),
+                "{name}"
+            );
+        }
     }
 
     /// Schema 7 kept a Mesh Sequence Cache's `CacheFile` fields on the resource and an unused `scale` param on the
@@ -1825,7 +1921,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -1873,7 +1969,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 8);
+        assert_eq!(parsed.doc.schema_version, 9);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -1919,7 +2015,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -1962,7 +2058,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(8);
+        expected["schema_version"] = json!(9);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -2000,7 +2096,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 8);
+        assert_eq!(migrated.schema_version, 9);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -2504,7 +2600,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 8);
+        assert_eq!(record.snapshot.schema_version, 9);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -2571,7 +2667,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 8);
+        assert_eq!(record.snapshot.schema_version, 9);
         let history_mesh = record
             .snapshot
             .data_blocks

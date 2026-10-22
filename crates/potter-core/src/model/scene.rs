@@ -123,7 +123,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 8,
+            schema_version: 9,
             scene_id,
             revision: 0,
             active_scene,
@@ -151,7 +151,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 8 {
+        if self.schema_version != 9 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -1205,6 +1205,10 @@ pub struct RenderSettings {
     )]
     pub filter_glossy: f64,
     pub film_transparent: bool,
+    /// Blender's `render.filter_size` (`scene.r.gauss`, `rna_scene.cc`): the reconstruction radius, in pixels, of
+    /// EEVEE's film (`eevee_film.cc`). Realtime Beauty uses it; Solid and the path tracer do not.
+    #[serde(default = "default_filter_size")]
+    pub filter_size: f64,
     pub engine: String,
     pub use_sequencer: bool,
     pub audio_codec: String,
@@ -1260,6 +1264,7 @@ impl Default for RenderSettings {
             transparent_max_bounces: 8,
             filter_glossy: 1.0,
             film_transparent: false,
+            filter_size: default_filter_size(),
             engine: "path".to_owned(),
             use_sequencer: false,
             audio_codec: "wav".to_owned(),
@@ -1279,6 +1284,10 @@ impl Default for RenderSettings {
 
 fn default_shutter() -> f64 {
     0.5
+}
+
+fn default_filter_size() -> f64 {
+    1.5
 }
 
 fn default_motion_blur_samples() -> u32 {
@@ -1857,6 +1866,156 @@ pub enum MaterialLink {
     Object,
 }
 
+/// A Cycles ray class that Blender's object visibility gates (`PATH_RAY_*` in Cycles' kernel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RayKind {
+    Camera,
+    Diffuse,
+    Glossy,
+    Transmission,
+    VolumeScatter,
+    Shadow,
+}
+
+/// Blender's per-object ray visibility (`visible_camera`, `visible_diffuse`, ...): one bit per `RayKind`. Cycles masks
+/// each object with these bits and skips it for rays whose kind is switched off. Stored as the mask a triangle carries,
+/// and serialised as the six named flags (`{"camera": true, ...}`), all required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RayVisibility {
+    mask: u8,
+}
+
+impl Default for RayVisibility {
+    /// Every ray kind is on: Blender's default for an object that is not a light.
+    fn default() -> Self {
+        Self {
+            mask: RayKind::ALL_MASK,
+        }
+    }
+}
+
+impl RayVisibility {
+    /// Blender's flags for a new object of `kind`. Lights are hidden from camera rays
+    /// (`BKE_object_init`, object.cc:2177); every other object starts fully visible.
+    #[must_use]
+    pub fn default_for_kind(kind: &str) -> Self {
+        let mut visibility = Self::default();
+        if kind == "light" {
+            visibility.set(RayKind::Camera, false);
+        }
+        visibility
+    }
+
+    #[must_use]
+    pub fn allows(self, ray: RayKind) -> bool {
+        self.mask & ray.bit() != 0
+    }
+
+    /// Sets one flag.
+    pub fn set(&mut self, ray: RayKind, value: bool) {
+        if value {
+            self.mask |= ray.bit();
+        } else {
+            self.mask &= !ray.bit();
+        }
+    }
+
+    /// One bit per ray kind, the mask a triangle carries so a BVH query tests a single `u8`.
+    #[must_use]
+    pub const fn mask(self) -> u8 {
+        self.mask
+    }
+}
+
+impl serde::Serialize for RayVisibility {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(RayKind::ALL.len()))?;
+        for ray in RayKind::ALL {
+            map.serialize_entry(ray.name(), &self.allows(ray))?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RayVisibility {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let flags = BTreeMap::<String, bool>::deserialize(deserializer)?;
+        if let Some(unknown) = flags
+            .keys()
+            .find(|key| !RayKind::ALL.iter().any(|ray| ray.name() == key.as_str()))
+        {
+            return Err(D::Error::unknown_field(unknown, &RAY_NAMES));
+        }
+        let mut visibility = Self { mask: 0 };
+        for ray in RayKind::ALL {
+            let value = flags
+                .get(ray.name())
+                .copied()
+                .ok_or_else(|| D::Error::missing_field(ray.name()))?;
+            visibility.set(ray, value);
+        }
+        Ok(visibility)
+    }
+}
+
+/// The six flag names, as the error message lists the fields a `RayVisibility` takes.
+const RAY_NAMES: [&str; 6] = [
+    "camera",
+    "diffuse",
+    "glossy",
+    "transmission",
+    "volume_scatter",
+    "shadow",
+];
+
+impl RayKind {
+    /// Every ray kind, in the order of their bits.
+    pub const ALL: [Self; 6] = [
+        Self::Camera,
+        Self::Diffuse,
+        Self::Glossy,
+        Self::Transmission,
+        Self::VolumeScatter,
+        Self::Shadow,
+    ];
+    /// Every ray kind's bit: the mask of a surface that no ray kind hides (`RayVisibility::default`).
+    pub const ALL_MASK: u8 = (1 << 6) - 1;
+
+    /// The kind's bit in a ray mask (`PATH_RAY_*` in Cycles' kernel).
+    #[must_use]
+    pub const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
+    /// The kind's name in Potter's JSON, as `ray_visibility.camera`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Camera => "camera",
+            Self::Diffuse => "diffuse",
+            Self::Glossy => "glossy",
+            Self::Transmission => "transmission",
+            Self::VolumeScatter => "volume_scatter",
+            Self::Shadow => "shadow",
+        }
+    }
+
+    /// Blender's RNA property for the kind's visibility flag, as `visible_camera`.
+    #[must_use]
+    pub const fn rna_property(self) -> &'static str {
+        match self {
+            Self::Camera => "visible_camera",
+            Self::Diffuse => "visible_diffuse",
+            Self::Glossy => "visible_glossy",
+            Self::Transmission => "visible_transmission",
+            Self::VolumeScatter => "visible_volume_scatter",
+            Self::Shadow => "visible_shadow",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
@@ -1918,6 +2077,10 @@ pub struct Node {
     pub constraints: Vec<Constraint>,
     #[serde(default)]
     pub drivers: Vec<Driver>,
+    /// Blender's object ray visibility. `None` means the default for the node's kind; see
+    /// [`Node::resolved_ray_visibility`]. Omitted from JSON when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ray_visibility: Option<RayVisibility>,
 }
 
 impl Default for Node {
@@ -1949,6 +2112,7 @@ impl Default for Node {
             pose: BTreeMap::new(),
             constraints: Vec::new(),
             drivers: Vec::new(),
+            ray_visibility: None,
         }
     }
 }
@@ -2003,6 +2167,13 @@ impl Node {
             self.materials.len(),
             data.map_or(0, |data| data.materials.len()),
         )
+    }
+
+    /// Blender's ray visibility for this node: the stored flags, or the default for its kind.
+    #[must_use]
+    pub fn resolved_ray_visibility(&self) -> RayVisibility {
+        self.ray_visibility
+            .unwrap_or_else(|| RayVisibility::default_for_kind(&self.kind))
     }
 
     /// Effective material for one indexed slot; out-of-range access clamps like Blender.

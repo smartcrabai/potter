@@ -119,8 +119,6 @@ pub fn render_sequence(
             "render samples must be between 1 and 1000000",
         ));
     }
-    let samples = if engine == "realtime" { 1 } else { samples };
-    let seed = if engine == "realtime" { 0 } else { seed };
     let scene_id = context.scene_id.as_ref().unwrap_or(&doc.active_scene);
     let scene = doc
         .scenes
@@ -448,7 +446,13 @@ fn render_motion_blurred_frame(
             "beauty",
             engine,
             film_transparent,
-            samples,
+            // EEVEE divides its sample count across the motion-blur steps, `divide_ceil_u(sample_count, steps)` in
+            // `Sampling::init` (`eevee_sampling.cc`). Each step is a full film pass, so the realtime total stays `samples`.
+            if engine == "realtime" {
+                samples.div_ceil(shutter_samples)
+            } else {
+                samples
+            },
             seed,
         )?;
         push_new_warnings(warnings, sample_warnings);

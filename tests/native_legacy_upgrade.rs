@@ -611,7 +611,7 @@ fn schema_v1_fixture_upgrades_on_apply_without_retired_keys() -> TestResult {
     assert_eq!(applied["ok"], true, "{applied}");
     let document = read_json(&scene.join("scene.json"))?;
     assert_eq!(
-        document["schema_version"], 7,
+        document["schema_version"], 9,
         "apply writes the current schema"
     );
     let mesh = stored_oracle_or_cube(&document)?;
@@ -674,7 +674,7 @@ fn schema_v2_scene_keeps_native_semantics_through_apply_undo_and_redo() -> TestR
         json!([{"op": "node.update", "target": {"id": node_id(&read_scene(&legacy)?, "Oracle")?}, "set": {"name": "Legacy Oracle"}}]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
-    assert_eq!(read_json(&legacy.join("scene.json"))?["schema_version"], 7);
+    assert_eq!(read_json(&legacy.join("scene.json"))?["schema_version"], 9);
     let upgraded = stored_legacy_mesh(&legacy)?;
     assert_native_semantics(&upgraded, &native)?;
     assert_upgraded_normals(&upgraded)?;

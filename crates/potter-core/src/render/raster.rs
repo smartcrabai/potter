@@ -7,7 +7,7 @@ use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, Wire
 use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
 use crate::geom::GeneratedCorners;
-use crate::model::{CameraData, CameraProjection};
+use crate::model::{CameraData, CameraProjection, RayKind};
 
 /// A camera projection in Blender's units: angles in radians, lengths in millimetres.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -267,6 +267,8 @@ pub(crate) struct Triangle {
     /// Evaluates the material graph at each hit of a realtime Beauty triangle whose graph reads color layers or needs
     /// hit data. Every realtime Beauty hit is shaded per pixel regardless, flat triangles included.
     pub(crate) lit_per_pixel: bool,
+    /// The owning object's ray mask (one `RayKind` bit each); realtime Beauty filters primary rays.
+    pub(crate) ray_mask: u8,
 }
 
 impl Triangle {
@@ -294,6 +296,7 @@ impl Triangle {
             normals: self.normals,
             layer_colors,
             lit_per_pixel: self.lit_per_pixel,
+            ray_mask: self.ray_mask,
         }
     }
 
@@ -444,6 +447,8 @@ pub(crate) struct Line {
     pub(crate) color: [f64; 4],
     pub(crate) object_index: u32,
     pub(crate) element_index: u32,
+    /// Object ray mask; realtime Beauty leaves out lines hidden from camera rays.
+    pub(crate) ray_mask: u8,
 }
 
 #[derive(Debug)]
@@ -614,6 +619,7 @@ pub(crate) fn rasterize_with_samples(
     background: [u8; 4],
     samples: u32,
     seed: u32,
+    filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
@@ -633,6 +639,7 @@ pub(crate) fn rasterize_with_samples(
             background,
             samples,
             seed,
+            filter_size,
             shader,
         )?;
         let right_output = rasterize_with_samples(
@@ -644,6 +651,7 @@ pub(crate) fn rasterize_with_samples(
             background,
             samples,
             seed,
+            filter_size,
             shader,
         )?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
@@ -680,7 +688,7 @@ pub(crate) fn rasterize_with_samples(
         )
     })?;
     let frame = camera_frame(camera, width, height)?;
-    let prepared = prepare_triangles(triangles)?;
+    let prepared = prepare_triangles(triangles, mode)?;
     let visibility = super::bvh::Bvh::build_from_positions(
         prepared.iter().map(|triangle| triangle.source.positions),
     )?;
@@ -716,6 +724,15 @@ pub(crate) fn rasterize_with_samples(
         )
     })?;
 
+    // Realtime Beauty reconstructs its samples with EEVEE's film filter; the other modes keep each pixel's own samples.
+    let mut film = film_radius(mode, samples, filter_size)
+        .map(|radius| {
+            // Side-by-side stereo puts the right eye at `width / 2`, as `ray_for_subpixel_in_frame` does.
+            let eye_split =
+                (camera.stereo_mode == StereoMode::SideBySide).then_some((width / 2) as usize);
+            FilmFilter::new(radius, width, height, eye_split)
+        })
+        .transpose()?;
     let mut candidates = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -773,8 +790,13 @@ pub(crate) fn rasterize_with_samples(
             if matches!(mode, Mode::Solid | Mode::Beauty | Mode::Wire) {
                 let mut average = [0.0_f64; 4];
                 for sample_index in 0..samples {
-                    let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
-                    let (sample_ray, sample_hit) = if sample_index == 0 {
+                    // Without a film the pixel keeps its own pattern, whose first sample is the centre. A film sample is
+                    // jittered over its pixel, the first included, as EEVEE jitters every sample (`pixel_jitter_get`).
+                    let (sample_x, sample_y) = match film.as_ref() {
+                        Some(film) => film.jitter(film_sample_offset(sample_index)),
+                        None => sample_offset(seed, x, y, sample_index),
+                    };
+                    let (sample_ray, sample_hit) = if sample_index == 0 && film.is_none() {
                         (center_ray, center_hit)
                     } else {
                         let ray = ray_for_subpixel_in_frame(
@@ -832,6 +854,20 @@ pub(crate) fn rasterize_with_samples(
                         average[channel] =
                             average[channel] * previous_weight + sample_color[channel] / count;
                     }
+                    if let Some(film) = film.as_mut() {
+                        // EEVEE shades each sample with its pixel's occlusion, then filters the shaded samples.
+                        let ao = ambient_occlusion
+                            .get(pixel_index)
+                            .copied()
+                            .map_or(1.0, f64::from);
+                        let shaded = [
+                            sample_color[0] * ao,
+                            sample_color[1] * ao,
+                            sample_color[2] * ao,
+                            sample_color[3],
+                        ];
+                        film.splat(x, y, sample_x, sample_y, sample_index, shaded);
+                    }
                 }
                 // Solid mirrors Blender Workbench, which shows no ambient occlusion by default.
                 let ao_in_color = !matches!(mode, Mode::Solid);
@@ -873,6 +909,14 @@ pub(crate) fn rasterize_with_samples(
         }
     }
 
+    if let Some(film) = &film {
+        for (pixel_index, (colour, weight)) in film.colour.iter().zip(&film.weight).enumerate() {
+            let average = colour.map(|sum| sum / weight.max(f64::MIN_POSITIVE));
+            rgba[pixel_index * 4..pixel_index * 4 + 4].copy_from_slice(&color_to_srgba(average));
+            linear_rgba[pixel_index] = linear_color_to_f32(average);
+        }
+    }
+
     Ok(RasterOutput {
         rgba,
         linear_rgba,
@@ -900,10 +944,20 @@ pub(crate) fn rasterize_with_lines(
     background: [u8; 4],
     samples: u32,
     seed: u32,
+    filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
 ) -> Result<RasterOutput> {
     let mut output = rasterize_with_samples(
-        triangles, camera, width, height, mode, background, samples, seed, shader,
+        triangles,
+        camera,
+        width,
+        height,
+        mode,
+        background,
+        samples,
+        seed,
+        filter_size,
+        shader,
     )?;
     if lines.is_empty() {
         return Ok(output);
@@ -928,6 +982,9 @@ pub(crate) fn rasterize_with_lines(
                 ErrorCode::EvaluationFailed,
                 "evaluated stroke contains invalid geometry or color",
             ));
+        }
+        if matches!(mode, Mode::Beauty) && line.ray_mask & RayKind::Camera.bit() == 0 {
+            continue;
         }
         let Some(start) = project_world(camera, &frame, width, height, line.start) else {
             continue;
@@ -1053,6 +1110,8 @@ pub(crate) fn rasterize_wireframe(
         [0; 4],
         1,
         0,
+        // Wire is never a film Beauty render, so no film filter applies.
+        0.0,
         None,
     )?;
     let mut output = rasterize_with_lines(
@@ -1065,6 +1124,7 @@ pub(crate) fn rasterize_wireframe(
         wireframe::background_rgba(),
         1,
         0,
+        0.0,
         None,
     )?;
     let frame = camera_frame(camera, width, height)?;
@@ -1590,6 +1650,9 @@ fn is_valid_fov(fov: f64) -> bool {
     fov.is_finite() && fov > 0.0 && fov <= crate::model::FISHEYE_FOV_MAX
 }
 
+/// Fraction of the hemisphere above `shading` that is unoccluded at `point`. Occluders are filtered
+/// by shadow visibility, as Cycles' ambient occlusion is, so objects hidden from camera rays still
+/// occlude.
 pub(crate) fn ambient_visibility(
     bvh: &super::bvh::Bvh,
     triangles: &[Triangle],
@@ -1628,7 +1691,9 @@ pub(crate) fn ambient_visibility(
             direction
         };
         if bvh
-            .closest_hit_two_sided(triangles, origin, direction, 1.0e-5, distance)
+            .closest_hit_where(triangles, origin, direction, 1.0e-5, distance, &|mask| {
+                mask & RayKind::Shadow.bit() != 0
+            })
             .is_none()
         {
             visible += 1;
@@ -1815,6 +1880,211 @@ fn sample_offset(seed: u32, x: u32, y: u32, sample_index: u32) -> (f64, f64) {
     let x_offset = f64::from(mix_sample_hash(key)) / 4_294_967_296.0;
     let y_offset = f64::from(mix_sample_hash(key ^ 0xa511_e9b3)) / 4_294_967_296.0;
     (x_offset, y_offset)
+}
+
+/// EEVEE's film reconstruction for realtime Beauty (`eevee_film.cc`): every shaded sample is splatted into the output
+/// pixels whose centres lie within `radius` of it, weighted by `film_filter_weight`, and an output pixel is the weighted
+/// mean of the samples that reached it. `colour` and `weight` are per output pixel.
+struct FilmFilter {
+    radius: f64,
+    width: usize,
+    height: usize,
+    /// The column where the right eye starts, in a side-by-side stereo frame. A sample splats only into its own eye's
+    /// columns, as each eye has its own film in EEVEE (`ShadingView::update_view` per view).
+    eye_split: Option<usize>,
+    colour: Vec<[f64; 4]>,
+    weight: Vec<f64>,
+}
+
+impl FilmFilter {
+    /// The sub-pixel position of a film sample from its offset in the pixel. EEVEE's `pixel_jitter_get` gives the
+    /// offset `j` of its film weights: below `FRAC_1_SQRT_2` px a disk of half the radius, mapped by
+    /// `Sampling::sample_disk` as `sqrt(u)` and `2*pi*v` (`eevee_film.cc`, `eevee_sampling.cc`), otherwise uniform over
+    /// the pixel. The camera's window shifts by `+j` in NDC (`ShadingView::update_view`, `eevee_view.cc`;
+    /// `window_translate_m4`, `math_geom.cc`), and content moves by that shift. So a pixel sees the scene at `-j` in NDC
+    /// x. NDC y points up but rows here point down (`ndc_y = 1 - 2 (y + sy) / h`), so the same shift is `+j` in row
+    /// units: the raster position is `(0.5 - j_x, 0.5 + j_y)`.
+    fn jitter(&self, offset: (f64, f64)) -> (f64, f64) {
+        if self.radius >= std::f64::consts::FRAC_1_SQRT_2 {
+            return ((1.0 - offset.0).fract(), offset.1);
+        }
+        let scale = 0.5 * self.radius * offset.0.sqrt();
+        let theta = std::f64::consts::TAU * offset.1;
+        (0.5 - scale * theta.cos(), 0.5 + scale * theta.sin())
+    }
+
+    fn new(radius: f64, width: u32, height: u32, eye_split: Option<usize>) -> Result<Self> {
+        let width = usize::try_from(width).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "image width exceeds platform limits",
+            )
+        })?;
+        let height = usize::try_from(height).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "image height exceeds platform limits",
+            )
+        })?;
+        let pixel_count = width.checked_mul(height).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "pixel count exceeds platform limits",
+            )
+        })?;
+        Ok(Self {
+            radius,
+            width,
+            height,
+            eye_split,
+            colour: allocate_filled(pixel_count, [0.0_f64; 4], "film colour")?,
+            weight: allocate_filled(pixel_count, 0.0_f64, "film weight")?,
+        })
+    }
+
+    /// The output columns a sample in column `x` may reach: its own eye's columns in a side-by-side frame.
+    fn eye_columns(&self, x: u32) -> (i64, i64) {
+        let width = self.width as i64;
+        match self.eye_split {
+            Some(split) => {
+                let split = split as i64;
+                if i64::from(x) < split {
+                    (0, split)
+                } else {
+                    (split, width)
+                }
+            }
+            None => (0, width),
+        }
+    }
+
+    fn accumulate(&mut self, px: usize, py: usize, weight: f64, shaded: [f64; 4]) {
+        let index = py * self.width + px;
+        for (sum, value) in self.colour[index].iter_mut().zip(shaded) {
+            *sum += weight * value;
+        }
+        self.weight[index] += weight;
+    }
+
+    /// Splats the shaded sample of frame `sample_index`, taken at `(sample_x, sample_y)` inside pixel `(x, y)`. Below
+    /// `LARGE_FILTER_RADIUS` it reaches the output pixels whose centres lie within the radius. From there on it reaches
+    /// EEVEE's 16 table taps (`large_filter_taps`), each weighted from its distance to the sample, with no radius test.
+    /// Either way the output stays in the sample's own eye's columns.
+    fn splat(
+        &mut self,
+        x: u32,
+        y: u32,
+        sample_x: f64,
+        sample_y: f64,
+        sample_index: u32,
+        shaded: [f64; 4],
+    ) {
+        let sample = (f64::from(x) + sample_x, f64::from(y) + sample_y);
+        let (lo, hi) = self.eye_columns(x);
+        let height = self.height as i64;
+        if self.radius < LARGE_FILTER_RADIUS {
+            let reach = (self.radius + 0.5).ceil() as i64;
+            let radius_squared = self.radius * self.radius;
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    let px = i64::from(x) + dx;
+                    let py = i64::from(y) + dy;
+                    if px < lo || px >= hi || py < 0 || py >= height {
+                        continue;
+                    }
+                    let centre = (px as f64 + 0.5, py as f64 + 0.5);
+                    let distance_squared =
+                        (centre.0 - sample.0).powi(2) + (centre.1 - sample.1).powi(2);
+                    if distance_squared >= radius_squared {
+                        continue;
+                    }
+                    let weight = film_filter_weight(self.radius, distance_squared);
+                    self.accumulate(px as usize, py as usize, weight, shaded);
+                }
+            }
+        } else {
+            for (tap_x, tap_y) in large_filter_taps(self.radius, sample_index) {
+                // EEVEE's table is in texel space with y up, and rows here point down.
+                let px = i64::from(x) - tap_x;
+                let py = i64::from(y) + tap_y;
+                if px < lo || px >= hi || py < 0 || py >= height {
+                    continue;
+                }
+                let centre = (px as f64 + 0.5, py as f64 + 0.5);
+                let distance_squared =
+                    (centre.0 - sample.0).powi(2) + (centre.1 - sample.1).powi(2);
+                let weight = film_filter_weight(self.radius, distance_squared);
+                self.accumulate(px as usize, py as usize, weight, shaded);
+            }
+        }
+    }
+}
+
+/// The film radius of realtime Beauty, or `None` for the one-sample render, where EEVEE's filter is zero and the sample
+/// sits at the pixel centre (`update_sample_table`, `sample_count() == 1`). Otherwise EEVEE clamps `scene.r.gauss` to
+/// 0..=100 (`eevee_film.cc`, `filter_radius`). The floor keeps the weights finite; below 0.01 px the samples stay within
+/// a disk of 0.5 px radius, so the filter is a point sample at the centre, as EEVEE renders it.
+fn film_radius(mode: Mode, samples: u32, filter_size: f64) -> Option<f64> {
+    if !matches!(mode, Mode::Beauty) || samples <= 1 {
+        return None;
+    }
+    Some(filter_size.clamp(0.0, 100.0).max(1.0e-4))
+}
+
+/// The filter radius from which EEVEE switches to its 16-tap table (`Film::update_sample_table`, `filter_radius < 2.20f`).
+const LARGE_FILTER_RADIUS: f64 = 2.2;
+
+/// EEVEE's large-filter table for frame `sample_index`: 16 integer texel offsets. For tap `i` the offset is the floor of
+/// `sample_spiral` at `((u + i) / 16, v)`, times the radius. The pair `(u, v)` is the SSS Halton pair at index `5 * k + 1`
+/// (`Sampling::step`, `SAMPLING_SSS_U` and `SAMPLING_SSS_V`, leap 5, primes 2 and 3). The offsets are in EEVEE's texel
+/// space, whose y points up.
+fn large_filter_taps(radius: f64, sample_index: u32) -> [(i64, i64); 16] {
+    let index = 5 * u64::from(sample_index) + 1;
+    let u = halton_radical_inverse(2, index);
+    let v = halton_radical_inverse(3, index);
+    std::array::from_fn(|i| {
+        let (x, y) = sample_spiral((u + i as f64) / 16.0, v);
+        ((x * radius).floor() as i64, (y * radius).floor() as i64)
+    })
+}
+
+/// `Sampling::sample_spiral` (`eevee_sampling.cc`): a Fibonacci spiral point for `rand_x`, rotated by `rand_y`.
+fn sample_spiral(rand_x: f64, rand_y: f64) -> (f64, f64) {
+    let omega = 4.0 * std::f64::consts::PI * (1.0 + 5.0_f64.sqrt()) * rand_x
+        + rand_y * std::f64::consts::TAU;
+    let radius = rand_x.sqrt();
+    (radius * omega.cos(), radius * omega.sin())
+}
+
+/// A film sample's offset inside its pixel: EEVEE's Halton (2, 3) sequence at index `sample_index + 1`, each dimension
+/// rotated by a fixed offset, `fract(halton + 1/2)` and `fract(halton + 2/3)` (`eevee_sampling.cc`, `Sampling::step`,
+/// with `BLI_halton_2d` from `blenlib/intern/rand.cc`). The pattern is the same for every pixel and needs no seed.
+fn film_sample_offset(sample_index: u32) -> (f64, f64) {
+    let index = u64::from(sample_index) + 1;
+    let x_offset = (halton_radical_inverse(2, index) + 0.5).fract();
+    let y_offset = (halton_radical_inverse(3, index) + 2.0 / 3.0).fract();
+    (x_offset, y_offset)
+}
+
+/// The radical inverse of `index` in `base`: its digits reversed about the radix point.
+fn halton_radical_inverse(base: u64, mut index: u64) -> f64 {
+    let inverse_base = 1.0 / base as f64;
+    let mut scale = 1.0;
+    let mut value = 0.0;
+    while index > 0 {
+        scale *= inverse_base;
+        value += scale * (index % base) as f64;
+        index /= base;
+    }
+    value
+}
+
+/// EEVEE's `film_filter_weight`: a Gaussian fitted to Blackman-Harris, with a standard deviation of 0.284 radii
+/// (`eevee_film_shared.hh`).
+fn film_filter_weight(radius: f64, distance_squared: f64) -> f64 {
+    const SIGMA: f64 = 0.284;
+    let r = distance_squared / (radius * radius);
+    (-0.5 / (SIGMA * SIGMA) * r).exp()
 }
 
 fn mix_sample_hash(mut value: u32) -> u32 {
@@ -2039,7 +2309,9 @@ fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4
     [color.x, color.y, color.z, alpha]
 }
 
-fn prepare_triangles(triangles: &[Triangle]) -> Result<Vec<PreparedTriangle>> {
+/// Primary-ray triangles. Realtime Beauty leaves out objects hidden from camera rays; the other
+/// modes draw every triangle, as the viewport does.
+fn prepare_triangles(triangles: &[Triangle], mode: Mode) -> Result<Vec<PreparedTriangle>> {
     let mut prepared = Vec::new();
     prepared.try_reserve_exact(triangles.len()).map_err(|_| {
         PotError::new(
@@ -2061,6 +2333,9 @@ fn prepare_triangles(triangles: &[Triangle]) -> Result<Vec<PreparedTriangle>> {
             return Err(PotError::invalid_argument(
                 "triangle positions and colors must be finite",
             ));
+        }
+        if matches!(mode, Mode::Beauty) && triangle.ray_mask & RayKind::Camera.bit() == 0 {
+            continue;
         }
         let edge1 = triangle.positions[1] - triangle.positions[0];
         let edge2 = triangle.positions[2] - triangle.positions[0];
@@ -2806,9 +3081,21 @@ mod tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 7,
             element_index: 0,
+            ray_mask: crate::model::RayVisibility::default().mask(),
         };
-        let output =
-            rasterize_with_lines(&[], &[line], &camera, 64, 32, Mode::Id, [0; 4], 1, 0, None)?;
+        let output = rasterize_with_lines(
+            &[],
+            &[line],
+            &camera,
+            64,
+            32,
+            Mode::Id,
+            [0; 4],
+            1,
+            0,
+            1.5,
+            None,
+        )?;
         assert!(
             output.ids.contains(&7),
             "the stroke behind the view axis must reach the image"
@@ -2831,6 +3118,7 @@ mod tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 7,
             element_index: 0,
+            ray_mask: crate::model::RayVisibility::default().mask(),
         };
         let output = rasterize_with_lines(
             &[],
@@ -2842,6 +3130,7 @@ mod tests {
             [0; 4],
             1,
             0,
+            1.5,
             None,
         )?;
         let mut drawn = 0_usize;
@@ -2872,6 +3161,7 @@ mod tests {
 #[cfg(test)]
 mod line_tests {
     use super::{Camera, Line, Mode, Projection, StereoMode, rasterize_with_lines};
+    use crate::model::RayVisibility;
     use glam::DVec3;
 
     #[test]
@@ -2896,6 +3186,7 @@ mod line_tests {
             color: [1.0, 0.0, 0.0, 1.0],
             object_index: 1,
             element_index: 2,
+            ray_mask: RayVisibility::default().mask(),
         };
         let output = rasterize_with_lines(
             &[],
@@ -2907,6 +3198,7 @@ mod line_tests {
             [242, 242, 242, 255],
             1,
             0,
+            1.5,
             None,
         );
         assert!(output.is_ok());
@@ -2958,6 +3250,7 @@ mod smooth_shading_tests {
         SurfaceShader, Triangle, rasterize_with_samples,
     };
     use crate::error::Result;
+    use crate::model::RayVisibility;
 
     const SIZE: u32 = 64;
     /// Pixel (32, 32) has its centre at world (1/64, -1/64, 0) for this camera.
@@ -3016,6 +3309,7 @@ mod smooth_shading_tests {
             normals,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 
@@ -3033,6 +3327,7 @@ mod smooth_shading_tests {
             [0, 0, 0, 255],
             1,
             0,
+            1.5,
             shader,
         )
         .expect("triangle rasterizes")
@@ -3270,11 +3565,12 @@ mod visibility_tests {
     use glam::DVec3;
 
     use super::{
-        AlphaMode, Camera, CameraFrame, Hit, Layer, PreparedTriangle, Projection, Ray, StereoMode,
-        Triangle, camera_frame, composite_layers, composite_sample, hit_opacity,
+        AlphaMode, Camera, CameraFrame, Hit, Layer, Mode, PreparedTriangle, Projection, Ray,
+        StereoMode, Triangle, camera_frame, composite_layers, composite_sample, hit_opacity,
         intersect_triangle, nearest_visible_hit, prepare_triangles, ray_for_pixel_in_frame,
     };
     use crate::float::equal_f64;
+    use crate::model::RayVisibility;
     use crate::render::bvh::Bvh;
 
     const SIZE: u32 = 48;
@@ -3304,6 +3600,7 @@ mod visibility_tests {
             normals: None,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
+            ray_mask: RayVisibility::default().mask(),
         }
     }
 
@@ -3415,7 +3712,7 @@ mod visibility_tests {
 
     #[test]
     fn bounded_nearest_hit_matches_a_scan_of_every_triangle() {
-        let prepared = prepare_triangles(&tied_grid()).expect("grid prepares");
+        let prepared = prepare_triangles(&tied_grid(), Mode::Solid).expect("grid prepares");
         assert_eq!(
             prepared.len(),
             4 * GRID * GRID,
@@ -3451,7 +3748,7 @@ mod visibility_tests {
 
     #[test]
     fn translucent_composite_matches_a_scan_of_every_triangle() {
-        let prepared = prepare_triangles(&tied_grid()).expect("grid prepares");
+        let prepared = prepare_triangles(&tied_grid(), Mode::Solid).expect("grid prepares");
         let visibility =
             Bvh::build_from_positions(prepared.iter().map(|triangle| triangle.source.positions))
                 .expect("visibility BVH builds");

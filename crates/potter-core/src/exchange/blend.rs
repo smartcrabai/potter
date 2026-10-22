@@ -30,11 +30,11 @@ use crate::{
         ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library,
         LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
         Material, MaterialLink, Modifier, ModifierParameterBinding, MovieClip, MovieTracking,
-        NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, Profile, Registry,
-        RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene, SceneDoc,
-        ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData, TimelineMarker,
-        Transform, UnitSettings, VertexGroup, ViewLayer, ViewportDisplay, VolumeInterpolation,
-        VolumeSampling, World, is_identity_matrix,
+        NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, Profile, RayKind,
+        RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
+        RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint,
+        TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer,
+        ViewportDisplay, VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
@@ -3120,6 +3120,7 @@ fn build_imported_graph(
                 .get("film_transparent")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            filter_size: number_field(&render, "filter_size", 1.5),
             engine: render
                 .get("engine")
                 .and_then(Value::as_str)
@@ -4468,6 +4469,7 @@ fn build_imported_graph(
                 .get("hide_viewport")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            ray_visibility: imported_ray_visibility(item, kind),
             render_visible: !item
                 .get("hide_render")
                 .and_then(Value::as_bool)
@@ -8906,6 +8908,41 @@ fn root_matrix_requires_approximation(node: &Node) -> bool {
     false
 }
 
+/// Blender's `visible_*` object flags are owned by the typed `Node::ray_visibility`, so they are
+/// kept out of the opaque RNA dump.
+fn rna_properties_without_ray_visibility(item: &Value) -> Value {
+    match item.get("rna_properties").and_then(Value::as_object) {
+        Some(rna) => Value::Object(
+            rna.iter()
+                .filter(|(key, _)| {
+                    !RayKind::ALL
+                        .iter()
+                        .any(|ray| ray.rna_property() == key.as_str())
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        None => Value::Null,
+    }
+}
+
+/// The object's ray visibility from its bridge dump. A flag missing from the dump keeps Blender's
+/// default for the object's kind, and a value equal to that default is not stored.
+fn imported_ray_visibility(item: &Value, kind: &str) -> Option<RayVisibility> {
+    let rna = item.get("rna_properties").and_then(Value::as_object);
+    let default = RayVisibility::default_for_kind(kind);
+    let flag = |key: &str, fallback: bool| {
+        rna.and_then(|rna| rna.get(key))
+            .and_then(Value::as_bool)
+            .unwrap_or(fallback)
+    };
+    let mut visibility = default;
+    for ray in RayKind::ALL {
+        visibility.set(ray, flag(ray.rna_property(), default.allows(ray)));
+    }
+    (visibility != default).then_some(visibility)
+}
+
 fn object_properties(item: &Value) -> Map<String, Value> {
     let mut props = item
         .get("custom_properties")
@@ -8917,7 +8954,7 @@ fn object_properties(item: &Value) -> Map<String, Value> {
         "delta_location": item.get("delta_location"), "delta_rotation_euler": item.get("delta_rotation_euler"),
         "delta_rotation_quaternion": item.get("delta_rotation_quaternion"), "delta_scale": item.get("delta_scale"),
         "matrix_basis": item.get("matrix_basis"), "matrix_local": item.get("matrix_local"),
-        "matrix_world": item.get("matrix_world"), "rna_properties": item.get("rna_properties"),
+        "matrix_world": item.get("matrix_world"), "rna_properties": rna_properties_without_ray_visibility(item),
     }));
     props
 }
