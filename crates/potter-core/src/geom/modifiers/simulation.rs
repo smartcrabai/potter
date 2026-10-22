@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -9,7 +9,6 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Mesh,
         vdb::{VdbGrid, VdbValue, VdbVolume},
         volume::{VolumeData, VolumeGeneratedSource, VolumeGrid, VolumeSource},
     },
