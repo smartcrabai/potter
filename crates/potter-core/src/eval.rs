@@ -1332,6 +1332,17 @@ impl Snapshot {
                                     ))
                                 })
                             },
+                            |modifier, parameter, base| {
+                                crate::eval::animation::animated_modifier_scalar(
+                                    id,
+                                    node,
+                                    doc,
+                                    &modifier.id,
+                                    parameter,
+                                    base,
+                                    frame,
+                                )
+                            },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;
                     modifier_warnings.extend(
@@ -1653,6 +1664,17 @@ impl Snapshot {
                                         node_materials.len(),
                                     ))
                                 })
+                            },
+                            |modifier, parameter, base| {
+                                crate::eval::animation::animated_modifier_scalar(
+                                    id,
+                                    node,
+                                    doc,
+                                    &modifier.id,
+                                    parameter,
+                                    base,
+                                    frame,
+                                )
                             },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;

@@ -1409,7 +1409,7 @@ mod tests {
     )]
 
     use glam::{DVec3, Vec3};
-    use serde_json::{Map, Value, json};
+    use serde_json::{Map, json};
 
     use super::{
         CornerNormalCode, NormalCodeOptions, SetterInput, code_value, corner_codes, corner_count,

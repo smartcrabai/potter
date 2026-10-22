@@ -1694,6 +1694,7 @@ fn compare_case(case: &Value, spec: &Value) -> TestResult<Errors> {
         return Err(format!("{name}: input mesh edge storage order differs from Blender").into());
     }
     let modifier = Modifier {
+        baked_ocean_cache: None,
         id: Id::new("subdivision_oracle")?,
         modifier_type: "subdivision".to_owned(),
         name: "Subdivision oracle".to_owned(),
