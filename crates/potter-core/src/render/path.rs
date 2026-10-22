@@ -2698,6 +2698,7 @@ fn overlay_rasterized_lines(
         height,
         Mode::Beauty,
         [0, 0, 0, 0],
+        None,
         1,
         seed,
         // One sample per pixel: EEVEE's film filter is off, so the overlay is drawn unfiltered.

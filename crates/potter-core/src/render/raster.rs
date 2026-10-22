@@ -601,6 +601,26 @@ pub(crate) fn camera_eye(camera: &Camera, eye: f64) -> Camera {
     result
 }
 
+/// The scene world's radiance along a view ray. Realtime Beauty shows it where no surface covers a sample, as EEVEE
+/// shows its world, and modes without one show their constant background colour.
+pub(crate) type WorldRadiance<'a> = &'a dyn Fn(DVec3) -> Result<DVec3>;
+
+/// The background a sample shows: the world's radiance along its ray when a world is given and the ray exists, else the
+/// constant background. The constant's alpha is the film's alpha either way.
+fn sample_background(
+    constant: [f64; 4],
+    world: Option<WorldRadiance<'_>>,
+    direction: Option<DVec3>,
+) -> Result<[f64; 4]> {
+    match (world, direction) {
+        (Some(world), Some(direction)) => {
+            let radiance = world(direction)?;
+            Ok([radiance.x, radiance.y, radiance.z, constant[3]])
+        }
+        _ => Ok(constant),
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "raster configuration is explicit at this low-level boundary"
@@ -612,6 +632,7 @@ pub(crate) fn rasterize_with_samples(
     height: u32,
     mode: Mode,
     background: [u8; 4],
+    world: Option<WorldRadiance<'_>>,
     samples: u32,
     seed: u32,
     filter_size: f64,
@@ -632,6 +653,7 @@ pub(crate) fn rasterize_with_samples(
             height,
             mode,
             background,
+            world,
             samples,
             seed,
             filter_size,
@@ -644,6 +666,7 @@ pub(crate) fn rasterize_with_samples(
             height,
             mode,
             background,
+            world,
             samples,
             seed,
             filter_size,
@@ -836,12 +859,16 @@ pub(crate) fn rasterize_with_samples(
                             &mut candidates,
                             sample_ray,
                             &frame,
-                            background_linear,
+                            sample_background(
+                                background_linear,
+                                world,
+                                Some(sample_ray.direction),
+                            )?,
                             shader,
                             sample_hit,
                         )?
                     } else {
-                        background_linear
+                        sample_background(background_linear, world, None)?
                     };
                     let count = f64::from(sample_index + 1);
                     let previous_weight = 1.0 - 1.0 / count;
@@ -937,6 +964,7 @@ pub(crate) fn rasterize_with_lines(
     height: u32,
     mode: Mode,
     background: [u8; 4],
+    world: Option<WorldRadiance<'_>>,
     samples: u32,
     seed: u32,
     filter_size: f64,
@@ -949,6 +977,7 @@ pub(crate) fn rasterize_with_lines(
         height,
         mode,
         background,
+        world,
         samples,
         seed,
         filter_size,
@@ -1100,6 +1129,7 @@ pub(crate) fn rasterize_wireframe(
         height,
         Mode::Wire,
         [0; 4],
+        None,
         1,
         0,
         // Wire is never a film Beauty render, so no film filter applies.
@@ -1114,6 +1144,7 @@ pub(crate) fn rasterize_wireframe(
         height,
         Mode::Wire,
         wireframe::background_rgba(),
+        None,
         1,
         0,
         0.0,
@@ -3072,6 +3103,7 @@ mod tests {
             32,
             Mode::Id,
             [0; 4],
+            None,
             1,
             0,
             1.5,
@@ -3108,6 +3140,7 @@ mod tests {
             height,
             Mode::Id,
             [0; 4],
+            None,
             1,
             0,
             1.5,
@@ -3174,6 +3207,7 @@ mod line_tests {
             5,
             Mode::Beauty,
             [242, 242, 242, 255],
+            None,
             1,
             0,
             1.5,
@@ -3301,6 +3335,7 @@ mod smooth_shading_tests {
             SIZE,
             mode,
             [0, 0, 0, 255],
+            None,
             1,
             0,
             1.5,
