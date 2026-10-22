@@ -1912,15 +1912,16 @@ fn attach_native_packed_bake_states(
                 }
             }
         }
-        let matches_source = |(object, blender_modifier, _): &(String, String, i32)| {
-            object.as_str() == owner_name && blender_modifier.as_str() == modifier_name
-        };
-        let source_id_count = states.bake_ids.iter().filter(matches_source).count();
+        let source_id_count = states
+            .bake_ids
+            .iter()
+            .filter(|key| key.0.as_str() == owner_name && key.1.as_str() == modifier_name)
+            .count();
         let source_ids_reported = states
             .bake_ids
             .iter()
-            .filter(matches_source)
-            .all(|(_, _, bake_id)| reported_ids.contains(bake_id));
+            .filter(|key| key.0.as_str() == owner_name && key.1.as_str() == modifier_name)
+            .all(|key| reported_ids.contains(&key.2));
         if source_id_count != reported_ids.len() || !source_ids_reported {
             return Err(PotError::with_details(
                 ErrorCode::ImportFailed,
