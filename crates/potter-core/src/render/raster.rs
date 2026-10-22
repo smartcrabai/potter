@@ -2230,6 +2230,7 @@ fn composite_sample(
     frame: &CameraFrame,
     background: [f64; 4],
     world: Option<WorldRadiance<'_>>,
+    shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
 ) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
@@ -3824,6 +3825,7 @@ mod visibility_tests {
                     ray,
                     &frame,
                     BACKGROUND,
+                    None,
                     None,
                     None,
                 )
