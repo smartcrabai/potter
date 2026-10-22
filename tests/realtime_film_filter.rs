@@ -5,7 +5,7 @@
 //! 64 px frame, once per filter size, with EEVEE at 256 samples. Its column profiles are committed in
 //! `eevee_film_filter.json`; run with a render directory of `0`, the script only saves the `.blend`, which the test
 //! imports (Filter Size 1.5). The test renders the same frame with `pot render --engine realtime` at each filter size,
-//! with 16 samples, and compares each column's mean over the rows against EEVEE's column profile for that size.
+//! with 256 samples, EEVEE's count, and compares each column's mean over the rows against EEVEE's profile for that size.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -38,7 +38,7 @@ const ORACLE: &str = include_str!("fixtures/native_oracle/eevee_film_filter.json
 
 /// Render settings shared with `eevee_film_filter.py`, and the sample count of Potter's realtime render.
 const RESOLUTION: u32 = 64;
-const SAMPLES: u32 = 16;
+const SAMPLES: u32 = 256;
 
 /// The filter sizes compared, as the keys of the oracle's `profiles`. `0.01` is the point sample below the
 /// jitter threshold, `0.5` a jitter inside a half-pixel disk, and `1.5` Blender's default.
@@ -47,14 +47,14 @@ const FILTER_SIZES: [&str; 3] = ["0.01", "0.5", "1.5"];
 /// The columns compared: the edge at pixel 32.3 and the neighbours that a filter of 1.5 px reaches.
 const COLUMNS: std::ops::RangeInclusive<usize> = 28..=36;
 
-/// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL: the residual below has no measured
-/// explanation yet, so this bound is not derived. Potter's film raster sits at `-j` (`render/raster.rs`, `jitter`), which
-/// EEVEE's window shift produces (`eevee_view.cc`, `window_translate_m4`). At EEVEE's 256 samples, same pattern and film,
-/// the worst deviations are 0 at 0.01 px, 0.0069 at 0.5 px (column 32, the edge), and 0.0021 at 1.5 px (columns 32 and
-/// 33). The raster sign moved the 0.5 px residual from 0.0095 to 0.0069. The 0.0069 is not half-float quantisation,
-/// which is near 5e-4. Karis's `1 / (4 + Y)` luma weight (`eevee_film.bsl.hh`, `sample_accum_combined`) is not the
-/// cause: it closes 0.5 px to 0.0036 but opens 1.5 px to 0.048. This test renders at 16 samples and checks the bound at
-/// that count. The bound stays at 0.03 until the 0.0069 is explained.
+/// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL: the residual below has no
+/// explanation that holds at both filter sizes, so this bound is not derived. Potter renders at EEVEE's 256 samples,
+/// with the same Halton pattern and film, and its raster sits at `-j` (`render/raster.rs`, `jitter`), as EEVEE's window
+/// shift does (`eevee_view.cc`, `window_translate_m4`). The worst deviations are 0 at 0.01 px, 0.0069 at 0.5 px (column
+/// 32, the edge), and 0.0021 at 1.5 px. The 0.0069 is not half-float quantisation (near 5e-4). EEVEE's static film
+/// accumulation weights the history by its own luma (`eevee_film.bsl.hh`, `store_combined`: `weight_dst =
+/// luma_weight(color_dst.x) * dst.weight`). Simulating that recurrence reproduces 0.5 px to 0.0004, but it opens 1.5 px
+/// to 0.048, so it does not explain both sizes. The bound stays at 0.03 until one model explains both.
 const TOLERANCE: f64 = 0.03;
 
 /// The mean red value of each column of the image `id`, averaged over the rows, read with Potter's own EXR loader.
