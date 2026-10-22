@@ -1,0 +1,42 @@
+{
+ "blender_version": "5.2.2 LTS",
+ "voxel_size": 0.25,
+ "operand_local_center": [
+  -1.0,
+  -1.0,
+  0.0
+ ],
+ "operand_size": 2.0,
+ "thresholds": [
+  0.1,
+  0.35
+ ],
+ "narrow_band": {
+  "interior_band_width": 0.2,
+  "expanded": false,
+  "counts": {
+   "0.1": {
+    "vertex_count": 296,
+    "polygon_count": 294
+   },
+   "0.35": {
+    "vertex_count": 296,
+    "polygon_count": 294
+   }
+  }
+ },
+ "expanded_band": {
+  "interior_band_width": 0.8,
+  "expanded": true,
+  "counts": {
+   "0.1": {
+    "vertex_count": 296,
+    "polygon_count": 294
+   },
+   "0.35": {
+    "vertex_count": 152,
+    "polygon_count": 150
+   }
+  }
+ }
+}
