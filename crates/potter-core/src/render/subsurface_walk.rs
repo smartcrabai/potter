@@ -10,10 +10,10 @@ use std::f64::consts::PI;
 use glam::DVec3;
 
 use super::bvh::{Bvh, BvhHit, WalkRay};
-use super::principled_bsdf::{concentric_disk, make_orthonormals, sample_visible_normal};
+use super::principled_bsdf::{concentric_disk, sample_visible_normal};
 use super::raster::Triangle;
 use super::subsurface::{SubsurfaceExit, raw_radius};
-use crate::shader::BsdfParams;
+use crate::shader::{BsdfParams, make_orthonormals};
 
 /// The random walk closures that share the walk (`CLOSURE_BSSRDF_RANDOM_WALK*_ID`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

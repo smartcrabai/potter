@@ -19,7 +19,8 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::ModifierGate,
     geom::Mesh,
-    model::{ForceFieldType, Id, Modifier, Node, RigidBodyType, SceneDoc},
+    model::{ForceFieldType, Id, Modifier, Node, SceneDoc},
+    physics_support,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,12 +76,28 @@ pub(crate) fn nonnegative_setting(
 
 const MAX_TOTAL_STEPS: usize = 8_192;
 
-fn frame_steps(frame: f64, substeps: usize, message: &'static str) -> Result<usize> {
+/// Substep budget for a solver advancing `frame` with `substeps` steps per frame.
+///
+/// Exceeding the budget is a reported limit, not a failure: the feature names the solver.
+fn frame_steps(frame: f64, substeps: usize, feature_id: &str) -> Result<usize> {
     let requested = frame.abs() * substeps as f64;
     if !requested.is_finite() || requested > MAX_TOTAL_STEPS as f64 {
-        return Err(PotError::new(ErrorCode::LimitExceeded, message));
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "simulation frame exceeds the bounded step budget",
+            json!({"feature_id":feature_id,"requested_steps":requested,"max_steps":MAX_TOTAL_STEPS,"status":"not_supported"}),
+        ));
     }
     Ok(requested.ceil().max(1.0) as usize)
+}
+
+/// A solver limitation that a fluid domain's output carries (the result is cached, so it is serialized).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FluidWarning {
+    /// Domain object whose output the limitation affects.
+    pub node_id: String,
+    /// Human-readable description of the limitation.
+    pub message: String,
 }
 
 /// Deterministic simulation outputs for one scene and frame.
@@ -122,11 +139,17 @@ pub struct SimulationResult {
     /// Marks the frame's non-rigid physics payload as fully evaluated in cache.
     #[serde(default)]
     pub physics_cache_key: Option<String>,
+    /// Solver limitations reported for the fluid domains of this frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fluid_warnings: Vec<FluidWarning>,
 }
 
 /// Deterministic simulation outputs for one scene and frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhysicsResult {
+    /// Solver limitations reported for the fluid domains of this frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fluid_warnings: Vec<FluidWarning>,
     /// Deformed local-space mesh vertices by object.
     pub deformed_vertices: BTreeMap<Id, Vec<[f64; 3]>>,
     /// Particle positions, velocities, and birth frames by emitter object.
@@ -205,24 +228,7 @@ fn scene_members(doc: &SceneDoc, scene_id: &Id) -> Result<BTreeSet<Id>> {
             format!("scene `{scene_id}` was not found"),
         )
     })?;
-    let mut pending = vec![scene.root_collection.clone()];
-    let mut visited = BTreeSet::new();
-    let mut members = BTreeSet::new();
-    while let Some(collection_id) = pending.pop() {
-        if !visited.insert(collection_id.clone()) {
-            continue;
-        }
-        let collection = doc.collections.get(&collection_id).ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "scene collection is missing",
-                json!({"scene_id":scene_id,"collection_id":collection_id}),
-            )
-        })?;
-        members.extend(collection.objects.iter().cloned());
-        pending.extend(collection.children.iter().cloned());
-    }
-    Ok(members)
+    collection_members(doc, &scene.root_collection)
 }
 
 /// Evaluates one physics modifier against the geometry produced by earlier stack entries.
@@ -238,6 +244,12 @@ pub(crate) fn evaluate_stack_modifier(
     gate: ModifierGate<'_>,
 ) -> Result<StackModifierResult> {
     let cache_directory = gate.context.cache_directory;
+    if !gate.is_active(node_id, modifier) {
+        return Ok(StackModifierResult {
+            mesh: input_mesh,
+            particles: None,
+        });
+    }
     let (property, system) =
         physics_stack_classification(&modifier.modifier_type).ok_or_else(|| {
             PotError::new(
@@ -351,18 +363,6 @@ pub(crate) fn evaluate_stack_modifier(
     {
         return Ok(StackModifierResult { mesh, particles });
     }
-    let scene = doc.scenes.get(scene_id).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::SceneNotFound,
-            format!("scene `{scene_id}` was not found"),
-        )
-    })?;
-    let fps = f64::from(scene.fps) / scene.fps_base;
-    if !fps.is_finite() || fps <= 0.0 || !frame.is_finite() {
-        return Err(PotError::invalid_argument(
-            "physics frame rate and frame must be finite and positive",
-        ));
-    }
     let matrix = matrices.get(node_id).copied().ok_or_else(|| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -370,71 +370,32 @@ pub(crate) fn evaluate_stack_modifier(
             json!({"node_id":node_id}),
         )
     })?;
-    let gravity = scene
-        .rigid_body_world
-        .as_ref()
-        .map_or(DVec3::new(0.0, 0.0, -9.81), |world| {
-            DVec3::from_array(world.gravity)
-        });
     let members = scene_members(doc, scene_id)?;
-    let collision_meshes = collider_triangles(doc, matrices, &members, gate)?;
-    let local_colliders = if setting_bool(settings, "collision_enabled") == Some(false)
-        || setting_bool(settings, "use_collision") == Some(false)
-    {
-        Vec::new()
-    } else {
-        local_collision_triangles(&collision_meshes, node_id, invert_matrix(matrix, node_id)?)
-    };
+    let context = FrameContext::new(doc, scene_id, frame, matrices, &members, gate)?;
     let mut mesh = input_mesh;
     let mut particles = None;
     match system {
-        "cloth" => {
-            let local_gravity = matrix.inverse().transform_vector3(gravity);
-            // Blender's physics cache starts at the scene's start frame with the rest state.
-            let solver_frame = (frame - f64::from(scene.frame_start)).max(0.0);
-            let positions = cloth::simulate(
-                &mesh,
-                &solver_settings,
-                solver_frame,
-                fps,
-                local_gravity,
-                &local_colliders,
-            )?;
-            set_vertex_positions(&mut mesh, positions, node_id)?;
-        }
-        "soft_body" => {
-            let local_gravity = matrix.inverse().transform_vector3(gravity);
-            let solver_frame = (frame - f64::from(scene.frame_start)).max(0.0);
-            let positions = softbody::simulate(
-                &mesh,
-                &solver_settings,
-                solver_frame,
-                fps,
-                local_gravity,
-                &local_colliders,
+        "cloth" | "soft_body" => {
+            let colliders =
+                collider_triangles(doc, matrices, &members, gate, ColliderConsumer::Surface)?;
+            let positions = simulate_surface(
+                &context, node_id, system, settings, &mesh, matrix, &colliders,
             )?;
             set_vertex_positions(&mut mesh, positions, node_id)?;
         }
         "particle_system" => {
-            let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
-                scene
-                    .rigid_body_world
-                    .as_ref()
-                    .map_or(0, |world| world.seed)
-            });
-            let colliders = collision_meshes
-                .iter()
-                .filter(|(collider_id, _)| collider_id != node_id)
-                .map(|(_, triangle)| *triangle)
-                .collect::<Vec<_>>();
+            let seed = setting_u32(settings, "seed").unwrap_or(context.seed);
+            let triangles =
+                collider_triangles(doc, matrices, &members, gate, ColliderConsumer::Point)?;
+            let colliders = point_colliders(&triangles, node_id);
             let fields = force_field_inputs(doc, matrices, &members)?;
             let states = particles::simulate_lifecycle(
                 &mesh,
                 &solver_settings,
                 matrix,
                 frame,
-                fps,
-                gravity,
+                context.fps,
+                context.gravity,
                 seed,
                 &fields,
                 &colliders,
@@ -450,7 +411,7 @@ pub(crate) fn evaluate_stack_modifier(
                 birth_frame: particle.birth_frame,
                 death_frame: particle.death_frame,
                 life_state: particle.life_state,
-                system_index: 0,
+                system_index,
                 is_child: particle.is_child,
                 size: particle.size,
                 mass: particle.mass,
@@ -459,51 +420,25 @@ pub(crate) fn evaluate_stack_modifier(
             particles = Some(states);
         }
         "fluid" => {
-            let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
-                scene
-                    .rigid_body_world
-                    .as_ref()
-                    .map_or(0, |world| world.seed)
-            });
-            let colliders = collision_meshes
-                .iter()
-                .filter(|(collider_id, _)| collider_id != node_id)
-                .map(|(_, triangle)| *triangle)
-                .collect::<Vec<_>>();
-            let samples = fluid::simulate(
-                &mesh, settings, matrix, frame, fps, gravity, seed, &colliders,
-            )?;
-            mesh = fluid_surface(&samples, matrix, settings)?;
-        }
-        "dynamic_paint" => {
-            let brushes = dynamic_paint_brush_settings(doc, matrices, settings, &members, gate)?;
-            let mut colors = vec![[0.0; 4]; mesh.vertices.len()];
-            if brushes.is_empty() {
-                colors = dynamic_paint::paint(
-                    &mesh,
-                    matrix,
-                    &[],
-                    setting_f64(settings, "radius").unwrap_or(1.0),
-                    setting_color(settings).unwrap_or([1.0, 0.0, 0.0, 1.0]),
-                    setting_f64(settings, "strength").unwrap_or(1.0),
-                )?;
-            } else {
-                for brush in &brushes {
-                    let painted = dynamic_paint::paint(
-                        &mesh,
-                        matrix,
-                        &[brush.position],
-                        brush.radius,
-                        brush.color,
-                        brush.strength,
-                    )?;
-                    for (current, candidate) in colors.iter_mut().zip(painted) {
-                        if candidate[3] > current[3] {
-                            *current = candidate;
-                        }
-                    }
+            let fluid_type = fluid_modifier_role(modifier);
+            if !matches!(fluid_type, "NONE" | "DOMAIN" | "FLOW" | "EFFECTOR") {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "fluid modifier type is invalid",
+                    json!({"node_id":node_id,"modifier_id":modifier.id,"fluid_type":fluid_type}),
+                ));
+            }
+            if fluid_type == "DOMAIN" {
+                // The physics result reports the same emitter; this surface only needs the positions.
+                let (samples, _) = simulate_fluid_domain(&context, &mesh, matrix, settings)?;
+                if !samples.is_empty() {
+                    let radius = fluid_particle_radius(settings, &mesh, matrix)?;
+                    mesh = fluid_surface(&samples, matrix, radius)?;
                 }
             }
+        }
+        "dynamic_paint" if setting_string(settings, "role").unwrap_or("canvas") == "canvas" => {
+            let colors = paint_canvas(&context, node_id, &mesh, settings)?;
             let values = mesh
                 .vertices
                 .iter()
@@ -527,7 +462,7 @@ pub(crate) fn evaluate_stack_modifier(
                 );
             }
         }
-        "collision" => {}
+        "dynamic_paint" | "collision" => {}
         _ => {
             return Err(PotError::new(
                 ErrorCode::InternalError,
@@ -574,106 +509,25 @@ fn normalize_solver_settings(settings: &Value, system: &str) -> Value {
     let Some(properties) = normalized.as_object_mut() else {
         return normalized;
     };
-    match system {
-        "cloth" => {
-            if !properties.contains_key("structural_stiffness") {
-                let tension = settings
-                    .get("tension_stiffness")
-                    .and_then(Value::as_f64)
-                    .map(normalize_cloth_stiffness);
-                let compression = settings
-                    .get("compression_stiffness")
-                    .and_then(Value::as_f64)
-                    .map(normalize_cloth_stiffness);
-                let structural = match (tension, compression) {
-                    (Some(tension), Some(compression)) => Some(f64::midpoint(tension, compression)),
-                    (Some(value), None) | (None, Some(value)) => Some(value),
-                    (None, None) => None,
-                };
-                if let Some(value) = structural {
-                    properties.insert("structural_stiffness".to_owned(), json!(value));
-                }
-            }
-            if !properties.contains_key("bend_stiffness")
-                && let Some(value) = settings.get("bending_stiffness").and_then(Value::as_f64)
-            {
-                properties.insert(
-                    "bend_stiffness".to_owned(),
-                    json!(normalize_cloth_stiffness(value)),
-                );
-            }
-            if let Some(value) = settings.get("shear_stiffness").and_then(Value::as_f64) {
-                properties.insert(
-                    "shear_stiffness".to_owned(),
-                    json!(normalize_cloth_stiffness(value)),
-                );
-            }
-            if !properties.contains_key("air_drag")
-                && let Some(value) = settings.get("air_damping")
-            {
-                properties.insert("air_drag".to_owned(), value.clone());
-            }
-            if !properties.contains_key("pin_group")
-                && let Some(value) = settings.get("vertex_group_mass")
-            {
-                properties.insert("pin_group".to_owned(), value.clone());
-            }
-            if !properties.contains_key("collision_distance")
-                && let Some(value) = settings.get("distance_min")
-            {
-                properties.insert("collision_distance".to_owned(), value.clone());
-            }
+    if system == "particle_system" {
+        if !properties.contains_key("random_velocity")
+            && let Some(value) = settings.get("factor_random")
+        {
+            properties.insert("random_velocity".to_owned(), value.clone());
         }
-        "soft_body" => {
-            if !properties.contains_key("goal_strength")
-                && let Some(value) = settings.get("goal_default")
-            {
-                properties.insert("goal_strength".to_owned(), value.clone());
-            }
-            if !properties.contains_key("goal_stiffness")
-                && let Some(value) = settings.get("goal_spring")
-            {
-                properties.insert("goal_stiffness".to_owned(), value.clone());
-            }
-            if !properties.contains_key("drag")
-                && let Some(value) = settings.get("friction")
-            {
-                properties.insert("drag".to_owned(), value.clone());
-            }
-            if !properties.contains_key("goal_group")
-                && let Some(value) = settings.get("vertex_group_goal")
-            {
-                properties.insert("goal_group".to_owned(), value.clone());
-            }
+        if !properties.contains_key("source")
+            && let Some(source) = settings.get("emit_from").and_then(Value::as_str)
+        {
+            let source = match source {
+                "VERT" => "vertices",
+                "FACE" => "faces",
+                "VOLUME" => "volume",
+                _ => source,
+            };
+            properties.insert("source".to_owned(), Value::String(source.to_owned()));
         }
-        "particle_system" => {
-            if !properties.contains_key("random_velocity")
-                && let Some(value) = settings.get("factor_random")
-            {
-                properties.insert("random_velocity".to_owned(), value.clone());
-            }
-            if !properties.contains_key("source")
-                && let Some(source) = settings.get("emit_from").and_then(Value::as_str)
-            {
-                let source = match source {
-                    "VERT" => "vertices",
-                    "FACE" => "faces",
-                    "VOLUME" => "volume",
-                    _ => source,
-                };
-                properties.insert("source".to_owned(), Value::String(source.to_owned()));
-            }
-        }
-        _ => {}
     }
     normalized
-}
-fn normalize_cloth_stiffness(value: f64) -> f64 {
-    if value > 1.0 {
-        1.0 / (1.0 + 1.0 / value)
-    } else {
-        value / (1.0 + value)
-    }
 }
 
 fn set_vertex_positions(mesh: &mut Mesh, positions: Vec<DVec3>, node_id: &Id) -> Result<()> {
@@ -752,6 +606,7 @@ pub(crate) fn evaluate(
     let mut result = result.unwrap_or_else(|| empty_result(key.clone()));
     result.deformed_vertices = physics.deformed_vertices;
     result.fluid_particles = physics.fluid_particles;
+    result.fluid_warnings = physics.fluid_warnings;
     result.fluid_surfaces = physics.fluid_surfaces;
     result.paint_colors = physics.paint_colors;
     result.paint_weights = physics.paint_weights;
@@ -792,6 +647,7 @@ fn empty_result(key: String) -> SimulationResult {
         paint_colors: BTreeMap::new(),
         paint_weights: BTreeMap::new(),
         physics_cache_key: None,
+        fluid_warnings: Vec::new(),
     }
 }
 
@@ -803,27 +659,10 @@ fn evaluate_physics(
     members: &BTreeSet<Id>,
     gate: ModifierGate<'_>,
 ) -> Result<PhysicsResult> {
-    let scene = doc.scenes.get(scene_id).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::SceneNotFound,
-            format!("scene `{scene_id}` was not found"),
-        )
-    })?;
-    let fps = f64::from(scene.fps) / scene.fps_base;
-    if !fps.is_finite() || fps <= 0.0 || !frame.is_finite() {
-        return Err(PotError::invalid_argument(
-            "physics frame rate and frame must be finite and positive",
-        ));
-    }
-    let gravity = scene
-        .rigid_body_world
-        .as_ref()
-        .map_or(DVec3::new(0.0, 0.0, -9.81), |world| {
-            DVec3::from_array(world.gravity)
-        });
-    let collision_meshes = collider_triangles(doc, matrices, members, gate)?;
+    let context = FrameContext::new(doc, scene_id, frame, matrices, members, gate)?;
     let force_fields = force_field_inputs(doc, matrices, members)?;
     let mut result = PhysicsResult {
+        fluid_warnings: Vec::new(),
         deformed_vertices: BTreeMap::new(),
         particles: BTreeMap::new(),
         fluid_particles: BTreeMap::new(),
@@ -838,79 +677,38 @@ fn evaluate_physics(
         let Some(matrix) = matrices.get(id).copied() else {
             continue;
         };
-        if let Some(settings) = node.properties.get("physics_cloth")
-            && gate.is_property_active(id, node, "physics_cloth", "cloth")
-        {
-            let mut mesh = mesh_for_node(doc, node, id)?.clone();
-            if let Some(data_block) = node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
+        for (property, system) in [
+            ("physics_cloth", "cloth"),
+            ("physics_soft_body", "soft_body"),
+        ] {
+            if let Some(settings) = node.properties.get(property)
+                && gate.is_property_active(id, node, property, system)
             {
-                crate::eval::attach_vertex_group_weights(&mut mesh, data_block);
+                let mesh = mesh_with_vertex_groups(doc, node, id)?;
+                let colliders =
+                    collider_triangles(doc, matrices, members, gate, ColliderConsumer::Surface)?;
+                let positions =
+                    simulate_surface(&context, id, system, settings, &mesh, matrix, &colliders)?;
+                result
+                    .deformed_vertices
+                    .insert(id.clone(), checked_positions(id, positions)?);
             }
-            let inverse = invert_matrix(matrix, id)?;
-            let local_gravity = inverse.transform_vector3(gravity);
-            let local_colliders = if setting_bool(settings, "collision_enabled") == Some(false) {
-                Vec::new()
-            } else {
-                local_collision_triangles(&collision_meshes, id, inverse)
-            };
-            let normalized = normalize_solver_settings(settings, "cloth");
-            let positions = cloth::simulate(
-                &mesh,
-                &normalized,
-                frame,
-                fps,
-                local_gravity,
-                &local_colliders,
-            )?;
-            result
-                .deformed_vertices
-                .insert(id.clone(), checked_positions(id, positions)?);
-        }
-        if let Some(settings) = node.properties.get("physics_soft_body")
-            && gate.is_property_active(id, node, "physics_soft_body", "soft_body")
-        {
-            let mut mesh = mesh_for_node(doc, node, id)?.clone();
-            if let Some(data_block) = node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
-            {
-                crate::eval::attach_vertex_group_weights(&mut mesh, data_block);
-            }
-            let inverse = invert_matrix(matrix, id)?;
-            let local_gravity = inverse.transform_vector3(gravity);
-            let local_colliders = local_collision_triangles(&collision_meshes, id, inverse);
-            let positions =
-                softbody::simulate(&mesh, settings, frame, fps, local_gravity, &local_colliders)?;
-            result
-                .deformed_vertices
-                .insert(id.clone(), checked_positions(id, positions)?);
         }
         if let Some(settings) = node.properties.get("physics_particle_emitter")
             && gate.is_property_active(id, node, "physics_particle_emitter", "particle_system")
         {
             let mesh = mesh_for_node(doc, node, id)?;
-            let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
-                scene
-                    .rigid_body_world
-                    .as_ref()
-                    .map_or(0, |world| world.seed)
-            });
-            let colliders = collision_meshes
-                .iter()
-                .filter(|(collider_id, _)| collider_id != id)
-                .map(|(_, triangle)| *triangle)
-                .collect::<Vec<_>>();
+            let seed = setting_u32(settings, "seed").unwrap_or(context.seed);
+            let triangles =
+                collider_triangles(doc, matrices, members, gate, ColliderConsumer::Point)?;
+            let colliders = point_colliders(&triangles, id);
             let particles = particles::simulate(
                 mesh,
                 settings,
                 matrix,
                 frame,
-                fps,
-                gravity,
+                context.fps,
+                context.gravity,
                 seed,
                 &force_fields,
                 &colliders,
@@ -953,70 +751,51 @@ fn evaluate_physics(
             );
         }
         if let Some(settings) = node.properties.get("physics_fluid")
-            && gate.is_property_active(id, node, "physics_fluid", "fluid")
+            && let Some(modifier) = active_modifier(id, node, "fluid", gate)
         {
-            let domain = mesh_for_node(doc, node, id)?;
-            let seed = setting_u32(settings, "seed").unwrap_or_else(|| {
-                scene
-                    .rigid_body_world
-                    .as_ref()
-                    .map_or(0, |world| world.seed)
-            });
-            let colliders = collision_meshes
-                .iter()
-                .filter(|(collider_id, _)| collider_id != id)
-                .map(|(_, triangle)| *triangle)
-                .collect::<Vec<_>>();
-            let particles = fluid::simulate(
-                domain, settings, matrix, frame, fps, gravity, seed, &colliders,
-            )?;
-            if particles.iter().any(|position| !position.is_finite()) {
-                return Err(PotError::new(
-                    ErrorCode::EvaluationFailed,
-                    format!("fluid state for `{id}` is not finite"),
+            let fluid_type = fluid_modifier_role(modifier);
+            if !matches!(fluid_type, "NONE" | "DOMAIN" | "FLOW" | "EFFECTOR") {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "fluid modifier type is invalid",
+                    json!({"node_id":id,"modifier_id":modifier.id,"fluid_type":fluid_type}),
                 ));
             }
-            let local_surface = fluid_surface(&particles, matrix, settings)?;
-            result
-                .fluid_particles
-                .insert(id.clone(), particles.iter().map(DVec3::to_array).collect());
-            if !local_surface.vertices.is_empty() {
-                result.fluid_surfaces.insert(id.clone(), local_surface);
+            if fluid_type == "DOMAIN" {
+                let domain = mesh_for_node(doc, node, id)?;
+                let (particles, spawns_inside_effector) =
+                    simulate_fluid_domain(&context, domain, matrix, settings)?;
+                if particles.iter().any(|position| !position.is_finite()) {
+                    return Err(PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        format!("fluid state for `{id}` is not finite"),
+                    ));
+                }
+                if spawns_inside_effector {
+                    result.fluid_warnings.push(FluidWarning {
+                        node_id: id.to_string(),
+                        message: "a flow spawns liquid inside an effector; Potter does not push that liquid out, and Blender slows it instead (solver parity is a known gap)".to_owned(),
+                    });
+                }
+                if !particles.is_empty() {
+                    let radius = fluid_particle_radius(settings, domain, matrix)?;
+                    let local_surface = fluid_surface(&particles, matrix, radius)?;
+                    result
+                        .fluid_particles
+                        .insert(id.clone(), particles.iter().map(DVec3::to_array).collect());
+                    if !local_surface.vertices.is_empty() {
+                        result.fluid_surfaces.insert(id.clone(), local_surface);
+                    }
+                }
             }
         }
         if let Some(settings) = node.properties.get("physics_dynamic_paint")
             && gate.is_property_active(id, node, "physics_dynamic_paint", "dynamic_paint")
             && setting_string(settings, "role").unwrap_or("canvas") == "canvas"
+            && active_modifier(id, node, "dynamic_paint", gate).is_some()
         {
             let canvas = mesh_for_node(doc, node, id)?;
-            let brushes = dynamic_paint_brush_settings(doc, matrices, settings, members, gate)?;
-            let mut colors = vec![[0.0; 4]; canvas.vertices.len()];
-            if brushes.is_empty() {
-                colors = dynamic_paint::paint(
-                    canvas,
-                    matrix,
-                    &[],
-                    setting_f64(settings, "radius").unwrap_or(1.0),
-                    setting_color(settings).unwrap_or([1.0, 0.0, 0.0, 1.0]),
-                    setting_f64(settings, "strength").unwrap_or(1.0),
-                )?;
-            } else {
-                for brush in &brushes {
-                    let painted = dynamic_paint::paint(
-                        canvas,
-                        matrix,
-                        &[brush.position],
-                        brush.radius,
-                        brush.color,
-                        brush.strength,
-                    )?;
-                    for (current, candidate) in colors.iter_mut().zip(painted) {
-                        if candidate[3] > current[3] {
-                            *current = candidate;
-                        }
-                    }
-                }
-            }
+            let colors = paint_canvas(&context, id, canvas, settings)?;
             if colors.len() != canvas.vertices.len()
                 || colors.iter().flatten().any(|value| !value.is_finite())
             {
@@ -1061,99 +840,64 @@ fn mesh_for_node<'a>(doc: &'a SceneDoc, node: &Node, id: &Id) -> Result<&'a Mesh
         })
 }
 
-fn collider_triangles(
-    doc: &SceneDoc,
-    matrices: &BTreeMap<Id, DMat4>,
-    members: &BTreeSet<Id>,
+fn active_modifier<'a>(
+    node_id: &Id,
+    node: &'a Node,
+    modifier_type: &str,
     gate: ModifierGate<'_>,
-) -> Result<Vec<(Id, [DVec3; 3])>> {
-    let mut triangles = Vec::new();
-    for (id, node) in &doc.nodes {
-        if !members.contains(id) {
-            continue;
-        }
-        let enabled = node
-            .rigid_body
-            .as_ref()
-            .is_some_and(|body| body.body_type == RigidBodyType::Passive)
-            || (node.properties.contains_key("physics_collision")
-                && gate.is_property_active(id, node, "physics_collision", "collision"))
-            || node
-                .properties
-                .get("collision_enabled")
-                .and_then(Value::as_bool)
-                == Some(true);
-        if !enabled {
-            continue;
-        }
-        let mesh = mesh_for_node(doc, node, id)?;
-        let matrix = matrices.get(id).copied().ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "collision mesh transform is missing",
-                json!({"node_id":id}),
-            )
-        })?;
-        let positions = mesh
-            .vertices
-            .iter()
-            .map(|vertex| (vertex.id, matrix.transform_point3(vertex.co)))
-            .collect::<BTreeMap<_, _>>();
-        for triangle in mesh.tessellate().map_err(|error| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                format!("collision mesh `{id}` is invalid: {error}"),
-                json!({"node_id":id}),
-            )
-        })? {
-            let points = triangle.map(|vertex_id| positions.get(&vertex_id).copied());
-            let [Some(a), Some(b), Some(c)] = points else {
-                return Err(PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "collision triangle references a missing vertex",
-                ));
-            };
-            let triangle = [a, b, c];
-            let settings = node.properties.get("physics_collision");
-            let outer = settings
-                .and_then(|settings| settings.get("thickness_outer"))
-                .and_then(Value::as_f64)
-                .or_else(|| {
-                    settings
-                        .and_then(|settings| settings.get("thickness"))
-                        .and_then(Value::as_f64)
-                })
-                .unwrap_or(0.0);
-            let inner = settings
-                .and_then(|settings| settings.get("thickness_inner"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let normal = (b - a).cross(c - a).normalize_or_zero();
-            if outer == 0.0 && inner == 0.0 || normal == DVec3::ZERO {
-                triangles.push((id.clone(), triangle));
-            } else {
-                if outer > 0.0 {
-                    triangles.push((id.clone(), triangle.map(|point| point + normal * outer)));
-                }
-                if inner > 0.0 {
-                    triangles.push((id.clone(), triangle.map(|point| point - normal * inner)));
-                }
-            }
-        }
-    }
-    Ok(triangles)
+) -> Option<&'a Modifier> {
+    node.modifiers.iter().find(|modifier| {
+        modifier.modifier_type == modifier_type && gate.is_active(node_id, modifier)
+    })
 }
 
-fn local_collision_triangles(
-    triangles: &[(Id, [DVec3; 3])],
-    subject_id: &Id,
-    inverse: DMat4,
-) -> Vec<[DVec3; 3]> {
-    triangles
+fn fluid_modifier_role(modifier: &Modifier) -> &str {
+    modifier
+        .params
+        .get("fluid_type")
+        .and_then(Value::as_str)
+        .unwrap_or("NONE")
+}
+
+fn fluid_mesh_triangles(
+    doc: &SceneDoc,
+    matrices: &BTreeMap<Id, DMat4>,
+    node: &Node,
+    node_id: &Id,
+) -> Result<Vec<[DVec3; 3]>> {
+    let mesh = mesh_for_node(doc, node, node_id)?;
+    let matrix = matrices.get(node_id).copied().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "fluid object transform is missing",
+            json!({"node_id":node_id}),
+        )
+    })?;
+    let positions = mesh
+        .vertices
         .iter()
-        .filter(|(id, _)| id != subject_id)
-        .map(|(_, triangle)| triangle.map(|point| inverse.transform_point3(point)))
-        .collect()
+        .map(|vertex| (vertex.id, matrix.transform_point3(vertex.co)))
+        .collect::<BTreeMap<_, _>>();
+    let mesh_triangles = mesh.tessellate().map_err(|error| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            format!("fluid mesh `{node_id}` is invalid: {error}"),
+            json!({"node_id":node_id}),
+        )
+    })?;
+    let mut triangles = Vec::with_capacity(mesh_triangles.len());
+    for triangle in mesh_triangles {
+        let points = triangle.map(|vertex_id| positions.get(&vertex_id).copied());
+        let [Some(a), Some(b), Some(c)] = points else {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "fluid triangle references a missing vertex",
+                json!({"node_id":node_id}),
+            ));
+        };
+        triangles.push([a, b, c]);
+    }
+    Ok(triangles)
 }
 
 fn force_field_inputs(
@@ -1191,106 +935,7 @@ fn force_field_inputs(
     Ok(inputs)
 }
 
-#[derive(Clone, Copy)]
-struct DynamicPaintBrush {
-    position: DVec3,
-    radius: f64,
-    color: [f64; 4],
-    strength: f64,
-}
-fn dynamic_paint_brush_settings(
-    doc: &SceneDoc,
-    matrices: &BTreeMap<Id, DMat4>,
-    canvas_settings: &Value,
-    members: &BTreeSet<Id>,
-    gate: ModifierGate<'_>,
-) -> Result<Vec<DynamicPaintBrush>> {
-    let mut brush_ids = BTreeSet::new();
-    if let Some(values) = canvas_settings.get("brushes").and_then(Value::as_array) {
-        for value in values {
-            let value = value.as_str().ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidOperation,
-                    "dynamic-paint brush IDs must be strings",
-                )
-            })?;
-            let id = Id::new(value.to_owned())
-                .map_err(|error| PotError::new(ErrorCode::InvalidOperation, error.message))?;
-            if doc.nodes.get(&id).is_some_and(|node| {
-                !gate.is_property_active(&id, node, "physics_dynamic_paint", "dynamic_paint")
-            }) {
-                continue;
-            }
-            if !members.contains(&id) {
-                return Err(PotError::with_details(
-                    ErrorCode::TargetNotFound,
-                    "dynamic-paint brush is not in the active Scene",
-                    json!({"brush_id":id}),
-                ));
-            }
-            brush_ids.insert(id);
-        }
-    } else {
-        for (id, node) in &doc.nodes {
-            if members.contains(id)
-                && gate.is_property_active(id, node, "physics_dynamic_paint", "dynamic_paint")
-                && node
-                    .properties
-                    .get("physics_dynamic_paint")
-                    .and_then(|settings| setting_string(settings, "role"))
-                    == Some("brush")
-            {
-                brush_ids.insert(id.clone());
-            }
-        }
-    }
-    let canvas_radius = setting_f64(canvas_settings, "radius").unwrap_or(1.0);
-    let canvas_color = setting_color(canvas_settings).unwrap_or([1.0, 0.0, 0.0, 1.0]);
-    let canvas_strength = setting_f64(canvas_settings, "strength").unwrap_or(1.0);
-    let mut brushes = Vec::with_capacity(brush_ids.len());
-    for id in brush_ids {
-        let node = doc.nodes.get(&id).ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::TargetNotFound,
-                "dynamic-paint brush Object was not found",
-                json!({"brush_id":id}),
-            )
-        })?;
-        let settings = node
-            .properties
-            .get("physics_dynamic_paint")
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::InvalidOperation,
-                    "dynamic-paint target is not configured as a brush",
-                    json!({"brush_id":id}),
-                )
-            })?;
-        if setting_string(settings, "role") != Some("brush") {
-            return Err(PotError::with_details(
-                ErrorCode::InvalidOperation,
-                "dynamic-paint target is not configured as a brush",
-                json!({"brush_id":id}),
-            ));
-        }
-        let matrix = matrices.get(&id).copied().ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "dynamic-paint brush transform is missing",
-                json!({"node_id":id}),
-            )
-        })?;
-        brushes.push(DynamicPaintBrush {
-            position: matrix.transform_point3(DVec3::ZERO),
-            radius: setting_f64(settings, "radius").unwrap_or(canvas_radius),
-            color: setting_color(settings).unwrap_or(canvas_color),
-            strength: setting_f64(settings, "strength").unwrap_or(canvas_strength),
-        });
-    }
-    Ok(brushes)
-}
-
-fn fluid_surface(particles: &[DVec3], matrix: DMat4, settings: &Value) -> Result<Mesh> {
+fn fluid_surface(particles: &[DVec3], matrix: DMat4, radius: f64) -> Result<Mesh> {
     if particles.is_empty() {
         return Ok(Mesh::default());
     }
@@ -1301,7 +946,6 @@ fn fluid_surface(particles: &[DVec3], matrix: DMat4, settings: &Value) -> Result
             "fluid domain transform cannot be inverted",
         ));
     }
-    let radius = setting_f64(settings, "particle_radius").unwrap_or(0.15);
     let stride = particles.len().div_ceil(32);
     let mut data = MetaballData::default();
     let mut minimum = DVec3::splat(f64::INFINITY);
@@ -1367,10 +1011,6 @@ fn checked_positions(id: &Id, positions: Vec<DVec3>) -> Result<Vec<[f64; 3]>> {
         .collect())
 }
 
-fn setting_bool(settings: &Value, key: &str) -> Option<bool> {
-    settings.get(key).and_then(Value::as_bool)
-}
-
 fn setting_f64(settings: &Value, key: &str) -> Option<f64> {
     settings
         .get(key)
@@ -1389,10 +1029,944 @@ fn setting_string<'a>(settings: &'a Value, key: &str) -> Option<&'a str> {
     settings.get(key).and_then(Value::as_str)
 }
 
+/// Colour from a 3- or 4-channel array under `key`; a 3-channel colour is opaque.
+fn color_setting(settings: &Value, key: &str) -> Option<[f64; 4]> {
+    let values = settings.get(key)?.as_array()?;
+    match values.as_slice() {
+        [r, g, b, a] => Some([r.as_f64()?, g.as_f64()?, b.as_f64()?, a.as_f64()?]),
+        [r, g, b] => Some([r.as_f64()?, g.as_f64()?, b.as_f64()?, 1.0]),
+        _ => None,
+    }
+}
+
 fn setting_color(settings: &Value) -> Option<[f64; 4]> {
-    let values = settings.get("color")?.as_array()?;
-    let [r, g, b, a] = values.as_slice() else {
-        return None;
+    color_setting(settings, "color")
+}
+
+/// Solver window of a Blender point cache.
+///
+/// Scene frames before `start` keep the input state, and frames after `end` hold the state at
+/// `end` (`pointcache.cc`, `cloth.cc`). The solver is sampled at `frame - start`.
+#[derive(Clone, Copy)]
+struct CacheWindow {
+    start: f64,
+    end: f64,
+}
+
+impl CacheWindow {
+    fn solver_frame(self, frame: f64) -> f64 {
+        (frame.min(self.end) - self.start).max(0.0)
+    }
+}
+
+fn frame_window(start: f64, end: f64) -> Result<CacheWindow> {
+    if end < start {
+        return Err(PotError::invalid_argument(
+            "point cache frame_end must not be before frame_start",
+        ));
+    }
+    Ok(CacheWindow { start, end })
+}
+
+/// Window of a nested `point_cache` block, with Blender's defaults when the block is absent.
+fn point_cache_window(settings: &Value) -> Result<CacheWindow> {
+    let Some(cache) = settings.get("point_cache") else {
+        return frame_window(1.0, 250.0);
     };
-    Some([r.as_f64()?, g.as_f64()?, b.as_f64()?, a.as_f64()?])
+    if !cache.is_object() {
+        return Err(PotError::invalid_argument("point_cache must be an object"));
+    }
+    physics_support::reject_unhonoured(
+        "point_cache",
+        cache,
+        physics_support::honoured_properties("point_cache"),
+    )?;
+    let start = setting_number(cache, "frame_start", 1.0, "point cache", "a finite number")?;
+    let end = setting_number(cache, "frame_end", 250.0, "point cache", "a finite number")?;
+    frame_window(start, end)
+}
+
+/// Window of a fluid domain's `cache_frame_start` and `cache_frame_end`.
+fn domain_cache_window(settings: &Value) -> Result<CacheWindow> {
+    let start = setting_number(
+        settings,
+        "cache_frame_start",
+        1.0,
+        "fluid",
+        "a finite number",
+    )?;
+    let end = setting_number(
+        settings,
+        "cache_frame_end",
+        250.0,
+        "fluid",
+        "a finite number",
+    )?;
+    frame_window(start, end)
+}
+
+fn bool_setting(settings: &Value, key: &str, default: bool, family: &str) -> Result<bool> {
+    settings.get(key).map_or(Ok(default), |value| {
+        value
+            .as_bool()
+            .ok_or_else(|| PotError::invalid_argument(format!("{family} {key} must be a boolean")))
+    })
+}
+
+fn unsupported_feature(feature_id: &str, reason: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        reason,
+        json!({"feature_id":feature_id,"reason":reason,"status":"not_supported"}),
+    )
+}
+
+/// Objects of a collection and of its child collections.
+fn collection_members(doc: &SceneDoc, root: &Id) -> Result<BTreeSet<Id>> {
+    let mut pending = vec![root.clone()];
+    let mut visited = BTreeSet::new();
+    let mut members = BTreeSet::new();
+    while let Some(collection_id) = pending.pop() {
+        if !visited.insert(collection_id.clone()) {
+            continue;
+        }
+        let collection = doc.collections.get(&collection_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "collection is missing",
+                json!({"collection_id":collection_id}),
+            )
+        })?;
+        members.extend(collection.objects.iter().cloned());
+        pending.extend(collection.children.iter().cloned());
+    }
+    Ok(members)
+}
+
+/// Members of the collection that a Blender collision or effector reference names.
+///
+/// `None` when the reference is unset, which means every collider applies. A reference that does
+/// not resolve to a Potter Collection is refused, because Blender Collection pointers are not
+/// mapped by the importer.
+fn collection_filter(
+    doc: &SceneDoc,
+    value: Option<&Value>,
+    feature_id: &str,
+) -> Result<Option<BTreeSet<Id>>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let collection = value
+        .as_str()
+        .and_then(|name| Id::new(name.to_owned()).ok())
+        .filter(|id| doc.collections.contains_key(id));
+    let Some(collection) = collection else {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Blender collision collection reference is not a Potter Collection",
+            json!({"feature_id":feature_id,"status":"not_supported"}),
+        ));
+    };
+    collection_members(doc, &collection).map(Some)
+}
+
+/// Solver that consumes a collider set.
+///
+/// Surface solvers (cloth and soft bodies) apply the full collision settings. Point solvers
+/// (particles and liquid) apply only `thickness_outer`, as a two-sided offset of each surface.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColliderConsumer {
+    Surface,
+    Point,
+}
+
+/// World-space collision triangle with the Blender collision settings its consumer honours.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColliderTriangle {
+    pub points: [DVec3; 3],
+    /// Distance kept on the front side of the surface (`thickness_outer`).
+    pub thickness_outer: f64,
+    /// Distance kept on the back side of the surface (`thickness_inner`). Only soft bodies apply
+    /// it; cloth and point solvers ignore it, as Blender does.
+    pub thickness_inner: f64,
+    /// Only motion from the front side collides (`use_culling`).
+    pub culling: bool,
+    /// Coulomb friction of the surface in percent (`cloth_friction`). Only cloth applies it.
+    pub friction: f64,
+}
+
+/// Collision triangles in world space that `consumer` honours, each tagged with its object.
+///
+/// Blender collides with objects whose COLLISION modifier has `use` set. Passive rigid bodies are
+/// not colliders unless they also carry a COLLISION modifier.
+fn collider_triangles(
+    doc: &SceneDoc,
+    matrices: &BTreeMap<Id, DMat4>,
+    members: &BTreeSet<Id>,
+    gate: ModifierGate<'_>,
+    consumer: ColliderConsumer,
+) -> Result<Vec<(Id, ColliderTriangle)>> {
+    let honoured: &[&str] = match consumer {
+        ColliderConsumer::Surface => physics_support::honoured_properties("collision"),
+        ColliderConsumer::Point => &physics_support::POINT_COLLISION_HONOURED[..],
+    };
+    let mut triangles = Vec::new();
+    for (id, node) in &doc.nodes {
+        if !members.contains(id) {
+            continue;
+        }
+        let Some(settings) = node.properties.get("physics_collision") else {
+            continue;
+        };
+        if !gate.is_property_active(id, node, "physics_collision", "collision")
+            || !bool_setting(settings, "use", true, "collision")?
+        {
+            continue;
+        }
+        physics_support::reject_unhonoured("collision", settings, honoured)?;
+        let thickness_outer = nonnegative_setting(settings, "thickness_outer", 0.02, "collision")?;
+        let thickness_inner = nonnegative_setting(settings, "thickness_inner", 0.2, "collision")?;
+        let culling = bool_setting(settings, "use_culling", true, "collision")?;
+        let friction = nonnegative_setting(settings, "cloth_friction", 5.0, "collision")?;
+        let mesh = mesh_for_node(doc, node, id)?;
+        let matrix = matrices.get(id).copied().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "collision mesh transform is missing",
+                json!({"node_id":id}),
+            )
+        })?;
+        let positions = mesh
+            .vertices
+            .iter()
+            .map(|vertex| (vertex.id, matrix.transform_point3(vertex.co)))
+            .collect::<BTreeMap<_, _>>();
+        for triangle in mesh.tessellate().map_err(|error| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                format!("collision mesh `{id}` is invalid: {error}"),
+                json!({"node_id":id}),
+            )
+        })? {
+            let points = triangle.map(|vertex_id| positions.get(&vertex_id).copied());
+            let [Some(a), Some(b), Some(c)] = points else {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "collision triangle references a missing vertex",
+                ));
+            };
+            triangles.push((
+                id.clone(),
+                ColliderTriangle {
+                    points: [a, b, c],
+                    thickness_outer,
+                    thickness_inner,
+                    culling,
+                    friction,
+                },
+            ));
+        }
+    }
+    Ok(triangles)
+}
+
+/// Colliders that `subject` sees, in the subject's local frame.
+///
+/// `collection` restricts colliders to a consumer's collection, and `None` keeps every collider.
+/// A subject never collides with itself. Thickness values stay in the subject's local units.
+fn local_colliders(
+    triangles: &[(Id, ColliderTriangle)],
+    subject: &Id,
+    collection: Option<&BTreeSet<Id>>,
+    inverse: DMat4,
+) -> Vec<ColliderTriangle> {
+    triangles
+        .iter()
+        .filter(|(id, _)| id != subject && collection.is_none_or(|members| members.contains(id)))
+        .map(|(_, triangle)| ColliderTriangle {
+            points: triangle.points.map(|point| inverse.transform_point3(point)),
+            ..*triangle
+        })
+        .collect()
+}
+
+/// Two-sided world-space triangles for point solvers.
+///
+/// Each surface is offset along its normal by its `thickness_outer`, and a subject never collides
+/// with itself.
+fn point_colliders(triangles: &[(Id, ColliderTriangle)], subject: &Id) -> Vec<[DVec3; 3]> {
+    triangles
+        .iter()
+        .filter(|(id, _)| id != subject)
+        .map(|(_, triangle)| {
+            let [a, b, c] = triangle.points;
+            let normal = (b - a).cross(c - a).normalize_or_zero();
+            triangle
+                .points
+                .map(|point| point + normal * triangle.thickness_outer)
+        })
+        .collect()
+}
+
+/// Scene inputs that every physics evaluation at one frame shares.
+#[derive(Clone, Copy)]
+struct FrameContext<'a> {
+    doc: &'a SceneDoc,
+    matrices: &'a BTreeMap<Id, DMat4>,
+    members: &'a BTreeSet<Id>,
+    gate: ModifierGate<'a>,
+    frame: f64,
+    fps: f64,
+    gravity: DVec3,
+    seed: u32,
+}
+
+impl<'a> FrameContext<'a> {
+    fn new(
+        doc: &'a SceneDoc,
+        scene_id: &Id,
+        frame: f64,
+        matrices: &'a BTreeMap<Id, DMat4>,
+        members: &'a BTreeSet<Id>,
+        gate: ModifierGate<'a>,
+    ) -> Result<Self> {
+        let scene = doc.scenes.get(scene_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneNotFound,
+                format!("scene `{scene_id}` was not found"),
+            )
+        })?;
+        let fps = f64::from(scene.fps) / scene.fps_base;
+        if !fps.is_finite() || fps <= 0.0 || !frame.is_finite() {
+            return Err(PotError::invalid_argument(
+                "physics frame rate and frame must be finite and positive",
+            ));
+        }
+        let (gravity, seed) = scene
+            .rigid_body_world
+            .as_ref()
+            .map_or((DVec3::new(0.0, 0.0, -9.81), 0), |world| {
+                (DVec3::from_array(world.gravity), world.seed)
+            });
+        Ok(Self {
+            doc,
+            matrices,
+            members,
+            gate,
+            frame,
+            fps,
+            gravity,
+            seed,
+        })
+    }
+}
+
+/// Mesh of a scene node with its vertex-group weights attached.
+fn mesh_with_vertex_groups(doc: &SceneDoc, node: &Node, id: &Id) -> Result<Mesh> {
+    let mut mesh = mesh_for_node(doc, node, id)?.clone();
+    if let Some(data_block) = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+    {
+        crate::eval::attach_vertex_group_weights(&mut mesh, data_block);
+    }
+    Ok(mesh)
+}
+
+/// Cloth or soft-body vertex positions for `subject` at the context frame, in its local space.
+///
+/// The solver runs inside the point-cache window. Cloth takes its collision toggle and collection
+/// from the nested `collision_settings`; soft bodies take `collision_collection`.
+fn simulate_surface(
+    context: &FrameContext<'_>,
+    subject: &Id,
+    system: &str,
+    settings: &Value,
+    mesh: &Mesh,
+    matrix: DMat4,
+    colliders: &[(Id, ColliderTriangle)],
+) -> Result<Vec<DVec3>> {
+    let window = point_cache_window(settings)?;
+    let inverse = invert_matrix(matrix, subject)?;
+    let (collision_enabled, collection) = if system == "cloth" {
+        let collision = settings.get("collision_settings");
+        if let Some(collision) = collision {
+            physics_support::reject_unhonoured(
+                "cloth_collision",
+                collision,
+                physics_support::honoured_properties("cloth_collision"),
+            )?;
+        }
+        let enabled = match collision {
+            Some(collision) => bool_setting(collision, "use_collision", true, "cloth collision")?,
+            None => true,
+        };
+        let collection = collection_filter(
+            context.doc,
+            collision.and_then(|collision| collision.get("collection")),
+            "physics.cloth_collision.collection",
+        )?;
+        (enabled, collection)
+    } else {
+        let collection = collection_filter(
+            context.doc,
+            settings.get("collision_collection"),
+            "physics.soft_body.collision_collection",
+        )?;
+        (true, collection)
+    };
+    let surface_colliders = if collision_enabled {
+        local_colliders(colliders, subject, collection.as_ref(), inverse)
+    } else {
+        Vec::new()
+    };
+    let local_gravity = inverse.transform_vector3(context.gravity);
+    let solver_frame = window.solver_frame(context.frame);
+    if system == "cloth" {
+        cloth::simulate(
+            mesh,
+            settings,
+            solver_frame,
+            context.fps,
+            local_gravity,
+            &surface_colliders,
+        )
+    } else {
+        softbody::simulate(
+            mesh,
+            settings,
+            solver_frame,
+            context.fps,
+            local_gravity,
+            &surface_colliders,
+        )
+    }
+}
+
+/// Rejects Blender fluid domains that Potter does not simulate.
+///
+/// A domain without `domain_type` is a Potter-native liquid domain with absolute units.
+fn validate_fluid_domain(settings: &Value) -> Result<()> {
+    let Some(kind) = setting_string(settings, "domain_type") else {
+        return Ok(());
+    };
+    match kind {
+        "LIQUID" => {
+            let system = physics_support::fluid_domain_system(kind);
+            physics_support::reject_unhonoured(
+                system,
+                settings,
+                physics_support::honoured_properties(system),
+            )
+        }
+        "GAS" => Err(unsupported_feature(
+            "physics.fluid.smoke_fire",
+            "gas (smoke and fire) domains are not supported; only liquid SPH simulation is",
+        )),
+        _ => Err(physics_support::unsupported_property(
+            "fluid_domain",
+            "domain_type",
+        )),
+    }
+}
+
+/// Liquid particle radius in world units.
+///
+/// Blender stores `particle_radius` as a factor of the domain cell size (`rna_fluid.cc`). A Blender
+/// domain, one that carries a `domain_type`, multiplies that factor by its cell size, taken as the
+/// longest world-space side divided by `resolution_max`. A Potter-native domain keeps
+/// `particle_radius` as an absolute world radius.
+fn fluid_particle_radius(settings: &Value, domain: &Mesh, matrix: DMat4) -> Result<f64> {
+    if settings.get("domain_type").is_none() {
+        return Ok(setting_f64(settings, "particle_radius").unwrap_or(0.15));
+    }
+    let factor = nonnegative_setting(settings, "particle_radius", 1.0, "fluid")?;
+    let resolution_max =
+        setting_number(settings, "resolution_max", 32.0, "fluid", "a finite number")?;
+    if resolution_max < 1.0 {
+        return Err(PotError::invalid_argument(
+            "fluid resolution_max must be at least 1",
+        ));
+    }
+    let radius = factor * domain_world_extent(domain, matrix) / resolution_max;
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "fluid domain particle radius must be positive",
+        ));
+    }
+    Ok(radius)
+}
+
+/// Longest world-space side of the domain's vertex bounds.
+fn domain_world_extent(domain: &Mesh, matrix: DMat4) -> f64 {
+    let mut minimum = DVec3::splat(f64::INFINITY);
+    let mut maximum = DVec3::splat(f64::NEG_INFINITY);
+    for vertex in &domain.vertices {
+        let point = matrix.transform_point3(vertex.co);
+        minimum = minimum.min(point);
+        maximum = maximum.max(point);
+    }
+    (maximum - minimum).max_element()
+}
+
+/// Liquid emitters from the scene's active FLOW objects.
+fn fluid_flow_sources(context: &FrameContext<'_>) -> Result<Vec<fluid::FlowSource>> {
+    let mut flows = Vec::new();
+    for (node_id, node) in &context.doc.nodes {
+        if !context.members.contains(node_id) {
+            continue;
+        }
+        let Some(modifier) = active_modifier(node_id, node, "fluid", context.gate) else {
+            continue;
+        };
+        if fluid_modifier_role(modifier) != "FLOW" {
+            continue;
+        }
+        let settings = node.properties.get("physics_fluid").ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "fluid flow modifier has no linked settings",
+                json!({"node_id":node_id}),
+            )
+        })?;
+        flows.push(fluid::FlowSource {
+            triangles: fluid_mesh_triangles(context.doc, context.matrices, node, node_id)?,
+            inflow_rate: flow_inflow_rate(settings)?,
+        });
+    }
+    Ok(flows)
+}
+
+/// Emission rate in particles per frame for one flow.
+///
+/// A Blender flow, one whose settings carry `flow_type` or `flow_behavior`, must be a LIQUID INFLOW
+/// flow from its MESH source. Blender's liquid flow fills the mesh volume, which has no
+/// particle-rate equivalent, so it needs an explicit Potter-native `inflow_rate` and is refused
+/// without one. Blender's `density` scales only smoke and fire, so it has no effect on liquid.
+fn flow_inflow_rate(settings: &Value) -> Result<f64> {
+    if settings.get("flow_type").is_some() || settings.get("flow_behavior").is_some() {
+        physics_support::reject_unhonoured(
+            "fluid_flow",
+            settings,
+            physics_support::honoured_properties("fluid_flow"),
+        )?;
+        match setting_string(settings, "flow_type").unwrap_or("SMOKE") {
+            "LIQUID" => {}
+            "SMOKE" | "FIRE" | "BOTH" => {
+                return Err(unsupported_feature(
+                    "physics.fluid.smoke_fire",
+                    "smoke and fire fluid flows are not supported",
+                ));
+            }
+            _ => {
+                return Err(physics_support::unsupported_property(
+                    "fluid_flow",
+                    "flow_type",
+                ));
+            }
+        }
+        if setting_string(settings, "flow_behavior").unwrap_or("GEOMETRY") != "INFLOW" {
+            return Err(unsupported_feature(
+                "physics.fluid.flow_behavior",
+                "only INFLOW liquid flows are supported",
+            ));
+        }
+        if setting_string(settings, "flow_source").unwrap_or("MESH") != "MESH" {
+            return Err(physics_support::unsupported_property(
+                "fluid_flow",
+                "flow_source",
+            ));
+        }
+        if settings.get("inflow_rate").is_none() {
+            return Err(unsupported_feature(
+                "physics.fluid.emission",
+                "Blender liquid flow emission has no particle-rate equivalent; set inflow_rate explicitly",
+            ));
+        }
+    }
+    nonnegative_setting(settings, "inflow_rate", 0.0, "fluid")
+}
+
+/// Liquid obstacle triangles from the fluid effector objects in `collection`.
+///
+/// Blender takes liquid obstacles only from fluid effectors, not from COLLISION modifiers. A
+/// COLLISION effector is an obstacle, `use_effector` False skips the object, and any other effector
+/// type is refused.
+fn fluid_effector_triangles(
+    context: &FrameContext<'_>,
+    collection: Option<&BTreeSet<Id>>,
+) -> Result<Vec<Vec<[DVec3; 3]>>> {
+    let mut effectors = Vec::new();
+    for (node_id, node) in &context.doc.nodes {
+        if !context.members.contains(node_id)
+            || collection.is_some_and(|members| !members.contains(node_id))
+        {
+            continue;
+        }
+        let Some(modifier) = active_modifier(node_id, node, "fluid", context.gate) else {
+            continue;
+        };
+        if fluid_modifier_role(modifier) != "EFFECTOR" {
+            continue;
+        }
+        let settings = node.properties.get("physics_fluid").ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "fluid effector modifier has no linked settings",
+                json!({"node_id":node_id}),
+            )
+        })?;
+        physics_support::reject_unhonoured(
+            "fluid_effector",
+            settings,
+            physics_support::honoured_properties("fluid_effector"),
+        )?;
+        if setting_string(settings, "effector_type").is_some_and(|kind| kind != "COLLISION") {
+            return Err(physics_support::unsupported_property(
+                "fluid_effector",
+                "effector_type",
+            ));
+        }
+        if !bool_setting(settings, "use_effector", true, "fluid effector")? {
+            continue;
+        }
+        effectors.push(fluid_mesh_triangles(
+            context.doc,
+            context.matrices,
+            node,
+            node_id,
+        )?);
+    }
+    Ok(effectors)
+}
+
+/// Liquid particles that the fluid domain holds at the context frame. Empty without an emitter.
+fn simulate_fluid_domain(
+    context: &FrameContext<'_>,
+    domain: &Mesh,
+    matrix: DMat4,
+    settings: &Value,
+) -> Result<(Vec<DVec3>, bool)> {
+    validate_fluid_domain(settings)?;
+    let flows = fluid_flow_sources(context)?;
+    if flows.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let window = domain_cache_window(settings)?;
+    let collection = collection_filter(
+        context.doc,
+        settings.get("effector_group"),
+        "physics.fluid_domain.effector_group",
+    )?;
+    let effectors = fluid_effector_triangles(context, collection.as_ref())?;
+    let obstacles = effectors.iter().flatten().copied().collect::<Vec<_>>();
+    let seed = setting_u32(settings, "seed").unwrap_or(context.seed);
+    let spawns_inside_effector = fluid::emitter_spawns_inside_effector(&flows, &effectors);
+    let positions = fluid::simulate_with_sources(
+        domain,
+        settings,
+        matrix,
+        window.solver_frame(context.frame),
+        context.fps,
+        context.gravity,
+        seed,
+        &obstacles,
+        &flows,
+    )?;
+    Ok((positions, spawns_inside_effector))
+}
+
+#[derive(Clone, Copy)]
+struct DynamicPaintBrush {
+    position: DVec3,
+    radius: f64,
+    color: [f64; 4],
+    strength: f64,
+}
+
+/// Brushes that paint a canvas: its explicit `brushes` list, or every scene brush.
+///
+/// A brush reads Blender's `paint_distance`, `paint_color`, and `paint_alpha`. Missing values fall
+/// back to the canvas's Potter-native `radius`, `color`, and `strength`, which have no Blender
+/// counterpart and are not Blender defaults.
+fn dynamic_paint_brush_settings(
+    context: &FrameContext<'_>,
+    canvas_settings: &Value,
+) -> Result<Vec<DynamicPaintBrush>> {
+    let FrameContext {
+        doc,
+        matrices,
+        members,
+        gate,
+        ..
+    } = *context;
+    let mut brush_ids = BTreeSet::new();
+    if let Some(values) = canvas_settings.get("brushes").and_then(Value::as_array) {
+        for value in values {
+            let value = value.as_str().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "dynamic-paint brush IDs must be strings",
+                )
+            })?;
+            let id = Id::new(value.to_owned())
+                .map_err(|error| PotError::new(ErrorCode::InvalidOperation, error.message))?;
+            if doc.nodes.get(&id).is_some_and(|node| {
+                !gate.is_property_active(&id, node, "physics_dynamic_paint", "dynamic_paint")
+            }) {
+                continue;
+            }
+            if !members.contains(&id) {
+                return Err(PotError::with_details(
+                    ErrorCode::TargetNotFound,
+                    "dynamic-paint brush is not in the active Scene",
+                    json!({"brush_id":id}),
+                ));
+            }
+            brush_ids.insert(id);
+        }
+    } else {
+        for (id, node) in &doc.nodes {
+            if members.contains(id)
+                && gate.is_property_active(id, node, "physics_dynamic_paint", "dynamic_paint")
+                && node
+                    .properties
+                    .get("physics_dynamic_paint")
+                    .and_then(|settings| setting_string(settings, "role"))
+                    == Some("brush")
+                && active_modifier(id, node, "dynamic_paint", gate).is_some()
+            {
+                brush_ids.insert(id.clone());
+            }
+        }
+    }
+    let canvas_radius = setting_f64(canvas_settings, "radius").unwrap_or(1.0);
+    let canvas_color = setting_color(canvas_settings).unwrap_or([1.0, 0.0, 0.0, 1.0]);
+    let canvas_strength = setting_f64(canvas_settings, "strength").unwrap_or(1.0);
+    let mut brushes = Vec::with_capacity(brush_ids.len());
+    for id in brush_ids {
+        let node = doc.nodes.get(&id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "dynamic-paint brush Object was not found",
+                json!({"brush_id":id}),
+            )
+        })?;
+        let settings = node
+            .properties
+            .get("physics_dynamic_paint")
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::InvalidOperation,
+                    "dynamic-paint target is not configured as a brush",
+                    json!({"brush_id":id}),
+                )
+            })?;
+        if setting_string(settings, "role") != Some("brush") {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidOperation,
+                "dynamic-paint target is not configured as a brush",
+                json!({"brush_id":id}),
+            ));
+        }
+        physics_support::reject_unhonoured(
+            "dynamic_paint_brush",
+            settings,
+            physics_support::honoured_properties("dynamic_paint_brush"),
+        )?;
+        let matrix = matrices.get(&id).copied().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint brush transform is missing",
+                json!({"node_id":id}),
+            )
+        })?;
+        brushes.push(DynamicPaintBrush {
+            position: matrix.transform_point3(DVec3::ZERO),
+            // Blender's brush names take precedence; Potter-native keys fill in when they are absent.
+            radius: setting_f64(settings, "paint_distance")
+                .or_else(|| setting_f64(settings, "radius"))
+                .unwrap_or(canvas_radius),
+            color: color_setting(settings, "paint_color")
+                .or_else(|| color_setting(settings, "color"))
+                .unwrap_or(canvas_color),
+            strength: setting_f64(settings, "paint_alpha")
+                .or_else(|| setting_f64(settings, "strength"))
+                .unwrap_or(canvas_strength),
+        });
+    }
+    Ok(brushes)
+}
+
+/// The frame a canvas paints at, or `None` before it paints. Blender's dynamic paint does not evaluate
+/// a surface before its `frame_start` (`dynamicPaint_frameUpdate` reads the cache there), so the canvas
+/// keeps its geometry and is unpainted. After `frame_end` Blender holds the surface's end state, which
+/// Potter reproduces by evaluating the brushes at `frame_end`. A canvas paints when any of its surfaces
+/// has started; the first started surface in order sets the frame.
+fn canvas_paint_frame(canvas: &Value, frame: f64) -> Result<Option<f64>> {
+    let Some(surfaces) = canvas.get("canvas_surfaces") else {
+        return Ok(Some(frame));
+    };
+    let surfaces = surfaces.as_array().ok_or_else(|| {
+        PotError::invalid_argument("dynamic-paint canvas_surfaces must be an array")
+    })?;
+    if surfaces.is_empty() {
+        return Ok(Some(frame));
+    }
+    for surface in surfaces {
+        let start = setting_number(
+            surface,
+            "frame_start",
+            1.0,
+            "dynamic-paint surface",
+            "a finite number",
+        )?;
+        let end = setting_number(
+            surface,
+            "frame_end",
+            250.0,
+            "dynamic-paint surface",
+            "a finite number",
+        )?;
+        if frame >= start {
+            return Ok(Some(frame.min(end)));
+        }
+    }
+    Ok(None)
+}
+
+/// World matrices of the scene at `frame`, with the drivers evaluated there (as `ops/node.rs` does).
+/// Brush transforms are evaluated without evaluated meshes, so a brush whose constraint depends on a
+/// mesh uses its transform without that mesh.
+fn scene_world_matrices_at(doc: &SceneDoc, frame: f64) -> Result<BTreeMap<Id, DMat4>> {
+    let drivers = crate::eval::rig::evaluate_drivers(doc, frame)?;
+    crate::eval::rig::evaluate_world_matrices_with_drivers(doc, frame, &drivers)
+}
+
+fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
+    let Some(surfaces) = canvas.get("canvas_surfaces") else {
+        return Ok(());
+    };
+    let surfaces = surfaces.as_array().ok_or_else(|| {
+        PotError::invalid_argument("dynamic-paint canvas_surfaces must be an array")
+    })?;
+    for surface in surfaces {
+        physics_support::reject_unhonoured(
+            "dynamic_paint_surface",
+            surface,
+            physics_support::honoured_properties("dynamic_paint_surface"),
+        )?;
+        if setting_string(surface, "surface_type").is_some_and(|kind| kind != "PAINT") {
+            return Err(physics_support::unsupported_property(
+                "dynamic_paint_surface",
+                "surface_type",
+            ));
+        }
+        if setting_string(surface, "surface_format").is_some_and(|format| format != "VERTEX") {
+            return Err(physics_support::unsupported_property(
+                "dynamic_paint_surface",
+                "surface_format",
+            ));
+        }
+        point_cache_window(surface)?;
+    }
+    Ok(())
+}
+
+/// Per-vertex RGBA colours that the canvas's dynamic-paint settings produce at the context frame, or at
+/// the surface's `frame_end` once the context frame has passed it.
+fn paint_canvas(
+    context: &FrameContext<'_>,
+    canvas_id: &Id,
+    canvas: &Mesh,
+    settings: &Value,
+) -> Result<Vec<[f64; 4]>> {
+    validate_dynamic_paint_canvas(settings)?;
+    let Some(paint_frame) = canvas_paint_frame(settings, context.frame)? else {
+        return Ok(vec![[0.0; 4]; canvas.vertices.len()]);
+    };
+    let paint_matrices;
+    let paint_context = if paint_frame >= context.frame {
+        *context
+    } else {
+        paint_matrices = scene_world_matrices_at(context.doc, paint_frame)?;
+        FrameContext {
+            frame: paint_frame,
+            matrices: &paint_matrices,
+            ..*context
+        }
+    };
+    let matrix = paint_context
+        .matrices
+        .get(canvas_id)
+        .copied()
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint canvas transform is missing at its paint frame",
+                json!({"node_id":canvas_id}),
+            )
+        })?;
+    let context = &paint_context;
+    let brushes = dynamic_paint_brush_settings(context, settings)?;
+    if brushes.is_empty() {
+        return dynamic_paint::paint(
+            canvas,
+            matrix,
+            &[],
+            setting_f64(settings, "radius").unwrap_or(1.0),
+            setting_color(settings).unwrap_or([1.0, 0.0, 0.0, 1.0]),
+            setting_f64(settings, "strength").unwrap_or(1.0),
+        );
+    }
+    let mut colors = vec![[0.0; 4]; canvas.vertices.len()];
+    for brush in &brushes {
+        let painted = dynamic_paint::paint(
+            canvas,
+            matrix,
+            &[brush.position],
+            brush.radius,
+            brush.color,
+            brush.strength,
+        )?;
+        for (current, candidate) in colors.iter_mut().zip(painted) {
+            if candidate[3] > current[3] {
+                *current = candidate;
+            }
+        }
+    }
+    Ok(colors)
+}
+
+#[cfg(test)]
+mod dynamic_paint_frame_tests {
+    use serde_json::json;
+
+    use super::canvas_paint_frame;
+    use crate::error::Result;
+
+    /// The paint frame, as an exact integer-valued frame, for comparisons without float equality.
+    fn paint_frame_in_tenths(canvas: &serde_json::Value, frame: f64) -> Result<Option<i64>> {
+        Ok(canvas_paint_frame(canvas, frame)?.map(|paint| (paint * 10.0).round() as i64))
+    }
+
+    #[test]
+    fn canvas_is_unpainted_before_frame_start_and_paints_at_the_frame_inside_the_range()
+    -> Result<()> {
+        let canvas = json!({"canvas_surfaces": [{"frame_start": 5, "frame_end": 20}]});
+        assert_eq!(paint_frame_in_tenths(&canvas, 4.0)?, None);
+        assert_eq!(paint_frame_in_tenths(&canvas, 5.0)?, Some(50));
+        assert_eq!(paint_frame_in_tenths(&canvas, 20.0)?, Some(200));
+        Ok(())
+    }
+
+    #[test]
+    fn frame_after_frame_end_paints_at_frame_end_as_blender_holds_its_end_state() -> Result<()> {
+        let canvas = json!({"canvas_surfaces": [{"frame_start": 1, "frame_end": 20}]});
+        assert_eq!(paint_frame_in_tenths(&canvas, 21.0)?, Some(200));
+        assert_eq!(paint_frame_in_tenths(&canvas, 300.0)?, Some(200));
+        Ok(())
+    }
 }
