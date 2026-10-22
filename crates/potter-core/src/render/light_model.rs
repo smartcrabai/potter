@@ -712,8 +712,8 @@ mod realtime_cutoff_tests {
 
     fn light(energy: f64, color: [f64; 3]) -> LightData {
         LightData {
-            energy,
             color,
+            energy,
             ..LightData::default()
         }
     }

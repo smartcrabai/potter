@@ -8985,10 +8985,22 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 .and_then(|tree| tree.get("nodes"))
                 .and_then(Value::as_array)
                 .is_some_and(|nodes| {
+                    // The node kinds `shader/world.rs` evaluates, so a world built from them renders natively.
                     nodes.iter().any(|node| {
                         !matches!(
                             node.get("type").and_then(Value::as_str),
-                            Some("ShaderNodeBackground" | "ShaderNodeOutputWorld")
+                            Some(
+                                "ShaderNodeBackground"
+                                    | "ShaderNodeOutputWorld"
+                                    | "ShaderNodeEmission"
+                                    | "ShaderNodeTexSky"
+                                    | "ShaderNodeTexEnvironment"
+                                    | "ShaderNodeTexCoord"
+                                    | "ShaderNodeMixRGB"
+                                    | "ShaderNodeMix"
+                                    | "ShaderNodeMixShader"
+                                    | "ShaderNodeAddShader"
+                            )
                         )
                     })
                 });

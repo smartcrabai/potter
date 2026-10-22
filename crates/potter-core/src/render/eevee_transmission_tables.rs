@@ -32,8 +32,10 @@ static ASSET: &[u8] = include_bytes!("eevee_transmission_tables.f32le");
 /// The decoded values, decoded once. A wrong asset length panics on first use, which the unit test catches.
 static VALUES: LazyLock<Vec<f32>> = LazyLock::new(|| {
     let values: Vec<f32> = ASSET
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
     assert_eq!(
         values.len(),

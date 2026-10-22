@@ -104,6 +104,8 @@ fn realtime_glass_direct_light_matches_eevee() -> TestResult {
             .arg(&frames)
             .arg("--json")
             .output()?;
+        // Diagnostic: the DIAG lines of `scene.rs` (`glass_direct_contribution`) are on the render's stderr.
+        eprint!("{}", String::from_utf8_lossy(&rendered.stderr));
         assert!(
             rendered.status.success(),
             "{scene}: realtime render failed: {}",

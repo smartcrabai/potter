@@ -1570,8 +1570,8 @@ fn default_sun_angle() -> f64 {
     0.526_f64.to_radians()
 }
 
-fn is_default_sun_angle(value: &f64) -> bool {
-    (value - default_sun_angle()).abs() < 1.0e-6
+fn is_default_sun_angle<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_sun_angle()).abs() < 1.0e-6
 }
 
 /// Blender's light closure multipliers default to one (`DNA_light_types.h`: `diff_fac`, `spec_fac`, `transmission_fac`,
@@ -1580,8 +1580,8 @@ fn default_light_factor() -> f64 {
     1.0
 }
 
-fn is_default_light_factor(value: &f64) -> bool {
-    (value - 1.0).abs() < 1.0e-6
+fn is_default_light_factor<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - 1.0).abs() < 1.0e-6
 }
 
 /// Blender's light cutoff distance default, `DNA_light_types.h`: 40 m.
@@ -1589,8 +1589,8 @@ fn default_cutoff_distance() -> f64 {
     40.0
 }
 
-fn is_default_cutoff_distance(value: &f64) -> bool {
-    (value - default_cutoff_distance()).abs() < 1.0e-9
+fn is_default_cutoff_distance<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_cutoff_distance()).abs() < 1.0e-9
 }
 
 /// Blender's `eevee.light_threshold` default, `DNA_scene_types.h`: 0.01.
@@ -1598,8 +1598,8 @@ fn default_light_threshold() -> f64 {
     0.01
 }
 
-fn is_default_light_threshold(value: &f64) -> bool {
-    (value - default_light_threshold()).abs() < 1.0e-6
+fn is_default_light_threshold<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_light_threshold()).abs() < 1.0e-6
 }
 fn default_volume_color() -> [f64; 3] {
     [0.5; 3]
@@ -2749,6 +2749,7 @@ pub enum ThicknessMode {
 
 impl ThicknessMode {
     /// The name the operation schema and the Blender bridge use.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Sphere => "sphere",

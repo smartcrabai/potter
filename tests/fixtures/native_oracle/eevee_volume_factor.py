@@ -55,6 +55,10 @@ scatter = nodes.new("ShaderNodeVolumeScatter")
 scatter.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
 scatter.inputs["Density"].default_value = 0.5
 links.new(scatter.outputs["Volume"], nodes["Material Output"].inputs["Volume"])
+# A Transparent Surface: the cube's surface adds no light and lets the volume show, which is what an unlinked Surface
+# does in Blender. An opaque black one would hide the volume behind the cube's faces.
+clear = nodes.new("ShaderNodeBsdfTransparent")
+links.new(clear.outputs["BSDF"], nodes["Material Output"].inputs["Surface"])
 cube.data.materials.append(material)
 
 light_data = bpy.data.lights.new("Light", "POINT")
