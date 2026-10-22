@@ -2236,7 +2236,7 @@ def object_dump(obj):
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
             "volume_bounds": volume_bounds,
-            "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots", "track_axis", "up_axis"))}
+            "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots", "track_axis", "up_axis", "dimensions"))}
 
 
 def _action_slot_assigned_objects(action, slot):
