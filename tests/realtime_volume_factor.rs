@@ -223,9 +223,9 @@ fn realtime_volumetric_shadow_setting_matches_native_ab_response() -> TestResult
     assert_eq!(disabled["ok"], true, "{disabled}");
     assert_eq!(
         read_scene(&project)?["scenes"][active.as_str()]["render"]["eevee_use_volumetric_shadows"]
-            .as_bool()
-            .unwrap_or(false),
-        false
+            .as_bool(),
+        Some(false),
+        "Blender's default volumetric shadows are enabled unexpectedly"
     );
     let unshadowed = render_project(root.path(), &project, "volume_unshadowed")?;
 
@@ -267,7 +267,7 @@ fn realtime_volumetric_shadow_setting_matches_native_ab_response() -> TestResult
     Ok(())
 }
 
-/// Volume-only meshes are not opaque Beauty or AO surfaces; zero-density emission remains visible, but only after clip_start.
+/// Volume-only meshes are not opaque Beauty or AO surfaces; zero-density emission remains visible, but only after `clip_start`.
 #[test]
 fn realtime_zero_density_volume_only_mesh_matches_no_object() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
