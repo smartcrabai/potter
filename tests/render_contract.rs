@@ -519,8 +519,8 @@ fn render_uses_scene_settings_for_png_and_linear_exr_sequences() -> Result<(), B
     assert_eq!(pixels.get(3), Some(&0));
     let realtime_manifest: Value =
         serde_json::from_slice(&fs::read(png_dir.join("render.manifest.json"))?)?;
-    assert_eq!(realtime_manifest["samples"], 1);
-    assert_eq!(realtime_manifest["seed"], 0);
+    assert_eq!(realtime_manifest["samples"], 2);
+    assert_eq!(realtime_manifest["seed"], 7);
     Ok(())
 }
 

@@ -556,8 +556,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                     | "particle_instance"
                     | "explode"
             )
-            || (modifier.modifier_type == "volume_to_mesh"
-                && modifier.params.get("object").is_some_and(Value::is_string))
+            || modifier.modifier_type == "volume_to_mesh"
             || scene_operand_modifier
         {
             adaptive_normals = None;
@@ -608,7 +607,18 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             continue;
         }
         if modifier.modifier_type == "mesh_to_volume" {
-            continue;
+            return Err(PotError::with_details(
+                ErrorCode::InvalidOperation,
+                "mesh_to_volume requires a volume Object; Blender cannot add it to a mesh Object",
+                json!({"modifier_id":modifier.id,"object_type":"mesh"}),
+            ));
+        }
+        if modifier.modifier_type == "volume_displace" {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidOperation,
+                "volume_displace requires a volume Object; Blender cannot add it to a mesh Object",
+                json!({"modifier_id":modifier.id,"object_type":"mesh"}),
+            ));
         }
         adaptive_normals = None;
         if modifier.modifier_type == "mesh_deform" && modifier.binding_data.is_none() {
