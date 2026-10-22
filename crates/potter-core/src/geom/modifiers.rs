@@ -2402,7 +2402,7 @@ fn array_empty_source_transform(step: Mat4, count: usize) -> Mat4 {
     result
 }
 
-/// A DIRECTIONAL normal edit with no target (MOD_normal_edit.cc `is_valid_target`).
+/// A DIRECTIONAL normal edit with no target (`MOD_normal_edit.cc`, `is_valid_target`).
 fn normal_edit_target_disabled(modifier: &Modifier) -> bool {
     modifier.params.get("mode").and_then(Value::as_str) == Some("DIRECTIONAL")
         && modifier
