@@ -726,7 +726,15 @@ impl Front {
             self.geo.edge_order[edge_id].1,
         );
         let mut successors = Vec::new();
-        for &face in self.edge_faces(edge_id) {
+        // `BM_LOOPS_OF_EDGE` visits the newest radial loop first, then the older loops in creation order
+        // (`bmesh_radial_loop_append`, bmesh_structure.cc:377-391): [last, first, ..., penultimate].
+        let edge_faces = self.edge_faces(edge_id);
+        for radial_index in 0..edge_faces.len() {
+            let face = edge_faces[if radial_index == 0 {
+                edge_faces.len() - 1
+            } else {
+                radial_index - 1
+            }];
             let vertices = &self.geo.polygons[face].0;
             let count = vertices.len();
             for index in 0..count {
@@ -808,9 +816,11 @@ impl Front {
 
     /// Blender's `fast_bevel_edge_order` followed by `find_bevel_edge_order`.
     fn bevel_edge_order(&self, vertex: usize, incident: &[usize]) -> Result<Vec<usize>> {
+        // Blender tags selected edges only for EDGES affect (`bmesh_bevel.cc` vert construct, the `nsel` and
+        // first-edge test), so a VERTICES bevel starts from a face-count-one edge or the vertex's first edge.
         let mut first = None;
         for &edge_id in incident {
-            if first.is_none() && {
+            if first.is_none() && !self.p.affect_vertices && {
                 let (a, b) = self.geo.edge_order[edge_id];
                 self.is_selected(a, b)
             } {
