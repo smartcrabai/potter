@@ -1550,6 +1550,7 @@ pub(super) struct RealtimeVolumePass<'pass, 'scene> {
     seed: u32,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct RealtimeVolumeSampleInfo<'a> {
     pub(super) camera: &'a Camera,
     pub(super) frame: &'a CameraFrame,
@@ -1816,7 +1817,7 @@ fn prepare_realtime_mesh_sample(
                     failure = Some(error);
                     return false;
                 }
-            };
+            }
             if !hit_media.is_empty() {
                 boundaries.extend(hit_media.iter().copied().map(|medium| (distance, medium)));
             }
@@ -1869,7 +1870,9 @@ fn realtime_mesh_volume_integral(
     while event_index < boundaries.len() && boundaries[event_index].0 <= max_distance {
         let distance = boundaries[event_index].0;
         let was_inside = !media.is_empty();
-        while event_index < boundaries.len() && boundaries[event_index].0 == distance {
+        while event_index < boundaries.len()
+            && boundaries[event_index].0.total_cmp(&distance).is_eq()
+        {
             toggle_mesh_medium(media, &boundaries[event_index].1);
             event_index += 1;
         }
@@ -1948,7 +1951,9 @@ fn realtime_mesh_volume_integral(
     event_index = 0;
     while event_index < boundaries.len() && boundaries[event_index].0 <= entry {
         let distance = boundaries[event_index].0;
-        while event_index < boundaries.len() && boundaries[event_index].0 == distance {
+        while event_index < boundaries.len()
+            && boundaries[event_index].0.total_cmp(&distance).is_eq()
+        {
             toggle_mesh_medium(media, &boundaries[event_index].1);
             event_index += 1;
         }
@@ -1968,7 +1973,7 @@ fn realtime_mesh_volume_integral(
         };
         let next = next_mesh_boundary.min(next_voxel_boundary);
         integrator.integrate_interval(media.as_slice(), position, next)?;
-        while event_index < boundaries.len() && boundaries[event_index].0 == next {
+        while event_index < boundaries.len() && boundaries[event_index].0.total_cmp(&next).is_eq() {
             toggle_mesh_medium(media, &boundaries[event_index].1);
             event_index += 1;
         }
@@ -4359,10 +4364,8 @@ fn shadow_transmittance_with_volumetric_shadows(
                     return false;
                 }
             };
-            if volumetric_shadows {
-                if let Some(stack) = stack_medium(&shadow_media) {
-                    transmittance *= medium_transmittance(&stack, hit.distance);
-                }
+            if volumetric_shadows && let Some(stack) = stack_medium(&shadow_media) {
+                transmittance *= medium_transmittance(&stack, hit.distance);
             }
             if volumetric_shadows {
                 for medium in &media {
@@ -5770,7 +5773,7 @@ fn camera_media(
                     failure = Some(error);
                     return false;
                 }
-            };
+            }
             for medium in hit_media.iter() {
                 toggle_mesh_medium(inside, medium);
             }

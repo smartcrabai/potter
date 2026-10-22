@@ -1940,7 +1940,7 @@ impl SurfaceShader for SceneShader<'_> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
         if matches!(self.mode, Mode::Beauty)
-            && prepared.is_some_and(|prepared| prepared.is_volume_only())
+            && prepared.is_some_and(PreparedMaterial::is_volume_only)
         {
             return Ok(SurfaceSample {
                 color: [0.0; 4],

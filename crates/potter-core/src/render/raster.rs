@@ -987,7 +987,6 @@ pub(super) fn rasterize_with_lines(
     prepared_materials: &[crate::shader::PreparedMaterial],
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
-    let mut volume_pass = volume_pass;
     let mut output = rasterize_with_samples(
         triangles,
         camera,
@@ -1001,7 +1000,7 @@ pub(super) fn rasterize_with_lines(
         filter_size,
         shader,
         prepared_materials,
-        volume_pass.as_deref_mut(),
+        volume_pass,
     )?;
     if lines.is_empty() {
         return Ok(output);
@@ -2269,7 +2268,7 @@ fn composite_sample(
     world: Option<WorldRadiance<'_>>,
     shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
-    mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
+    volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
 ) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
@@ -2324,7 +2323,7 @@ fn composite_sample(
         hits[insert_at] = Some(visible_hit);
         hit_count = next_count;
     }
-    if let Some(volume_sample) = volume_sample.as_deref_mut() {
+    if let Some(volume_sample) = volume_sample {
         let mut transmittance = DVec3::ONE;
         let mut alpha_transmittance = 1.0;
         let mut premultiplied = DVec3::ZERO;
@@ -3933,6 +3932,10 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod composite_layer_tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "the test background closure is constant"
+    )]
     use super::{Layer, composite_layers_with_background};
 
     fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
