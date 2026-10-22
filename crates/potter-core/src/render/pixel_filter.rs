@@ -144,11 +144,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn box_filter_samples_are_uniform_over_the_pixel() {
-        let filter = PixelFilter::new(PixelFilterType::Box, 1.5);
+    fn box_filter_samples_are_uniform_over_one_pixel() {
+        let filter = PixelFilter::new(PixelFilterType::Box, 1.0);
         for step in 0..100 {
+            // Avoid the final table entry, which is zero in Cycles.
             let u = f64::from(step) / 100.0;
-            assert!((filter.lookup(u) - u).abs() < 2.0e-3, "u = {u}");
+            let (x, y) = filter.sample(1, u, u);
+            assert!((x - 0.5 - (u - 0.5)).abs() < 2.0e-3, "x offset at u = {u}");
+            assert!(
+                (-0.5..=0.5).contains(&(x - 0.5)),
+                "x offset out of box at u = {u}"
+            );
+            assert!(
+                (-0.5..=0.5).contains(&(y - 0.5)),
+                "y offset out of box at v = {u}"
+            );
+            assert!((y - 0.5 - (0.5 - u)).abs() < 2.0e-3, "y offset at v = {u}");
         }
     }
 
