@@ -1912,7 +1912,7 @@ fn attach_native_packed_bake_states(
             .bake_ids
             .iter()
             .filter(|(object, blender_modifier, _)| {
-                object == owner_name && blender_modifier == modifier_name
+                object == owner_name && blender_modifier == &modifier_name
             })
             .map(|(_, _, bake_id)| *bake_id)
             .collect::<BTreeSet<_>>();
