@@ -13,12 +13,12 @@
 //! macOS; see its `MANIFEST.json`), not a live render, so the test has no platform term. Every pixel whose centre lies
 //! within 0.75 of a sphere's radius is compared with the committed pixel at the same UV.
 //!
-//! The tolerance per sphere is the model bound alone: the largest deviation of the Python mirror of the transmission model
-//! over the world (`fixtures/native_oracle/eevee_glass_world_mirror.py`) from the committed render, rounded up. Those are
-//! clear 0.01049 (bound 1.1e-2), tinted 0.00233 (2.4e-3) and rough 0.00990 (1.0e-2). The worst pixels of the clear and
-//! rough spheres sit on a 5-bit truncation step of the probe's blue channel, where EEVEE and the model both truncate.
-//! The same mirror with the probe straight through gives a worst deviation of 0.050, and with the single-event (thin)
-//! probe 0.035, so the bounds separate a wrong probe direction from the truncation noise.
+//! The tolerance per sphere is the model bound alone: the largest deviation of the Python mirror over the world
+//! (`fixtures/native_oracle/eevee_glass_world_mirror.py`, which reads the world through the render's 64-texel cube-map
+//! probe, as Potter does) from the committed render, rounded up. Those are clear 0.01049 (bound 1.1e-2), tinted 0.00341
+//! (3.5e-3) and rough 0.01038 (1.1e-2). The worst clear and rough pixels sit on the probe's 5-bit blue truncation and its
+//! texel edges, where EEVEE and the model both sample a texel. The same mirror with a single refraction event (a thin
+//! object) gives 0.062 (clear), 0.187 (tinted) and 0.059 (rough), far outside the bounds.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -55,8 +55,8 @@ const EEVEE_WORLD: &[u8] = include_bytes!("fixtures/native_oracle/eevee_macos/gl
 /// pixel (see the module docs: the model bound, rounded up).
 const SPHERES: [(&str, f64, f64); 3] = [
     ("clear", -2.4, 1.1e-2),
-    ("tinted", 0.0, 2.4e-3),
-    ("rough", 2.4, 1.0e-2),
+    ("tinted", 0.0, 3.5e-3),
+    ("rough", 2.4, 1.1e-2),
 ];
 
 /// The render size and orthographic scale the oracle uses, so Potter's pixel grid is EEVEE's.

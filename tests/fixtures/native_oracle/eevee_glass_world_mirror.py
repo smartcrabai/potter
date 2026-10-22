@@ -8,7 +8,10 @@ so two refraction events), and `glass_closures`' weights (the reflectance, and t
 `glass_split` is `eevee_glass_direct_mirror.py`'s port of `bsdf_lut`, called once per channel with the tint
 `sqrt(Base Color)`, since its normalisation depends on the tint.
 
-The world is `t = (z + 1) / 2`, colour `(0.25 + 0.5 t, 0.5, 0.75 - 0.5 t)` by the direction's elevation `z`.
+The world is `t = (z + 1) / 2`, colour `(0.25 + 0.5 t, 0.5, 0.75 - 0.5 t)` by the direction's elevation `z`. Potter
+reads the world through its render's world probe (`render/world_probe.rs`): a cube map of 64 texels per face, each holding
+the world at its centre, and a lookup returns the texel the direction pierces (nearest, no filtering). The mirror builds
+the same table and looks up the same texels.
 
 The test's tolerance is the largest deviation printed here, rounded up. Run it with no arguments:
 
@@ -68,9 +71,75 @@ def lerp(a, b, t):
     return add(a, mul(sub(b, a), t))
 
 
+FACE_TEXELS = 64
+_PROBE = None
+
+
 def world(direction):
-    t = (direction[2] + 1.0) / 2.0
+    """The world's colour at a direction (`evaluate_world` normalises its direction first)."""
+    d = normalize_or(direction, (0.0, 0.0, 1.0))
+    t = (d[2] + 1.0) / 2.0
     return (0.25 + 0.5 * t, 0.5, 0.75 - 0.5 * t)
+
+
+def texel_centre(index):
+    return 2.0 * (index + 0.5) / FACE_TEXELS - 1.0
+
+
+def face_direction(face, s, t):
+    """`face_direction` in `world_probe.rs`: +X, -X, +Y, -Y, +Z, -Z."""
+    if face == 0:
+        return (1.0, -t, -s)
+    if face == 1:
+        return (-1.0, -t, s)
+    if face == 2:
+        return (s, 1.0, t)
+    if face == 3:
+        return (s, -1.0, -t)
+    if face == 4:
+        return (s, -t, 1.0)
+    return (-s, -t, -1.0)
+
+
+def cube_coordinates(d):
+    """`cube_coordinates` in `world_probe.rs`: the face and the (s, t) the direction pierces."""
+    mx, my, mz = abs(d[0]), abs(d[1]), abs(d[2])
+    if mx >= my and mx >= mz:
+        if d[0] > 0.0:
+            return 0, -d[2] / mx, -d[1] / mx
+        return 1, d[2] / mx, -d[1] / mx
+    if my >= mz:
+        if d[1] > 0.0:
+            return 2, d[0] / my, d[2] / my
+        return 3, d[0] / my, -d[2] / my
+    if d[2] > 0.0:
+        return 4, d[0] / mz, -d[1] / mz
+    return 5, -d[0] / mz, -d[1] / mz
+
+
+def texel_index(coordinate):
+    index = math.floor((coordinate + 1.0) / 2.0 * FACE_TEXELS)
+    return min(max(index, 0), FACE_TEXELS - 1)
+
+
+def probe_table():
+    """The world at every texel centre, `WorldProbe::build`: face by face, row by row. Built once."""
+    global _PROBE
+    if _PROBE is None:
+        _PROBE = [
+            world(face_direction(face, texel_centre(column), texel_centre(row)))
+            for face in range(6)
+            for row in range(FACE_TEXELS)
+            for column in range(FACE_TEXELS)
+        ]
+    return _PROBE
+
+
+def probe_texel(direction):
+    """`WorldProbe::radiance`: the texel the direction falls in, as built."""
+    face, s, t = cube_coordinates(direction)
+    index = (face * FACE_TEXELS + texel_index(t)) * FACE_TEXELS + texel_index(s)
+    return probe_table()[index]
 
 
 def truncate_ufloat(value, mantissa_bits):
@@ -93,7 +162,7 @@ def probe_radiance(radiance):
 
 
 def prefiltered(axis, roughness):
-    """`prefiltered_with`: five taps over the roughness's spread, each captured, averaged."""
+    """`prefiltered_world` with `probe_radiance`: five taps over the roughness's spread, each texel captured, averaged."""
     axis = normalize_or(axis, (0.0, 0.0, 0.0))
     if axis == (0.0, 0.0, 0.0):
         return (0.0, 0.0, 0.0)
@@ -109,7 +178,7 @@ def prefiltered(axis, roughness):
             add(axis, add(mul(tangent, spread * offset_x), mul(bitangent, spread * offset_y))),
             (0.0, 0.0, 0.0),
         )
-        total = add(total, probe_radiance(world(direction)))
+        total = add(total, probe_radiance(probe_texel(direction)))
     return mul(total, 1.0 / 5.0)
 
 

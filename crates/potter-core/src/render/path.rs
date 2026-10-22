@@ -1472,6 +1472,12 @@ pub(super) fn composite_realtime_volumes(
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
     let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images, warnings)?;
+    // TEMPORARY DIAGNOSTIC (remove with the volume_factor investigation): whether the composite has any volume to march.
+    eprintln!(
+        "VOLUME_DIAG composite volumes={} lights={}",
+        volumes.len(),
+        collect_lights(doc, snapshot).len()
+    );
     if volumes.is_empty() {
         return Ok(());
     }
