@@ -1490,7 +1490,17 @@ fn abort_node_bake_transaction<T>(
     transaction: NodeBakePayloadTransaction,
     error: PotError,
 ) -> Result<T> {
-    transaction.rollback()?;
+    let Err(rollback_error) = transaction.rollback() else {
+        return Err(error);
+    };
+    // The bake's own error is what the user needs; the failed rollback is recorded alongside it.
+    let mut error = error;
+    let mut details = match std::mem::take(&mut error.details) {
+        Value::Object(details) => details,
+        _ => serde_json::Map::new(),
+    };
+    details.insert("rollback".to_owned(), json!(rollback_error.message));
+    error.details = Value::Object(details);
     Err(error)
 }
 fn account_node_bake_payload_bytes(retained: &mut usize, bytes: &[u8]) -> Result<()> {

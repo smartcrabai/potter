@@ -223,11 +223,8 @@ pub(crate) fn validate_node_bake_frame(frame: &NodeBakeFrame) -> Result<()> {
                     return Err(invalid());
                 }
             }
-            NodeBakeValue::Scalar { value } => {
-                if !valid_value(value) {
-                    return Err(invalid());
-                }
-            }
+            // A JSON scalar is always representable: serde_json cannot hold a non-finite number.
+            NodeBakeValue::Scalar { .. } => {}
             NodeBakeValue::Field { attribute_name } => {
                 let has_attribute = !attribute_name.is_empty()
                     && frame.values.values().any(|value| {
@@ -247,9 +244,7 @@ pub(crate) fn validate_node_bake_frame(frame: &NodeBakeFrame) -> Result<()> {
                         attribute
                             .get("data")
                             .and_then(Value::as_array)
-                            .is_some_and(|values| {
-                                values.len() == expected_count && values.iter().all(valid_value)
-                            })
+                            .is_some_and(|values| values.len() == expected_count)
                     });
                 if !has_attribute {
                     return Err(invalid());
@@ -413,14 +408,6 @@ fn valid_sha256_digest(digest: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     })
-}
-
-fn valid_value(value: &Value) -> bool {
-    match value {
-        Value::Null | Value::Bool(_) | Value::String(_) | Value::Number(_) => true,
-        Value::Array(values) => values.iter().all(valid_value),
-        Value::Object(values) => values.values().all(valid_value),
-    }
 }
 
 fn estimate_json_value_heap(value: &Value) -> usize {

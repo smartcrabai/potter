@@ -1715,3 +1715,92 @@ fn modifier_documents_without_bake_settings_have_no_bakes_key_and_load_unchanged
     assert_dimensions(&unbaked, [2.0, 2.0, 2.0])?;
     Ok(())
 }
+
+/// The Geometry Nodes Bake node of a scene: its node group ID and node ID.
+fn find_bake_node(scene: &Value) -> Result<(String, String), Box<dyn Error>> {
+    for (group_id, group) in scene["node_groups"].as_object().into_iter().flatten() {
+        for (node_id, node) in group["nodes"].as_object().into_iter().flatten() {
+            if node["type"] == "GeometryNodeBake" {
+                return Ok((group_id.clone(), node_id.clone()));
+            }
+        }
+    }
+    Err(std::io::Error::other("scene has no Bake node").into())
+}
+
+/// Number of links that touch the given node of a node group.
+fn links_touching(scene: &Value, group_id: &str, node_id: &str) -> usize {
+    scene["node_groups"][group_id]["links"]
+        .as_array()
+        .map_or(0, |links| {
+            links
+                .iter()
+                .filter(|link| link["from_node"] == node_id || link["to_node"] == node_id)
+                .count()
+        })
+}
+
+#[test]
+fn bake_node_survives_blend_export_and_import() -> Result<(), Box<dyn Error>> {
+    // Needs Blender for the .blend export and import; skip like the other Blender tests when absent.
+    if std::env::var_os("POTTER_BLENDER").is_none() {
+        assert!(
+            std::env::var_os("POTTER_REQUIRE_BLENDER").is_none(),
+            "POTTER_REQUIRE_BLENDER is set but POTTER_BLENDER is not"
+        );
+        eprintln!("skipping Bake node .blend round trip: POTTER_BLENDER is unset");
+        return Ok(());
+    }
+    let directory = tempdir()?;
+    let project = directory.path().join("bake-node-project");
+    let batch_file = directory.path().join("operations.json");
+    create_project(&project, &batch_file, "PACKED", "", false)?;
+    let before = document(&project)?;
+    let (group_id, node_id) = find_bake_node(&before)?;
+    let links_before = links_touching(&before, &group_id, &node_id);
+    assert!(links_before > 0, "the Bake node has no links to round-trip");
+    let items_before =
+        &before["node_groups"][&group_id]["nodes"][&node_id]["properties"]["bake_items"];
+    assert_eq!(items_before[0]["name"], "Geometry");
+
+    let blend = directory.path().join("bake-node.blend");
+    run_json(
+        pot()
+            .arg("export")
+            .arg(&project)
+            .args(["--format", "blend", "--out"])
+            .arg(&blend),
+        "exporting the Bake node to .blend",
+    )?;
+    let imported = directory.path().join("imported-bake-node");
+    run_json(
+        pot().arg("init").arg(&imported),
+        "initializing the import project",
+    )?;
+    let revision = document(&imported)?["revision"]
+        .as_u64()
+        .ok_or_else(|| std::io::Error::other("initialized project revision is missing"))?;
+    run_json(
+        pot()
+            .arg("import")
+            .arg(&imported)
+            .arg("--file")
+            .arg(&blend)
+            .args(["--format", "blend", "--base-revision"])
+            .arg(revision.to_string()),
+        "importing the Bake node .blend",
+    )?;
+
+    let after = document(&imported)?;
+    let (imported_group, imported_node) = find_bake_node(&after)?;
+    let items =
+        &after["node_groups"][&imported_group]["nodes"][&imported_node]["properties"]["bake_items"];
+    assert_eq!(items.as_array().map(Vec::len), Some(1), "{items}");
+    assert_eq!(items[0]["name"], "Geometry", "{items}");
+    assert_eq!(
+        links_touching(&after, &imported_group, &imported_node),
+        links_before,
+        "the Bake node's links changed across the .blend round trip"
+    );
+    Ok(())
+}
