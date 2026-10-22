@@ -1,6 +1,6 @@
 //! Blender attribute-domain, normal, UV, transfer, and point-cache modifiers.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use glam::{DMat4, DVec2, DVec3};
 use serde_json::{Map, Value, json};

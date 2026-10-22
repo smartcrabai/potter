@@ -413,7 +413,7 @@ fn material_volume_output_transmits_according_to_beer_lambert() -> Result<(), Bo
 #[test]
 fn true_displacement_subdivides_and_moves_the_rendered_silhouette() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    let mut foreground_counts = Vec::new();
+    let mut heights = Vec::new();
     for method in ["bump", "displacement"] {
         let scene = directory.path().join(method);
         let operations = vec![
@@ -425,7 +425,7 @@ fn true_displacement_subdivides_and_moves_the_rendered_silhouette() -> Result<()
             json!({"op":"node.create","id":"body","kind":"box","params":{"size":1.0},"material":"clay"}),
             json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,-4.0,4.0],"rotation":[std::f64::consts::FRAC_PI_8.sin(),0.0,0.0,std::f64::consts::FRAC_PI_8.cos()]},"projection":"orthographic","ortho_scale":4.0}),
             json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}}),
-            json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":64,"resolution_y":64,"samples":1,"seed":0,"max_bounces":0}}),
+            json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":64,"resolution_y":64,"samples":64,"seed":0,"max_bounces":0}}),
         ];
         make_scene(&scene, &operations)?;
         let (_, _, pixels) = render_png(
@@ -433,22 +433,23 @@ fn true_displacement_subdivides_and_moves_the_rendered_silhouette() -> Result<()
             &directory.path().join(format!("{method}_render")),
             Some("path"),
         )?;
-        foreground_counts.push(
-            pixels
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .filter(|pixel| pixel[0] > 150)
-                .count(),
-        );
+        // Rows that hold a foreground pixel, read at 64 samples. A single sample per pixel gives a
+        // hard on/off edge at each pixel's sample point, and the 0.5 displacement moves the edge only
+        // a few rows at this scale, so the one-sample silhouette can match. At 64 samples the edge is
+        // antialiased and its extent changes with the displacement (24 rows bump, 35 displaced).
+        let rows: Vec<usize> = (0..64)
+            .filter(|&y| (0..64).any(|x| pixels[(y * 64 + x) * 4] > 150))
+            .collect();
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            return Err("render has no foreground".into());
+        };
+        heights.push(last - first);
     }
-    let bump = *foreground_counts.first().ok_or("bump render is missing")?;
-    let displaced = *foreground_counts
-        .get(1)
-        .ok_or("displacement render is missing")?;
-    assert_ne!(
-        displaced, bump,
-        "true displacement should alter the subdivided render silhouette"
+    let bump = *heights.first().ok_or("bump render is missing")?;
+    let displaced = *heights.get(1).ok_or("displacement render is missing")?;
+    assert!(
+        displaced > bump,
+        "true displacement should grow the subdivided render silhouette: displaced {displaced} rows, bump {bump} rows"
     );
     Ok(())
 }

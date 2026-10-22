@@ -15,8 +15,6 @@ use tempfile::tempdir;
 const SCENE_BUILDER: &str = include_str!("fixtures/blend_realistic_scene.py");
 const SCENE_DUMPER: &str = include_str!("fixtures/blend_realistic_scene_dump.py");
 const FRAME_TOLERANCE: f64 = 1.0e-5;
-const GATED_OBJECTS: [&str; 1] = ["Gear_Array_Bevel_Subdivision_Normal"];
-
 fn checked_output(mut command: Command, label: &str) -> Result<Output, Box<dyn Error>> {
     let output = command.output()?;
     if !output.status.success() {
@@ -385,9 +383,6 @@ fn assert_import_inspection(
             .as_array()
             .ok_or_else(|| io::Error::other(format!("frame {frame}: inspect items missing")))?;
         for (name, id) in &ids {
-            if GATED_OBJECTS.contains(&name.as_str()) {
-                continue;
-            }
             let item = items
                 .iter()
                 .find(|candidate| candidate["id"].as_str() == Some(id.as_str()))
@@ -440,33 +435,6 @@ fn assert_import_inspection(
             }
         }
     }
-    Ok(())
-}
-
-fn assert_gated_feature_error(
-    project: &Path,
-    document: &Value,
-    object: &str,
-    feature: &str,
-) -> Result<(), Box<dyn Error>> {
-    let (_, id) = object_ids_by_name(document)?
-        .into_iter()
-        .find(|(name, _)| name == object)
-        .ok_or_else(|| io::Error::other(format!("gated object `{object}` missing")))?;
-    let output = Command::new(env!("CARGO_BIN_EXE_pot"))
-        .arg("inspect")
-        .arg(project)
-        .args(["--id"])
-        .arg(&id)
-        .args(["--frame", "1", "--json"])
-        .output()?;
-    assert!(!output.status.success(), "{object} unexpectedly evaluated");
-    let envelope: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(envelope["error"]["code"], "UNSUPPORTED_FEATURE", "{object}");
-    assert_eq!(
-        envelope["error"]["details"]["feature_id"], feature,
-        "{object}"
-    );
     Ok(())
 }
 
@@ -595,27 +563,14 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
         .arg("render")
         .arg(&project)
         .args(["--format", "png", "--out"])
-        .arg(root.join("unsupported-render"))
+        .arg(root.join("realistic-render"))
         .arg("--json")
         .output()?;
     assert!(
-        !render.status.success(),
-        "render unexpectedly evaluated unsupported stack"
+        render.status.success(),
+        "render refused the realistic stack: {}",
+        String::from_utf8_lossy(&render.stdout)
     );
-    let render_error: Value = serde_json::from_slice(&render.stdout)?;
-    assert_eq!(render_error["error"]["code"], "UNSUPPORTED_FEATURE");
-    let details = &render_error["error"]["details"];
-    let feature = details["feature_id"]
-        .as_str()
-        .ok_or("render error lacks feature_id")?;
-    let expected_object = match feature {
-        "modifier.bevel.high_valence_vertex_mesh" => GATED_OBJECTS[0],
-        _ => return Err(format!("unexpected render feature {feature}").into()),
-    };
-    let node_id = details["node_id"]
-        .as_str()
-        .ok_or("render error lacks node_id")?;
-    assert_eq!(document["nodes"][node_id]["name"], expected_object);
     assert_modifier_reference(
         &document,
         "Rigged_Cylinder_Skin",
@@ -625,7 +580,7 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     )?;
     assert_modifier_reference(
         &document,
-        GATED_OBJECTS[0],
+        "Gear_Array_Bevel_Subdivision_Normal",
         "02 | three-stage train with end cap",
         "end_cap",
         "Gear_Array_EndCap_Source",
@@ -647,12 +602,6 @@ fn realistic_blender_scene_import_export_reopen_preserves_settings_and_evaluatio
     assert_surface_binding_data(&document)?;
     assert_shape_key_action_slot(&document)?;
     assert_import_inspection(&project, &source, &document)?;
-    assert_gated_feature_error(
-        &project,
-        &document,
-        GATED_OBJECTS[0],
-        "modifier.bevel.high_valence_vertex_mesh",
-    )?;
 
     let lossy_project = root.join("allow-lossy-project");
     run_pot(

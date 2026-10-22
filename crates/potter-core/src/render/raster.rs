@@ -1727,16 +1727,13 @@ fn ray_for_subpixel_in_frame(
     sample_x: f64,
     sample_y: f64,
 ) -> Result<Option<Ray>> {
-    if !pixel_in_bounds(width, height, x, y)
-        || !sample_x.is_finite()
-        || !sample_y.is_finite()
-        || !(0.0..1.0).contains(&sample_x)
-        || !(0.0..1.0).contains(&sample_y)
-    {
+    if !pixel_in_bounds(width, height, x, y) || !sample_x.is_finite() || !sample_y.is_finite() {
         return Err(PotError::invalid_argument(
-            "pixel sample coordinates must lie inside a non-empty image",
+            "pixel sample offsets must be finite inside a non-empty image",
         ));
     }
+    // Offsets are from the pixel's corner and may leave the pixel: a Cycles pixel filter with
+    // support wider than one pixel places samples in the neighbours' area (`pixel_filter.rs`).
 
     let (view_x, view_width, eye) = if frame.stereo_mode == StereoMode::SideBySide {
         let split = width / 2;

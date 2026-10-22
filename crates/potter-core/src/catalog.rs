@@ -496,34 +496,19 @@ pub fn feature_catalog() -> Value {
             &["modifier.create"],
             [true, true, true, true, true, false, false],
         ),
-        supported(
-            "modifier.bevel",
-            "Bevel modifier",
-            "BEVEL",
-            &["modifier.create"],
-            [true, true, true, true, true, false, false],
-        ),
-        unsupported(
-            "modifier.bevel.high_valence_vertex_mesh",
-            "Bevel high-valence vertex meshes",
-            "BEVEL",
-            &["modifier.create"],
-            "Blender 5.2.2 bevels four-or-more-edge vertices with multiple selected edges using a BMesh ADJ vertex mesh that Potter does not reproduce; the stacked gear probe diverged by 2.760223e-2 in vertex position.",
-        ),
-        unsupported(
-            "modifier.bevel.mark_seam",
-            "Bevel mark seam on seamed edges",
-            "BEVEL",
-            &["modifier.create"],
-            "Blender copies the input's seam edges onto the new rung edges (check_edge_data_seam_sharp_edges); Potter does not, so a bevel with mark_seam on a mesh that has seam edges is refused. Without seam edges Blender changes nothing and Potter evaluates it.",
-        ),
-        unsupported(
-            "modifier.bevel.shading_segments",
-            "Bevel harden normals and sharp-edge marks outside single-segment edge bevels",
-            "BEVEL",
-            &["modifier.create"],
-            "harden_normals (any input) and mark_sharp on an input with sharp edges are evaluated only for one-segment EDGES bevels; other segment counts or VERTICES bevels with those settings are refused.",
-        ),
+        {
+            let mut row = supported(
+                "modifier.bevel",
+                "Bevel modifier",
+                "BEVEL",
+                &["modifier.create"],
+                [true, true, true, true, true, false, false],
+            );
+            row["reason"] = json!(
+                "Ports Blender 5.2.2's BMesh bevel (boundary, profile, rings, vmesh, shading) and evaluates every affect mode, segment count, and option. Parity is gated by the Blender 5.2.2 corpus in `tests/modifier_bevel_uv.rs`: every case matches Blender except those in its `KNOWN_GAPS` table, which records the differing columns and cause (clamped and non-planar corner normals, vertex-mode odd-segment corner snaps, clamped vertex weights). `mesh.bevel` still uses the older edit path."
+            );
+            row
+        },
         supported(
             "modifier.decimate",
             "Decimate modifier",

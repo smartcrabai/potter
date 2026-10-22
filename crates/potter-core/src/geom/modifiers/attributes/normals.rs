@@ -1,8 +1,8 @@
 //! Weighted-normal and normal-edit modifiers.
 
 use super::{
-    BTreeMap, DVec3, ErrorCode, HashMap, Mesh, Modifier, PotError, Result, SceneOperand, Value,
-    boolean, face_normal, face_points, get_group_weights, invalid, number, optional_string, string,
+    BTreeMap, DVec3, ErrorCode, HashMap, HashSet, Mesh, Modifier, PotError, Result, SceneOperand,
+    Value, boolean, face_normal, get_group_weights, invalid, number, optional_string, string,
     vector3,
 };
 use std::{ffi::c_void, mem::size_of, os::raw::c_int};
@@ -61,17 +61,37 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
         }
     }
     let sharp_edges = crate::geom::normals::sharp_edge_flags(mesh)?;
-    let face_strengths = mesh
-        .attributes
-        .get("__mod_weightednormals_faceweight")
-        .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object);
-    let face_influence = use_face_influence && face_strengths.is_some();
+    let strengths = if use_face_influence {
+        mesh.attributes
+            .get("__mod_weightednormals_faceweight")
+            .and_then(|attribute| attribute.get("values"))
+            .and_then(Value::as_object)
+            .map(|values| {
+                mesh.faces
+                    .iter()
+                    .map(|face| {
+                        values
+                            .get(&format!("f{}", face.id))
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0)
+                    })
+                    .collect::<Vec<_>>()
+            })
+    } else {
+        None
+    };
+    let face_influence = strengths.is_some();
     let positions = mesh
         .vertices
         .iter()
         .map(|vertex| vertex.co)
         .collect::<Vec<_>>();
+    let vertex_index_by_id: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
     let total_corners = mesh
         .faces
         .iter()
@@ -88,10 +108,20 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
     };
     for face in &mesh.faces {
         face_corner_starts.push(corner_offset);
-        let points = face_points(mesh, &face.vertices)?
-            .into_iter()
-            .map(|point| Vec3::new(point.x as f32, point.y as f32, point.z as f32))
-            .collect::<Vec<_>>();
+        let points = face
+            .vertices
+            .iter()
+            .map(|id| {
+                let point = vertex_index_by_id
+                    .get(id)
+                    .and_then(|&index| positions.get(index))
+                    .copied()
+                    .ok_or_else(|| {
+                        PotError::invalid_argument("mesh face references a missing vertex")
+                    })?;
+                Ok(Vec3::new(point.x as f32, point.y as f32, point.z as f32))
+            })
+            .collect::<Result<Vec<_>>>()?;
         face_normals.push(blender_face_normal(&points));
         face_areas.push(blender_face_area(&points));
         if mode != "FACE_AREA" {
@@ -136,7 +166,7 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
                 (edge.vertices[1], edge.vertices[0])
             }
         })
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<HashSet<_>>();
     let mut fan_by_corner = vec![0; total_corners];
     if keep_sharp {
         let mut next_fan = 0;
@@ -237,14 +267,9 @@ pub(super) fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> 
         } else {
             WeightedItemKey::Vertex(event.vertex)
         };
-        let strength = if face_influence {
-            face_strengths
-                .and_then(|values| values.get(&format!("f{}", mesh.faces[event.face].id)))
-                .and_then(Value::as_i64)
-                .unwrap_or(0) as i32
-        } else {
-            0
-        };
+        let strength = strengths
+            .as_ref()
+            .map_or(0, |values| values[event.face] as i32);
         let item = items.entry(key).or_insert_with(|| WeightedItem {
             normal: Vec3::ZERO,
             current_value: 0.0,
@@ -553,7 +578,7 @@ fn faces_share_smooth_edge_at_vertex(
     second_index: usize,
     vertex_id: u32,
     edge_uses: &HashMap<(u32, u32), Vec<(usize, bool)>>,
-    sharp_edge_keys: &std::collections::BTreeSet<(u32, u32)>,
+    sharp_edge_keys: &HashSet<(u32, u32)>,
     smooth_faces: &[bool],
 ) -> bool {
     if !smooth_faces.get(first_index).copied().unwrap_or(false)
@@ -598,7 +623,7 @@ fn smooth_fan_faces(
     start: usize,
     incident: &[usize],
     edge_uses: &HashMap<(u32, u32), Vec<(usize, bool)>>,
-    sharp_edge_keys: &std::collections::BTreeSet<(u32, u32)>,
+    sharp_edge_keys: &HashSet<(u32, u32)>,
     smooth_faces: &[bool],
 ) -> Vec<usize> {
     let mut fan = vec![start];
