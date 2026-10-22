@@ -1610,11 +1610,9 @@ fn image_pixel(
         .get(index)
         .copied()
         .ok_or_else(|| invalid_image_sample("image texture texel index is invalid"))?;
+    // A buffer without RGB copies its single value into all four components (`ibuf_get_color`,
+    // texture_image.cc), so no colour is filled in here; `use_alpha` only selects the alpha (`talpha`).
     let mut texel = pixel.map(|value| value as f32);
-    if !matches!(settings.source_channels, 3 | 4) && settings.use_alpha && !settings.calculate_alpha
-    {
-        texel[..3].fill(1.0);
-    }
     if settings.source_srgb_encoded {
         texel[0] = srgb_encoded_channel(texel[0]);
         texel[1] = srgb_encoded_channel(texel[1]);
