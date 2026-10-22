@@ -15,7 +15,7 @@ use crate::{
 use super::{SimulationResult, cache};
 
 /// Bump whenever solver behavior or its deterministic output contract changes.
-pub const SOLVER_VERSION: &str = "potter-physics-2";
+pub const SOLVER_VERSION: &str = "potter-physics-3";
 
 const CONTACT_SLOP: f64 = 1.0e-8;
 const POSITION_CORRECTION: f64 = 0.8;
@@ -1448,6 +1448,7 @@ fn make_result(bodies: Vec<Body>, key: String) -> Result<SimulationResult> {
         linear_velocities.insert(body.id, velocity);
     }
     Ok(SimulationResult {
+        fluid_warnings: Vec::new(),
         world_matrices,
         linear_velocities,
         cache_key: key,

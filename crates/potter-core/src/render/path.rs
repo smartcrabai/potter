@@ -1377,8 +1377,7 @@ fn realtime_volume_integral(
         ) {
             entry = entry.min(volume_entry);
             exit = exit.max(volume_exit);
-            minimum_step = minimum_step
-                .min(instance.voxel_size / local_direction.length().max(f64::MIN_POSITIVE) * 0.5);
+            minimum_step = minimum_step.min(volume_sampling_step(instance, local_direction));
         }
     }
     if !entry.is_finite() || exit <= entry {
@@ -4777,8 +4776,7 @@ fn voxel_grid(
         ) {
             entry = entry.min(volume_entry);
             exit = exit.max(volume_exit);
-            let local_speed = local_direction.length().max(f64::MIN_POSITIVE);
-            minimum_step = minimum_step.min(instance.voxel_size / local_speed * 0.5);
+            minimum_step = minimum_step.min(volume_sampling_step(instance, local_direction));
             stochastic |= instance.scattering
                 && instance.albedo.max_element() > 0.0
                 && instance.extinction_scale > 0.0;
@@ -5112,6 +5110,22 @@ fn instance_density_checked(instance: &VolumeInstance<'_>, local_position: DVec3
     }
 }
 
+/// The largest step, in meters along a volume-local direction, that moves the sampled index by at most half a voxel. The
+/// index speed is the norm of the local direction in index space, so an affine grid's skew and anisotropic scale count;
+/// a decoded VDB has no index matrix and steps by its voxel size.
+fn volume_sampling_step(instance: &VolumeInstance<'_>, local_direction: DVec3) -> f64 {
+    match instance.index_from_local {
+        Some(index_from_local) => {
+            let index_speed = index_from_local
+                .transform_vector3(local_direction)
+                .length()
+                .max(f64::MIN_POSITIVE);
+            0.5 / index_speed
+        }
+        None => instance.voxel_size / local_direction.length().max(f64::MIN_POSITIVE) * 0.5,
+    }
+}
+
 fn march_volumes(
     volumes: &[VolumeInstance<'_>],
     origin: DVec3,
@@ -5204,9 +5218,8 @@ fn march_volumes_with_budget(
             }
             continue;
         }
-        let local_speed = local_direction.length().max(f64::MIN_POSITIVE);
-        let step_world =
-            (instance.voxel_size / local_speed * 0.5).max(segment_length / step_budget as f64);
+        let step_world = volume_sampling_step(instance, local_direction)
+            .max(segment_length / step_budget as f64);
         let steps = (segment_length / step_world)
             .ceil()
             .clamp(1.0, step_budget as f64) as usize;

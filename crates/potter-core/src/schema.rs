@@ -105,6 +105,7 @@ fn scene_schema() -> Value {
         "resources":{"type":"object","additionalProperties":{"type":"object","properties":{"storage":{"const":"inline"},"kind":{"type":"string"}},"allOf":[{"if":{"required":["storage"]},"then":{"required":["kind"],"allOf":[{"if":{"properties":{"kind":{"const":"legacy_texture"}},"required":["kind"]},"then":{"$ref":"#/$defs/legacy_texture_resource"}}]}}]}},
         "libraries":registry_schema("library"),
         "compatibility":{"type":"object"},
+        "accepted_losses":{"type":"array","items":{"type":"string"},"uniqueItems":true},
         "avatar":avatar_settings_schema(),
         "history":{"$ref":"#/$defs/history"}
     });
@@ -1700,6 +1701,34 @@ fn operation_contract(name: &str) -> OperationContract {
             "none",
             json!({"tags":[],"visible":true,"render_visible":true,"selectable":true,"projection":"perspective"}),
         ),
+        "volume.create" => (
+            vec![
+                "id",
+                "name",
+                "data_id",
+                "grids",
+                "source",
+                "collection",
+                "transform",
+                "parent",
+                "parent_inverse",
+                "materials",
+                "visible",
+                "render_visible",
+                "selectable",
+            ],
+            vec!["op"],
+            "volume object",
+            "none",
+            json!({}),
+        ),
+        "volume.update" => (
+            vec!["target", "set"],
+            vec!["op", "target", "set"],
+            "volume object",
+            "none",
+            json!({}),
+        ),
         "camera.update" => (
             vec!["target", "set"],
             vec!["op", "target", "set"],
@@ -2517,60 +2546,121 @@ fn physics_settings_schema(operation: &str) -> Value {
     json!({"type":"object","properties":properties,"additionalProperties":false})
 }
 
+/// Blender RNA settings that operation `system` accepts, typed from their generated defaults.
+///
+/// Every Blender name is listed, so a non-honoured value reaches ops, which refuses it with
+/// `UnsupportedFeature`. A type comes from the defaults only when every table that holds the name
+/// agrees on it. A `null` default says nothing about the type.
+fn blender_schema_properties(system: &str) -> Map<String, Value> {
+    const ROLE_TABLES: [&str; 8] = [
+        "fluid_domain",
+        "fluid_domain_liquid",
+        "fluid_flow",
+        "fluid_effector",
+        "dynamic_paint_canvas",
+        "dynamic_paint_surface",
+        "dynamic_paint_brush",
+        "point_cache",
+    ];
+    const DYNAMIC_PAINT_TABLES: [&str; 3] = [
+        "dynamic_paint_canvas",
+        "dynamic_paint_surface",
+        "dynamic_paint_brush",
+    ];
+    let tables: &[&str] = match system {
+        "cloth" => &["cloth"],
+        "soft_body" => &["soft_body"],
+        "collision" => &["collision"],
+        // Fluid takes every role's Blender names, as ops does. Dynamic paint takes only its own roles.
+        "fluid" => &ROLE_TABLES,
+        "dynamic_paint" => &DYNAMIC_PAINT_TABLES,
+        _ => &[],
+    };
+    let mut names = std::collections::BTreeSet::new();
+    let mut kinds = std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+    for table in tables {
+        for (name, default) in crate::physics_support::blender_properties(table)
+            .into_iter()
+            .flatten()
+        {
+            names.insert(name.as_str());
+            if let Some(kind) = json_type(default) {
+                kinds.entry(name.as_str()).or_default().insert(kind);
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let schema = match kinds.get(name) {
+                Some(types) if types.len() == 1 => json!({"type": types.iter().next().copied()}),
+                _ => json!({}),
+            };
+            (name.to_owned(), schema)
+        })
+        .collect()
+}
+
+fn json_type(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(_) => Some("number"),
+        Value::String(_) => Some("string"),
+        Value::Array(_) => Some("array"),
+        Value::Object(_) => Some("object"),
+        Value::Null => None,
+    }
+}
+
 fn physics_settings_properties(operation: &str) -> Value {
     let system = operation
         .strip_prefix("physics.")
         .and_then(|name| name.split_once('.'))
         .map(|(system, _)| system)
         .unwrap_or_default();
+    let mut properties = blender_schema_properties(system);
+    if let Value::Object(native) = physics_native_properties(system) {
+        properties.extend(native);
+    }
+    Value::Object(properties)
+}
+
+/// Potter-native and explicitly ranged settings of a physics system. They override the Blender names.
+fn physics_native_properties(system: &str) -> Value {
     match system {
         "cloth" => json!({
-            "stiffness":{"type":"number","minimum":0,"maximum":1},
-            "structural_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "shear_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "bend_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "air_drag":{"type":"number","minimum":0},"drag":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "substeps":{"type":"integer","minimum":1,"maximum":32},
-            "iterations":{"type":"integer","minimum":1,"maximum":64},
             "quality":{"type":"integer","minimum":1,"maximum":32},
-            "pin_group":{"type":"string","minLength":1},
-            "tension_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "compression_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "bending_stiffness":{"type":"number","minimum":0,"maximum":1},
+            "iterations":{"type":"integer","minimum":1,"maximum":64},
             "mass":{"type":"number","exclusiveMinimum":0},
             "air_damping":{"type":"number","minimum":0},
-            "vertex_group_mass":{"type":"string","minLength":1},
-            "use_collision":{"type":"boolean"},
-            "collision_distance":{"type":"number","minimum":0},
-            "use_self_collision":{"type":"boolean"},
-            "self_collision_distance":{"type":"number","minimum":0},
-            "distance_min":{"type":"number","minimum":0},
+            "tension_stiffness":{"type":"number","minimum":0},
+            "compression_stiffness":{"type":"number","minimum":0},
+            "shear_stiffness":{"type":"number","minimum":0},
+            "bending_stiffness":{"type":"number","minimum":0},
+            "bending_model":{"enum":["ANGULAR","LINEAR"]},
+            "vertex_group_mass":{"type":"string"},
+            "collision_settings":{"type":"object","properties":{
+                "use_collision":{"type":"boolean"},
+                "distance_min":{"type":"number","minimum":0},
+                "use_self_collision":{"type":"boolean"},
+                "self_distance_min":{"type":"number","minimum":0},
+                "collection":{"type":["string","null"]}
+            }}
         }),
         "soft_body" => json!({
-            "stiffness":{"type":"number","minimum":0,"maximum":1},
-            "edge_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "volume_stiffness":{"type":"number","minimum":0,"maximum":1},
-            "goal_group":{"type":"string","minLength":1},
-            "vertex_group_goal":{"type":"string","minLength":1},
-            "goal_strength":{"type":"number","minimum":0,"maximum":1},
-            "goal_stiffness":{"type":"number","minimum":0,"maximum":1},
             "substeps":{"type":"integer","minimum":1,"maximum":32},
             "iterations":{"type":"integer","minimum":1,"maximum":64},
-            "quality":{"type":"integer","minimum":1,"maximum":32},
-            "air_drag":{"type":"number","minimum":0},"drag":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "restitution":{"type":"number","minimum":0,"maximum":1},
-            "goal_spring":{"type":"number","minimum":0,"maximum":1},
-            "goal_friction":{"type":"number","minimum":0,"maximum":1},
-            "goal_default":{"type":"number","minimum":0,"maximum":1},
-            "goal_min":{"type":"number"},
-            "goal_max":{"type":"number"},
             "mass":{"type":"number","exclusiveMinimum":0},
             "friction":{"type":"number","minimum":0},
             "speed":{"type":"number","minimum":0},
-            "plastic":{"type":"number","minimum":0,"maximum":1},
-            "bend":{"type":"number","minimum":0,"maximum":1},
+            "goal_spring":{"type":"number","minimum":0,"maximum":1},
+            "goal_default":{"type":"number","minimum":0,"maximum":1},
+            "goal_min":{"type":"number"},
+            "goal_max":{"type":"number"},
+            "use_goal":{"type":"boolean"},
+            "use_edges":{"type":"boolean"},
+            "vertex_group_goal":{"type":"string"},
+            "collision_collection":{"type":["string","null"]}
         }),
         "particle_emitter" => json!({
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
@@ -2594,40 +2684,54 @@ fn physics_settings_properties(operation: &str) -> Value {
             "child_radius":{"type":"number","minimum":0},
             "child_type":{"enum":["NONE","SIMPLE","INTERPOLATED"]},
             "frame_start":{"type":"number"},
-            "frame_end":{"type":"number"}
+            "frame_end":{"type":"number"},
+            "source":{"enum":["faces","vertices"]},
+            "velocity":vec_schema(3),
+            "normal_velocity":{"type":"number","minimum":0},
+            "render_as":{"enum":["points","object","hair_curves"]},
+            "instance_object":{"type":"string","minLength":1},
+            "hair_length":{"type":"number","exclusiveMinimum":0},
+            "start_frame":{"type":"number"},
+            "end_frame":{"type":"number"}
         }),
         "fluid" => json!({
-            "type":{"enum":["liquid","smoke","fire"]},
+            "domain_type":{"enum":["LIQUID","GAS"]},
+            "particle_radius":{"type":"number","minimum":0},
+            "resolution_max":{"type":"integer","minimum":1},
+            "cache_frame_start":{"type":"number"},
+            "cache_frame_end":{"type":"number"},
+            "effector_group":{"type":["string","null"]},
             "resolution":{"type":"integer","minimum":1,"maximum":10},
-            "particle_radius":{"type":"number","exclusiveMinimum":0},
             "smoothing_length":{"type":"number","exclusiveMinimum":0},
             "pressure_stiffness":{"type":"number","minimum":0},
             "viscosity":{"type":"number","minimum":0},
+            "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
+            "flow_type":{"enum":["SMOKE","LIQUID","FIRE","BOTH"]},
+            "flow_behavior":{"enum":["GEOMETRY","INFLOW","OUTFLOW"]},
+            "flow_source":{"enum":["PARTICLES","MESH"]},
+            "density":{"type":"number","minimum":0,"maximum":10},
             "inflow_rate":{"type":"number","minimum":0},
-            "seed":{"type":"integer","minimum":0,"maximum":u32::MAX}
+            "effector_type":{"enum":["COLLISION","GUIDE"]},
+            "use_effector":{"type":"boolean"}
         }),
         "dynamic_paint" => json!({
             "role":{"enum":["canvas","brush"]},
             "radius":{"type":"number","exclusiveMinimum":0},
             "color":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},
-            "strength":{"type":"number","minimum":0,"maximum":1},
+            "strength":{"type":"number","minimum":0},
             "brushes":{"type":"array","items":id_schema()},
-            "surface_format":{"enum":["color","weight"]}
+            "surface_format":{"enum":["color","weight"]},
+            "paint_color":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":4},
+            "paint_alpha":{"type":"number","minimum":0},
+            "paint_distance":{"type":"number","minimum":0}
         }),
         "collision" => json!({
-            "thickness":{"type":"number","minimum":0},
+            "use":{"type":"boolean"},
             "thickness_outer":{"type":"number","minimum":0},
             "thickness_inner":{"type":"number","minimum":0},
-            "damping":{"type":"number","minimum":0},
-            "damping_factor":{"type":"number","minimum":0,"maximum":1},
-            "damping_random":{"type":"number","minimum":0,"maximum":1},
-            "permeability":{"type":"number","minimum":0,"maximum":1},
-            "stickiness":{"type":"number","minimum":0,"maximum":1},
-            "friction_factor":{"type":"number","minimum":0,"maximum":1},
-            "friction_random":{"type":"number","minimum":0,"maximum":1},
             "use_culling":{"type":"boolean"},
             "use_normal":{"type":"boolean"},
-            "use_particle_kill":{"type":"boolean"}
+            "cloth_friction":{"type":"number","minimum":0,"maximum":80}
         }),
         _ => json!({}),
     }
