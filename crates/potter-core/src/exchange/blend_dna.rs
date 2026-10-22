@@ -59,8 +59,10 @@ pub(crate) struct NativeBakeStates {
     pub(crate) packed: BTreeSet<(String, String, i32)>,
 }
 
+pub(crate) type NativeModifierBindings = BTreeMap<(String, String), Value>;
+
 pub(crate) struct NativeBlendMetadata {
-    pub(crate) modifier_bindings: BTreeMap<(String, String), Value>,
+    pub(crate) modifier_bindings: NativeModifierBindings,
     pub(crate) multires_displacements: BTreeMap<String, Value>,
     pub(crate) node_bakes: NativeBakeStates,
 }
@@ -69,11 +71,11 @@ pub(crate) struct NativeBlendMetadata {
 pub(crate) fn read_native_metadata(bytes: &[u8]) -> Result<NativeBlendMetadata, String> {
     with_blend_bytes(bytes, |bytes| {
         let file = BlendFile::parse(bytes)?;
-        let (modifier_bindings, bake_ids, packed) = file.read_modifier_metadata(true)?;
+        let (modifier_bindings, node_bakes) = file.read_modifier_metadata(true)?;
         Ok(NativeBlendMetadata {
             modifier_bindings,
             multires_displacements: file.read_multires_displacements()?,
-            node_bakes: NativeBakeStates { bake_ids, packed },
+            node_bakes,
         })
     })
 }
@@ -83,7 +85,7 @@ pub(crate) fn read_node_bake_states(bytes: &[u8]) -> Result<NativeBakeStates, St
     with_blend_bytes(bytes, |bytes| {
         let file = BlendFile::parse(bytes)?;
         file.read_modifier_metadata(false)
-            .map(|(_, bake_ids, packed)| NativeBakeStates { bake_ids, packed })
+            .map(|(_, node_bakes)| node_bakes)
     })
 }
 
@@ -1198,14 +1200,7 @@ impl<'a> BlendFile<'a> {
     fn read_modifier_metadata(
         &self,
         include_bindings: bool,
-    ) -> Result<
-        (
-            BTreeMap<(String, String), Value>,
-            BTreeSet<(String, String, i32)>,
-            BTreeSet<(String, String, i32)>,
-        ),
-        String,
-    > {
+    ) -> Result<(NativeModifierBindings, NativeBakeStates), String> {
         let Some(object_struct) = self.schema.struct_index("Object") else {
             return Err("Blender DNA schema does not contain Object".into());
         };
@@ -1361,7 +1356,13 @@ impl<'a> BlendFile<'a> {
                 }
             }
         }
-        Ok((output, node_bake_ids, packed_node_bakes))
+        Ok((
+            output,
+            NativeBakeStates {
+                bake_ids: node_bake_ids,
+                packed: packed_node_bakes,
+            },
+        ))
     }
 
     fn append_packed_node_bake_states(

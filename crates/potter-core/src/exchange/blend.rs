@@ -1891,8 +1891,12 @@ fn attach_native_packed_bake_states(
                 Some(Value::Null) => None,
                 _ => return Err(invalid_intermediate("Bake node name is invalid")),
             };
-            let key = (owner_name.to_owned(), modifier_name.to_owned(), bake_id);
-            if !states.bake_ids.contains(&key) {
+            let matches_bake = |(object, blender_modifier, id): &(String, String, i32)| {
+                object.as_str() == owner_name
+                    && blender_modifier.as_str() == modifier_name
+                    && *id == bake_id
+            };
+            if !states.bake_ids.iter().any(matches_bake) {
                 return Err(PotError::with_details(
                     ErrorCode::ImportFailed,
                     "Blender Bake IDs differ between RNA and serialized SDNA",
@@ -1900,7 +1904,7 @@ fn attach_native_packed_bake_states(
                         "modifier":modifier_name,"node":node_name,"bake_id":bake_id}),
                 ));
             }
-            if states.packed.contains(&key) {
+            if states.packed.iter().any(matches_bake) {
                 if let Some(node_name) = node_name {
                     packed_payloads.push(node_name.to_owned());
                 } else {
@@ -1908,15 +1912,16 @@ fn attach_native_packed_bake_states(
                 }
             }
         }
-        let source_ids = states
+        let matches_source = |(object, blender_modifier, _): &(String, String, i32)| {
+            object.as_str() == owner_name && blender_modifier.as_str() == modifier_name
+        };
+        let source_id_count = states.bake_ids.iter().filter(matches_source).count();
+        let source_ids_reported = states
             .bake_ids
             .iter()
-            .filter(|(object, blender_modifier, _)| {
-                object == owner_name && blender_modifier == &modifier_name
-            })
-            .map(|(_, _, bake_id)| *bake_id)
-            .collect::<BTreeSet<_>>();
-        if source_ids != reported_ids {
+            .filter(matches_source)
+            .all(|(_, _, bake_id)| reported_ids.contains(bake_id));
+        if source_id_count != reported_ids.len() || !source_ids_reported {
             return Err(PotError::with_details(
                 ErrorCode::ImportFailed,
                 "Blender Bake ID list is incomplete between RNA and serialized SDNA",
@@ -18653,10 +18658,11 @@ print("UNSUPPORTED_POSE " + json.dumps({
                 "properties": {"node_group": "Geometry", "bakes": {
                     "bake_main": {"bake_mode": "STILL"},
                     "bake_disk": {"bake_target": "DISK"},
-                    "bake_empty_packed": {"bake_target": "PACKED"}
+                    "bake_empty_packed": {"bake_target": "PACKED"},
+                    "bake 42": {"bake_target": "DISK"}
                 }},
                 "bake_losses": {
-                    "packed_payloads": ["bake_main", "bake_disk"],
+                    "packed_payloads": ["bake_main", "bake_disk", "bake 42"],
                     "packed_unmapped_ids": [42],
                     "data_blocks": ["bake_main"],
                     "unmapped": ["Bake.001"]
@@ -18675,6 +18681,10 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert_eq!(
             bake_losses,
             [
+                (
+                    "blender.modifier.nodes_bake_packed".to_owned(),
+                    Some("Geo".to_owned())
+                ),
                 (
                     "blender.modifier.nodes_bake_packed".to_owned(),
                     Some("Geo".to_owned())
