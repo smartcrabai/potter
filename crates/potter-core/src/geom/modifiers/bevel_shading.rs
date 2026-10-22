@@ -6,214 +6,40 @@
 //   source/blender/blenkernel/intern/mesh_normals.cc, SPDX-FileCopyrightText: 2023 Blender
 //   Authors, GPL-2.0-or-later.
 
-//! Shading of bevel output, from Blender's `bmesh_bevel.cc`.
+//! Shading of bevel output, from Blender's `bmesh_bevel.cc` (`bevel_harden_normals`,
+//! `bevel_edges_sharp_boundary`).
 //!
-//! Blender builds every new face with `bev_create_ngon`, which copies the face attributes of one
-//! representative face, the smooth flag included. Which face that is follows from the `BMesh` edge
-//! order: a mesh stores its edges in the order `mesh_calc_edges` first meets them, and each
-//! vertex's disk cycle keeps that order.
-//!
-//! After the faces are built, Blender carries no custom normals through a bevel: every loop is
-//! recomputed from the output fans. `harden_normals` then writes the normals of strip and corner
-//! loops from their neighbouring faces (`bevel_harden_normals`), and the custom normals of each
-//! smooth fan are averaged in that fan's frame (`normals_calc_corners`). `mark_sharp` flags the
-//! rung edges of smooth beveled edges (`set_bound_vert_seams`, `bevel_extend_edge_data`).
+//! Bevel loops do not carry the input custom-normal codes: each loop starts at the zero code, which
+//! decodes to its fan normal. Hardening writes a code only on the strip and corner loops that have a
+//! rule, and each fan then averages its codes (zeros included) in the fan's own space, as
+//! `normals_calc_corners` does. Blender's rule normals come from the `BMesh` face and vertex normals,
+//! which this module recomputes from the output geometry.
 
 use std::collections::{HashMap, HashSet};
 
 use glam::DVec3;
 use serde_json::{Map, Value, json};
 
-use super::{BevelEdgeFacesWithMaterial, Mesh, Polygon, edge_key};
+use super::{Mesh, edge_key};
 use crate::{
     error::Result,
     geom::{
-        clnor::{self, NormalCodeOptions, SetterInput},
+        clnor::{self, NormalCodeOptions},
         normals::{corner_angle, face_normal, smooth_face_flags},
     },
 };
-
-/// A beveled edge's side: `(face index, loop's first vertex, loop's second vertex, material)`.
-pub(super) type EdgeSide = (usize, usize, usize, u32);
 
 /// Blender's `FKind` for an output polygon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     /// A rebuilt input face (`F_RECON`).
     Source,
+    /// An untouched input face (`F_ORIG`), retaining its original loops.
+    Original,
     /// A strip along a beveled edge (`F_EDGE`).
     Strip,
     /// A corner polygon at a beveled vertex (`F_VERT`).
     Corner,
-}
-
-/// Edges in the order Blender's mesh stores them, each as `(lower, higher)` vertex: the first
-/// occurrence over the face corners, taking each corner's edge to its previous corner.
-pub(super) fn blender_edge_order(polygons: &[Polygon]) -> Vec<(usize, usize)> {
-    let mut seen = HashSet::new();
-    let mut order = Vec::new();
-    for (face, _) in polygons {
-        for corner in 0..face.len() {
-            let key = edge_key(face[(corner + face.len() - 1) % face.len()], face[corner]);
-            if seen.insert(key) {
-                order.push(key);
-            }
-        }
-    }
-    order
-}
-
-/// Faces on either side of an edge.
-fn faces_of(edge_faces: &BevelEdgeFacesWithMaterial, edge: (usize, usize)) -> Vec<usize> {
-    edge_faces
-        .get(&edge)
-        .map(|sides| sides.iter().map(|side| side.0).collect())
-        .unwrap_or_default()
-}
-
-/// The face whose smooth flag a bevel's corner polygon copies at `vertex` (`bevel_build_poly`
-/// takes `boundvert_rep_face` of the vertex's first boundary vertex).
-///
-/// `BMesh` starts the vertex's edge order at its first beveled edge `first` and walks to the first
-/// later edge `second` that shares a face with it. Blender then reverses the order when the walk
-/// turned clockwise, so the representative is the face of `first` that `second` does not share.
-/// `None` when the vertex has no beveled edge or the topology is not a manifold fan there.
-pub(super) fn corner_source(
-    vertex: usize,
-    order: &[(usize, usize)],
-    edge_faces: &BevelEdgeFacesWithMaterial,
-    selected_edges: &HashSet<(usize, usize)>,
-) -> Option<usize> {
-    let incident: Vec<(usize, usize)> = order
-        .iter()
-        .copied()
-        .filter(|edge| edge.0 == vertex || edge.1 == vertex)
-        .collect();
-    let first = *incident.iter().find(|edge| selected_edges.contains(edge))?;
-    let first_faces = faces_of(edge_faces, first);
-    let second = incident
-        .iter()
-        .copied()
-        .filter(|edge| *edge != first)
-        .find(|edge| {
-            faces_of(edge_faces, *edge)
-                .iter()
-                .any(|face| first_faces.contains(face))
-        })?;
-    let second_faces = faces_of(edge_faces, second);
-    first_faces
-        .into_iter()
-        .find(|face| !second_faces.contains(face))
-}
-
-/// The two faces a beveled edge's strips copy their smooth flags from, as `(before, after)`, given
-/// the edge's two sides. `before` is the face whose loop runs from the higher vertex to the lower:
-/// Blender's `fprev` at the edge's lower vertex, which `bevel_build_edge_polygons` reads first.
-pub(super) fn strip_faces(
-    edge: (usize, usize),
-    first: EdgeSide,
-    second: EdgeSide,
-) -> (usize, usize) {
-    if (first.1, first.2) == (edge.1, edge.0) {
-        (first.0, second.0)
-    } else {
-        (second.0, first.0)
-    }
-}
-
-/// The face a bevel strip piece copies its smooth flag from. Blender interpolates a strip from
-/// `before` up to its middle piece and from `after` beyond it: for an odd segment count the middle
-/// piece is still `before`, for an even count it is `after` (`bevel_build_edge_polygons`).
-/// `segment` is zero based.
-pub(super) fn strip_face_for_segment(
-    before: usize,
-    after: usize,
-    segments: usize,
-    segment: usize,
-) -> usize {
-    let threshold = segments / 2 + segments % 2;
-    if segment < threshold { before } else { after }
-}
-
-/// Orients a single-segment corner polygon as Blender builds it. Blender's corner loop runs each
-/// rung it shares with a strip against that strip: the rung at the edge's higher vertex runs from
-/// the `after` face to the `before` face, and at its lower vertex from `before` to `after`
-/// (`strip_faces`). `faces` and `points` are the polygon's face and point at each corner, in
-/// boundary order. The polygon is reversed when its first rung runs the other way.
-pub(super) fn orient_corner(
-    vertex: usize,
-    faces: &[usize],
-    points: Vec<usize>,
-    edge_faces: &BevelEdgeFacesWithMaterial,
-) -> Vec<usize> {
-    let (Some(&first), Some(&next)) = (faces.first(), faces.get(1)) else {
-        return points;
-    };
-    let shared = edge_faces.iter().find(|(edge, sides)| {
-        (edge.0 == vertex || edge.1 == vertex)
-            && sides.len() == 2
-            && sides.iter().any(|side| side.0 == first)
-            && sides.iter().any(|side| side.0 == next)
-    });
-    let Some((edge, sides)) = shared else {
-        return points;
-    };
-    let (before, after) = strip_faces(*edge, sides[0], sides[1]);
-    let from = if vertex == edge.1 { after } else { before };
-    if from == first {
-        points
-    } else {
-        points.into_iter().rev().collect()
-    }
-}
-
-/// Rung edges that `mark_sharp` flags for a single-segment edge bevel, as point pairs.
-///
-/// A vertex with at least two input-sharp edges (`bevel_extend_edge_data`, with `sharp_len` from
-/// `check_edge_data_seam_sharp_edges`) marks the rung of every beveled smooth edge: the corner
-/// polygon edge between the two face corners of that edge at the vertex. `corner_point` gives the
-/// output point of a face corner. Vertices with a single beveled edge are skipped
-/// (`bv->selcount < 2`).
-pub(super) fn mark_sharp_rungs(
-    edge_faces: &BevelEdgeFacesWithMaterial,
-    selected_edges: &HashSet<(usize, usize)>,
-    input_sharp: &HashSet<(usize, usize)>,
-    corner_point: &HashMap<(usize, usize), usize>,
-    vertex_count: usize,
-) -> Vec<(usize, usize)> {
-    let mut rungs = Vec::new();
-    for vertex in 0..vertex_count {
-        let incident: Vec<(usize, usize)> = edge_faces
-            .keys()
-            .copied()
-            .filter(|edge| edge.0 == vertex || edge.1 == vertex)
-            .collect();
-        let beveled = incident
-            .iter()
-            .filter(|edge| selected_edges.contains(edge))
-            .count();
-        let sharp = incident
-            .iter()
-            .filter(|edge| input_sharp.contains(edge))
-            .count();
-        if beveled < 2 || sharp < 2 {
-            continue;
-        }
-        for edge in incident {
-            if !selected_edges.contains(&edge) || input_sharp.contains(&edge) {
-                continue;
-            }
-            if let [first, second] = edge_faces[&edge].as_slice()
-                && let (Some(a), Some(b)) = (
-                    corner_point.get(&(first.0, vertex)),
-                    corner_point.get(&(second.0, vertex)),
-                )
-            {
-                rungs.push((*a, *b));
-            }
-        }
-    }
-    rungs
 }
 
 /// Output polygons with their loops' neighbours, as Blender's fan walk sees them.
@@ -302,7 +128,7 @@ fn harden_normals(topology: &Topology) -> Vec<Vec<Option<DVec3>>> {
     for (polygon, face) in topology.polygons.iter().enumerate() {
         let row = (0..face.len())
             .map(|corner| {
-                if topology.kinds[polygon] == Kind::Source {
+                if matches!(topology.kinds[polygon], Kind::Source | Kind::Original) {
                     None
                 } else {
                     harden_loop(topology, (polygon, corner))
@@ -313,17 +139,19 @@ fn harden_normals(topology: &Topology) -> Vec<Vec<Option<DVec3>>> {
     }
     normals
 }
-
 fn harden_loop(topology: &Topology, loop_: Loop) -> Option<DVec3> {
     let (polygon, corner) = loop_;
     let own = topology.kinds[polygon];
     let normal = |other: Loop| topology.face_normals[other.0];
     let prev_loop = topology.previous(loop_);
+    // `BM_vert_step_fan_loop` (bmesh_query.cc:473-490) steps across the edge *other* than `e_step`:
+    // Blender's `lprev` (`estep = l->prev->e`) is the face across the outgoing edge `l->e`, and
+    // `lnext` (`estep = l->e`) the face across the incoming edge (bmesh_bevel.cc:3051-3053).
     let lprev = topology.neighbour(loop_, true);
     let lnext = topology.neighbour(loop_, false);
     let (kprev, knext) = (topology.kind(lprev), topology.kind(lnext));
     match own {
-        Kind::Source => None,
+        Kind::Source | Kind::Original => None,
         Kind::Strip => {
             if let (Some(prev), true) = (lprev, kprev == Some(Kind::Strip) && topology.long(loop_))
             {
@@ -354,6 +182,8 @@ fn harden_loop(topology: &Topology, loop_: Loop) -> Option<DVec3> {
             } else if let Some(next) = lnext.filter(|_| knext == Some(Kind::Source)) {
                 Some(normal(next))
             } else {
+                // Blender: `lprevprev` is across `lprev->e` and `lnextnext` across `lnext->prev->e`
+                // (bmesh_bevel.cc:3092-3093, 3099; bmesh_query.cc:473-490).
                 let lprevprev = lprev.and_then(|prev| topology.neighbour(prev, true));
                 let lnextnext = lnext.and_then(|next| topology.neighbour(next, false));
                 let kprevprev = topology.kind(lprevprev);
@@ -387,6 +217,22 @@ fn harden_loop(topology: &Topology, loop_: Loop) -> Option<DVec3> {
     }
 }
 
+/// Edges in the order Blender's mesh stores them, each as `(lower, higher)` vertex: the first
+/// occurrence over the face corners, taking each corner's edge to its previous corner.
+pub(super) fn blender_edge_order(polygons: &[super::Polygon]) -> Vec<(usize, usize)> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    for (face, _) in polygons {
+        for corner in 0..face.len() {
+            let key = edge_key(face[(corner + face.len() - 1) % face.len()], face[corner]);
+            if seen.insert(key) {
+                order.push(key);
+            }
+        }
+    }
+    order
+}
+
 /// Blender's `bevel_edges_sharp_boundary`, run when the input has no custom normals: an edge of a
 /// smooth rebuilt face that meets a strip or corner polygon is sharp. Point pairs.
 fn sharp_boundary(topology: &Topology, smooth: &[bool]) -> Vec<(usize, usize)> {
@@ -406,18 +252,32 @@ fn sharp_boundary(topology: &Topology, smooth: &[bool]) -> Vec<(usize, usize)> {
     edges
 }
 
+/// Applies Blender's loop-local hardening writes without re-encoding other fan corners.
+fn write_hardened_codes(
+    codes: &mut [clnor::CornerNormalCode],
+    fans: &clnor::Fans,
+    rules: &[Vec<Option<DVec3>>],
+) {
+    for (corner, normal) in rules.iter().flatten().enumerate() {
+        if let Some(normal) = normal {
+            codes[corner] = if *normal == DVec3::ZERO {
+                clnor::CornerNormalCode::Auto
+            } else {
+                let fan = fans.fan_of[corner];
+                clnor::encode_vector_in_space(&fans.spaces[fan], *normal)
+            };
+        }
+    }
+}
+
 /// Writes the shading of a built bevel result (faces in `kinds` order).
 ///
-/// Blender drops the input custom normals (the loops are rebuilt), so the `custom_normal`
-/// attribute is removed. `sharp_points` are the point pairs to mark sharp (see
-/// [`mark_sharp_rungs`]). With `harden`, the boundary edges of smooth faces are marked sharp when
-/// the input has no custom normals, and each strip and corner loop gets its hardened normal. The
-/// hardened codes are averaged over their fan in the fan's frame, so every corner of an affected
-/// fan takes the decoded average (Blender's `normals_calc_corners`).
+/// With `harden`, `bevel_harden_normals` sets the custom-normal code of each loop that has a rule,
+/// and each fan averages its codes. `input_custom` says the input had custom normals; without them
+/// the boundary edges that `bevel_harden_normals` marks sharp are added here.
 pub(super) fn shade_output(
     mesh: &mut Mesh,
     kinds: &[Kind],
-    sharp_points: &[(usize, usize)],
     harden: bool,
     input_custom: bool,
 ) -> Result<()> {
@@ -435,10 +295,11 @@ pub(super) fn shade_output(
         .collect();
     let smooth = smooth_face_flags(mesh)?;
     let topology = Topology::new(&points, polygons.clone(), kinds);
-    let mut sharp: Vec<(usize, usize)> = sharp_points.to_vec();
-    if harden && !input_custom {
-        sharp.extend(sharp_boundary(&topology, &smooth));
-    }
+    let sharp: Vec<(usize, usize)> = if harden && !input_custom {
+        sharp_boundary(&topology, &smooth)
+    } else {
+        Vec::new()
+    };
     let ids: HashSet<(u32, u32)> = sharp
         .iter()
         .map(|(a, b)| {
@@ -465,65 +326,166 @@ pub(super) fn shade_output(
             existing.extend(values);
         }
     }
-    mesh.attributes.remove("custom_normal");
     if !harden {
         return Ok(());
     }
     let rules = harden_normals(&topology);
-    if rules.iter().all(|row| row.iter().all(Option::is_none)) {
-        return Ok(());
-    }
-    // Sharp flags are final now; the fans and their frames come from the mesh without custom data.
-    let mut starts = Vec::with_capacity(polygons.len());
-    let mut total = 0;
-    for polygon in &polygons {
-        starts.push(total);
-        total += polygon.len();
-    }
-    // Bevel output keeps Potter's storage order as its loop order.
-    let numbering: Vec<usize> = (0..total).collect();
+    let total: usize = polygons.iter().map(Vec::len).sum();
+    let numbering = clnor::corner_order(mesh)?.unwrap_or_else(|| (0..total).collect());
     let fans = clnor::mesh_fans(mesh, &points, &numbering)?;
-    // Each hardened corner's code in its fan's frame; unhardened corners of a fan contribute zero.
-    let mut codes = vec![[0_i32; 2]; total];
-    let mut affected = vec![false; fans.corners.len()];
-    for (polygon, row) in rules.iter().enumerate() {
-        let start = starts[polygon];
-        for (corner, rule) in row.iter().enumerate() {
-            if let Some(normal) = rule {
-                let global = start + corner;
-                let fan = fans.fan_of[global];
-                codes[global] = fans.spaces[fan].encode(normal.as_vec3());
-                affected[fan] = true;
-            }
-        }
-    }
-    let mut values = vec![DVec3::ZERO; total];
-    for (fan, members) in fans.corners.iter().enumerate() {
-        if !affected[fan] {
-            continue;
-        }
-        let mut sum = [0_i32; 2];
-        for member in members {
-            sum[0] += codes[*member][0];
-            sum[1] += codes[*member][1];
-        }
-        let count = members.len() as i32;
-        let average = [sum[0] / count, sum[1] / count];
-        let normal = fans.spaces[fan].decode(average).as_dvec3();
-        for member in members {
-            values[*member] = normal;
-        }
-    }
-    // Corners of unaffected fans have no hardened normal: they stay automatic (`None`).
-    let vectors: Vec<Option<DVec3>> = (0..total)
-        .map(|global| affected[fans.fan_of[global]].then_some(values[global]))
-        .collect();
-    clnor::encode_vectors(
+    let mut codes =
+        clnor::corner_codes(mesh)?.unwrap_or_else(|| vec![clnor::CornerNormalCode::Auto; total]);
+    write_hardened_codes(&mut codes, &fans, &rules);
+    clnor::write_codes(
         mesh,
-        Some(&vectors),
+        Some(&codes),
         NormalCodeOptions {
             corner_order: Some(&numbering),
-            setter_input: SetterInput::NormalizeInput,
+            ..NormalCodeOptions::default()
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::DVec3;
+    use std::collections::HashSet;
+
+    use crate::geom::clnor::{self, CornerNormalCode};
+
+    use super::{Kind, Topology, harden_normals, sharp_boundary, write_hardened_codes};
+
+    /// A source square `[0, 1, 2, 3]` in the plane `z = 0` and a strip `[0, 1, 4, 3]` below its edge
+    /// `3 -> 0`. The strip's corners 0 and 2 are its LONG loops.
+    fn square_and_strip() -> Topology {
+        let points = [
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(1.0, 1.0, 0.0),
+            DVec3::new(0.0, 1.0, 0.0),
+            DVec3::new(1.0, 0.5, -1.0),
+        ];
+        Topology::new(
+            &points,
+            vec![vec![0, 1, 2, 3], vec![0, 1, 4, 3]],
+            &[Kind::Source, Kind::Strip],
+        )
+    }
+
+    fn assert_rule(actual: Option<DVec3>, expected: Option<DVec3>) {
+        match (actual, expected) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) => {
+                assert!(
+                    (actual - expected).length() < 1e-12,
+                    "{actual:?} != {expected:?}"
+                );
+            }
+            _ => panic!("{actual:?} != {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn long_strip_loops_next_to_a_source_face_take_its_normal() {
+        let rules = harden_normals(&square_and_strip());
+        assert!(
+            rules[0].iter().all(Option::is_none),
+            "source loops keep their fan normal"
+        );
+        // Blender's `bevel_harden_normals` on this topology (bmesh_bevel.cc:3060-3075). Loop 0 is
+        // LONG with a RECON face across its outgoing edge (branch 3). Loop 1 follows LONG loop 0 and
+        // its incoming edge borders the RECON square (branch 4), so it takes the square's normal.
+        // Loop 2 has no neighbours. Loop 3 is not LONG and its RECON face is across its outgoing
+        // edge, which neither branch reads, so it keeps its fan normal.
+        let up = Some(DVec3::Z);
+        assert_rule(rules[1][0], up);
+        assert_rule(rules[1][1], up);
+        assert_rule(rules[1][2], None);
+        assert_rule(rules[1][3], None);
+    }
+
+    #[test]
+    fn smooth_source_edges_beside_a_corner_are_sharp() {
+        let mut topology = square_and_strip();
+        topology.kinds = vec![Kind::Source, Kind::Corner];
+        // The corner polygon shares the source edges 0-1 and 3-0.
+        assert_eq!(
+            sharp_boundary(&topology, &[true, false]),
+            vec![(0, 1), (0, 3)]
+        );
+        assert_eq!(
+            sharp_boundary(&topology, &[false, false]),
+            Vec::<(usize, usize)>::new()
+        );
+    }
+
+    #[test]
+    fn strip_long_loop_uses_the_face_across_its_outgoing_edge() {
+        let points = [
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::new(0.0, 0.0, -1.0),
+            DVec3::new(1.0, 0.0, -1.0),
+            DVec3::new(0.0, 1.0, -1.0),
+        ];
+        let topology = Topology::new(
+            &points,
+            vec![vec![0, 1, 2], vec![0, 1, 4, 3], vec![3, 0, 5]],
+            &[Kind::Source, Kind::Strip, Kind::Corner],
+        );
+        assert_rule(harden_normals(&topology)[1][0], Some(DVec3::Z));
+    }
+
+    #[test]
+    fn corner_loop_walks_two_faces_along_the_blender_fan_direction() {
+        let points = [
+            DVec3::ZERO,
+            DVec3::X,
+            DVec3::Y,
+            DVec3::new(0.0, 1.0, -1.0),
+            DVec3::new(0.0, 0.0, -1.0),
+            DVec3::new(1.0, 0.0, -1.0),
+        ];
+        let topology = Topology::new(
+            &points,
+            vec![vec![0, 1, 2], vec![1, 0, 4, 3], vec![4, 0, 5]],
+            &[Kind::Corner, Kind::Strip, Kind::Source],
+        );
+        assert_rule(harden_normals(&topology)[0][0], Some(DVec3::Y));
+    }
+
+    #[test]
+    fn hardening_changes_only_assigned_codes_in_their_output_fan_spaces() {
+        let points = [DVec3::ZERO, DVec3::X, DVec3::Y, DVec3::Z];
+        let faces = [vec![0, 1, 2], vec![1, 0, 3]];
+        let numbering = [0, 1, 2, 3, 4, 5];
+        let fans = clnor::fans(&points, &faces, &[true, true], &HashSet::new(), &numbering);
+        assert_eq!(fans.fan_of[0], fans.fan_of[4]);
+
+        let mut codes = [
+            CornerNormalCode::Auto,
+            CornerNormalCode::Authored([11, 12]),
+            CornerNormalCode::ExplicitZero,
+            CornerNormalCode::Auto,
+            CornerNormalCode::Authored([21, 22]),
+            CornerNormalCode::Authored([31, 32]),
+        ];
+        let expected = clnor::encode_vector_in_space(&fans.spaces[fans.fan_of[0]], DVec3::X);
+        write_hardened_codes(
+            &mut codes,
+            &fans,
+            &[
+                vec![Some(DVec3::X), None, None],
+                vec![None, None, Some(DVec3::ZERO)],
+            ],
+        );
+
+        assert_eq!(codes[0], expected);
+        assert_eq!(codes[1], CornerNormalCode::Authored([11, 12]));
+        assert_eq!(codes[2], CornerNormalCode::ExplicitZero);
+        assert_eq!(codes[3], CornerNormalCode::Auto);
+        assert_eq!(codes[4], CornerNormalCode::Authored([21, 22]));
+        assert_eq!(codes[5], CornerNormalCode::Auto);
+    }
 }

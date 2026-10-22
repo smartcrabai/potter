@@ -44,7 +44,17 @@
   ],
   "face_smooth": [],
   "sharp_edges": [],
-  "custom_normals": null
+  "custom_normals": null,
+  "blender_edge_order": [
+   [
+    0,
+    1
+   ],
+   [
+    1,
+    2
+   ]
+  ]
  },
  "objects": {},
  "output": {

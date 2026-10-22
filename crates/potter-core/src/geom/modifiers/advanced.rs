@@ -730,6 +730,7 @@ pub(super) fn screw(
         source_vertices: None,
         faces: output_face_sources,
         corners: Some(output_corner_sources),
+        ..Default::default()
     };
     let mut result = build_mesh(
         merged.points,

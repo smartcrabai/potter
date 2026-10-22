@@ -578,6 +578,7 @@ pub(super) fn skin(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
         source_vertices: None,
         faces: vec![None; faces.len()],
         corners: None,
+        ..Default::default()
     };
     let mut result = build_mesh(points, faces, loose_edges, &origin, mesh)?;
     // Skin's fresh BMesh has no point CD_ORIGINDEX layer, so the index carrier is dropped.

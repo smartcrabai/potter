@@ -179,6 +179,7 @@ pub(super) fn build(
             .map(|corners| corners.first().map(|sample| sample.face))
             .collect(),
         corners: Some(corner_sources),
+        ..Default::default()
     };
     let staged = Staged {
         vertices: vertex_stages,

@@ -7,6 +7,7 @@ mod eevee_transmission_tables;
 mod light_model;
 mod path;
 mod pick;
+mod pixel_filter;
 mod preview;
 mod principled_bsdf;
 mod principled_tables;

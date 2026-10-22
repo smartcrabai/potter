@@ -44,6 +44,7 @@ use super::{
         inside_emitter, local_light_influence_radius_squared, point_intensity, spot_attenuation,
         spread_attenuation, spread_region,
     },
+    pixel_filter::PixelFilter,
     raster::{
         Camera, CameraFrame, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals,
         camera_eye, camera_frame, rasterize_with_lines, ray_for_sample, ray_for_sample_in_frame,
@@ -1057,6 +1058,7 @@ struct RenderJob<'a> {
     volumes: &'a [VolumeInstance<'a>],
     images: &'a BTreeMap<String, ImageData>,
     importance: Option<&'a WorldImportanceSampler>,
+    pixel_filter: &'a PixelFilter,
     /// The camera and its frame for each eye: one for a mono camera, the left then the right eye for anaglyph.
     eyes: &'a [(Camera, CameraFrame)],
     anaglyph: bool,
@@ -1120,8 +1122,10 @@ fn render_rows(
             let mut alpha_sum = 0.0;
             for sample_index in 0..job.samples {
                 let mut rng = Pcg32::for_sample(job.seed, x, y, sample_index);
-                let sample_x = rng.next_f64();
-                let sample_y = rng.next_f64();
+                let filter_u = rng.next_f64();
+                let filter_v = rng.next_f64();
+                let (sample_x, sample_y) =
+                    job.pixel_filter.sample(sample_index, filter_u, filter_v);
                 let (radiance, alpha) = if job.anaglyph {
                     let (left_camera, left_frame) = &job.eyes[0];
                     let (right_camera, right_frame) = &job.eyes[1];
@@ -1301,6 +1305,7 @@ pub(super) fn render(
     volume_bounces: u32,
     transparent_max_bounces: u32,
     film_transparent: bool,
+    pixel_filter: &PixelFilter,
     images: &BTreeMap<String, ImageData>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
@@ -1407,6 +1412,7 @@ pub(super) fn render(
             volumes: &volumes,
             images,
             importance: world_importance.as_ref(),
+            pixel_filter,
             eyes: &eyes,
             anaglyph,
             width,
