@@ -11,7 +11,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{
         AdaptiveCameraOverride, AdaptiveRenderRequest, EvaluationContext, EvaluationPurpose,
-        Snapshot,
+        EvaluationSession, Snapshot,
     },
     hash,
     model::{CameraData, CameraProjection, Id, SceneDoc},
@@ -307,6 +307,7 @@ pub fn render_previews(
 pub(crate) fn render_camera_frame(
     doc: &SceneDoc,
     context: &EvaluationContext,
+    session: &mut EvaluationSession,
     project_root: &Path,
     cache_directory: &Path,
     camera_id: &str,
@@ -337,11 +338,12 @@ pub(crate) fn render_camera_frame(
             dicing_rate: scene.render.dicing_rate,
         });
     }
-    let snapshot = Snapshot::evaluate_with_cache(
+    let snapshot = Snapshot::evaluate_with_cache_session(
         doc,
         &evaluation_context,
         Some(project_root),
         Some(cache_directory),
+        session,
     )?;
     let images = super::path::load_images(doc, project_root, None)?;
     let geometry = extract_geometry(

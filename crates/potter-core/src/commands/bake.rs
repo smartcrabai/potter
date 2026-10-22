@@ -13,7 +13,7 @@ use super::util::{parse_id, with_load_warnings};
 use crate::{
     cli::{BakeArgs, BakeKind},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, EvaluationSession, Snapshot},
     geom::Mesh,
     model::{Id, Modifier, OceanBakeCache},
     response::SceneInfo,
@@ -77,14 +77,16 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     let mut stage = BakeStage::create(&args.out)?;
     let mut files = Vec::new();
     let mut baked_frames = Vec::new();
+    let mut evaluation_session = EvaluationSession::default();
     for (frame_index, frame) in frames.into_iter().enumerate() {
         let mut frame_context = context.clone();
         frame_context.frame = Some(frame);
-        let snapshot = Snapshot::evaluate_with_cache(
+        let snapshot = Snapshot::evaluate_with_cache_session(
             doc,
             &frame_context,
             Some(project.path()),
             Some(cache_directory),
+            &mut evaluation_session,
         )?;
         match args.kind {
             BakeKind::Animation => {

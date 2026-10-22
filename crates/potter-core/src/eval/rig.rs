@@ -8,6 +8,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
+    sync::Arc,
 };
 
 use glam::{DMat3, DMat4, DQuat, DVec3, EulerRot, Mat3, Mat4};
@@ -15,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::animation::animated_transform,
+    eval::{EvaluationSession, animation::animated_transform},
     geom::{
         Mesh,
         blender_matrix::{blender_matrix_from_f64, blender_mul_m4, dmat4_from_blender},
@@ -548,6 +549,7 @@ pub(crate) fn evaluate_armature_bone_world_matrices_with_drivers(
     target_worlds: &BTreeMap<Id, DMat4>,
     driver_values: &BTreeMap<(Id, String, u32), f64>,
 ) -> Result<BTreeMap<Id, DMat4>> {
+    let mut session = EvaluationSession::default();
     evaluate_armature_bone_world_matrices_with_resources(
         doc,
         armature_node_id,
@@ -558,6 +560,7 @@ pub(crate) fn evaluate_armature_bone_world_matrices_with_drivers(
         None,
         24,
         1.0,
+        &mut session,
     )
 }
 
@@ -571,6 +574,7 @@ pub(crate) fn evaluate_armature_bone_world_matrices_with_resources(
     project_root: Option<&Path>,
     fps: u32,
     fps_base: f64,
+    session: &mut EvaluationSession,
 ) -> Result<BTreeMap<Id, DMat4>> {
     evaluate_armature_bone_world_matrices_with_meshes(
         doc,
@@ -583,6 +587,7 @@ pub(crate) fn evaluate_armature_bone_world_matrices_with_resources(
         fps,
         fps_base,
         None,
+        session,
     )
 }
 
@@ -596,6 +601,7 @@ pub(crate) fn evaluate_armature_bone_world_and_pose_matrices_with_resources(
     project_root: Option<&Path>,
     fps: u32,
     fps_base: f64,
+    session: &mut EvaluationSession,
 ) -> Result<EvaluatedArmatureBoneMatrices> {
     evaluate_armature_bone_world_and_pose_matrices_with_meshes(
         doc,
@@ -608,6 +614,7 @@ pub(crate) fn evaluate_armature_bone_world_and_pose_matrices_with_resources(
         fps,
         fps_base,
         None,
+        session,
         true,
     )
 }
@@ -623,6 +630,7 @@ pub(crate) fn evaluate_armature_bone_world_matrices_with_evaluated_meshes(
     fps: u32,
     fps_base: f64,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
+    session: &mut EvaluationSession,
 ) -> Result<BTreeMap<Id, DMat4>> {
     evaluate_armature_bone_world_matrices_with_meshes(
         doc,
@@ -635,6 +643,7 @@ pub(crate) fn evaluate_armature_bone_world_matrices_with_evaluated_meshes(
         fps,
         fps_base,
         Some(evaluated_meshes),
+        session,
     )
 }
 
@@ -649,6 +658,7 @@ pub(crate) fn evaluate_armature_bone_world_and_pose_matrices_with_evaluated_mesh
     fps: u32,
     fps_base: f64,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
+    session: &mut EvaluationSession,
 ) -> Result<EvaluatedArmatureBoneMatrices> {
     evaluate_armature_bone_world_and_pose_matrices_with_meshes(
         doc,
@@ -661,6 +671,7 @@ pub(crate) fn evaluate_armature_bone_world_and_pose_matrices_with_evaluated_mesh
         fps,
         fps_base,
         Some(evaluated_meshes),
+        session,
         true,
     )
 }
@@ -676,6 +687,7 @@ fn evaluate_armature_bone_world_and_pose_matrices_with_meshes(
     fps: u32,
     fps_base: f64,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+    session: &mut EvaluationSession,
     include_pose: bool,
 ) -> Result<EvaluatedArmatureBoneMatrices> {
     let node = doc.nodes.get(armature_node_id).ok_or_else(|| {
@@ -725,6 +737,7 @@ fn evaluate_armature_bone_world_and_pose_matrices_with_meshes(
         project_root,
         fps,
         fps_base,
+        session,
     )?;
     let bones = evaluate_pose_matrices(
         armature_node_id,
@@ -741,6 +754,7 @@ fn evaluate_armature_bone_world_and_pose_matrices_with_meshes(
         fps,
         fps_base,
         evaluated_meshes,
+        session,
     )?;
     let mut pose_matrices = include_pose.then(BTreeMap::new);
     let mut world = BTreeMap::new();
@@ -775,6 +789,7 @@ fn evaluate_armature_bone_world_matrices_with_meshes(
     fps: u32,
     fps_base: f64,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+    session: &mut EvaluationSession,
 ) -> Result<BTreeMap<Id, DMat4>> {
     let matrices = evaluate_armature_bone_world_and_pose_matrices_with_meshes(
         doc,
@@ -787,6 +802,7 @@ fn evaluate_armature_bone_world_matrices_with_meshes(
         fps,
         fps_base,
         evaluated_meshes,
+        session,
         false,
     )?;
     Ok(matrices.world)
@@ -1179,6 +1195,7 @@ fn ik_target_matrices(
     project_root: Option<&Path>,
     fps: u32,
     fps_base: f64,
+    session: &mut EvaluationSession,
 ) -> Result<BTreeMap<Id, IkGoal>> {
     let owner_node = doc.nodes.get(armature_node_id).ok_or_else(|| {
         evaluation_error_with(
@@ -1230,6 +1247,7 @@ fn ik_target_matrices(
                 project_root,
                 fps,
                 fps_base,
+                session,
             )?;
             target_world =
                 constraint_target_bone_matrix(constraint, target_node, doc, target_world)?;
@@ -1309,6 +1327,7 @@ fn ik_target_matrices(
                         project_root,
                         fps,
                         fps_base,
+                        session,
                     )?;
                     constraint_target_bone_matrix_for_id(
                         constraint,
@@ -1364,6 +1383,7 @@ fn ik_target_bone_matrix(
     project_root: Option<&Path>,
     fps: u32,
     fps_base: f64,
+    session: &mut EvaluationSession,
 ) -> Result<DMat4> {
     if target_id == owner_id {
         return evaluate_bone_matrices(owner_armature, owner_pose)?
@@ -1393,6 +1413,7 @@ fn ik_target_bone_matrix(
         project_root,
         fps,
         fps_base,
+        session,
     )?
     .get(bone_id)
     .copied()
@@ -1426,6 +1447,7 @@ fn apply_pose_bone_constraints(
     fps: u32,
     fps_base: f64,
     matrices: &mut BTreeMap<Id, BoneMatrices>,
+    session: &mut EvaluationSession,
 ) -> Result<()> {
     if !constraints.iter().any(|constraint| {
         constraint.owner_bone.is_some()
@@ -1508,7 +1530,19 @@ fn apply_pose_bone_constraints(
                 .or(constraint_camera_target_id(constraint)?);
             let legacy_space = constraint.constraint_type == ConstraintType::TransformCache;
             let target_matrix = if constraint.constraint_type == ConstraintType::TransformCache {
-                transform_cache_matrix(doc, constraint, project_root, frame, fps, fps_base)?
+                let Some(matrix) = transform_cache_matrix(
+                    doc,
+                    constraint,
+                    project_root,
+                    frame,
+                    fps,
+                    fps_base,
+                    session,
+                )?
+                else {
+                    continue;
+                };
+                matrix
             } else if let Some(target_id) = &constraint_target_id {
                 let target_world = if target_id == armature_node_id {
                     armature_world
@@ -1542,6 +1576,7 @@ fn apply_pose_bone_constraints(
                             fps,
                             fps_base,
                             evaluated_meshes,
+                            session,
                         )?
                         .get(target_bone_id)
                         .copied()
@@ -1661,6 +1696,7 @@ fn evaluate_pose_matrices(
     fps: u32,
     fps_base: f64,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+    session: &mut EvaluationSession,
 ) -> Result<BTreeMap<Id, BoneMatrices>> {
     let mut result_pose = pose.clone();
     for bone_id in armature.bones.keys() {
@@ -1737,6 +1773,7 @@ fn evaluate_pose_matrices(
         fps,
         fps_base,
         &mut matrices,
+        session,
     )?;
     Ok(matrices)
 }
@@ -4102,6 +4139,7 @@ pub(crate) fn apply_armature_modifier_with_drivers(
     fps_base: f64,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
     multi_input: Option<&[DVec3]>,
+    session: &mut EvaluationSession,
 ) -> Result<()> {
     if modifier.modifier_type != "armature" || !modifier.enabled {
         return Ok(());
@@ -4166,6 +4204,7 @@ pub(crate) fn apply_armature_modifier_with_drivers(
         project_root,
         fps,
         fps_base,
+        session,
     )?;
     let bones = evaluate_pose_matrices(
         &armature_id,
@@ -4182,6 +4221,7 @@ pub(crate) fn apply_armature_modifier_with_drivers(
         fps,
         fps_base,
         Some(evaluated_meshes),
+        session,
     )?;
     apply_armature_skinning(
         mesh,
@@ -4206,6 +4246,7 @@ pub(crate) fn evaluate_world_matrices_with_drivers(
     driver_values: &BTreeMap<(Id, String, u32), f64>,
 ) -> Result<BTreeMap<Id, DMat4>> {
     let scene = doc.scenes.get(&doc.active_scene);
+    let mut session = EvaluationSession::default();
     evaluate_world_matrices_with_resources(
         doc,
         frame,
@@ -4213,6 +4254,7 @@ pub(crate) fn evaluate_world_matrices_with_drivers(
         None,
         scene.map_or(24, |scene| scene.fps),
         scene.map_or(1.0, |scene| scene.fps_base),
+        &mut session,
     )
 }
 
@@ -4223,6 +4265,7 @@ pub(crate) fn evaluate_world_matrices_with_resources(
     project_root: Option<&Path>,
     fps: u32,
     fps_base: f64,
+    session: &mut EvaluationSession,
 ) -> Result<BTreeMap<Id, DMat4>> {
     evaluate_world_matrices_with_meshes(
         doc,
@@ -4232,6 +4275,7 @@ pub(crate) fn evaluate_world_matrices_with_resources(
         fps,
         fps_base,
         None,
+        session,
     )
 }
 
@@ -4243,6 +4287,7 @@ pub(crate) fn evaluate_world_matrices_with_evaluated_meshes(
     fps: u32,
     fps_base: f64,
     evaluated_meshes: &BTreeMap<Id, Mesh>,
+    session: &mut EvaluationSession,
 ) -> Result<BTreeMap<Id, DMat4>> {
     evaluate_world_matrices_with_meshes(
         doc,
@@ -4252,6 +4297,7 @@ pub(crate) fn evaluate_world_matrices_with_evaluated_meshes(
         fps,
         fps_base,
         Some(evaluated_meshes),
+        session,
     )
 }
 
@@ -4263,6 +4309,7 @@ fn evaluate_world_matrices_with_meshes(
     fps: u32,
     fps_base: f64,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+    session: &mut EvaluationSession,
 ) -> Result<BTreeMap<Id, DMat4>> {
     fn visit(
         id: &Id,
@@ -4273,6 +4320,7 @@ fn evaluate_world_matrices_with_meshes(
         fps: u32,
         fps_base: f64,
         evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+        session: &mut EvaluationSession,
         output: &mut BTreeMap<Id, DMat4>,
         active: &mut Vec<Id>,
     ) -> Result<DMat4> {
@@ -4307,6 +4355,7 @@ fn evaluate_world_matrices_with_meshes(
                     fps,
                     fps_base,
                     evaluated_meshes,
+                    session,
                     output,
                     active,
                 )?;
@@ -4333,6 +4382,7 @@ fn evaluate_world_matrices_with_meshes(
                         fps,
                         fps_base,
                         evaluated_meshes,
+                        session,
                         output,
                         active,
                     )?;
@@ -4356,6 +4406,7 @@ fn evaluate_world_matrices_with_meshes(
                     fps,
                     fps_base,
                     evaluated_meshes,
+                    session,
                     output,
                     active,
                 )?;
@@ -4377,6 +4428,7 @@ fn evaluate_world_matrices_with_meshes(
                         fps,
                         fps_base,
                         evaluated_meshes,
+                        session,
                         output,
                         active,
                     )?;
@@ -4403,6 +4455,7 @@ fn evaluate_world_matrices_with_meshes(
                 fps,
                 fps_base,
                 evaluated_meshes,
+                session,
                 output,
                 active,
             )?;
@@ -4424,6 +4477,7 @@ fn evaluate_world_matrices_with_meshes(
                     fps,
                     fps_base,
                     evaluated_meshes,
+                    session,
                 )?;
                 bone_worlds.get(bone_id).copied().ok_or_else(|| {
                     evaluation_error_with(
@@ -4473,6 +4527,7 @@ fn evaluate_world_matrices_with_meshes(
                     fps,
                     fps_base,
                     evaluated_meshes,
+                    session,
                     output,
                     active,
                 )?)
@@ -4501,6 +4556,7 @@ fn evaluate_world_matrices_with_meshes(
                         fps,
                         fps_base,
                         evaluated_meshes,
+                        session,
                         output,
                         active,
                     )?;
@@ -4524,6 +4580,7 @@ fn evaluate_world_matrices_with_meshes(
                     fps,
                     fps_base,
                     evaluated_meshes,
+                    session,
                     output,
                     active,
                 )?;
@@ -4545,6 +4602,7 @@ fn evaluate_world_matrices_with_meshes(
                         fps,
                         fps_base,
                         evaluated_meshes,
+                        session,
                         output,
                         active,
                     )?;
@@ -4557,7 +4615,19 @@ fn evaluate_world_matrices_with_meshes(
                 continue;
             }
             let target_matrix = if constraint.constraint_type == ConstraintType::TransformCache {
-                transform_cache_matrix(doc, constraint, project_root, frame, fps, fps_base)?
+                let Some(matrix) = transform_cache_matrix(
+                    doc,
+                    constraint,
+                    project_root,
+                    frame,
+                    fps,
+                    fps_base,
+                    session,
+                )?
+                else {
+                    continue;
+                };
+                matrix
             } else if let (Some(target_id), Some(bone_id)) =
                 (target_id.as_ref(), constraint.subtarget.as_ref())
             {
@@ -4574,6 +4644,7 @@ fn evaluate_world_matrices_with_meshes(
                     fps,
                     fps_base,
                     evaluated_meshes,
+                    session,
                 )?;
                 let bone_world = bone_worlds.get(bone_id).copied().ok_or_else(|| {
                     evaluation_error_with(
@@ -4633,6 +4704,7 @@ fn evaluate_world_matrices_with_meshes(
             fps,
             fps_base,
             evaluated_meshes,
+            session,
             &mut output,
             &mut active,
         )?;
@@ -4647,7 +4719,8 @@ fn transform_cache_matrix(
     frame: f64,
     fps: u32,
     fps_base: f64,
-) -> Result<DMat4> {
+    session: &mut EvaluationSession,
+) -> Result<Option<DMat4>> {
     let resource_text = string_param(&constraint.params, "resource")?;
     let resource_id = Id::new(resource_text.to_owned()).map_err(|error| {
         evaluation_error_with(
@@ -4689,72 +4762,76 @@ fn transform_cache_matrix(
                 })?,
         ),
     };
-    let rate = f64::from(fps) / fps_base;
-    if !rate.is_finite() || rate <= 0.0 {
-        return Err(evaluation_error(
-            "Transform Cache requires a finite positive scene frame rate",
-        ));
-    }
-    let time_seconds = (override_frame.unwrap_or(frame) - frame_offset) / rate;
-    if !time_seconds.is_finite() {
-        return Err(evaluation_error(
-            "Transform Cache sample time is not finite",
-        ));
-    }
-    let bytes = match doc.resources.get(&resource_id) {
-        Some(resource) if resource.get("sequence_frames").is_some() => {
-            let sequence_frame = override_frame.unwrap_or(frame);
-            match crate::eval::read_cache_sequence_resource(resource, project_root, sequence_frame)?
-            {
-                crate::eval::CacheSequenceRead::Available(bytes, _) => bytes,
-                crate::eval::CacheSequenceRead::Missing {
-                    frame: missing_frame,
-                    reason,
-                } => {
-                    let previous_frame = resource
-                        .get("sequence_frames")
-                        .and_then(Value::as_object)
-                        .into_iter()
-                        .flat_map(|frames| frames.keys())
-                        .filter_map(|key| key.parse::<i32>().ok())
-                        .filter(|frame| *frame < missing_frame)
-                        .max();
-                    let Some(previous_frame) = previous_frame else {
-                        return Err(PotError::with_details(
-                            ErrorCode::DependencyMissing,
-                            "Alembic sequence frame is unavailable for Transform Cache",
-                            json!({"constraint_id":constraint.id,"resource_id":resource_id,"frame":missing_frame,"reason":reason}),
-                        ));
-                    };
-                    match crate::eval::read_cache_sequence_resource(
-                        resource,
-                        project_root,
-                        f64::from(previous_frame),
-                    )? {
-                        crate::eval::CacheSequenceRead::Available(bytes, _) => bytes,
-                        crate::eval::CacheSequenceRead::Missing { frame, reason } => {
-                            return Err(PotError::with_details(
-                                ErrorCode::DependencyMissing,
-                                "previous Alembic sequence frame is unavailable for Transform Cache",
-                                json!({"constraint_id":constraint.id,"resource_id":resource_id,"frame":missing_frame,"previous_frame":frame,"reason":reason}),
-                            ));
-                        }
-                    }
-                }
-            }
+    let sequence_time = override_frame.unwrap_or(frame);
+    let matrix = if let Some(resource) = doc.resources.get(&resource_id)
+        && resource.get("sequence_frames").is_some()
+    {
+        // A missing path does not replace Blender's selected CacheFile reader; keep that archive and sample it at
+        // the current sequence frame. With no reader selected yet, Blender leaves the owner matrix unchanged.
+        if let crate::eval::CacheSequenceRead::Available(bytes, hash) =
+            crate::eval::read_cache_sequence_resource(resource, project_root, sequence_time)?
+        {
+            let selected_frame = num_traits::ToPrimitive::to_i32(&sequence_time.trunc())
+                .ok_or_else(|| {
+                    evaluation_error("Transform Cache sequence frame is outside int32 range")
+                })?;
+            session.cache_file_archives.insert(
+                resource_id.clone(),
+                crate::eval::SelectedCacheFileArchive {
+                    frame: selected_frame,
+                    bytes: Arc::new(bytes),
+                    hash: Arc::from(hash),
+                },
+            );
         }
-        _ => crate::eval::read_cache_resource(doc, project_root, &resource_id)?.0,
+        let Some(reader) = session.cache_file_archives.get(&resource_id) else {
+            return Ok(None);
+        };
+        let values = crate::exchange::alembic::read_xform_matrix(
+            reader.bytes.as_slice(),
+            object_path,
+            sequence_time,
+            scale,
+        )
+        .map_err(|error| {
+            PotError::with_details(
+                error.code,
+                error.message,
+                json!({
+                    "resource_id":resource_id,
+                    "selected_archive_frame":reader.frame,
+                    "selected_archive_hash":reader.hash.as_ref(),
+                    "requested_frame":sequence_time,
+                    "cause":error.details,
+                }),
+            )
+        })?;
+        DMat4::from_cols_array(&values)
+    } else {
+        let rate = f64::from(fps) / fps_base;
+        if !rate.is_finite() || rate <= 0.0 {
+            return Err(evaluation_error(
+                "Transform Cache requires a finite positive scene frame rate",
+            ));
+        }
+        let time_seconds = (sequence_time - frame_offset) / rate;
+        if !time_seconds.is_finite() {
+            return Err(evaluation_error(
+                "Transform Cache sample time is not finite",
+            ));
+        }
+        let (bytes, _) = crate::eval::read_cache_resource(doc, project_root, &resource_id)?;
+        DMat4::from_cols_array(&crate::exchange::alembic::read_xform_matrix(
+            &bytes,
+            object_path,
+            time_seconds,
+            scale,
+        )?)
     };
-    let matrix = DMat4::from_cols_array(&crate::exchange::alembic::read_xform_matrix(
-        &bytes,
-        object_path,
-        time_seconds,
-        scale,
-    )?);
     if !finite_matrix(matrix) {
         return Err(evaluation_error("Transform Cache matrix is not finite"));
     }
-    Ok(matrix)
+    Ok(Some(matrix))
 }
 
 fn checked_influence(constraint: &Constraint) -> Result<f64> {
@@ -9140,7 +9217,10 @@ mod tests {
                 .unwrap_or_default(),
             ..Constraint::default()
         };
-        let Err(error) = transform_cache_matrix(&doc, &constraint, None, 1.0, 24, 1.0) else {
+        let mut session = EvaluationSession::default();
+        let Err(error) =
+            transform_cache_matrix(&doc, &constraint, None, 1.0, 24, 1.0, &mut session)
+        else {
             panic!("a usd_cache resource must be refused");
         };
         assert_eq!(error.code, ErrorCode::UnsupportedFeature);

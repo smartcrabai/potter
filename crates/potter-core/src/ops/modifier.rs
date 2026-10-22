@@ -1476,6 +1476,7 @@ fn evaluate_modifier_output(
         } else {
             let frame = engine.evaluation_frame;
             let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
+            let mut transform_cache_session = crate::eval::EvaluationSession::default();
             let operand_snapshot = crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
                 engine.doc,
                 &crate::eval::EvaluationContext {
@@ -1484,6 +1485,7 @@ fn evaluate_modifier_output(
                 },
                 engine.asset_root,
                 engine.cache_directory,
+                &mut transform_cache_session,
                 target,
                 modifier_id,
                 &driver_values,
@@ -1595,6 +1597,7 @@ fn evaluate_modifier_output(
                                 .map_or(1.0, |scene| scene.fps_base),
                             evaluated_operand_meshes,
                             multi_input,
+                            &mut transform_cache_session,
                         ),
                         "lattice" => crate::eval::apply_lattice_modifier(
                             mesh,

@@ -89,6 +89,35 @@ pub struct EvaluationContext {
     pub purpose: EvaluationPurpose,
 }
 
+/// Runtime state retained while evaluating successive frames, including the Alembic archive selected by a `CacheFile`.
+/// Create one per render/bake frame sequence; ordinary single-frame evaluation uses a fresh session.
+#[derive(Debug, Default)]
+pub struct EvaluationSession {
+    pub(crate) cache_file_archives: BTreeMap<Id, SelectedCacheFileArchive>,
+}
+impl EvaluationSession {
+    fn cache_file_archive_identity(&self) -> Value {
+        Value::Object(
+            self.cache_file_archives
+                .iter()
+                .map(|(resource_id, archive)| {
+                    (
+                        resource_id.to_string(),
+                        json!({"frame":archive.frame,"hash":archive.hash.as_ref()}),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SelectedCacheFileArchive {
+    pub(crate) frame: i32,
+    pub(crate) bytes: Arc<Vec<u8>>,
+    pub(crate) hash: Arc<str>,
+}
+
 /// Borrowed project resources for one modifier evaluation.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ModifierEvaluationContext<'a> {
@@ -374,11 +403,24 @@ impl Snapshot {
         project_root: Option<&Path>,
         cache_directory: Option<&Path>,
     ) -> Result<Self> {
+        let mut session = EvaluationSession::default();
+        Self::evaluate_with_cache_session(doc, context, project_root, cache_directory, &mut session)
+    }
+
+    /// Evaluate one frame with an explicit session shared across successive frame evaluations.
+    pub fn evaluate_with_cache_session(
+        doc: &SceneDoc,
+        context: &EvaluationContext,
+        project_root: Option<&Path>,
+        cache_directory: Option<&Path>,
+        session: &mut EvaluationSession,
+    ) -> Result<Self> {
         Self::evaluate_internal(
             doc,
             context,
             project_root,
             cache_directory,
+            session,
             None,
             None,
             None,
@@ -402,11 +444,13 @@ impl Snapshot {
                 ));
             }
         }
+        let mut session = EvaluationSession::default();
         Self::evaluate_internal(
             doc,
             context,
             project_root,
             cache_directory,
+            &mut session,
             Some(node_ids),
             None,
             None,
@@ -444,11 +488,13 @@ impl Snapshot {
                 json!({"node_id":prefix_node_id}),
             )
         })?;
+        let mut session = EvaluationSession::default();
         Self::evaluate_internal(
             doc,
             context,
             project_root,
             cache_directory,
+            &mut session,
             Some(node_ids),
             Some(ModifierPrefix {
                 node_id: prefix_node_id,
@@ -465,6 +511,7 @@ impl Snapshot {
         context: &EvaluationContext,
         project_root: Option<&Path>,
         cache_directory: Option<&Path>,
+        session: &mut EvaluationSession,
         target_id: &Id,
         modifier_id: &Id,
         driver_values: &BTreeMap<(Id, String, u32), f64>,
@@ -537,6 +584,7 @@ impl Snapshot {
             Some(&world_matrix_ids),
             None,
             Some(driver_values),
+            session,
         )
     }
 
@@ -567,6 +615,7 @@ impl Snapshot {
             None,
         )?;
         let mut node_errors = BTreeMap::new();
+        let mut session = EvaluationSession::default();
         loop {
             let evaluation = Self::evaluate_gated(
                 doc,
@@ -580,6 +629,7 @@ impl Snapshot {
                 None,
                 None,
                 None,
+                &mut session,
             );
             match evaluation {
                 Ok(snapshot) if node_errors.is_empty() => {
@@ -597,7 +647,7 @@ impl Snapshot {
                         "purpose": snapshot.purpose,
                         "frame": snapshot.frame,
                         "adaptive_render": context.adaptive_render,
-                        "simulation_cache_key": snapshot.simulation_cache_key,
+                        "cache_file_archives": session.cache_file_archive_identity(),
                     });
                     snapshot.evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
                     for node_id in node_errors.keys() {
@@ -686,6 +736,7 @@ impl Snapshot {
         context: &EvaluationContext,
         project_root: Option<&Path>,
         cache_directory: Option<&Path>,
+        session: &mut EvaluationSession,
         selected_nodes: Option<&BTreeSet<Id>>,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
@@ -781,6 +832,7 @@ impl Snapshot {
             world_matrix_ids,
             modifier_prefix,
             driver_values,
+            session,
         )
     }
 
@@ -798,6 +850,7 @@ impl Snapshot {
         world_matrix_ids: Option<&BTreeSet<Id>>,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+        session: &mut EvaluationSession,
     ) -> Result<Self> {
         // Settings that an accepted lossy import reported are not evaluated: evaluate a copy without them,
         // and carry one warning per value.
@@ -818,6 +871,7 @@ impl Snapshot {
             world_matrix_ids,
             modifier_prefix,
             driver_values,
+            session,
         )?;
         snapshot.warnings.splice(0..0, accepted_warnings);
         Ok(snapshot)
@@ -835,6 +889,7 @@ impl Snapshot {
         world_matrix_ids: Option<&BTreeSet<Id>>,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+        session: &mut EvaluationSession,
     ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
@@ -890,6 +945,7 @@ impl Snapshot {
             modifier_context.project_root,
             scene.fps,
             scene.fps_base,
+            session,
         )?;
         let adaptive_render = context
             .adaptive_render
@@ -1036,6 +1092,7 @@ impl Snapshot {
                             modifier_context.project_root,
                             scene.fps,
                             scene.fps_base,
+                            session,
                         )?;
                     (evaluated.world, evaluated.pose)
                 } else {
@@ -1050,6 +1107,7 @@ impl Snapshot {
                             modifier_context.project_root,
                             scene.fps,
                             scene.fps_base,
+                            session,
                         )?,
                         None,
                     )
@@ -1081,7 +1139,7 @@ impl Snapshot {
             "purpose": context.purpose,
             "frame": frame,
             "adaptive_render": context.adaptive_render,
-            "simulation_cache_key": simulation_cache_key,
+            "cache_file_archives": session.cache_file_archive_identity(),
         });
         if let Some(prefix) = modifier_prefix {
             evaluation_key["modifier_prefix"] =
@@ -1256,6 +1314,7 @@ impl Snapshot {
                                         scene.fps_base,
                                         &meshes,
                                         multi_input,
+                                        session,
                                     ),
                                     "lattice" => apply_lattice_modifier(
                                         mesh, modifier, id, data_block, doc, &matrices,
@@ -1324,6 +1383,7 @@ impl Snapshot {
                                         frame,
                                         scene.fps,
                                         scene.fps_base,
+                                        session,
                                     )
                                     .map(|warnings| modifier_warnings.extend(warnings)),
                                     "mesh_cache" => apply_mesh_cache_modifier(
@@ -1589,6 +1649,7 @@ impl Snapshot {
                                         scene.fps_base,
                                         &meshes,
                                         multi_input,
+                                        session,
                                     ),
                                     "lattice" => apply_lattice_modifier(
                                         mesh, modifier, id, data_block, doc, &matrices,
@@ -1657,6 +1718,7 @@ impl Snapshot {
                                         frame,
                                         scene.fps,
                                         scene.fps_base,
+                                        session,
                                     )
                                     .map(|warnings| modifier_warnings.extend(warnings)),
                                     "mesh_cache" => apply_mesh_cache_modifier(
@@ -2012,6 +2074,7 @@ impl Snapshot {
                 scene.fps,
                 scene.fps_base,
                 &meshes,
+                session,
             )?;
             for (id, evaluated_node) in &mut nodes {
                 let matrix = matrices.get(id).copied().ok_or_else(|| {
@@ -2052,6 +2115,7 @@ impl Snapshot {
                                 scene.fps,
                                 scene.fps_base,
                                 &meshes,
+                                session,
                             )?;
                         (evaluated.world, evaluated.pose)
                     } else {
@@ -2067,6 +2131,7 @@ impl Snapshot {
                                 scene.fps,
                                 scene.fps_base,
                                 &meshes,
+                                session,
                             )?,
                             None,
                         )
@@ -3132,6 +3197,7 @@ fn apply_mesh_sequence_cache_modifier(
     frame: f64,
     fps: u32,
     fps_base: f64,
+    session: &mut EvaluationSession,
 ) -> Result<Vec<PotError>> {
     // Blender's MeshSequenceCache is disabled without an object path or a cache resource.
     match modifier.params.get("object_path") {
@@ -3192,17 +3258,49 @@ fn apply_mesh_sequence_cache_modifier(
                 })?,
         };
         match read_cache_sequence_resource(resource, project_root, requested_frame)? {
-            CacheSequenceRead::Available(bytes, digest) => (bytes, digest),
+            CacheSequenceRead::Available(bytes, digest) => {
+                let selected_frame = num_traits::ToPrimitive::to_i32(&requested_frame.trunc())
+                    .ok_or_else(|| {
+                        PotError::with_details(
+                            ErrorCode::InvalidArgument,
+                            "Mesh Sequence Cache frame is outside int32 sequence range",
+                            json!({"modifier_id":modifier.id,"frame":requested_frame}),
+                        )
+                    })?;
+                let selected = SelectedCacheFileArchive {
+                    frame: selected_frame,
+                    bytes: Arc::new(bytes),
+                    hash: Arc::from(digest),
+                };
+                session
+                    .cache_file_archives
+                    .insert(resource_id.clone(), selected);
+                let selected = session
+                    .cache_file_archives
+                    .get(&resource_id)
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "selected cache archive disappeared",
+                        )
+                    })?;
+                (Arc::clone(&selected.bytes), Arc::clone(&selected.hash))
+            }
             CacheSequenceRead::Missing { frame, reason } => {
-                return Ok(vec![PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "Alembic sequence frame is unavailable; Mesh Sequence Cache was skipped",
-                    json!({"modifier_id":modifier.id,"node_id":subject_id,"resource_id":resource_id,"frame":frame,"reason":reason}),
-                )]);
+                if let Some(selected) = session.cache_file_archives.get(&resource_id) {
+                    (Arc::clone(&selected.bytes), Arc::clone(&selected.hash))
+                } else {
+                    return Ok(vec![PotError::with_details(
+                        ErrorCode::DependencyMissing,
+                        "Alembic sequence frame is unavailable; Mesh Sequence Cache was skipped",
+                        json!({"modifier_id":modifier.id,"node_id":subject_id,"resource_id":resource_id,"frame":frame,"reason":reason}),
+                    )]);
+                }
             }
         }
     } else {
-        read_cache_resource(doc, project_root, &resource_id)?
+        let (bytes, digest) = read_cache_resource(doc, project_root, &resource_id)?;
+        (Arc::new(bytes), Arc::from(digest))
     };
     crate::cache_sequence::reject_usd_cache(&bytes, resource_id.as_str())?;
     crate::geom::mesh_cache::evaluate(

@@ -2,7 +2,7 @@ use std::{error::Error, fs, io, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationSession, Snapshot},
     model::{Id, ReconstructedPoint, SceneDoc, TrackingMarker},
     ops,
     tracking::{CameraModel, CameraObservation},
@@ -85,6 +85,35 @@ fn max_matrix_error(left: DMat4, right: DMat4) -> f64 {
         .zip(right.to_cols_array())
         .map(|(left, right)| (left - right).abs())
         .fold(0.0_f64, f64::max)
+}
+
+fn assert_mesh_positions_match(mesh: &potter_core::geom::Mesh, expected: &Value) -> TestResult {
+    let expected: Vec<[f64; 3]> = serde_json::from_value(expected.clone())?;
+    assert_eq!(mesh.vertices.len(), expected.len());
+    let mut actual = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.to_array())
+        .collect::<Vec<_>>();
+    for expected in expected {
+        let Some(index) = actual.iter().position(|point| {
+            point
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-5)
+        }) else {
+            return Err(io::Error::other(format!(
+                "cache mesh vertex {expected:?} was not present in {actual:?}"
+            ))
+            .into());
+        };
+        actual.swap_remove(index);
+    }
+    assert!(
+        actual.is_empty(),
+        "unexpected cache mesh vertices: {actual:?}"
+    );
+    Ok(())
 }
 fn object_reprojection_errors(
     doc: &SceneDoc,
@@ -2163,7 +2192,7 @@ with open(output_path, "w", encoding="utf-8") as output:
     Ok(())
 }
 #[test]
-fn blender_transform_cache_sequence_gap_uses_the_last_valid_frame() -> TestResult {
+fn blender_transform_cache_sequence_gap_reuses_the_selected_archive() -> TestResult {
     let Some(blender) = blender_executable() else {
         return Err(
             io::Error::other("Blender is required for the Transform Cache sequence probe").into(),
@@ -2177,40 +2206,79 @@ import bpy, json, os, sys
 root = sys.argv[sys.argv.index("--") + 1]
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
-for frame, x in ((1, 10.0), (2, 20.0), (4, 40.0)):
-    scene.frame_set(frame)
+scene.render.fps = 1
+def new_source():
     mesh = bpy.data.meshes.new("Mesh")
-    mesh.from_pydata([(0,0,0),(1,0,0),(0,1,0)], [], [(0,1,2)])
-    obj = bpy.data.objects.new("Animated", mesh)
-    scene.collection.objects.link(obj)
-    obj.location.x = x
-    obj.select_set(True); bpy.context.view_layer.objects.active = obj
-    bpy.ops.wm.alembic_export(filepath=os.path.join(root, f"seq.{frame:04d}.abc"),
-        start=frame, end=frame, selected=True, flatten=False, uvs=False, normals=False,
-        as_background_job=False)
-    bpy.data.objects.remove(obj, do_unlink=True); bpy.data.meshes.remove(mesh)
-first_path = os.path.join(root, "seq.0001.abc")
-bpy.ops.wm.alembic_import(filepath=first_path, set_frame_range=False,
-    always_add_cache_reader=True, as_background_job=False)
+    mesh.from_pydata([(-1,-1,0),(1,-1,0),(1,1,0),(-1,1,0)], [], [(0,1,2,3)])
+    obj = bpy.data.objects.new("Animated", mesh); scene.collection.objects.link(obj)
+    return obj, mesh
+for frame, x in ((1,10.0),(2,20.0)):
+    scene.frame_set(frame); obj, mesh = new_source()
+    obj.location.x = x; obj.select_set(True); bpy.context.view_layer.objects.active = obj
+    bpy.ops.wm.alembic_export(filepath=os.path.join(root,f"seq.{frame:04d}.abc"),
+        start=frame,end=frame,selected=True,flatten=False,uvs=False,normals=False,as_background_job=False)
+    bpy.data.objects.remove(obj,do_unlink=True); bpy.data.meshes.remove(mesh)
+scene.frame_set(3); obj, mesh = new_source()
+basis = obj.shape_key_add(name="Basis")
+lift = obj.shape_key_add(name="Lift")
+lift.data[0].co.z = 2.0
+lift.value = 0.0; lift.keyframe_insert(data_path="value",frame=3)
+lift.value = 1.0; lift.keyframe_insert(data_path="value",frame=4)
+obj.location.x = 30.0; obj.keyframe_insert(data_path="location",frame=3)
+obj.location.x = 40.0; obj.keyframe_insert(data_path="location",frame=4)
+obj.select_set(True); bpy.context.view_layer.objects.active = obj
+bpy.ops.wm.alembic_export(filepath=os.path.join(root,"seq.0004.abc"),
+    start=3,end=4,selected=True,flatten=False,uvs=False,normals=False,as_background_job=False)
+bpy.data.objects.remove(obj,do_unlink=True); bpy.data.meshes.remove(mesh)
+scene.render.fps = 24
+first_path = os.path.join(root,"seq.0001.abc")
+bpy.ops.wm.alembic_import(filepath=first_path,set_frame_range=False,always_add_cache_reader=True,as_background_job=False)
 cache = bpy.data.cache_files[-1]
 object_path = cache.object_paths[0].path
 cache.filepath = first_path; cache.is_sequence = True
 for obj in list(bpy.data.objects):
-    if obj.type == "MESH": bpy.data.objects.remove(obj, do_unlink=True)
-owner = bpy.data.objects.new("Owner", None); scene.collection.objects.link(owner)
-owner.location = (3.0, 5.0, 7.0); owner.rotation_euler = (0.2, -0.3, 0.4); owner.scale = (1.5, 2.0, 0.75)
+    if obj.type == "MESH": bpy.data.objects.remove(obj,do_unlink=True)
+def new_owner(name):
+    obj = bpy.data.objects.new(name,None); scene.collection.objects.link(obj)
+    obj.location=(3.0,5.0,7.0); obj.rotation_euler=(0.2,-0.3,0.4); obj.scale=(1.5,2.0,0.75)
+    return obj
+def matrix(obj):
+    value=obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).matrix_world
+    return [float(value[r][c]) for c in range(4) for r in range(4)]
+def positions(obj):
+    evaluated=obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    mesh=evaluated.to_mesh()
+    try: return [[float(v.co[i]) for i in range(3)] for v in mesh.vertices]
+    finally: evaluated.to_mesh_clear()
+owner = new_owner("SequenceOwner")
 constraint = owner.constraints.new("TRANSFORM_CACHE")
-constraint.cache_file = cache; constraint.object_path = object_path
-assert constraint.is_valid
-result = {}
-for frame in (1, 2, 3):
+constraint.cache_file=cache; constraint.object_path=object_path
+receiver_mesh=bpy.data.meshes.new("ReceiverMesh")
+receiver_mesh.from_pydata([(-1,-1,0),(1,-1,0),(1,1,0),(-1,1,0)], [], [(0,1,2,3)])
+receiver=bpy.data.objects.new("Receiver",receiver_mesh); scene.collection.objects.link(receiver)
+modifier=receiver.modifiers.new("Sequence Cache","MESH_SEQUENCE_CACHE")
+modifier.cache_file=cache; modifier.object_path=object_path; modifier.read_data={"VERT","POLY"}
+sequence={}
+for frame in (4,3):
     scene.frame_set(frame); bpy.context.view_layer.update()
-    matrix = owner.evaluated_get(bpy.context.evaluated_depsgraph_get()).matrix_world
-    result[str(frame)] = [float(matrix[r][c]) for c in range(4) for r in range(4)]
-assert result["1"] != result["2"], "Xform sequence frames must differ"
-assert result["3"] == result["2"], "Blender holds its last Transform Cache matrix on a missing frame"
-with open(os.path.join(root, "sequence_matrices.json"), "w", encoding="utf-8") as f:
-    json.dump(result, f)
+    sequence[str(frame)]={"matrix":matrix(owner),"vertices":positions(receiver)}
+assert sequence["4"]["matrix"] != sequence["3"]["matrix"]
+assert sequence["4"]["vertices"] != sequence["3"]["vertices"]
+missing_cache_path=os.path.join(root,"seq.0003.abc")
+bpy.ops.cachefile.open(filepath=missing_cache_path)
+missing_cache=bpy.data.cache_files[-1]; missing_cache.is_sequence=True
+fresh_owner=new_owner("FreshOwner")
+fresh_constraint=fresh_owner.constraints.new("TRANSFORM_CACHE")
+fresh_constraint.cache_file=missing_cache; fresh_constraint.object_path=object_path
+fresh_mesh=bpy.data.meshes.new("FreshMesh")
+fresh_mesh.from_pydata([(-1,-1,0),(1,-1,0),(1,1,0),(-1,1,0)], [], [(0,1,2,3)])
+fresh_receiver=bpy.data.objects.new("FreshReceiver",fresh_mesh); scene.collection.objects.link(fresh_receiver)
+fresh_modifier=fresh_receiver.modifiers.new("Missing Cache","MESH_SEQUENCE_CACHE")
+fresh_modifier.cache_file=missing_cache; fresh_modifier.object_path=object_path; fresh_modifier.read_data={"VERT","POLY"}
+scene.frame_set(3); bpy.context.view_layer.update()
+fresh_missing={"matrix":matrix(fresh_owner),"vertices":positions(fresh_receiver)}
+with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f:
+    json.dump({"sequence":sequence,"fresh_missing":fresh_missing},f)
 "#;
     let script_path = root.join("make_transform_sequence.py");
     fs::write(&script_path, script)?;
@@ -2227,8 +2295,10 @@ with open(os.path.join(root, "sequence_matrices.json"), "w", encoding="utf-8") a
     let pattern = root.join("seq.####.abc");
     let (_directory, project_path) = project(&json!([
         {"op":"node.create","id":"owner","kind":"empty","transform":{"translation":[3.0,5.0,7.0],"rotation_deg":[11.459_156,-17.188_734,22.918_312],"scale":[1.5,2.0,0.75]}},
+        {"op":"node.create","id":"receiver","kind":"plane","params":{"size":2.0}},
         {"op":"resource.pack","id":"cache","uri":pattern,"kind":"alembic","sequence":{"start":1,"end":2}},
-        {"op":"constraint.create","target":{"id":"owner"},"id":"cache","type":"transform_cache","params":{"resource":"cache","object_path":"/Animated/Mesh","frame_offset":0.0,"scale":1.0,"override_frame":null}}
+        {"op":"constraint.create","target":{"id":"owner"},"id":"cache","type":"transform_cache","params":{"resource":"cache","object_path":"/Animated/Mesh","frame_offset":0.0,"scale":1.0,"override_frame":null}},
+        {"op":"modifier.create","target":{"id":"receiver"},"id":"sequence","type":"mesh_sequence_cache","params":{"resource":"cache","object_path":"/Animated/Mesh","is_sequence":true,"read_data":["VERT","POLY"]}}
     ]))?;
     let frame4 = fs::read(root.join("seq.0004.abc"))?;
     let digest = potter_core::hash::sha256(&frame4);
@@ -2244,8 +2314,9 @@ with open(os.path.join(root, "sequence_matrices.json"), "w", encoding="utf-8") a
     )?;
     let document: SceneDoc = serde_json::from_slice(&fs::read(project_path.join("scene.json"))?)?;
     let oracle: Value = serde_json::from_slice(&fs::read(output_path)?)?;
-    for frame in [1.0, 2.0] {
-        let snapshot = Snapshot::evaluate_with_cache(
+    let mut session = EvaluationSession::default();
+    for frame in [4.0, 3.0] {
+        let snapshot = Snapshot::evaluate_with_cache_session(
             &document,
             &EvaluationContext {
                 frame: Some(frame),
@@ -2253,16 +2324,24 @@ with open(os.path.join(root, "sequence_matrices.json"), "w", encoding="utf-8") a
             },
             Some(&project_path),
             Some(&project_path.join(".potter/cache")),
+            &mut session,
         )?;
         let actual = snapshot.nodes[&Id::new("owner")?].world_matrix;
+        let oracle_frame = &oracle["sequence"][frame.to_string()];
         assert!(
             max_matrix_error(
                 DMat4::from_cols_array(&actual),
-                blender_matrix(&oracle[frame.to_string()])?
-            ) < 1.0e-5
+                blender_matrix(&oracle_frame["matrix"])?
+            ) < 1.0e-5,
+            "Transform Cache differs at frame {frame}"
         );
+        let mesh = snapshot
+            .meshes
+            .get(&Id::new("receiver")?)
+            .ok_or_else(|| io::Error::other("Mesh Sequence Cache receiver mesh is missing"))?;
+        assert_mesh_positions_match(mesh, &oracle_frame["vertices"])?;
     }
-    let missing = Snapshot::evaluate_with_cache(
+    let retained_missing = Snapshot::evaluate_with_cache_session(
         &document,
         &EvaluationContext {
             frame: Some(3.0),
@@ -2270,15 +2349,36 @@ with open(os.path.join(root, "sequence_matrices.json"), "w", encoding="utf-8") a
         },
         Some(&project_path),
         Some(&project_path.join(".potter/cache")),
+        &mut session,
     )?;
-    let actual = missing.nodes[&Id::new("owner")?].world_matrix;
+    let mut fresh_session = EvaluationSession::default();
+    let fresh_missing = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(3.0),
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut fresh_session,
+    )?;
+    assert_ne!(
+        retained_missing.evaluation_hash, fresh_missing.evaluation_hash,
+        "the selected CacheFile archive participates in the evaluation key"
+    );
+    let actual = fresh_missing.nodes[&Id::new("owner")?].world_matrix;
     assert!(
         max_matrix_error(
             DMat4::from_cols_array(&actual),
-            blender_matrix(&oracle["3"])?
+            blender_matrix(&oracle["fresh_missing"]["matrix"])?
         ) < 1.0e-5,
-        "a missing frame in a sequence must retain Blender's last valid Transform Cache matrix"
+        "without a selected CacheFile archive, Transform Cache must preserve the owner's base matrix"
     );
+    let mesh = fresh_missing
+        .meshes
+        .get(&Id::new("receiver")?)
+        .ok_or_else(|| io::Error::other("fresh missing-frame receiver mesh is missing"))?;
+    assert_mesh_positions_match(mesh, &oracle["fresh_missing"]["vertices"])?;
     Ok(())
 }
 #[test]
