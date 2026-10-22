@@ -896,6 +896,10 @@ fn crate_uv_values(mesh: &Mesh) -> BTreeMap<String, Value> {
 /// Cause not root-caused (the fan and keep-sharp aggregation in `geom/modifiers/attributes/normals.rs`).
 const RECORDED_NORMAL_GAPS: &[(&str, f64)] = &[("FACE_AREA_keep_sharp", 5.063_058_373_093_456e-4)];
 
+// Assumption for these fixtures: paired rounded `short2` outputs differ by <=1 code per factor
+// and each fixture's decoded factor scale is <=pi (`mesh_normals.cc:703-739`).
+// The two factors then bound direction error by `2pi/32767 ~= 1.918e-4` rad;
+// `2e-4` leaves `8.25e-6` for f32 decode arithmetic.
 const NORMAL_TOLERANCE: f64 = 2.0e-4;
 
 fn assert_faces_match(

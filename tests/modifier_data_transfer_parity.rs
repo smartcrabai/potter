@@ -397,6 +397,8 @@ const RECORDED_DATA_TRANSFER_GAPS: &[(&str, f64)] = &[
     ("uv island islands_precision=1", 31.330_000_001_192_094),
 ];
 
+// `1e-6` is the existing absolute float32 payload allowance (~8.4 ULP at |x|=1), not a worst-case geometric remap bound.
+// Discrete mapping/source choices are asserted separately.
 /// Asserts a parity error against `tolerance`, or, for a recorded gap, against the recorded error: the case must stay
 /// above the tolerance and keep its recorded value, so any change fails until the table is updated.
 fn assert_parity_error(label: &str, error: f64, tolerance: f64, detail: &str) {
@@ -1736,6 +1738,8 @@ fn custom_normal_transfer_keeps_typed_codes_and_corner_order() -> Result<(), Box
         .map(|normal| normal.to_array())
         .collect::<Vec<_>>();
     let error = max_error(&json!(actual_values), &expected["output_normals"])?;
+    // The custom-normal `2e-4` comparison uses the short2-codec bound
+    // documented by `NORMAL_TOLERANCE` in `modifier_normal_parity.rs`.
     assert!(error < 2.0e-4, "CUSTOM_NORMAL max error {error}");
     assert_eq!(actual.attributes["custom_normal"]["type"], "normal_code");
     Ok(())
@@ -3122,6 +3126,9 @@ fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<d
     );
     let error = max_error(&actual_values, &expected["corner_normals"])?;
     assert!(
+        // Blender returns these axis-aligned `corner_normals` as float32
+        // (ULP at 1 is `2^-23 ~= 1.19e-7`); keep the existing component allowance
+        // distinct from short2-coded normals.
         error < 2.0e-4,
         "sharp-transfer derived corner-normal max error {error}"
     );
