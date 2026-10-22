@@ -411,6 +411,17 @@ fn project_world_point_f32(point: Vec3, projection: &ProjectorProjection) -> Vec
 }
 
 /// Build Blender's complete UV Warp matrix from original object or pose-bone world matrices.
+/// Whether a UV Warp names a bone (`bone_from` or `bone_to`), which needs the scene's resolved pose.
+fn bone_mode(modifier: &Modifier) -> bool {
+    ["bone_from", "bone_to"].iter().any(|parameter| {
+        modifier
+            .params
+            .get(*parameter)
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty())
+    })
+}
+
 pub(crate) fn build_uv_warp_matrix_f32(
     source_world: Option<[f32; 16]>,
     destination_world: Option<[f32; 16]>,
@@ -535,6 +546,13 @@ pub(super) fn uv_warp(
     };
     let matrix = if let Some(columns) = modifier.runtime.uv_warp_matrix {
         flatten_runtime_matrix(columns)
+    } else if bone_mode(modifier) {
+        // Bone pose matrices exist only in the scene context, so a bone-mode warp without them is refused.
+        return Err(PotError::with_details(
+            ErrorCode::EvaluationFailed,
+            "UV Warp bone matrix is missing from the evaluated scene context",
+            json!({"modifier_id":modifier.id}),
+        ));
     } else if ["object_from", "object_to"].iter().all(|parameter| {
         modifier
             .params
@@ -543,21 +561,27 @@ pub(super) fn uv_warp(
     }) {
         build_uv_warp_matrix_f32(None, None, modifier)?
     } else {
-        // Direct evaluation passes the object references as operands; the scene path sets the runtime
-        // matrix above. Each operand's Blender f32 world matrix is the object's world transform.
+        // Direct evaluation passes the object references as operands; each named object's world matrix is
+        // its Blender f32 world transform. A named object without one is refused, not treated as identity.
         let operand_world = |parameter: &str| -> Result<Option<[f32; 16]>> {
-            let Some(operand) = operands.get(parameter).and_then(|items| items.first()) else {
+            let named = modifier
+                .params
+                .get(parameter)
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty());
+            if !named {
                 return Ok(None);
-            };
-            operand
-                .blender_matrices_f32
-                .as_ref()
+            }
+            operands
+                .get(parameter)
+                .and_then(|items| items.first())
+                .and_then(|operand| operand.blender_matrices_f32.as_ref())
                 .and_then(|matrices| matrices.world)
                 .map(Some)
                 .ok_or_else(|| {
                     PotError::with_details(
                         ErrorCode::EvaluationFailed,
-                        "UV Warp reference world matrix is missing from the evaluated scene context",
+                        "UV Warp object matrix is missing from the evaluated scene context",
                         json!({"modifier_id":modifier.id,"parameter":parameter}),
                     )
                 })

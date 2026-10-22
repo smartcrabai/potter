@@ -879,7 +879,7 @@ fn crate_uv_values(mesh: &Mesh) -> BTreeMap<String, Value> {
 
 /// Recorded gaps: cases whose maximum corner-normal angle (radians) against Blender 5.2.2 is known to exceed the
 /// tolerance. Each is asserted to stay at its recorded value, so any change fails the test until this table is updated.
-/// FACE_AREA_keep_sharp, weighted normal with keep sharp and FACE_AREA weights: 5.063e-4 rad against a 2e-4 tolerance.
+/// `FACE_AREA_keep_sharp`, weighted normal with keep sharp and `FACE_AREA` weights: 5.063e-4 rad against a 2e-4 tolerance.
 /// Cause not root-caused (the fan and keep-sharp aggregation in `geom/modifiers/attributes/normals.rs`).
 const RECORDED_NORMAL_GAPS: &[(&str, f64)] = &[("FACE_AREA_keep_sharp", 5.063_058_373_093_456e-4)];
 
