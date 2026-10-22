@@ -47,15 +47,18 @@ const FILTER_SIZES: [&str; 3] = ["0.01", "0.5", "1.5"];
 /// The columns compared: the edge at pixel 32.3 and the neighbours that a filter of 1.5 px reaches.
 const COLUMNS: std::ops::RangeInclusive<usize> = 28..=36;
 
-/// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL: the residual below has no
-/// explanation that holds at both filter sizes, so this bound is not derived. Potter renders at EEVEE's 256 samples,
-/// with the same Halton pattern and film, and its raster sits at `-j` (`render/raster.rs`, `jitter`), as EEVEE's window
-/// shift does (`eevee_view.cc`, `window_translate_m4`). The worst deviations are 0 at 0.01 px, 0.0069 at 0.5 px (column
-/// 32, the edge), and 0.0021 at 1.5 px. The 0.0069 is not half-float quantisation (near 5e-4). EEVEE's static film
-/// accumulation weights the history by its own luma (`eevee_film.bsl.hh`, `store_combined`: `weight_dst =
-/// luma_weight(color_dst.x) * dst.weight`). Simulating that recurrence reproduces 0.5 px to 0.0004, but it opens 1.5 px
-/// to 0.048, so it does not explain both sizes. The bound stays at 0.03 until one model explains both.
-const TOLERANCE: f64 = 0.03;
+/// Linear tolerance on a column's row-averaged red value against EEVEE, derived as one sample's weight at the edge. The
+/// film averages 256 samples, so the largest single frame's share of a column's weight is the smallest change one sample
+/// can make: 0.0077 for filter sizes 0.5 and 0.7 px, and 0.0044 at 1.5 px, from the Gaussian weights of the Halton
+/// pattern. The bound is that share rounded up. Potter renders at EEVEE's 256 samples, with the same Halton pattern and
+/// film, and its raster sits at `-j` (`render/raster.rs`, `jitter`), as EEVEE's window shift does (`eevee_view.cc`,
+/// `window_translate_m4`). The measured deviations are 0 at 0.01 px, 0.0069 at 0.5 px (column 32, the edge), and 0.0021
+/// at 1.5 px, all within the bound. A sweep of EEVEE renders from 0.3 to 1.5 px matches the plain Gaussian sum within
+/// 0.007 at every size, and the residual changes sign between sizes, which a single edge sample explains. Not explained:
+/// why one sample lands differently in EEVEE at 0.5 and 0.7 px. Sub-pixel snapping to 1/256 px narrows 0.7 px but not
+/// 0.5 px. EEVEE's static luma-history recurrence (`eevee_film.bsl.hh`, `store_combined`) was tested and rejected: it fits
+/// 0.5 px only by coincidence and misses the other sizes.
+const TOLERANCE: f64 = 0.008;
 
 /// The mean red value of each column of the image `id`, averaged over the rows, read with Potter's own EXR loader.
 fn column_profile(project: &Path, id: &str) -> Result<Vec<f64>, Box<dyn Error>> {
