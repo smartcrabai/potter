@@ -124,6 +124,12 @@ pub fn export_blend(
     check_blender_version(&blender)?;
     let mut losses = export_losses(doc);
     losses.extend(native_bind_export_losses(doc, project));
+    // An accepted import loss for a physics setting is re-reported from its compatibility payload, so
+    // re-exporting that setting adds no new loss. Other accepted losses (images, materials) still refuse.
+    losses.retain(|loss| {
+        !(loss.feature_id.starts_with("blender.physics.")
+            && doc.accepted_losses.contains(&loss.feature_id))
+    });
     let (texture_losses, texture_edits) =
         crate::exchange::material_graph::plan_blend_textures(doc)?;
     losses.extend(texture_losses);
@@ -2977,6 +2983,7 @@ fn build_imported_graph(
             ))
             .map_err(|_| invalid_intermediate("render transparent_max_bounces is out of range"))?,
             dicing_rate: number_field(&render, "dicing_rate", 1.0),
+            filter_glossy: number_field(&render, "filter_glossy", 1.0),
             preview_dicing_rate: number_field(&render, "preview_dicing_rate", 8.0),
             max_subdivisions: u32::try_from(integer_field(&render, "max_subdivisions", 12))
                 .map_err(|_| invalid_intermediate("render max_subdivisions is out of range"))?,
@@ -3971,6 +3978,16 @@ fn build_imported_graph(
                         )?;
                     }
                 }
+                if modifier_type == "VOLUME_DISPLACE"
+                    && params
+                        .get("texture")
+                        .and_then(|texture| texture.get("id_type"))
+                        .and_then(Value::as_str)
+                        == Some("Texture")
+                {
+                    // A Blender Tex has no Potter model: `import_losses` reports it, and the modifier keeps no texture.
+                    params.remove("texture");
+                }
                 if modifier_type == "UV_PROJECT" {
                     let projectors = params
                         .get("projectors")
@@ -4042,12 +4059,32 @@ fn build_imported_graph(
                         .get("physics_settings")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
+                    let blender_system = blender_physics_system(modifier_type, &settings);
+                    if model_type == "fluid" {
+                        if let Some(settings) = settings.as_object_mut() {
+                            settings.remove("role");
+                        }
+                    } else if model_type == "dynamic_paint"
+                        && let Some(role) = settings
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .filter(|role| matches!(*role, "brush" | "canvas"))
+                    {
+                        params.insert(
+                            "ui_type".to_owned(),
+                            json!(if role == "brush" { "BRUSH" } else { "CANVAS" }),
+                        );
+                    }
                     canonicalize_blender_id_references(
                         &mut settings,
                         &object_ids,
                         &movie_clip_ids,
                         &action_ids,
                     )?;
+                    if let (Some(system), Some(block)) = (blender_system, settings.as_object_mut())
+                    {
+                        resolve_physics_collection_references(system, block, &collection_ids);
+                    }
                     if model_type == "particle_system" {
                         if !properties.contains_key(property) {
                             properties.insert(property.to_owned(), settings.clone());
@@ -6472,6 +6509,7 @@ fn import_volumes(
             crate::geom::volume::VolumeSource::Generated(
                 crate::geom::volume::VolumeGeneratedSource {
                     algorithm: "empty".to_owned(),
+                    active_bounds: None,
                 },
             )
         } else {
@@ -8809,6 +8847,14 @@ fn imported_fisheye_lens(item: &Value) -> Option<f64> {
 
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // The importer maps a Blender Collection pointer to a Potter collection only when the raw `collections` array names it.
+    let collection_names: BTreeSet<&str> = raw
+        .get("collections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .collect();
     // Blender stores every panorama setting on every camera, so a value Potter cannot hold is reported whatever the camera's
     // type: the import never changes a camera silently.
     for camera in raw
@@ -9047,6 +9093,28 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             if !known_modifier(kind) {
                 losses.push(loss(format!("blender.modifier.{}", kind.to_lowercase()), modifier.get("name").and_then(Value::as_str), "modifier properties are preserved, but this modifier is not editable/evaluated by potter"));
             }
+            if kind == "VOLUME_DISPLACE"
+                && modifier
+                    .get("properties")
+                    .and_then(|params| params.get("texture"))
+                    .and_then(|texture| texture.get("id_type"))
+                    .and_then(Value::as_str)
+                    == Some("Texture")
+            {
+                losses.push(loss(
+                    "blender.modifier.volume_displace.texture",
+                    modifier.get("name").and_then(Value::as_str),
+                    "Potter's Volume Displace samples only Image textures and its noise sentinel; the Blender Tex data-block has no Potter model, so the modifier displaces without a texture",
+                ));
+            }
+            if let Some(settings) = modifier.get("physics_settings") {
+                losses.extend(physics_import_losses(
+                    modifier.get("name").and_then(Value::as_str),
+                    kind,
+                    settings,
+                    &collection_names,
+                ));
+            }
         }
     }
     for action in raw
@@ -9187,6 +9255,29 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 "this render engine is retained in compatibility data but not re-created",
             ));
         }
+        // Render simplify scales every volume voxel size (`BKE_volume_simplify_factor`), which Potter does not apply.
+        let render = scene.get("render");
+        let simplify_on = render
+            .and_then(|render| render.get("use_simplify"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let simplify_volumes = render
+            .and_then(|render| render.get("simplify_volumes"))
+            .and_then(Value::as_f64);
+        let has_volume_modifiers = scene
+            .get("volume_modifier_objects")
+            .and_then(Value::as_array)
+            .is_some_and(|objects| !objects.is_empty());
+        if simplify_on
+            && has_volume_modifiers
+            && simplify_volumes.is_some_and(|scale| (scale - 1.0).abs() > 1.0e-9)
+        {
+            losses.push(loss(
+                "blender.scene.simplify_volumes",
+                scene.get("name").and_then(Value::as_str),
+                "Blender's render simplify scales the voxel size of the volume modifiers by simplify_volumes; Potter does not apply the simplify volume scale, so their grids keep full resolution",
+            ));
+        }
     }
     for data in raw
         .get("other_datablocks")
@@ -9240,6 +9331,275 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         ));
     }
     losses
+}
+
+/// The Blender physics system of a modifier's settings block, from the modifier type and the role that selects the block: a
+/// Fluid modifier's domain, flow, or effector, and a Dynamic Paint modifier's canvas or brush. A domain's system depends on its
+/// `domain_type`, since GAS and LIQUID domains have different Blender defaults.
+fn blender_physics_system(modifier_type: &str, settings: &Value) -> Option<&'static str> {
+    let role = settings.get("role").and_then(Value::as_str);
+    match (modifier_type, role) {
+        ("CLOTH", _) => Some("cloth"),
+        ("SOFT_BODY", _) => Some("soft_body"),
+        ("COLLISION", _) => Some("collision"),
+        ("DYNAMIC_PAINT", Some("canvas")) => Some("dynamic_paint_canvas"),
+        ("DYNAMIC_PAINT", Some("brush")) => Some("dynamic_paint_brush"),
+        ("FLUID", Some("DOMAIN")) => Some(crate::physics_support::fluid_domain_system(
+            settings
+                .get("domain_type")
+                .and_then(Value::as_str)
+                .unwrap_or("GAS"),
+        )),
+        ("FLUID", Some("FLOW")) => Some("fluid_flow"),
+        ("FLUID", Some("EFFECTOR")) => Some("fluid_effector"),
+        _ => None,
+    }
+}
+
+/// Name of the Blender Collection that a physics value points at. The bridge dumps an ID pointer as `{"id_type", "name"}`.
+fn collection_pointer_name(value: &Value) -> Option<&str> {
+    (value.get("id_type").and_then(Value::as_str) == Some("Collection"))
+        .then(|| value.get("name").and_then(Value::as_str))
+        .flatten()
+}
+
+/// Maps the Blender Collection pointers of a physics block, and of the nested blocks and surfaces it holds, to Potter collection
+/// ids. A pointer that the property consumes, and whose collection was imported, becomes that id. Every other pointer is cleared;
+/// `collect_physics_import_losses` reports it.
+fn resolve_physics_collection_references(
+    system: &str,
+    block: &mut Map<String, Value>,
+    collection_ids: &BTreeMap<String, Id>,
+) {
+    let honoured = crate::physics_support::honoured_properties(system);
+    for (key, value) in block.iter_mut() {
+        if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
+            match value {
+                Value::Object(nested_block) => {
+                    resolve_physics_collection_references(nested, nested_block, collection_ids);
+                }
+                Value::Array(items) => {
+                    for nested_block in items.iter_mut().filter_map(Value::as_object_mut) {
+                        resolve_physics_collection_references(nested, nested_block, collection_ids);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Some(name) = collection_pointer_name(value).map(str::to_owned) else {
+            continue;
+        };
+        *value = match collection_ids.get(&name) {
+            Some(id) if honoured.contains(&key.as_str()) => json!(id.as_str()),
+            _ => Value::Null,
+        };
+    }
+}
+
+/// Blender physics settings that Potter keeps but does not evaluate. `settings` is the bridge dump of one modifier's physics
+/// block, scoped by `blender_physics_system`. Each property that the block holds away from its Blender default, and that Potter
+/// does not evaluate, is a loss. `collections` names the imported collections.
+fn physics_import_losses(
+    modifier_name: Option<&str>,
+    modifier_type: &str,
+    settings: &Value,
+    collections: &BTreeSet<&str>,
+) -> Vec<Loss> {
+    let Some(system) = blender_physics_system(modifier_type, settings) else {
+        return Vec::new();
+    };
+    let mut losses = Vec::new();
+    if let Some(block) = settings.as_object() {
+        collect_physics_import_losses(system, block, modifier_name, collections, &mut losses);
+    }
+    losses
+}
+
+fn collect_physics_import_losses(
+    system: &str,
+    block: &Map<String, Value>,
+    owner: Option<&str>,
+    collections: &BTreeSet<&str>,
+    losses: &mut Vec<Loss>,
+) {
+    let honoured = crate::physics_support::honoured_properties(system);
+    for (key, value) in block {
+        if key == "role" {
+            continue;
+        }
+        if crate::physics_support::is_runtime_state(system, key) {
+            // Blender's solver state (estimates, cache paths, cache flags), not a setting the user chose.
+            continue;
+        }
+        if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
+            match value {
+                Value::Object(nested_block) => {
+                    collect_physics_import_losses(nested, nested_block, owner, collections, losses);
+                }
+                Value::Array(items) => {
+                    for nested_block in items.iter().filter_map(Value::as_object) {
+                        collect_physics_import_losses(
+                            nested,
+                            nested_block,
+                            owner,
+                            collections,
+                            losses,
+                        );
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if !crate::physics_support::is_semantic_when(system, key, block) {
+            continue;
+        }
+        let consumed = honoured.contains(&key.as_str());
+        if let Some(name) = collection_pointer_name(value) {
+            // A consumed pointer to an imported collection is mapped on import; every other pointer is cleared there.
+            if !(consumed && collections.contains(name)) {
+                losses.push(loss(
+                    format!("blender.physics.{system}.{key}"),
+                    owner,
+                    &format!(
+                        "Blender's {key} points at collection `{name}`, which Potter cannot apply to this {system} property; the reference is cleared on import, so Potter applies the setting without it"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if consumed {
+            continue;
+        }
+        let default = crate::physics_support::blender_default(system, key);
+        let unchanged = if default.is_some() {
+            crate::physics_support::is_default_value(system, key, value)
+        } else {
+            value.is_null()
+        };
+        if unchanged {
+            continue;
+        }
+        let reason = match default {
+            Some(default) => format!(
+                "Blender's {key} is {value}, not its default {default}; Potter does not evaluate this {system} property and uses its own model, so the value is kept only in compatibility data"
+            ),
+            None => format!(
+                "Blender's {key} is {value}; Potter does not evaluate this {system} property and uses its own model, so the value is kept only in compatibility data"
+            ),
+        };
+        losses.push(loss(
+            format!("blender.physics.{system}.{key}"),
+            owner,
+            &reason,
+        ));
+    }
+}
+
+/// Potter physics settings that the bridge writes only as Blender RNA properties. A key that Blender does not have is dropped
+/// on export, so each set one is reported; null, an empty string, and an empty collection are unset. `role` and `is_baked` are
+/// bridge markers. Each dynamic-paint surface is a block of its own, checked against the surface properties.
+fn potter_physics_export_losses(node: &Node) -> Vec<Loss> {
+    let mut losses = Vec::new();
+    for modifier in &node.modifiers {
+        let (property, system) = match modifier.modifier_type.as_str() {
+            "cloth" => ("physics_cloth", "cloth"),
+            "soft_body" => ("physics_soft_body", "soft_body"),
+            "collision" => ("physics_collision", "collision"),
+            "fluid" => {
+                // The bridge writes `domain_type` when the settings hold it, so that is the domain Blender will have.
+                let domain_type = node
+                    .properties
+                    .get("physics_fluid")
+                    .and_then(Value::as_object)
+                    .and_then(|settings| settings.get("domain_type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("GAS");
+                (
+                    "physics_fluid",
+                    match modifier.params.get("fluid_type").and_then(Value::as_str) {
+                        Some("DOMAIN") => crate::physics_support::fluid_domain_system(domain_type),
+                        Some("FLOW") => "fluid_flow",
+                        Some("EFFECTOR") => "fluid_effector",
+                        _ => continue,
+                    },
+                )
+            }
+            "dynamic_paint" => {
+                let ui_brush =
+                    modifier.params.get("ui_type").and_then(Value::as_str) == Some("BRUSH");
+                let role = node
+                    .properties
+                    .get("physics_dynamic_paint")
+                    .and_then(Value::as_object)
+                    .and_then(|settings| settings.get("role"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(if ui_brush { "brush" } else { "canvas" });
+                (
+                    "physics_dynamic_paint",
+                    if role == "brush" {
+                        "dynamic_paint_brush"
+                    } else {
+                        "dynamic_paint_canvas"
+                    },
+                )
+            }
+            _ => continue,
+        };
+        if let Some(settings) = node.properties.get(property).and_then(Value::as_object) {
+            collect_potter_physics_export_losses(system, settings, &modifier.id, &mut losses);
+        }
+    }
+    losses
+}
+
+fn collect_potter_physics_export_losses(
+    system: &str,
+    settings: &Map<String, Value>,
+    owner: &Id,
+    losses: &mut Vec<Loss>,
+) {
+    for (key, value) in settings {
+        let unset = match value {
+            Value::Null => true,
+            Value::String(text) => text.is_empty(),
+            Value::Array(items) => items.is_empty(),
+            Value::Object(entries) => entries.is_empty(),
+            _ => false,
+        };
+        if matches!(key.as_str(), "role" | "is_baked")
+            || unset
+            || crate::physics_support::is_runtime_state(system, key)
+        {
+            continue;
+        }
+        if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
+            match value {
+                Value::Object(block) => {
+                    collect_potter_physics_export_losses(nested, block, owner, losses);
+                }
+                Value::Array(blocks) => {
+                    for block in blocks.iter().filter_map(Value::as_object) {
+                        collect_potter_physics_export_losses(nested, block, owner, losses);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if !crate::physics_support::is_semantic_when(system, key, settings) {
+            continue;
+        }
+        if crate::physics_support::is_blender_property(system, key) {
+            continue;
+        }
+        losses.push(loss(
+            format!("potter.physics.{system}.{key}"),
+            Some(owner.as_str()),
+            "this Potter physics setting is not a Blender RNA property, so it is not written to the .blend",
+        ));
+    }
 }
 
 fn has_verbatim_native_movie_clip(doc: &SceneDoc, clip: &MovieClip) -> bool {
@@ -9596,6 +9956,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 ));
             }
         }
+        losses.extend(potter_physics_export_losses(node));
     }
     for link in native_value_noise_texture_links(doc) {
         losses.push(loss(
@@ -18599,5 +18960,153 @@ mod workbench_display_loss_tests {
             losses(&[("background_type", json!("VIEWPORT"))]),
             ["blender.scene.display_background"]
         );
+    }
+}
+
+#[cfg(test)]
+mod volume_and_physics_loss_tests {
+    use super::*;
+
+    fn features(raw: &Value) -> Vec<String> {
+        import_losses(raw)
+            .into_iter()
+            .map(|loss| loss.feature_id)
+            .collect()
+    }
+
+    #[test]
+    fn volume_displace_tex_pointer_is_reported_and_no_texture_is_not() {
+        let object = |texture: Value| {
+            json!({"name": "Vol", "type": "VOLUME", "modifiers": [{
+                "name": "Displace", "type": "VOLUME_DISPLACE", "properties": {"texture": texture}
+            }]})
+        };
+        assert_eq!(
+            features(&json!({"objects": [object(json!({"id_type": "Texture", "name": "Tex"}))]})),
+            ["blender.modifier.volume_displace.texture"]
+        );
+        assert_eq!(
+            features(&json!({"objects": [object(Value::Null)]})),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn simplify_is_reported_only_when_the_scene_has_a_volume_modifier() {
+        let has_simplify = |volume_objects: Value| {
+            features(&json!({"scenes": [{
+                "name": "Scene",
+                "render": {"use_simplify": true, "simplify_volumes": 0.5},
+                "volume_modifier_objects": volume_objects,
+            }]}))
+            .iter()
+            .any(|feature| feature == "blender.scene.simplify_volumes")
+        };
+        assert!(has_simplify(json!(["Vol"])));
+        assert!(!has_simplify(json!([])));
+    }
+
+    #[test]
+    fn physics_value_at_its_blender_default_is_not_reported() {
+        let raw = json!({"objects": [{"name": "Col", "type": "MESH", "modifiers": [{
+            "name": "Collision", "type": "COLLISION",
+            "physics_settings": {"thickness_outer": 0.02, "use_culling": true}
+        }]}]});
+        assert_eq!(features(&raw), Vec::<String>::new());
+    }
+
+    #[test]
+    fn potter_only_physics_keys_are_reported_on_export() -> Result<()> {
+        let settings: Map<String, Value> = [
+            ("stiffness".to_owned(), json!(0.5)),
+            ("mass".to_owned(), json!(0.3)),
+        ]
+        .into_iter()
+        .collect();
+        let owner = Id::new("cloth_modifier")?;
+        let mut losses = Vec::new();
+        collect_potter_physics_export_losses("cloth", &settings, &owner, &mut losses);
+        let features: Vec<String> = losses.into_iter().map(|loss| loss.feature_id).collect();
+        assert_eq!(features, ["potter.physics.cloth.stiffness"]);
+        Ok(())
+    }
+
+    #[test]
+    fn collection_pointer_maps_to_potter_collection_when_consumed_and_imported() -> Result<()> {
+        let collection_ids = BTreeMap::from([("Col".to_owned(), Id::new("collection_col")?)]);
+        let mut settings =
+            json!({"collision_settings": {"collection": {"id_type": "Collection", "name": "Col"}}});
+        let block = settings
+            .as_object_mut()
+            .ok_or_else(|| PotError::invalid_argument("test settings must be an object"))?;
+        resolve_physics_collection_references("cloth", block, &collection_ids);
+        assert_eq!(
+            settings["collision_settings"]["collection"],
+            json!("collection_col")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collection_pointer_to_an_unimported_collection_is_cleared_and_reported() -> Result<()> {
+        let mut settings = json!({"collision_settings": {"collection": {"id_type": "Collection", "name": "Missing"}}});
+        let block = settings
+            .as_object_mut()
+            .ok_or_else(|| PotError::invalid_argument("test settings must be an object"))?;
+        resolve_physics_collection_references("cloth", block, &BTreeMap::new());
+        assert_eq!(settings["collision_settings"]["collection"], Value::Null);
+        let raw = json!({"objects": [{"name": "Cloth", "type": "MESH", "modifiers": [{
+            "name": "Cloth", "type": "CLOTH",
+            "physics_settings": {"collision_settings": {"collection": {"id_type": "Collection", "name": "Missing"}}}
+        }]}]});
+        assert_eq!(
+            features(&raw),
+            ["blender.physics.cloth_collision.collection"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collection_pointer_to_an_imported_collection_is_not_reported() {
+        let raw = json!({"collections": [{"name": "Col"}], "objects": [{"name": "Cloth", "type": "MESH", "modifiers": [{
+            "name": "Cloth", "type": "CLOTH",
+            "physics_settings": {"collision_settings": {"collection": {"id_type": "Collection", "name": "Col"}}}
+        }]}]});
+        assert_eq!(features(&raw), Vec::<String>::new());
+    }
+
+    #[test]
+    fn dynamic_paint_surface_collection_is_reported_per_surface() {
+        let raw = json!({"objects": [{"name": "Canvas", "type": "MESH", "modifiers": [{
+            "name": "Paint", "type": "DYNAMIC_PAINT",
+            "physics_settings": {"role": "canvas", "canvas_surfaces": [
+                {"brush_collection": {"id_type": "Collection", "name": "Brushes"}}
+            ]}
+        }]}]});
+        assert_eq!(
+            features(&raw),
+            ["blender.physics.dynamic_paint_surface.brush_collection"]
+        );
+    }
+
+    #[test]
+    fn potter_only_surface_keys_are_reported_on_export() -> Result<()> {
+        let settings: Map<String, Value> = [(
+            "canvas_surfaces".to_owned(),
+            json!([{"stiffness": 0.5, "surface_type": "PAINT"}]),
+        )]
+        .into_iter()
+        .collect();
+        let owner = Id::new("paint_modifier")?;
+        let mut losses = Vec::new();
+        collect_potter_physics_export_losses(
+            "dynamic_paint_canvas",
+            &settings,
+            &owner,
+            &mut losses,
+        );
+        let features: Vec<String> = losses.into_iter().map(|loss| loss.feature_id).collect();
+        assert_eq!(features, ["potter.physics.dynamic_paint_surface.stiffness"]);
+        Ok(())
     }
 }

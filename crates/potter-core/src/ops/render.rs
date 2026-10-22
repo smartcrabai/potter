@@ -13,6 +13,7 @@ const SET_FIELDS: &[&str] = &[
     "max_bounces",
     "volume_bounces",
     "transparent_max_bounces",
+    "filter_glossy",
     "film_transparent",
     "filter_size",
     "engine",
@@ -117,6 +118,8 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
     let max_bounces = optional_u32(engine, set, "max_bounces", 0, 1024)?;
     let volume_bounces = optional_u32(engine, set, "volume_bounces", 0, 1024)?;
     let transparent_max_bounces = optional_u32(engine, set, "transparent_max_bounces", 0, 1024)?;
+    // Blender's `cycles.blur_glossy` ranges over 0 to 10 (`intern/cycles/blender/addon/properties.py`, `blur_glossy`).
+    let filter_glossy = optional_f64(engine, set, "filter_glossy", 0.0, 10.0)?;
     let motion_blur_samples = optional_u32(engine, set, "motion_blur_samples", 1, 64)?;
     let dicing_rate = optional_f64(engine, set, "dicing_rate", 0.1, 1000.0)?;
     let filter_size = optional_f64(engine, set, "filter_size", 0.0, 500.0)?;
@@ -274,6 +277,9 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         }
         if let Some(value) = transparent_max_bounces {
             scene.render.transparent_max_bounces = value;
+        }
+        if let Some(value) = filter_glossy {
+            scene.render.filter_glossy = value;
         }
         if let Some(value) = film_transparent {
             scene.render.film_transparent = value;

@@ -20,6 +20,115 @@ struct ColliderTriangle {
     normal: DVec3,
 }
 
+/// A scene flow object, expressed as world-space triangles.
+pub struct FlowSource {
+    pub triangles: Vec<[DVec3; 3]>,
+    pub inflow_rate: f64,
+}
+
+/// Whether a flow emits from a surface triangle whose centre lies inside an effector.
+///
+/// Particles spawn on the flow surface and Potter does not push a particle out of an effector it
+/// starts in, so the caller reports the case as a loss. Blender 5.2.2 keeps that liquid in the
+/// effector's column but slows it: measured headless with a 1-unit INFLOW flow at z = 1.5 and a
+/// 0.3-unit effector at z = 0.95, the column's lowest liquid descends about 0.012 per frame while it is
+/// inside, against about 0.075 without the effector, and it leaves through the bottom face around frame 8.
+/// Potter has no grid obstacle rule to reproduce that, so this is a reported gap (solver parity).
+///
+/// `effectors` holds one closed triangle list per effector. A point is inside when it is inside one
+/// effector's own surface, so an overlap of two effectors does not cancel the crossings.
+#[must_use]
+pub fn emitter_spawns_inside_effector(flows: &[FlowSource], effectors: &[Vec<[DVec3; 3]>]) -> bool {
+    const SAMPLE_DIVISIONS: usize = 8;
+    let Some((effector_min, effector_max)) =
+        effectors.iter().flatten().map(triangle_bounds).reduce(
+            |(minimum, maximum), (next_min, next_max)| {
+                (minimum.min(next_min), maximum.max(next_max))
+            },
+        )
+    else {
+        return false;
+    };
+    flows.iter().any(|flow| {
+        flow.triangles.iter().any(|triangle| {
+            let (minimum, maximum) = triangle_bounds(triangle);
+            // A triangle whose box misses the effector's box cannot have a point inside it.
+            let apart = (0..3).any(|axis| {
+                maximum[axis] < effector_min[axis] || minimum[axis] > effector_max[axis]
+            });
+            !apart
+                && triangle_samples(*triangle, SAMPLE_DIVISIONS).any(|point| {
+                    effectors
+                        .iter()
+                        .any(|effector| point_inside_closed_surface(point, effector))
+                })
+        })
+    })
+}
+
+fn triangle_bounds(triangle: &[DVec3; 3]) -> (DVec3, DVec3) {
+    (
+        triangle[0].min(triangle[1]).min(triangle[2]),
+        triangle[0].max(triangle[1]).max(triangle[2]),
+    )
+}
+
+/// Points on a regular barycentric grid over `triangle`, `divisions` steps along each edge.
+fn triangle_samples(triangle: [DVec3; 3], divisions: usize) -> impl Iterator<Item = DVec3> {
+    let [first, second, third] = triangle;
+    let step = divisions as f64;
+    (0..=divisions).flat_map(move |row| {
+        (0..=divisions - row).map(move |column| {
+            let u = column as f64 / step;
+            let v = row as f64 / step;
+            first + (second - first) * u + (third - first) * v
+        })
+    })
+}
+
+/// Parity of ray crossings through a closed triangle set; an odd count means inside.
+fn point_inside_closed_surface(point: DVec3, triangles: &[[DVec3; 3]]) -> bool {
+    let direction = DVec3::new(1.0, 0.371_390_676_354_103_7, 0.529_173_248_214_697_2);
+    triangles
+        .iter()
+        .filter(|triangle| ray_crosses_triangle(point, direction, **triangle))
+        .count()
+        % 2
+        == 1
+}
+
+/// Möller-Trumbore test for a ray that starts at `origin` and crosses the triangle ahead of it.
+fn ray_crosses_triangle(origin: DVec3, direction: DVec3, triangle: [DVec3; 3]) -> bool {
+    let [first, second, third] = triangle;
+    let first_edge = second - first;
+    let second_edge = third - first;
+    let p_vector = direction.cross(second_edge);
+    let determinant = first_edge.dot(p_vector);
+    if determinant.abs() < 1.0e-12 {
+        return false;
+    }
+    let inverse = 1.0 / determinant;
+    let offset = origin - first;
+    let barycentric_u = offset.dot(p_vector) * inverse;
+    if !(0.0..=1.0).contains(&barycentric_u) {
+        return false;
+    }
+    let q_vector = offset.cross(first_edge);
+    let barycentric_v = direction.dot(q_vector) * inverse;
+    if barycentric_v < 0.0 || barycentric_u + barycentric_v > 1.0 {
+        return false;
+    }
+    second_edge.dot(q_vector) * inverse > 0.0
+}
+
+struct PreparedFlow<'a> {
+    triangles: &'a [[DVec3; 3]],
+    weighted_triangles: Vec<(f64, usize)>,
+    total_area: f64,
+    inflow_rate: f64,
+    count: usize,
+}
+
 #[derive(Clone, Copy)]
 struct Random(u64);
 
@@ -59,6 +168,31 @@ pub fn simulate(
     seed: u32,
     colliders: &[[DVec3; 3]],
 ) -> Result<Vec<DVec3>> {
+    simulate_with_sources(
+        domain,
+        settings,
+        world,
+        frame,
+        fps,
+        gravity,
+        seed,
+        colliders,
+        &[],
+    )
+}
+
+/// Simulate a domain using explicit scene flow sources and their own inflow rates.
+pub fn simulate_with_sources(
+    domain: &Mesh,
+    settings: &Value,
+    world: DMat4,
+    frame: f64,
+    fps: f64,
+    gravity: DVec3,
+    seed: u32,
+    colliders: &[[DVec3; 3]],
+    flows: &[FlowSource],
+) -> Result<Vec<DVec3>> {
     if !frame.is_finite() || frame < 0.0 {
         return Err(invalid("fluid frame must be finite and non-negative"));
     }
@@ -74,6 +208,11 @@ pub fn simulate(
     if colliders.len() > MAX_COLLIDERS {
         return Err(limit(
             "fluid simulation exceeds the 100000 collider-triangle limit",
+        ));
+    }
+    if flows.len() > MAX_COLLIDERS {
+        return Err(limit(
+            "fluid simulation exceeds the 100000 flow-source limit",
         ));
     }
     let mut world_colliders = Vec::with_capacity(colliders.len());
@@ -145,8 +284,11 @@ pub fn simulate(
         .checked_mul(resolution)
         .and_then(|count| count.checked_mul(resolution))
         .ok_or_else(|| limit("fluid particle count exceeds limits"))?;
-    let inflow_rate =
-        super::setting_number(settings, "inflow_rate", 0.0, "fluid", "a finite number")?;
+    let inflow_rate = if flows.is_empty() {
+        super::setting_number(settings, "inflow_rate", 0.0, "fluid", "a finite number")?
+    } else {
+        0.0
+    };
     if inflow_rate < 0.0 {
         return Err(invalid("fluid inflow_rate must be non-negative"));
     }
@@ -155,8 +297,84 @@ pub fn simulate(
         return Err(limit("fluid inflow exceeds the particle limit"));
     }
     let inflow_count = inflow_count_float as usize;
+    let mut prepared_flows = Vec::with_capacity(flows.len());
+    let mut flow_triangle_count = 0_usize;
+    let mut flow_inflow_count = 0_usize;
+    for flow in flows {
+        if !flow.inflow_rate.is_finite() || flow.inflow_rate < 0.0 {
+            return Err(invalid(
+                "fluid flow inflow_rate must be finite and non-negative",
+            ));
+        }
+        flow_triangle_count = flow_triangle_count
+            .checked_add(flow.triangles.len())
+            .ok_or_else(|| limit("fluid flow mesh exceeds limits"))?;
+        if flow_triangle_count > MAX_COLLIDERS {
+            return Err(limit("fluid flow meshes exceed the 100000 triangle limit"));
+        }
+        if flow.triangles.is_empty() {
+            continue;
+        }
+        let mut source_min = DVec3::splat(f64::INFINITY);
+        let mut source_max = DVec3::splat(f64::NEG_INFINITY);
+        for triangle in &flow.triangles {
+            for point in triangle {
+                if !point.is_finite() {
+                    return Err(invalid("fluid flow triangles must be finite"));
+                }
+                source_min = source_min.min(*point);
+                source_max = source_max.max(*point);
+            }
+        }
+        if source_min.cmplt(minimum).any() || source_max.cmpgt(maximum).any() {
+            continue;
+        }
+        let flow_count_float = (flow.inflow_rate * frame).floor();
+        if !flow_count_float.is_finite() || flow_count_float > MAX_PARTICLES as f64 {
+            return Err(limit("fluid flow inflow exceeds the particle limit"));
+        }
+        let count = flow_count_float as usize;
+        if count == 0 {
+            continue;
+        }
+        let mut weighted_triangles = Vec::with_capacity(flow.triangles.len());
+        let mut total_area = 0.0;
+        for (index, triangle) in flow.triangles.iter().enumerate() {
+            let area = (triangle[1] - triangle[0])
+                .cross(triangle[2] - triangle[0])
+                .length()
+                * 0.5;
+            if !area.is_finite() {
+                return Err(invalid("fluid flow triangle has a non-finite area"));
+            }
+            if area > f64::EPSILON {
+                total_area += area;
+                if !total_area.is_finite() {
+                    return Err(limit("fluid flow surface area exceeds numeric limits"));
+                }
+                weighted_triangles.push((total_area, index));
+            }
+        }
+        if total_area == 0.0 {
+            continue;
+        }
+        flow_inflow_count = flow_inflow_count
+            .checked_add(count)
+            .ok_or_else(|| limit("fluid flow inflow exceeds the particle limit"))?;
+        prepared_flows.push(PreparedFlow {
+            triangles: &flow.triangles,
+            weighted_triangles,
+            total_area,
+            inflow_rate: flow.inflow_rate,
+            count,
+        });
+    }
+    if !flows.is_empty() && prepared_flows.is_empty() {
+        return Ok(Vec::new());
+    }
     let count = base_count
         .checked_add(inflow_count)
+        .and_then(|count| count.checked_add(flow_inflow_count))
         .ok_or_else(|| limit("fluid particle count exceeds limits"))?;
     if count > MAX_PARTICLES {
         return Err(limit("fluid output exceeds the 1024 particle limit"));
@@ -246,6 +464,24 @@ pub fn simulate(
         );
         positions.push(clamp_to_bounds(position, minimum, maximum, particle_radius));
         ages.push(age);
+    }
+    for flow in &prepared_flows {
+        for index in 0..flow.count {
+            let birth_frame = (index + 1) as f64 / flow.inflow_rate;
+            let age = (frame - birth_frame).max(0.0) / fps;
+            let sample = random.unit() * flow.total_area;
+            let weighted_index = flow
+                .weighted_triangles
+                .partition_point(|(area, _)| *area <= sample)
+                .min(flow.weighted_triangles.len() - 1);
+            let triangle_index = flow.weighted_triangles[weighted_index].1;
+            let [a, b, c] = flow.triangles[triangle_index];
+            let root = random.unit().sqrt();
+            let across = random.unit();
+            let position = a * (1.0 - root) + b * (root * (1.0 - across)) + c * (root * across);
+            positions.push(position);
+            ages.push(age);
+        }
     }
 
     for index in 0..positions.len() {
@@ -463,7 +699,7 @@ mod tests {
 
     use crate::geom::{Mesh, Vertex};
 
-    use super::simulate;
+    use super::{FlowSource, emitter_spawns_inside_effector, simulate, simulate_with_sources};
 
     #[test]
     fn liquid_is_deterministic_bounded_and_falls_under_gravity() {
@@ -570,5 +806,139 @@ mod tests {
         .expect("simulation succeeds");
         assert_eq!(positions.len(), 1);
         assert!(positions[0].z >= z && positions[0].z <= 2.0);
+    }
+    #[test]
+    fn contained_flow_emits_from_its_surface_and_outside_flow_is_ignored() {
+        let domain = Mesh {
+            vertices: vec![
+                Vertex {
+                    id: 0,
+                    co: DVec3::splat(-1.0),
+                },
+                Vertex {
+                    id: 1,
+                    co: DVec3::splat(1.0),
+                },
+            ],
+            ..Mesh::default()
+        };
+        let source = FlowSource {
+            triangles: vec![
+                [
+                    DVec3::new(-0.5, -0.5, 0.5),
+                    DVec3::new(0.5, -0.5, 0.5),
+                    DVec3::new(0.5, 0.5, 0.5),
+                ],
+                [
+                    DVec3::new(-0.5, -0.5, 0.5),
+                    DVec3::new(0.5, 0.5, 0.5),
+                    DVec3::new(-0.5, 0.5, 0.5),
+                ],
+            ],
+            inflow_rate: 2.0,
+        };
+        let settings = json!({"resolution":1,"pressure_stiffness":0.0,"viscosity":0.0});
+        let emitted = simulate_with_sources(
+            &domain,
+            &settings,
+            DMat4::IDENTITY,
+            1.0,
+            24.0,
+            DVec3::ZERO,
+            7,
+            &[],
+            &[source],
+        )
+        .expect("contained flow succeeds");
+        assert_eq!(emitted.len(), 3);
+        assert!(
+            emitted[1..]
+                .iter()
+                .all(|point| (point.z - 0.5).abs() < 1.0e-12)
+        );
+
+        let outside = FlowSource {
+            triangles: vec![[
+                DVec3::new(-0.5, -0.5, 0.5),
+                DVec3::new(0.5, -0.5, 0.5),
+                DVec3::new(0.0, 0.5, 1.5),
+            ]],
+            inflow_rate: 2.0,
+        };
+        let baseline = simulate(
+            &domain,
+            &settings,
+            DMat4::IDENTITY,
+            1.0,
+            24.0,
+            DVec3::ZERO,
+            7,
+            &[],
+        )
+        .expect("domain succeeds");
+        let ignored = simulate_with_sources(
+            &domain,
+            &settings,
+            DMat4::IDENTITY,
+            1.0,
+            24.0,
+            DVec3::ZERO,
+            7,
+            &[],
+            &[outside],
+        )
+        .expect("outside flow succeeds");
+        assert_ne!(baseline, Vec::<DVec3>::new());
+        assert_eq!(ignored, Vec::<DVec3>::new());
+    }
+
+    /// Triangles of the closed axis-aligned box from `low` to `high`.
+    fn cube_triangles(low: DVec3, high: DVec3) -> Vec<[DVec3; 3]> {
+        let corner = |x: f64, y: f64, z: f64| DVec3::new(x, y, z);
+        let c000 = corner(low.x, low.y, low.z);
+        let c100 = corner(high.x, low.y, low.z);
+        let c010 = corner(low.x, high.y, low.z);
+        let c110 = corner(high.x, high.y, low.z);
+        let c001 = corner(low.x, low.y, high.z);
+        let c101 = corner(high.x, low.y, high.z);
+        let c011 = corner(low.x, high.y, high.z);
+        let c111 = corner(high.x, high.y, high.z);
+        vec![
+            [c000, c100, c110],
+            [c000, c110, c010],
+            [c001, c111, c101],
+            [c001, c011, c111],
+            [c000, c101, c100],
+            [c000, c001, c101],
+            [c010, c110, c111],
+            [c010, c111, c011],
+            [c000, c010, c011],
+            [c000, c011, c001],
+            [c100, c101, c111],
+            [c100, c111, c110],
+        ]
+    }
+
+    #[test]
+    fn emitter_inside_two_overlapping_effectors_is_reported() {
+        // A triangle wholly inside the box [0, 2]^3: every sample lies in both copies.
+        let flow = || FlowSource {
+            triangles: vec![[
+                DVec3::splat(0.9),
+                DVec3::new(1.1, 0.9, 0.9),
+                DVec3::new(0.9, 1.1, 0.9),
+            ]],
+            inflow_rate: 1.0,
+        };
+        let cube = cube_triangles(DVec3::ZERO, DVec3::splat(2.0));
+        assert!(emitter_spawns_inside_effector(
+            &[flow()],
+            std::slice::from_ref(&cube)
+        ));
+        // Two identical effectors would cancel under a single parity count; per effector they do not.
+        assert!(emitter_spawns_inside_effector(
+            &[flow()],
+            &[cube.clone(), cube]
+        ));
     }
 }
