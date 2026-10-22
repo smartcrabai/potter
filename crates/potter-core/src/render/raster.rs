@@ -882,31 +882,7 @@ pub(crate) fn rasterize_with_samples(
                             average[channel] * previous_weight + sample_color[channel] / count;
                     }
                     if let Some(film) = film.as_mut() {
-                        // EEVEE shades each sample with its pixel's occlusion, then filters the shaded samples.
-                        let ao = ambient_occlusion
-                            .get(pixel_index)
-                            .copied()
-                            .map_or(1.0, f64::from);
-                        let shaded = [
-                            sample_color[0] * ao,
-                            sample_color[1] * ao,
-                            sample_color[2] * ao,
-                            sample_color[3],
-                        ];
-                        film.splat(x, y, sample_x, sample_y, sample_index, shaded);
-                    }
-                }
-                // Beauty applies occlusion to the environment light in its shading (`scene.rs` `shade`), as EEVEE's horizon
-                // scan does. Workbench (Solid) shows none by default, and the wire overlay keeps the composite's.
-                let ao_in_color = matches!(mode, Mode::Wire);
-                if let Some(ao) = ambient_occlusion
-                    .get(pixel_index)
-                    .copied()
-                    .filter(|_| ao_in_color)
-                {
-                    let ao = f64::from(ao);
-                    for channel in &mut average[..3] {
-                        *channel *= ao;
+                        film.splat(x, y, sample_x, sample_y, sample_index, sample_color);
                     }
                 }
                 let color = color_to_srgba(average);
