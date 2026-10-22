@@ -1593,23 +1593,28 @@ for obj in list(bpy.data.objects):
             # The operator polls for an editable active object; use an unhidden local copy.
             probe_obj = obj.copy()
             bpy.context.scene.collection.objects.link(probe_obj)
+            if bpy.data.objects.get(probe_obj.name) is None or probe_obj.library is not None:
+                raise RuntimeError("copied Bake object is not linked and local")
             probe_obj.hide_viewport = False
             probe_obj.hide_render = False
             probe_obj.hide_set(False)
             try:
                 probe_modifier = probe_obj.modifiers.get(modifier.name)
-                if probe_modifier is None:
-                    raise RuntimeError("copied object has no node modifier")
+                if probe_modifier is None or probe_modifier.id_data.name != probe_obj.name:
+                    raise RuntimeError("copied object has no valid node modifier")
                 probe_bake = next(
                     (entry for entry in probe_modifier.bakes if entry.bake_id == bake.bake_id),
                     None)
-                if probe_bake is None:
+                if (probe_bake is None or probe_bake.node is None
+                        or probe_bake.node.name != bake.node.name):
                     raise RuntimeError("copied modifier has no matching Bake node")
                 with bpy.context.temp_override(
                         object=probe_obj,
                         active_object=probe_obj,
                         selected_objects=[probe_obj],
                         selected_editable_objects=[probe_obj]):
+                    if not bpy.ops.object.geometry_node_bake_unpack_single.poll():
+                        raise RuntimeError("copied Bake object is not editable in Blender context")
                     # PF_REMOVE frees only the copy's packed state and never writes packed member paths.
                     result = bpy.ops.object.geometry_node_bake_unpack_single(
                         session_uid=probe_obj.session_uid,
