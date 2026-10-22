@@ -37,8 +37,8 @@ use super::{
         sheen_coefficient, specular_coefficient,
     },
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceShader, Triangle, ViewBasis, blend_color,
-        blend_corner_normals, blend_uv,
+        AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, Triangle, ViewBasis,
+        blend_color, blend_corner_normals, blend_uv,
     },
     studio,
     wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
@@ -1842,7 +1842,7 @@ pub(super) fn surface_shader<'a>(
 }
 
 impl SurfaceShader for SceneShader<'_> {
-    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<[f64; 4]> {
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
         let graph_shading = if triangle.lit_per_pixel {
@@ -1908,7 +1908,7 @@ impl SurfaceShader for SceneShader<'_> {
                 self.view.to_view(facing),
                 self.view.to_view(hit.view),
             );
-            return Ok([lit.x, lit.y, lit.z, alpha]);
+            return Ok(SurfaceSample::opaque([lit.x, lit.y, lit.z, alpha]));
         }
         let occluders = ShadowOccluders::new(
             self.doc,
@@ -1935,7 +1935,29 @@ impl SurfaceShader for SceneShader<'_> {
             self.images,
         )?;
         occluders.finish()?;
-        Ok(color)
+        Ok(SurfaceSample {
+            color,
+            transparent_tint: beauty_tint(material, surface_tint(closures)),
+        })
+    }
+}
+
+/// The transparent tint the Beauty composite applies to a surface. EEVEE keeps a Transparent closure's colour per channel
+/// only for a BLENDED material (`ForwardPipeline::use_colored_transparency`, `GPU_MATFLAG_TRANSPARENT_MAYBE_COLORED`).
+/// A DITHERED material stores one alpha, `1 - average(transmittance)` (`eevee_surf_deferred.bsl.hh`, `out_color.a`), so
+/// its tint is the channel mean. `alpha_mode` `blend` is BLENDED; `opaque` and `clip` are DITHERED
+/// (`blend_bridge.py`, `surface_render_method`).
+fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
+    // A transmittance is a fraction of the light: EEVEE clamps the Color at zero and saturates the result
+    // (`gpu_shader_material_transparent.glsl`, `eevee_surf_deferred.bsl.hh`), so a tint above one or below zero is cut to
+    // [0, 1] before it can amplify or invert the background.
+    let tint = tint.map(|channel| channel.clamp(0.0, 1.0));
+    match material {
+        Some(material) if material.alpha_mode != "blend" => {
+            let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
+            [mean; 3]
+        }
+        _ => tint,
     }
 }
 
@@ -2267,6 +2289,41 @@ fn opaque_share(closures: &[ShaderClosure]) -> f64 {
         .map(|closure| closure.weight * closure.params.alpha.clamp(0.0, 1.0))
         .sum::<f64>()
         .clamp(0.0, 1.0)
+}
+
+/// The transparent tint of a hit, as the composite applies it: a hit passes `(1 - opacity) * tint` of the light behind
+/// it. EEVEE accumulates every transparent closure into one transmittance, `g_transmittance += transmittance * weight`
+/// (`eevee_nodetree_lib.bsl.hh`, `closure_eval(ClosureTransparency)`), and Cycles sums the closures' transparent weights
+/// the same way. So a mix of closures passes `sum w (1 - alpha) tint`, and the tint is that over the pass chance.
+fn surface_tint(closures: &[ShaderClosure]) -> [f64; 3] {
+    weighted_tint(
+        closures.iter().map(|closure| {
+            (
+                closure.weight,
+                closure.params.alpha,
+                closure.params.transparent_tint,
+            )
+        }),
+        opaque_share(closures),
+    )
+}
+
+/// The tint for `(weight, alpha, tint)` closures that together have `opacity`: the summed transmittance
+/// `sum w (1 - alpha) tint` over the pass chance `1 - opacity`. A surface with no pass chance passes nothing, so its tint
+/// is white.
+fn weighted_tint(terms: impl Iterator<Item = (f64, f64, [f64; 3])>, opacity: f64) -> [f64; 3] {
+    let chance = 1.0 - opacity;
+    if chance <= 0.0 {
+        return [1.0; 3];
+    }
+    let mut transmittance = [0.0; 3];
+    for (weight, alpha, tint) in terms {
+        let passed = weight * (1.0 - alpha.clamp(0.0, 1.0));
+        for (sum, channel) in transmittance.iter_mut().zip(tint) {
+            *sum += passed * channel;
+        }
+    }
+    transmittance.map(|sum| sum / chance)
 }
 
 fn base_albedo(params: &BsdfParams) -> DVec3 {
@@ -3072,17 +3129,19 @@ mod shading_normal_tests {
         )
         .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
         let point = triangle.positions.iter().copied().sum::<DVec3>() / 3.0;
-        let color = shader.shade(
-            triangle,
-            &SurfaceHit {
-                point,
-                shadow_point: point,
-                normal: DVec3::Z,
-                geometric: DVec3::Z,
-                barycentric: [1.0 / 3.0; 3],
-                view: DVec3::Z,
-            },
-        )?;
+        let color = shader
+            .shade(
+                triangle,
+                &SurfaceHit {
+                    point,
+                    shadow_point: point,
+                    normal: DVec3::Z,
+                    geometric: DVec3::Z,
+                    barycentric: [1.0 / 3.0; 3],
+                    view: DVec3::Z,
+                },
+            )?
+            .color;
         // No lights and no world: the hit returns its emission alone, as Cycles does. The old
         // Potter-only `albedo * 0.08` ambient fallback is gone.
         let expected_rgb = [0.7, 0.1, 0.2];
@@ -3516,5 +3575,91 @@ mod transparent_shadow_tests {
             ..blend
         };
         assert!(!casts(&blend_off));
+    }
+}
+
+#[cfg(test)]
+mod beauty_tint_tests {
+    use super::{beauty_tint, weighted_tint};
+    use crate::model::Material;
+
+    fn material(alpha_mode: &str) -> Material {
+        Material {
+            alpha_mode: alpha_mode.to_owned(),
+            ..Material::default()
+        }
+    }
+
+    #[test]
+    fn blended_material_keeps_each_channel() {
+        assert_eq!(
+            beauty_tint(Some(&material("blend")), [0.2, 0.8, 0.4]),
+            [0.2, 0.8, 0.4]
+        );
+    }
+
+    /// A DITHERED material takes the mean of the Color's channels: (0.2 + 0.8 + 0.4) / 3 on every channel.
+    #[test]
+    fn dithered_material_takes_the_channel_mean() {
+        let mean = (0.2 + 0.8 + 0.4) / 3.0;
+        for alpha_mode in ["opaque", "clip"] {
+            for channel in beauty_tint(Some(&material(alpha_mode)), [0.2, 0.8, 0.4]) {
+                assert!((channel - mean).abs() < 1.0e-12, "{alpha_mode}: {channel}");
+            }
+        }
+    }
+
+    /// Tints are clamped to [0, 1] first. BLENDED clamps each channel: 2 -> 1, -1 -> 0, 0.5 stays. DITHERED takes the
+    /// mean of the clamped channels: (1 + 0 + 0.5) / 3 = 0.5.
+    #[test]
+    fn tints_are_clamped_before_use() {
+        assert_eq!(
+            beauty_tint(Some(&material("blend")), [2.0, -1.0, 0.5]),
+            [1.0, 0.0, 0.5]
+        );
+        let dithered = beauty_tint(Some(&material("clip")), [2.0, -1.0, 0.5]);
+        assert!((dithered[0] - 0.5).abs() < 1.0e-12, "{dithered:?}");
+    }
+
+    #[test]
+    fn no_material_keeps_the_tint_clamped() {
+        assert_eq!(beauty_tint(None, [0.5, 1.5, -0.2]), [0.5, 1.0, 0.0]);
+    }
+
+    /// Mix(0.5) of a Transparent (colour (0.2, 0.8, 0.4)) and an opaque Principled. The transparent closure passes
+    /// 0.5 * tint, the opaque one passes nothing, so the surface's tint is the Transparent colour and the composite passes
+    /// `(1 - 0.5) * tint`: the transmittance EEVEE sums (`g_transmittance`) is `0.5 * tint`.
+    #[test]
+    fn mix_of_transparent_and_opaque_keeps_the_transparent_colour() {
+        let tint = [0.2, 0.8, 0.4];
+        let terms = [(0.5, 1.0, [1.0; 3]), (0.5, 0.0, tint)];
+        let opacity = 0.5;
+        let actual = weighted_tint(terms.into_iter(), opacity);
+        for (channel, expected) in tint.iter().enumerate() {
+            assert!((actual[channel] - expected).abs() < 1.0e-12, "{actual:?}");
+        }
+    }
+
+    /// Two transparent closures, weights 0.5 and 0.5, alphas 0 and 0.5, tints (0.2, 0.8, 0.4) and white. The passed
+    /// transmittance is 0.5 * (0.2, 0.8, 0.4) + 0.5 * 0.5 * (1, 1, 1) = (0.35, 0.65, 0.45), the opacity is
+    /// 0.5 * 0 + 0.5 * 0.5 = 0.25, so the tint is (0.35, 0.65, 0.45) / 0.75.
+    #[test]
+    fn weighted_sum_over_two_transparent_closures() {
+        let terms = [(0.5, 0.0, [0.2, 0.8, 0.4]), (0.5, 0.5, [1.0; 3])];
+        let actual = weighted_tint(terms.into_iter(), 0.25);
+        let expected = [0.35 / 0.75, 0.65 / 0.75, 0.45 / 0.75];
+        for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "channel {channel}: {actual}"
+            );
+        }
+    }
+
+    /// A surface that passes nothing (opacity 1) has no pass chance, so its tint is white.
+    #[test]
+    fn fully_opaque_surface_has_a_white_tint() {
+        let actual = weighted_tint([(1.0, 1.0, [0.2, 0.8, 0.4])].into_iter(), 1.0);
+        assert_eq!(actual, [1.0; 3]);
     }
 }

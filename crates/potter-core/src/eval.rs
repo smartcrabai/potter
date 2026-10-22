@@ -1376,6 +1376,17 @@ impl Snapshot {
                                     ))
                                 })
                             },
+                            |modifier, parameter, base| {
+                                crate::eval::animation::animated_modifier_scalar(
+                                    id,
+                                    node,
+                                    doc,
+                                    &modifier.id,
+                                    parameter,
+                                    base,
+                                    frame,
+                                )
+                            },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;
                     node_bake_captures.extend(evaluated.bake_captures.into_iter().map(
@@ -1715,6 +1726,17 @@ impl Snapshot {
                                         node_materials.len(),
                                     ))
                                 })
+                            },
+                            |modifier, parameter, base| {
+                                crate::eval::animation::animated_modifier_scalar(
+                                    id,
+                                    node,
+                                    doc,
+                                    &modifier.id,
+                                    parameter,
+                                    base,
+                                    frame,
+                                )
                             },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;

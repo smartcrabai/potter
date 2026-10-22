@@ -32,7 +32,7 @@ pub enum CliCommand {
     Export(ExportArgs),
     #[command(about = "Render frames to an image sequence or movie.")]
     Render(RenderArgs),
-    #[command(about = "Bake simulation, texture, geometry, or animation data.")]
+    #[command(about = "Bake simulation, texture, geometry, animation, or ocean data.")]
     Bake(BakeArgs),
     #[command(about = "List and verify project assets.")]
     Assets(AssetsArgs),
@@ -231,7 +231,10 @@ pub struct BakeArgs {
     pub scene: PathBuf,
     #[arg(long, required = true, value_enum, help = "Data kind to bake.")]
     pub kind: BakeKind,
-    #[arg(long, help = "Target entity ID, when required by the bake kind.")]
+    #[arg(
+        long,
+        help = "Target Object or modifier ID, depending on the bake kind."
+    )]
     pub target: Option<String>,
     #[arg(long, help = "Modifier ID for a node bake.")]
     pub modifier: Option<String>,
@@ -252,9 +255,15 @@ pub struct BakeArgs {
     pub unpack_method: Option<NodeBakeUnpackMethod>,
     #[arg(long, help = "Delete a node bake and resume live evaluation.")]
     pub delete: bool,
-    #[arg(long, help = "Frame range as start:end[:step].")]
+    #[arg(
+        long,
+        help = "Frame range as start:end[:step] (Ocean uses modifier frame_start/end)."
+    )]
     pub frames: Option<String>,
-    #[arg(long, help = "Output directory. Required for non-node bake kinds.")]
+    #[arg(
+        long,
+        help = "Output directory for baked data or the bake report. Required for Ocean, animation, geometry, and simulation bakes."
+    )]
     pub out: Option<PathBuf>,
     #[arg(long, help = "Replace existing output files.")]
     pub overwrite: bool,
@@ -368,6 +377,7 @@ pub enum BakeKind {
     Texture,
     Geometry,
     Animation,
+    Ocean,
     #[value(name = "node-bake")]
     NodeBake,
 }

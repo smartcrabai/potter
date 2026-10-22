@@ -1268,7 +1268,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jcode-applet-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "serde",
  "serde_json",
@@ -1277,7 +1277,7 @@ dependencies = [
 [[package]]
 name = "jcode-harness-api"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "jcode-applet-types",
  "jcode-session-types",
@@ -1291,7 +1291,7 @@ dependencies = [
 [[package]]
 name = "jcode-message-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "chrono",
  "serde",
@@ -1301,7 +1301,7 @@ dependencies = [
 [[package]]
 name = "jcode-provider-metadata"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "url",
 ]
@@ -1309,7 +1309,7 @@ dependencies = [
 [[package]]
 name = "jcode-sdk"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "anyhow",
  "jcode-applet-types",
@@ -1330,7 +1330,7 @@ dependencies = [
 [[package]]
 name = "jcode-session-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "chrono",
  "jcode-message-types",
@@ -1341,7 +1341,7 @@ dependencies = [
 [[package]]
 name = "jcode-side-panel-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "serde",
 ]
@@ -1349,7 +1349,7 @@ dependencies = [
 [[package]]
 name = "jcode-task-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "chrono",
  "serde",
@@ -1359,7 +1359,7 @@ dependencies = [
 [[package]]
 name = "jcode-todo-policy"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "chrono",
  "jcode-task-types",
@@ -1370,7 +1370,7 @@ dependencies = [
 [[package]]
 name = "jcode-transport"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -1381,7 +1381,7 @@ dependencies = [
 [[package]]
 name = "jcode-usage-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=28d51019f7fdd30bbde69d40c87d59536314bd46#28d51019f7fdd30bbde69d40c87d59536314bd46"
+source = "git+https://github.com/1jehuang/jcode?rev=4367eba2a68deb0417fecc40526f560a58d8ef4d#4367eba2a68deb0417fecc40526f560a58d8ef4d"
 dependencies = [
  "serde",
  "serde_json",

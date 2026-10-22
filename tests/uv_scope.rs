@@ -109,6 +109,7 @@ fn add_modifier(doc: &mut SceneDoc, node: &str, modifier_type: &str, params: Val
         show_render: true,
         params,
         binding_data: None,
+        baked_ocean_cache: None,
         runtime: ModifierRuntime::default(),
     });
 }

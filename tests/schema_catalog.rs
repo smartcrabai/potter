@@ -648,13 +648,13 @@ fn command_help_documents_each_cli_surface_and_version() {
         ),
         (
             "bake",
-            "Bake simulation, texture, geometry, or animation data.",
+            "Bake simulation, texture, geometry, animation, or ocean data.",
             &[
                 "Project directory.",
                 "Data kind to bake.",
-                "Target entity ID, when required by the bake kind.",
-                "Frame range as start:end[:step].",
-                "Output directory.",
+                "Target Object or modifier ID, depending on the bake kind.",
+                "Frame range as start:end[:step] (Ocean uses modifier frame_start/end).",
+                "Output directory for baked data or the bake report.",
                 "Replace existing output files.",
                 "Scene ID to evaluate; defaults to the active scene.",
                 "View Layer ID to evaluate.",

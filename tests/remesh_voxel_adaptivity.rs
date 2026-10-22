@@ -148,6 +148,7 @@ fn remesh_modifier(params: Value) -> Result<Modifier, Box<dyn Error>> {
         show_render: true,
         params: serde_json::from_value(params)?,
         binding_data: None,
+        baked_ocean_cache: None,
         runtime: ModifierRuntime::default(),
     })
 }

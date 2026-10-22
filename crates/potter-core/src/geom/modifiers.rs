@@ -51,6 +51,7 @@ pub(crate) use displacement::{
 mod mirror;
 pub(crate) mod multires;
 mod ocean;
+pub(crate) use ocean::{OceanBakeImage, OceanBakeSequence, ocean_cache_directory};
 pub(crate) mod remesh_modes;
 pub(crate) mod shrinkwrap;
 pub mod simulation;
@@ -189,7 +190,8 @@ pub(crate) fn evaluate_modifiers_with_texture_seed_at_frame(
     frame: f64,
     subject_name: &str,
     texture_seed: TextureSeed<'_>,
-    material_slot_count: Option<usize>,
+    context: ModifierEvaluationContext<'_>,
+    modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_scene_context(
         evaluated,
@@ -202,14 +204,12 @@ pub(crate) fn evaluate_modifiers_with_texture_seed_at_frame(
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
-        ModifierEvaluationContext {
-            material_slot_count,
-            ..ModifierEvaluationContext::default()
-        },
+        context,
         |_, modifier| modifier.enabled,
         texture_seed,
         None,
         |_, modifier, _warnings, _, _texture_rng| Err(unsupported_modifier(modifier)),
+        modifier_parameter,
     )
 }
 
@@ -338,6 +338,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         Option<&[DVec3]>,
         &mut BlenderRng,
     ) -> Result<Option<usize>>,
+    modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
 ) -> Result<ModifierEvaluation> {
     evaluate_modifiers_with_scene_context_and_normals(
         evaluated,
@@ -355,6 +356,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         texture_seed,
         adaptive_render,
         custom_modifier,
+        modifier_parameter,
     )
     .map(|(evaluation, _)| evaluation)
 }
@@ -381,6 +383,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
         Option<&[DVec3]>,
         &mut BlenderRng,
     ) -> Result<Option<usize>>,
+    mut modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
 ) -> Result<(ModifierEvaluation, Option<Vec<Option<DVec3>>>)> {
     let had_origindex = origindex_values(&evaluated).is_some();
     if !frame.is_finite() {
@@ -741,7 +744,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             "boolean" => boolean_modifier(&evaluated, modifier)?,
             "mesh_deform" => deform::mesh_deform(&evaluated, modifier)?,
             "remesh" => remesh_modes::remesh_modifier(&evaluated, modifier)?,
-            "ocean" => ocean::ocean(&evaluated, modifier, frame, context)?,
+            "ocean" => ocean::ocean_with_parameter_evaluator(
+                &evaluated,
+                modifier,
+                frame,
+                context,
+                |parameter, base| modifier_parameter(modifier, parameter, base),
+            )?,
             _ => return Err(unsupported_modifier(modifier)),
         };
         let dropped: Vec<String> = attributes_before
@@ -820,7 +829,11 @@ pub fn evaluate_modifiers_with_groups_at_frame(
         frame,
         subject_name,
         TextureSeed::new(EvaluationPurpose::Preview, 0, subject_name),
-        material_slot_count,
+        ModifierEvaluationContext {
+            material_slot_count,
+            ..ModifierEvaluationContext::default()
+        },
+        |_, _, _| Ok(None),
     )
 }
 
@@ -7547,6 +7560,7 @@ mod tests {
 
     fn modifier(enabled: bool, modifier_type: &str) -> Modifier {
         Modifier {
+            baked_ocean_cache: None,
             id: Id::new("modifier_one").unwrap(),
             modifier_type: modifier_type.to_owned(),
             name: "Modifier".to_owned(),
