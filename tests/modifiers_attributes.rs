@@ -2218,7 +2218,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &project_mesh,
         &modifier(
             "uv_project",
-            json!({"projectors":["camera_z","camera_x"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
+            json!({"projectors":["camera_z","camera_x"],"projector_count":2,"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
         )?,
         &projectors,
         None,
@@ -2526,11 +2526,21 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "uv":flip_v(&json!([[0.25,0.25],[1.25,0.25],[1.25,1.25],[0.25,1.25]]))
         }])),
     );
-    domain_source
-        .attributes
-        .insert("sharp_edges".to_owned(), json!([2]));
+    // Edge 2 of the source is the 2-3 edge (the Blender oracle marks the same edge sharp).
+    let sharp_edges = domain_source
+        .edges
+        .iter()
+        .map(|edge| {
+            let sharp = matches!(edge.vertices, [2, 3] | [3, 2]);
+            (format!("e{}", edge.id), json!(sharp))
+        })
+        .collect::<serde_json::Map<_, _>>();
     domain_source.attributes.insert(
-        "uv_seam".to_owned(),
+        "sharp".to_owned(),
+        json!({"domain":"edge","type":"bool","values":sharp_edges}),
+    );
+    domain_source.attributes.insert(
+        "seam".to_owned(),
         json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":true,"e2":false,"e3":false}}),
     );
     domain_source.attributes.insert(
@@ -2554,7 +2564,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         json!({"layers":["color"],"active":"color","render":"color"}),
     );
     domain_source.attributes.insert(
-        "smooth".to_owned(),
+        "shade_smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":true}}),
     );
     domain_source.attributes.insert(
@@ -2613,11 +2623,12 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         storage: potter_core::image::ImageStorage::default(),
         width: 2,
         height: 2,
+        // Potter stores rows top-down; the Blender oracle lists the bottom row first.
         pixels: vec![
-            [0.0, 0.0, 0.0, 1.0],
-            [0.25, 0.25, 0.25, 1.0],
             [0.6, 0.6, 0.6, 1.0],
             [1.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.25, 0.25, 0.25, 1.0],
         ],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
@@ -3028,9 +3039,13 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
             {"face_id":1,"uv":[[0,1],[1,0],[0,0]]}
         ])),
     );
-    mesh.attributes.insert("sharp_edges".to_owned(), json!([]));
+    // The Blender oracle creates this layer on the destination (SHARP_EDGE only writes into an existing one).
     mesh.attributes.insert(
-        "uv_seam".to_owned(),
+        "sharp".to_owned(),
+        json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":false,"e2":false,"e3":false,"e4":false}}),
+    );
+    mesh.attributes.insert(
+        "seam".to_owned(),
         json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":false,"e2":false,"e3":false,"e4":false}}),
     );
     mesh.attributes.insert(
@@ -3049,33 +3064,38 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         }),
     )?;
     mesh.attributes.insert(
-        "smooth".to_owned(),
+        "shade_smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),
     );
     mesh.attributes.insert(
         "freestyle_face".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),
     );
+    // The Blender oracle creates this colour layer on the destination before the transfer (the modifier
+    // never creates one, so the layer has to exist for COLOR_CORNER to write into it).
+    mesh.attributes.insert(
+        "color".to_owned(),
+        json!({"domain":"corner","type":"color","values":{
+            "f0":[[0.0,0.0,0.0,1.0],[0.0,0.0,0.0,1.0],[0.0,0.0,0.0,1.0]],
+            "f1":[[0.0,0.0,0.0,1.0],[0.0,0.0,0.0,1.0],[0.0,0.0,0.0,1.0]]
+        }}),
+    );
+    mesh.attributes.insert(
+        "color_layers".to_owned(),
+        json!({"layers":["color"],"active":"color","render":"color"}),
+    );
     Ok(mesh)
 }
 
 fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
-    let sharp_ids = mesh
-        .attributes
-        .get("sharp_edges")
-        .and_then(Value::as_array)
-        .ok_or("sharp edge attribute missing")?
-        .iter()
-        .filter_map(Value::as_u64)
-        .filter_map(|id| u32::try_from(id).ok())
-        .collect::<std::collections::BTreeSet<_>>();
     let edge_attributes = |name: &str| {
         mesh.attributes
             .get(name)
             .and_then(|attribute| attribute.get("values"))
             .and_then(Value::as_object)
     };
-    let seam_values = edge_attributes("uv_seam").ok_or("seam edge values missing")?;
+    let sharp_values = edge_attributes("sharp").ok_or("sharp edge values missing")?;
+    let seam_values = edge_attributes("seam").ok_or("seam edge values missing")?;
     let crease_values = edge_attributes("crease_edge").ok_or("crease edge values missing")?;
     let mut sharp = serde_json::Map::new();
     let mut seam = serde_json::Map::new();
@@ -3084,7 +3104,15 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         let first = edge.vertices[0].min(edge.vertices[1]);
         let second = edge.vertices[0].max(edge.vertices[1]);
         let key = format!("{first}-{second}");
-        sharp.insert(key.clone(), Value::Bool(sharp_ids.contains(&edge.id)));
+        sharp.insert(
+            key.clone(),
+            Value::Bool(
+                sharp_values
+                    .get(&format!("e{}", edge.id))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+        );
         seam.insert(
             key.clone(),
             Value::Bool(
@@ -3161,7 +3189,7 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         "uv":uv,
         "color":corner_values("color")?,
         "normal":corner_normal_vectors_json(mesh)?,
-        "smooth":face_values("smooth")?,
+        "smooth":face_values("shade_smooth")?,
         "freestyle":face_values("freestyle_face")?
     }))
 }

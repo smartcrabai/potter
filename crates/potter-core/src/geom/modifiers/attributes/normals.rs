@@ -706,7 +706,9 @@ pub(super) fn normal_edit(
             } else if parallel {
                 target_direction
             } else {
-                (target_origin - vertex.co).normalize_or_zero()
+                // MOD_normal_edit.cc: generate_vert_coordinates subtracts the target's origin, then
+                // `sub_v3_v3v3(co, target_co, co)` gives target - (vertex - target) = 2 * target - vertex.
+                (target_origin - (vertex.co - target_origin)).normalize_or_zero()
             };
             let Some(current_normals) = current_normals.as_ref() else {
                 normals.push(destination);

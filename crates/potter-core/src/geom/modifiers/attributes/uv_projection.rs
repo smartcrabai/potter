@@ -513,7 +513,7 @@ fn blender_rotate_z_m4(matrix: &mut [f32; 16], angle: f32) {
 pub(super) fn uv_warp(
     mesh: &Mesh,
     modifier: &Modifier,
-    _operands: &BTreeMap<String, Vec<SceneOperand>>,
+    operands: &BTreeMap<String, Vec<SceneOperand>>,
 ) -> Result<Mesh> {
     let mut store = crate::geom::uv_layers::read(mesh);
     let requested_layer = string(modifier, "uv_layer")?;
@@ -543,11 +543,30 @@ pub(super) fn uv_warp(
     }) {
         build_uv_warp_matrix_f32(None, None, modifier)?
     } else {
-        return Err(PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "UV Warp matrix is missing from the evaluated scene context",
-            json!({"modifier_id":modifier.id}),
-        ));
+        // Direct evaluation passes the object references as operands; the scene path sets the runtime
+        // matrix above. Each operand's Blender f32 world matrix is the object's world transform.
+        let operand_world = |parameter: &str| -> Result<Option<[f32; 16]>> {
+            let Some(operand) = operands.get(parameter).and_then(|items| items.first()) else {
+                return Ok(None);
+            };
+            operand
+                .blender_matrices_f32
+                .as_ref()
+                .and_then(|matrices| matrices.world)
+                .map(Some)
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::EvaluationFailed,
+                        "UV Warp reference world matrix is missing from the evaluated scene context",
+                        json!({"modifier_id":modifier.id,"parameter":parameter}),
+                    )
+                })
+        };
+        build_uv_warp_matrix_f32(
+            operand_world("object_from")?,
+            operand_world("object_to")?,
+            modifier,
+        )?
     };
     let group = optional_string(modifier, "vertex_group")?;
     let has_deform_weights = mesh
