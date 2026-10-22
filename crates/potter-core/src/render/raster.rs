@@ -859,11 +859,8 @@ pub(crate) fn rasterize_with_samples(
                             &mut candidates,
                             sample_ray,
                             &frame,
-                            sample_background(
-                                background_linear,
-                                world,
-                                Some(sample_ray.direction),
-                            )?,
+                            background_linear,
+                            world,
                             shader,
                             sample_hit,
                         )?
@@ -2219,7 +2216,7 @@ fn composite_sample(
     ray: Ray,
     frame: &CameraFrame,
     background: [f64; 4],
-    shader: Option<&dyn SurfaceShader>,
+    world: Option<WorldRadiance<'_>>,
     cached_hit: Option<VisibleHit>,
 ) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
@@ -2280,7 +2277,10 @@ fn composite_sample(
             tint: visible_hit.transparent_tint,
         }
     });
-    Ok(composite_layers(layers, background))
+    composite_layers_with_background(layers, background[3], || {
+        let background = sample_background(background, world, Some(ray.direction))?;
+        Ok([background[0], background[1], background[2]])
+    })
 }
 
 /// One surface of a pixel's stack, for `composite_layers`.
@@ -2303,6 +2303,17 @@ struct Layer {
 /// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
 /// scalar composite of the layers. Returns the un-premultiplied colour and that alpha.
 fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
+    composite_layers_with_background(layers, background[3], || {
+        Ok([background[0], background[1], background[2]])
+    })
+    .expect("constant background evaluation cannot fail")
+}
+
+fn composite_layers_with_background(
+    layers: impl IntoIterator<Item = Layer>,
+    background_alpha: f64,
+    background_rgb: impl FnOnce() -> Result<[f64; 3]>,
+) -> Result<[f64; 4]> {
     let mut transmittance = DVec3::ONE;
     let mut alpha_transmittance = 1.0;
     let mut premultiplied = DVec3::ZERO;
@@ -2316,15 +2327,25 @@ fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4
             break;
         }
     }
-    let background_alpha = background[3].clamp(0.0, 1.0);
-    premultiplied += DVec3::from_array([background[0], background[1], background[2]])
-        * (transmittance * background_alpha);
+    let background_alpha = background_alpha.clamp(0.0, 1.0);
+    // Opaque surfaces block the world, so avoid evaluating its graph for these samples.
+    let background_rgb = if transmittance == DVec3::ZERO {
+        [0.0; 3]
+    } else {
+        background_rgb()?
+    };
+    premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
     let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
     if alpha <= f64::MIN_POSITIVE {
-        return background;
+        return Ok([
+            background_rgb[0],
+            background_rgb[1],
+            background_rgb[2],
+            alpha,
+        ]);
     }
     let color = premultiplied / alpha;
-    [color.x, color.y, color.z, alpha]
+    Ok([color.x, color.y, color.z, alpha])
 }
 
 fn prepare_triangles(triangles: &[Triangle]) -> Result<Vec<PreparedTriangle>> {
