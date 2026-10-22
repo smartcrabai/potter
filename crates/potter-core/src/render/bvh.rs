@@ -26,7 +26,7 @@ pub(crate) struct WalkRay {
     pub kind: Option<RayKind>,
 }
 
-/// A closest-hit query: the ray, its extent, whether back faces count, and which triangles it may hit. Traversal
+/// A BVH ray query: the ray, its extent, whether back faces count, and which triangles it may hit. Traversal
 /// carries it as one value instead of a long argument list.
 #[derive(Clone, Copy)]
 struct RayQuery<'a> {
@@ -220,6 +220,29 @@ impl Bvh {
         self.closest_hit_mode(triangles, query)
     }
 
+    /// Whether the ray hits any triangle admitted by `accepts`. Back faces count.
+    pub(crate) fn any_hit_where(
+        &self,
+        triangles: &[Triangle],
+        origin: DVec3,
+        direction: DVec3,
+        t_min: f64,
+        t_max: f64,
+        accepts: &dyn Fn(u8) -> bool,
+    ) -> bool {
+        self.any_hit_mode(
+            triangles,
+            RayQuery {
+                origin,
+                direction,
+                t_min,
+                t_max,
+                two_sided: true,
+                accepts,
+            },
+        )
+    }
+
     /// Walks the surfaces `walk` meets, nearest first, while `walk.remaining` is left along it. `visit` receives each
     /// hit and the origin the ray left from, and returns whether the walk goes on. The ray restarts `walk.epsilon`
     /// past each hit, and the walk ends when the distance is spent. Triangles whose object is hidden from the ray's
@@ -316,6 +339,87 @@ impl Bvh {
             self.visit(root, span, &query, &mut nearest);
         }
         nearest
+    }
+
+    fn any_hit_mode(&self, triangles: &[Triangle], query: RayQuery<'_>) -> bool {
+        if triangles.len() != self.triangle_count
+            || !is_finite_vec3(query.origin)
+            || !is_finite_vec3(query.direction)
+            || query.t_min.is_nan()
+            || query.t_max.is_nan()
+            || query.t_min > query.t_max
+        {
+            return false;
+        }
+
+        let Some(root) = self.root else {
+            return false;
+        };
+        let Some(span) = self
+            .nodes
+            .get(root)
+            .and_then(|node| node.bounds.slab_span(query.origin, query.direction))
+        else {
+            return false;
+        };
+        self.any_visit(root, span, &query)
+    }
+
+    fn any_visit(&self, node_index: usize, span: (f64, f64), query: &RayQuery<'_>) -> bool {
+        let Some(node) = self.nodes.get(node_index).copied() else {
+            return false;
+        };
+        if clip_span(span, query.t_min, query.t_max).is_none() {
+            return false;
+        }
+
+        match node.kind {
+            NodeKind::Leaf { start, count } => {
+                let Some(end) = start.checked_add(count) else {
+                    return false;
+                };
+                for offset in start..end {
+                    let Some(leaf) = self.leaf_triangles.get(offset) else {
+                        continue;
+                    };
+                    if !(query.accepts)(leaf.ray_mask) {
+                        continue;
+                    }
+                    if intersect_triangle(
+                        leaf,
+                        query.origin,
+                        query.direction,
+                        query.t_min,
+                        query.t_max,
+                        query.two_sided,
+                    )
+                    .is_some()
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            NodeKind::Branch { left, right } => {
+                let left_entry = self.entry(left, query, query.t_max);
+                let right_entry = self.entry(right, query, query.t_max);
+                match (left_entry, right_entry) {
+                    (Some(left_entry), Some(right_entry)) => {
+                        let (first, second) = if left_entry.near <= right_entry.near {
+                            (left_entry, right_entry)
+                        } else {
+                            (right_entry, left_entry)
+                        };
+                        self.any_visit(first.node, first.span, query)
+                            || self.any_visit(second.node, second.span, query)
+                    }
+                    (Some(entry), None) | (None, Some(entry)) => {
+                        self.any_visit(entry.node, entry.span, query)
+                    }
+                    (None, None) => false,
+                }
+            }
+        }
     }
 
     fn entry(&self, index: usize, query: &RayQuery<'_>, max_distance: f64) -> Option<ChildEntry> {
@@ -646,16 +750,16 @@ mod tests {
     use glam::DVec3;
     use proptest::prelude::*;
 
-    use crate::model::RayVisibility;
+    use crate::model::{RayKind, RayVisibility};
     use crate::render::raster::{AlphaMode, Triangle};
 
     use super::{Bvh, BvhHit, RayQuery};
 
     proptest! {
         #[test]
-        fn closest_bvh_hit_matches_brute_force_moller_trumbore(
+        fn bvh_hit_queries_match_brute_force_moller_trumbore(
             triangle_data in prop::collection::vec(
-                (-8.0_f64..8.0, -8.0_f64..8.0, -8.0_f64..8.0, 0.1_f64..2.0, any::<bool>()),
+                (-8.0_f64..8.0, -8.0_f64..8.0, -8.0_f64..8.0, 0.1_f64..2.0, any::<bool>(), any::<bool>()),
                 1..=24,
             ),
             target_index in any::<usize>(),
@@ -672,7 +776,7 @@ mod tests {
             let triangles = triangle_data
                 .iter()
                 .enumerate()
-                .map(|(index, (x, y, z, size, double_sided))| {
+                .map(|(index, (x, y, z, size, double_sided, shadow_visible))| {
                     let center = DVec3::new(*x, *y, *z);
                     Triangle {
                         positions: [
@@ -693,7 +797,11 @@ mod tests {
                         normals: None,
                         layer_colors: Vec::new(),
                         lit_per_pixel: false,
-                        ray_mask: RayVisibility::default().mask(),
+                        ray_mask: if *shadow_visible {
+                            RayVisibility::default().mask()
+                        } else {
+                            RayVisibility::default().mask() & !RayKind::Shadow.bit()
+                        },
                     }
                 })
                 .collect::<Vec<_>>();
@@ -729,6 +837,23 @@ mod tests {
             let expected_two_sided =
                 brute_force_hit(&triangles, origin, ray_direction, t_min, t_max, true);
             prop_assert_eq!(actual_two_sided, expected_two_sided);
+            let actual_any =
+                bvh.any_hit_where(&triangles, origin, ray_direction, t_min, t_max, &|_| true);
+            prop_assert_eq!(actual_any, expected_two_sided.is_some());
+            let accepts_shadow = |mask| mask & RayKind::Shadow.bit() != 0;
+            let actual_shadow =
+                bvh.closest_hit_where(&triangles, origin, ray_direction, t_min, t_max, &accepts_shadow);
+            let actual_any_shadow =
+                bvh.any_hit_where(&triangles, origin, ray_direction, t_min, t_max, &accepts_shadow);
+            prop_assert_eq!(actual_any_shadow, actual_shadow.is_some());
+            prop_assert!(!bvh.any_hit_where(
+                &triangles,
+                origin,
+                ray_direction,
+                t_min,
+                t_max,
+                &|_| false,
+            ));
         }
     }
 
