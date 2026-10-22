@@ -128,7 +128,7 @@ fn texture_coordinates(
         .collect())
 }
 
-/// The UV of each vertex from the first face that uses it (MOD_util.cc), or `None` for a mesh without UV maps.
+/// The UV of each vertex from the first face that uses it (`MOD_util.cc`), or `None` for a mesh without UV maps.
 fn vertex_uv_coordinates(
     mesh: &Mesh,
     modifier: &Modifier,

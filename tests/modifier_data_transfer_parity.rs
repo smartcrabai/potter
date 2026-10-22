@@ -393,11 +393,8 @@ fn pair_expected(mesh: &Mesh, expected: &Value) -> Result<Value, Box<dyn Error>>
 /// Recorded gaps: parity cases still different from Blender 5.2.2, with their measured maximum error.
 /// - `uv island islands_precision=1`: corners 1 and 2 take a different island path than Blender's A* search
 ///   (`mesh_remap.cc` A* section against `transfer.rs` `astar_face_path`). Not root-caused.
-/// - `POLYINTERP_VNORPROJ`: 0.005 at vertex 1 (0.578256 against 0.583316). Not root-caused: the sphere-cast
-///   weights (`transfer.rs` polygon weights) against Blender's `interp_weights_poly_v3`.
 const RECORDED_DATA_TRANSFER_GAPS: &[(&str, f64)] = &[
     ("uv island islands_precision=1", 31.330_000_001_192_094),
-    ("POLYINTERP_VNORPROJ", 5.060_065_180_970_907e-3),
 ];
 
 /// Asserts a parity error against `tolerance`, or, for a recorded gap, against the recorded error: the case must stay

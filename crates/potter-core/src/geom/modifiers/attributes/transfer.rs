@@ -251,35 +251,35 @@ pub(super) fn data_transfer(
                     "sharp",
                     edge_mapping,
                     &mapping_context,
-                )?,
+                ),
                 "SEAM" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
                     "seam",
                     edge_mapping,
                     &mapping_context,
-                )?,
+                ),
                 "CREASE" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
                     "crease_edge",
                     edge_mapping,
                     &mapping_context,
-                )?,
+                ),
                 "BEVEL_WEIGHT_EDGE" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
                     "bevel_weight_edge",
                     edge_mapping,
                     &mapping_context,
-                )?,
+                ),
                 "FREESTYLE_EDGE" => transfer_edge_attribute(
                     &mut result,
                     &source.mesh,
                     "freestyle_edge",
                     edge_mapping,
                     &mapping_context,
-                )?,
+                ),
                 _ => {
                     return Err(invalid(
                         modifier,
@@ -694,7 +694,7 @@ fn transfer_vertex_attribute(
         .cloned()
         .ok_or_else(|| invalid(modifier, name, "destination point-attribute values"))?;
     let mut output = destination_values;
-    for index in 0..destination.vertices.len() {
+    for (index, slot) in output.iter_mut().enumerate().take(destination.vertices.len()) {
         let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping)
         else {
             continue;
@@ -707,7 +707,7 @@ fn transfer_vertex_attribute(
             })
             .collect::<Vec<_>>();
         if let Some(value) = weighted_values(&samples) {
-            output[index] = value;
+            *slot = value;
         }
     }
     if let Some(layers) = destination
@@ -727,13 +727,13 @@ fn transfer_edge_attribute(
     name: &str,
     mapping: &str,
     mapping_context: &TransferMapContext<'_>,
-) -> Result<()> {
+) {
     let intrinsic_flag = matches!(name, "sharp" | "seam");
     // The modifier never creates a layer (`use_create = false`, MOD_datatransfer.cc), and the
     // sharp/seam mappings exist only for a destination layer that is already present
     // (blenkernel/intern/data_transfer.cc, `lookup_for_write_span` before `add_item`).
     if intrinsic_flag && !destination.attributes.contains_key(name) {
-        return Ok(());
+        return;
     }
     let float_attribute = matches!(name, "crease_edge" | "bevel_weight_edge");
     let blender_index = (!intrinsic_flag)
@@ -782,7 +782,7 @@ fn transfer_edge_attribute(
         }
     }
     if !intrinsic_flag && blender_index.is_none() && !destination.attributes.contains_key(name) {
-        return Ok(());
+        return;
     }
     for (destination_index, edge) in destination.edges.iter().enumerate() {
         let Some(mapped) =
@@ -848,7 +848,6 @@ fn transfer_edge_attribute(
             json!({"domain":"edge","type":kind,"values":output}),
         );
     }
-    Ok(())
 }
 
 fn transfer_uv(
@@ -2162,8 +2161,8 @@ fn mapped_edge_sources(
     }
 }
 
-/// The destination normal a loop mapping compares against. NEAREST_POLYNOR always uses the face normal
-/// (mesh_remap.cc:1454, :1502); the other mappings use the corner normal when the mesh has one.
+/// The destination normal a loop mapping compares against. `NEAREST_POLYNOR` always uses the face normal
+/// (`mesh_remap.cc:1454`, `mesh_remap.cc:1502`); the other mappings use the corner normal when the mesh has one.
 fn loop_destination_normal(
     context: &TransferMapContext<'_>,
     destination: &Mesh,
