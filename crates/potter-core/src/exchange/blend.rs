@@ -9282,15 +9282,14 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     nodes.iter().any(|node| {
                         let properties = node.get("properties");
                         match node.get("type").and_then(Value::as_str) {
-                            Some("ShaderNodeMix") => crate::shader::world_mix_mode(
+                            Some("ShaderNodeMix") => !crate::shader::world_mix_supported(
                                 properties
                                     .and_then(|properties| properties.get("data_type"))
                                     .and_then(Value::as_str),
                                 properties
                                     .and_then(|properties| properties.get("blend_type"))
                                     .and_then(Value::as_str),
-                            )
-                            .is_err(),
+                            ),
                             Some(
                                 "ShaderNodeBackground"
                                     | "ShaderNodeOutputWorld"

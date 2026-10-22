@@ -18,7 +18,7 @@ enum WorldValue {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum WorldMixMode {
+enum WorldMixMode {
     Mix,
     Add,
     Multiply,
@@ -27,12 +27,12 @@ pub(crate) enum WorldMixMode {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum WorldMixError<'a> {
+enum WorldMixError<'a> {
     UnsupportedDataType(&'a str),
     UnsupportedBlendType(&'a str),
 }
 
-pub(crate) fn world_mix_mode<'a>(
+fn world_mix_mode<'a>(
     data_type: Option<&'a str>,
     blend_type: Option<&'a str>,
 ) -> std::result::Result<WorldMixMode, WorldMixError<'a>> {
@@ -49,6 +49,10 @@ pub(crate) fn world_mix_mode<'a>(
         "DIVIDE" => Ok(WorldMixMode::Divide),
         unsupported => Err(WorldMixError::UnsupportedBlendType(unsupported)),
     }
+}
+
+pub(crate) fn world_mix_supported(data_type: Option<&str>, blend_type: Option<&str>) -> bool {
+    world_mix_mode(data_type, blend_type).is_ok()
 }
 
 /// Evaluates the World node graph for a single outgoing direction.

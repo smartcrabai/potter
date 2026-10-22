@@ -2484,7 +2484,6 @@ fn shade(
     let receiver = Receiver {
         point,
         shadow_point,
-        normal,
         geometric,
         view,
     };
@@ -3031,13 +3030,11 @@ fn sun_disc_visibility(
     total / SUN_DISC_SAMPLES as f64
 }
 
-/// The receiver of direct light at a shading point: the point and its shadow origin, its shading and geometric normals,
-/// and the view the lobes are evaluated along.
+/// The receiver of direct light at a shading point: the point and its shadow origin, the geometric normal, and the view.
 #[derive(Clone, Copy)]
 struct Receiver {
     point: DVec3,
     shadow_point: DVec3,
-    normal: DVec3,
     geometric: DVec3,
     view: DVec3,
 }

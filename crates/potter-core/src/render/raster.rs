@@ -2293,6 +2293,7 @@ struct Layer {
 /// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
 /// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
 /// scalar composite of the layers. Returns the un-premultiplied colour and that alpha.
+#[cfg(test)]
 fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
     composite_layers_with_background(layers, background[3], || {
         Ok([background[0], background[1], background[2]])
