@@ -57,7 +57,7 @@ KINDS = {
         "blender_type": "SOFT_BODY",
         "potter_type": "soft_body",
         "params": {},
-        "potter_settings": {"goal_strength": 0.7},
+        "potter_settings": {"goal_default": 0.7},
     },
     "cloth": {
         "blender_type": "CLOTH",
@@ -69,7 +69,7 @@ KINDS = {
         "blender_type": "COLLISION",
         "potter_type": "collision",
         "params": {},
-        "potter_settings": {"thickness": 0.01},
+        "potter_settings": {"thickness_outer": 0.01},
     },
     "dynamic_paint": {
         "blender_type": "DYNAMIC_PAINT",
@@ -81,7 +81,7 @@ KINDS = {
         "blender_type": "FLUID",
         "potter_type": "fluid",
         "params": {},
-        "potter_settings": {"type": "liquid", "resolution": 4},
+        "potter_settings": {"domain_type": "LIQUID", "resolution_max": 4},
     },
     "particle_system": {
         "blender_type": "PARTICLE_SYSTEM",

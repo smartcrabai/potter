@@ -3,9 +3,9 @@
     reason = "Blender round-trip fixtures use fixed valid test data"
 )]
 
-use std::{error::Error, fs};
+use std::{error::Error, fs, path::Path, process::Command};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -20,6 +20,61 @@ use blender_checked::blender_executable as blender;
 use blender_script_guarded::run_blender_script;
 use pot_json_guarded::pot_json;
 use process::run_guarded;
+
+/// Loss ids the physics fixture imports with, sorted: one per Blender setting that Potter keeps but
+/// does not evaluate and that the fixture leaves away from its Blender default (values Blender
+/// derives from those settings included). Dynamic Paint surfaces are reported per surface, not as
+/// one `canvas_surfaces` id.
+const EXPECTED_PHYSICS_LOSSES: &[&str] = &[
+    "blender.physics.cloth.use_dynamic_mesh",
+    "blender.physics.cloth.use_sewing_springs",
+    "blender.physics.cloth_collision.collision_quality",
+    "blender.physics.cloth_collision.damping",
+    "blender.physics.cloth_collision.friction",
+    "blender.physics.cloth_collision.self_friction",
+    "blender.physics.collision.absorption",
+    "blender.physics.collision.damping_factor",
+    "blender.physics.collision.damping_random",
+    "blender.physics.collision.friction_factor",
+    "blender.physics.collision.friction_random",
+    "blender.physics.collision.permeability",
+    "blender.physics.collision.use_particle_kill",
+    "blender.physics.dynamic_paint_brush.paint_wetness",
+    "blender.physics.dynamic_paint_brush.smudge_strength",
+    "blender.physics.dynamic_paint_brush.use_paint_erase",
+    "blender.physics.dynamic_paint_brush.use_smudge",
+    "blender.physics.dynamic_paint_brush.use_velocity_alpha",
+    "blender.physics.dynamic_paint_brush.velocity_max",
+    "blender.physics.dynamic_paint_brush.wave_factor",
+    "blender.physics.dynamic_paint_brush.wave_type",
+    "blender.physics.dynamic_paint_surface.dissolve_speed",
+    "blender.physics.dynamic_paint_surface.dry_speed",
+    "blender.physics.dynamic_paint_surface.use_dissolve",
+    "blender.physics.fluid_domain_liquid.cache_data_format",
+    "blender.physics.fluid_domain_liquid.cache_frame_offset",
+    "blender.physics.fluid_domain_liquid.cache_mesh_format",
+    "blender.physics.fluid_domain_liquid.time_scale",
+    "blender.physics.fluid_domain_liquid.use_adaptive_domain",
+    "blender.physics.fluid_effector.subframes",
+    "blender.physics.fluid_effector.surface_distance",
+    "blender.physics.fluid_effector.use_plane_init",
+    "blender.physics.fluid_effector.velocity_factor",
+    "blender.physics.fluid_flow.fuel_amount",
+    "blender.physics.fluid_flow.surface_distance",
+    "blender.physics.fluid_flow.temperature",
+    "blender.physics.fluid_flow.use_initial_velocity",
+    "blender.physics.fluid_flow.velocity_coord",
+    "blender.physics.soft_body.aero",
+    "blender.physics.soft_body.bend",
+    "blender.physics.soft_body.damping",
+    "blender.physics.soft_body.goal_friction",
+    "blender.physics.soft_body.pull",
+    "blender.physics.soft_body.push",
+    "blender.physics.soft_body.spring_length",
+    "blender.physics.soft_body.use_edge_collision",
+    "blender.physics.soft_body.use_face_collision",
+    "blender.physics.soft_body.use_stiff_quads",
+];
 
 const FIXTURE: &str = r"
 import bpy, openvdb
@@ -416,16 +471,16 @@ checks['soft_body'] = {'settings':fields(soft.settings, ['mass','friction','spee
 collision = bpy.data.objects['Collision'].modifiers['CollisionSettingsFixture']
 checks['collision'] = {'settings':fields(collision.settings, ['use','damping_factor','damping_random','friction_factor','friction_random','permeability','use_particle_kill','thickness_inner','thickness_outer','cloth_friction','absorption'])}
 brush_mod = bpy.data.objects['DynamicPaintBrush'].modifiers['BrushSettingsFixture']
-checks['dynamic_paint_brush'] = {'settings':fields(brush_mod.brush_settings, ['paint_color','paint_alpha','use_absolute_alpha','paint_wetness','use_paint_erase','wave_type','wave_factor','wave_clamp','use_smudge','smudge_strength','velocity_max','use_velocity_alpha']), 'canvas_surfaces':[], 'role':'brush'}
+checks['dynamic_paint_brush'] = {'settings':fields(brush_mod.brush_settings, ['paint_color','paint_alpha','use_absolute_alpha','paint_wetness','use_paint_erase','wave_type','wave_factor','wave_clamp','use_smudge','smudge_strength','velocity_max','use_velocity_alpha']), 'canvas_surfaces':[], 'role':'brush', 'ui_type':brush_mod.ui_type}
 canvas_mod = bpy.data.objects['DynamicPaintCanvas'].modifiers['CanvasSettingsFixture']
 canvas_surfaces = canvas_mod.canvas_settings.canvas_surfaces
-checks['dynamic_paint_canvas'] = {'settings':{}, 'canvas_surfaces':[fields(canvas_surfaces[0], ['surface_format','surface_type','is_active','use_dissolve','dissolve_speed','use_drying','dry_speed','frame_start','frame_end'])], 'role':'canvas'}
+checks['dynamic_paint_canvas'] = {'settings':{}, 'canvas_surfaces':[fields(canvas_surfaces[0], ['surface_format','surface_type','is_active','use_dissolve','dissolve_speed','use_drying','dry_speed','frame_start','frame_end'])], 'role':'canvas', 'ui_type':canvas_mod.ui_type}
 domain_mod = bpy.data.objects['FluidDomain'].modifiers['FluidDomainSettingsFixture']
-checks['fluid_domain'] = {'settings':fields(domain_mod.domain_settings, ['domain_type','resolution_max','use_adaptive_domain','cache_frame_start','cache_frame_end','cache_frame_offset','cache_data_format','cache_mesh_format','cache_directory','time_scale']), 'role':'DOMAIN', 'show_viewport':bool(domain_mod.show_viewport), 'show_render':bool(domain_mod.show_render)}
+checks['fluid_domain'] = {'settings':fields(domain_mod.domain_settings, ['domain_type','resolution_max','use_adaptive_domain','cache_frame_start','cache_frame_end','cache_frame_offset','cache_data_format','cache_mesh_format','cache_directory','time_scale']), 'role':'DOMAIN', 'fluid_type':domain_mod.fluid_type, 'show_viewport':bool(domain_mod.show_viewport), 'show_render':bool(domain_mod.show_render)}
 flow_mod = bpy.data.objects['FluidFlow'].modifiers['FluidFlowSettingsFixture']
-checks['fluid_flow'] = {'settings':fields(flow_mod.flow_settings, ['density','fuel_amount','temperature','flow_type','flow_behavior','flow_source','use_absolute','use_initial_velocity','velocity_coord','surface_distance']), 'role':'FLOW', 'show_viewport':bool(flow_mod.show_viewport), 'show_render':bool(flow_mod.show_render)}
+checks['fluid_flow'] = {'settings':fields(flow_mod.flow_settings, ['density','fuel_amount','temperature','flow_type','flow_behavior','flow_source','use_absolute','use_initial_velocity','velocity_coord','surface_distance']), 'role':'FLOW', 'fluid_type':flow_mod.fluid_type, 'show_viewport':bool(flow_mod.show_viewport), 'show_render':bool(flow_mod.show_render)}
 effector_mod = bpy.data.objects['FluidEffector'].modifiers['FluidEffectorSettingsFixture']
-checks['fluid_effector'] = {'settings':fields(effector_mod.effector_settings, ['effector_type','surface_distance','use_plane_init','velocity_factor','guide_mode','use_effector','subframes']), 'role':'EFFECTOR', 'show_viewport':bool(effector_mod.show_viewport), 'show_render':bool(effector_mod.show_render)}
+checks['fluid_effector'] = {'settings':fields(effector_mod.effector_settings, ['effector_type','surface_distance','use_plane_init','velocity_factor','guide_mode','use_effector','subframes']), 'role':'EFFECTOR', 'fluid_type':effector_mod.fluid_type, 'show_viewport':bool(effector_mod.show_viewport), 'show_render':bool(effector_mod.show_render)}
 emitter = bpy.data.objects['ParticleEmitter']
 particle_system = emitter.particle_systems[0]
 checks['particle_system'] = {'settings':fields(particle_system.settings, ['count','frame_start','frame_end','lifetime','lifetime_random','emit_from','physics_type','normal_factor','factor_random','particle_size','size_random','render_type','child_type']), 'point_cache':cache_values(particle_system), 'seed':int(particle_system.seed)}
@@ -460,6 +515,27 @@ with open(output, 'w', encoding='utf-8') as handle:
     json.dump({'settings':checks, 'modifiers':mods, 'geometry':geometry_after,
                'frame_start':scene.frame_start, 'frame_end':scene.frame_end,
                'fluid_particle_types':fluid_particle_types}, handle)
+";
+
+const REOPEN_DYNAMIC_PAINT_ROLES: &str = r"
+import bpy, json, sys
+arguments = sys.argv[sys.argv.index('--') + 1:]
+bpy.ops.wm.open_mainfile(filepath=arguments[1])
+
+def role_state(object_name, modifier_name):
+    modifier = bpy.data.objects[object_name].modifiers[modifier_name]
+    return {
+        'ui_type': modifier.ui_type,
+        'has_brush_settings': modifier.brush_settings is not None,
+        'has_canvas_settings': modifier.canvas_settings is not None,
+    }
+
+result = {
+    'canvas_object': role_state('DynamicPaintCanvas', 'CanvasSettingsFixture'),
+    'brush_object': role_state('DynamicPaintBrush', 'BrushSettingsFixture'),
+}
+with open(arguments[2], 'w', encoding='utf-8') as handle:
+    json.dump(result, handle)
 ";
 
 fn assert_subset(actual: &Value, expected: &Value, context: &str) {
@@ -597,6 +673,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         root.join("source.blend").to_str().unwrap(),
         "--format",
         "blend",
+        "--allow-lossy",
         "--mode",
         "replace",
         "--base-revision",
@@ -604,7 +681,14 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         "--blender",
         blender.to_str().unwrap(),
     ])?;
-    assert_eq!(imported["result"]["losses"], json!([]), "{imported}");
+    let mut loss_ids = imported["result"]["losses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|loss| loss["feature_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    loss_ids.sort();
+    assert_eq!(loss_ids, EXPECTED_PHYSICS_LOSSES, "{imported}");
     assert_eq!(
         expected["settings"]["particle_system"]["point_cache"]["is_baked"], true,
         "the Blender fixture must carry a baked particle point cache",
@@ -615,7 +699,25 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
     let source_scene = scenes.values().next().unwrap();
     assert_eq!(source_scene["frame_start"], expected["frame_start"]);
     assert_eq!(source_scene["frame_end"], expected["frame_end"]);
+    assert_imported_physics(&expected, mappings, &scene);
+    assert_catalog_parity();
+    assert_inspected_geometry(&project, &expected, mappings)?;
+    assert_particle_instance_and_explode(&expected, mappings, &scene);
+    let after = assert_export_and_reopen(root, &project, &blender, &expected)?;
+    assert_reopened_settings(&after, &expected);
+    let same_role_scene = assert_dynamic_paint_same_role(root, &project, &scene, mappings)?;
+    assert_dynamic_paint_role_transitions(
+        root,
+        &project,
+        &blender,
+        &scene,
+        mappings,
+        &same_role_scene,
+    )?;
+    Ok(())
+}
 
+fn assert_imported_physics(expected: &Value, mappings: &Map<String, Value>, scene: &Value) {
     let physics_property = [
         ("Cloth", "cloth", "physics_cloth", "ClothSettingsFixture"),
         (
@@ -669,7 +771,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
     ];
     for (object_name, case_name, property_name, modifier_name) in physics_property {
         let node_id = mappings[&format!("Object:{object_name}")].as_str().unwrap();
-        let imported_modifier = modifier(&scene, node_id, modifier_name);
+        let imported_modifier = modifier(scene, node_id, modifier_name);
         assert!(
             imported_modifier["params"]["settings_id"]
                 .as_str()
@@ -681,7 +783,19 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         } else {
             &scene["nodes"][node_id]["properties"][property_name]
         };
-        assert_physics_settings(settings, &expected["settings"][case_name], case_name);
+        let mut expected_settings = expected["settings"][case_name].clone();
+        if property_name == "physics_fluid" {
+            let role = expected_settings["role"].as_str().unwrap();
+            assert_eq!(imported_modifier["params"]["fluid_type"], role);
+            expected_settings.as_object_mut().unwrap().remove("role");
+        } else if property_name == "physics_dynamic_paint" {
+            let role = expected_settings["role"].as_str().unwrap();
+            assert_eq!(
+                imported_modifier["params"]["ui_type"],
+                if role == "brush" { "BRUSH" } else { "CANVAS" }
+            );
+        }
+        assert_physics_settings(settings, &expected_settings, case_name);
         if let Some(show_viewport) = expected["settings"][case_name].get("show_viewport") {
             assert_eq!(imported_modifier["enabled"], true, "{case_name}.enabled");
             assert_eq!(
@@ -704,6 +818,9 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         .filter(|system| system["type"] == "FLIP")
         .count();
     assert_eq!(flip_systems, 1, "imported FLIP particle system count");
+}
+
+fn assert_catalog_parity() {
     let catalog = potter_core::catalog::feature_catalog();
     let parity_feature = catalog["features"]
         .as_array()
@@ -713,14 +830,17 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         .unwrap();
     assert_eq!(parity_feature["status"], "not_supported");
     assert_eq!(parity_feature["capabilities"]["evaluate"], false);
+}
 
+fn assert_inspected_geometry(
+    project: &Path,
+    expected: &Value,
+    mappings: &Map<String, Value>,
+) -> Result<(), Box<dyn Error>> {
+    // Potter evaluates these at frame 1 and must reproduce Blender's mesh.
     for object_name in [
-        "Cloth",
-        "SoftBody",
         "Collision",
         "DynamicPaintBrush",
-        "DynamicPaintCanvas",
-        "FluidDomain",
         "FluidFlow",
         "FluidEffector",
         "ParticleInstance",
@@ -742,9 +862,46 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
             &format!("Potter frame 1 {object_name}"),
         );
     }
+    // These carry Blender settings that the lossy import reported and the user accepted. Potter does not
+    // evaluate them, and it must not refuse the scene for them: evaluation warns about each accepted value
+    // (`accepted_loss`) instead, so the frame-1 inspect succeeds.
+    for object_name in ["Cloth", "SoftBody", "DynamicPaintCanvas", "FluidDomain"] {
+        let node_id = mappings[&format!("Object:{object_name}")].as_str().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+        command.args([
+            "inspect",
+            project.to_str().unwrap(),
+            "--id",
+            node_id,
+            "--frame",
+            "1",
+            "--json",
+        ]);
+        let output = run_guarded(command)?;
+        let envelope: Value = serde_json::from_slice(&output.stdout)?;
+        assert!(
+            output.status.success(),
+            "{object_name} refused at frame 1 for accepted lossy values: {envelope}"
+        );
+        for warning in envelope["warnings"].as_array().into_iter().flatten() {
+            if warning["details"]["feature_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("blender.physics."))
+            {
+                assert_eq!(warning["details"]["status"], "accepted_loss", "{envelope}");
+            }
+        }
+    }
+    Ok(())
+}
 
+fn assert_particle_instance_and_explode(
+    expected: &Value,
+    mappings: &Map<String, Value>,
+    scene: &Value,
+) {
     let instance_id = mappings["Object:ParticleInstance"].as_str().unwrap();
-    let instance = modifier(&scene, instance_id, "ParticleInstanceSettingsFixture");
+    let instance = modifier(scene, instance_id, "ParticleInstanceSettingsFixture");
     assert_eq!(
         instance["params"]["object"],
         mappings["Object:ParticleEmitter"]
@@ -767,7 +924,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         "particle instance params",
     );
     let explode_id = mappings["Object:Explode"].as_str().unwrap();
-    let explode_modifier = modifier(&scene, explode_id, "ExplodeSettingsFixture");
+    let explode_modifier = modifier(scene, explode_id, "ExplodeSettingsFixture");
     assert_subset(
         &explode_modifier["params"],
         &json!({
@@ -780,7 +937,14 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         }),
         "explode params",
     );
+}
 
+fn assert_export_and_reopen(
+    root: &Path,
+    project: &Path,
+    blender: &Path,
+    expected: &Value,
+) -> Result<Value, Box<dyn Error>> {
     let exported = root.join("roundtrip.blend");
     pot_json(&[
         "export",
@@ -794,7 +958,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
     ])?;
     let reopened_path = root.join("reopened.json");
     run_blender_script(
-        &blender,
+        blender,
         "reopen_sim_fixture.py",
         REOPEN,
         root,
@@ -810,6 +974,10 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
     );
     assert_eq!(after["frame_start"], expected["frame_start"]);
     assert_eq!(after["frame_end"], expected["frame_end"]);
+    Ok(after)
+}
+
+fn assert_reopened_settings(after: &Value, expected: &Value) {
     for case_name in [
         "cloth",
         "soft_body",
@@ -828,6 +996,18 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
             &format!("reopened.{case_name}"),
         );
     }
+    assert_eq!(after["settings"]["dynamic_paint_brush"]["ui_type"], "BRUSH");
+    assert_eq!(
+        after["settings"]["dynamic_paint_canvas"]["ui_type"],
+        "CANVAS"
+    );
+    for (name, role) in [
+        ("fluid_domain", "DOMAIN"),
+        ("fluid_flow", "FLOW"),
+        ("fluid_effector", "EFFECTOR"),
+    ] {
+        assert_eq!(after["settings"][name]["fluid_type"], role);
+    }
     assert_subset(
         &after["modifiers"]["ParticleInstance"],
         &expected["modifiers"]["ParticleInstance"],
@@ -845,5 +1025,177 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
             &format!("reopened frame 1 {object_name}"),
         );
     }
+}
+
+fn assert_dynamic_paint_same_role(
+    root: &Path,
+    project: &Path,
+    scene: &Value,
+    mappings: &Map<String, Value>,
+) -> Result<Value, Box<dyn Error>> {
+    let canvas_id = mappings["Object:DynamicPaintCanvas"].as_str().unwrap();
+    let brush_id = mappings["Object:DynamicPaintBrush"].as_str().unwrap();
+    let canvas_modifier_id = modifier(scene, canvas_id, "CanvasSettingsFixture")["id"]
+        .as_str()
+        .unwrap();
+    let brush_modifier_id = modifier(scene, brush_id, "BrushSettingsFixture")["id"]
+        .as_str()
+        .unwrap();
+    let imported_canvas_surfaces =
+        scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"]["canvas_surfaces"].clone();
+    let imported_brush_color =
+        scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"]["paint_color"].clone();
+    let imported_compatibility = scene["compatibility"]["blender_adapter"]["intermediate"].clone();
+    let imported_history_head = scene["history"]["head"].as_str().unwrap().to_owned();
+    let history_hash = imported_history_head.strip_prefix("sha256:").unwrap();
+    let history_blob_path = project
+        .join("history")
+        .join("sha256")
+        .join(history_hash)
+        .join("blob.json");
+    let imported_history_blob = fs::read(&history_blob_path)?;
+
+    let same_role_batch = json!({
+        "schema_version":1,
+        "base_revision":scene["revision"],
+        "operations":[
+            {"op":"physics.dynamic_paint.update","target":{"id":canvas_id},"set":{"strength":0.5}},
+            {"op":"modifier.update","target":{"id":canvas_id},"modifier_id":canvas_modifier_id,"set":{"params":{"ui_type":"CANVAS"}}},
+            {"op":"physics.dynamic_paint.update","target":{"id":brush_id},"set":{"paint_alpha":0.75}},
+            {"op":"modifier.update","target":{"id":brush_id},"modifier_id":brush_modifier_id,"set":{"params":{"ui_type":"BRUSH"}}}
+        ]
+    });
+    let same_role_path = root.join("dynamic_paint_same_role.json");
+    fs::write(&same_role_path, serde_json::to_vec(&same_role_batch)?)?;
+    pot_json(&[
+        "apply",
+        project.to_str().unwrap(),
+        "--file",
+        same_role_path.to_str().unwrap(),
+    ])?;
+    let same_role_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    assert_eq!(
+        same_role_scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"]["canvas_surfaces"],
+        imported_canvas_surfaces
+    );
+    assert_eq!(
+        same_role_scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"]["paint_color"],
+        imported_brush_color
+    );
+    assert_eq!(
+        same_role_scene["compatibility"]["blender_adapter"]["intermediate"],
+        imported_compatibility
+    );
+    assert!(
+        same_role_scene["history"]["undo"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(imported_history_head))
+    );
+    assert_eq!(fs::read(&history_blob_path)?, imported_history_blob);
+    Ok(same_role_scene)
+}
+
+fn assert_dynamic_paint_role_transitions(
+    root: &Path,
+    project: &Path,
+    blender: &Path,
+    scene: &Value,
+    mappings: &Map<String, Value>,
+    same_role_scene: &Value,
+) -> Result<(), Box<dyn Error>> {
+    let canvas_id = mappings["Object:DynamicPaintCanvas"].as_str().unwrap();
+    let brush_id = mappings["Object:DynamicPaintBrush"].as_str().unwrap();
+    let canvas_modifier_id = modifier(scene, canvas_id, "CanvasSettingsFixture")["id"]
+        .as_str()
+        .unwrap();
+    let brush_modifier_id = modifier(scene, brush_id, "BrushSettingsFixture")["id"]
+        .as_str()
+        .unwrap();
+    let transition_batch = json!({
+        "schema_version":1,
+        "base_revision":same_role_scene["revision"],
+        "operations":[
+            {"op":"modifier.update","target":{"id":canvas_id},"modifier_id":canvas_modifier_id,"set":{"params":{"ui_type":"BRUSH"}}},
+            {"op":"modifier.update","target":{"id":brush_id},"modifier_id":brush_modifier_id,"set":{"params":{"ui_type":"CANVAS"}}}
+        ]
+    });
+    let transition_path = root.join("dynamic_paint_role_transitions.json");
+    fs::write(&transition_path, serde_json::to_vec(&transition_batch)?)?;
+    pot_json(&[
+        "apply",
+        project.to_str().unwrap(),
+        "--file",
+        transition_path.to_str().unwrap(),
+    ])?;
+    let transitioned_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let canvas_settings =
+        &transitioned_scene["nodes"][canvas_id]["properties"]["physics_dynamic_paint"];
+    let brush_settings =
+        &transitioned_scene["nodes"][brush_id]["properties"]["physics_dynamic_paint"];
+    assert_eq!(canvas_settings["role"], "brush");
+    assert!(canvas_settings.get("canvas_surfaces").is_none());
+    assert!(canvas_settings.get("surface_format").is_none());
+    assert_eq!(
+        modifier(&transitioned_scene, canvas_id, "CanvasSettingsFixture")["params"]["ui_type"],
+        "BRUSH"
+    );
+    assert_eq!(brush_settings["role"], "canvas");
+    assert!(brush_settings.get("paint_color").is_none());
+    assert!(brush_settings.get("use_velocity_alpha").is_none());
+    assert_eq!(
+        modifier(&transitioned_scene, brush_id, "BrushSettingsFixture")["params"]["ui_type"],
+        "CANVAS"
+    );
+
+    // The same-role batch sets the canvas `strength`, which has no Blender property: exporting it is a
+    // reported loss (`potter.physics.dynamic_paint_canvas.strength`), accepted here because this step tests
+    // the role transitions, not that value.
+    let transitioned_blend = root.join("dynamic_paint_role_transitions.blend");
+    pot_json(&[
+        "export",
+        project.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--out",
+        transitioned_blend.to_str().unwrap(),
+        "--blender",
+        blender.to_str().unwrap(),
+        "--allow-lossy",
+    ])?;
+    let transitioned_reopen_path = root.join("dynamic_paint_role_reopened.json");
+    run_blender_script(
+        blender,
+        "reopen_dynamic_paint_roles.py",
+        REOPEN_DYNAMIC_PAINT_ROLES,
+        root,
+        &[&transitioned_blend, &transitioned_reopen_path],
+        "Dynamic Paint role export failed",
+        run_guarded,
+    )?;
+    let transitioned_reopened: Value =
+        serde_json::from_slice(&fs::read(transitioned_reopen_path)?)?;
+    assert_eq!(transitioned_reopened["canvas_object"]["ui_type"], "BRUSH");
+    assert!(
+        transitioned_reopened["canvas_object"]["has_brush_settings"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        !transitioned_reopened["canvas_object"]["has_canvas_settings"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(transitioned_reopened["brush_object"]["ui_type"], "CANVAS");
+    assert!(
+        !transitioned_reopened["brush_object"]["has_brush_settings"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        transitioned_reopened["brush_object"]["has_canvas_settings"]
+            .as_bool()
+            .unwrap()
+    );
     Ok(())
 }

@@ -681,7 +681,12 @@ fn bump_node_perturbs_principled_normal_from_height_gradient() {
     let mut graph = NodeGroup::new("Bump", GraphKind::Shader);
     add_node(&mut graph, "out", "OutputMaterial", &[]);
     add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
-    add_node(&mut graph, "bump", "ShaderNodeBump", &[]);
+    add_node(
+        &mut graph,
+        "bump",
+        "ShaderNodeBump",
+        &[("Distance", json!(1.0))],
+    );
     add_node(&mut graph, "coordinates", "ShaderNodeTexCoord", &[]);
     add_node(
         &mut graph,
