@@ -406,19 +406,22 @@ fn scenario_geometry<'a>(results: &'a BTreeMap<String, Value>, id: &str, state: 
         .expect("Blender scenario result is missing")
 }
 
-/// Blender evaluates each vertex in f32 through a chain: a quaternion rotation of the vertex, then
-/// scale and translation to the particle location. Potter computes in f64 and is compared after
-/// rounding to f32. The chain magnitude M is the largest value Blender carries through that chain:
-/// the largest output coordinate or particle location, reported by the Blender runner as
-/// `chain_magnitude`. Every rounding in the chain is at most half an ulp of its result, so the bound
-/// is F32_CHAIN_ROUNDINGS half-ulps of M. [INFERENCE] The count of 12 is an estimate of the roundings
-/// on one vertex's path (the rotation's cross products and multiply-adds, then scale and
-/// translation), not counted from the Blender source. Intermediates such as rotated cube corners
-/// (at most sqrt(3) for M = 1) stay in M's binade, so they share its ulp.
+/// Blender evaluates each vertex in f32 through a chain (explode fragment placement, particle
+/// instance transforms). Potter computes in f64 and is compared after rounding to f32. The chain
+/// magnitude M is the largest value Blender carries through that chain, reported by the Blender
+/// runner as `chain_magnitude`.
 ///
-/// Measured: the explode edge-cut difference is 6 ulp at M = 1.0, which equals this bound exactly
-/// (12 half-ulps = 6 * 2^-23); particle_instance_amount_half is 2 ulp at M = 3.69. The f32 rounding
-/// of Potter's positions is included in the comparison.
+/// NOT DERIVED. `F32_CHAIN_ROUNDINGS` (12 half-ulps of M) was chosen to cover the measured
+/// differences; it is not a worst-case bound. The explode edge-cut vertex path, from
+/// `MOD_explode.cc` (v5.2.2) lines 1000-1017, has these f32 operations: `sub_v3` (exact for the
+/// fixture's cube corners), `sub_qt_qtqt` (28 roundings: 16 products, 12 add/sub, `math_rotation_c.cc`),
+/// `mul_qt_v3` (41 roundings: 20 in the first stage, 21 in the second, `math_rotation_c.cc:77`),
+/// `add_v3` (3 roundings), and
+/// `mul_m4_v3` with identity matrices (exact). A first-order worst-case analysis with Cauchy-Schwarz
+/// magnitudes gives 221 ulp(1) per coordinate. Randomized f32 emulation reaches 4.96 ulp(1). The
+/// explode measurement is 6 ulp on the CI (Linux) Blender and 4 ulp on macOS arm64, so it is within
+/// the derived path bound. The particle quaternion's own f32 construction error is not yet counted,
+/// so no complete bound exists yet; this constant should be replaced by a per-scenario derivation.
 const F32_CHAIN_ROUNDINGS: f64 = 12.0;
 
 /// `value` rounded to f32, by parsing its shortest decimal form. This avoids an `as` cast, which the

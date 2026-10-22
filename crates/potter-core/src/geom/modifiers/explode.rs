@@ -1241,10 +1241,11 @@ mod tests {
         let expected_faces = [vec![0, 1, 2], vec![3, 4, 5, 6], vec![4, 7, 5]];
         assert_eq!(output.vertices.len(), expected_vertices.len());
         for (vertex, expected) in output.vertices.iter().zip(expected_vertices) {
-            // Blender's expected coordinates are f32 chain results: 12 half-ulps at magnitude 1
-            // (`F32_CHAIN_ROUNDINGS` in tests/modifier_param_audit.rs). The 1e-12 is Potter's own
-            // f64 error, about 1e-15 at magnitude 1.
-            let bound = 6.0 * f64::from(f32::EPSILON) + 1.0e-12;
+            // Derived vertex-path bound: 221 ulp(1) first-order worst case for the operations in
+            // MOD_explode.cc's edge-cut path (see tests/modifier_param_audit.rs). It excludes the
+            // particle quaternion's own f32 construction error, which is not yet counted. The 1e-12
+            // is Potter's f64 error.
+            let bound = 221.0 * f64::from(f32::EPSILON) + 1.0e-12;
             assert!(
                 (vertex.co - DVec3::from_array(expected))
                     .abs()
