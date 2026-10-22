@@ -361,8 +361,11 @@ import bpy
 import json
 import math
 import os
+import platform
 import sys
 
+def build_string(value):
+    return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 # Potter's plane is built in grid order (geom/primitive_order.rs), so ids 2 and 3 are swapped.
 vertices = [(-0.5, -0.5, 0.0), (0.5, -0.5, 0.0), (-0.5, 0.5, 0.0), (0.5, 0.5, 0.0)]
@@ -402,6 +405,14 @@ pose_bone.rotation_quaternion = (math.cos(0.23), 0.0, 0.0, math.sin(0.23))
 pose_bone.location = (0.2, 0.3, 0.0)
 
 results = {}
+results["blender_build"] = {
+    "version": bpy.app.version_string,
+    "build_hash": build_string(bpy.app.build_hash),
+    "build_date": build_string(bpy.app.build_date),
+    "build_time": build_string(bpy.app.build_time),
+    "platform": build_string(bpy.app.build_platform),
+    "machine": platform.machine(),
+}
 for mapping in ["LOCAL", "GLOBAL", "OBJECT", "OBJECT_NULL", "UV", "UV_FALLBACK", "BONE", "BONE_MISSING"]:
     for channel in channels:
         name = "Owner_" + mapping + "_" + channel
@@ -455,6 +466,11 @@ for mapping in ["LOCAL", "GLOBAL", "OBJECT", "OBJECT_NULL", "UV", "UV_FALLBACK",
 
 # Procedural (legacy) texture masks: a CLOUDS texture sampled with LOCAL coordinates.
 cloud_texture = bpy.data.textures.new("CloudsMask", type="CLOUDS")
+results["procedural_CLOUDS_input"] = {
+    "texture_type": cloud_texture.type,
+    "cloud_type": cloud_texture.cloud_type,
+    "group_weights": weights,
+}
 for channel in ["INT", "RED", "ALPHA"]:
     name = "Owner_CLOUDS_" + channel
     mesh = bpy.data.meshes.new(name + "Mesh")
@@ -477,12 +493,32 @@ for channel in ["INT", "RED", "ALPHA"]:
     evaluated_mesh = evaluated.to_mesh()
     evaluated_group = evaluated.vertex_groups["A"]
     result = []
+    membership = []
     for vertex in evaluated_mesh.vertices:
-        result.append(next(
-            (assignment.weight for assignment in vertex.groups
-             if assignment.group == evaluated_group.index), 0.0))
+        assignment = next(
+            (assignment for assignment in vertex.groups
+             if assignment.group == evaluated_group.index), None)
+        membership.append(assignment is not None)
+        result.append(assignment.weight if assignment is not None else 0.0)
     evaluated.to_mesh_clear()
     results["procedural_CLOUDS_" + channel] = result
+    results["procedural_CLOUDS_" + channel + "_members"] = membership
+    results["procedural_CLOUDS_" + channel + "_settings"] = {
+        "vertex_group": modifier.vertex_group,
+        "texture_type": modifier.mask_texture.type,
+        "cloud_type": cloud_texture.cloud_type,
+        "falloff_type": modifier.falloff_type,
+        "invert_falloff": modifier.invert_falloff,
+        "normalize": modifier.normalize,
+        "default_weight": modifier.default_weight,
+        "use_add": modifier.use_add,
+        "add_threshold": modifier.add_threshold,
+        "use_remove": modifier.use_remove,
+        "remove_threshold": modifier.remove_threshold,
+        "mask_constant": modifier.mask_constant,
+        "channel": modifier.mask_tex_use_channel,
+        "mapping": modifier.mask_tex_mapping,
+    }
 
 with open(os.path.join(root, "weight-texture-oracle.json"), "w", encoding="utf-8") as handle:
     json.dump(results, handle, sort_keys=True)
@@ -632,9 +668,34 @@ fn texture_oracle(root: &Path) -> Result<Option<Value>, Box<dyn Error>> {
         root,
         "Blender weight texture oracle failed",
     )?;
-    Ok(Some(serde_json::from_slice(&fs::read(
-        root.join("weight-texture-oracle.json"),
-    )?)?))
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("weight-texture-oracle.json"))?)?;
+    // Set only with the target macOS Blender executable to regenerate the pinned CLOUDS oracle.
+    if let Some(path) = std::env::var_os("POTTER_RECORD_CLOUDS_ORACLE") {
+        let cloud_oracle = json!({
+            "blender": expected["blender_build"].clone(),
+            "input": expected["procedural_CLOUDS_input"].clone(),
+            "channels": {
+                "INT": {
+                    "weights": expected["procedural_CLOUDS_INT"].clone(),
+                    "members": expected["procedural_CLOUDS_INT_members"].clone(),
+                    "settings": expected["procedural_CLOUDS_INT_settings"].clone(),
+                },
+                "RED": {
+                    "weights": expected["procedural_CLOUDS_RED"].clone(),
+                    "members": expected["procedural_CLOUDS_RED_members"].clone(),
+                    "settings": expected["procedural_CLOUDS_RED_settings"].clone(),
+                },
+                "ALPHA": {
+                    "weights": expected["procedural_CLOUDS_ALPHA"].clone(),
+                    "members": expected["procedural_CLOUDS_ALPHA_members"].clone(),
+                    "settings": expected["procedural_CLOUDS_ALPHA_settings"].clone(),
+                },
+            },
+        });
+        fs::write(path, serde_json::to_vec_pretty(&cloud_oracle)?)?;
+    }
+    Ok(Some(expected))
 }
 
 fn operand(
@@ -1770,10 +1831,23 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
 fn procedural_texture_weight_mask_matches_blender_clouds_local() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let root = directory.path();
-    let Some(expected) = texture_oracle(root)? else {
-        eprintln!("skipping procedural weight mask parity test: Blender is unavailable");
-        return Ok(());
-    };
+    // Blender leaves scalar CLOUDS alpha unset; pin the measured macOS arm64 5.2.2 build.
+    let expected: Value = serde_json::from_str(include_str!(
+        "fixtures/procedural_clouds_blender_5_2_2_macos_arm64.json"
+    ))?;
+    assert_eq!(expected["blender"]["version"].as_str(), Some("5.2.2 LTS"));
+    assert_eq!(
+        expected["blender"]["build_hash"].as_str(),
+        Some("d13f752e3b9c")
+    );
+    assert_eq!(expected["blender"]["platform"].as_str(), Some("Darwin"));
+    assert_eq!(expected["blender"]["machine"].as_str(), Some("arm64"));
+    assert_eq!(expected["input"]["texture_type"].as_str(), Some("CLOUDS"));
+    assert_eq!(expected["input"]["cloud_type"].as_str(), Some("GRAYSCALE"));
+    assert_eq!(
+        expected["input"]["group_weights"],
+        json!([0.2, 0.4, 0.6, 0.8])
+    );
     let scene = root.join("scene");
     let operations_path = root.join("procedural-mask-operations.json");
     let initialized = Command::new(env!("CARGO_BIN_EXE_pot"))
@@ -1787,26 +1861,48 @@ fn procedural_texture_weight_mask_matches_blender_clouds_local() -> Result<(), B
         String::from_utf8_lossy(&initialized.stdout)
     );
     let channels = ["INT", "RED", "ALPHA"];
-    let mut operations =
-        vec![json!({"op":"texture.create","id":"clouds_mask","texture_type":"CLOUDS"})];
+    let input_weights = expected["input"]["group_weights"]
+        .as_array()
+        .ok_or("CLOUDS fixture group weights are missing")?;
+    assert_eq!(input_weights.len(), 4, "CLOUDS fixture vertex count");
+    let group_weights = input_weights
+        .iter()
+        .enumerate()
+        .map(|(vertex_id, weight)| json!({"vertex_id":vertex_id,"weight":weight}))
+        .collect::<Vec<_>>();
+    let mut operations = vec![json!({
+        "op":"texture.create","id":"clouds_mask",
+        "texture_type":expected["input"]["texture_type"]
+    })];
     for channel in channels {
         let object_id = format!("clouds_{}", channel.to_lowercase());
         let group_id = format!("group_{object_id}");
+        let settings = &expected["channels"][channel]["settings"];
         operations
             .push(json!({"op":"node.create","id":object_id,"kind":"plane","params":{"size":1.0}}));
         operations.push(
             json!({"op":"vertex_group.create","target":{"id":object_id},"id":group_id,"name":"A"}),
         );
-        operations.push(json!({"op":"vertex_group.assign","target":{"id":object_id},"group_id":group_id,"weights":[
-            {"vertex_id":0,"weight":0.2},{"vertex_id":1,"weight":0.4},
-            {"vertex_id":2,"weight":0.6},{"vertex_id":3,"weight":0.8}
-        ]}));
+        operations.push(json!({
+            "op":"vertex_group.assign","target":{"id":object_id},
+            "group_id":group_id,"weights":group_weights.clone()
+        }));
         operations.push(json!({
             "op":"modifier.create","target":{"id":object_id},"id":format!("modifier_{object_id}"),
             "type":"vertex_weight_edit","params":{
-                "vertex_group":"A","falloff_type":"SHARP","normalize":false,
-                "mask_texture":"clouds_mask","mask_tex_use_channel":channel,
-                "mask_tex_mapping":"LOCAL","mask_constant":0.75
+                "vertex_group":settings["vertex_group"],
+                "falloff_type":settings["falloff_type"],
+                "invert_falloff":settings["invert_falloff"],
+                "normalize":settings["normalize"],
+                "default_weight":settings["default_weight"],
+                "use_add":settings["use_add"],
+                "add_threshold":settings["add_threshold"],
+                "use_remove":settings["use_remove"],
+                "remove_threshold":settings["remove_threshold"],
+                "mask_texture":"clouds_mask",
+                "mask_tex_use_channel":settings["channel"],
+                "mask_tex_mapping":settings["mapping"],
+                "mask_constant":settings["mask_constant"]
             }
         }));
     }
@@ -1842,10 +1938,16 @@ fn procedural_texture_weight_mask_matches_blender_clouds_local() -> Result<(), B
             .get(&object_id)
             .ok_or("evaluated procedural mask mesh is missing")?;
         let label = format!("procedural CLOUDS LOCAL/{channel}");
+        let channel_oracle = &expected["channels"][channel];
+        assert_eq!(
+            json!(members(mesh, "A")?),
+            channel_oracle["members"],
+            "{label} vertex-group membership"
+        );
         assert_weights(
             &label,
             &weights(mesh, "A")?,
-            &expected[&format!("procedural_CLOUDS_{channel}")],
+            &channel_oracle["weights"],
             3.0e-5,
         )?;
     }

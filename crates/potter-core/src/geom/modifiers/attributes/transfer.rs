@@ -694,7 +694,11 @@ fn transfer_vertex_attribute(
         .cloned()
         .ok_or_else(|| invalid(modifier, name, "destination point-attribute values"))?;
     let mut output = destination_values;
-    for (index, slot) in output.iter_mut().enumerate().take(destination.vertices.len()) {
+    for (index, slot) in output
+        .iter_mut()
+        .enumerate()
+        .take(destination.vertices.len())
+    {
         let Some(mapped) = mapped_vertex_sources(mapping_context, destination, index, mapping)
         else {
             continue;
@@ -2805,7 +2809,7 @@ fn projected_polygon_sources(
         crate::geom::triangulate::NgonMethod::Clip,
         3,
     );
-    let triangle_corners = triangles
+    let mut triangle_corners = triangles
         .iter()
         .filter(|triangle| triangle.face == 0 && triangle.corners.len() == 3)
         .map(|triangle| {
@@ -2816,6 +2820,11 @@ fn projected_polygon_sources(
             ]
         })
         .collect::<Vec<_>>();
+    if positions.len() == 4 {
+        // Blender's PNORPROJ branch emits quads as [0, 1, 2], then [0, 2, 3].
+        // The generic triangulator returns BMesh slot order, with the last triangle in the original face slot.
+        triangle_corners.reverse();
+    }
     if triangle_corners.is_empty() {
         return None;
     }

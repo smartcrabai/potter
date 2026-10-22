@@ -1,0 +1,112 @@
+{
+  "blender": {
+    "build_date": "2026-09-15",
+    "build_hash": "d13f752e3b9c",
+    "build_time": "01:49:19",
+    "machine": "arm64",
+    "platform": "Darwin",
+    "version": "5.2.2 LTS"
+  },
+  "channels": {
+    "ALPHA": {
+      "members": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "settings": {
+        "add_threshold": 0.009999999776482582,
+        "channel": "ALPHA",
+        "cloud_type": "GRAYSCALE",
+        "default_weight": 0.0,
+        "falloff_type": "SHARP",
+        "invert_falloff": false,
+        "mapping": "LOCAL",
+        "mask_constant": 0.75,
+        "normalize": false,
+        "remove_threshold": 0.009999999776482582,
+        "texture_type": "CLOUDS",
+        "use_add": false,
+        "use_remove": false,
+        "vertex_group": "A"
+      },
+      "weights": [
+        0.20000000298023224,
+        0.4000000059604645,
+        0.6000000238418579,
+        0.800000011920929
+      ]
+    },
+    "INT": {
+      "members": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "settings": {
+        "add_threshold": 0.009999999776482582,
+        "channel": "INT",
+        "cloud_type": "GRAYSCALE",
+        "default_weight": 0.0,
+        "falloff_type": "SHARP",
+        "invert_falloff": false,
+        "mapping": "LOCAL",
+        "mask_constant": 0.75,
+        "normalize": false,
+        "remove_threshold": 0.009999999776482582,
+        "texture_type": "CLOUDS",
+        "use_add": false,
+        "use_remove": false,
+        "vertex_group": "A"
+      },
+      "weights": [
+        0.14000000059604645,
+        0.3100000023841858,
+        0.5099999904632568,
+        0.7400000095367432
+      ]
+    },
+    "RED": {
+      "members": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "settings": {
+        "add_threshold": 0.009999999776482582,
+        "channel": "RED",
+        "cloud_type": "GRAYSCALE",
+        "default_weight": 0.0,
+        "falloff_type": "SHARP",
+        "invert_falloff": false,
+        "mapping": "LOCAL",
+        "mask_constant": 0.75,
+        "normalize": false,
+        "remove_threshold": 0.009999999776482582,
+        "texture_type": "CLOUDS",
+        "use_add": false,
+        "use_remove": false,
+        "vertex_group": "A"
+      },
+      "weights": [
+        0.14000000059604645,
+        0.3100000023841858,
+        0.5099999904632568,
+        0.7400000095367432
+      ]
+    }
+  },
+  "input": {
+    "cloud_type": "GRAYSCALE",
+    "group_weights": [
+      0.2,
+      0.4,
+      0.6,
+      0.8
+    ],
+    "texture_type": "CLOUDS"
+  }
+}

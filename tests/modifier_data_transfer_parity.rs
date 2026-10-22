@@ -393,9 +393,8 @@ fn pair_expected(mesh: &Mesh, expected: &Value) -> Result<Value, Box<dyn Error>>
 /// Recorded gaps: parity cases still different from Blender 5.2.2, with their measured maximum error.
 /// - `uv island islands_precision=1`: corners 1 and 2 take a different island path than Blender's A* search
 ///   (`mesh_remap.cc` A* section against `transfer.rs` `astar_face_path`). Not root-caused.
-const RECORDED_DATA_TRANSFER_GAPS: &[(&str, f64)] = &[
-    ("uv island islands_precision=1", 31.330_000_001_192_094),
-];
+const RECORDED_DATA_TRANSFER_GAPS: &[(&str, f64)] =
+    &[("uv island islands_precision=1", 31.330_000_001_192_094)];
 
 // `1e-6` is the existing absolute float32 payload allowance (~8.4 ULP at |x|=1), not a worst-case geometric remap bound.
 // Discrete mapping/source choices are asserted separately.
@@ -2370,18 +2369,23 @@ for zi in range(grid_size):
         a=zi*(grid_size+1)+yi; b=a+1; d=(zi+1)*(grid_size+1)+yi; c=d+1
         oblique_source_faces.append((a,b,c,d))
 oblique_dest_verts=[(0.1,-0.8,-0.7),(0.1,0.9,-0.6),(0.1,0.65,0.8),(0.1,-0.7,0.9)]
-for label,selected in (('PNORPROJ_OBLIQUE_HIT',19),('PNORPROJ_OBLIQUE_MISS',0)):
-    source=make('ObliqueSource'+label,oblique_source_verts,oblique_source_faces)
+oblique_hit_flags=[]
+for selected in range(grid_size*grid_size):
+    source=make('ObliqueSource'+str(selected),oblique_source_verts,oblique_source_faces)
     flags=source.data.attributes.new(name='freestyle_face',type='BOOLEAN',domain='FACE')
     for index,item in enumerate(flags.data): item.value=(index==selected)
-    dest=make('ObliqueDest'+label,oblique_dest_verts,[(0,1,2,3)])
+    dest=make('ObliqueDest'+str(selected),oblique_dest_verts,[(0,1,2,3)])
     attr=dest.data.attributes.new(name='freestyle_face',type='BOOLEAN',domain='FACE')
     attr.data[0].value=False
     mod=dest.modifiers.new('Transfer','DATA_TRANSFER'); mod.object=source; mod.use_poly_data=True
     mod.data_types_polys={'FREESTYLE_FACE'}; mod.poly_mapping='POLYINTERP_PNORPROJ'
     mod.mix_mode='REPLACE'; mod.mix_factor=1.0; mod.use_max_distance=True; mod.max_distance=5.0; mod.ray_radius=0.5
     bpy.context.view_layer.update(); ev=dest.evaluated_get(bpy.context.evaluated_depsgraph_get()); me=ev.to_mesh()
-    face_result[label]=[me.attributes['freestyle_face'].data[i].value for i in range(len(me.polygons))]; ev.to_mesh_clear()
+    hit=me.attributes['freestyle_face'].data[0].value
+    if selected == 19: face_result['PNORPROJ_OBLIQUE_HIT']=[hit]
+    if selected == 0: face_result['PNORPROJ_OBLIQUE_MISS']=[hit]
+    oblique_hit_flags.append(hit); ev.to_mesh_clear()
+face_result['PNORPROJ_OBLIQUE_HIT_SET']=[i for i,hit in enumerate(oblique_hit_flags) if hit]
 with open(os.path.join(root,'domain-mapping-oracle.json'),'w') as f: json.dump({'edge':edge_result,'face':face_result},f)
 ";
 
@@ -2733,10 +2737,8 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         DVec3::new(0.1, 0.65, 0.8),
         DVec3::new(0.1, -0.7, 0.9),
     ];
-    for (label, selected) in [
-        ("PNORPROJ_OBLIQUE_HIT", 19usize),
-        ("PNORPROJ_OBLIQUE_MISS", 0),
-    ] {
+    let mut oblique_hit_flags = Vec::with_capacity(grid_size * grid_size);
+    for selected in 0..grid_size * grid_size {
         let mut oblique_source =
             Mesh::from_positions_and_faces(oblique_positions.clone(), oblique_faces.clone())?;
         let face_flags = (0..grid_size * grid_size)
@@ -2785,8 +2787,28 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
             &AttributeLayerSelection::default(),
         )?;
         let values = oblique_actual.attributes["blender_attributes"][0]["values"].clone();
-        assert_eq!(values, expected["face"][label], "oblique {label} flags");
+        oblique_hit_flags.push(values[0].clone());
     }
+    let hit_indices = oblique_hit_flags
+        .iter()
+        .enumerate()
+        .filter_map(|(index, flag)| (flag.as_bool() == Some(true)).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        json!(hit_indices),
+        expected["face"]["PNORPROJ_OBLIQUE_HIT_SET"],
+        "PNORPROJ one-hot mapped source-face indices"
+    );
+    assert_eq!(
+        json!([oblique_hit_flags[19].clone()]),
+        expected["face"]["PNORPROJ_OBLIQUE_HIT"],
+        "oblique PNORPROJ hit flags"
+    );
+    assert_eq!(
+        json!([oblique_hit_flags[0].clone()]),
+        expected["face"]["PNORPROJ_OBLIQUE_MISS"],
+        "oblique PNORPROJ miss flags"
+    );
     Ok(())
 }
 
