@@ -1,6 +1,6 @@
 """EEVEE oracle for the realtime light shapes beyond the area and point lights (Blender 5.2.2).
 
-Two scenes, each on a black world, rendered by EEVEE and saved as `.blend` for Potter to import:
+Three scenes, each on a black world, rendered by EEVEE and saved as `.blend` for Potter to import:
 
 - Sun: a perspective camera at the origin looks up +Z, and a sun with `visible_camera` on shines down -Z, so its
   disc sits at the image centre. The disc has the sun's angular diameter (`SUN_ANGLE`), which EEVEE takes as
@@ -8,10 +8,11 @@ Two scenes, each on a black world, rendered by EEVEE and saved as `.blend` for P
   (`shape_display_light_radiance_get`).
 - Spot and absorber: the orthographic top view of `eevee_light_shapes.py` with a spot light that faces the camera at
   (0, 2.5) m, and an absorbing slab, 2 m thick, over the area light. EEVEE multiplies each light shape by the
-  transmittance in front of it (`eevee_light_shape_display.bsl.hh`, `vol.transmittance`), so the area light is
-  dimmed by the slab. The spot's radiance on axis is the sphere-light formula `P / (4 π² r²)`.
+  transmittance in front of it (`eevee_light_shape_display.bsl.hh`), so the area light is dimmed by the slab. The
+  spot's radiance on axis is the sphere-light formula `P / (4 π² r²)`.
 
-Rows are reported top-down, as Potter's images are indexed.
+Rows are reported top-down, as Potter's images are indexed. Passing `-` for each render output saves the three `.blend`
+files without rendering; tests use the committed macOS f32le captures.
 
 Arguments after `--`: sun_blend, spot_blend, absorber_blend, json_out, sun_exr, spot_exr, absorber_exr.
 """
@@ -48,6 +49,7 @@ SLAB_THICKNESS = 2.0
 sun_blend, spot_blend, absorber_blend, json_out, sun_exr, spot_exr, absorber_exr = sys.argv[
     sys.argv.index("--") + 1 :
 ][:7]
+render_eevee = all(path != "-" for path in (sun_exr, spot_exr, absorber_exr))
 
 
 def new_scene():
@@ -126,11 +128,12 @@ sun = bpy.data.objects["Sun"].data
 sun.angle = SUN_ANGLE
 sun.energy = SUN_ENERGY
 bpy.ops.wm.save_as_mainfile(filepath=sun_blend)
-sun_pixels = render_and_read(scene, sun_exr)
-radius = math.tan(SUN_ANGLE / 2.0)
-result["sun_formula_radiance"] = SUN_ENERGY * (1.0 + 1.0 / radius**2) / math.pi
-result["sun_centre_mean_red"] = window_mean(sun_pixels, RESOLUTION // 2, RESOLUTION // 2)
-result["sun_corner_mean_red"] = window_mean(sun_pixels, RESOLUTION // 8, RESOLUTION // 8)
+if render_eevee:
+    sun_pixels = render_and_read(scene, sun_exr)
+    radius = math.tan(SUN_ANGLE / 2.0)
+    result["sun_formula_radiance"] = SUN_ENERGY * (1.0 + 1.0 / radius**2) / math.pi
+    result["sun_centre_mean_red"] = window_mean(sun_pixels, RESOLUTION // 2, RESOLUTION // 2)
+    result["sun_corner_mean_red"] = window_mean(sun_pixels, RESOLUTION // 8, RESOLUTION // 8)
 
 # Spot scene, without an absorber: EEVEE's volume grid is coarse and bleeds an absorber's edge onto nearby pixels, so
 # the spot is measured where no volume is.
@@ -149,20 +152,21 @@ spot.energy = SPOT_ENERGY
 spot.spot_size = math.radians(60.0)
 spot.spot_blend = 0.15
 bpy.ops.wm.save_as_mainfile(filepath=spot_blend)
-spot_pixels = render_and_read(scene, spot_exr)
-# Blender's image rows run bottom-up; the spot is at +2.5 m in Y, so its top-down row is (0.5 - y / size) · RES.
 spot_row_top = int(math.floor((0.5 - SPOT_CENTRE_Y / ORTHO_SCALE) * RESOLUTION))
 spot_column = RESOLUTION // 2
 point_column = int(math.floor((POINT_CENTRE_X / ORTHO_SCALE + 0.5) * RESOLUTION))
 area_column = int(math.floor((AREA_CENTRE_X / ORTHO_SCALE + 0.5) * RESOLUTION))
-result["spot_row_top_down"] = spot_row_top
-result["spot_column"] = spot_column
-result["spot_mean_red"] = window_mean(spot_pixels, spot_column, spot_row_top)
-result["spot_formula_radiance"] = SPOT_ENERGY / (4.0 * math.pi**2 * SPOT_RADIUS**2)
-result["area_clear_mean_red"] = window_mean(spot_pixels, area_column, RESOLUTION // 2)
-result["point_mean_red"] = window_mean(spot_pixels, point_column, RESOLUTION // 2)
-result["area_column"] = area_column
-result["point_column"] = point_column
+if render_eevee:
+    spot_pixels = render_and_read(scene, spot_exr)
+    # Blender's image rows run bottom-up; the spot is at +2.5 m in Y, so its top-down row is (0.5 - y / size) · RES.
+    result["spot_row_top_down"] = spot_row_top
+    result["spot_column"] = spot_column
+    result["spot_mean_red"] = window_mean(spot_pixels, spot_column, spot_row_top)
+    result["spot_formula_radiance"] = SPOT_ENERGY / (4.0 * math.pi**2 * SPOT_RADIUS**2)
+    result["area_clear_mean_red"] = window_mean(spot_pixels, area_column, RESOLUTION // 2)
+    result["point_mean_red"] = window_mean(spot_pixels, point_column, RESOLUTION // 2)
+    result["area_column"] = area_column
+    result["point_column"] = point_column
 
 # Absorber scene: the same area light, behind a slab of absorbing volume 2 m thick. EEVEE multiplies the light's shape by
 # the transmittance in front of it (`eevee_light_shape_display.bsl.hh`, `vol.transmittance`).
@@ -191,6 +195,10 @@ volume.inputs["Anisotropy"].default_value = 0.0
 tree.links.new(volume.outputs["Volume"], output.inputs["Volume"])
 slab.data.materials.append(material)
 bpy.ops.wm.save_as_mainfile(filepath=absorber_blend)
+if not render_eevee:
+    print("SAVED", sun_blend, spot_blend, absorber_blend, "(EEVEE renders skipped)")
+    sys.exit(0)
+
 absorber_pixels = render_and_read(scene, absorber_exr)
 result["area_through_absorber_mean_red"] = window_mean(absorber_pixels, area_column, RESOLUTION // 2)
 result["absorber_transmittance"] = result["area_through_absorber_mean_red"] / result["area_clear_mean_red"]

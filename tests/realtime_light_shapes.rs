@@ -1,10 +1,10 @@
-//! Camera-visible light shapes in the realtime Beauty image, checked against Blender 5.2.2's EEVEE.
+//! Camera-visible light shapes in the realtime Beauty image, checked against committed Blender 5.2.2 EEVEE captures.
 //!
-//! `fixtures/native_oracle/eevee_light_shapes.py` renders a square area light and a radius-1 point light, both with
-//! `visible_camera` on, on a black world. EEVEE draws each emitter at its radiance (`eevee_light_shape_display`), which
-//! is the path tracer's emitter radiance for the same light. The test imports the saved `.blend` and renders it with
-//! `pot render --engine realtime`, then compares the mean red value of a 7 x 7 window at each light's centre, and the
-//! background, with EEVEE's.
+//! `fixtures/native_oracle/eevee_light_shapes.py` saves a square area light and a radius-1 point light, both with
+//! `visible_camera` on, on a black world. The committed macOS EEVEE capture draws each emitter at its radiance
+//! (`eevee_light_shape_display`), which is the path tracer's emitter radiance for the same light. The test imports the
+//! saved `.blend` and renders it with `pot render --engine realtime`, then compares the mean red value of a 7 x 7
+//! window at each light's centre and the background with the captured EEVEE pixels.
 //!
 //! The tolerance is 0.005: EEVEE's own window means lie within 0.0005 of the emitter formulas (`P / (π A)` for the
 //! area light and `P / (4 π² r²)` for the sphere), so the bound is ten times that gap, far below either light's value.
@@ -22,7 +22,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{error::Error, fs, path::Path};
+use std::{error::Error, path::Path};
 
 use native_oracle::{
     TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
@@ -30,17 +30,21 @@ use native_oracle::{
 };
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
-use serde_json::{Value, json};
+use serde_json::json;
 use tempfile::tempdir;
 
-/// The scene and EEVEE render (`eevee_light_shapes.py`).
+/// The scene generator (`eevee_light_shapes.py`).
 const SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_light_shapes.py");
 
 /// Render settings shared with `eevee_light_shapes.py`.
 const RESOLUTION: u32 = 64;
-
-/// Linear tolerance on a window mean of red against EEVEE. See the module comment.
+const WINDOW: usize = 3;
+/// Linear tolerance on a window mean against EEVEE.
 const TOLERANCE: f64 = 0.005;
+
+/// Blender's bottom-up RGB f32le capture for the area and point light scene.
+const EEVEE_AREA_POINT: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/area_point.f32le");
 
 /// The mean red value of the `(2 * half + 1)` square window centred on `(column, row)` in the image `id`, read with
 /// Potter's own EXR loader at the texel centres.
@@ -67,6 +71,26 @@ fn window_mean(
     Ok(total / count)
 }
 
+/// The mean red value of an RGB f32le capture window; fixture rows are bottom-up, unlike Potter's top-down rows.
+fn oracle_window_mean(capture: &[u8], column: usize, row: usize, half: usize) -> f64 {
+    let resolution = RESOLUTION as usize;
+    assert_eq!(capture.len(), resolution * resolution * 3 * 4);
+    let mut total = 0.0;
+    for top_down_row in row - half..=row + half {
+        let bottom_up_row = resolution - 1 - top_down_row;
+        for sample_column in column - half..=column + half {
+            let offset = (bottom_up_row * resolution + sample_column) * 3 * 4;
+            let red = f32::from_le_bytes([
+                capture[offset],
+                capture[offset + 1],
+                capture[offset + 2],
+                capture[offset + 3],
+            ]);
+            total += f64::from(red);
+        }
+    }
+    total / ((2 * half + 1) * (2 * half + 1)) as f64
+}
 #[test]
 fn realtime_camera_visible_lights_match_eevee_emitters() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
@@ -75,23 +99,12 @@ fn realtime_camera_visible_lights_match_eevee_emitters() -> TestResult {
     let root = tempdir()?;
     let script = write_script(root.path(), "eevee_light_shapes.py", SCRIPT)?;
     let blend = root.path().join("light_shapes.blend");
-    let oracle_json = root.path().join("eevee_light_shapes.json");
-    let eevee_exr = root.path().join("eevee_light_shapes.exr");
     run_blender_arguments(
         &blender,
         &script,
         None,
-        &[blend.as_path(), oracle_json.as_path(), eevee_exr.as_path()],
+        &[blend.as_path(), Path::new("-"), Path::new("-")],
     )?;
-    let oracle: Value = serde_json::from_slice(&fs::read(&oracle_json)?)?;
-    let half = oracle["window"].as_u64().ok_or("window is missing")? as usize;
-    let row = RESOLUTION as usize / 2;
-    let area_column = oracle["area_centre_column"]
-        .as_u64()
-        .ok_or("area column is missing")? as usize;
-    let point_column = oracle["point_centre_column"]
-        .as_u64()
-        .ok_or("point column is missing")? as usize;
 
     let (project, _) = import_blend(&blender, root.path(), "project", &blend)?;
     let scene = read_scene(&project)?;
@@ -128,33 +141,22 @@ fn realtime_camera_visible_lights_match_eevee_emitters() -> TestResult {
     )?;
     assert_eq!(loaded["ok"], true, "{loaded}");
 
+    let row = RESOLUTION as usize / 2;
     let checks = [
         (
             "area light",
-            window_mean(&project, "render", area_column, row, half)?,
-            oracle["area_mean_red"]
-                .as_f64()
-                .ok_or("area mean is missing")?,
+            window_mean(&project, "render", 20, row, WINDOW)?,
+            oracle_window_mean(EEVEE_AREA_POINT, 20, row, WINDOW),
         ),
         (
             "point light",
-            window_mean(&project, "render", point_column, row, half)?,
-            oracle["point_mean_red"]
-                .as_f64()
-                .ok_or("point mean is missing")?,
+            window_mean(&project, "render", 44, row, WINDOW)?,
+            oracle_window_mean(EEVEE_AREA_POINT, 44, row, WINDOW),
         ),
         (
             "background",
-            window_mean(
-                &project,
-                "render",
-                RESOLUTION as usize / 4,
-                RESOLUTION as usize / 4,
-                half,
-            )?,
-            oracle["background_mean_red"]
-                .as_f64()
-                .ok_or("background mean is missing")?,
+            window_mean(&project, "render", 16, 16, WINDOW)?,
+            oracle_window_mean(EEVEE_AREA_POINT, 16, 16, WINDOW),
         ),
     ];
     for (name, actual, expected) in checks {

@@ -9,7 +9,8 @@ A black world and an orthographic camera of 8 m (64 px, 0.125 m per pixel) look 
 
 EEVEE draws each emitter as its radiance (`light.color` times `1 / (π · area)`, `shape_display_light_radiance_get`).
 The output JSON holds the mean red value over a 7 x 7 pixel window at each light's centre and over a background window,
-for a fixed scene and no sampling noise beyond EEVEE's own.
+for a fixed scene and no sampling noise beyond EEVEE's own. Pass `-` for `render_exr` to save the `.blend` without
+rendering; test expectations come from the committed macOS f32le capture.
 
 Arguments after `--`: blend_out, json_out, render_exr. `blend_out` is the scene for Potter to import.
 """
@@ -85,6 +86,10 @@ point.location = (POINT_CENTRE_X, 0.0, 0.0)
 point.visible_camera = True
 
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
+
+if render_exr == "-":
+    print("SAVED", blend_out, "(EEVEE render skipped)")
+    sys.exit(0)
 
 scene.render.filepath = render_exr
 bpy.ops.render.render(write_still=True)
