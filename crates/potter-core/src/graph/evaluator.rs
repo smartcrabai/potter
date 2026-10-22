@@ -98,9 +98,9 @@ enum Field {
 
 struct Evaluator<'a> {
     group: &'a NodeGroup,
+    subject_name: &'a str,
     input: Option<&'a Mesh>,
     overrides: &'a Map<String, Value>,
-    subject_name: &'a str,
     frame: f64,
     simulation_signature: Option<String>,
     simulation_states: HashMap<Id, GeometryValue>,
@@ -137,6 +137,7 @@ pub fn evaluate(
 /// # Errors
 ///
 /// Returns an error for invalid graphs, unsupported graph kinds, or invalid evaluation.
+/// `subject_name` is the evaluating object's Blender name, which subject-bound modifiers use.
 pub fn evaluate_at_frame(
     group: &NodeGroup,
     input: Option<&Mesh>,
@@ -237,10 +238,10 @@ pub fn evaluate_at_frame(
     };
     let mut evaluator = Evaluator {
         group,
+        subject_name,
         input,
         overrides,
         frame,
-        subject_name,
         simulation_signature,
         simulation_states: HashMap::new(),
         repeat_states: HashMap::new(),
