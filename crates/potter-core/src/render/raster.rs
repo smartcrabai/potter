@@ -3593,7 +3593,7 @@ mod visibility_tests {
 
     use super::{
         AlphaMode, Camera, CameraFrame, Hit, Layer, PreparedTriangle, Projection, Ray, StereoMode,
-        Triangle, camera_frame, composite_layers, composite_sample, hit_opacity,
+        Triangle, camera_frame, composite_layers_with_background, composite_sample, hit_opacity,
         intersect_triangle, nearest_visible_hit, prepare_triangles, ray_for_pixel_in_frame,
     };
     use crate::float::equal_f64;
@@ -3705,7 +3705,7 @@ mod visibility_tests {
         ray: Ray,
         frame: &CameraFrame,
         background: [f64; 4],
-    ) -> Result<[f64; 4]> {
+    ) -> super::Result<[f64; 4]> {
         let mut layers: Vec<(usize, Hit)> = Vec::new();
         for (index, triangle) in triangles.iter().enumerate() {
             let Some(hit) = intersect_triangle(triangle, ray, frame) else {
