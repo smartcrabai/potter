@@ -241,6 +241,7 @@ fn input(grouped: bool) -> Mesh {
 
 fn modifier(modifier_type: &str, params: Value) -> Modifier {
     Modifier {
+        baked_ocean_cache: None,
         id: Id::new("modifier_test").unwrap(),
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),

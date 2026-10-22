@@ -47,6 +47,7 @@ fn points(value: &Value) -> Vec<DVec3> {
 
 fn modifier(modifier_type: &str, params: Value) -> Modifier {
     Modifier {
+        baked_ocean_cache: None,
         id: Id::new("modifier_test").unwrap(),
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
@@ -61,6 +62,7 @@ fn modifier(modifier_type: &str, params: Value) -> Modifier {
 
 fn bound(modifier: Modifier, flat_coords: &Value) -> Modifier {
     Modifier {
+        baked_ocean_cache: None,
         binding_data: Some(json!({
             "format": "blender_corrective_bind_v1",
             "coords": flat_coords,

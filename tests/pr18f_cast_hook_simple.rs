@@ -1239,6 +1239,7 @@ fn assert_same_positions(result: &Mesh, expected: &Mesh) {
 /// A modifier as the scene hands it over: its reference is already resolved into `object_matrix`.
 fn modifier(modifier_type: &str, params: Value, object_matrix: Option<[f64; 16]>) -> Modifier {
     Modifier {
+        baked_ocean_cache: None,
         id: Id::new("modifier_under_test").unwrap(),
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),

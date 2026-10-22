@@ -47,6 +47,7 @@ fn modifier(params: &Value) -> TestResult<Modifier> {
             .ok_or("bevel params must be an object")?
             .clone(),
         binding_data: None,
+        baked_ocean_cache: None,
         runtime: ModifierRuntime::default(),
     })
 }
