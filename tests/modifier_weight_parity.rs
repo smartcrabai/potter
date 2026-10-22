@@ -491,6 +491,7 @@ print("WEIGHT_TEXTURE_ORACLE_WRITTEN")
 
 fn modifier(modifier_type: &str, params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
+        baked_ocean_cache: None,
         id: Id::new("weight_test_modifier")?,
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),

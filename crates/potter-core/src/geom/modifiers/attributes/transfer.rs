@@ -5,7 +5,7 @@ use super::{
     get_group_weights, invalid, number, optional_string, string, string_set,
 };
 use crate::blender_rng::BlenderRng;
-use crate::geom::bvh::{KdopTree, NearestHit, RayHit};
+use crate::geom::bvh::{Bounds, KdopTree, NearestHit, RayHit, TREE_EPSILON, kdop_bounds};
 use crate::geom::color_layers::{self, ColorDomain};
 use crate::geom::uv_layers::{UvLayer, UvStore, read as read_uv_store, read_layers, write_layers};
 use glam::{DVec2, DVec3};
@@ -1534,7 +1534,7 @@ impl<'a> TransferMapContext<'a> {
             .iter()
             .map(|&point| padded_leaf_bounds([point, point, point], 0.0))
             .collect::<Result<Vec<_>>>()?;
-        let source_vertex_bvh = KdopTree::from_leaf_bounds(&vertex_bounds);
+        let source_vertex_bvh = KdopTree::new(vertex_bounds, 2, 6);
         let edge_bounds = source
             .edges
             .iter()
@@ -1553,7 +1553,7 @@ impl<'a> TransferMapContext<'a> {
                 padded_leaf_bounds([first, second, second], max_ray_radius)
             })
             .collect::<Result<Vec<_>>>()?;
-        let source_edge_bvh = KdopTree::from_leaf_bounds(&edge_bounds);
+        let source_edge_bvh = KdopTree::new(edge_bounds, 2, 6);
         let source_corner_normals = if needs_loop_normals {
             Some(crate::geom::normals::corner_normals(
                 source,
@@ -1984,7 +1984,7 @@ fn build_source_face_graph(
             padded_leaf_bounds([first, second, third], ray_padding)
         })
         .collect::<Result<Vec<_>>>()?;
-    let triangle_bvh = KdopTree::from_leaf_bounds(&triangle_bounds);
+    let triangle_bvh = KdopTree::new(triangle_bounds, 2, 6);
     Ok(SourceFaceGraph {
         face_islands,
         islands,
@@ -3112,9 +3112,12 @@ fn nearest_surface_in_island(
 /// The leaf box of the triangle `points`, grown by `padding` on every side. The box carries the
 /// tree epsilon from `KdopTree::leaf_bounds_for_triangle`; a point or segment is a degenerate
 /// triangle of its corners.
-fn padded_leaf_bounds(points: [DVec3; 3], padding: f64) -> Result<[f32; 6]> {
-    let mut bounds =
-        KdopTree::leaf_bounds_for_triangle(points.map(|point| point.as_vec3().to_array()));
+fn padded_leaf_bounds(points: [DVec3; 3], padding: f64) -> Result<Bounds> {
+    let mut bounds = kdop_bounds(
+        &points.map(|point| point.as_vec3().to_array()),
+        TREE_EPSILON,
+        6,
+    );
     let padding = padding as f32;
     for axis in 0..3 {
         bounds[2 * axis] -= padding;
@@ -4555,6 +4558,7 @@ mod tests {
             .insert(format!("e{shared_edge}"), json!(true));
 
         let modifier = Modifier {
+            baked_ocean_cache: None,
             id: Id::new("transfer_sharp")?,
             modifier_type: "data_transfer".to_owned(),
             name: "Data Transfer".to_owned(),

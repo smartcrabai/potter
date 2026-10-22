@@ -120,6 +120,7 @@ with open(root + '/expected_mask.json','w') as file:
 
 fn mask_modifier(params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
+        baked_ocean_cache: None,
         id: Id::new("mask_parity_modifier")?,
         modifier_type: "mask".to_owned(),
         name: "Mask".to_owned(),

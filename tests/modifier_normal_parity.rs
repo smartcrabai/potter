@@ -712,6 +712,7 @@ fn pot_mesh(case: &Value) -> Result<Mesh, Box<dyn Error>> {
 
 fn modifier(case: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
+        baked_ocean_cache: None,
         id: potter_core::model::Id::new("normal_modifier")?,
         modifier_type: case["modifier_type"]
             .as_str()
@@ -987,6 +988,7 @@ fn weighted_normal_uses_blenders_ranked_weight_curve() -> Result<(), Box<dyn Err
         vec![vec![0, 1, 2], vec![0, 3, 4]],
     )?;
     let modifier = Modifier {
+        baked_ocean_cache: None,
         id: potter_core::model::Id::new("weighted_normal")?,
         modifier_type: "weighted_normal".to_owned(),
         name: "Ranked weight curve".to_owned(),
@@ -1035,6 +1037,7 @@ fn weighted_normal_threshold_includes_exact_compare_boundary() -> Result<(), Box
         vec![vec![0, 1, 2], vec![0, 3, 4], vec![0, 5, 6]],
     )?;
     let modifier = Modifier {
+        baked_ocean_cache: None,
         id: potter_core::model::Id::new("weighted_threshold")?,
         modifier_type: "weighted_normal".to_owned(),
         name: "Inclusive threshold boundary".to_owned(),
@@ -1072,6 +1075,7 @@ fn normal_edit_direction_uses_target_minus_vertex() -> Result<(), Box<dyn Error>
     let mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     let modifier = Modifier {
+        baked_ocean_cache: None,
         id: potter_core::model::Id::new("directional")?,
         modifier_type: "normal_edit".to_owned(),
         name: "Directional sign".to_owned(),

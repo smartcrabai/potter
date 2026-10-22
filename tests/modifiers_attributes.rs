@@ -34,6 +34,7 @@ use blender_file::blender_executable;
 )]
 fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
+        baked_ocean_cache: None,
         id: potter_core::model::Id::new("test_modifier")?,
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
@@ -45,7 +46,6 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
             .ok_or("modifier params must be an object")?
             .clone(),
         binding_data: None,
-        baked_ocean_cache: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     })
 }

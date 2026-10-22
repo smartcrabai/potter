@@ -308,6 +308,7 @@ with open(root + '/expected_uv_warp.json','w') as file:
 
 fn test_modifier(modifier_type: &str, params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
+        baked_ocean_cache: None,
         id: Id::new("uv_parity_modifier")?,
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),

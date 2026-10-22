@@ -25,6 +25,7 @@ mod blender_script;
 
 fn modifier(modifier_type: &str, params: &Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
+        baked_ocean_cache: None,
         id: potter_core::model::Id::new("transfer_test")?,
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
