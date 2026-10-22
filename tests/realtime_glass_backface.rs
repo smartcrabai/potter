@@ -1,5 +1,4 @@
-//! Realtime Beauty transmits direct light through a double-sided glass face viewed from its back. The camera and
-//! transmission normal are antiparallel, exercising the LTC frame's zero-tangent case through the CLI render path.
+//! Realtime Beauty's direct light through double-sided glass viewed from its back, exercised through the CLI render path.
 
 #[path = "common/native_oracle.rs"]
 #[expect(
@@ -13,11 +12,10 @@ use potter_core::{
     image::{ImageInterpolation, load_image_data, sample},
     model::Image,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
-#[test]
-fn realtime_glass_transmits_toward_a_viewer_on_its_back_side() -> TestResult {
+fn assert_backface_glass_lit(light: Value, case: &str) -> TestResult {
     let root = tempdir()?;
     let project = root.path().join("project");
     pot_json(|command| {
@@ -32,8 +30,7 @@ fn realtime_glass_transmits_toward_a_viewer_on_its_back_side() -> TestResult {
              "transmission": 1.0, "ior": 1.45, "roughness": 0.0, "double_sided": true},
             {"op": "node.create", "id": "glass_plane", "kind": "plane", "params": {"size": 2.0},
              "transform": {"rotation": [1.0, 0.0, 0.0, 0.0]}, "material": "glass"},
-            {"op": "light.create", "id": "transmitted_light", "light_type": "point", "energy": 1000.0,
-             "radius": 0.1, "transform": {"translation": [0.0, 0.0, -2.0]}},
+            light,
             {"op": "camera.create", "id": "camera_back", "projection": "orthographic", "ortho_scale": 2.2,
              "transform": {"translation": [0.0, 0.0, 4.0]}},
             {"op": "scene.update", "target": {"id": "scene_main"}, "set": {"camera": "camera_back"}},
@@ -53,7 +50,7 @@ fn realtime_glass_transmits_toward_a_viewer_on_its_back_side() -> TestResult {
         .output()?;
     assert!(
         rendered.status.success(),
-        "realtime render failed: {}",
+        "realtime render for {case} failed: {}",
         String::from_utf8_lossy(&rendered.stdout)
     );
 
@@ -68,7 +65,43 @@ fn realtime_glass_transmits_toward_a_viewer_on_its_back_side() -> TestResult {
     let pixel = sample(&data, [0.5, 0.5], false);
     assert!(
         pixel[..3].iter().any(|channel| channel.is_finite() && *channel > 1.0e-4),
-        "back-side glass did not transmit the light below it: {pixel:?}"
+        "back-side glass did not receive {case}: {pixel:?}"
     );
     Ok(())
+}
+
+#[test]
+fn realtime_glass_transmits_toward_a_viewer_on_its_back_side() -> TestResult {
+    assert_backface_glass_lit(
+        json!({
+            "op": "light.create", "id": "transmitted_point", "light_type": "point", "energy": 1000.0,
+            "radius": 0.1, "transform": {"translation": [0.0, 0.0, -2.0]}
+        }),
+        "point-light transmission",
+    )
+}
+
+#[test]
+fn realtime_glass_reflects_direct_light_on_its_back_side() -> TestResult {
+    assert_backface_glass_lit(
+        json!({
+            "op": "light.create", "id": "reflected_point", "light_type": "point", "energy": 1000.0,
+            "radius": 0.1, "transform": {"translation": [0.0, 0.0, 2.0]}
+        }),
+        "direct reflection",
+    )
+}
+
+#[test]
+fn realtime_glass_transmits_area_light_toward_a_viewer_on_its_back_side() -> TestResult {
+    assert_backface_glass_lit(
+        json!({
+            "op": "light.create", "id": "transmitted_area", "light_type": "area", "energy": 1000.0,
+            "transform": {
+                "translation": [0.0, 0.0, -2.0],
+                "rotation": [0.0, 1.0, 0.0, 0.0]
+            }
+        }),
+        "area-light transmission",
+    )
 }

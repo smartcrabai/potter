@@ -3324,7 +3324,7 @@ fn glass_direct_contribution(
         direct.emitter.shape_radius(),
         direct.direction,
         direct.distance,
-        receiver.normal,
+        glass.oriented_normal,
         false,
     );
     if ray_visibility.allows(RayKind::Glossy) && facing > 0.0 {
@@ -3338,7 +3338,7 @@ fn glass_direct_contribution(
                 direct.centre,
                 -direct.axis,
                 receiver.point,
-                receiver.normal,
+                glass.oriented_normal,
             ),
             None => visibility_for_light(
                 shadow,
@@ -3351,7 +3351,7 @@ fn glass_direct_contribution(
             ),
         };
         let form = direct.emitter.form_factor(
-            receiver.normal,
+            glass.oriented_normal,
             receiver.view,
             glass.reflection_matrix,
             direct.to_centre,
@@ -3383,7 +3383,7 @@ fn glass_direct_contribution(
                 origin,
                 &shape,
                 (direct.centre, -direct.axis),
-                -receiver.normal,
+                -glass.oriented_normal,
             ),
             None => transmitted_visibility(shadow, origin, &direct),
         };

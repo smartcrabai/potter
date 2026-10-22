@@ -354,6 +354,8 @@ pub(crate) struct GlassClosures {
 /// its lobe integrates around.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GlassLight {
+    /// The glass shading normal oriented toward the view, shared by its direct-light hemisphere tests.
+    pub(crate) oriented_normal: DVec3,
     /// The reflection closure's colour: its weight times the glass reflectance and the tint, over the layers above.
     pub(crate) reflection: DVec3,
     /// The reflection's inverse LTC matrix, sampled at `N · V` and the roughness (`bxdf_ggx_light_reflection`).
@@ -457,6 +459,7 @@ pub(crate) fn glass_light(
     let (transmission_normal, cos_theta) =
         transmission_light_normal(lobe.normal, view, lobe.ior, lobe.roughness, thickness);
     Some(GlassLight {
+        oriented_normal: lobe.normal,
         reflection: lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight,
         reflection_matrix: sample_matrix(lobe.normal.dot(view), lobe.roughness),
         transmission,

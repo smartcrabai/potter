@@ -9280,8 +9280,17 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 .is_some_and(|nodes| {
                     // The node kinds `shader/world.rs` evaluates, so a world built from them renders natively.
                     nodes.iter().any(|node| {
-                        !matches!(
-                            node.get("type").and_then(Value::as_str),
+                        let properties = node.get("properties");
+                        match node.get("type").and_then(Value::as_str) {
+                            Some("ShaderNodeMix") => crate::shader::world_mix_mode(
+                                properties
+                                    .and_then(|properties| properties.get("data_type"))
+                                    .and_then(Value::as_str),
+                                properties
+                                    .and_then(|properties| properties.get("blend_type"))
+                                    .and_then(Value::as_str),
+                            )
+                            .is_err(),
                             Some(
                                 "ShaderNodeBackground"
                                     | "ShaderNodeOutputWorld"
@@ -9290,11 +9299,11 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                                     | "ShaderNodeTexEnvironment"
                                     | "ShaderNodeTexCoord"
                                     | "ShaderNodeMixRGB"
-                                    | "ShaderNodeMix"
                                     | "ShaderNodeMixShader"
                                     | "ShaderNodeAddShader"
-                            )
-                        )
+                            ) => true,
+                            _ => false,
+                        }
                     })
                 });
             if has_unmapped_nodes {
