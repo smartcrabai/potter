@@ -606,7 +606,7 @@ fn strip_influence(strip: &NlaStrip, frame: f64) -> Result<f64> {
 
 /// Blender's `nla_blend_value` and `nla_combine_value` for one scalar channel (`NEC_MIX_ADD`).
 /// Replace and Add blend against the lower value. Combine adds the strip's offset from the channel's
-/// default, so an NLA stack over a channel at its default leaves the default untouched (anim_sys.cc:1866, 1890).
+/// default, so an NLA stack over a channel at its default leaves the default untouched (`anim_sys.cc:1866`, `1890`).
 fn blend_scalar(
     current: f64,
     target: f64,

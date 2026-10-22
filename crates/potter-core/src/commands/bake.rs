@@ -814,7 +814,7 @@ fn remove_path(path: &Path) -> Result<()> {
 mod tests {
     use std::error::Error;
 
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
     use super::write_ocean_exr;
     use crate::{

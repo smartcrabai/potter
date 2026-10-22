@@ -19,7 +19,9 @@ use crate::{
     geom::{
         Mesh,
         blender_matrix::blender_invert_m4,
-        bvh::{KdopTree, NearestHit, RAYCAST_DIST_MAX, Ray, RayHit, TREE_EPSILON},
+        bvh::{
+            Bounds, KdopTree, NearestHit, RAYCAST_DIST_MAX, Ray, RayHit, TREE_EPSILON, kdop_bounds,
+        },
         normals,
     },
     model::{Id, Modifier, ModifierRuntime},
@@ -459,12 +461,13 @@ fn build_vertex_surface(mesh: &Mesh) -> Surface {
         .iter()
         .map(|vertex| vertex.co.as_vec3())
         .collect();
-    let bounds: Vec<[f32; 6]> = positions
+    // Blender's vertex tree: each vertex is a point box, inflated by the clamped tree epsilon.
+    let bounds: Vec<Bounds> = positions
         .iter()
-        .map(|point| KdopTree::leaf_bounds_for_point(point.to_array()))
+        .map(|point| kdop_bounds(&[point.to_array()], TREE_EPSILON, 6))
         .collect();
     Surface {
-        tree: KdopTree::from_leaf_bounds(&bounds),
+        tree: KdopTree::new(bounds, 2, 6),
         positions,
         vertex_normals: Vec::new(),
         corner_normals: Vec::new(),
@@ -588,16 +591,18 @@ fn build_surface(mesh: &Mesh, needs: SurfaceNeeds) -> Result<Surface> {
         }
         corner_offset += face.vertices.len();
     }
-    let bounds: Vec<[f32; 6]> = tris
+    let bounds: Vec<Bounds> = tris
         .iter()
         .map(|tri| {
-            KdopTree::leaf_bounds_for_triangle(
-                tri.vertices.map(|vertex| positions[vertex].to_array()),
+            kdop_bounds(
+                &tri.vertices.map(|vertex| positions[vertex].to_array()),
+                TREE_EPSILON,
+                6,
             )
         })
         .collect();
     Ok(Surface {
-        tree: KdopTree::from_leaf_bounds(&bounds),
+        tree: KdopTree::new(bounds, 2, 6),
         positions,
         vertex_normals,
         corner_normals,
@@ -1562,7 +1567,7 @@ mod tests {
     use crate::{
         geom::{
             Mesh, UvSphereParams,
-            bvh::{KdopTree, Ray, RayHit},
+            bvh::{Bounds, KdopTree, Ray, RayHit, TREE_EPSILON, kdop_bounds},
         },
         model::{Id, Modifier, ModifierRuntime},
     };
@@ -1633,13 +1638,11 @@ mod tests {
             [Vec3::ZERO, Vec3::X, Vec3::Y],
             [Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y],
         ];
-        let leaves: Vec<[f32; 6]> = triangles
+        let leaves: Vec<Bounds> = triangles
             .iter()
-            .map(|triangle| {
-                KdopTree::leaf_bounds_for_triangle(triangle.map(|point| point.to_array()))
-            })
+            .map(|triangle| kdop_bounds(&triangle.map(|point| point.to_array()), TREE_EPSILON, 6))
             .collect();
-        let tree = KdopTree::from_leaf_bounds(&leaves);
+        let tree = KdopTree::new(leaves, 2, 6);
         let mut ray_hit = RayHit {
             index: -1,
             dist: f32::MAX,
