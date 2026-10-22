@@ -254,7 +254,7 @@ pub struct BakeArgs {
     pub delete: bool,
     #[arg(long, help = "Frame range as start:end[:step].")]
     pub frames: Option<String>,
-    #[arg(long, help = "Output directory for non-node bake kinds.")]
+    #[arg(long, help = "Output directory. Required for non-node bake kinds.")]
     pub out: Option<PathBuf>,
     #[arg(long, help = "Replace existing output files.")]
     pub overwrite: bool,

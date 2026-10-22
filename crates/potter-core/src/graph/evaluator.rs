@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    GraphKind, GraphNode, NodeBakeFrame, NodeBakeRecord, NodeBakeValue, NodeGroup,
+    GraphKind, GraphNode, NodeBakeFrame, NodeBakeRecord, NodeBakeValue, NodeGroup, same_bake_frame,
     sockets::{is_known_node_type, node_sockets},
 };
 
@@ -287,14 +287,11 @@ pub fn evaluate_at_frame_with_bakes(
             instance_paths: Vec::new(),
         }),
     )?;
-    let geometry = match value {
-        EvalValue::Geometry(value) => value,
-        _ => {
-            return Err(PotError::new(
-                ErrorCode::EvaluationFailed,
-                "geometry group output is not geometry",
-            ));
-        }
+    let EvalValue::Geometry(geometry) = value else {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "geometry group output is not geometry",
+        ));
     };
     for node_id in capture_bake_nodes {
         let parsed_id = Id::new(node_id.clone()).map_err(|_| {
@@ -3380,7 +3377,7 @@ fn read_bake_value(
     socket: &str,
 ) -> Result<Option<NodeBakeValue>> {
     let next = record.frames.partition_point(|baked| baked.frame < frame);
-    if next < record.frames.len() && record.frames[next].frame == frame {
+    if next < record.frames.len() && same_bake_frame(record.frames[next].frame, frame) {
         return record.frames[next]
             .values
             .get(socket)
@@ -3684,27 +3681,40 @@ fn kani_seeded_sample_stays_in_unit_interval() {
 }
 #[cfg(test)]
 mod node_bake_tests {
-    #![expect(clippy::unwrap_used, reason = "node-bake evaluator tests")]
-
     use super::{NodeBakeFrame, NodeBakeRecord, NodeBakeValue, mix_bake_values, read_bake_value};
-    use crate::geom::{Face, Mesh, Vertex};
+    use crate::{
+        error::{ErrorCode, PotError, Result},
+        geom::{Face, IdCounters, Mesh, Vertex},
+    };
     use glam::DVec3;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
+    fn invalid(message: &str) -> PotError {
+        PotError::new(ErrorCode::InternalError, message)
+    }
+
+    /// A triangle fan whose `next_id` counters allocate past every element ID, as a valid mesh must.
     fn triangle(z: f64, vertex_count: u32, winding: [u32; 3]) -> Mesh {
-        let mut mesh = Mesh::default();
-        mesh.vertices = (0..vertex_count)
-            .map(|id| Vertex {
-                id,
-                co: DVec3::new(f64::from(id), 0.0, z),
-            })
-            .collect();
-        mesh.faces.push(Face {
-            id: 0,
-            vertices: winding.to_vec(),
-            material_index: 0,
-        });
-        mesh
+        Mesh {
+            vertices: (0..vertex_count)
+                .map(|id| Vertex {
+                    id,
+                    co: DVec3::new(f64::from(id), 0.0, z),
+                })
+                .collect(),
+            faces: vec![Face {
+                id: 0,
+                vertices: winding.to_vec(),
+                material_index: 0,
+            }],
+            next_id: IdCounters {
+                vertex: vertex_count,
+                edge: 0,
+                face: 1,
+            },
+            ..Mesh::default()
+        }
     }
 
     fn geometry(mesh: Mesh) -> NodeBakeValue {
@@ -3715,13 +3725,22 @@ mod node_bake_tests {
         }
     }
 
+    fn record(frames: Vec<NodeBakeFrame>) -> NodeBakeRecord {
+        NodeBakeRecord {
+            storage: "inline".to_owned(),
+            kind: "node_bake".to_owned(),
+            version: 1,
+            frames,
+        }
+    }
+
     #[test]
-    fn geometry_cache_interpolates_only_matching_topology() {
+    fn geometry_cache_interpolates_only_matching_topology() -> Result<()> {
         let first = geometry(triangle(0.0, 3, [0, 1, 2]));
         let same_topology = geometry(triangle(2.0, 3, [0, 1, 2]));
-        let mixed = mix_bake_values(&first, &same_topology, 0.5);
-        let NodeBakeValue::Geometry { mesh, .. } = mixed else {
-            panic!("geometry cache produced a non-geometry value");
+        let NodeBakeValue::Geometry { mesh, .. } = mix_bake_values(&first, &same_topology, 0.5)
+        else {
+            return Err(invalid("geometry cache produced a non-geometry value"));
         };
         assert!((mesh.vertices[0].co.z - 1.0).abs() < 1.0e-12);
 
@@ -3730,48 +3749,45 @@ mod node_bake_tests {
 
         let different_faces = geometry(triangle(8.0, 3, [0, 2, 1]));
         assert_eq!(mix_bake_values(&first, &different_faces, 0.5), first);
+        Ok(())
     }
 
     #[test]
-    fn scalar_bakes_interpolate_and_clamp_frame_range() {
-        let record = NodeBakeRecord {
-            storage: "inline".to_owned(),
-            kind: "node_bake".to_owned(),
-            version: 1,
-            frames: [1.0, 3.0]
-                .into_iter()
-                .zip([2.0, 6.0])
-                .map(|(frame, value)| NodeBakeFrame {
-                    frame,
-                    values: [(
-                        "Item_0".to_owned(),
-                        NodeBakeValue::Scalar {
-                            value: json!(value),
-                        },
-                    )]
-                    .into(),
-                })
-                .collect(),
-        };
+    fn scalar_bakes_interpolate_and_clamp_frame_range() -> Result<()> {
+        let frames = [(1.0, 2.0), (3.0, 6.0)]
+            .into_iter()
+            .map(|(frame, value)| NodeBakeFrame {
+                frame,
+                values: BTreeMap::from([(
+                    "Item_0".to_owned(),
+                    NodeBakeValue::Scalar {
+                        value: json!(value),
+                    },
+                )]),
+            })
+            .collect();
+        let record = record(frames);
         for (frame, expected) in [(0.0, 2.0), (2.0, 4.0), (4.0, 6.0)] {
-            let value = read_bake_value(&record, frame, "Item_0")
-                .expect("bake frame is valid")
-                .expect("bake item is present");
-            let NodeBakeValue::Scalar { value } = value else {
-                panic!("scalar bake returned a non-scalar value");
+            let Some(NodeBakeValue::Scalar { value }) = read_bake_value(&record, frame, "Item_0")?
+            else {
+                return Err(invalid("scalar bake item is missing"));
             };
-            assert!((value.as_f64().expect("scalar is numeric") - expected).abs() < 1.0e-12);
+            let number = value
+                .as_f64()
+                .ok_or_else(|| invalid("scalar is not numeric"))?;
+            assert!((number - expected).abs() < 1.0e-12);
         }
+        Ok(())
     }
 
     #[test]
-    fn typed_bake_values_and_material_references_roundtrip() {
+    fn typed_bake_values_and_material_references_roundtrip() -> Result<()> {
         let mut carrier = triangle(0.0, 3, [0, 1, 2]);
         carrier.attributes.insert(
             "attr".to_owned(),
             json!({"domain": "POINT", "type": "float", "data": [1.0, 2.0, 3.0]}),
         );
-        let mut values: std::collections::BTreeMap<String, NodeBakeValue> = [
+        let mut values: BTreeMap<String, NodeBakeValue> = [
             ("float", json!(0.75)),
             ("integer", json!(7)),
             ("boolean", json!(true)),
@@ -3791,29 +3807,24 @@ mod node_bake_tests {
                 attribute_name: "attr".to_owned(),
             },
         );
-        let record = NodeBakeRecord {
-            storage: "inline".to_owned(),
-            kind: "node_bake".to_owned(),
-            version: 1,
-            frames: vec![NodeBakeFrame { frame: 1.0, values }],
-        };
-        let encoded = serde_json::to_value(&record).expect("bake record serializes");
-        crate::graph::validate_node_bake_resource(&encoded).expect("typed values validate");
+        let record = record(vec![NodeBakeFrame { frame: 1.0, values }]);
+        let encoded = serde_json::to_value(&record).map_err(PotError::internal_json)?;
+        crate::graph::validate_node_bake_resource(&encoded)?;
         for socket in [
             "float", "integer", "boolean", "vector", "rotation", "color", "string", "material",
         ] {
-            let value = read_bake_value(&record, 1.0, socket)
-                .expect("bake item is valid")
-                .expect("bake item is present");
+            let value = read_bake_value(&record, 1.0, socket)?
+                .ok_or_else(|| invalid("bake item is present"))?;
             assert!(matches!(value, NodeBakeValue::Scalar { .. }));
         }
+        let field = read_bake_value(&record, 1.0, "field")?
+            .ok_or_else(|| invalid("field item is present"))?;
         assert_eq!(
-            read_bake_value(&record, 1.0, "field")
-                .expect("field item is valid")
-                .expect("field item is present"),
+            field,
             NodeBakeValue::Field {
                 attribute_name: "attr".to_owned(),
             }
         );
+        Ok(())
     }
 }

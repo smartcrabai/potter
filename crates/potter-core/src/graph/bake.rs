@@ -72,6 +72,15 @@ pub(crate) const MAX_NODE_BAKE_FRAME_COUNT: usize = 100_001;
 // Conservatively accounts for map/vector node overhead before decoding another frame.
 pub(crate) const NODE_BAKE_JSON_MEMORY_MULTIPLIER: usize = 32;
 
+// Frame keys are stored as JSON numbers; two keys name the same frame when they agree to this
+// tolerance, far below any frame spacing Blender can express.
+const NODE_BAKE_FRAME_EPSILON: f64 = 1.0e-9;
+
+/// Whether two bake frame keys name the same frame.
+pub(crate) fn same_bake_frame(first: f64, second: f64) -> bool {
+    (first - second).abs() <= NODE_BAKE_FRAME_EPSILON
+}
+
 fn bake_attribute_element_count(mesh: &Mesh, domain: &str) -> Option<usize> {
     match domain {
         "POINT" => Some(mesh.vertices.len()),
@@ -317,11 +326,11 @@ pub(crate) fn validate_node_bake_settings(value: &Value) -> Result<()> {
     };
     let config = value.as_object().ok_or_else(invalid)?;
     match config.get("bake_mode").and_then(Value::as_str) {
-        None | Some("STILL") | Some("ANIMATION") => {}
+        None | Some("STILL" | "ANIMATION") => {}
         _ => return Err(invalid()),
     }
     match config.get("bake_target").and_then(Value::as_str) {
-        None | Some("INHERIT") | Some("PACKED") | Some("DISK") => {}
+        None | Some("INHERIT" | "PACKED" | "DISK") => {}
         _ => return Err(invalid()),
     }
     let custom_range = match config.get("use_custom_simulation_frame_range") {
@@ -1091,12 +1100,12 @@ fn directory_open_error(error: std::io::Error) -> PotError {
             "node-bake path contains a symlink or non-directory",
         )
     } else {
-        storage_error(error)
+        storage_error(&error)
     }
 }
 
-fn storage_error(error: std::io::Error) -> PotError {
-    PotError::io(&error)
+fn storage_error(error: &std::io::Error) -> PotError {
+    PotError::io(error)
 }
 
 fn open_regular_file(directory: &File, filename: &str) -> Result<Option<File>> {
@@ -1197,7 +1206,7 @@ fn unique_backup_name() -> String {
 #[cfg(unix)]
 fn rename_noreplace(directory: &File, from: &str, to: &str) -> Result<()> {
     renameat_with(directory, from, directory, to, RenameFlags::NOREPLACE)
-        .map_err(|error| storage_error(std::io::Error::from(error)))
+        .map_err(|error| storage_error(&std::io::Error::from(error)))
 }
 
 #[cfg(unix)]
@@ -1382,7 +1391,7 @@ fn validate_payload_frame(
             "node-bake frame exceeds the decoded memory limit",
         ));
     }
-    if frame.frame != expected_frame {
+    if !same_bake_frame(frame.frame, expected_frame) {
         return Err(PotError::new(
             ErrorCode::SceneInvalid,
             "node-bake frame does not match its manifest",

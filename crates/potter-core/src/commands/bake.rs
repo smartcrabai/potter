@@ -15,7 +15,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, EvaluationPurpose, Snapshot},
     geom::Mesh,
-    graph::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord},
+    graph::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord, same_bake_frame},
     model::{Id, SceneDoc},
     response::SceneInfo,
     store::Project,
@@ -795,7 +795,7 @@ fn pack_node_bake(
                 json!({"cause":error.to_string(),"digest":digest}),
             )
         })?;
-        if frame.frame != expected_frame {
+        if !same_bake_frame(frame.frame, expected_frame) {
             return Err(PotError::new(
                 ErrorCode::SceneInvalid,
                 "disk node-bake frame does not match its manifest",
@@ -1121,8 +1121,8 @@ fn node_bake_mode(config: Option<&Value>) -> Result<NodeBakeMode> {
         .and_then(|config| config.get("bake_mode"))
         .and_then(Value::as_str)
     {
-        None | Some("STILL") | Some("still") => Ok(NodeBakeMode::Still),
-        Some("ANIMATION") | Some("animation") => Ok(NodeBakeMode::Animation),
+        None | Some("STILL" | "still") => Ok(NodeBakeMode::Still),
+        Some("ANIMATION" | "animation") => Ok(NodeBakeMode::Animation),
         Some(mode) => Err(PotError::with_details(
             ErrorCode::SceneInvalid,
             "node-bake mode must be STILL or ANIMATION",
@@ -1181,7 +1181,7 @@ fn node_bake_frames(
     }
 }
 
-/// Blender `fix_frame_range` (bake_geometry_nodes_modifier.cc): a range that ends before it starts
+/// Blender `fix_frame_range` (`bake_geometry_nodes_modifier.cc`): a range that ends before it starts
 /// bakes only its start frame.
 fn fix_frame_range(start: i32, end: i32) -> (i32, i32) {
     (start, end.max(start))
@@ -1201,7 +1201,7 @@ fn node_bake_config_frame(config: Option<&Value>, key: &str) -> Result<i32> {
         })
 }
 
-/// Blender stores bake frame bounds as 32-bit ints (rna_modifier.cc).
+/// Blender stores bake frame bounds as 32-bit ints (`rna_modifier.cc`).
 fn whole_frame(frame: f64) -> Result<i32> {
     match i32::try_from(frame as i64) {
         Ok(whole) if frame.fract() == 0.0 => Ok(whole),
@@ -1211,7 +1211,7 @@ fn whole_frame(frame: f64) -> Result<i32> {
     }
 }
 
-/// Blender `get_default_modifier_bake_directory` (bake_geometry_nodes_modifier.cc). The project
+/// Blender `get_default_modifier_bake_directory` (`bake_geometry_nodes_modifier.cc`). The project
 /// directory stands in for the `.blend` file; `None` when it has no usable file stem.
 fn default_modifier_bake_directory(
     project_root: &Path,
@@ -2038,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn default_bake_directory_uses_blender_escaped_names() -> Result<()> {
+    fn default_bake_directory_uses_blender_escaped_names() {
         assert_eq!(escape_bake_name("Cube"), "Cube");
         assert_eq!(escape_bake_name("Cube.001"), "Cube46484849");
         assert_eq!(escape_bake_name("\u{e9}"), "-61-87");
@@ -2054,7 +2054,6 @@ mod tests {
             default_modifier_bake_directory(Path::new("/"), "Cube", "Nodes"),
             None
         );
-        Ok(())
     }
 
     #[test]

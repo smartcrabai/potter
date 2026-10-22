@@ -2588,7 +2588,7 @@ fn prepare_node_bake_modifiers<'a>(
                                 json!({"cause":error.to_string(),"digest":digest}),
                             )
                         })?;
-                        if frame.frame != expected_frame {
+                        if !crate::graph::same_bake_frame(frame.frame, expected_frame) {
                             return Err(PotError::new(
                                 ErrorCode::SceneInvalid,
                                 "disk node-bake frame does not match its manifest",
