@@ -446,7 +446,13 @@ fn render_motion_blurred_frame(
             "beauty",
             engine,
             film_transparent,
-            samples,
+            // EEVEE divides its sample count across the motion-blur steps, `divide_ceil_u(sample_count, steps)` in
+            // `Sampling::init` (`eevee_sampling.cc`). Each step is a full film pass, so the realtime total stays `samples`.
+            if engine == "realtime" {
+                samples.div_ceil(shutter_samples)
+            } else {
+                samples
+            },
             seed,
         )?;
         push_new_warnings(warnings, sample_warnings);

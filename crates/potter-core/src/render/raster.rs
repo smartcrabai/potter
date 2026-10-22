@@ -701,7 +701,12 @@ pub(crate) fn rasterize_with_samples(
 
     // Realtime Beauty reconstructs its samples with EEVEE's film filter; the other modes keep each pixel's own samples.
     let mut film = film_radius(mode, samples, filter_size)
-        .map(|radius| FilmFilter::new(radius, width, height))
+        .map(|radius| {
+            // Side-by-side stereo puts the right eye at `width / 2`, as `ray_for_subpixel_in_frame` does.
+            let eye_split =
+                (camera.stereo_mode == StereoMode::SideBySide).then_some((width / 2) as usize);
+            FilmFilter::new(radius, width, height, eye_split)
+        })
         .transpose()?;
     let mut candidates = Vec::new();
     for y in 0..height {
@@ -839,7 +844,7 @@ pub(crate) fn rasterize_with_samples(
                             sample_color[2] * ao,
                             sample_color[3],
                         ];
-                        film.splat(x, y, sample_x, sample_y, shaded);
+                        film.splat(x, y, sample_x, sample_y, sample_index, shaded);
                     }
                 }
                 // Solid mirrors Blender Workbench, which shows no ambient occlusion by default.
@@ -1854,6 +1859,9 @@ struct FilmFilter {
     radius: f64,
     width: usize,
     height: usize,
+    /// The column where the right eye starts, in a side-by-side stereo frame. A sample splats only into its own eye's
+    /// columns, as each eye has its own film in EEVEE (`ShadingView::update_view` per view).
+    eye_split: Option<usize>,
     colour: Vec<[f64; 4]>,
     weight: Vec<f64>,
 }
@@ -1862,20 +1870,20 @@ impl FilmFilter {
     /// The sub-pixel position of a film sample from its offset in the pixel. EEVEE's `pixel_jitter_get` gives the
     /// offset `j` of its film weights: below `FRAC_1_SQRT_2` px a disk of half the radius, mapped by
     /// `Sampling::sample_disk` as `sqrt(u)` and `2*pi*v` (`eevee_film.cc`, `eevee_sampling.cc`), otherwise uniform over
-    /// the pixel. The camera does not sample at `+j`: `ShadingView::update_view` shifts the window by `+j`
-    /// (`eevee_view.cc`), and `window_translate_m4` adds it to the projection's translation (`math_geom.cc`), so each
-    /// pixel sees the scene at `-j`. The film's own distances are `(x, y) - j` (`Film::update_sample_table`), which
-    /// measure from that sample. So the raster position here is `-j`, the mirror of the offset, for both branches.
+    /// the pixel. The camera's window shifts by `+j` in NDC (`ShadingView::update_view`, `eevee_view.cc`;
+    /// `window_translate_m4`, `math_geom.cc`), and content moves by that shift. So a pixel sees the scene at `-j` in NDC
+    /// x. NDC y points up but rows here point down (`ndc_y = 1 - 2 (y + sy) / h`), so the same shift is `+j` in row
+    /// units: the raster position is `(0.5 - j_x, 0.5 + j_y)`.
     fn jitter(&self, offset: (f64, f64)) -> (f64, f64) {
         if self.radius >= std::f64::consts::FRAC_1_SQRT_2 {
-            return ((1.0 - offset.0).fract(), (1.0 - offset.1).fract());
+            return ((1.0 - offset.0).fract(), offset.1);
         }
         let scale = 0.5 * self.radius * offset.0.sqrt();
         let theta = std::f64::consts::TAU * offset.1;
-        (0.5 - scale * theta.cos(), 0.5 - scale * theta.sin())
+        (0.5 - scale * theta.cos(), 0.5 + scale * theta.sin())
     }
 
-    fn new(radius: f64, width: u32, height: u32) -> Result<Self> {
+    fn new(radius: f64, width: u32, height: u32, eye_split: Option<usize>) -> Result<Self> {
         let width = usize::try_from(width).map_err(|_| {
             PotError::new(
                 ErrorCode::LimitExceeded,
@@ -1898,37 +1906,85 @@ impl FilmFilter {
             radius,
             width,
             height,
+            eye_split,
             colour: allocate_filled(pixel_count, [0.0_f64; 4], "film colour")?,
             weight: allocate_filled(pixel_count, 0.0_f64, "film weight")?,
         })
     }
 
-    /// Splats a shaded sample taken at `(sample_x, sample_y)` inside pixel `(x, y)`. Output pixels are visited within
-    /// the window that can hold a centre closer than `radius`; the exact distance test decides the rest.
-    fn splat(&mut self, x: u32, y: u32, sample_x: f64, sample_y: f64, shaded: [f64; 4]) {
+    /// The output columns a sample in column `x` may reach: its own eye's columns in a side-by-side frame.
+    fn eye_columns(&self, x: u32) -> (i64, i64) {
+        let width = self.width as i64;
+        match self.eye_split {
+            Some(split) => {
+                let split = split as i64;
+                if i64::from(x) < split {
+                    (0, split)
+                } else {
+                    (split, width)
+                }
+            }
+            None => (0, width),
+        }
+    }
+
+    fn accumulate(&mut self, px: usize, py: usize, weight: f64, shaded: [f64; 4]) {
+        let index = py * self.width + px;
+        for (sum, value) in self.colour[index].iter_mut().zip(shaded) {
+            *sum += weight * value;
+        }
+        self.weight[index] += weight;
+    }
+
+    /// Splats the shaded sample of frame `sample_index`, taken at `(sample_x, sample_y)` inside pixel `(x, y)`. Below
+    /// `LARGE_FILTER_RADIUS` it reaches the output pixels whose centres lie within the radius. From there on it reaches
+    /// EEVEE's 16 table taps (`large_filter_taps`), each weighted from its distance to the sample, with no radius test.
+    /// Either way the output stays in the sample's own eye's columns.
+    fn splat(
+        &mut self,
+        x: u32,
+        y: u32,
+        sample_x: f64,
+        sample_y: f64,
+        sample_index: u32,
+        shaded: [f64; 4],
+    ) {
         let sample = (f64::from(x) + sample_x, f64::from(y) + sample_y);
-        let reach = (self.radius + 0.5).ceil() as i64;
-        let radius_squared = self.radius * self.radius;
-        let (width, height) = (self.width as i64, self.height as i64);
-        for dy in -reach..=reach {
-            for dx in -reach..=reach {
-                let px = i64::from(x) + dx;
-                let py = i64::from(y) + dy;
-                if px < 0 || py < 0 || px >= width || py >= height {
+        let (lo, hi) = self.eye_columns(x);
+        let height = self.height as i64;
+        if self.radius < LARGE_FILTER_RADIUS {
+            let reach = (self.radius + 0.5).ceil() as i64;
+            let radius_squared = self.radius * self.radius;
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    let px = i64::from(x) + dx;
+                    let py = i64::from(y) + dy;
+                    if px < lo || px >= hi || py < 0 || py >= height {
+                        continue;
+                    }
+                    let centre = (px as f64 + 0.5, py as f64 + 0.5);
+                    let distance_squared =
+                        (centre.0 - sample.0).powi(2) + (centre.1 - sample.1).powi(2);
+                    if distance_squared >= radius_squared {
+                        continue;
+                    }
+                    let weight = film_filter_weight(self.radius, distance_squared);
+                    self.accumulate(px as usize, py as usize, weight, shaded);
+                }
+            }
+        } else {
+            for (tap_x, tap_y) in large_filter_taps(self.radius, sample_index) {
+                // EEVEE's table is in texel space with y up, and rows here point down.
+                let px = i64::from(x) - tap_x;
+                let py = i64::from(y) + tap_y;
+                if px < lo || px >= hi || py < 0 || py >= height {
                     continue;
                 }
                 let centre = (px as f64 + 0.5, py as f64 + 0.5);
                 let distance_squared =
                     (centre.0 - sample.0).powi(2) + (centre.1 - sample.1).powi(2);
-                if distance_squared >= radius_squared {
-                    continue;
-                }
                 let weight = film_filter_weight(self.radius, distance_squared);
-                let index = py as usize * self.width + px as usize;
-                for (sum, value) in self.colour[index].iter_mut().zip(shaded) {
-                    *sum += weight * value;
-                }
-                self.weight[index] += weight;
+                self.accumulate(px as usize, py as usize, weight, shaded);
             }
         }
     }
@@ -1943,6 +1999,30 @@ fn film_radius(mode: Mode, samples: u32, filter_size: f64) -> Option<f64> {
         return None;
     }
     Some(filter_size.clamp(0.0, 100.0).max(1.0e-4))
+}
+
+/// The filter radius from which EEVEE switches to its 16-tap table (`Film::update_sample_table`, `filter_radius < 2.20f`).
+const LARGE_FILTER_RADIUS: f64 = 2.2;
+
+/// EEVEE's large-filter table for frame `sample_index`: 16 integer texel offsets, `floor(sample_spiral(((u + i) / 16, v))
+/// * radius)` for `i` in `0..16`, where `(u, v)` is the SSS Halton pair at index `5 * k + 1` (`Sampling::step`,
+/// `SAMPLING_SSS_U` and `SAMPLING_SSS_V`, leap 5, primes 2 and 3). The offsets are in EEVEE's texel space, whose y points up.
+fn large_filter_taps(radius: f64, sample_index: u32) -> [(i64, i64); 16] {
+    let index = 5 * u64::from(sample_index) + 1;
+    let u = halton_radical_inverse(2, index);
+    let v = halton_radical_inverse(3, index);
+    std::array::from_fn(|i| {
+        let (x, y) = sample_spiral((u + i as f64) / 16.0, v);
+        ((x * radius).floor() as i64, (y * radius).floor() as i64)
+    })
+}
+
+/// `Sampling::sample_spiral` (`eevee_sampling.cc`): a Fibonacci spiral point for `rand_x`, rotated by `rand_y`.
+fn sample_spiral(rand_x: f64, rand_y: f64) -> (f64, f64) {
+    let omega = 4.0 * std::f64::consts::PI * (1.0 + 5.0_f64.sqrt()) * rand_x
+        + rand_y * std::f64::consts::TAU;
+    let radius = rand_x.sqrt();
+    (radius * omega.cos(), radius * omega.sin())
 }
 
 /// A film sample's offset inside its pixel: EEVEE's Halton (2, 3) sequence at index `sample_index + 1`, each dimension
