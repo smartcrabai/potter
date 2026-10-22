@@ -434,7 +434,7 @@ fn float_dot(left: Vec3, right: Vec3) -> f32 {
 }
 
 /// Blender's `safe_acos_approx` in f32. The constants are Blender's literals at their f32 values.
-fn float_safe_acos_approx(x: f32) -> f32 {
+pub(crate) fn float_safe_acos_approx(x: f32) -> f32 {
     let magnitude = x.abs();
     let m = if magnitude < 1.0 {
         1.0 - (1.0 - magnitude)

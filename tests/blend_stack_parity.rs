@@ -195,10 +195,9 @@ fn points_from_json(value: &Value) -> TestResult<Vec<DVec3>> {
 #[test]
 #[expect(
     clippy::too_many_lines,
-    reason = "one fixture verifies the source mesh, bevel gate, and Blender prefix parity end to end"
+    reason = "one fixture verifies the source mesh and Blender prefix parity end to end"
 )]
-fn gear_bevel_array_subdivision_weighted_normal_stack_stops_at_unsupported_blender_corner()
--> TestResult<()> {
+fn gear_bevel_array_subdivision_weighted_normal_stack_matches_blender() -> TestResult<()> {
     const TOLERANCE: f64 = 1.0e-5;
     let Some(blender) = blender_executable() else {
         eprintln!("skipping gear stack Blender parity test: Blender is unavailable");
@@ -287,52 +286,42 @@ fn gear_bevel_array_subdivision_weighted_normal_stack_stops_at_unsupported_blend
     assert!(cap_only.meshes.contains_key(&cap_id));
     assert!(!cap_only.meshes.contains_key(&gear_id));
     let feature_catalog = potter_core::catalog::feature_catalog();
-    let bevel_corner_feature = feature_catalog["features"]
-        .as_array()
-        .and_then(|features| {
-            features
-                .iter()
-                .find(|feature| feature["feature_id"] == "modifier.bevel.high_valence_vertex_mesh")
-        })
-        .ok_or("high-valence bevel corner is missing from the feature catalog")?;
-    assert_eq!(bevel_corner_feature["status"], "not_supported");
-    assert_eq!(bevel_corner_feature["capabilities"]["evaluate"], false);
+    assert!(
+        !feature_catalog["features"]
+            .as_array()
+            .is_some_and(|features| features.iter().any(|feature| {
+                feature["feature_id"] == "modifier.bevel.high_valence_vertex_mesh"
+            })),
+        "high-valence bevel must not remain cataloged as unsupported"
+    );
     let preview = run_pot(&["preview", project_path, "--views", "iso", "--size", "64"])?;
     let warnings = preview["result"]["warnings"]
         .as_array()
         .ok_or("preview warnings are missing")?;
     assert!(
-        warnings.iter().any(|warning| {
+        !warnings.iter().any(|warning| {
             warning["feature_id"] == "modifier.bevel.high_valence_vertex_mesh"
                 && warning["node_id"] == gear_id.as_str()
         }),
-        "preview must warn about the unsupported gear object: {warnings:?}"
+        "preview must evaluate the high-valence gear without a refusal warning: {warnings:?}"
     );
 
     let targeted_inspect = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["inspect", project_path, "--id", gear_id.as_str(), "--json"])
         .output()?;
-    assert_eq!(targeted_inspect.status.code(), Some(4));
+    assert!(
+        targeted_inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&targeted_inspect.stderr)
+    );
     let targeted_inspect: Value = serde_json::from_slice(&targeted_inspect.stdout)?;
-    assert_eq!(targeted_inspect["error"]["code"], "UNSUPPORTED_FEATURE");
-    assert_eq!(
-        targeted_inspect["error"]["details"]["feature_id"],
-        "modifier.bevel.high_valence_vertex_mesh"
-    );
-    assert_eq!(
-        targeted_inspect["error"]["details"]["node_id"],
-        gear_id.as_str()
-    );
-
-    let whole_scene_inspect = run_pot(&["inspect", project_path])?;
-    let gear_item = whole_scene_inspect["result"]["items"]
+    let gear_item = targeted_inspect["result"]["items"]
         .as_array()
         .and_then(|items| items.iter().find(|item| item["id"] == gear_id.as_str()))
-        .ok_or("whole-scene inspect omitted the unsupported gear object")?;
-    assert_eq!(gear_item["evaluation_error"]["code"], "UNSUPPORTED_FEATURE");
-    assert_eq!(
-        gear_item["evaluation_error"]["details"]["feature_id"],
-        "modifier.bevel.high_valence_vertex_mesh"
+        .ok_or("targeted inspect omitted the evaluated gear object")?;
+    assert!(
+        gear_item["evaluation_error"].is_null(),
+        "targeted inspect must evaluate the high-valence bevel: {gear_item}"
     );
 
     for (index, blender_positions) in prefixes.iter().enumerate() {
@@ -344,27 +333,10 @@ fn gear_bevel_array_subdivision_weighted_normal_stack_stops_at_unsupported_blend
         for (modifier_index, modifier) in gear.modifiers.iter_mut().enumerate() {
             modifier.show_viewport = modifier_index < index;
         }
-        let snapshot = match Snapshot::evaluate(
+        let snapshot = Snapshot::evaluate(
             &prefix_document,
             &potter_core::eval::EvaluationContext::default(),
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                assert_eq!(index, 1, "the source prefix must remain evaluable");
-                assert_eq!(
-                    error.code,
-                    potter_core::error::ErrorCode::UnsupportedFeature,
-                    "the first modifier prefix must use a typed feature gate"
-                );
-                assert_eq!(
-                    error.details["feature_id"],
-                    serde_json::json!("modifier.bevel.high_valence_vertex_mesh")
-                );
-                assert!(error.details["vertex_id"].is_number());
-                assert_eq!(error.details["node_id"], serde_json::json!(gear_id));
-                return Ok(());
-            }
-        };
+        )?;
         let evaluated = snapshot
             .meshes
             .get(&gear_id)

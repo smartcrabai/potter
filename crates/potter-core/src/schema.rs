@@ -320,6 +320,9 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["offscreen_dicing_scale"] =
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
+    render["properties"]["pixel_filter_type"] =
+        json!({"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"],"default":"BLACKMAN_HARRIS"});
+    render["properties"]["filter_width"] = json!({"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX,"default":crate::model::DEFAULT_FILTER_WIDTH});
     render["properties"]["filter_size"] = json!({"type":"number","minimum":0,"maximum":500});
     render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0,"maximum":10});
     render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
@@ -2536,6 +2539,8 @@ fn set_schema(operation: &str) -> Value {
             "max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "volume_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
+            "pixel_filter_type":{"enum":["BOX","GAUSSIAN","BLACKMAN_HARRIS"]},
+            "filter_width":{"type":"number","minimum":crate::model::FILTER_WIDTH_MIN,"maximum":crate::model::FILTER_WIDTH_MAX},
             "filter_glossy":{"type":"number","minimum":0,"maximum":10},
             "film_transparent":{"type":"boolean"},
             "filter_size":{"type":"number","minimum":0,"maximum":500},

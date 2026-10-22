@@ -140,6 +140,7 @@ pub(crate) fn polys_to_mesh(
         source_vertices: None,
         faces: planned.iter().map(|face| Some(face.joined_face)).collect(),
         corners: Some(corner_sources(&joined, &planned, &positions)),
+        ..Default::default()
     };
     remap_interpolated_corners_skipping(&joined.mesh, &mut mesh, &origin, &["custom_normal"])?;
     mix_custom_normals(
