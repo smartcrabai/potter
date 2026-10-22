@@ -364,10 +364,11 @@ import os
 import sys
 
 root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
-vertices = [(-0.5, -0.5, 0.0), (0.5, -0.5, 0.0), (0.5, 0.5, 0.0), (-0.5, 0.5, 0.0)]
-faces = [(0, 1, 2, 3)]
+# Potter's plane is built in grid order (geom/primitive_order.rs), so ids 2 and 3 are swapped.
+vertices = [(-0.5, -0.5, 0.0), (0.5, -0.5, 0.0), (-0.5, 0.5, 0.0), (0.5, 0.5, 0.0)]
+faces = [(0, 1, 3, 2)]
 weights = [0.2, 0.4, 0.6, 0.8]
-uvs = [(0.15, 0.2), (0.8, 0.1), (0.7, 0.85), (0.25, 0.75)]
+uvs = [(0.15, 0.2), (0.8, 0.1), (0.25, 0.75), (0.7, 0.85)]
 pixels = [(0.05, 0.15, 0.8, 0.2), (0.35, 0.6, 0.1, 0.4),
           (0.9, 0.25, 0.45, 0.7), (0.65, 0.85, 0.3, 1.0)]
 channels = ["INT", "RED", "GREEN", "BLUE", "HUE", "SAT", "VAL", "ALPHA"]
@@ -1601,6 +1602,7 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
     ];
     let channels = ["INT", "RED", "GREEN", "BLUE", "HUE", "SAT", "VAL", "ALPHA"];
     // The canonical store is V-down; the Blender oracle fixture uses its native V-up UVs.
+    // Per corner of the grid plane, whose face is [v0, v1, v3, v2] (geom/primitive_order.rs grid).
     let uv_values = json!([[0.15, 0.8], [0.8, 0.9], [0.7, 0.15], [0.25, 0.25]]);
     for mapping in mappings {
         for channel in channels {

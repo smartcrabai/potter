@@ -532,42 +532,38 @@ fn attribute_modifier_boundary_parameters_are_accepted() {
 }
 
 #[test]
-fn null_required_references_are_refused_with_pointers() {
-    let setup = json!([
+fn blender_optional_null_references_are_accepted_and_kept() {
+    // Blender's object and target pointers are optional (PROP_NONE): a null reference disables the
+    // modifier (is_disabled) instead of refusing it. normal_edit's target is needed only for
+    // DIRECTIONAL mode, which is reported when evaluated.
+    let (_directory, scene) = setup_scene(&json!([
         {"op":"node.create","id":"body","kind":"box","params":{"size":1.0}},
-        {"op":"node.create","id":"guard","kind":"box","params":{"size":1.0}}
-    ]);
-    let cases = [
-        invalid_case(
-            "vertex-weight proximity target null",
-            setup.clone(),
-            json!({"op":"modifier.create","target":{"id":"body"},"id":"proximity","type":"vertex_weight_proximity","params":{"target":null,"vertex_group":"weights"}}),
-            "INVALID_OPERATION",
-            Some("/operations/0/params/target"),
-            Some("modifier.vertex_weight_proximity"),
-        ),
-        invalid_case(
-            "normal edit target null",
-            setup.clone(),
-            json!({"op":"modifier.create","target":{"id":"body"},"id":"normal","type":"normal_edit","params":{"target":null}}),
-            "INVALID_OPERATION",
-            Some("/operations/0/params/target"),
-            Some("modifier.normal_edit"),
-        ),
-        invalid_case(
-            "data transfer object null",
-            setup,
-            json!({"op":"modifier.create","target":{"id":"body"},"id":"transfer","type":"data_transfer","params":{"object":null}}),
-            "INVALID_OPERATION",
-            Some("/operations/0/params/object"),
-            Some("modifier.data_transfer"),
-        ),
-    ];
-    run_invalid_cases(&cases);
+        {"op":"vertex_group.create","target":{"id":"body"},"id":"weights","name":"weights"}
+    ]));
+    let output = apply(
+        &scene,
+        1,
+        &json!([
+            {"op":"modifier.create","target":{"id":"body"},"id":"proximity","type":"vertex_weight_proximity","params":{"target":null,"vertex_group":"weights"}},
+            {"op":"modifier.create","target":{"id":"body"},"id":"normal","type":"normal_edit","params":{"mode":"RADIAL","target":null}},
+            {"op":"modifier.create","target":{"id":"body"},"id":"transfer","type":"data_transfer","params":{"object":null}}
+        ]),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document: SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let modifiers = &document.nodes[&Id::new("body").unwrap()].modifiers;
+    assert!(modifiers[0].params["target"].is_null());
+    assert!(modifiers[1].params["target"].is_null());
+    assert!(modifiers[2].params["object"].is_null());
 }
 
 #[test]
-fn null_required_reference_batches_leave_the_scene_and_revision_unchanged() {
+fn rejected_batches_leave_the_scene_and_revision_unchanged() {
     let (_directory, scene) =
         setup_scene(&json!([{"op":"node.create","id":"body","kind":"box","params":{"size":1.0}}]));
     let before = fs::read(scene.join("scene.json")).unwrap();
@@ -576,12 +572,12 @@ fn null_required_reference_batches_leave_the_scene_and_revision_unchanged() {
         1,
         &json!([
             {"op":"node.create","id":"extra","kind":"box","params":{"size":1.0}},
-            {"op":"modifier.create","target":{"id":"body"},"id":"transfer","type":"data_transfer","params":{"object":null}}
+            {"op":"modifier.create","target":{"id":"missing"},"id":"transfer","type":"data_transfer","params":{"object":null}}
         ]),
     );
     assert!(
         !output.status.success(),
-        "null required object was accepted"
+        "a modifier was added to a missing object"
     );
     assert_eq!(
         fs::read(scene.join("scene.json")).unwrap(),

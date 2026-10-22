@@ -702,6 +702,16 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             "cast" => advanced::cast(&evaluated, modifier)?,
             "wave" => wave_textured(&evaluated, modifier, frame, None, &mut texture_rng)?,
             "warp" => warp_textured(&evaluated, modifier, None, &mut texture_rng)?,
+            // MOD_normal_edit.cc is_valid_target: DIRECTIONAL needs a target; without one Blender sets
+            // "Invalid target settings" and passes the mesh through.
+            "normal_edit" if normal_edit_target_disabled(modifier) => {
+                warnings.push(modifier_warning(
+                    modifier,
+                    "modifier.normal_edit.target",
+                    "Invalid target settings",
+                ));
+                evaluated.clone()
+            }
             "vertex_weight_edit"
             | "vertex_weight_mix"
             | "vertex_weight_proximity"
@@ -1803,7 +1813,7 @@ fn array(
         }
     }
     if let Some((feature_id, message)) = fallback_warning {
-        warnings.push(array_count_warning(modifier, feature_id, message));
+        warnings.push(modifier_warning(modifier, feature_id, message));
     }
     let count_usize = usize::try_from(count).map_err(|_| mesh_error(&MeshError::IdExhausted))?;
     // Blender's 2^26-vertex limit has applied above. This budget bounds the memory the copies
@@ -2392,7 +2402,16 @@ fn array_empty_source_transform(step: Mat4, count: usize) -> Mat4 {
     result
 }
 
-fn array_count_warning(modifier: &Modifier, feature_id: &str, message: &str) -> PotError {
+/// A DIRECTIONAL normal edit with no target (MOD_normal_edit.cc `is_valid_target`).
+fn normal_edit_target_disabled(modifier: &Modifier) -> bool {
+    modifier.params.get("mode").and_then(Value::as_str) == Some("DIRECTIONAL")
+        && modifier
+            .params
+            .get("target")
+            .is_none_or(|value| value.is_null() || value.as_str().is_some_and(str::is_empty))
+}
+
+fn modifier_warning(modifier: &Modifier, feature_id: &str, message: &str) -> PotError {
     PotError::with_details(
         ErrorCode::EvaluationFailed,
         message,

@@ -2938,8 +2938,16 @@ fn weighted_normal_mesh(sharp_edge: bool) -> Result<Mesh, Box<dyn Error>> {
                     || (edge.vertices[0] == 2 && edge.vertices[1] == 0)
             })
             .ok_or("weighted-normal sharp edge missing")?;
-        mesh.attributes
-            .insert("sharp_edges".to_owned(), json!([edge.id]));
+        let sharp_edge = edge.id;
+        let values = mesh
+            .edges
+            .iter()
+            .map(|edge| (format!("e{}", edge.id), json!(edge.id == sharp_edge)))
+            .collect::<serde_json::Map<_, _>>();
+        mesh.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain":"edge","type":"bool","values":values}),
+        );
     }
     Ok(mesh)
 }

@@ -2033,9 +2033,11 @@ fn validate_attribute_modifier_params_inner(
     params: &Map<String, Value>,
 ) -> Result<()> {
     let required: &[&str] = match modifier_type {
+        // Blender's object and target pointers are PROP_NONE: a null reference disables the modifier
+        // (is_disabled) rather than refusing it. normal_edit's target is needed only in DIRECTIONAL,
+        // and that case is reported at evaluation.
         "vertex_weight_edit" | "vertex_weight_proximity" => &["vertex_group"],
         "vertex_weight_mix" => &["vertex_group_a", "vertex_group_b"],
-        "normal_edit" => &["target"],
         "uv_project" => &["projectors"],
         _ => &[],
     };
