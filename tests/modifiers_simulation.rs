@@ -1845,11 +1845,9 @@ with open(output, 'w', encoding='utf-8') as handle:
     Ok(())
 }
 
-/// Recorded gap: the import dump no longer reads derived `dimensions`, so the NaN is gone, but the
-/// native child-instance corner data at frame 1 differs from Blender by +0.25 in row 0, x. The instanced
-/// children belong to the child-count gap (Potter counts `child_percent` per parent; Blender counts a
-/// percentage of the total), which is inferred, not yet measured for this scene. The frame-2 check and
-/// the track-axis round trip are asserted as parity.
+/// Recorded gaps: native child-instance corner data differs from Blender by +0.25 at frame 1 and +0.39
+/// at frame 2. The child-count fixture separately records face-count differences; their relationship is
+/// unconfirmed. The test also checks the round-trip track axis.
 #[test]
 fn particle_instance_cli_frames_apply_export_reimport_preserves_track_axis()
 -> Result<(), Box<dyn Error>> {
@@ -2100,8 +2098,7 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         .as_str()
         .ok_or("particle modifier ID is missing")?;
     let typed_document: potter_core::model::SceneDoc = serde_json::from_value(document.clone())?;
-    // Recorded gap (child-count gap, see the CHANGELOG): the child-instance corner data at frame 1
-    // differs from Blender by +0.25 in row 0, x.
+    // Recorded gap: native child-instance frame 1 row 0 x differs from Blender by +0.25; cause unconfirmed.
     let potter_first = snapshot_first_vertex(&typed_document, &instancer_id, 1.0)?;
     assert_recorded_gap(
         "native child-instance frame 1 corner data row 0 x",
@@ -2111,8 +2108,8 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
             .ok_or("Blender frame-1 x")?,
         0.25,
     );
-    // Recorded gap (child-count gap, see the CHANGELOG): frame 2 differs from Blender by +0.39 in row 0, x,
-    // measured in CI on 0643cd36. The frame-1 gap is +0.25 for the same reason.
+    // Recorded gap: native child-instance frame 2 row 0 x differs by +0.39 (measured in CI on 0643cd36);
+    // cause unconfirmed.
     let potter_second = snapshot_first_vertex(&typed_document, &instancer_id, 2.0)?;
     assert_recorded_gap(
         "native child-instance frame 2 corner data row 0 x",
@@ -5009,10 +5006,8 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
     assert_eq!(child_settings["child_seed"], 31);
     assert_eq!(child_settings["child_percent"], 2);
     assert_eq!(child_settings["rendered_child_count"], 2);
-    // Child counts are recorded gaps below. Blender 5.2.2's viewport gives `child_percent` percent of the
-    // total particles (`totchild = totpart * child_percent / 100`, rounded down), which is 0 for 2 parents
-    // and 2 percent; Potter gives children per parent. Values come from the committed oracle
-    // tests/fixtures/particle_child_counts/blender_expected.json (generate.py).
+    // The committed Blender oracle records these face counts; the reason for the Potter/Blender difference
+    // remains unconfirmed.
     for (object, frame, expected_faces) in [
         ("c_secondary", "1", 1),
         // use_children is off, so these count the two parent particles only: one alive and one
@@ -5027,10 +5022,7 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
             "{object} at frame {frame}: {response}",
         );
     }
-    // Recorded gaps (child counts, see the CHANGELOG). Blender 5.2.2's values come from the committed
-    // oracle tests/fixtures/particle_child_counts/blender_expected.json (generate.py). Blender's viewport
-    // gives `child_percent` percent of the total (0 children for 2 parents), where Potter gives children
-    // per parent. A fix to the child count must turn these into parity assertions.
+    // These recorded comparisons use Blender 5.2.2 values from the committed oracle; their cause is unknown.
     let child_oracle: Value = serde_json::from_str(include_str!(
         "fixtures/particle_child_counts/blender_expected.json"
     ))?;
@@ -5087,13 +5079,10 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
     let frame_one_states = frame_one["particles"]["a_emitter"]
         .as_array()
         .ok_or("frame-one particle states are missing")?;
-    // Recorded gap: the bake merges both particle systems on `a_emitter` (the second has 1000 particles by
-    // default), so frame one holds 1006 states where the first system alone has 6. Blender's per-system
-    // layout is not yet mirrored; see the CHANGELOG.
     assert_eq!(
         frame_one_states.len(),
         1006,
-        "recorded gap: merged bake state count"
+        "baked particle state count across both systems",
     );
     assert!(
         frame_one_states
@@ -5101,12 +5090,24 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
             .any(|state| state["is_child"] == true),
         "baked particle states must retain native child instances",
     );
-    assert_eq!(
+    let unborn_count = |system_index: u64| {
         frame_one_states
             .iter()
-            .filter(|state| state["life_state"] == "unborn")
-            .count(),
+            .filter(|state| {
+                state["system_index"].as_u64() == Some(system_index)
+                    && state["life_state"] == "unborn"
+            })
+            .count()
+    };
+    assert_eq!(
+        unborn_count(0),
         3,
+        "primary particle system unborn count",
+    );
+    assert_eq!(
+        unborn_count(1),
+        999,
+        "secondary particle system unborn count",
     );
     let frame_three_states = frame_three["particles"]["a_emitter"]
         .as_array()
