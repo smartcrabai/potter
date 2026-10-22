@@ -437,13 +437,14 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     // location, and the bake is packed instead (get_node_bake_path, object_bake_simulation.cc:1005-1009).
     let mut default_directory = None;
     let mut resolved_directory = crate::graph::node_bake_directory(modifier, &bake_settings);
-    if bake_target == "DISK" && resolved_directory.is_none() && !custom_path {
-        if let Some(directory) =
+    if bake_target == "DISK"
+        && resolved_directory.is_none()
+        && !custom_path
+        && let Some(directory) =
             default_modifier_bake_directory(project.path(), &object.name, &modifier.name)
-        {
-            resolved_directory = Some(directory.clone());
-            default_directory = Some(directory);
-        }
+    {
+        resolved_directory = Some(directory.clone());
+        default_directory = Some(directory);
     }
     if bake_target == "DISK" && resolved_directory.is_none() {
         bake_target = "PACKED";
@@ -879,7 +880,7 @@ fn unpack_node_bake(
             "only a packed Bake-node cache can be unpacked",
         ));
     }
-    let record = node_bake_packed_record(project, &config)?;
+    let (resource_id, record) = node_bake_packed_record(project, &config)?;
     let (bake_directory, use_custom_path, custom_directory) =
         node_bake_unpack_directory(method, modifier, bake_settings);
     let mut transaction = NodeBakePayloadTransaction::new(project.path())?;
@@ -1540,7 +1541,7 @@ fn stage_delete_node_bake_payloads(
             }
         }
         "packed" => {
-            let record = node_bake_packed_record(project, config)?;
+            let (_, record) = node_bake_packed_record(project, config)?;
             for frame in &record.frames {
                 let bytes = serde_json::to_vec(frame).map_err(PotError::internal_json)?;
                 let digest = crate::hash::sha256(&bytes);
@@ -1581,8 +1582,9 @@ fn node_bake_payload_is_kept(
         })
 }
 
-fn node_bake_packed_record(project: &Project, config: &Value) -> Result<NodeBakeRecord> {
-    let (_, resource) = crate::graph::packed_node_bake_resource(&project.doc().resources, config)?;
+fn node_bake_packed_record(project: &Project, config: &Value) -> Result<(Id, NodeBakeRecord)> {
+    let (resource_id, resource) =
+        crate::graph::packed_node_bake_resource(&project.doc().resources, config)?;
     let record = serde_json::from_value::<NodeBakeRecord>(resource.clone()).map_err(|error| {
         PotError::with_details(
             ErrorCode::SceneInvalid,
@@ -1591,7 +1593,7 @@ fn node_bake_packed_record(project: &Project, config: &Value) -> Result<NodeBake
         )
     })?;
     crate::graph::validate_node_bake_record(&record)?;
-    Ok(record)
+    Ok((resource_id, record))
 }
 
 fn node_bake_payload_directory(
@@ -1624,6 +1626,11 @@ fn node_bake_payload_directory(
                 "custom node-bake directory is missing",
             )
         });
+    }
+    // A disk payload keeps the directory it was written to, so a later change to the modifier's directory does not
+    // move it. The directory is recorded as `cache_directory` when the payloads are written.
+    if let Some(written) = config.get("cache_directory").and_then(Value::as_str) {
+        return Ok(written.to_owned());
     }
     Ok(directory.unwrap_or_default())
 }

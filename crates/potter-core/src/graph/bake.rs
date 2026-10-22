@@ -391,6 +391,7 @@ pub(crate) fn validate_node_bake_config(value: &Value) -> Result<()> {
         "frame_end",
         "use_custom_path",
         "directory",
+        "cache_directory",
     ];
     if config.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(invalid());
@@ -487,9 +488,9 @@ pub(crate) fn validate_node_bake_settings(value: &Value) -> Result<()> {
     if config
         .get("use_custom_path")
         .is_some_and(|value| !value.is_boolean())
-        || config
-            .get("directory")
-            .is_some_and(|value| !value.is_string())
+        || ["directory", "cache_directory"]
+            .into_iter()
+            .any(|key| config.get(key).is_some_and(|value| !value.is_string()))
     {
         return Err(invalid());
     }
@@ -693,7 +694,6 @@ impl NodeBakePayloadTransaction {
         })?;
         let prior_bytes =
             read_regular_file(directory_handle, &filename, MAX_NODE_BAKE_PAYLOAD_BYTES)?;
-        let had_prior = prior_bytes.is_some();
         let prior_digest = if let Some(current) = prior_bytes {
             let current_digest = crate::hash::sha256(&current);
             if current_digest == digest {
@@ -732,7 +732,7 @@ impl NodeBakePayloadTransaction {
             backup_created: false,
             destination_published: false,
         });
-        Ok(!had_prior)
+        Ok(())
     }
 
     pub fn stage_delete(
@@ -1702,7 +1702,7 @@ mod tests {
         validate_node_bake_config(&json!({
             "storage":"disk",
             "frames":[{"frame":1,"digest":format!("sha256:{}", "0".repeat(64))}],
-            "directory":"//bakes"
+            "cache_directory":"//bakes"
         }))
         .unwrap();
         for invalid in [
@@ -1747,37 +1747,35 @@ mod tests {
         assert!(!project.path().join(".potter/bakes").exists());
 
         let mut transaction = NodeBakePayloadTransaction::new(project.path()).unwrap();
-        assert!(
-            transaction
-                .stage_write(
-                    "//cache-a",
-                    &object_id,
-                    &modifier_id,
-                    "bake",
-                    &digest,
-                    &payload,
-                    1.0,
-                    false,
-                )
-                .unwrap()
-        );
+        transaction
+            .stage_write(
+                "//cache-a",
+                &object_id,
+                &modifier_id,
+                "bake",
+                &digest,
+                &payload,
+                1.0,
+                false,
+            )
+            .unwrap();
+        assert_eq!(transaction.operations.len(), 1);
         transaction.publish().unwrap();
         transaction.commit().unwrap();
         let mut unchanged = NodeBakePayloadTransaction::new(project.path()).unwrap();
-        assert!(
-            !unchanged
-                .stage_write(
-                    "//cache-a",
-                    &object_id,
-                    &modifier_id,
-                    "bake",
-                    &digest,
-                    &payload,
-                    1.0,
-                    false,
-                )
-                .unwrap()
-        );
+        unchanged
+            .stage_write(
+                "//cache-a",
+                &object_id,
+                &modifier_id,
+                "bake",
+                &digest,
+                &payload,
+                1.0,
+                false,
+            )
+            .unwrap();
+        assert!(unchanged.operations.is_empty());
         unchanged.commit().unwrap();
         assert_eq!(
             read_node_bake_payload(
@@ -1839,39 +1837,37 @@ mod tests {
         );
 
         let mut rolled_back = NodeBakePayloadTransaction::new(project.path()).unwrap();
-        assert!(
-            !rolled_back
-                .stage_write(
-                    "//cache-a",
-                    &object_id,
-                    &modifier_id,
-                    "bake",
-                    &digest,
-                    &payload,
-                    1.0,
-                    true,
-                )
-                .unwrap()
-        );
+        rolled_back
+            .stage_write(
+                "//cache-a",
+                &object_id,
+                &modifier_id,
+                "bake",
+                &digest,
+                &payload,
+                1.0,
+                true,
+            )
+            .unwrap();
+        assert_eq!(rolled_back.operations.len(), 1);
         rolled_back.publish().unwrap();
         rolled_back.rollback().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"corrupt");
 
         let mut replacement = NodeBakePayloadTransaction::new(project.path()).unwrap();
-        assert!(
-            !replacement
-                .stage_write(
-                    "//cache-a",
-                    &object_id,
-                    &modifier_id,
-                    "bake",
-                    &digest,
-                    &payload,
-                    1.0,
-                    true,
-                )
-                .unwrap()
-        );
+        replacement
+            .stage_write(
+                "//cache-a",
+                &object_id,
+                &modifier_id,
+                "bake",
+                &digest,
+                &payload,
+                1.0,
+                true,
+            )
+            .unwrap();
+        assert_eq!(replacement.operations.len(), 1);
         replacement.publish().unwrap();
         replacement.commit().unwrap();
         assert_eq!(fs::read(&path).unwrap(), payload);
@@ -1886,20 +1882,18 @@ mod tests {
         );
         drop(wrong_frame);
         let mut restored_delete = NodeBakePayloadTransaction::new(project.path()).unwrap();
-        assert!(
-            restored_delete
-                .stage_delete("//cache-a", &object_id, &modifier_id, "bake", &digest, 1.0,)
-                .unwrap()
-        );
+        restored_delete
+            .stage_delete("//cache-a", &object_id, &modifier_id, "bake", &digest, 1.0)
+            .unwrap();
+        assert_eq!(restored_delete.operations.len(), 1);
         restored_delete.publish().unwrap();
         restored_delete.rollback().unwrap();
         assert_eq!(fs::read(&path).unwrap(), payload);
         let mut deletion = NodeBakePayloadTransaction::new(project.path()).unwrap();
-        assert!(
-            deletion
-                .stage_delete("//cache-a", &object_id, &modifier_id, "bake", &digest, 1.0,)
-                .unwrap()
-        );
+        deletion
+            .stage_delete("//cache-a", &object_id, &modifier_id, "bake", &digest, 1.0)
+            .unwrap();
+        assert_eq!(deletion.operations.len(), 1);
         deletion.publish().unwrap();
         deletion.commit().unwrap();
         assert!(!path.exists());

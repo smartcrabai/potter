@@ -4650,6 +4650,10 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
                 except Exception as error:
                     raise ValueError("%s cannot restore interface socket %s" %
                                      (owner, entry.get("name", ""))) from error
+        # A geometry graph with no declared outputs has an implicit Geometry output that its group output node links to
+        # (sockets.rs `NodeGroupOutput`), so Blender needs the socket for those links.
+        if tree.bl_idname == "GeometryNodeTree" and not raw.get("interface", {}).get("outputs"):
+            interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
     tree.nodes.clear()
     nodes = {}
     # Saved socket identifiers of Bake items, per node name, mapped to the identifiers Blender assigned.
@@ -4673,6 +4677,9 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
         if node_color is not None and (not isinstance(node_color, list) or len(node_color) != 3):
             # Node color is display-only; discard malformed legacy presentation metadata.
             node_properties.pop("color", None)
+        if node.bl_idname == "GeometryNodeMeshCube" and "size" in node_properties:
+            # Blender 5.2 has no RNA for a cube's size: it is the Size input, which is the only place it can live.
+            node.inputs["Size"].default_value = tuple(node_properties.pop("size"))
         set_rna(node, node_properties, id_lookup, strict=True,
                 owner="%s node %s" % (owner, node.name))
         set_id(node, source.get("potter_id"))
@@ -4716,7 +4723,10 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             to_socket = next((value for value in to_node.inputs
                               if value.name == source.get("to_socket")), None)
         if from_socket is None or to_socket is None:
-            raise ValueError("%s has an unavailable node socket" % owner)
+            raise ValueError("%s has an unavailable node socket on link %s.%s -> %s.%s (outputs: %s, inputs: %s)" % (
+                owner, source.get("from_node"), source.get("from_socket"), source.get("to_node"),
+                source.get("to_socket"), [s.identifier for s in from_node.outputs],
+                [s.identifier for s in to_node.inputs]))
         tree.links.new(from_socket, to_socket)
     return socket_map
 

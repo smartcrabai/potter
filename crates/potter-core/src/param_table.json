@@ -2144,6 +2144,9 @@
               },
               "directory": {
                 "type": "string"
+              },
+              "cache_directory": {
+                "type": "string"
               }
             },
             "oneOf": [
@@ -2163,6 +2166,11 @@
                     {
                       "required": [
                         "frames"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "cache_directory"
                       ]
                     }
                   ]

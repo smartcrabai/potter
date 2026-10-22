@@ -1155,17 +1155,19 @@ fn imported_bake_node_settings_drive_disk_target_custom_path_and_frame_range()
         "initializing node-settings project",
     )?;
     let mut operations = transformed_cube_bake_operations("PACKED", "//modifier-cache");
-    let bake_node = operations
+    let modifier = operations
         .iter_mut()
-        .find(|operation| operation["id"] == "bake")
-        .ok_or_else(|| std::io::Error::other("Bake node operation is missing"))?;
-    bake_node["properties"]["bake_mode"] = json!("ANIMATION");
-    bake_node["properties"]["bake_target"] = json!("DISK");
-    bake_node["properties"]["use_custom_simulation_frame_range"] = json!(true);
-    bake_node["properties"]["frame_start"] = json!(2);
-    bake_node["properties"]["frame_end"] = json!(4);
-    bake_node["properties"]["use_custom_path"] = json!(true);
-    bake_node["properties"]["directory"] = json!("//node-cache");
+        .find(|operation| operation["op"] == "modifier.create")
+        .ok_or_else(|| std::io::Error::other("modifier operation is missing"))?;
+    modifier["params"]["bakes"] = json!({"bake": {
+        "bake_mode": "ANIMATION",
+        "bake_target": "DISK",
+        "use_custom_simulation_frame_range": true,
+        "frame_start": 2,
+        "frame_end": 4,
+        "use_custom_path": true,
+        "directory": "//node-cache"
+    }});
     apply(&project, &batch_file, &json!(operations))?;
 
     let baked = bake(&project, None, None, BakeAction::Bake)?;
@@ -1216,10 +1218,6 @@ fn disk_node_bake_pack_unpack_and_delete_preserve_baked_geometry() -> Result<(),
     let packed_params = &packed_scene["nodes"]["body"]["modifiers"][0]["params"];
     assert_eq!(packed_params["bake_target"], "DISK");
     assert_eq!(packed_params["bakes"]["bake"]["bake_target"], "PACKED");
-    assert_eq!(
-        packed_scene["node_groups"]["geo"]["nodes"]["bake"]["properties"]["bake_target"],
-        "PACKED"
-    );
     let packed_resource_id = packed_params["bakes"]["bake"]["resource_id"]
         .as_str()
         .ok_or_else(|| std::io::Error::other("packed bake resource ID is missing"))?
@@ -1245,10 +1243,6 @@ fn disk_node_bake_pack_unpack_and_delete_preserve_baked_geometry() -> Result<(),
     let unpacked_params = &unpacked_scene["nodes"]["body"]["modifiers"][0]["params"];
     assert_eq!(unpacked_params["bake_target"], "DISK");
     assert_eq!(unpacked_params["bakes"]["bake"]["bake_target"], "DISK");
-    assert_eq!(
-        unpacked_scene["node_groups"]["geo"]["nodes"]["bake"]["properties"]["bake_target"],
-        "DISK"
-    );
     assert!(
         unpacked_scene["resources"]
             .get(packed_resource_id.as_str())
@@ -1373,10 +1367,6 @@ fn failed_node_bake_unpack_preserves_scene_and_conflicting_payload() -> Result<(
     assert_eq!(
         after["nodes"]["body"]["modifiers"][0]["params"]["bake_target"],
         before_params["bake_target"]
-    );
-    assert_eq!(
-        after["node_groups"]["geo"]["nodes"]["bake"]["properties"]["bake_target"],
-        before["node_groups"]["geo"]["nodes"]["bake"]["properties"]["bake_target"]
     );
     assert_eq!(fs::read(&payload_path)?, b"corrupt existing payload");
     let unpacked = bake_with_unpack_method(
