@@ -789,6 +789,12 @@ fn transfer_edge_attribute(
     mapping_context: &TransferMapContext<'_>,
 ) -> Result<()> {
     let intrinsic_flag = matches!(name, "sharp" | "seam");
+    // The modifier never creates a layer (`use_create = false`, MOD_datatransfer.cc), and the
+    // sharp/seam mappings exist only for a destination layer that is already present
+    // (blenkernel/intern/data_transfer.cc, `lookup_for_write_span` before `add_item`).
+    if intrinsic_flag && !destination.attributes.contains_key(name) {
+        return Ok(());
+    }
     let float_attribute = matches!(name, "crease_edge" | "bevel_weight_edge");
     let blender_index = (!intrinsic_flag)
         .then(|| {

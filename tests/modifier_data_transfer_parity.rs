@@ -2748,6 +2748,9 @@ faces=[(0,1,2,3)]
 def mesh(name, source):
     data=bpy.data.meshes.new(name+'Mesh'); data.from_pydata(verts,[],faces); data.update()
     obj=bpy.data.objects.new(name,data); bpy.context.collection.objects.link(obj)
+    # Blender only maps SHARP_EDGE/SEAM onto destination layers that already exist.
+    for flag_name in ('sharp_edge','uv_seam'):
+        data.attributes.get(flag_name) or data.attributes.new(name=flag_name,type='BOOLEAN',domain='EDGE')
     specifications=(
         ('bevel_weight_vert','FLOAT','POINT',[0.1,0.3,0.5,0.7] if source else [0.8,0.6,0.4,0.2]),
         ('freestyle_face','BOOLEAN','FACE',[True] if source else [False]),
