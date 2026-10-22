@@ -82,8 +82,8 @@ pub fn load_image_data_with_staged(
 }
 
 /// Loads an image using the selection captured by a legacy Image Texture's `ImageUser`.
-/// The legacy sampler reads straight texels, so a premultiplied EXR RGBA colour pass is
-/// unpremultiplied here; other passes keep their stored values.
+/// The stored values as loaded, with the image's alpha mode recorded in `ImageStorage`: a premultiplied EXR keeps its
+/// premultiplied texels, which Blender's texture sampler (`imagewrap`) divides by alpha after filtering.
 pub(crate) fn load_image_data_for_legacy_texture(
     image: &Image,
     root: &Path,
@@ -108,7 +108,7 @@ fn load_image_data_with_staged_and_user(
 ) -> Result<(ImageData, bool, usize)> {
     let decode = |bytes: &[u8]| {
         if let Some(selection) = selection {
-            decode_pixels_with_image_user(bytes, image.colorspace, image.alpha_mode, selection)
+            decode_pixels_with_image_user(bytes, image.colorspace, selection)
         } else {
             decode_pixels(bytes, image.colorspace)
                 .map(|(width, height, pixels)| (width, height, pixels, true, 4))
@@ -128,15 +128,7 @@ fn load_image_data_with_staged_and_user(
                 serde_json::json!({"image":image.name,"expected":[image.width,image.height],"actual":[width,height]}),
             ));
         }
-        let mut storage = image_storage(image, &base_bytes);
-        // The legacy decode unpremultiplies a premultiplied EXR colour pass, so its texels are straight
-        // and the storage says so.
-        if selection.is_some()
-            && base_bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01])
-            && legacy_colour_is_straight(image.alpha_mode, color_pass, source_channels)
-        {
-            storage.straight_alpha = true;
-        }
+        let storage = image_storage(image, &base_bytes);
         (width, height, pixels, color_pass, source_channels, storage)
     };
     let mut tiles = BTreeMap::new();
@@ -187,12 +179,11 @@ type DecodedImageUserPixels = (u32, u32, Vec<[f64; 4]>, bool, usize);
 fn decode_pixels_with_image_user(
     bytes: &[u8],
     colorspace: ImageColorspace,
-    alpha_mode: ImageAlphaMode,
     selection: ImageUserSelection,
 ) -> Result<DecodedImageUserPixels> {
     if bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
         let (width, height, mut pixels, color_pass, source_channels) =
-            decode_exr_with_image_user(bytes, selection, alpha_mode)?;
+            decode_exr_with_image_user(bytes, selection)?;
         if color_pass {
             pixels = apply_colorspace(pixels, colorspace);
             if source_channels == 1 {
@@ -679,17 +670,11 @@ fn decode_exr(bytes: &[u8]) -> Result<(u32, u32, Vec<[f64; 4]>)> {
 fn decode_exr_with_image_user(
     bytes: &[u8],
     selection: ImageUserSelection,
-    alpha_mode: ImageAlphaMode,
 ) -> Result<DecodedImageUserPixels> {
     let image = read_exr_data(bytes)?;
     let multilayer = exr_is_multilayer(&image);
     if !multilayer {
-        let (width, height, mut pixels) = decode_exr_default(&image)?;
-        if legacy_colour_is_straight(alpha_mode, true, 4) {
-            for pixel in &mut pixels {
-                unpremultiply_exr_pixel(pixel);
-            }
-        }
+        let (width, height, pixels) = decode_exr_default(&image)?;
         return Ok((width, height, pixels, true, 4));
     }
 
@@ -736,7 +721,6 @@ fn decode_exr_with_image_user(
     let (channel_slots, channel_ids) = exr_pass_channel_layout(pass);
     let channel_count = pass.channels.len();
     let color_pass = is_exr_color_pass(channel_count, &channel_ids);
-    let straight_colour = legacy_colour_is_straight(alpha_mode, color_pass, channel_count);
     let mut pixels = Vec::with_capacity(pixel_count);
     for index in 0..pixel_count {
         let mut pixel = if channel_count == 1 {
@@ -757,9 +741,6 @@ fn decode_exr_with_image_user(
             let value = exr_sample(pass.channels[0].channel, index)?;
             [value; 4]
         };
-        if straight_colour {
-            unpremultiply_exr_pixel(&mut pixel);
-        }
         pixels.push(pixel);
     }
     validate_pixels(width, height, &pixels)?;
@@ -855,28 +836,6 @@ fn decode_exr_default(image: &ExrImageData) -> Result<(u32, u32, Vec<[f64; 4]>)>
     }
     validate_pixels(width, height, &pixels)?;
     Ok((width, height, pixels))
-}
-
-/// Whether a legacy image's decoded colour pass is straight. A premultiplied RGBA colour pass is
-/// unpremultiplied at decode, as F's `image_user` decode did, so the legacy sampler reads straight
-/// texels. Z, depth, and other passes keep their stored values, and so do the other alpha modes.
-fn legacy_colour_is_straight(
-    alpha_mode: ImageAlphaMode,
-    color_pass: bool,
-    channel_count: usize,
-) -> bool {
-    alpha_mode == ImageAlphaMode::Premultiplied && color_pass && channel_count == 4
-}
-
-fn unpremultiply_exr_pixel(pixel: &mut [f64; 4]) {
-    let alpha = pixel[3];
-    if alpha == 0.0 {
-        pixel[..3].fill(0.0);
-    } else {
-        for component in &mut pixel[..3] {
-            *component /= alpha;
-        }
-    }
 }
 
 fn exr_channel<'a>(
