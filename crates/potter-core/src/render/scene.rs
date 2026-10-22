@@ -1429,7 +1429,11 @@ impl PointShadowMap {
         let pixel_y = (0.5 - y * 0.5) * f64::from(SHADOW_MAP_SIZE) - 0.5;
         let center_x = pixel_x.round() as i32;
         let center_y = pixel_y.round() as i32;
-        let bias = (depth * 0.001).max(1.0e-4);
+        // One texel's world size at this depth: a face spans `2 · depth` across (its 90° field of view). A receiver on a
+        // curved surface sees its neighbouring texels at a depth one texel's slope away, so a bias below a texel
+        // self-shadows the lit side. `tests/fixtures/native_oracle/point_shadow_bias.py` measures it against exact rays:
+        // 90 of 250 lit sphere points are dark at 0.001 · depth, none at one texel, and the plane's shadow is unchanged.
+        let bias = 2.0 * depth / f64::from(SHADOW_MAP_SIZE);
         let mut visible = 0.0;
         for offset in PCF_OFFSETS {
             let sample_x = center_x + offset[0];
@@ -2558,6 +2562,42 @@ fn glass_environment(
         closures.transmission_direction,
         closures.transmission_roughness,
     )?;
+    // TEMPORARY DIAGNOSTIC (remove with the glass_world investigation): the rough sphere's centre pixel of the glass world
+    // test, identified by its reflection direction (about (-0.118, 0.073, 0.990) for uv (0.807, 0.505)).
+    if closures.reflection_roughness == 0.5
+        && (closures.reflection_direction - DVec3::new(-0.1184, 0.0726, 0.9903)).length() < 0.02
+    {
+        eprintln!(
+            "WORLD_DIAG tdir={:?} trough={:.4} tweight={:?} rdir={:?} rrough={:.4} rweight={:?} reflected={:?} transmitted={:?}",
+            closures.transmission_direction,
+            closures.transmission_roughness,
+            closures.transmission,
+            closures.reflection_direction,
+            closures.reflection_roughness,
+            closures.reflection,
+            reflected,
+            transmitted,
+        );
+        for offset in [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            let spread = closures.transmission_roughness.powi(2) * 0.5;
+            let axis = closures.transmission_direction.normalize_or_zero();
+            let tangent = if axis.z.abs() < 0.999 {
+                axis.cross(DVec3::Z).normalize_or_zero()
+            } else {
+                axis.cross(DVec3::Y).normalize_or_zero()
+            };
+            let bitangent = axis.cross(tangent).normalize_or_zero();
+            let direction =
+                (axis + tangent * (spread * offset.0) + bitangent * (spread * offset.1))
+                    .normalize_or_zero();
+            let colour = crate::shader::evaluate_world(world, groups, images, direction)
+                .unwrap_or(DVec3::ZERO);
+            eprintln!(
+                "WORLD_DIAG tap offset={offset:?} direction={direction:?} world={colour:?} stored={:?}",
+                probe_radiance(colour)
+            );
+        }
+    }
     Ok(reflected * closures.reflection + transmitted * closures.transmission)
 }
 

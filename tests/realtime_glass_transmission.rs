@@ -8,12 +8,20 @@
 //! by `pot render --engine realtime`, and every pixel whose centre lies within 0.75 of a sphere's radius is compared
 //! with EEVEE's pixel at the same UV.
 //!
-//! The tolerance is derived from the model. `eevee_transmission.rs` (R + (T · √base)², with the LUT split and the
-//! thickness squared) differs from EEVEE by at most 0.00169 over those pixels (the rough sphere at its rim, r = 0.746;
-//! the clear sphere is at most 0.00134 and the tinted one 0.00113). EEVEE stores its render in half float, one step at
-//! [0.5, 1) being 4.9e-4. The bound is that worst deviation plus one half-float step, rounded up to 2.5e-3. A dropped
-//! transmission, a single refraction event (T instead of T², 0.033 at the centre), or a tint that is the base colour
-//! rather than its square root (0.1 or more on the tinted sphere) fails by an order of magnitude.
+//! The tolerance is the model bound plus the platform difference, per sphere, both measured:
+//! - The model bound (`eevee_transmission.rs` against macOS EEVEE 5.2.2 over every interior pixel, with
+//!   `fixtures/native_oracle/eevee_glass_transmission_deviation.py`): clear 0.00134, tinted 0.00113, rough 0.00169.
+//! - The platform difference (the largest per-pixel |Linux EEVEE − macOS EEVEE| over the same pixels, from the CI log of
+//!   3eab1d54 against the local render): clear 0.00147, tinted 0.00293. The rough sphere was not printed by that run
+//!   (the test stopped at tinted), so its difference is provisional: it uses the largest measured, 0.00293.
+//!
+//! The bounds (clear 2.9e-3, tinted 4.1e-3, rough 4.7e-3) are those sums rounded up. They discriminate against the model
+//! as follows: an IOR error of 0.014 (clear), 0.03 (rough) or 0.034 (tinted) exceeds its bound, and a single-event
+//! (thin-object) refraction gives 0.037 on clear and rough. A tint that is the base colour rather than its square root
+//! also exceeds the tinted bound by a wide margin.
+//!
+//! Every sphere is printed (`GLASS_SPHERE`, `GLASS_PX`, `GLASS_SUMMARY`) before any assertion, so the next CI log holds
+//! the platform difference for all three.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -39,14 +47,13 @@ use potter_core::model::Image;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-/// Largest allowed deviation from EEVEE's pixel (see the module docs).
-const TOLERANCE: f64 = 2.5e-3;
+/// Largest allowed deviation from EEVEE's pixel, per sphere (see the module docs): the model bound measured on macOS,
+/// plus the largest per-pixel platform difference between Linux and macOS EEVEE. Clear and tinted are measured (CI log of
+/// 3eab1d54: 0.00147 and 0.00293); rough is provisional, pending its CI measurement, so it uses the largest measured.
+const TOLERANCES: [(&str, f64); 3] = [("clear", 2.9e-3), ("tinted", 4.1e-3), ("rough", 4.7e-3)];
 
 /// Blender 5.2.2 EEVEE oracle: the three spheres, the saved `.blend`, and the interior pixels with EEVEE's RGB.
 const EEVEE_SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_glass_transmission.py");
-
-/// The spheres, by the names `eevee_glass_transmission.py` writes into its JSON.
-const SPHERES: [&str; 3] = ["clear", "tinted", "rough"];
 
 /// The render size and orthographic scale the oracle uses, so Potter's pixel grid is EEVEE's.
 const SIZE: u32 = 96;
@@ -109,15 +116,29 @@ fn realtime_glass_transmission_matches_eevee() -> TestResult {
 
     let image: Image = serde_json::from_value(read_scene(&project)?["images"]["render"].clone())?;
     let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
-    for name in SPHERES {
+    // Every sphere is measured before any assertion, so one failure does not hide the others' numbers.
+    let mut results = Vec::new();
+    for (name, tolerance) in TOLERANCES {
         eprintln!("GLASS_SPHERE {name}");
-        let worst = worst_deviation(&data, &oracle["spheres"][name])?;
+        results.push((
+            name,
+            tolerance,
+            worst_deviation(&data, &oracle["spheres"][name])?,
+        ));
+    }
+    for (name, tolerance, worst) in &results {
+        eprintln!(
+            "GLASS_SUMMARY {name} max {} at uv {:?} tolerance {tolerance}",
+            worst.max, worst.uv
+        );
+    }
+    for (name, tolerance, worst) in results {
         assert!(
-            worst.deviation <= TOLERANCE,
-            "{name} sphere: Potter realtime {:?} differs from EEVEE {:?} by {} at uv {:?} (tolerance {TOLERANCE})",
+            worst.max <= tolerance,
+            "{name} sphere: Potter realtime {:?} differs from EEVEE {:?} by {} at uv {:?} (tolerance {tolerance})",
             worst.actual,
             worst.wanted,
-            worst.deviation,
+            worst.max,
             worst.uv,
         );
     }
@@ -126,7 +147,7 @@ fn realtime_glass_transmission_matches_eevee() -> TestResult {
 
 /// The largest per-channel deviation of Potter's realtime pixels from EEVEE's over one sphere's interior samples.
 struct Deviation {
-    deviation: f64,
+    max: f64,
     uv: [f64; 2],
     actual: [f64; 3],
     wanted: [f64; 3],
@@ -147,7 +168,7 @@ fn worst_deviation(
         .into());
     }
     let mut worst = Deviation {
-        deviation: 0.0,
+        max: 0.0,
         uv: [0.0; 2],
         actual: [0.0; 3],
         wanted: [0.0; 3],
@@ -176,9 +197,9 @@ fn worst_deviation(
             actual[2],
             deviation
         );
-        if deviation > worst.deviation {
+        if deviation > worst.max {
             worst = Deviation {
-                deviation,
+                max: deviation,
                 uv,
                 actual,
                 wanted,

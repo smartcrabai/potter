@@ -1333,6 +1333,19 @@ pub(super) fn composite_realtime_volumes(
                 fallback,
                 &mut rng,
             )?;
+            // TEMPORARY DIAGNOSTIC (remove with the volume_factor investigation): the centre pixel's in-scatter terms.
+            if x == width / 2 && y == height / 2 {
+                eprintln!(
+                    "VOLUME_DIAG lights={} volumes={} factors={:?} radiance={volume_radiance:?} transmittance={transmittance:.4} \
+                     fallback={fallback:?} max_distance={max_distance:.4} origin={origin:?} direction={direction:?}",
+                    lights.len(),
+                    volumes.len(),
+                    lights
+                        .iter()
+                        .map(|light| (light.volume_factor, light.volume_radius_squared))
+                        .collect::<Vec<_>>(),
+                );
+            }
             if transmittance >= 1.0 && volume_radiance.max_element() <= 0.0 {
                 continue;
             }

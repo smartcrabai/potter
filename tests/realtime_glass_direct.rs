@@ -124,11 +124,11 @@ fn realtime_glass_direct_light_matches_eevee() -> TestResult {
         for name in SPHERES {
             let worst = worst_deviation(&data, &oracle["spheres"][name])?;
             assert!(
-                worst.deviation <= TOLERANCE,
+                worst.max <= TOLERANCE,
                 "{scene} {name} sphere: Potter realtime {:?} differs from EEVEE {:?} by {} at world {:?} (tolerance {TOLERANCE})",
                 worst.actual,
                 worst.wanted,
-                worst.deviation,
+                worst.max,
                 worst.world,
             );
         }
@@ -138,7 +138,7 @@ fn realtime_glass_direct_light_matches_eevee() -> TestResult {
 
 /// The largest per-channel deviation of Potter's realtime pixels from EEVEE's over one sphere's interior samples.
 struct Deviation {
-    deviation: f64,
+    max: f64,
     world: [f64; 2],
     actual: [f64; 3],
     wanted: [f64; 3],
@@ -159,7 +159,7 @@ fn worst_deviation(
         .into());
     }
     let mut worst = Deviation {
-        deviation: 0.0,
+        max: 0.0,
         world: [0.0; 2],
         actual: [0.0; 3],
         wanted: [0.0; 3],
@@ -174,9 +174,9 @@ fn worst_deviation(
             .zip(wanted)
             .map(|(a, w)| (a - w).abs())
             .fold(0.0_f64, f64::max);
-        if deviation > worst.deviation {
+        if deviation > worst.max {
             worst = Deviation {
-                deviation,
+                max: deviation,
                 world: pair(&sample_value["world"])?,
                 actual,
                 wanted,

@@ -101,6 +101,8 @@ fn realtime_glass_world_transmission_matches_eevee() -> TestResult {
         .arg(&frames)
         .arg("--json")
         .output()?;
+    // Diagnostic: the render's stderr carries the DIAG lines of `scene.rs` and `path.rs`.
+    eprint!("{}", String::from_utf8_lossy(&rendered.stderr));
     assert!(
         rendered.status.success(),
         "realtime render failed: {}",
