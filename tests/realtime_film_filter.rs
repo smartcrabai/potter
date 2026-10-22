@@ -47,14 +47,14 @@ const FILTER_SIZES: [&str; 3] = ["0.01", "0.5", "1.5"];
 /// The columns compared: the edge at pixel 32.3 and the neighbours that a filter of 1.5 px reaches.
 const COLUMNS: std::ops::RangeInclusive<usize> = 28..=36;
 
-/// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL. Potter's Halton pattern is
-/// deterministic, and EEVEE's 256-sample profiles are committed. Potter at 16 samples (this test) deviates by up to
-/// 0.0157 (1.5 px), a quadrature error. Potter at EEVEE's 256 samples, same pattern and same film, deviates by up to
-/// 0.0095 at 0.5 px (column 32, the edge), 0.0022 at 1.5 px, and 0 at 0.01 px. That 0.0095 is not EXR quantisation: the
-/// committed profile is half-float, but that error is near 5e-4. EEVEE's film also weights each sample by Karis's
-/// `1 / (4 + Y)` luma (`eevee_film.bsl.hh`, `sample_accum_combined`). Applying it in Potter closes the 0.5 px gap to
-/// 0.0036 but opens 1.5 px to 0.048, so the source model does not yet explain EEVEE's weighting. Until it does, the
-/// bound stays at 0.03.
+/// Linear tolerance on a column's row-averaged red value against EEVEE. PROVISIONAL: the residual below has no measured
+/// explanation yet, so this bound is not derived. Potter's film raster sits at `-j` (`render/raster.rs`, `jitter`), which
+/// EEVEE's window shift produces (`eevee_view.cc`, `window_translate_m4`). At EEVEE's 256 samples, same pattern and film,
+/// the worst deviations are 0 at 0.01 px, 0.0069 at 0.5 px (column 32, the edge), and 0.0021 at 1.5 px (columns 32 and
+/// 33). The raster sign moved the 0.5 px residual from 0.0095 to 0.0069. The 0.0069 is not half-float quantisation,
+/// which is near 5e-4. Karis's `1 / (4 + Y)` luma weight (`eevee_film.bsl.hh`, `sample_accum_combined`) is not the
+/// cause: it closes 0.5 px to 0.0036 but opens 1.5 px to 0.048. This test renders at 16 samples and checks the bound at
+/// that count. The bound stays at 0.03 until the 0.0069 is explained.
 const TOLERANCE: f64 = 0.03;
 
 /// The mean red value of each column of the image `id`, averaged over the rows, read with Potter's own EXR loader.

@@ -1832,17 +1832,20 @@ struct FilmFilter {
 }
 
 impl FilmFilter {
-    /// The sub-pixel position of a film sample from its offset in the pixel. Below `FRAC_1_SQRT_2` px EEVEE confines
-    /// the jitter to a disk of half the radius about the centre, bias 0.5, mapped by `Sampling::sample_disk` as
-    /// `sqrt(u)` and `2*pi*v` (`eevee_film.cc`, `pixel_jitter_get`; `eevee_sampling.cc`, `sample_disk`). Otherwise the
-    /// offset is uniform over the pixel.
+    /// The sub-pixel position of a film sample from its offset in the pixel. EEVEE's `pixel_jitter_get` gives the
+    /// offset `j` of its film weights: below `FRAC_1_SQRT_2` px a disk of half the radius, mapped by
+    /// `Sampling::sample_disk` as `sqrt(u)` and `2*pi*v` (`eevee_film.cc`, `eevee_sampling.cc`), otherwise uniform over
+    /// the pixel. The camera does not sample at `+j`: `ShadingView::update_view` shifts the window by `+j`
+    /// (`eevee_view.cc`), and `window_translate_m4` adds it to the projection's translation (`math_geom.cc`), so each
+    /// pixel sees the scene at `-j`. The film's own distances are `(x, y) - j` (`Film::update_sample_table`), which
+    /// measure from that sample. So the raster position here is `-j`, the mirror of the offset, for both branches.
     fn jitter(&self, offset: (f64, f64)) -> (f64, f64) {
         if self.radius >= std::f64::consts::FRAC_1_SQRT_2 {
-            return offset;
+            return ((1.0 - offset.0).fract(), (1.0 - offset.1).fract());
         }
         let scale = 0.5 * self.radius * offset.0.sqrt();
         let theta = std::f64::consts::TAU * offset.1;
-        (0.5 + scale * theta.cos(), 0.5 + scale * theta.sin())
+        (0.5 - scale * theta.cos(), 0.5 - scale * theta.sin())
     }
 
     fn new(radius: f64, width: u32, height: u32) -> Result<Self> {
