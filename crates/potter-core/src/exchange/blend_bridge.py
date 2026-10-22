@@ -2740,6 +2740,7 @@ def dump_scene(scene):
                 "audio_codec": potter_audio_codec(getattr(getattr(scene.render, "ffmpeg", None),
                                                           "audio_codec", "PCM")),
                 "film_transparent": bool(scene.render.film_transparent),
+                "filter_size": float(scene.render.filter_size),
                 "engine": "path" if render_engine == "CYCLES" else "realtime",
                 "engine_native": render_engine,
                 "dicing_rate": float(getattr(cycles, "dicing_rate", 1.0)),
@@ -7701,6 +7702,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene.render.resolution_y = int(render.get("resolution_y", 1080))
         scene.render.resolution_percentage = int(render.get("resolution_percentage", 100))
         scene.render.film_transparent = bool(render.get("film_transparent", False))
+        scene.render.filter_size = float(render.get("filter_size", 1.5))
         scene.render.use_sequencer = bool(render.get("use_sequencer", False))
         available_engines = {
             item.identifier
@@ -8206,13 +8208,17 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj.track_axis = item.get("track_axis", "POS_Y")
         obj.up_axis = item.get("up_axis", "Z")
         set_props(obj, item.get("properties", {}))
-        visibility_rna = {
+        hide_rna = {
             key: value for key, value in (metadata.get("rna_properties") or {}).items()
-            if key.startswith("visible_")
-            or (key.startswith("hide_")
-                and key not in ("hide_viewport", "hide_render", "hide_select"))
+            if key.startswith("hide_") and key not in ("hide_viewport", "hide_render", "hide_select")
         }
-        set_rna(obj, visibility_rna)
+        set_rna(obj, hide_rna)
+        ray_visibility = item.get("ray_visibility") or {}
+        for field, prop in (("camera", "visible_camera"), ("diffuse", "visible_diffuse"),
+                            ("glossy", "visible_glossy"), ("transmission", "visible_transmission"),
+                            ("volume_scatter", "visible_volume_scatter"), ("shadow", "visible_shadow")):
+            if field in ray_visibility:
+                setattr(obj, prop, bool(ray_visibility[field]))
         if item.get("tags"):
             obj["potter.tags"] = item["tags"]
 

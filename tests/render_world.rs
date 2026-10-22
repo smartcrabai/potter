@@ -832,3 +832,58 @@ fn realtime_blends_alpha_and_respects_alpha_clip_thresholds() -> Result<(), Box<
     }
     Ok(())
 }
+
+/// Realtime side-by-side stereo with the film on (16 samples): each eye's centre keeps its own object's colour. The eye
+/// split bounds each sample's splat to its own eye's columns (`render/raster.rs`, `FilmFilter::eye_columns`).
+#[test]
+fn realtime_side_by_side_keeps_each_eye_in_its_own_half() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let operations = vec![
+        json!({"op":"world.create","id":"world_main","color":[0.0,0.0,0.0],"strength":0.0}),
+        json!({"op":"material.create","id":"left_red","base_color":[1.0,0.0,0.0,1.0],"emission_color":[1.0,0.0,0.0],"emission_strength":2.0}),
+        json!({"op":"material.create","id":"right_blue","base_color":[0.0,0.0,1.0,1.0],"emission_color":[0.0,0.0,1.0],"emission_strength":2.0}),
+        json!({"op":"node.create","id":"left_object","kind":"box","params":{"size":0.35},"transform":{"translation":[-0.5,0.0,0.0],"scale":[1.0,1.0,0.285_714_285_714_285_7]},"material":"left_red"}),
+        json!({"op":"node.create","id":"right_object","kind":"box","params":{"size":0.35},"transform":{"translation":[0.5,0.0,0.0],"scale":[1.0,1.0,0.285_714_285_714_285_7]},"material":"right_blue"}),
+        json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,4.0]},"projection":"orthographic","ortho_scale":2.0,"stereo_mode":"side_by_side","interocular_distance":1.0}),
+        json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":32,"resolution_y":32,"samples":16,"seed":0,"max_bounces":0}}),
+    ];
+    make_scene(&scene, &operations)?;
+    let (width, height, pixels) =
+        render_png(&scene, &directory.path().join("render"), Some("realtime"))?;
+    let left = pixel(&pixels, width, height, width / 4, height / 2)?;
+    let right = pixel(&pixels, width, height, 3 * width / 4, height / 2)?;
+    assert!(
+        left[0] > left[2],
+        "left eye should show the red object: {left:?}"
+    );
+    assert!(
+        right[2] > right[0],
+        "right eye should show the blue object: {right:?}"
+    );
+    Ok(())
+}
+
+/// Realtime motion blur runs with the scene's samples split across its shutter steps (`render/sequence.rs`,
+/// `render_motion_blurred_frame`, `divide_ceil`). The manifest still reports the scene's sample count.
+#[test]
+fn realtime_motion_blur_reports_the_scene_sample_count() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let operations = vec![
+        json!({"op":"world.create","id":"world_main","color":[0.0,0.0,0.0],"strength":0.0}),
+        json!({"op":"material.create","id":"red","base_color":[1.0,0.0,0.0,1.0],"emission_color":[1.0,0.0,0.0],"emission_strength":2.0}),
+        json!({"op":"node.create","id":"body","kind":"box","params":{"size":0.5},"transform":{"translation":[0.0,0.0,0.0]},"material":"red"}),
+        json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,4.0]},"projection":"orthographic","ortho_scale":2.0}),
+        json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":16,"resolution_y":16,"samples":16,"seed":0,"max_bounces":0,"motion_blur":true,"shutter":1.0,"motion_blur_samples":4}}),
+    ];
+    make_scene(&scene, &operations)?;
+    let output = directory.path().join("render");
+    render_png(&scene, &output, Some("realtime"))?;
+    let manifest: Value = serde_json::from_slice(&fs::read(output.join("render.manifest.json"))?)?;
+    assert_eq!(manifest["samples"], 16, "{manifest}");
+    assert_eq!(manifest["motion_blur"]["samples"], 4, "{manifest}");
+    Ok(())
+}

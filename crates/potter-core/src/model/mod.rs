@@ -41,12 +41,12 @@ pub use scene::{
     Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus,
     LightData, LightType, MAX_REVISION, Material, MaterialLink, Modifier, ModifierParameterBinding,
     ModifierRuntime, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack,
-    Node, OceanBakeCache, PlaneHomography, PlaneTrack, PrimitiveDescriptor, Profile,
-    ReconstructedPoint, Reconstruction, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
-    RigidBodyWorld, Scene, SceneDoc, SolvedCamera, SurfaceData, SurfacePoint, TextObjectData,
-    TextureCoordinateMapping, TextureRef, TimelineMarker, TrackAxis, TrackingMarker,
-    TrackingObject, TrackingObjectPose, TrackingTrack, UnitSettings, UpAxis, ViewLayer,
-    ViewportDisplay, VolumeInterpolation, VolumeSampling, World,
+    Node, OceanBakeCache, PlaneHomography, PlaneTrack, PrimitiveDescriptor, Profile, RayKind,
+    RayVisibility, ReconstructedPoint, Reconstruction, RenderSettings, RigidBody, RigidBodyShape,
+    RigidBodyType, RigidBodyWorld, Scene, SceneDoc, SolvedCamera, SurfaceData, SurfacePoint,
+    TextObjectData, TextureCoordinateMapping, TextureRef, TimelineMarker, TrackAxis,
+    TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack, UnitSettings, UpAxis,
+    ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling, World,
 };
 pub(crate) use scene::{
     is_identity_matrix, material_link_at, material_slot_count, resolve_material_slot,

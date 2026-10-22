@@ -654,6 +654,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "visible",
             "render_visible",
             "selectable",
+            "ray_visibility",
             "action",
             "track_axis",
             "up_axis",
@@ -734,6 +735,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 &operation_pointer(engine.operation_index, "set/up_axis"),
             )
         })
+        .transpose()?;
+    let ray_visibility = set
+        .get("ray_visibility")
+        .map(|value| read_ray_visibility(engine, value))
         .transpose()?;
     let action = set
         .get("action")
@@ -842,6 +847,33 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 node.up_axis = up_axis;
                 item_changed = true;
             }
+            if let Some(updates) = &ray_visibility {
+                let mut visibility = node.resolved_ray_visibility();
+                for &(ray, value) in updates {
+                    visibility.set(ray, value);
+                }
+                // The typed field is the only copy afterwards: a default is omitted, and the legacy
+                // RNA copy in the metadata is dropped so it cannot override this edit on export.
+                let stored = (visibility
+                    != crate::model::RayVisibility::default_for_kind(&node.kind))
+                .then_some(visibility);
+                if node.ray_visibility != stored {
+                    node.ray_visibility = stored;
+                    item_changed = true;
+                }
+                if let Some(rna) = node
+                    .properties
+                    .get_mut("blender_object_metadata")
+                    .and_then(|metadata| metadata.get_mut("rna_properties"))
+                    .and_then(Value::as_object_mut)
+                {
+                    for ray in crate::model::RayKind::ALL {
+                        if rna.remove(ray.rna_property()).is_some() {
+                            item_changed = true;
+                        }
+                    }
+                }
+            }
             item_changed
         } else {
             false
@@ -874,6 +906,45 @@ fn read_up_axis(engine: &Engine<'_>, value: &Value, pointer: &str) -> Result<UpA
             pointer,
         )
     })
+}
+
+/// The flags an update names, by ray kind. Flags it leaves out keep their current value.
+fn read_ray_visibility(
+    engine: &Engine<'_>,
+    value: &Value,
+) -> Result<Vec<(crate::model::RayKind, bool)>> {
+    use crate::model::RayKind;
+    let object = value.as_object().ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "ray_visibility must be an object",
+            &operation_pointer(engine.operation_index, "set/ray_visibility"),
+        )
+    })?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !RayKind::ALL.iter().any(|ray| ray.name() == key.as_str()))
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("unknown ray_visibility flag `{key}`"),
+            &operation_pointer(engine.operation_index, "set/ray_visibility"),
+        ));
+    }
+    RayKind::ALL
+        .into_iter()
+        .filter_map(|ray| {
+            object.get(ray.name()).map(|flag| {
+                flag.as_bool().map(|flag| (ray, flag)).ok_or_else(|| {
+                    engine.error(
+                        ErrorCode::InvalidOperation,
+                        format!("ray_visibility.{} must be a boolean", ray.name()),
+                        &operation_pointer(engine.operation_index, "set/ray_visibility"),
+                    )
+                })
+            })
+        })
+        .collect()
 }
 
 fn read_optional_bool(

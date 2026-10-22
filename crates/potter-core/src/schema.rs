@@ -89,7 +89,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":7},
+        "schema_version":{"const":8},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -184,6 +184,9 @@ fn scene_schema() -> Value {
     root["$defs"]["node"]["properties"]["track_axis"] =
         json!({"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]});
     root["$defs"]["node"]["properties"]["up_axis"] = json!({"enum":["X","Y","Z"]});
+    root["$defs"]["node"]["properties"]["ray_visibility"] = json!({
+        "oneOf":[{"type":"null"},{"type":"object","required":["camera","diffuse","glossy","transmission","volume_scatter","shadow"],"properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false}]
+    });
     root["$defs"]["captured_matrix_basis"] = json!({
         "type":"object",
         "required":["matrix_basis","fingerprint"],
@@ -314,6 +317,7 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["offscreen_dicing_scale"] =
         json!({"type":"number","minimum":1.0,"maximum":f32::MAX});
     render["properties"]["dicing_camera"] = json!({"oneOf":[id_schema(),{"type":"null"}]});
+    render["properties"]["filter_size"] = json!({"type":"number","minimum":0,"maximum":500});
     render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0,"maximum":10});
     render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
 
@@ -2474,6 +2478,7 @@ fn set_schema(operation: &str) -> Value {
             "params":{"type":"object"},"materials":{"type":"array","items":{"oneOf":[id_schema(),{"type":"null"}]}},
             "visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},
             "track_axis":{"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]},"up_axis":{"enum":["X","Y","Z"]},
+            "ray_visibility":{"type":"object","properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false},
             "action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}
         }),
         "shape_key.update" => json!({
@@ -2537,6 +2542,7 @@ fn set_schema(operation: &str) -> Value {
             "transparent_max_bounces":{"type":"integer","minimum":0,"maximum":1024},
             "filter_glossy":{"type":"number","minimum":0,"maximum":10},
             "film_transparent":{"type":"boolean"},
+            "filter_size":{"type":"number","minimum":0,"maximum":500},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},
             "audio_codec":{"enum":["wav","flac"]},

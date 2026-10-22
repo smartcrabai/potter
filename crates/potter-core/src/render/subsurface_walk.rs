@@ -9,7 +9,7 @@ use std::f64::consts::PI;
 
 use glam::DVec3;
 
-use super::bvh::{Bvh, BvhHit};
+use super::bvh::{Bvh, BvhHit, WalkRay};
 use super::principled_bsdf::{concentric_disk, sample_visible_normal};
 use super::raster::Triangle;
 use super::subsurface::{SubsurfaceExit, raw_radius};
@@ -529,10 +529,13 @@ pub(super) fn walk(
         let mut closest: Option<(f64, BvhHit, DVec3)> = None;
         bvh.walk_hits(
             triangles,
-            origin,
-            direction,
-            entry.epsilon,
-            max_distance,
+            WalkRay {
+                origin,
+                direction,
+                epsilon: entry.epsilon,
+                remaining: max_distance,
+                kind: None,
+            },
             |hit, from| {
                 if bounce == 0 && hit.triangle_index == entry.entry_triangle {
                     return true;

@@ -1,9 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
-use glam::{DMat3, DMat4, DQuat, DVec3, IVec3};
+use glam::{DMat4, DVec3, IVec3};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -636,6 +636,16 @@ pub(super) fn invalid(message: &str) -> PotError {
 
 fn limit(message: &str) -> PotError {
     PotError::new(ErrorCode::LimitExceeded, message)
+}
+fn take_id(next: &mut u32) -> Result<u32> {
+    let id = *next;
+    *next = next.checked_add(1).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "modifier output exhausted mesh element IDs",
+        )
+    })?;
+    Ok(id)
 }
 
 fn unsupported(feature_id: &str, reason: &str) -> PotError {
