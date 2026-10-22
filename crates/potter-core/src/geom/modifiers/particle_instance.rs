@@ -40,13 +40,11 @@ fn unit_float_to_byte(value: f32) -> u8 {
 
 /// Blender's byte color stores grey RGB and raw alpha `1/255`; the canonical store is linear RGBA.
 fn byte_color(value: f32) -> [f64; 4] {
-    let encoded = f64::from(unit_float_to_byte(value)) / 255.0;
-    let linear = if encoded <= 0.04045 {
-        encoded / 12.92
-    } else {
-        ((encoded + 0.055) / 1.055).powf(2.4)
-    };
-    [linear, linear, linear, 1.0 / 255.0]
+    // Blender stores the grey byte and raw alpha byte 1; its `Color Attribute` readback decodes them
+    // in f32 (`srgb_to_linearrgb_uchar4`, `math_color.cc`). `color_layers` keeps that op order, so
+    // this matches Blender's bits where f64 decoding differs by about 3 ulp.
+    let byte = f32::from(unit_float_to_byte(value));
+    color_layers::byte_color_decoded_components([byte, byte, byte, 1.0])
 }
 
 /// Instances the source `mesh` at each selected particle of `particles`.
