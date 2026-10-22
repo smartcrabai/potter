@@ -2,648 +2,1332 @@
 //
 // Portions derived from Blender (https://www.blender.org):
 //   source/blender/modifiers/intern/MOD_ocean.cc, SPDX-FileCopyrightText: Blender Authors, GPL-2.0-or-later.
-//   source/blender/blenkernel/intern/ocean.cc, source/blender/blenlib/intern/rand.cc, source/blender/blenlib/BLI_rand.h, SPDX-FileCopyrightText: 2001-2002 NaN Holding BV. All rights reserved., GPL-2.0-or-later.
-//   source/blender/blenlib/BLI_hash.h, SPDX-FileCopyrightText: 2023 Blender Authors, GPL-2.0-or-later.
+//   source/blender/blenkernel/intern/ocean.cc, source/blender/blenkernel/intern/ocean_spectrum.cc,
+//   source/blender/blenlib/intern/rand.cc, source/blender/blenlib/BLI_rand.hh,
+//   source/blender/blenlib/BLI_hash.h, SPDX-License-Identifier: Blender Authors, GPL-2.0-or-later.
 
-//! Seeded Tessendorf-style ocean spectrum and inverse FFT evaluation.
+//! Native Blender-compatible seeded ocean spectrum evaluation.
 
-use std::f64::consts::TAU;
+mod fft;
+mod spectrum;
+
+use std::{collections::BTreeSet, fs, path::Path};
 
 use glam::DVec3;
-use serde_json::{Map, json};
+use serde_json::{Value, json};
 
 use crate::{
+    blender_rng::BlenderRng,
     error::{ErrorCode, PotError, Result},
-    eval::ModifierEvaluationContext,
-    geom::{GridParams, Mesh},
-    model::Modifier,
+    eval::{EvaluationPurpose, ModifierEvaluationContext},
+    geom::{
+        Mesh,
+        color_layers::{self, ColorDomain, ColorLayer},
+        uv_layers::{self, UvLayer},
+    },
+    model::{Modifier, OceanBakeCache},
 };
 
 use super::{
     bool_param, invalid_parameter, number_param, schema_value, string_param_with_expected,
     uint_param, validated,
 };
+use fft::{C2r2d, Complex};
+use spectrum::{Settings as SpectrumSettings, Spectrum, energy, hash_int_2d, omega, wave_numbers};
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Complex {
-    re: f64,
-    im: f64,
+// Bound the full n-by-n spectrum by the native mesh-element capacity.
+const MAX_OCEAN_RESOLUTION: u32 = 1024;
+const MAX_OCEAN_SPECTRUM_SAMPLES: usize = 2_000_000;
+const MAX_OCEAN_GRID_VERTICES: usize = 2_000_000;
+
+#[derive(Clone)]
+struct OceanParams {
+    render_resolution: u32,
+    viewport_resolution: u32,
+    size: f32,
+    spatial_size: f32,
+    repeat_x: u32,
+    repeat_y: u32,
+    wave_scale: f32,
+    wave_scale_min: f32,
+    choppiness: f32,
+    wind_velocity: f32,
+    wave_alignment: f32,
+    wave_direction: f32,
+    damping: f32,
+    depth: f32,
+    time: f32,
+    spectrum: Spectrum,
+    sharpen_peak: f32,
+    fetch: f32,
+    random_seed: u32,
+    foam_coverage: f32,
+    foam_name: String,
+    spray_name: String,
+    use_foam: bool,
+    use_spray: bool,
+    use_normals: bool,
+    foam_fade: f32,
+    invert_spray: bool,
 }
 
-impl Complex {
-    fn from_polar(radius: f64, phase: f64) -> Self {
-        Self {
-            re: radius * phase.cos(),
-            im: radius * phase.sin(),
+impl OceanParams {
+    fn read(modifier: &Modifier) -> Result<Self> {
+        let geometry_mode =
+            string_param_with_expected(modifier, "geometry_mode", "a Blender enum or string")?;
+        if !["GENERATE", "DISPLACE"].contains(&geometry_mode) {
+            return Err(invalid_parameter(
+                modifier,
+                "geometry_mode",
+                "GENERATE or DISPLACE",
+            ));
         }
+        let resolution = resolution_param(modifier, "resolution")?;
+        let viewport_resolution = resolution_param(modifier, "viewport_resolution")?;
+        let size = number_param(modifier, "size")? as f32;
+        let spatial_size = number_param(modifier, "spatial_size")? as f32;
+        let repeat_x = repeat_param(modifier, "repeat_x")?;
+        let repeat_y = repeat_param(modifier, "repeat_y")?;
+        let wave_scale = number_param(modifier, "wave_scale")? as f32;
+        let wave_scale_min = number_param(modifier, "wave_scale_min")? as f32;
+        let choppiness = number_param(modifier, "choppiness")? as f32;
+        let wind_velocity = number_param(modifier, "wind_velocity")? as f32;
+        let wave_alignment = number_param(modifier, "wave_alignment")? as f32;
+        let wave_direction = number_param(modifier, "wave_direction")? as f32;
+        let damping = number_param(modifier, "damping")? as f32;
+        let depth = number_param(modifier, "depth")? as f32;
+        let time = number_param(modifier, "time")? as f32;
+        let spectrum_name =
+            string_param_with_expected(modifier, "spectrum", "a Blender enum or string")?;
+        let spectrum = Spectrum::parse(spectrum_name)
+            .ok_or_else(|| invalid_parameter(modifier, "spectrum", "a Blender ocean spectrum"))?;
+        let sharpen_peak = number_param(modifier, "sharpen_peak_jonswap")? as f32;
+        let fetch = number_param(modifier, "fetch_jonswap")? as f32;
+        let random_seed = seed_param(modifier, "random_seed")?;
+        let foam_coverage = number_param(modifier, "foam_coverage")? as f32;
+        let foam_name =
+            string_param_with_expected(modifier, "foam_layer_name", "a Blender enum or string")?
+                .to_owned();
+        let spray_name =
+            string_param_with_expected(modifier, "spray_layer_name", "a Blender enum or string")?
+                .to_owned();
+        let use_foam = bool_param(modifier, "use_foam")?;
+        let use_spray = bool_param(modifier, "use_spray")?;
+        let use_normals = bool_param(modifier, "use_normals")?;
+        let foam_fade = number_param(modifier, "bake_foam_fade")? as f32;
+        let invert_spray = bool_param(modifier, "invert_spray")?;
+
+        if !size.is_finite()
+            || !spatial_size.is_finite()
+            || !wave_scale.is_finite()
+            || !wave_scale_min.is_finite()
+            || !choppiness.is_finite()
+            || !wind_velocity.is_finite()
+            || !wave_alignment.is_finite()
+            || !wave_direction.is_finite()
+            || !damping.is_finite()
+            || !depth.is_finite()
+            || !time.is_finite()
+            || !sharpen_peak.is_finite()
+            || !fetch.is_finite()
+            || !foam_coverage.is_finite()
+            || !foam_fade.is_finite()
+        {
+            return Err(invalid_parameter(
+                modifier,
+                "time",
+                "finite ocean parameters",
+            ));
+        }
+        Ok(Self {
+            render_resolution: resolution,
+            viewport_resolution,
+            size,
+            spatial_size,
+            repeat_x,
+            repeat_y,
+            wave_scale,
+            wave_scale_min,
+            choppiness,
+            wind_velocity,
+            wave_alignment,
+            wave_direction,
+            damping,
+            depth,
+            time,
+            spectrum,
+            sharpen_peak,
+            fetch,
+            random_seed,
+            foam_coverage,
+            foam_name,
+            spray_name,
+            use_foam,
+            use_spray,
+            use_normals,
+            foam_fade,
+            invert_spray,
+        })
     }
 
-    fn conjugate(self) -> Self {
-        Self {
-            re: self.re,
-            im: -self.im,
+    fn spectrum_settings(&self) -> SpectrumSettings {
+        SpectrumSettings::new(self)
+    }
+}
+
+struct OceanSpectrum {
+    n: usize,
+    kx: Vec<f32>,
+    kz: Vec<f32>,
+    k: Vec<f32>,
+    h0: Vec<Complex>,
+    h0_minus: Vec<Complex>,
+    fft: C2r2d,
+    normalization: f32,
+    depth: f32,
+}
+
+struct OceanFields {
+    n: usize,
+    displacement_y: Vec<f64>,
+    displacement_x: Vec<f64>,
+    displacement_z: Vec<f64>,
+    jacobian_xx: Vec<f64>,
+    jacobian_zz: Vec<f64>,
+    jacobian_xz: Vec<f64>,
+    normal_x: Vec<f64>,
+    normal_z: Vec<f64>,
+    normal_y: f32,
+}
+pub(crate) struct OceanBakeImage {
+    pub(crate) filename: String,
+    pub(crate) resolution: usize,
+    pub(crate) pixels: Vec<[f32; 4]>,
+}
+struct OceanCacheFrame {
+    width: usize,
+    height: usize,
+    displacement: Vec<[f32; 4]>,
+    foam: Option<Vec<[f32; 4]>>,
+    spray: Option<Vec<[f32; 4]>>,
+    spray_inverse: Option<Vec<[f32; 4]>>,
+}
+
+pub(crate) struct OceanBakeSequence {
+    params: OceanParams,
+    spectrum: OceanSpectrum,
+    previous_foam: Vec<f32>,
+}
+
+#[derive(Clone, Copy)]
+struct Eigenstuff {
+    jminus: f32,
+    eplus_x: f32,
+    eplus_z: f32,
+    eminus_x: f32,
+    eminus_z: f32,
+}
+
+impl OceanSpectrum {
+    fn new(params: &OceanParams, n: usize) -> Result<Self> {
+        let count = n.checked_mul(n).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "ocean spectrum exceeds mesh limits",
+            )
+        })?;
+        if count > MAX_OCEAN_SPECTRUM_SAMPLES {
+            return Err(PotError::new(
+                ErrorCode::LimitExceeded,
+                "ocean spectrum exceeds configured sample limit",
+            ));
+        }
+        let settings = params.spectrum_settings();
+        let kx = wave_numbers(n, settings.length);
+        let kz = wave_numbers(n, settings.length);
+        let mut k = vec![0.0; n * (n / 2 + 1)];
+        let half = n / 2 + 1;
+        for i in 0..n {
+            for j in 0..half {
+                let kx_i = kx[i];
+                let kz_j = kz[j];
+                k[i * half + j] = (kx_i * kx_i + kz_j * kz_j).sqrt();
+            }
+        }
+        let mut h0 = vec![Complex::default(); count];
+        let mut h0_minus = vec![Complex::default(); count];
+        for i in 0..n {
+            for j in 0..n {
+                let hash_x = (kx[i] * 360.0) as i32 as u32;
+                let hash_z = (kz[j] * 360.0) as i32 as u32;
+                let seed = params.random_seed.wrapping_add(hash_int_2d(hash_x, hash_z));
+                let mut rng = BlenderRng::seed(seed);
+                let gaussian = Complex::new(
+                    f64::from(blender_gaussian(&mut rng)),
+                    f64::from(blender_gaussian(&mut rng)),
+                );
+                let energy_value = energy(&settings, kx[i], kz[j]);
+                let reverse_energy = energy(&settings, -kx[i], -kz[j]);
+                h0[i * n + j] = gaussian.scale(f64::from((energy_value / 2.0).sqrt()));
+                h0_minus[i * n + j] = gaussian.scale(f64::from((reverse_energy / 2.0).sqrt()));
+            }
+        }
+        let fft = C2r2d::new(n, n);
+        let mut spectrum = Self {
+            n,
+            kx,
+            kz,
+            k,
+            h0,
+            h0_minus,
+            fft,
+            normalization: 1.0,
+            depth: settings.depth,
+        };
+        // Blender's `set_height_normalize_factor`: `max_h` is a float holding the largest |disp_y| of a
+        // time-0, unit-scale simulation, and `res = 1.0f / max_h`.
+        let initial = spectrum.compute(0.0, 1.0, 0.0, false, false, false);
+        let max_height = initial
+            .displacement_y
+            .iter()
+            .fold(0.0_f64, |max, value| max.max(value.abs()));
+        let max_height = if max_height == 0.0 {
+            1.0e-5_f32
+        } else {
+            max_height as f32
+        };
+        spectrum.normalization = 1.0_f32 / max_height;
+        Ok(spectrum)
+    }
+
+    /// Blender's `BKE_ocean_simulate`. FFTW runs in double precision, and so do the fields. Blender
+    /// rounds to single precision where its code types a value as `float`: the phase factors, each
+    /// `mul_complex_c` product (`fftwf_complex temp`), every `init_complex` / `real_c` / `image_c` FFT
+    /// input, and the Jacobian ratios. Each of those is mirrored by `round32` below.
+    fn compute(
+        &self,
+        time: f32,
+        wave_scale: f32,
+        choppiness: f32,
+        do_jacobian: bool,
+        do_chop: bool,
+        do_normals: bool,
+    ) -> OceanFields {
+        let n = self.n;
+        let half = n / 2 + 1;
+        // `scale *= o->normalize_factor`, in float.
+        let scale = wave_scale * self.normalization;
+        let mut htilda = vec![Complex::default(); n * half];
+        for i in 0..n {
+            for j in 0..half {
+                let index = i * half + j;
+                // `omega(k, depth) * t` is float; `expf(0) * cosf` and `sinf` are float too.
+                let phase = omega(self.k[index], self.depth) * time;
+                let h0 = self.h0[i * n + j];
+                let h0_minus = self.h0_minus[i * n + j].conj();
+                let positive = complex_product_f32(h0, unit_phasor(phase));
+                let negative = complex_product_f32(h0_minus, unit_phasor(-phase));
+                htilda[index] = Complex {
+                    re: positive.re + negative.re,
+                    im: positive.im + negative.im,
+                };
+            }
+        }
+        let scaled: Vec<Complex> = htilda
+            .iter()
+            .map(|value| value.scale(f64::from(scale)))
+            .collect();
+        let displacement_y = self.fft.run(&scaled);
+        let count = n * n;
+        let mut displacement_x = vec![0.0; count];
+        let mut displacement_z = vec![0.0; count];
+        if do_chop && choppiness > 0.0 {
+            let mut chop_x = vec![Complex::default(); n * half];
+            let mut chop_z = vec![Complex::default(); n * half];
+            for i in 0..n {
+                for j in 0..half {
+                    let index = i * half + j;
+                    let k = self.k[index];
+                    let base = chop_base(scale, choppiness, htilda[index]);
+                    let (ratio_x, ratio_z) = if k == 0.0 {
+                        (0.0, 0.0)
+                    } else {
+                        (self.kx[i] / k, self.kz[j] / k)
+                    };
+                    chop_x[index] = scale_round32(base, f64::from(ratio_x));
+                    chop_z[index] = scale_round32(base, f64::from(ratio_z));
+                }
+            }
+            displacement_x = self.fft.run(&chop_x);
+            displacement_z = self.fft.run(&chop_z);
+        }
+        let (normal_x, normal_z, normal_y) = if do_normals {
+            let mut nx = vec![Complex::default(); n * half];
+            let mut nz = vec![Complex::default(); n * half];
+            for i in 0..n {
+                for j in 0..half {
+                    let index = i * half + j;
+                    // `init_complex(mp, 0, -1)`, `* htilda` (float), then `* kx[i]` / `* kz[i]`.
+                    let base = complex_product_f32(Complex { re: 0.0, im: -1.0 }, htilda[index]);
+                    nx[index] = scale_round32(base, f64::from(self.kx[i]));
+                    nz[index] = scale_round32(base, f64::from(self.kz[i]));
+                }
+            }
+            (
+                self.fft.run(&nx),
+                self.fft.run(&nz),
+                1.0 / (wave_scale * self.normalization),
+            )
+        } else {
+            (vec![0.0; count], vec![0.0; count], 0.0)
+        };
+        let (jacobian_xx, jacobian_zz, jacobian_xz) = if do_jacobian {
+            let mut jxx = vec![Complex::default(); n * half];
+            let mut jzz = vec![Complex::default(); n * half];
+            let mut jxz = vec![Complex::default(); n * half];
+            for i in 0..n {
+                for j in 0..half {
+                    let index = i * half + j;
+                    let k = self.k[index];
+                    let kx = self.kx[i];
+                    let kz = self.kz[j];
+                    let base = jacobian_base(choppiness, htilda[index]);
+                    // Blender's float ratios: `kx*kx/k`, `kz*kz/k`, `kx*kz/k`.
+                    let (xx, zz, xz) = if k == 0.0 {
+                        (0.0, 0.0, 0.0)
+                    } else {
+                        (kx * kx / k, kz * kz / k, kx * kz / k)
+                    };
+                    jxx[index] = scale_round32(base, f64::from(xx));
+                    jzz[index] = scale_round32(base, f64::from(zz));
+                    jxz[index] = scale_round32(base, f64::from(xz));
+                }
+            }
+            let mut xx = self.fft.run(&jxx);
+            let mut zz = self.fft.run(&jzz);
+            let xz = self.fft.run(&jxz);
+            for value in &mut xx {
+                *value += 1.0;
+            }
+            for value in &mut zz {
+                *value += 1.0;
+            }
+            (xx, zz, xz)
+        } else {
+            (vec![1.0; count], vec![1.0; count], vec![0.0; count])
+        };
+        OceanFields {
+            n,
+            displacement_y,
+            displacement_x,
+            displacement_z,
+            jacobian_xx,
+            jacobian_zz,
+            jacobian_xz,
+            normal_x,
+            normal_z,
+            normal_y,
         }
     }
 }
 
-impl std::ops::Add for Complex {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self::Output {
-        Self {
-            re: self.re + rhs.re,
-            im: self.im + rhs.im,
+/// Blender's `float` storage: `init_complex`, `real_c`, `image_c`, and `mul_complex_c`'s `temp`.
+fn round32(value: f64) -> f64 {
+    f64::from(value as f32)
+}
+
+/// Blender's `mul_complex_c`: the product is formed in double and stored as an `fftwf_complex`.
+fn complex_product_f32(a: Complex, b: Complex) -> Complex {
+    Complex {
+        re: round32(a.re * b.re - a.im * b.im),
+        im: round32(a.re * b.im + a.im * b.re),
+    }
+}
+
+/// `exp_complex` of the purely imaginary `(0, phase)`: `cosf(phase)` and `sinf(phase)` in float.
+fn unit_phasor(phase: f32) -> Complex {
+    Complex {
+        re: f64::from(phase.cos()),
+        im: f64::from(phase.sin()),
+    }
+}
+
+/// A `mul_complex_f` ratio applied to a float-valued base, then stored as the float FFT input.
+fn scale_round32(base: Complex, factor: f64) -> Complex {
+    Complex {
+        re: round32(base.re * factor),
+        im: round32(base.im * factor),
+    }
+}
+
+/// Blender's displacement-x/z base: `init_complex(mp, -scale, 0)`, `* chop` (double), `* (0, -1)`,
+/// and `* htilda` (float products).
+fn chop_base(scale: f32, chop: f32, h: Complex) -> Complex {
+    let mp = Complex {
+        re: -f64::from(scale) * f64::from(chop),
+        im: 0.0,
+    };
+    let mp = complex_product_f32(mp, Complex { re: 0.0, im: -1.0 });
+    complex_product_f32(mp, h)
+}
+
+/// Blender's Jacobian base: `init_complex(mp, -1, 0)`, `* chop` (double), then `* htilda` (float).
+fn jacobian_base(chop: f32, h: Complex) -> Complex {
+    complex_product_f32(
+        Complex {
+            re: -f64::from(chop),
+            im: 0.0,
+        },
+        h,
+    )
+}
+
+impl OceanFields {
+    fn sample(&self, values: &[f64], u: f32, v: f32) -> f32 {
+        sample_grid(values, self.n, self.n, u, v)
+    }
+
+    fn eigenstuff(&self, u: f32, v: f32) -> Eigenstuff {
+        eigenstuff_from_jacobian(
+            self.sample(&self.jacobian_xx, u, v),
+            self.sample(&self.jacobian_zz, u, v),
+            self.sample(&self.jacobian_xz, u, v),
+        )
+    }
+
+    fn eigenstuff_at(&self, index: usize) -> Eigenstuff {
+        eigenstuff_from_jacobian(
+            self.jacobian_xx[index] as f32,
+            self.jacobian_zz[index] as f32,
+            self.jacobian_xz[index] as f32,
+        )
+    }
+}
+
+fn eigenstuff_from_jacobian(jxx: f32, jzz: f32, jxz: f32) -> Eigenstuff {
+    let a = jxx + jzz;
+    let b = ((jxx - jzz) * (jxx - jzz) + 4.0 * jxz * jxz).sqrt();
+    let jminus = 0.5 * (a - b);
+    let jplus = a.midpoint(b);
+    let qplus = (jplus - jxx) / jxz;
+    let qminus = (jminus - jxx) / jxz;
+    let norm_plus = (1.0 + qplus * qplus).sqrt();
+    let norm_minus = (1.0 + qminus * qminus).sqrt();
+    Eigenstuff {
+        jminus,
+        eplus_x: 1.0 / norm_plus,
+        eplus_z: qplus / norm_plus,
+        eminus_x: 1.0 / norm_minus,
+        eminus_z: qminus / norm_minus,
+    }
+}
+
+/// Field index for EXR pixel `pixel` of an `n`-by-`n` bake. The spectrum fields are stored as `i * n + j` with
+/// `i` along u, but a bake row is v-major (`row * n + col`, the layout `sample_cache_uv` reads), so
+/// `col = i` and `row = j`. Blender writes its bake in this row-major order.
+fn image_field_index(pixel: usize, n: usize) -> usize {
+    (pixel % n) * n + pixel / n
+}
+
+impl OceanBakeSequence {
+    pub(crate) fn new(modifier: &Modifier) -> Result<Self> {
+        let params = OceanParams::read(modifier)?;
+        let resolution = usize::try_from(params.render_resolution).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "ocean bake resolution exceeds platform limits",
+            )
+        })?;
+        let n = resolution.checked_mul(resolution).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "ocean bake resolution exceeds mesh limits",
+            )
+        })?;
+        let count = n.checked_mul(n).ok_or_else(|| {
+            PotError::new(ErrorCode::LimitExceeded, "ocean bake exceeds mesh limits")
+        })?;
+        let spectrum = OceanSpectrum::new(&params, n)?;
+        let previous_foam = if params.use_foam {
+            vec![0.0; count]
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            params,
+            spectrum,
+            previous_foam,
+        })
+    }
+
+    pub(crate) fn bake_frame(&mut self, frame: i32, time: f32) -> Result<Vec<OceanBakeImage>> {
+        if !time.is_finite() {
+            return Err(PotError::invalid_argument("ocean bake time must be finite"));
+        }
+        let params = &self.params;
+        let fields = self.spectrum.compute(
+            time,
+            params.wave_scale,
+            params.choppiness,
+            params.use_foam,
+            params.choppiness > 0.0,
+            params.use_normals,
+        );
+        let count = fields.n * fields.n;
+        let mut images = Vec::with_capacity(5);
+        let mut displacement = Vec::with_capacity(count);
+        for pixel in 0..count {
+            let index = image_field_index(pixel, fields.n);
+            displacement.push([
+                fields.displacement_x[index] as f32,
+                fields.displacement_y[index] as f32,
+                fields.displacement_z[index] as f32,
+                1.0,
+            ]);
+        }
+        images.push(OceanBakeImage {
+            filename: format!("disp_{frame:04}.exr"),
+            resolution: fields.n,
+            pixels: displacement,
+        });
+
+        if params.use_foam {
+            let mut foam = Vec::with_capacity(count);
+            let mut spray = params.use_spray.then(|| Vec::with_capacity(count));
+            let mut spray_inverse = params.use_spray.then(|| Vec::with_capacity(count));
+            for pixel in 0..count {
+                let index = image_field_index(pixel, fields.n);
+                let eigen = fields.eigenstuff_at(index);
+                let fresh = (eigen.jminus * -0.005 + params.foam_coverage).clamp(0.0, 1.0);
+                let previous = &mut self.previous_foam[index];
+                if *previous < 1.0 {
+                    *previous *= *previous;
+                }
+                let neg_eplus = if eigen.eplus_z < 0.0 {
+                    (1.0 + eigen.eplus_z).max(0.0)
+                } else {
+                    1.0
+                };
+                *previous *= params.foam_fade * (0.75 + neg_eplus * 0.25);
+                *previous = (*previous + fresh).min(1.0);
+                foam.push([*previous, *previous, *previous, 1.0]);
+                if let Some(spray) = &mut spray {
+                    spray.push([eigen.eplus_x, 0.0, eigen.eplus_z, 1.0]);
+                }
+                if let Some(spray_inverse) = &mut spray_inverse {
+                    spray_inverse.push([eigen.eminus_x, 0.0, eigen.eminus_z, 1.0]);
+                }
+            }
+            images.push(OceanBakeImage {
+                filename: format!("foam_{frame:04}.exr"),
+                resolution: fields.n,
+                pixels: foam,
+            });
+            if let Some(pixels) = spray {
+                images.push(OceanBakeImage {
+                    filename: format!("spray_{frame:04}.exr"),
+                    resolution: fields.n,
+                    pixels,
+                });
+            }
+            if let Some(pixels) = spray_inverse {
+                images.push(OceanBakeImage {
+                    filename: format!("spray_inverse_{frame:04}.exr"),
+                    resolution: fields.n,
+                    pixels,
+                });
+            }
+        }
+        if params.use_normals {
+            let mut normals = Vec::with_capacity(count);
+            for pixel in 0..count {
+                let index = image_field_index(pixel, fields.n);
+                let mut normal = [
+                    fields.normal_x[index] as f32,
+                    fields.normal_y,
+                    fields.normal_z[index] as f32,
+                ];
+                let length =
+                    (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+                for component in &mut normal {
+                    *component /= length;
+                }
+                normals.push([normal[0], normal[1], normal[2], 1.0]);
+            }
+            images.push(OceanBakeImage {
+                filename: format!("normal_{frame:04}.exr"),
+                resolution: fields.n,
+                pixels: normals,
+            });
+        }
+        Ok(images)
+    }
+}
+
+/// Blender's `gaussRand` over the shared `BLI_rand` stream: the polar accept, with the second value discarded.
+fn blender_gaussian(rng: &mut BlenderRng) -> f32 {
+    loop {
+        let x = 1.0 - 2.0 * uniform(rng);
+        let y = 1.0 - 2.0 * uniform(rng);
+        let length_squared = x * x + y * y;
+        if length_squared > 0.0 && length_squared < 1.0 {
+            return x * (-2.0 * length_squared.ln() / length_squared).sqrt();
         }
     }
 }
 
-impl std::ops::Mul for Complex {
-    type Output = Self;
-    fn mul(self, rhs: Self) -> Self::Output {
-        Self {
-            re: self.re * rhs.re - self.im * rhs.im,
-            im: self.re * rhs.im + self.im * rhs.re,
-        }
-    }
+/// `BLI_rand`'s float in `[0, 1)`: the 31-bit output over 2^31.
+fn uniform(rng: &mut BlenderRng) -> f32 {
+    rng.get_uint32() as f32 / 2_147_483_648.0
 }
 
-/// Evaluate either the generated periodic grid or an input mesh displaced by the spectrum.
+/// Evaluates either Blender's generated periodic grid or an input mesh displaced by the spectrum.
+#[cfg(test)]
 pub(super) fn ocean(
     mesh: &Mesh,
     modifier: &Modifier,
-    _frame: f64,
+    frame: f64,
     context: ModifierEvaluationContext<'_>,
 ) -> Result<Mesh> {
+    ocean_with_parameter_evaluator(mesh, modifier, frame, context, |_, _| Ok(None))
+}
+
+/// Live evaluation resolves the animated `time` through `evaluate_parameter` once per frame.
+pub(super) fn ocean_with_parameter_evaluator(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    frame: f64,
+    context: ModifierEvaluationContext<'_>,
+    mut evaluate_parameter: impl FnMut(&str, f64) -> Result<Option<f64>>,
+) -> Result<Mesh> {
+    let params = OceanParams::read(modifier)?;
     let geometry_mode =
         string_param_with_expected(modifier, "geometry_mode", "a Blender enum or string")?;
-    if !["GENERATE", "DISPLACE"].contains(&geometry_mode) {
-        return Err(invalid_parameter(
-            modifier,
-            "geometry_mode",
-            "GENERATE or DISPLACE",
-        ));
-    }
-    let resolution_name = if context.purpose == crate::eval::EvaluationPurpose::Render {
-        "resolution"
+    let resolution = if context.purpose == EvaluationPurpose::Render {
+        params.render_resolution
     } else {
-        "viewport_resolution"
+        params.viewport_resolution
     };
-    let resolution = resolution_param(modifier, resolution_name)?;
-    let geometry_resolution = usize::try_from(resolution)
-        .map_err(|_| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "ocean resolution exceeds mesh limits",
-            )
-        })?
-        .checked_mul(usize::try_from(resolution).map_err(|_| {
-            PotError::new(
-                ErrorCode::LimitExceeded,
-                "ocean resolution exceeds mesh limits",
-            )
-        })?)
+    let n = usize::try_from(resolution)
+        .ok()
+        .and_then(|resolution| resolution.checked_mul(resolution))
         .ok_or_else(|| {
             PotError::new(
                 ErrorCode::LimitExceeded,
                 "ocean resolution exceeds mesh limits",
             )
         })?;
-    let n = geometry_resolution;
-    let spatial_size = number_param(modifier, "spatial_size")?;
-    let size = number_param(modifier, "size")?;
-    let depth = number_param(modifier, "depth")?;
-    let wave_scale = number_param(modifier, "wave_scale")?;
-    let wave_scale_min = number_param(modifier, "wave_scale_min")?;
-    let choppiness = number_param(modifier, "choppiness")?;
-    let wind_velocity = number_param(modifier, "wind_velocity")?;
-    let wave_alignment = number_param(modifier, "wave_alignment")?;
-    let wave_direction = number_param(modifier, "wave_direction")?;
-    let damping = number_param(modifier, "damping")?;
-    let frame_time = number_param(modifier, "time")?;
-    let repeat_x = repeat_param(modifier, "repeat_x")?;
-    let repeat_y = repeat_param(modifier, "repeat_y")?;
-    if !spatial_size.is_finite() || spatial_size <= 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "spatial_size",
-            "a finite positive length in object space",
-        ));
+    let size_co_inv = 1.0_f32 / (params.size * params.spatial_size);
+    if !size_co_inv.is_finite() {
+        return Ok(mesh.clone());
     }
-    if !size.is_finite() || size <= 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "size",
-            "a finite positive object-space scale",
-        ));
-    }
-    if !depth.is_finite() || depth < 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "depth",
-            "a finite non-negative depth",
-        ));
-    }
-    if wave_scale < 0.0 || wave_scale_min < 0.0 || choppiness < 0.0 || wind_velocity <= 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "wave_scale",
-            "non-negative wave scales, choppiness, and positive wind velocity",
-        ));
-    }
-    if !(0.0..=1.0).contains(&wave_alignment) || !wave_direction.is_finite() {
-        return Err(invalid_parameter(
-            modifier,
-            "wave_alignment",
-            "wave_alignment in [0, 1] and a finite wave_direction in radians",
-        ));
-    }
-    if !(0.0..=1.0).contains(&damping) {
-        return Err(invalid_parameter(modifier, "damping", "a number in [0, 1]"));
-    }
-    if !frame_time.is_finite() {
-        return Err(invalid_parameter(
-            modifier,
-            "time",
-            "a finite time in seconds",
-        ));
-    }
-    let spectrum = string_param_with_expected(modifier, "spectrum", "a Blender enum or string")?;
-    if ![
-        "PHILLIPS",
-        "PIERSON_MOSKOWITZ",
-        "JONSWAP",
-        "TEXEL_MARSEN_ARSLOE",
-    ]
-    .contains(&spectrum)
-    {
-        return Err(invalid_parameter(
-            modifier,
-            "spectrum",
-            "PHILLIPS, PIERSON_MOSKOWITZ, JONSWAP, or TEXEL_MARSEN_ARSLOE",
-        ));
-    }
-    let sharpen_peak = number_param(modifier, "sharpen_peak_jonswap")?;
-    let fetch = number_param(modifier, "fetch_jonswap")?;
-    if !(0.0..=1.0).contains(&sharpen_peak) || !fetch.is_finite() || fetch < 0.0 {
-        return Err(invalid_parameter(
-            modifier,
-            "sharpen_peak_jonswap",
-            "sharpen_peak_jonswap in [0, 1] and non-negative fetch_jonswap",
-        ));
-    }
-    let use_normals = bool_param(modifier, "use_normals")?;
-    let use_foam = bool_param(modifier, "use_foam")?;
-    let foam_layer_name =
-        string_param_with_expected(modifier, "foam_layer_name", "a Blender enum or string")?;
-    let foam_coverage = number_param(modifier, "foam_coverage")?;
-    let random_seed = seed_param(modifier, "random_seed")?;
-    let (spectrum_values, displacement_x, displacement_y) = height_spectrum(
-        n,
-        spatial_size,
-        depth,
-        wind_velocity,
-        wave_scale,
-        wave_scale_min,
-        choppiness,
-        wave_alignment,
-        wave_direction,
-        damping,
-        frame_time,
-        spectrum,
-        sharpen_peak,
-        fetch,
-        random_seed,
-    );
-    let extent_x = spatial_size * size * f64::from(repeat_x);
-    let extent_y = spatial_size * size * f64::from(repeat_y);
+    let (x_intervals, y_intervals) = if geometry_mode == "GENERATE" {
+        let repeat_x = usize::try_from(params.repeat_x).unwrap_or(usize::MAX);
+        let repeat_y = usize::try_from(params.repeat_y).unwrap_or(usize::MAX);
+        let x_intervals = n.checked_mul(repeat_x).ok_or_else(|| {
+            PotError::new(ErrorCode::LimitExceeded, "ocean grid exceeds mesh limits")
+        })?;
+        let y_intervals = n.checked_mul(repeat_y).ok_or_else(|| {
+            PotError::new(ErrorCode::LimitExceeded, "ocean grid exceeds mesh limits")
+        })?;
+        let vertex_count = x_intervals
+            .checked_add(1)
+            .and_then(|x| y_intervals.checked_add(1).and_then(|y| x.checked_mul(y)))
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::LimitExceeded, "ocean grid exceeds mesh limits")
+            })?;
+        if vertex_count > MAX_OCEAN_GRID_VERTICES {
+            return Err(PotError::new(
+                ErrorCode::LimitExceeded,
+                "ocean grid exceeds configured vertex limit",
+            ));
+        }
+        (x_intervals, y_intervals)
+    } else {
+        (0, 0)
+    };
+
     let mut output = if geometry_mode == "GENERATE" {
-        let subdivisions = |repeats: u32| {
-            geometry_resolution
-                .checked_mul(usize::try_from(repeats).map_err(|_| {
-                    PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "ocean repeat count exceeds mesh limits",
-                    )
-                })?)
-                .and_then(|intervals| intervals.checked_add(1))
-                .and_then(|vertices| u32::try_from(vertices).ok())
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "ocean grid resolution exceeds mesh limits",
-                    )
-                })
-        };
-        let x_subdivisions = subdivisions(repeat_x)?;
-        let y_subdivisions = subdivisions(repeat_y)?;
-        Mesh::grid(GridParams {
-            size_x: extent_x,
-            size_y: extent_y,
-            x_subdivisions,
-            y_subdivisions,
-        })
-        .map_err(|error| {
-            PotError::invalid_argument(format!("ocean grid construction failed: {error}"))
-        })?
+        generate_ocean_geometry(&params, n, x_intervals, y_intervals)?
     } else {
         mesh.clone()
     };
-    let spacing_x = spatial_size * size / n as f64;
-    let spacing_y = spatial_size * size / n as f64;
-    let mut normals = Map::new();
-    let mut foam = Map::new();
-    for vertex in &mut output.vertices {
-        // Blender maps object coordinates to the periodic ocean domain [0, 1].
-        let u = ((vertex.co.x / (spatial_size * size) + 0.5) * n as f64).rem_euclid(n as f64);
-        let v = ((vertex.co.y / (spatial_size * size) + 0.5) * n as f64).rem_euclid(n as f64);
-        let height = sample_grid(&spectrum_values, n, u, v);
-        let derivative_x = (sample_grid(&spectrum_values, n, u + 1.0, v)
-            - sample_grid(&spectrum_values, n, u - 1.0, v))
-            * 0.5;
-        let derivative_y = (sample_grid(&spectrum_values, n, u, v + 1.0)
-            - sample_grid(&spectrum_values, n, u, v - 1.0))
-            * 0.5;
-        let displacement_x = sample_grid(&displacement_x, n, u, v);
-        let displacement_y = sample_grid(&displacement_y, n, u, v);
-        let gradient = DVec3::new(-derivative_x / spacing_x, -derivative_y / spacing_y, 1.0);
-        if geometry_mode == "GENERATE" {
-            vertex.co.x += displacement_x;
-            vertex.co.y += displacement_y;
-            vertex.co.z = height;
+    let cached = modifier
+        .baked_ocean_cache
+        .as_ref()
+        .map(|cache| load_ocean_cache_frame(modifier, &params, cache, frame as i32, context))
+        .transpose()?;
+    let fields = if cached.is_none() {
+        let base_time = f64::from(params.time);
+        let time = evaluate_parameter("time", base_time)?.unwrap_or(base_time) as f32;
+        if !time.is_finite() {
+            return Err(invalid_parameter(
+                modifier,
+                "time",
+                "a finite Blender float",
+            ));
+        }
+        let spectrum = OceanSpectrum::new(&params, n)?;
+        Some(spectrum.compute(
+            time,
+            params.wave_scale,
+            params.choppiness,
+            params.use_foam,
+            params.choppiness > 0.0,
+            // Live evaluation reads no normal field (the bake writes them), so the normal FFTs are skipped.
+            false,
+        ))
+    } else {
+        None
+    };
+    let original_positions: Vec<DVec3> = output.vertices.iter().map(|vertex| vertex.co).collect();
+    let vertex_index: std::collections::HashMap<u32, usize> = output
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let mut color_store = color_layers::read(&output);
+    let mut used_names = layer_names(&output);
+    used_names.extend(color_store.layers.iter().map(|layer| layer.name.clone()));
+    let foam_name = params
+        .use_foam
+        .then(|| unique_attribute_name(&params.foam_name, &mut used_names));
+    let spray_name = (params.use_foam && params.use_spray)
+        .then(|| unique_attribute_name(&params.spray_name, &mut used_names));
+
+    if let Some(name) = &foam_name {
+        let mut values =
+            Vec::with_capacity(output.faces.iter().map(|face| face.vertices.len()).sum());
+        for face in &output.faces {
+            for vertex_id in &face.vertices {
+                let position = original_positions[vertex_index[vertex_id]];
+                let (u, v) = ocean_uv(position, size_co_inv);
+                let foam = if let Some(cache) = &cached {
+                    let pixels = cache.foam.as_deref().ok_or_else(|| {
+                        PotError::new(ErrorCode::SceneInvalid, "Ocean foam cache image is missing")
+                    })?;
+                    sample_cache_uv(pixels, cache.width, cache.height, u, v, n, n)[0]
+                        .clamp(0.0, 1.0)
+                } else {
+                    let fields = fields.as_ref().ok_or_else(|| {
+                        PotError::new(ErrorCode::InternalError, "live Ocean spectrum is missing")
+                    })?;
+                    let eigen = fields.eigenstuff(u, v);
+                    (eigen.jminus * -0.005 + params.foam_coverage).clamp(0.0, 1.0)
+                };
+                let color = byte_color(foam);
+                values.push(srgb_color(color, color, color));
+            }
+        }
+        color_store.layers.push(ColorLayer {
+            name: name.clone(),
+            domain: ColorDomain::Corner,
+            values,
+        });
+        set_byte_color_data_type(&mut output, name)?;
+    }
+    if let Some(name) = &spray_name {
+        let mut values =
+            Vec::with_capacity(output.faces.iter().map(|face| face.vertices.len()).sum());
+        for face in &output.faces {
+            let first = values.len();
+            values.resize(first + face.vertices.len(), [1.0, 1.0, 1.0, 1.0]);
+            if let Some(vertex_id) = face.vertices.last() {
+                let position = original_positions[vertex_index[vertex_id]];
+                let (u, v) = ocean_uv(position, size_co_inv);
+                let (red, blue) = if let Some(cache) = &cached {
+                    let pixels = if params.invert_spray {
+                        cache.spray_inverse.as_deref()
+                    } else {
+                        cache.spray.as_deref()
+                    }
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "Ocean spray cache image is missing",
+                        )
+                    })?;
+                    let sample = sample_cache_uv(pixels, cache.width, cache.height, u, v, n, n);
+                    (sample[0], sample[2])
+                } else {
+                    let fields = fields.as_ref().ok_or_else(|| {
+                        PotError::new(ErrorCode::InternalError, "live Ocean spectrum is missing")
+                    })?;
+                    let eigen = fields.eigenstuff(u, v);
+                    if params.invert_spray {
+                        (eigen.eminus_x, eigen.eminus_z)
+                    } else {
+                        (eigen.eplus_x, eigen.eplus_z)
+                    }
+                };
+                values[first] = srgb_color(spray_byte(red), 0, spray_byte(blue));
+            }
+        }
+        color_store.layers.push(ColorLayer {
+            name: name.clone(),
+            domain: ColorDomain::Corner,
+            values,
+        });
+        set_byte_color_data_type(&mut output, name)?;
+    }
+    color_layers::write(&mut output, &color_store);
+
+    for (index, vertex) in output.vertices.iter_mut().enumerate() {
+        let original = original_positions[index];
+        let (u, v) = ocean_uv(original, size_co_inv);
+        let (dx, dy, dz) = if let Some(cache) = &cached {
+            let displacement =
+                sample_cache_uv(&cache.displacement, cache.width, cache.height, u, v, n, n);
+            (
+                if params.choppiness > 0.0 {
+                    displacement[0]
+                } else {
+                    0.0
+                },
+                if params.choppiness > 0.0 {
+                    displacement[2]
+                } else {
+                    0.0
+                },
+                displacement[1],
+            )
         } else {
-            vertex.co.x += displacement_x;
-            vertex.co.y += displacement_y;
-            vertex.co.z += height;
-        }
-        if use_normals {
-            let normal = gradient.normalize_or_zero();
-            normals.insert(vertex.id.to_string(), json!(normal.to_array()));
-        }
-        if use_foam {
-            let steepness = derivative_x.hypot(derivative_y);
-            let foam_amount =
-                ((steepness - (1.0 - foam_coverage)) / foam_coverage.max(1.0e-9)).clamp(0.0, 1.0);
-            foam.insert(vertex.id.to_string(), json!(foam_amount));
-        }
-    }
-    if use_normals {
-        output.attributes.insert(
-            "ocean_normal".to_owned(),
-            json!({"domain":"vertices","type":"float3","values":normals}),
-        );
-    }
-    if use_foam && !foam_layer_name.is_empty() {
-        output.attributes.insert(
-            foam_layer_name.to_owned(),
-            json!({"domain":"vertices","type":"float","values":foam}),
+            let fields = fields.as_ref().ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "live Ocean spectrum is missing")
+            })?;
+            (
+                if params.choppiness > 0.0 {
+                    fields.sample(&fields.displacement_x, u, v)
+                } else {
+                    0.0
+                },
+                if params.choppiness > 0.0 {
+                    fields.sample(&fields.displacement_z, u, v)
+                } else {
+                    0.0
+                },
+                fields.sample(&fields.displacement_y, u, v),
+            )
+        };
+        vertex.co = DVec3::new(
+            f64::from(original.x as f32 + dx),
+            f64::from(original.y as f32 + dy),
+            f64::from(original.z as f32 + dz),
         );
     }
     validated(&output)?;
     Ok(output)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "ocean spectrum consumes the named Blender RNA properties"
-)]
-fn height_spectrum(
+fn generate_ocean_geometry(
+    params: &OceanParams,
     n: usize,
-    spatial_size: f64,
-    depth: f64,
-    wind_velocity: f64,
-    wave_scale: f64,
-    wave_scale_min: f64,
-    choppiness: f64,
-    alignment: f64,
-    direction: f64,
-    damping: f64,
-    time: f64,
-    spectrum: &str,
-    jonswap_peak: f64,
-    fetch: f64,
-    seed: u64,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut frequency = vec![Complex::default(); n * n];
-    let mut frequency_x = vec![Complex::default(); n * n];
-    let mut frequency_y = vec![Complex::default(); n * n];
-    let mut normalization_frequency = vec![Complex::default(); n * n];
-    let wind_x = direction.cos();
-    let wind_y = -direction.sin();
-    let gravity = 9.81;
-    let largest_wave = wind_velocity * wind_velocity / gravity;
-    for x in 0..n {
-        let signed_x = if x <= n / 2 {
-            x as f64
-        } else {
-            x as f64 - n as f64 + 1.0
-        };
-        let kx = TAU * signed_x / spatial_size;
-        let blender_kx = (2.0_f32 * std::f32::consts::PI * signed_x as f32) / spatial_size as f32;
-        for y in 0..=n / 2 {
-            let ky = TAU * y as f64 / spatial_size;
-            let blender_ky = (2.0_f32 * std::f32::consts::PI * y as f32) / spatial_size as f32;
-            let wave_number = kx.hypot(ky);
-            if wave_number <= 1.0e-12 {
-                continue;
-            }
-            let direction_cosine = (kx * wind_x + ky * wind_y) / wave_number;
-            let direction_cosine_reverse = -direction_cosine;
-            let adjusted_direction = if direction_cosine < 0.0 {
-                direction_cosine * (1.0 - damping)
-            } else {
-                direction_cosine
-            };
-            let adjusted_reverse_direction = if direction_cosine_reverse < 0.0 {
-                direction_cosine_reverse * (1.0 - damping)
-            } else {
-                direction_cosine_reverse
-            };
-            let alignment_factor = adjusted_direction.abs().powf(alignment * 10.0);
-            let alignment_factor_reverse = adjusted_reverse_direction.abs().powf(alignment * 10.0);
-            let base = (-(1.0 / (wave_number * largest_wave).powi(2))).exp() / wave_number.powi(4)
-                * alignment_factor
-                * (-(wave_scale_min * wave_scale_min * wave_number.powi(2))).exp();
-            let base_reverse = (-(1.0 / (wave_number * largest_wave).powi(2))).exp()
-                / wave_number.powi(4)
-                * alignment_factor_reverse
-                * (-(wave_scale_min * wave_scale_min * wave_number.powi(2))).exp();
-            let dispersion = (gravity * wave_number * (wave_number * depth).tanh()).sqrt();
-            let spectral_scale = spectrum_factor(
-                spectrum,
-                kx,
-                ky,
-                wave_number,
-                depth,
-                wind_velocity,
-                fetch,
-                jonswap_peak,
-                alignment,
-                direction,
-                damping,
-            );
-            let reverse_spectral_scale = spectrum_factor(
-                spectrum,
-                -kx,
-                -ky,
-                wave_number,
-                depth,
-                wind_velocity,
-                fetch,
-                jonswap_peak,
-                alignment,
-                direction,
-                damping,
-            );
-            let hash_x = (blender_kx * 360.0) as i32 as u32;
-            let hash_y = (blender_ky * 360.0) as i32 as u32;
-            let random_seed = (seed as u32).wrapping_add(blender_hash_int_2d(hash_x, hash_y));
-            let mut random = BlenderRng::new(random_seed);
-            let (real, imaginary) = random.gaussian_pair();
-            let gaussian = Complex {
-                re: f64::from(real),
-                im: f64::from(imaginary),
-            };
-            let h0 = gaussian.scale((base * spectral_scale * 0.5).max(0.0).sqrt());
-            let h0_minus = gaussian.scale(
-                (base_reverse * reverse_spectral_scale * 0.5)
-                    .max(0.0)
-                    .sqrt(),
-            );
-            let phase = dispersion * time;
-            let positive = Complex::from_polar(1.0, phase);
-            let negative = Complex::from_polar(1.0, -phase);
-            let h0_minus_conjugate = h0_minus.conjugate();
-            let height = h0 * positive + h0_minus_conjugate * negative;
-            let index = x * n + y;
-            frequency[index] = height;
-            normalization_frequency[index] = h0 + h0_minus_conjugate;
-            let chop = choppiness / wave_number;
-            frequency_x[index] = height
-                * Complex {
-                    re: 0.0,
-                    im: chop * kx,
-                };
-            frequency_y[index] = height
-                * Complex {
-                    re: 0.0,
-                    im: chop * ky,
-                };
+    x_intervals: usize,
+    y_intervals: usize,
+) -> Result<Mesh> {
+    let vertex_count = (x_intervals + 1)
+        .checked_mul(y_intervals + 1)
+        .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "ocean grid exceeds mesh limits"))?;
+    let length = params.size * params.spatial_size;
+    let origin = -length / 2.0;
+    let step = length / n as f32;
+    let mut positions = Vec::with_capacity(vertex_count);
+    for y in 0..=y_intervals {
+        for x in 0..=x_intervals {
+            positions.push(DVec3::new(
+                f64::from(origin + x as f32 * step),
+                f64::from(origin + y as f32 * step),
+                0.0,
+            ));
         }
     }
-    for x in 0..n {
-        let opposite_x = (n - x) % n;
-        for y in n / 2 + 1..n {
-            let index = x * n + y;
-            let opposite = opposite_x * n + (n - y);
-            frequency[index] = frequency[opposite].conjugate();
-            frequency_x[index] = frequency_x[opposite].conjugate();
-            frequency_y[index] = frequency_y[opposite].conjugate();
-            normalization_frequency[index] = normalization_frequency[opposite].conjugate();
+    let face_count = x_intervals
+        .checked_mul(y_intervals)
+        .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "ocean grid exceeds mesh limits"))?;
+    let mut polygons = Vec::with_capacity(face_count);
+    let mut uv_faces = Vec::with_capacity(face_count);
+    let uv_step = 1.0_f32 / n as f32;
+    let row_width = x_intervals + 1;
+    for y in 0..y_intervals {
+        for x in 0..x_intervals {
+            let lower_left = y * row_width + x;
+            polygons.push(vec![
+                lower_left,
+                lower_left + 1,
+                lower_left + row_width + 1,
+                lower_left + row_width,
+            ]);
+            let u0 = f64::from(x as f32 * uv_step);
+            let u1 = f64::from((x + 1) as f32 * uv_step);
+            let v0 = f64::from(1.0_f32 - y as f32 * uv_step);
+            let v1 = f64::from(1.0_f32 - (y + 1) as f32 * uv_step);
+            uv_faces.push(Some(vec![[u0, v0], [u1, v0], [u1, v1], [u0, v1]]));
         }
     }
-    inverse_fft_2d(&mut frequency, n);
-    inverse_fft_2d(&mut frequency_x, n);
-    inverse_fft_2d(&mut frequency_y, n);
-    inverse_fft_2d(&mut normalization_frequency, n);
-    let maximum_initial_height = normalization_frequency
-        .iter()
-        .map(|height| height.re.abs())
-        .fold(0.0_f64, f64::max);
-    let normalization = 1.0 / maximum_initial_height.max(1.0e-5);
+    let mut output = Mesh::from_positions_and_faces(positions, polygons).map_err(|error| {
+        PotError::invalid_argument(format!("ocean grid construction failed: {error}"))
+    })?;
+    let mut uv_store = uv_layers::read(&output);
+    uv_store.layers.push(UvLayer::new("UVMap", uv_faces));
+    if uv_store.active.is_none() {
+        uv_store.active = Some("UVMap".to_owned());
+    }
+    if uv_store.render.is_none() {
+        uv_store.render = Some("UVMap".to_owned());
+    }
+    uv_layers::write(&mut output, &uv_store);
+    Ok(output)
+}
+
+fn ocean_uv(position: DVec3, size_co_inv: f32) -> (f32, f32) {
     (
-        frequency
-            .into_iter()
-            .map(|height| height.re * normalization * wave_scale)
-            .collect(),
-        frequency_x
-            .into_iter()
-            .map(|displacement| displacement.re * normalization * wave_scale)
-            .collect(),
-        frequency_y
-            .into_iter()
-            .map(|displacement| displacement.re * normalization * wave_scale)
-            .collect(),
+        (position.x as f32 * size_co_inv) + 0.5,
+        (position.y as f32 * size_co_inv) + 0.5,
     )
 }
 
-impl Complex {
-    fn scale(self, amount: f64) -> Self {
-        Self {
-            re: self.re * amount,
-            im: self.im * amount,
-        }
+fn sample_grid(values: &[f64], rows: usize, cols: usize, u: f32, v: f32) -> f32 {
+    let mut u = u % 1.0;
+    let mut v = v % 1.0;
+    if u < 0.0 {
+        u += 1.0;
     }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the Blender ocean spectrum depends on named modifier properties"
-)]
-fn spectrum_factor(
-    spectrum: &str,
-    kx: f64,
-    ky: f64,
-    wave_number: f64,
-    depth: f64,
-    wind: f64,
-    fetch: f64,
-    sharpen_peak: f64,
-    alignment: f64,
-    direction: f64,
-    damping: f64,
-) -> f64 {
-    let gravity = 9.81;
-    let omega = (gravity * wave_number * (wave_number * depth).tanh()).sqrt();
-    let wind_dot = (kx * direction.cos() - ky * direction.sin()) / wave_number.powi(2);
-    let apply_wind = |value: f64| {
-        let mut weighted = value * wind_dot.abs().powf(alignment * 10.0);
-        if wind_dot < 0.0 && alignment > 0.0 {
-            weighted *= 1.0 - damping;
-        }
-        weighted
+    if v < 0.0 {
+        v += 1.0;
+    }
+    let uu = u * rows as f32;
+    let vv = v * cols as f32;
+    let floor_x = uu.floor();
+    let floor_z = vv.floor();
+    let i0 = floor_x as usize;
+    let j0 = floor_z as usize;
+    let i1 = (i0 + 1) % rows;
+    let j1 = (j0 + 1) % cols;
+    let i0 = i0 % rows;
+    let j0 = j0 % cols;
+    let fx = uu - floor_x;
+    let fz = vv - floor_z;
+    let lerp = |target: f64, origin: f64, factor: f32| {
+        factor * target as f32 + (1.0 - factor) * origin as f32
     };
-    let jonswap = || {
-        let dimensionless_fetch = (gravity * fetch / wind.sqrt()).abs();
-        let alpha = 0.076 * dimensionless_fetch.powf(-0.22);
-        let peak_omega =
-            std::f64::consts::TAU * 3.5 * (gravity / wind).abs() * dimensionless_fetch.powf(-0.33);
-        let gamma = (sharpen_peak * 10.0).clamp(1.0, 6.0);
-        let base =
-            alpha * gravity.sqrt() / omega.powi(5) * (-1.25 * (peak_omega / omega).powi(4)).exp();
-        let sigma: f64 = if omega < peak_omega { 0.07 } else { 0.09 };
-        let peak_exponent = -((omega - peak_omega) / (sigma * peak_omega)).powi(2) / 2.0;
-        base * gamma.powf(peak_exponent.exp())
+    let first = lerp(values[i1 * cols + j1], values[i0 * cols + j1], fx);
+    let second = lerp(values[i1 * cols + j0], values[i0 * cols + j0], fx);
+    lerp(f64::from(first), f64::from(second), fz)
+}
+fn sample_cache_uv(
+    pixels: &[[f32; 4]],
+    width: usize,
+    height: usize,
+    u: f32,
+    v: f32,
+    resolution_x: usize,
+    resolution_y: usize,
+) -> [f32; 4] {
+    let mut u = u % 1.0;
+    let mut v = v % 1.0;
+    if u < 0.0 {
+        u += 1.0;
+    }
+    if v < 0.0 {
+        v += 1.0;
+    }
+    let texel_x = u * resolution_x as f32 - 0.5;
+    let texel_y = v * resolution_y as f32 - 0.5;
+    let extend = |coordinate: f32, size: usize| {
+        if coordinate >= 0.0 {
+            if coordinate < size as f32 {
+                coordinate as usize
+            } else {
+                size - 1
+            }
+        } else {
+            0
+        }
     };
-    match spectrum {
-        "PIERSON_MOSKOWITZ" => {
-            let peak_omega = 0.87 * gravity / wind;
-            let base = 0.0081 * gravity.sqrt() / omega.powi(5)
-                * (-1.291 * (peak_omega / omega).powi(4)).exp();
-            apply_wind(base)
+    let x1 = extend(texel_x, width);
+    let x2 = extend(texel_x + 1.0, width);
+    let y1 = extend(texel_y, height);
+    let y2 = extend(texel_y + 1.0, height);
+    let a = texel_x - texel_x.floor();
+    let b = texel_y - texel_y.floor();
+    let a_b = a * b;
+    let ma_b = (1.0 - a) * b;
+    let a_mb = a * (1.0 - b);
+    let ma_mb = (1.0 - a) * (1.0 - b);
+    let row1 = &pixels[width * y1 + x1];
+    let row2 = &pixels[width * y2 + x1];
+    let row3 = &pixels[width * y1 + x2];
+    let row4 = &pixels[width * y2 + x2];
+    std::array::from_fn(|channel| {
+        ma_mb * row1[channel] + a_mb * row3[channel] + ma_b * row2[channel] + a_b * row4[channel]
+    })
+}
+
+/// The directory of an Ocean bake cache, resolved the same way by `bake` and by every later read.
+/// `//` is relative to the project root, a relative path is joined onto the project root, and an
+/// absolute path is used as is. A relative path without a project root is an error, so a cache never
+/// lands in the working directory.
+pub(crate) fn ocean_cache_directory(
+    filepath: &str,
+    project_root: Option<&Path>,
+) -> Result<std::path::PathBuf> {
+    if filepath.is_empty() {
+        return Err(PotError::invalid_argument("Ocean cache filepath is empty"));
+    }
+    if let Some(relative) = filepath.strip_prefix("//") {
+        if relative.is_empty() || relative.starts_with('/') {
+            return Err(PotError::invalid_argument(
+                "Ocean `//` filepath must name a relative directory",
+            ));
         }
-        "JONSWAP" => apply_wind(jonswap()),
-        "TEXEL_MARSEN_ARSLOE" => {
-            let k_depth = omega * (depth / gravity).sqrt();
-            let depth_factor = 0.5 + 0.5 * (1.8 * (k_depth - 1.125)).tanh();
-            apply_wind(apply_wind(jonswap()) * depth_factor)
-        }
-        _ => 1.0,
+        return project_root.map(|root| root.join(relative)).ok_or_else(|| {
+            PotError::invalid_argument("project root is required for a // Ocean cache filepath")
+        });
+    }
+    let path = Path::new(filepath);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        project_root.map(|root| root.join(path)).ok_or_else(|| {
+            PotError::invalid_argument(
+                "project root is required for a relative Ocean cache filepath",
+            )
+        })
     }
 }
 
-fn inverse_fft_2d(values: &mut [Complex], n: usize) {
-    for row in values.chunks_exact_mut(n) {
-        fft_1d(row, true);
+fn load_ocean_cache_image(
+    directory: &Path,
+    filename: &str,
+    expected_hash: &str,
+    expected_dimension: usize,
+) -> Result<Vec<[f32; 4]>> {
+    if Path::new(filename).components().count() != 1
+        || Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(filename)
+    {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "Ocean cache file name must be a single path component",
+        ));
     }
-    let mut column = vec![Complex::default(); n];
-    for y in 0..n {
-        for x in 0..n {
-            column[x] = values[x * n + y];
+    let path = directory.join(filename);
+    let bytes = fs::read(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PotError::with_details(
+                ErrorCode::FileNotFound,
+                format!("Ocean cache image could not be read: {error}"),
+                json!({"path":path}),
+            )
+        } else {
+            PotError::io(&error)
         }
-        fft_1d(&mut column, true);
-        for x in 0..n {
-            values[x * n + y] = column[x];
-        }
+    })?;
+    let actual_hash = crate::hash::sha256(&bytes);
+    if actual_hash != expected_hash {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Ocean cache image digest does not match its baked manifest",
+            json!({"path":path,"expected":expected_hash,"actual":actual_hash}),
+        ));
     }
+    let (width, height, pixels) = crate::image::storage::decode_ocean_cache_exr(&bytes)?;
+    if width as usize != expected_dimension || height as usize != expected_dimension {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Ocean cache image dimensions do not match the baked resolution",
+            json!({"path":path,"expected":[expected_dimension,expected_dimension],"actual":[width,height]}),
+        ));
+    }
+    // A Blender EXR lists the image's top row first, while the ImBuf buffer's row 0 is the bottom
+    // (`openexr_api.cpp`, `ibuf->y - 1 - y`). Reverse the file's rows into the bottom-up order that
+    // `sample_cache_uv` reads.
+    let row_width = expected_dimension;
+    if row_width == 0 || pixels.len() != row_width * row_width {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "Ocean cache image has no complete rows",
+        ));
+    }
+    Ok(pixels
+        .chunks_exact(row_width)
+        .rev()
+        .flatten()
+        .map(|pixel| pixel.map(|value| value as f32))
+        .collect())
 }
 
-fn fft_1d(values: &mut [Complex], inverse: bool) {
-    let n = values.len();
-    if !n.is_power_of_two() {
-        let mut transformed = [Complex::default(); 81];
-        assert!(
-            n <= transformed.len(),
-            "Ocean FFT exceeds validated resolution"
-        );
-        let direction = if inverse { 1.0 } else { -1.0 };
-        let normalization = if inverse { 1.0 / n as f64 } else { 1.0 };
-        for (output_index, output) in transformed.iter_mut().take(n).enumerate() {
-            let mut total = Complex::default();
-            for (input_index, input) in values.iter().enumerate() {
-                let phase = direction * TAU * (input_index * output_index) as f64 / n as f64;
-                total = total + *input * Complex::from_polar(1.0, phase);
-            }
-            *output = total.scale(normalization);
-        }
-        values.copy_from_slice(&transformed[..n]);
-        return;
+fn load_ocean_cache_frame(
+    modifier: &Modifier,
+    params: &OceanParams,
+    cache: &OceanBakeCache,
+    frame: i32,
+    context: ModifierEvaluationContext<'_>,
+) -> Result<OceanCacheFrame> {
+    if cache.frame_start > cache.frame_end || cache.resolution == 0 {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "Ocean baked-cache range or resolution is invalid",
+        ));
     }
-    let mut reversed = 0_usize;
-    for index in 1..n {
-        let mut bit = n >> 1;
-        while reversed & bit != 0 {
-            reversed ^= bit;
-            bit >>= 1;
-        }
-        reversed ^= bit;
-        if index < reversed {
-            values.swap(index, reversed);
-        }
+    let image_resolution = usize::try_from(cache.resolution).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "Ocean cache resolution exceeds platform limits",
+        )
+    })?;
+    let sample_count = image_resolution
+        .checked_mul(image_resolution)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "Ocean cache sample count exceeds platform limits",
+            )
+        })?;
+    if sample_count > MAX_OCEAN_SPECTRUM_SAMPLES {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "Ocean cache sample count exceeds configured limit",
+        ));
     }
-    let direction = if inverse { 1.0 } else { -1.0 };
-    let mut length = 2;
-    while length <= n {
-        let root = Complex::from_polar(1.0, direction * TAU / length as f64);
-        for start in (0..n).step_by(length) {
-            let mut twiddle = Complex::from_polar(1.0, 0.0);
-            let half = length / 2;
-            for offset in 0..half {
-                let even = values[start + offset];
-                let odd = values[start + offset + half] * twiddle;
-                values[start + offset] = even + odd;
-                values[start + offset + half] = Complex {
-                    re: even.re - odd.re,
-                    im: even.im - odd.im,
-                };
-                twiddle = twiddle * root;
-            }
-        }
-        length <<= 1;
-    }
-    if inverse {
-        for value in values {
-            *value = value.scale(1.0 / n as f64);
-        }
-    }
+    let filepath = string_param_with_expected(modifier, "filepath", "an Ocean cache directory")?;
+    let directory = ocean_cache_directory(filepath, context.project_root)?;
+    let frame = frame.clamp(cache.frame_start, cache.frame_end);
+    let load_channel = |channel: &str, required: bool| -> Result<Option<Vec<[f32; 4]>>> {
+        let filename = format!("{channel}_{frame:04}.exr");
+        let Some(digest) = cache.manifest.get(&filename) else {
+            return if required {
+                Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "Ocean baked-cache manifest is missing a required image",
+                    json!({"modifier_id":modifier.id,"file":filename}),
+                ))
+            } else {
+                Ok(None)
+            };
+        };
+        load_ocean_cache_image(&directory, &filename, digest, image_resolution).map(Some)
+    };
+    let displacement = load_channel("disp", true)?.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "Ocean displacement cache image is missing",
+        )
+    })?;
+    let foam = load_channel("foam", params.use_foam)?;
+    let spray_enabled = params.use_foam && params.use_spray;
+    let spray = load_channel("spray", spray_enabled)?;
+    let spray_inverse = load_channel("spray_inverse", spray_enabled)?;
+    Ok(OceanCacheFrame {
+        width: image_resolution,
+        height: image_resolution,
+        displacement,
+        foam,
+        spray,
+        spray_inverse,
+    })
 }
 
-fn sample_grid(values: &[f64], n: usize, x: f64, y: f64) -> f64 {
-    let x = x.rem_euclid(n as f64);
-    let y = y.rem_euclid(n as f64);
-    let x0 = x.floor() as usize % n;
-    let y0 = y.floor() as usize % n;
-    let x1 = (x0 + 1) % n;
-    let y1 = (y0 + 1) % n;
-    let fx = x - x.floor();
-    let fy = y - y.floor();
-    let first = values[x0 * n + y0] * (1.0 - fy) + values[x0 * n + y1] * fy;
-    let second = values[x1 * n + y0] * (1.0 - fy) + values[x1 * n + y1] * fy;
-    first * (1.0 - fx) + second * fx
+fn byte_color(value: f32) -> u8 {
+    if value.is_nan() {
+        return 0;
+    }
+    (value.clamp(0.0, 1.0) * 255.0) as u8
+}
+
+fn spray_byte(value: f32) -> u8 {
+    if !value.is_finite() {
+        return 0;
+    }
+    ((value * 255.0) as i32) as u8
+}
+
+fn srgb_color(red: u8, green: u8, blue: u8) -> [f64; 4] {
+    let decode = |channel| crate::color::srgb_to_linear(f64::from(channel) / 255.0);
+    [decode(red), decode(green), decode(blue), 1.0]
+}
+fn set_byte_color_data_type(mesh: &mut Mesh, name: &str) -> Result<()> {
+    let metadata = mesh
+        .attributes
+        .entry("blender_metadata".to_owned())
+        .or_insert_with(|| json!({}));
+    let metadata = metadata.as_object_mut().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::ValidationFailed,
+            "Blender mesh metadata is not an object",
+        )
+    })?;
+    let data_types = metadata
+        .entry("color_data_types".to_owned())
+        .or_insert_with(|| json!({}));
+    let data_types = data_types.as_object_mut().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::ValidationFailed,
+            "Blender color data types are not an object",
+        )
+    })?;
+    data_types.insert(name.to_owned(), json!("BYTE_COLOR"));
+    Ok(())
+}
+
+fn unique_attribute_name(requested: &str, used: &mut BTreeSet<String>) -> String {
+    let base = if requested.is_empty() {
+        "Attribute"
+    } else {
+        requested
+    };
+    if used.insert(base.to_owned()) {
+        return base.to_owned();
+    }
+    for suffix in 1_u32.. {
+        let name = format!("{base}.{suffix:03}");
+        if used.insert(name.clone()) {
+            return name;
+        }
+    }
+    unreachable!("the attribute namespace cannot contain every u32 suffix")
+}
+fn layer_names(mesh: &Mesh) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = mesh
+        .attributes
+        .keys()
+        .filter_map(|key| crate::geom::attribute_keys::user_name(key).map(str::to_owned))
+        .collect();
+    names.extend(
+        uv_layers::read(mesh)
+            .layers
+            .into_iter()
+            .map(|layer| layer.name),
+    );
+    for (key, field) in [
+        ("blender_uv_layers", "name"),
+        ("blender_attributes", "name"),
+    ] {
+        if let Some(layers) = mesh.attributes.get(key).and_then(Value::as_array) {
+            names.extend(
+                layers
+                    .iter()
+                    .filter_map(|layer| layer.get(field).and_then(Value::as_str))
+                    .map(str::to_owned),
+            );
+        }
+    }
+    names
 }
 
 fn resolution_param(modifier: &Modifier, name: &str) -> Result<u32> {
     let value = uint_param(modifier, name)?;
-    if value == 0 {
+    if !(1..=MAX_OCEAN_RESOLUTION as u64).contains(&value) {
         return Err(invalid_parameter(
             modifier,
             name,
-            "an integer power-of-two exponent of at least 1",
+            "an integer resolution from 1 to 1024",
         ));
     }
-    if value > 9 {
-        return Err(PotError::new(
-            ErrorCode::LimitExceeded,
-            format!(
-                "Ocean resolution `{name}` exceeds the configured FFT budget (maximum exponent 9)"
-            ),
-        ));
-    }
-    u32::try_from(value).map_err(|_| {
-        invalid_parameter(
-            modifier,
-            name,
-            "an integer power-of-two exponent from 1 to 9",
-        )
-    })
+    Ok(value as u32)
 }
 
 fn repeat_param(modifier: &Modifier, name: &str) -> Result<u32> {
@@ -655,76 +1339,116 @@ fn repeat_param(modifier: &Modifier, name: &str) -> Result<u32> {
             "an integer from 1 to 1024",
         ));
     }
-    u32::try_from(value).map_err(|_| invalid_parameter(modifier, name, "an integer from 1 to 1024"))
+    Ok(value as u32)
 }
 
-fn seed_param(modifier: &Modifier, name: &str) -> Result<u64> {
+fn seed_param(modifier: &Modifier, name: &str) -> Result<u32> {
     schema_value(modifier, name)?
         .as_u64()
         .filter(|seed| *seed <= 2_147_483_647)
+        .map(|seed| seed as u32)
         .ok_or_else(|| invalid_parameter(modifier, name, "an integer from 0 to 2147483647"))
-}
-
-fn blender_hash_int_2d(x: u32, y: u32) -> u32 {
-    let initial = 0xdead_beef_u32.wrapping_add((2_u32 << 2) + 13);
-    let mut a = initial.wrapping_add(x);
-    let mut b = initial.wrapping_add(y);
-    let mut c = initial;
-    c ^= b;
-    c = c.wrapping_sub(b.rotate_left(14));
-    a ^= c;
-    a = a.wrapping_sub(c.rotate_left(11));
-    b ^= a;
-    b = b.wrapping_sub(a.rotate_left(25));
-    c ^= b;
-    c = c.wrapping_sub(b.rotate_left(16));
-    a ^= c;
-    a = a.wrapping_sub(c.rotate_left(4));
-    b ^= a;
-    b = b.wrapping_sub(a.rotate_left(14));
-    c ^= b;
-    c.wrapping_sub(b.rotate_left(24))
-}
-
-struct BlenderRng(u64);
-
-impl BlenderRng {
-    fn new(seed: u32) -> Self {
-        Self((u64::from(seed) << 16) | 0x330e)
-    }
-
-    fn get_float(&mut self) -> f32 {
-        self.0 =
-            (0x0005_deec_e66d_u64.wrapping_mul(self.0).wrapping_add(0xb)) & 0x0000_ffff_ffff_ffff;
-        (self.0 >> 17) as f32 / 2_147_483_648.0
-    }
-
-    fn gaussian(&mut self) -> f32 {
-        loop {
-            let x = 1.0 - 2.0 * self.get_float();
-            let y = 1.0 - 2.0 * self.get_float();
-            let length_squared = x * x + y * y;
-            if length_squared > 0.0 && length_squared < 1.0 {
-                return x * (-2.0 * length_squared.ln() / length_squared).sqrt();
-            }
-        }
-    }
-
-    fn gaussian_pair(&mut self) -> (f32, f32) {
-        (self.gaussian(), self.gaussian())
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{OceanBakeSequence, ocean, sample_cache_uv};
     use crate::{
         eval::ModifierEvaluationContext,
         geom::{GridParams, Mesh},
         model::{Id, Modifier},
     };
-    use serde_json::{Map, json};
+    use serde_json::{Map, Value, json};
 
-    use super::ocean;
+    fn modifier(params: serde_json::Value) -> Result<Modifier, Box<dyn std::error::Error>> {
+        Ok(Modifier {
+            id: Id::new("ocean_test")?,
+            modifier_type: "ocean".to_owned(),
+            name: "Ocean".to_owned(),
+            enabled: true,
+            params: serde_json::from_value::<Map<String, serde_json::Value>>(params)?,
+            binding_data: None,
+            baked_ocean_cache: None,
+            runtime: crate::model::ModifierRuntime::default(),
+            show_viewport: true,
+            show_render: true,
+        })
+    }
+
+    #[test]
+    fn generated_grid_has_blender_dimensions_and_corner_uvs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = Mesh::grid(GridParams {
+            size_x: 1.0,
+            size_y: 1.0,
+            x_subdivisions: 2,
+            y_subdivisions: 2,
+        })?;
+        let out = ocean(
+            &source,
+            &modifier(
+                json!({"geometry_mode":"GENERATE","resolution":3,"viewport_resolution":3,"spatial_size":8,"time":0.5,"random_seed":1}),
+            )?,
+            1.0,
+            ModifierEvaluationContext::default(),
+        )?;
+        assert_eq!(out.vertices.len(), 10 * 10);
+        assert_eq!(out.faces.len(), 9 * 9);
+        let uv_store = super::uv_layers::read(&out);
+        assert_eq!(uv_store.layers.len(), 1);
+        assert_eq!(uv_store.active.as_deref(), Some("UVMap"));
+        assert_eq!(uv_store.render.as_deref(), Some("UVMap"));
+        assert_eq!(
+            uv_store.layers[0].faces[0]
+                .as_ref()
+                .ok_or("UV face is missing")?[0],
+            [0.0, 1.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_ocean_uses_evaluated_modifier_time() -> Result<(), Box<dyn std::error::Error>> {
+        let source = Mesh::grid(GridParams {
+            size_x: 8.0,
+            size_y: 8.0,
+            x_subdivisions: 9,
+            y_subdivisions: 9,
+        })?;
+        let modifier = modifier(json!({
+            "geometry_mode":"DISPLACE",
+            "resolution":4,
+            "viewport_resolution":4,
+            "spatial_size":8,
+            "random_seed":12,
+            "choppiness":0.0,
+            "time":0.5
+        }))?;
+        let stored_time = ocean(
+            &source,
+            &modifier,
+            1.0,
+            ModifierEvaluationContext::default(),
+        )?;
+        let animated_time = super::ocean_with_parameter_evaluator(
+            &source,
+            &modifier,
+            1.0,
+            ModifierEvaluationContext::default(),
+            |parameter, base| {
+                assert_eq!(parameter, "time");
+                Ok(Some(base + 1.5))
+            },
+        )?;
+        assert!(
+            stored_time
+                .vertices
+                .iter()
+                .zip(&animated_time.vertices)
+                .any(|(stored, animated)| (stored.co.z - animated.co.z).abs() > 1.0e-8)
+        );
+        Ok(())
+    }
 
     #[test]
     fn spectrum_is_seeded_and_choppiness_changes_horizontal_positions()
@@ -735,42 +1459,384 @@ mod tests {
             x_subdivisions: 9,
             y_subdivisions: 9,
         })?;
-        let create = |choppiness| -> Result<Modifier, Box<dyn std::error::Error>> {
-            Ok(Modifier {
-                id: Id::new("ocean_test")?,
-                modifier_type: "ocean".to_owned(),
-                name: "Ocean".to_owned(),
-                enabled: true,
-                show_viewport: true,
-                show_render: true,
-                params: serde_json::from_value::<Map<String, serde_json::Value>>(json!({
-                    "geometry_mode":"DISPLACE", "resolution":4, "spatial_size":8.0,
-                    "random_seed":12, "choppiness":choppiness, "time":2.0
-                }))?,
-                binding_data: None,
-                runtime: crate::model::ModifierRuntime::default(),
-            })
-        };
-        let context = ModifierEvaluationContext::default();
-        let first = ocean(&source, &create(0.0)?, 1.0, context)?;
-        let repeated = ocean(&source, &create(0.0)?, 1.0, context)?;
+        let first = ocean(
+            &source,
+            &modifier(
+                json!({"geometry_mode":"DISPLACE","resolution":4,"viewport_resolution":4,"spatial_size":8,"random_seed":12,"choppiness":0.0,"time":2.0}),
+            )?,
+            1.0,
+            ModifierEvaluationContext::default(),
+        )?;
+        let repeated = ocean(
+            &source,
+            &modifier(
+                json!({"geometry_mode":"DISPLACE","resolution":4,"viewport_resolution":4,"spatial_size":8,"random_seed":12,"choppiness":0.0,"time":2.0}),
+            )?,
+            1.0,
+            ModifierEvaluationContext::default(),
+        )?;
         assert_eq!(first, repeated);
-        let chopped = ocean(&source, &create(2.0)?, 1.0, context)?;
+        let chopped = ocean(
+            &source,
+            &modifier(
+                json!({"geometry_mode":"DISPLACE","resolution":4,"viewport_resolution":4,"spatial_size":8,"random_seed":12,"choppiness":2.0,"time":2.0}),
+            )?,
+            1.0,
+            ModifierEvaluationContext::default(),
+        )?;
         assert!(
             first
                 .vertices
                 .iter()
                 .zip(&chopped.vertices)
-                .any(|(left, right)| {
-                    (left.co.x - right.co.x).abs() + (left.co.y - right.co.y).abs() > 1.0e-8
-                })
+                .any(|(a, b)| (a.co.x - b.co.x).abs() + (a.co.y - b.co.y).abs() > 1e-8)
         );
         assert!(
             first
                 .vertices
                 .iter()
-                .any(|vertex| vertex.co.z.abs() > 1.0e-10)
+                .any(|vertex| vertex.co.z.abs() > 1e-10)
         );
         Ok(())
+    }
+
+    #[test]
+    fn foam_and_spray_are_corner_byte_color_layers_with_source_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = Mesh::grid(GridParams {
+            size_x: 1.0,
+            size_y: 1.0,
+            x_subdivisions: 2,
+            y_subdivisions: 2,
+        })?;
+        let out = ocean(
+            &source,
+            &modifier(
+                json!({"geometry_mode":"GENERATE","resolution":2,"viewport_resolution":2,"spatial_size":8,"random_seed":12,"time":0.5,"use_foam":true,"use_spray":true,"foam_layer_name":"Foam","spray_layer_name":"Spray","foam_coverage":0.2}),
+            )?,
+            1.0,
+            ModifierEvaluationContext::default(),
+        )?;
+        let store = super::color_layers::read(&out);
+        for name in ["Foam", "Spray"] {
+            let layer = store
+                .layers
+                .iter()
+                .find(|layer| layer.name == name)
+                .ok_or("Ocean color layer is missing")?;
+            assert_eq!(layer.domain, super::color_layers::ColorDomain::Corner);
+            assert_eq!(
+                out.attributes["blender_metadata"]["color_data_types"][name],
+                "BYTE_COLOR"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ocean_colors_avoid_names_of_canonical_uv_layers() -> Result<(), Box<dyn std::error::Error>> {
+        let source = Mesh::grid(GridParams {
+            size_x: 1.0,
+            size_y: 1.0,
+            x_subdivisions: 2,
+            y_subdivisions: 2,
+        })?;
+        let output = ocean(
+            &source,
+            &modifier(json!({
+                "geometry_mode":"GENERATE","resolution":2,"viewport_resolution":2,
+                "spatial_size":8,"random_seed":12,"time":0.5,"use_foam":true,
+                "foam_layer_name":"UVMap"
+            }))?,
+            1.0,
+            ModifierEvaluationContext::default(),
+        )?;
+        let colors = super::color_layers::read(&output);
+        assert!(colors.layers.iter().any(|layer| layer.name == "UVMap.001"));
+        assert!(
+            super::uv_layers::read(&output)
+                .layers
+                .iter()
+                .any(|layer| layer.name == "UVMap")
+        );
+        Ok(())
+    }
+    #[test]
+    fn seeded_phillips_height_and_corner_colors_match_blender_522()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = Mesh::grid(GridParams {
+            size_x: 1.0,
+            size_y: 1.0,
+            x_subdivisions: 2,
+            y_subdivisions: 2,
+        })?;
+        let output = ocean(
+            &source,
+            &modifier(json!({
+                "geometry_mode":"GENERATE","resolution":4,"viewport_resolution":4,
+                "spatial_size":50,"size":1.0,"repeat_x":1,"repeat_y":1,
+                "random_seed":1,"time":0.5,"wave_scale":1.0,"wave_scale_min":0.01,
+                "choppiness":1.0,"wind_velocity":30.0,"damping":0.5,
+                "wave_alignment":0.0,"wave_direction":0.0,"depth":200.0,
+                "spectrum":"PHILLIPS","fetch_jonswap":120.0,"sharpen_peak_jonswap":0.0,
+                "use_foam":true,"use_spray":true,"invert_spray":false,
+                "foam_coverage":0.0,"foam_layer_name":"Foam","spray_layer_name":"Spray"
+            }))?,
+            1.0,
+            ModifierEvaluationContext::default(),
+        )?;
+        let first = output.vertices[0].co;
+        assert!((first.x + 25.0).abs() < 1.0e-6);
+        assert!((first.y + 25.0).abs() < 1.0e-6);
+        assert!((first.z + 0.100_274_428_725_242_61).abs() < 2.0e-6);
+        let colors = super::color_layers::read(&output);
+        let foam = colors
+            .layers
+            .iter()
+            .find(|layer| layer.name == "Foam")
+            .ok_or("foam layer is missing")?;
+        assert!((foam.values[3][0] - 0.010_960_093_699_395_657).abs() < 1.0e-7);
+        let spray = colors
+            .layers
+            .iter()
+            .find(|layer| layer.name == "Spray")
+            .ok_or("spray layer is missing")?;
+        assert!((spray.values[0][0] - 0.838_799_238_204_956).abs() < 1.0e-6);
+        assert!((spray.values[0][2] - 0.111_932_434_141_635_9).abs() < 1.0e-6);
+        Ok(())
+    }
+    // These are Blender's baked EXR pixels, not evaluated cached meshes: background baking returns
+    // before the job end callback sets `is_cached`.
+    #[test]
+    fn baked_sequence_matches_blender_522_exr_pixels() -> Result<(), Box<dyn std::error::Error>> {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../../../tests/fixtures/ocean_parity/corpus.json"
+        ))?;
+        for case in corpus["cases"]
+            .as_array()
+            .ok_or("Ocean corpus cases are missing")?
+        {
+            let Some(files) = case["exr_files"].as_object() else {
+                continue;
+            };
+            let modifier = modifier(case["params"].clone())?;
+            let mut sequence = OceanBakeSequence::new(&modifier)?;
+            let start = case["params"]["frame_start"]
+                .as_i64()
+                .ok_or("bake frame_start is missing")? as i32;
+            let end = case["params"]["frame_end"]
+                .as_i64()
+                .ok_or("bake frame_end is missing")? as i32;
+            let base_time = case["params"]["time"]
+                .as_f64()
+                .ok_or("bake time is missing")? as f32;
+            let frame_times =
+                case["observations"]["animated_time"]["modifier_time_by_frame"].as_object();
+            if let Some(animated_time) = case["observations"]["animated_time"].as_object() {
+                let data_path = animated_time["time_data_path"]
+                    .as_str()
+                    .ok_or("animated Ocean time path is missing")?;
+                assert!(
+                    animated_time["channel_curves"]
+                        .as_array()
+                        .is_some_and(|curves| curves.iter().any(|curve| {
+                            curve["data_path"].as_str() == Some(data_path)
+                                && curve["array_index"].as_u64() == Some(0)
+                        })),
+                    "{} has no ActionSlot F-Curve for its actual modifier time path",
+                    case["name"]
+                );
+                assert!(
+                    animated_time["action_slot_identifier"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty()),
+                    "{} animated Ocean Action has no slot identity",
+                    case["name"]
+                );
+                let times = frame_times.ok_or("animated Ocean frame-time map is missing")?;
+                assert!(
+                    times.len() > 1,
+                    "{} has no per-frame animated time samples",
+                    case["name"]
+                );
+                let start_time = times
+                    .get(&start.to_string())
+                    .and_then(Value::as_f64)
+                    .ok_or("animated Ocean first-frame time is missing")?;
+                let end_time = times
+                    .get(&end.to_string())
+                    .and_then(Value::as_f64)
+                    .ok_or("animated Ocean last-frame time is missing")?;
+                assert_ne!(
+                    start_time, end_time,
+                    "{} animated Ocean time did not change over its bake frames",
+                    case["name"]
+                );
+            }
+            for frame in start..=end {
+                let time = match frame_times {
+                    Some(times) => times
+                        .get(&frame.to_string())
+                        .and_then(Value::as_f64)
+                        .ok_or("animated Ocean frame time is missing")?
+                        as f32,
+                    None => base_time,
+                };
+                let actual = sequence.bake_frame(frame, time)?;
+                let suffix = format!("_{frame:04}.exr");
+                let expected_count = files.keys().filter(|name| name.ends_with(&suffix)).count();
+                assert_eq!(
+                    actual.len(),
+                    expected_count,
+                    "{} frame {frame} channel count",
+                    case["name"]
+                );
+                for image in actual {
+                    let expected = &files[&image.filename];
+                    assert_eq!(
+                        expected["width"].as_u64(),
+                        Some(image.resolution as u64),
+                        "{} {} width",
+                        case["name"],
+                        image.filename
+                    );
+                    assert_eq!(
+                        expected["height"].as_u64(),
+                        Some(image.resolution as u64),
+                        "{} {} height",
+                        case["name"],
+                        image.filename
+                    );
+                    assert!(
+                        expected["stored_channel_types"]
+                            .as_object()
+                            .is_some_and(|types| types.values().all(|value| value == "half")),
+                        "{} {} is not Blender half-float EXR",
+                        case["name"],
+                        image.filename
+                    );
+                    let expected_pixels = expected["pixel_values_rgba_row_major"]
+                        .as_array()
+                        .ok_or("baked EXR pixels are missing")?;
+                    assert_eq!(
+                        expected_pixels.len(),
+                        image.pixels.len() * 4,
+                        "{} {} pixel count",
+                        case["name"],
+                        image.filename
+                    );
+                    for (pixel, actual) in image.pixels.iter().enumerate() {
+                        for (channel, actual) in actual.iter().enumerate() {
+                            let expected = expected_pixels[pixel * 4 + channel]
+                                .as_f64()
+                                .ok_or("baked EXR channel is not numeric")?
+                                as f32;
+                            let rounded = exr::prelude::f16::from_f32(*actual).to_f32();
+                            let half = exr::prelude::f16::from_f32(*actual);
+                            let bits = half.to_bits();
+                            let ulp = if bits.trailing_zeros() >= 15 {
+                                exr::prelude::f16::from_bits(1).to_f32()
+                            } else if bits & 0x8000 == 0 {
+                                (exr::prelude::f16::from_bits(bits + 1).to_f32() - rounded).abs()
+                            } else {
+                                (exr::prelude::f16::from_bits(bits - 1).to_f32() - rounded).abs()
+                            };
+                            assert!(
+                                (expected - rounded).abs() <= ulp,
+                                "{} {} pixel {pixel} channel {channel}: native {actual} -> {rounded}, Blender {expected}, half ULP {ulp}",
+                                case["name"],
+                                image.filename,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// `BKE_ocean_cache_eval_uv` (`ocean.cc`): `texel = (u, v) * res - 0.5`, then bilinear over the
+    /// baked texels with `imbuf::interpolate_bilinear_fl`, which clamps each texel index to the image edge
+    /// (`BLI_math_interp.hh`, "Samples outside the image are clamped to texels at image edge").
+    fn blender_cache_eval_uv(pixels: &[[f32; 4]], res: usize, u: f32, v: f32) -> [f32; 4] {
+        let texel_x = u * res as f32 - 0.5;
+        let texel_y = v * res as f32 - 0.5;
+        let (x0, y0) = (texel_x.floor(), texel_y.floor());
+        let (fx, fy) = (texel_x - x0, texel_y - y0);
+        let texel = |x: f32, y: f32| {
+            let clamp = |c: f32| c.clamp(0.0, res as f32 - 1.0) as usize;
+            pixels[clamp(y) * res + clamp(x)]
+        };
+        let mut out = [0.0_f32; 4];
+        for (channel, value) in out.iter_mut().enumerate() {
+            let top = texel(x0, y0)[channel] * (1.0 - fx) + texel(x0 + 1.0, y0)[channel] * fx;
+            let bottom =
+                texel(x0, y0 + 1.0)[channel] * (1.0 - fx) + texel(x0 + 1.0, y0 + 1.0)[channel] * fx;
+            *value = top * (1.0 - fy) + bottom * fy;
+        }
+        out
+    }
+    #[test]
+    fn cached_sampling_is_blenders_cache_eval_uv() -> Result<(), Box<dyn std::error::Error>> {
+        let modifier = modifier(json!({
+            "geometry_mode":"GENERATE","resolution":4,"viewport_resolution":4,"spatial_size":12,
+            "time":0.75,"choppiness":1.0,"use_foam":true,"use_spray":true,"use_normals":true,
+            "foam_layer_name":"foam","spray_layer_name":"spray","frame_start":1,"frame_end":2
+        }))?;
+        let mut sequence = OceanBakeSequence::new(&modifier)?;
+        let images = sequence.bake_frame(1, 0.75)?;
+        let disp = images
+            .iter()
+            .find(|image| image.filename == "disp_0001.exr")
+            .ok_or("disp image is missing")?;
+        let res = disp.resolution;
+        for (u, v) in [
+            (0.0, 0.0),
+            (0.13, 0.71),
+            (0.5, 0.5),
+            (0.999, 0.001),
+            (0.03125, 0.96875),
+        ] {
+            let expected = blender_cache_eval_uv(&disp.pixels, res, u, v);
+            let actual = sample_cache_uv(&disp.pixels, res, res, u, v, res, res);
+            for channel in 0..4 {
+                assert!(
+                    (expected[channel] - actual[channel]).abs() <= 1.0e-6,
+                    "uv ({u}, {v}) channel {channel}: {actual:?} vs Blender rule {expected:?}"
+                );
+            }
+        }
+        // At a texel centre the rule returns that texel exactly.
+        for (x, y) in [(3, 5), (0, 0), (res - 1, res - 1)] {
+            let u = (x as f32 + 0.5) / res as f32;
+            let v = (y as f32 + 0.5) / res as f32;
+            assert_eq!(
+                sample_cache_uv(&disp.pixels, res, res, u, v, res, res),
+                disp.pixels[y * res + x],
+                "texel centre ({x}, {y})"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn cached_ocean_sampling_wraps_uv_and_extends_image_edges() {
+        let pixels = [
+            [0.0, 10.0, 20.0, 1.0],
+            [2.0, 12.0, 22.0, 1.0],
+            [4.0, 14.0, 24.0, 1.0],
+            [6.0, 16.0, 26.0, 1.0],
+        ];
+        assert_eq!(
+            sample_cache_uv(&pixels, 2, 2, 0.5, 0.5, 2, 2),
+            [3.0, 13.0, 23.0, 1.0]
+        );
+        assert_eq!(sample_cache_uv(&pixels, 2, 2, 0.0, 0.0, 2, 2), pixels[0]);
+        assert_eq!(
+            sample_cache_uv(&pixels, 2, 2, 0.875, 0.5, 2, 2),
+            [4.0, 14.0, 24.0, 1.0]
+        );
+        assert_eq!(
+            sample_cache_uv(&pixels, 2, 2, -0.125, 0.5, 2, 2),
+            [4.0, 14.0, 24.0, 1.0]
+        );
     }
 }

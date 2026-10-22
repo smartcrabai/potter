@@ -1079,6 +1079,9 @@ pub struct NlaTrack {
 pub struct NlaStrip {
     pub id: Id,
     pub action: Id,
+    /// Action slot assigned to this strip; `None` only for single-slot or slotless Actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_slot: Option<Id>,
     pub frame_start: f64,
     pub frame_end: f64,
     pub action_frame_start: f64,
@@ -1113,6 +1116,9 @@ pub enum NlaExtrapolation {
 pub struct ActionSlot {
     pub id: Id,
     pub node: Id,
+    /// Blender `ActionSlot` identity, kept only to map linked Blender slots back to stable IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blender_identifier: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1756,6 +1762,16 @@ impl Default for ForceField {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct OceanBakeCache {
+    pub frame_start: i32,
+    pub frame_end: i32,
+    /// Square EXR width in pixels (the modifier's render resolution squared).
+    pub resolution: u32,
+    pub manifest: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Modifier {
     pub id: Id,
     #[serde(rename = "type")]
@@ -1773,6 +1789,8 @@ pub struct Modifier {
     pub show_render: bool,
     #[serde(default)]
     pub params: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baked_ocean_cache: Option<OceanBakeCache>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[doc(hidden)]
     pub binding_data: Option<Value>,
@@ -1847,6 +1865,22 @@ pub struct Action {
     pub fcurves: Vec<FCurve>,
     #[serde(default)]
     pub slots: Vec<ActionSlot>,
+    /// Action slot assigned to each Object that uses this Action as its active Action.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub active_slots: BTreeMap<Id, Id>,
+    /// Scalar modifier-parameter bindings per flattened F-Curve index.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub modifier_bindings: BTreeMap<u32, Vec<ModifierParameterBinding>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModifierParameterBinding {
+    pub node: Id,
+    pub modifier: Id,
+    pub parameter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_slot: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

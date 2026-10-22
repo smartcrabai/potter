@@ -838,6 +838,7 @@ mod tests {
         let mut params = serde_json::Map::new();
         params.insert("uv_layer".to_owned(), json!(uv_layer));
         Modifier {
+            baked_ocean_cache: None,
             id: Id::new("displace").unwrap(),
             modifier_type: "displace".to_owned(),
             name: "Displace".to_owned(),

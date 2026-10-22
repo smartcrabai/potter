@@ -194,6 +194,10 @@ scene/
 
 Empty registries are also explicit. Standalone graphs / physics / tracking, etc. reference typed Data-Blocks from the relevant registry. Large arrays are not required to be in scene.json; use the same type inline or by hash reference.
 
+Blender Ocean `time` animation is bound at the exchange boundary to stable Node, Modifier, and Action-slot IDs (`Action.modifier_bindings`, `Action.active_slots`, `NlaStrip.action_slot`); one Action slot may drive several Objects. Only Ocean `time` is evaluated, through the existing Action/NLA frame and blend rules, in live snapshots and Ocean bakes. Other modifier-parameter curves are preserved with a `blender.animation.modifier_parameter` loss and are never evaluated.
+
+Ocean bake caches are gated on `Modifier.baked_ocean_cache` alone. Blender's `ocean.is_cached` job-end flag is UNVERIFIED: a headless `ocean_bake` leaves it false, and the GUI oracle that would have checked cache retention across time and choppiness edits was removed. Potter's own cache behavior is covered by `tests/ocean_cache_cli.rs`.
+
 ### Geometry, Sharing, and Visibility
 
 - Provide operations to create primitives such as boxes, spheres, cylinders, planes, cones, tori, icospheres, circles, and grids. Preserve editable descriptors and base geometry.

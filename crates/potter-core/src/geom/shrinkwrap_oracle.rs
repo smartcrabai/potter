@@ -120,6 +120,7 @@ fn shrinkwrap_modifier(params: &Map<String, Value>) -> TestResult<Modifier> {
         show_render: true,
         params: params.clone(),
         binding_data: None,
+        baked_ocean_cache: None,
         runtime: ModifierRuntime::default(),
     })
 }
