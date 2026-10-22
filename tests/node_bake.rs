@@ -1807,9 +1807,10 @@ fn packed_bake_without_data_block_references_is_reported_on_import() -> Result<(
     };
     let directory = tempdir()?;
     let blend = directory.path().join("packed-bake.blend");
+    let library = directory.path().join("packed-bake-library.blend");
     let script = r#"
 import bpy, sys
-blend = sys.argv[sys.argv.index("--") + 1]
+blend, library = sys.argv[sys.argv.index("--") + 1:]
 obj = bpy.context.object
 tree = bpy.data.node_groups.new("Geometry", "GeometryNodeTree")
 tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
@@ -1832,6 +1833,20 @@ assert "FINISHED" in result
 assert len(bake.data_blocks) == 0
 obj.hide_viewport = True
 obj.hide_set(True)
+bpy.ops.wm.save_as_mainfile(filepath=library)
+
+bpy.ops.wm.read_factory_settings(use_empty=True)
+with bpy.data.libraries.load(library, link=False) as (data_from, data_to):
+    data_to.objects = ["Cube"]
+local = data_to.objects[0]
+bpy.context.scene.collection.objects.link(local)
+local.name = "HiddenLocalBake"
+local.hide_viewport = True
+local.hide_set(True)
+with bpy.data.libraries.load(library, link=True) as (data_from, data_to):
+    data_to.objects = ["Cube"]
+linked = data_to.objects[0]
+bpy.context.scene.collection.objects.link(linked)
 bpy.ops.wm.save_as_mainfile(filepath=blend)
 "#;
     run_ok(
@@ -1845,8 +1860,9 @@ bpy.ops.wm.save_as_mainfile(filepath=blend)
                 script,
                 "--",
             ])
-            .arg(&blend),
-        "creating a packed geometry Bake with no data-block references",
+            .arg(&blend)
+            .arg(&library),
+        "creating hidden and linked packed Bake nodes with no data-block references",
     )?;
     let imported = directory.path().join("packed-bake-import");
     run_json(
@@ -1868,15 +1884,13 @@ bpy.ops.wm.save_as_mainfile(filepath=blend)
     assert!(!output.status.success());
     let response: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(response["error"]["code"], "UNREPRESENTABLE_FEATURE");
-    assert!(
-        response["result"]["losses"]
-            .as_array()
-            .is_some_and(|losses| {
-                losses
-                    .iter()
-                    .any(|loss| loss["feature_id"] == "blender.modifier.nodes_bake_packed")
-            })
-    );
+    let packed_loss_count = response["result"]["losses"].as_array().map_or(0, |losses| {
+        losses
+            .iter()
+            .filter(|loss| loss["feature_id"] == "blender.modifier.nodes_bake_packed")
+            .count()
+    });
+    assert_eq!(packed_loss_count, 2, "{response}");
     assert!(!directory.path().join("must-not-extract").exists());
     Ok(())
 }

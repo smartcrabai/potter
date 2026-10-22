@@ -18477,7 +18477,7 @@ print("UNSUPPORTED_POSE " + json.dumps({
                     "bake_empty_packed": {"bake_target": "PACKED"}
                 }},
                 "bake_losses": {
-                    "packed_payloads": ["bake_main"],
+                    "packed_payloads": ["bake_main", "bake_disk"],
                     "data_blocks": ["bake_main"],
                     "unmapped": ["Bake.001"]
                 }
@@ -18495,6 +18495,10 @@ print("UNSUPPORTED_POSE " + json.dumps({
         assert_eq!(
             bake_losses,
             [
+                (
+                    "blender.modifier.nodes_bake_packed".to_owned(),
+                    Some("Geo".to_owned())
+                ),
                 (
                     "blender.modifier.nodes_bake_packed".to_owned(),
                     Some("Geo".to_owned())
