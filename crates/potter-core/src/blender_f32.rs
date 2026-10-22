@@ -218,10 +218,30 @@ mod tests {
         assert_eq!(vertex_birth_velocity(flipped, NORMAL_FACTOR), VELOCITY_B);
     }
 
+    /// Per-component bound, derived from one-ulp perturbations of each libm call in `vec_to_quat`
+    /// (acos, sin and cos of phi, atan2, sin and cos of the twist). The worst first-order sums are
+    /// 2.0, 3.25, 2.62 and 3.0 ulp(1); adding 0.5 ulp(1) for the final f32 rounding gives 4 ulp(1),
+    /// which is 2^-21 at magnitude 1. Blender's stored bits come from macOS libm; the Linux CI
+    /// libm may differ by up to this bound, and macOS is the parity target (checked on the lane).
+    const ORIENTATION_LIBM_BOUND: f32 = 4.0 * (1.0 / 8_388_608.0);
+
+    fn assert_within_libm_bound(actual: [f32; 4], expected: [f32; 4]) {
+        for (component, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (got - want).abs() <= ORIENTATION_LIBM_BOUND,
+                "component {component}: {got} differs from {want} beyond the libm bound"
+            );
+        }
+    }
+
     #[test]
-    fn velocity_orientation_matches_blender_stored_rotation_bits() {
-        assert_eq!(velocity_orientation(VELOCITY_A), ROTATION_A);
-        assert_eq!(velocity_orientation(VELOCITY_B), ROTATION_B);
+    fn velocity_orientation_matches_blender_stored_rotation_within_libm_bound() {
+        assert_within_libm_bound(velocity_orientation(VELOCITY_A), ROTATION_A);
+        assert_within_libm_bound(velocity_orientation(VELOCITY_B), ROTATION_B);
+    }
+
+    #[test]
+    fn quat_to_xyzw_reorders_blender_wxyz_to_potter_xyzw() {
         assert_eq!(
             quat_to_xyzw(ROTATION_A),
             [
