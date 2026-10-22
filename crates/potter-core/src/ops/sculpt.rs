@@ -650,6 +650,7 @@ fn apply_multires(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Re
                     ("total_levels".to_owned(), json!(total_levels)),
                 ]),
                 binding_data: None,
+                baked_ocean_cache: None,
                 runtime: crate::model::ModifierRuntime::default(),
             },
         );
@@ -1256,6 +1257,7 @@ mod multires_selection_tests {
 
     fn multires_modifier(id: &str, show_viewport: bool) -> Modifier {
         Modifier {
+            baked_ocean_cache: None,
             id: Id::new(id).unwrap(),
             modifier_type: "multires".to_owned(),
             name: "Multires".to_owned(),
