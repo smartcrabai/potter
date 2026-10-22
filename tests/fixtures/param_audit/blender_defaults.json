@@ -1,6 +1,9 @@
 {
   "blender_version": "5.2.2 LTS",
   "exceptions": {
+    "bevel.custom_profile": {
+      "reason": "Blender's CurveProfilePoint exposes location and handle types only, not handle positions, so the table default's handle positions cannot be sampled at runtime."
+    },
     "mesh_sequence_cache.frame_offset": {
       "reason": "Blender's MeshSequenceCacheModifier does not expose frame_offset as an RNA property, so the table default cannot be sampled at runtime."
     },
@@ -78,6 +81,7 @@
     "bevel": {
       "affect": "EDGES",
       "angle_limit": 0.5235987901687622,
+      "custom_profile": "CurveProfile",
       "edge_weight": "bevel_weight_edge",
       "face_strength_mode": "FSTR_NONE",
       "harden_normals": false,
@@ -618,7 +622,7 @@
       "damping": 0.5,
       "depth": 200.0,
       "fetch_jonswap": 120.0,
-      "filepath": "/var/folders/yt/jkgjjlb55fvbjsx8t5xw72280000gn/T/blender_YBaswW/cache_ocean",
+      "filepath": "/var/folders/yt/jkgjjlb55fvbjsx8t5xw72280000gn/T/blender_1N0HEj/cache_ocean",
       "foam_coverage": 0.0,
       "foam_layer_name": "",
       "frame_end": 250,

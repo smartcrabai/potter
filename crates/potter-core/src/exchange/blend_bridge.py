@@ -6,12 +6,14 @@ IDs are described in the intermediate payload and the Rust side also stores the 
 file bytes as an immutable compatibility blob.
 """
 import base64
+import ctypes
 import bpy
 import ctypes
 import json
 import math
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import traceback
@@ -325,6 +327,106 @@ def rna_props(block, omit=()):
     return result
 
 
+def _curve_profile_params(profile):
+    """Capture Blender 5.2.2 CurveProfile points, including RNA-hidden handle coordinates."""
+    handle_types = {"ALIGN": "ALIGNED"}
+    points = []
+    for point in profile.points:
+        # Blender 5.2.2 stores h1_loc at 0xC followed by h2_loc at 0x14.
+        h1x, h1y, h2x, h2y = struct.unpack(
+            "<ffff", ctypes.string_at(point.as_pointer() + 0xC, 16))
+        points.append({
+            "location": [float(point.location[0]), float(point.location[1])],
+            "handle_1": [h1x, h1y],
+            "handle_2": [h2x, h2y],
+            "handle_type_1": handle_types.get(point.handle_type_1, point.handle_type_1),
+            "handle_type_2": handle_types.get(point.handle_type_2, point.handle_type_2),
+        })
+    return {
+        "points": points,
+        "use_clip": bool(profile.use_clip),
+        "use_sample_straight_edges": bool(profile.use_sample_straight_edges),
+        "use_sample_even_lengths": bool(profile.use_sample_even_lengths),
+    }
+
+
+def _line_curve_profile_params():
+    return {
+        "points": [
+            {
+                "location": [1.0, 0.0],
+                "handle_1": [1.0, 0.0],
+                "handle_2": [1.0, 0.0],
+                "handle_type_1": "AUTO",
+                "handle_type_2": "AUTO",
+            },
+            {
+                "location": [0.0, 1.0],
+                "handle_1": [0.0, 1.0],
+                "handle_2": [0.0, 1.0],
+                "handle_type_1": "AUTO",
+                "handle_type_2": "AUTO",
+            },
+        ],
+        "use_clip": True,
+        "use_sample_straight_edges": False,
+        "use_sample_even_lengths": False,
+    }
+
+
+def _curve_profile_vec2(point, key):
+    value = point.get(key)
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("bevel custom profile %s must be [x, y]" % key)
+    coordinates = [float(value[0]), float(value[1])]
+    if not all(math.isfinite(coordinate) for coordinate in coordinates):
+        raise ValueError("bevel custom profile %s must be finite" % key)
+    return coordinates
+
+
+def _set_curve_profile_params(profile, values):
+    """Restore authored CurveProfile points and stored handle coordinates without preset fallback."""
+    points = values.get("points")
+    if not isinstance(points, list) or len(points) < 2:
+        raise ValueError("bevel custom profile needs at least two points")
+    profile.preset = "LINE"
+    for name in ("use_clip", "use_sample_straight_edges", "use_sample_even_lengths"):
+        value = values.get(name)
+        if not isinstance(value, bool):
+            raise ValueError("bevel custom profile %s must be boolean" % name)
+        setattr(profile, name, value)
+    while len(profile.points) < len(points):
+        profile.points.add(0.5, 0.5)
+    if len(profile.points) != len(points):
+        raise ValueError("bevel custom profile point count could not be restored")
+    for index, point_values in enumerate(points):
+        profile.points[index].location = _curve_profile_vec2(point_values, "location")
+    # Calculate AUTO handles from the restored locations before applying stored handles.
+    profile.initialize(2)
+    handle_codes = {"FREE": 0, "AUTO": 1, "VECTOR": 2, "ALIGN": 3, "ALIGNED": 3}
+    for index, point_values in enumerate(points):
+        point = profile.points[index]
+        handle_1 = point_values.get("handle_type_1")
+        handle_2 = point_values.get("handle_type_2")
+        if handle_1 not in handle_codes or handle_2 not in handle_codes:
+            raise ValueError("invalid bevel custom profile handle types")
+        ctypes.memmove(
+            point.as_pointer() + 0xA,
+            bytes([handle_codes[handle_1], handle_codes[handle_2]]),
+            2,
+        )
+    for index, point_values in enumerate(points):
+        point = profile.points[index]
+        handle_1 = _curve_profile_vec2(point_values, "handle_1")
+        handle_2 = _curve_profile_vec2(point_values, "handle_2")
+        ctypes.memmove(
+            point.as_pointer() + 0xC,
+            struct.pack("<ffff", handle_1[0], handle_1[1], handle_2[0], handle_2[1]),
+            16,
+        )
+    profile.initialize(2)
+
+
 def _physics_rna_values(block, depth=0):
     if block is None or depth > 8:
         return {}
@@ -525,6 +627,11 @@ def modifier_params(modifier):
     if modifier.type in ("HOOK", "WARP"):
         omitted += ("falloff_curve",)
     params = rna_props(modifier, omitted)
+    if modifier.type == "BEVEL":
+        if getattr(modifier, "profile_type", None) == "CUSTOM":
+            params["custom_profile"] = _curve_profile_params(modifier.custom_profile)
+        else:
+            params["custom_profile"] = _line_curve_profile_params()
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         params["map_curve"] = _curve_mapping_points(modifier.map_curve)
     if modifier.type in ("HOOK", "WARP"):
@@ -3459,7 +3566,17 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
     if kind == "dynamic_paint":
         dynamic_paint_temporary_link = _ensure_dynamic_paint_role(
             modifier, obj, dynamic_paint_role)
+    custom_profile_values = None
     rna_params = dict(params)
+    if modifier.type == "BEVEL":
+        rna_params.pop("custom_profile", None)
+        if "custom_profile" in params:
+            custom_profile_values = params["custom_profile"]
+            if (not isinstance(custom_profile_values, dict)
+                    or not isinstance(custom_profile_values.get("points"), list)):
+                raise ValueError("custom bevel profile points are missing from modifier params")
+        else:
+            custom_profile_values = _line_curve_profile_params()
     for parameter in (
         "projectors",
         "resource",
@@ -3483,6 +3600,8 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         ):
             rna_params.pop(parameter, None)
     set_rna(modifier, rna_params, id_lookup)
+    if custom_profile_values is not None:
+        _set_curve_profile_params(modifier.custom_profile, custom_profile_values)
     lost_texture_ids = {
         texture_id
         for texture_id, record in doc.get("resources", {}).items()

@@ -1662,6 +1662,83 @@
           "minimum": 0.0,
           "maximum": 1.0
         },
+        "custom_profile": {
+          "type": "object",
+          "properties": {
+            "points": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2
+                  },
+                  "handle_1": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2
+                  },
+                  "handle_2": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2
+                  },
+                  "handle_type_1": {
+                    "enum": ["AUTO", "VECTOR", "FREE", "ALIGNED"]
+                  },
+                  "handle_type_2": {
+                    "enum": ["AUTO", "VECTOR", "FREE", "ALIGNED"]
+                  }
+                },
+                "required": [
+                  "location",
+                  "handle_1",
+                  "handle_2",
+                  "handle_type_1",
+                  "handle_type_2"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "use_clip": {"type": "boolean"},
+            "use_sample_straight_edges": {"type": "boolean"},
+            "use_sample_even_lengths": {"type": "boolean"}
+          },
+          "required": [
+            "points",
+            "use_clip",
+            "use_sample_straight_edges",
+            "use_sample_even_lengths"
+          ],
+          "additionalProperties": false,
+          "default": {
+            "points": [
+              {
+                "location": [1.0, 0.0],
+                "handle_1": [1.0, 0.0],
+                "handle_2": [1.0, 0.0],
+                "handle_type_1": "AUTO",
+                "handle_type_2": "AUTO"
+              },
+              {
+                "location": [0.0, 1.0],
+                "handle_1": [0.0, 1.0],
+                "handle_2": [0.0, 1.0],
+                "handle_type_1": "AUTO",
+                "handle_type_2": "AUTO"
+              }
+            ],
+            "use_clip": true,
+            "use_sample_straight_edges": false,
+            "use_sample_even_lengths": false
+          }
+        },
         "material": {
           "type": "integer",
           "default": -1,

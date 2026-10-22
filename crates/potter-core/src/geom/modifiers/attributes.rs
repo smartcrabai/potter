@@ -1,6 +1,6 @@
 //! Blender attribute-domain, normal, UV, transfer, and point-cache modifiers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use glam::{DMat3, DMat4, DVec2, DVec3, Vec2, Vec3};
 use serde_json::{Map, Value, json};
@@ -1248,19 +1248,66 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
                 .collect::<std::collections::BTreeSet<_>>()
         })
         .unwrap_or_default();
+    // Each sharp edge as its vertex pair: edge tests are then set lookups, not scans of the mesh edges.
+    let sharp_pairs: HashSet<(u32, u32)> = mesh
+        .edges
+        .iter()
+        .filter(|edge| sharp_edges.contains(&edge.id))
+        .map(|edge| {
+            let [first, second] = edge.vertices;
+            (first.min(second), first.max(second))
+        })
+        .collect();
+    // Corner points once per face: looking vertices up per call was O(vertices) each time.
+    let index_of: HashMap<u32, usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect();
+    let face_corners: Vec<Vec<DVec3>> = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| {
+                    index_of
+                        .get(id)
+                        .map(|&index| mesh.vertices[index].co)
+                        .ok_or_else(|| {
+                            PotError::invalid_argument("mesh face references a missing vertex")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<_>>()?;
     let mut normals = Vec::with_capacity(mesh.faces.len());
     let mut areas = Vec::with_capacity(mesh.faces.len());
-    for face in &mesh.faces {
-        let points = face_points(mesh, face.vertices.as_slice())?;
-        let normal = polygon_normal(&points);
-        normals.push(normal);
-        areas.push(polygon_area(&points));
+    for points in &face_corners {
+        normals.push(polygon_normal(points));
+        areas.push(polygon_area(points));
     }
-    let face_strengths = mesh
+    // Face strength per face index, read once: the key is formatted per face, not per use.
+    let strengths: Vec<i64> = mesh
         .attributes
         .get("__mod_weightednormals_faceweight")
         .and_then(|attribute| attribute.get("values"))
-        .and_then(Value::as_object);
+        .and_then(Value::as_object)
+        .map_or_else(
+            || vec![0; mesh.faces.len()],
+            |values| {
+                mesh.faces
+                    .iter()
+                    .map(|face| {
+                        values
+                            .get(&format!("f{}", face.id))
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0)
+                    })
+                    .collect()
+            },
+        );
     let mut incident = HashMap::<u32, Vec<usize>>::new();
     for (face_index, face) in mesh.faces.iter().enumerate() {
         for vertex_id in &face.vertices {
@@ -1273,7 +1320,7 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             let current = normals[face_index];
             let incident_faces = incident.get(vertex_id).map_or(&[][..], Vec::as_slice);
             let fan = if keep_sharp {
-                smooth_fan_faces(mesh, *vertex_id, face_index, incident_faces, &sharp_edges)
+                smooth_fan_faces(mesh, *vertex_id, face_index, incident_faces, &sharp_pairs)
             } else {
                 Vec::new()
             };
@@ -1285,30 +1332,20 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
             let maximum_strength = use_face_influence.then(|| {
                 adjacent
                     .iter()
-                    .map(|index| {
-                        face_strengths
-                            .and_then(|values| values.get(&format!("f{}", mesh.faces[*index].id)))
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0)
-                    })
+                    .map(|index| strengths[*index])
                     .max()
                     .unwrap_or(0)
             });
             let mut sum = DVec3::ZERO;
             for adjacent_index in adjacent {
-                if maximum_strength.is_some_and(|maximum| {
-                    face_strengths
-                        .and_then(|values| {
-                            values.get(&format!("f{}", mesh.faces[*adjacent_index].id))
-                        })
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0)
-                        != maximum
-                }) {
+                if maximum_strength.is_some_and(|maximum| strengths[*adjacent_index] != maximum) {
                     continue;
                 }
-                let adjacent_face = &mesh.faces[*adjacent_index];
-                let angle = corner_angle(mesh, adjacent_face, *vertex_id)?;
+                let angle = corner_angle_at(
+                    &face_corners[*adjacent_index],
+                    &mesh.faces[*adjacent_index].vertices,
+                    *vertex_id,
+                )?;
                 let weight = match mode {
                     "FACE_AREA" => areas[*adjacent_index],
                     "CORNER_ANGLE" => angle,
@@ -1352,25 +1389,17 @@ fn weighted_normal(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
     Ok(result)
 }
 
-fn edge_is_sharp(
-    mesh: &Mesh,
-    first: u32,
-    second: u32,
-    sharp_edges: &std::collections::BTreeSet<u32>,
-) -> bool {
-    mesh.edges.iter().any(|edge| {
-        ((edge.vertices[0] == first && edge.vertices[1] == second)
-            || (edge.vertices[0] == second && edge.vertices[1] == first))
-            && sharp_edges.contains(&edge.id)
-    })
+/// Whether the edge between `first` and `second` is sharp, from the sharp vertex pairs of the mesh
+/// (`sharp_pairs` holds each sharp edge as `(lower, higher)`), built once per modifier evaluation.
+fn edge_is_sharp(first: u32, second: u32, sharp_pairs: &HashSet<(u32, u32)>) -> bool {
+    sharp_pairs.contains(&(first.min(second), first.max(second)))
 }
 
 fn faces_share_smooth_edge_at_vertex(
-    mesh: &Mesh,
     first: &Face,
     second: &Face,
     vertex_id: u32,
-    sharp_edges: &std::collections::BTreeSet<u32>,
+    sharp_pairs: &HashSet<(u32, u32)>,
 ) -> bool {
     let Some(index) = first.vertices.iter().position(|id| *id == vertex_id) else {
         return false;
@@ -1380,7 +1409,7 @@ fn faces_share_smooth_edge_at_vertex(
         first.vertices[(index + 1) % first.vertices.len()],
     ];
     neighbors.into_iter().any(|neighbor| {
-        !edge_is_sharp(mesh, vertex_id, neighbor, sharp_edges)
+        !edge_is_sharp(vertex_id, neighbor, sharp_pairs)
             && (0..second.vertices.len()).any(|corner| {
                 let current = second.vertices[corner];
                 let next = second.vertices[(corner + 1) % second.vertices.len()];
@@ -1395,7 +1424,7 @@ fn smooth_fan_faces(
     vertex_id: u32,
     start: usize,
     incident: &[usize],
-    sharp_edges: &std::collections::BTreeSet<u32>,
+    sharp_pairs: &HashSet<(u32, u32)>,
 ) -> Vec<usize> {
     let mut fan = vec![start];
     let mut cursor = 0;
@@ -1404,11 +1433,10 @@ fn smooth_fan_faces(
         for candidate in incident {
             if !fan.contains(candidate)
                 && faces_share_smooth_edge_at_vertex(
-                    mesh,
                     current,
                     &mesh.faces[*candidate],
                     vertex_id,
-                    sharp_edges,
+                    sharp_pairs,
                 )
             {
                 fan.push(*candidate);
@@ -3238,13 +3266,13 @@ fn polygon_area(points: &[DVec3]) -> f64 {
         .sum()
 }
 
-fn corner_angle(mesh: &Mesh, face: &Face, vertex_id: u32) -> Result<f64> {
-    let index = face
-        .vertices
+/// The angle at `vertex_id` of a face whose corner points are `points` (in `ids` order): the angle
+/// between its two edges, from the normalized edge directions.
+fn corner_angle_at(points: &[DVec3], ids: &[u32], vertex_id: u32) -> Result<f64> {
+    let index = ids
         .iter()
         .position(|id| *id == vertex_id)
         .ok_or_else(|| PotError::invalid_argument("face corner vertex was not found"))?;
-    let points = face_points(mesh, &face.vertices)?;
     let center = points[index];
     let previous = (points[(index + points.len() - 1) % points.len()] - center).normalize_or_zero();
     let next = (points[(index + 1) % points.len()] - center).normalize_or_zero();
