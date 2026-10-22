@@ -1,6 +1,7 @@
 use glam::DVec3;
 
 use crate::error::{ErrorCode, PotError, Result};
+use crate::model::RayKind;
 use crate::render::raster::Triangle;
 
 const LEAF_TRIANGLE_COUNT: usize = 4;
@@ -22,9 +23,10 @@ pub(crate) struct WalkRay {
     pub direction: DVec3,
     pub epsilon: f64,
     pub remaining: f64,
-    pub kind: Option<crate::model::RayKind>,
+    pub kind: Option<RayKind>,
 }
-/// A closest-hit query: the ray, its extent, whether back faces count, and the triangles it may hit. Traversal
+
+/// A closest-hit query: the ray, its extent, whether back faces count, and which triangles it may hit. Traversal
 /// carries it as one value instead of a long argument list.
 #[derive(Clone, Copy)]
 struct RayQuery<'a> {
@@ -33,14 +35,41 @@ struct RayQuery<'a> {
     t_min: f64,
     t_max: f64,
     two_sided: bool,
-    accepts: &'a dyn Fn(&Triangle) -> bool,
+    /// Admits a triangle by its object's ray mask (`Triangle::ray_mask`).
+    accepts: &'a dyn Fn(u8) -> bool,
 }
+
 #[derive(Debug)]
 pub(crate) struct Bvh {
     nodes: Vec<Node>,
     triangle_indices: Vec<usize>,
+    /// Parallel to `triangle_indices`: leaf tests read this contiguous array and never the source triangles.
+    leaf_triangles: Vec<LeafTriangle>,
     root: Option<usize>,
     triangle_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LeafTriangle {
+    positions: [DVec3; 3],
+    triangle_index: usize,
+    double_sided: bool,
+    ray_mask: u8,
+}
+
+/// One primitive handed to [`Bvh::build_primitives`]: its corners, its sidedness and the ray kinds its object admits.
+#[derive(Debug, Clone, Copy)]
+struct Primitive {
+    positions: [DVec3; 3],
+    double_sided: bool,
+    ray_mask: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChildEntry {
+    node: usize,
+    span: (f64, f64),
+    near: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,16 +103,39 @@ impl Bvh {
                 ));
             }
         }
-        Self::build_from_positions(triangles.iter().map(|triangle| triangle.positions))
+        Self::build_primitives(triangles.iter().map(|triangle| Primitive {
+            positions: triangle.positions,
+            double_sided: triangle.double_sided,
+            ray_mask: triangle.ray_mask,
+        }))
     }
 
-    /// A BVH over triangles given by their corner positions; primitive `i` is the `i`th item.
+    /// A BVH over triangles given by their corner positions; primitive `i` is the `i`th item. These primitives carry
+    /// no double-sided flag, so they are one-sided, and no ray mask, so every ray kind meets them.
     pub(crate) fn build_from_positions(
         positions: impl IntoIterator<Item = [DVec3; 3]>,
     ) -> Result<Self> {
-        let primitive_bounds: Vec<Aabb> = positions
+        Self::build_primitives(positions.into_iter().map(|corners| Primitive {
+            positions: corners,
+            double_sided: false,
+            ray_mask: RayKind::ALL_MASK,
+        }))
+    }
+
+    fn build_primitives(items: impl IntoIterator<Item = Primitive>) -> Result<Self> {
+        let primitives: Vec<LeafTriangle> = items
             .into_iter()
-            .map(|corners| Aabb::for_corners(&corners))
+            .enumerate()
+            .map(|(triangle_index, primitive)| LeafTriangle {
+                positions: primitive.positions,
+                triangle_index,
+                double_sided: primitive.double_sided,
+                ray_mask: primitive.ray_mask,
+            })
+            .collect();
+        let primitive_bounds: Vec<Aabb> = primitives
+            .iter()
+            .map(|primitive| Aabb::for_corners(&primitive.positions))
             .collect();
         let triangle_count = primitive_bounds.len();
         let node_capacity = maximum_node_count(triangle_count)?;
@@ -118,15 +170,36 @@ impl Bvh {
             )?)
         };
 
+        let mut leaf_triangles = Vec::new();
+        leaf_triangles
+            .try_reserve_exact(triangle_count)
+            .map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "BVH triangle count exceeds available memory",
+                )
+            })?;
+        for &index in &triangle_indices {
+            let Some(primitive) = primitives.get(index) else {
+                return Err(PotError::new(
+                    ErrorCode::InternalError,
+                    "BVH triangle index is out of range",
+                ));
+            };
+            leaf_triangles.push(*primitive);
+        }
+
         Ok(Self {
             nodes,
             triangle_indices,
+            leaf_triangles,
             root,
             triangle_count,
         })
     }
 
-    /// The nearest hit among the triangles `accepts` admits, so a ray passes through the others.
+    /// The nearest hit among the triangles `accepts` admits, given each triangle's object ray mask, so a ray passes
+    /// through the others. Back faces count.
     pub(crate) fn closest_hit_where(
         &self,
         triangles: &[Triangle],
@@ -134,7 +207,7 @@ impl Bvh {
         direction: DVec3,
         t_min: f64,
         t_max: f64,
-        accepts: &dyn Fn(&Triangle) -> bool,
+        accepts: &dyn Fn(u8) -> bool,
     ) -> Option<BvhHit> {
         let query = RayQuery {
             origin,
@@ -164,14 +237,11 @@ impl Bvh {
             mut remaining,
             kind,
         } = walk;
-        while let Some(hit) = self.closest_hit_where(
-            triangles,
-            origin,
-            direction,
-            epsilon,
-            remaining,
-            &|triangle| kind.is_none_or(|kind| triangle.ray_mask & kind.bit() != 0),
-        ) {
+        while let Some(hit) =
+            self.closest_hit_where(triangles, origin, direction, epsilon, remaining, &|mask| {
+                kind.is_none_or(|kind| mask & kind.bit() != 0)
+            })
+        {
             if !visit(hit, origin) {
                 break;
             }
@@ -203,7 +273,8 @@ impl Bvh {
         if node
             .bounds
             .padded(origin)
-            .intersect_interval(origin, direction, 0.0, f64::INFINITY)
+            .slab_span(origin, direction)
+            .and_then(|span| clip_span(span, 0.0, f64::INFINITY))
             .is_none()
         {
             return;
@@ -225,54 +296,54 @@ impl Bvh {
     }
 
     fn closest_hit_mode(&self, triangles: &[Triangle], query: RayQuery<'_>) -> Option<BvhHit> {
-        let RayQuery {
-            origin,
-            direction,
-            t_min,
-            t_max,
-            ..
-        } = query;
         if triangles.len() != self.triangle_count
-            || !is_finite_vec3(origin)
-            || !is_finite_vec3(direction)
-            || t_min.is_nan()
-            || t_max.is_nan()
-            || t_min > t_max
+            || !is_finite_vec3(query.origin)
+            || !is_finite_vec3(query.direction)
+            || query.t_min.is_nan()
+            || query.t_max.is_nan()
+            || query.t_min > query.t_max
         {
             return None;
         }
 
         let mut nearest = None;
-        if let Some(root) = self.root {
-            self.visit(root, triangles, &query, &mut nearest);
+        if let Some(root) = self.root
+            && let Some(span) = self
+                .nodes
+                .get(root)
+                .and_then(|node| node.bounds.slab_span(query.origin, query.direction))
+        {
+            self.visit(root, span, &query, &mut nearest);
         }
         nearest
+    }
+
+    fn entry(&self, index: usize, query: &RayQuery<'_>, max_distance: f64) -> Option<ChildEntry> {
+        let span = self
+            .nodes
+            .get(index)?
+            .bounds
+            .slab_span(query.origin, query.direction)?;
+        let (near, _) = clip_span(span, query.t_min, max_distance)?;
+        Some(ChildEntry {
+            node: index,
+            span,
+            near,
+        })
     }
 
     fn visit(
         &self,
         node_index: usize,
-        triangles: &[Triangle],
+        span: (f64, f64),
         query: &RayQuery<'_>,
         nearest: &mut Option<BvhHit>,
     ) {
-        let RayQuery {
-            origin,
-            direction,
-            t_min,
-            t_max,
-            two_sided,
-            accepts,
-        } = *query;
         let Some(node) = self.nodes.get(node_index).copied() else {
             return;
         };
-        let current_max = nearest.map_or(t_max, |hit: BvhHit| hit.distance.min(t_max));
-        if node
-            .bounds
-            .intersect_interval(origin, direction, t_min, current_max)
-            .is_none()
-        {
+        let current_max = nearest.map_or(query.t_max, |hit: BvhHit| hit.distance.min(query.t_max));
+        if clip_span(span, query.t_min, current_max).is_none() {
             return;
         }
 
@@ -282,23 +353,19 @@ impl Bvh {
                     return;
                 };
                 for offset in start..end {
-                    let Some(&triangle_index) = self.triangle_indices.get(offset) else {
+                    let Some(leaf) = self.leaf_triangles.get(offset) else {
                         continue;
                     };
-                    let Some(triangle) = triangles.get(triangle_index) else {
-                        continue;
-                    };
-                    if !accepts(triangle) {
+                    if !(query.accepts)(leaf.ray_mask) {
                         continue;
                     }
                     let Some(hit) = intersect_triangle(
-                        triangle,
-                        triangle_index,
-                        origin,
-                        direction,
-                        t_min,
+                        leaf,
+                        query.origin,
+                        query.direction,
+                        query.t_min,
                         current_max,
-                        two_sided,
+                        query.two_sided,
                     ) else {
                         continue;
                     };
@@ -312,30 +379,21 @@ impl Bvh {
                 }
             }
             NodeKind::Branch { left, right } => {
-                let max_distance = nearest.map_or(t_max, |hit: BvhHit| hit.distance.min(t_max));
-                let left_interval = self.nodes.get(left).and_then(|child| {
-                    child
-                        .bounds
-                        .intersect_interval(origin, direction, t_min, max_distance)
-                });
-                let right_interval = self.nodes.get(right).and_then(|child| {
-                    child
-                        .bounds
-                        .intersect_interval(origin, direction, t_min, max_distance)
-                });
-
-                match (left_interval, right_interval) {
-                    (Some(left_interval), Some(right_interval)) => {
-                        if left_interval.0 <= right_interval.0 {
-                            self.visit(left, triangles, query, nearest);
-                            self.visit(right, triangles, query, nearest);
+                let left_entry = self.entry(left, query, current_max);
+                let right_entry = self.entry(right, query, current_max);
+                match (left_entry, right_entry) {
+                    (Some(left_entry), Some(right_entry)) => {
+                        let (first, second) = if left_entry.near <= right_entry.near {
+                            (left_entry, right_entry)
                         } else {
-                            self.visit(right, triangles, query, nearest);
-                            self.visit(left, triangles, query, nearest);
-                        }
+                            (right_entry, left_entry)
+                        };
+                        self.visit(first.node, first.span, query, nearest);
+                        self.visit(second.node, second.span, query, nearest);
                     }
-                    (Some(_), None) => self.visit(left, triangles, query, nearest),
-                    (None, Some(_)) => self.visit(right, triangles, query, nearest),
+                    (Some(entry), None) | (None, Some(entry)) => {
+                        self.visit(entry.node, entry.span, query, nearest);
+                    }
                     (None, None) => {}
                 }
             }
@@ -466,15 +524,11 @@ impl Aabb {
         axis
     }
 
-    fn intersect_interval(
-        self,
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        t_max: f64,
-    ) -> Option<(f64, f64)> {
-        let mut near = t_min;
-        let mut far = t_max;
+    /// The ray's span through the box's slabs, before clamping to a query interval, so it is the same for every
+    /// query. `None` when the slabs are empty or a ray parallel to an axis starts outside the box.
+    fn slab_span(self, origin: DVec3, direction: DVec3) -> Option<(f64, f64)> {
+        let mut near = f64::NEG_INFINITY;
+        let mut far = f64::INFINITY;
         for axis in 0..3 {
             let ray_origin = origin[axis];
             let ray_direction = direction[axis];
@@ -516,22 +570,32 @@ impl Aabb {
     }
 }
 
+/// Clamps a box's slab span to the query interval `[t_min, t_max]`; `None` when they are disjoint.
+fn clip_span(span: (f64, f64), t_min: f64, t_max: f64) -> Option<(f64, f64)> {
+    let (slab_near, slab_far) = span;
+    let near = t_min.max(slab_near);
+    let far = t_max.min(slab_far);
+    if near > far {
+        return None;
+    }
+    Some((near, far))
+}
+
 fn intersect_triangle(
-    triangle: &Triangle,
-    triangle_index: usize,
+    leaf: &LeafTriangle,
     origin: DVec3,
     direction: DVec3,
     t_min: f64,
     t_max: f64,
     two_sided: bool,
 ) -> Option<BvhHit> {
-    let edge1 = triangle.positions[1] - triangle.positions[0];
-    let edge2 = triangle.positions[2] - triangle.positions[0];
+    let edge1 = leaf.positions[1] - leaf.positions[0];
+    let edge2 = leaf.positions[2] - leaf.positions[0];
     let p_vector = direction.cross(edge2);
     let determinant = edge1.dot(p_vector);
     if !determinant.is_finite()
         || determinant.abs() <= f64::MIN_POSITIVE
-        || (!two_sided && !triangle.double_sided && determinant <= 0.0)
+        || (!two_sided && !leaf.double_sided && determinant <= 0.0)
     {
         return None;
     }
@@ -540,7 +604,7 @@ fn intersect_triangle(
     if !inverse_determinant.is_finite() {
         return None;
     }
-    let from_vertex = origin - triangle.positions[0];
+    let from_vertex = origin - leaf.positions[0];
     let barycentric_1 = from_vertex.dot(p_vector) * inverse_determinant;
     let q_vector = from_vertex.cross(edge1);
     let barycentric_2 = direction.dot(q_vector) * inverse_determinant;
@@ -563,7 +627,7 @@ fn intersect_triangle(
     }
 
     Some(BvhHit {
-        triangle_index,
+        triangle_index: leaf.triangle_index,
         distance,
         barycentric: [
             barycentric_0.clamp(0.0, 1.0),

@@ -446,7 +446,7 @@ pub(crate) struct RasterOutput {
 }
 
 #[derive(Clone, Copy)]
-struct CameraFrame {
+pub(crate) struct CameraFrame {
     forward: DVec3,
     right: DVec3,
     up: DVec3,
@@ -548,8 +548,22 @@ pub(crate) fn ray_for_sample(
     sample_y: f64,
 ) -> Result<Option<(DVec3, DVec3)>> {
     let frame = camera_frame(camera, width, height)?;
+    ray_for_sample_in_frame(&frame, camera, width, height, x, y, sample_x, sample_y)
+}
+
+/// [`ray_for_sample`] with the frame already built by [`camera_frame`], so a render builds each eye's frame once.
+pub(crate) fn ray_for_sample_in_frame(
+    frame: &CameraFrame,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    sample_x: f64,
+    sample_y: f64,
+) -> Result<Option<(DVec3, DVec3)>> {
     let ray = ray_for_subpixel_in_frame(
-        &frame,
+        frame,
         camera.position,
         width,
         height,
@@ -1403,7 +1417,7 @@ fn view_axes(camera: &Camera) -> Result<(DVec3, DVec3, DVec3)> {
     Ok((forward, right, up))
 }
 
-fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame> {
+pub(crate) fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<CameraFrame> {
     if width == 0 || height == 0 {
         return Err(PotError::invalid_argument(
             "image width and height must both be non-zero",
@@ -1608,14 +1622,9 @@ pub(crate) fn ambient_visibility(
             direction
         };
         if bvh
-            .closest_hit_where(
-                triangles,
-                origin,
-                direction,
-                1.0e-5,
-                distance,
-                &|triangle| triangle.ray_mask & RayKind::Shadow.bit() != 0,
-            )
+            .closest_hit_where(triangles, origin, direction, 1.0e-5, distance, &|mask| {
+                mask & RayKind::Shadow.bit() != 0
+            })
             .is_none()
         {
             visible += 1;
