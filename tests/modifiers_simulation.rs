@@ -1647,7 +1647,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
             {"op":"node.create","id":"b_instance","kind":"plane","params":{}},
             {"op":"modifier.create","target":{"id":"b_instance"},"id":"particle_copy","type":"particle_instance","params":{"object":"a_emitter","particle_system_index":1,"use_normal":true,"use_children":false,"use_size":true,"show_alive":true,"show_dead":false,"show_unborn":false,"position":0,"random_position":0.0,"axis":"X","space":"WORLD","use_path":false}},
             {"op":"node.create","id":"c_exploder","kind":"box","params":{}},
-            {"op":"physics.particle_emitter.create","target":{"id":"c_exploder"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":1.1,"seed":3}},
+            {"op":"physics.particle_emitter.create","target":{"id":"c_exploder"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":1.1,"seed":29}},
             {"op":"modifier.create","target":{"id":"c_exploder"},"id":"explode_faces","type":"explode","params":{"use_edge_cut":true,"show_alive":true,"show_dead":false,"show_unborn":false,"use_size":false,"protect":0.0}}
         ]),
         0,

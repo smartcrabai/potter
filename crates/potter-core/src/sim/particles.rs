@@ -2155,6 +2155,7 @@ fn sample_interpolated_root(
         + triangle.points[2] * weights[2]
 }
 
+/// Parent association from Blender's interpolated-child distribution.
 fn nearest_parent_weights(
     point: DVec3,
     parents: &[DVec3],
@@ -2164,9 +2165,13 @@ fn nearest_parent_weights(
             "interpolated children require at least one parent particle",
         ));
     }
-    let mut nearest = [(usize::MAX, f64::INFINITY); 3];
+    // Blender's KDTreeNearest stores squared binary32 distance, which `distribute_children_exec`
+    // uses directly in the parent-weight exponent.
+    let point = point.as_vec3();
+    let mut nearest = [(usize::MAX, f32::INFINITY); 3];
     for (index, parent) in parents.iter().enumerate() {
-        let distance = parent.distance(point);
+        let delta = parent.as_vec3() - point;
+        let distance = (delta.x * delta.x + delta.y * delta.y) + delta.z * delta.z;
         if !distance.is_finite() {
             return Err(invalid("interpolated child parent distance is non-finite"));
         }
@@ -2185,21 +2190,20 @@ fn nearest_parent_weights(
     let count = parents.len().min(3);
     let maximum_distance = nearest[count - 1].1;
     let mut indices = [usize::MAX; 3];
-    let mut weights = [0.0; 3];
-    let mut total_weight = 0.0;
+    let mut weights = [0.0_f32; 3];
+    let mut total_weight = 0.0_f32;
     for slot in 0..count {
         indices[slot] = nearest[slot].0;
-        weights[slot] = if maximum_distance <= f64::EPSILON {
-            1.0
-        } else {
-            2.0_f64.powf(-6.0 * nearest[slot].1 / maximum_distance)
-        };
+        let exponent = -6.0_f32 * nearest[slot].1 / maximum_distance;
+        weights[slot] = 2.0_f64.powf(f64::from(exponent)) as f32;
         total_weight += weights[slot];
     }
-    for weight in &mut weights[..count] {
-        *weight /= total_weight;
+    if total_weight > 0.0 {
+        for weight in &mut weights[..count] {
+            *weight /= total_weight;
+        }
     }
-    Ok((indices, weights, count))
+    Ok((indices, weights.map(f64::from), count))
 }
 
 fn interpolated_child_path(
