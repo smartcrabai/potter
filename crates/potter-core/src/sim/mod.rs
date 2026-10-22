@@ -918,7 +918,7 @@ pub(crate) fn evaluate(
     }
     let physics = evaluate_physics(doc, scene_id, frame, base_world_matrices, &members, gate)?;
     let mut result = result.unwrap_or_else(|| empty_result(key.clone()));
-    result.cache_key = key.clone();
+    result.cache_key.clone_from(&key);
     result.deformed_vertices = physics.deformed_vertices;
     result.fluid_particles = physics.fluid_particles;
     result.fluid_surfaces = physics.fluid_surfaces;

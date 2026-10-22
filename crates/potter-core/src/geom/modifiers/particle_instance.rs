@@ -139,19 +139,17 @@ pub fn particle_instance(
             ParticleLifeState::Dead if !show_dead => return true,
             _ => {}
         }
-        if amount == 1.0 {
+        if amount.total_cmp(&1.0).is_eq() {
             return false;
         }
         let count = total as f32;
         let random_index = truncate(psys_frand(system_seed, 3578 + number as u32) * count) % total;
         let minimum = truncate(count * offset) % (total + 1);
         let maximum = truncate(count * (offset + amount)) % (total + 1);
-        if maximum > minimum {
-            random_index < minimum || random_index >= maximum
-        } else if maximum < minimum {
-            random_index < minimum && random_index >= maximum
-        } else {
-            true
+        match maximum.cmp(&minimum) {
+            std::cmp::Ordering::Greater => random_index < minimum || random_index >= maximum,
+            std::cmp::Ordering::Less => random_index < minimum && random_index >= maximum,
+            std::cmp::Ordering::Equal => true,
         }
     };
 
@@ -295,10 +293,10 @@ pub fn particle_instance(
             0.0
         };
         let spin = if has_path && (rotation > 0.0 || random_rotation > 0.0) {
-            let random_angle = if random_rotation != 0.0 {
-                random_rotation * (psys_frand(system_seed, 19957323 + number as u32) - 0.5)
-            } else {
+            let random_angle = if random_rotation == 0.0 {
                 0.0
+            } else {
+                random_rotation * (psys_frand(system_seed, 19_957_323 + number as u32) - 0.5)
             };
             let angle = (std::f64::consts::TAU * f64::from(rotation + random_angle)) as f32;
             DQuat::from_rotation_z(f64::from(angle))
@@ -313,7 +311,7 @@ pub fn particle_instance(
             let (orientation, translation) = if has_path {
                 let mut path_time = if preserve_shape {
                     position * (1.0 - random_position_offset)
-                } else if max_co != min_co {
+                } else if !max_co.total_cmp(&min_co).is_eq() {
                     ((oriented.to_array()[axis] as f32 - min_co) / (max_co - min_co))
                         * position
                         * (1.0 - random_position_offset)
@@ -817,9 +815,9 @@ mod tests {
 
         let output = particle_instance(&mesh, &particles, 0, DMat4::IDENTITY, 1, &params)?;
 
-        assert!(output.vertices.is_empty());
-        assert!(output.edges.is_empty());
-        assert!(output.faces.is_empty());
+        assert_eq!(output.vertices.len(), 0);
+        assert_eq!(output.edges.len(), 0);
+        assert_eq!(output.faces.len(), 0);
         Ok(())
     }
 }

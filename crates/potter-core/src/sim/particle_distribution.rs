@@ -48,7 +48,7 @@ fn binary_search(sum: &[f32], value: f32) -> usize {
         return high;
     }
     while low < high {
-        let mid = (low + high) / 2;
+        let mid = usize::midpoint(low, high);
         if sum[mid] >= value && sum[mid - 1] < value {
             return mid;
         }
@@ -611,7 +611,7 @@ pub(crate) fn distribute_grid(
                     }
                     for i in 0..size[0] {
                         let cell_index = base + i * stride_a;
-                        if inside != 0 || hair[cell_index] % 2 != 0 {
+                        if inside != 0 || !hair[cell_index].is_multiple_of(2) {
                             unexist[cell_index] = false;
                         }
                         inside = (inside + hair[cell_index]) % 2;
@@ -712,8 +712,8 @@ impl WatertightRay {
     /// `isect_ray_tri_watertight_v3_precalc`.
     fn new(direction: Float3) -> Self {
         let kz = axis_dominant(direction);
-        let mut kx = if kz != 2 { kz + 1 } else { 0 };
-        let mut ky = if kx != 2 { kx + 1 } else { 0 };
+        let mut kx = if kz == 2 { 0 } else { kz + 1 };
+        let mut ky = if kx == 2 { 0 } else { kx + 1 };
         // A negative ray swaps the two other axes, which keeps the triangles' winding.
         if direction[kz] < 0.0 {
             std::mem::swap(&mut kx, &mut ky);

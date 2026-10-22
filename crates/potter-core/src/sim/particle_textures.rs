@@ -78,10 +78,10 @@ fn texture_value_blend(tex: f64, out: f64, fact: f64, facg: f64, blend: Blend) -
         Blend::Subtract => -fact * tex + out,
         Blend::Add => fact * tex + out,
         Blend::Divide => {
-            if tex != 0.0 {
-                facm * out + fact * out / tex
-            } else {
+            if tex == 0.0 {
                 0.0
+            } else {
+                facm * out + fact * out / tex
             }
         }
         Blend::Difference => facm * out + fact * (tex - out).abs(),
@@ -293,13 +293,12 @@ pub(crate) fn birth_values(
     for slot in slots {
         let mut sampled = None;
         for &(channel, factor) in &slot.channels {
-            let value = match sampled {
-                Some(value) => value,
-                None => {
-                    let value = slot.sample(birth, rng)?;
-                    sampled = Some(value);
-                    value
-                }
+            let value = if let Some(value) = sampled {
+                value
+            } else {
+                let value = slot.sample(birth, rng)?;
+                sampled = Some(value);
+                value
             };
             let current = match channel {
                 Channel::Time => values.time,
@@ -364,14 +363,14 @@ impl TextureSlot<'_> {
 /// coordinates. The image's repeat, mirror, and crop settings are applied by that sampler.
 fn image_coordinates(mapping: Mapping2d, point: DVec3) -> DVec3 {
     let (u, v) = match mapping {
-        Mapping2d::Flat => ((point.x + 1.0) / 2.0, (point.y + 1.0) / 2.0),
+        Mapping2d::Flat => (point.x.midpoint(1.0), point.y.midpoint(1.0)),
         Mapping2d::Tube => {
             let u = if point.x * point.x + point.y * point.y < 1.0e-12 {
                 0.5
             } else {
                 snap_coordinate(point.x.atan2(-point.y) / std::f64::consts::TAU)
             };
-            (u, (point.z + 1.0) / 2.0)
+            (u, point.z.midpoint(1.0))
         }
         Mapping2d::Sphere => {
             let len_xy = (point.x * point.x + point.y * point.y).sqrt();
@@ -388,11 +387,11 @@ fn image_coordinates(mapping: Mapping2d, point: DVec3) -> DVec3 {
         Mapping2d::Cube => {
             let (x1, y1, z1) = (point.x.abs(), point.y.abs(), point.z.abs());
             if z1 >= x1 && z1 >= y1 {
-                ((point.x + 1.0) / 2.0, (point.y + 1.0) / 2.0)
+                (point.x.midpoint(1.0), point.y.midpoint(1.0))
             } else if y1 >= x1 && y1 >= z1 {
-                ((point.x + 1.0) / 2.0, (point.z + 1.0) / 2.0)
+                (point.x.midpoint(1.0), point.z.midpoint(1.0))
             } else {
-                ((point.y + 1.0) / 2.0, (point.z + 1.0) / 2.0)
+                (point.y.midpoint(1.0), point.z.midpoint(1.0))
             }
         }
     };

@@ -318,7 +318,7 @@ pub fn explode(
     }
     // remap_attributes carries layer names, pins and face presence; Blender's mask-23 corner sources then replace the face values.
     remap_uv_layers(mesh, &mut output, &output_uv_sources)?;
-    apply_particle_uv(mesh, &mut output, requested_uv, &particle_ages)?;
+    apply_particle_uv(mesh, &mut output, requested_uv, &particle_ages);
     output
         .validate()
         .map_err(|error| invalid(&format!("explode produced invalid geometry: {error}")))?;
@@ -562,7 +562,6 @@ fn cut_edges(
         if face.vertices.len() == 3 {
             let original = &face.vertices;
             match mask {
-                16 => add(original.clone(), vertex_particles[original[0]]),
                 19 | 21 | 22 => {
                     let order = match mask {
                         19 => [1, 2, 0],
@@ -601,7 +600,7 @@ fn cut_edges(
                         Some(copied_slots),
                     ));
                 }
-                17 | 18 | 20 => add(original.clone(), vertex_particles[original[0]]),
+                16 | 17 | 18 | 20 => add(original.clone(), vertex_particles[original[0]]),
                 _ => {
                     return Err(invalid(
                         "explode triangle has an impossible edge-cut pattern",
@@ -611,11 +610,10 @@ fn cut_edges(
         } else {
             let original = &face.vertices;
             let order = match mask {
-                3 | 10 | 11 | 15 => [0, 1, 2, 3],
-                5 | 6 | 7 => [1, 2, 3, 0],
+                0 | 3 | 10 | 11 | 15 => [0, 1, 2, 3],
+                5..=7 => [1, 2, 3, 0],
                 9 | 13 => [3, 0, 1, 2],
                 12 | 14 => [2, 3, 0, 1],
-                0 => [0, 1, 2, 3],
                 _ => return Err(invalid("explode quad has an impossible edge-cut pattern")),
             };
             let [a, b, c, d] = order.map(|corner| original[corner]);
@@ -734,9 +732,9 @@ fn source_corner_weights(
 }
 
 fn rotate_valid_face(
-    vertices: &mut Vec<u32>,
-    copy_corners: &mut Vec<Vec<(usize, f64)>>,
-    uv_corners: &mut Vec<Vec<(usize, f64)>>,
+    vertices: &mut [u32],
+    copy_corners: &mut [Vec<(usize, f64)>],
+    uv_corners: &mut [Vec<(usize, f64)>],
 ) {
     let rotation = if vertices.len() == 3 && vertices[2] == 0 {
         1
@@ -819,7 +817,7 @@ fn remap_uv_layers(
     Ok(())
 }
 
-/// Legacy tessfaces have an opaque-white fourth BYTE_COLOR slot even when the source is a triangle.
+/// Legacy tessfaces have an opaque-white fourth `BYTE_COLOR` slot even when the source is a triangle.
 fn fill_triangle_byte_color_padding(
     source: &Mesh,
     output: &mut Mesh,
@@ -881,23 +879,13 @@ fn particle_age(particle: Option<&ParticleState>, frame: f64) -> f32 {
         let lifetime = death - birth;
         (current - birth) / lifetime
     });
-    if age < 0.001 {
-        age = 0.001;
-    }
-    if age > 0.999 {
-        age = 0.999;
-    }
+    age = age.clamp(0.001, 0.999);
     age
 }
 
-fn apply_particle_uv(
-    source: &Mesh,
-    output: &mut Mesh,
-    requested: &str,
-    ages: &[f32],
-) -> crate::error::Result<()> {
+fn apply_particle_uv(source: &Mesh, output: &mut Mesh, requested: &str, ages: &[f32]) {
     if !uv_layers::has_uv_layers(source) || requested.is_empty() {
-        return Ok(());
+        return;
     }
     let mut layers = uv_layers::read_layers(output);
     if let Some(layer) = layers.iter_mut().find(|layer| layer.name == requested) {
@@ -906,7 +894,6 @@ fn apply_particle_uv(
         }
         uv_layers::write_layers(output, &layers);
     }
-    Ok(())
 }
 
 fn take_id(next: &mut u32) -> crate::error::Result<u32> {
@@ -1131,15 +1118,18 @@ mod tests {
         assert_eq!(output.vertices.len(), 8);
         let colors = output.attributes["FixtureCornerColor"]["values"]
             .as_object()
-            .expect("Explode corner color rows");
+            .ok_or_else(|| crate::error::PotError::invalid_argument("Explode corner color rows"))?;
         for face in &output.faces {
             let row = colors
                 .get(&format!("f{}", face.id))
                 .and_then(serde_json::Value::as_array)
-                .expect("Explode face color row");
+                .ok_or_else(|| {
+                    crate::error::PotError::invalid_argument("Explode face color row")
+                })?;
             let mut white_slots = 0;
             for value in row {
-                let color: [f64; 4] = serde_json::from_value(value.clone()).expect("RGBA color");
+                let color: [f64; 4] = serde_json::from_value(value.clone())
+                    .map_err(|error| crate::error::PotError::invalid_argument(error.to_string()))?;
                 if color == [1.0; 4] {
                     white_slots += 1;
                 } else {
@@ -1149,7 +1139,7 @@ mod tests {
                     );
                 }
             }
-            assert_eq!(white_slots, if face.vertices.len() == 4 { 1 } else { 0 });
+            assert_eq!(white_slots, usize::from(face.vertices.len() == 4));
         }
         Ok(())
     }

@@ -761,8 +761,9 @@ fn simulate_with_lifecycle(
         };
         // Blender's `PARS_UNEXIST` (`init_particle_texture`): `free_unexisting_particles` removes those
         // particles, so the survivors' index drives the later per-particle random draws.
-        let exists = !(values.density
-            < f64::from(psys_frand(system_seed, particle_index.wrapping_add(125))));
+        let threshold = f64::from(psys_frand(system_seed, particle_index.wrapping_add(125)));
+        // `!(density < threshold)` also keeps a NaN density, which an ordered `>=` would drop.
+        let exists = values.density.is_nan() || values.density >= threshold;
         if !exists {
             continue;
         }
@@ -2179,7 +2180,7 @@ fn nearest_parent_weights(
         }
         for slot in 0..nearest.len() {
             if distance < nearest[slot].1
-                || (distance == nearest[slot].1 && index < nearest[slot].0)
+                || (distance.total_cmp(&nearest[slot].1).is_eq() && index < nearest[slot].0)
             {
                 for displaced in (slot + 1..nearest.len()).rev() {
                     nearest[displaced] = nearest[displaced - 1];
@@ -2695,7 +2696,7 @@ mod tests {
         .expect("missing path keys preserve current particle state");
 
         assert_eq!(particles.len(), 1);
-        assert!(particles[0].path.is_empty());
+        assert_eq!(particles[0].path.len(), 0);
         assert_eq!(particles[0].life_state, ParticleLifeState::Alive);
     }
 
@@ -2823,7 +2824,7 @@ mod tests {
         assert_eq!(particles.len(), 2);
         assert_eq!(particles[0].birth_frame, 0.0);
         assert_eq!(particles[0].life_state, ParticleLifeState::Alive);
-        assert!(!particles[0].path.is_empty());
+        assert_ne!(particles[0].path.len(), 0);
         assert!(particles[0].path_root_rotation.is_some());
         assert_eq!(particles[1].life_state, ParticleLifeState::Alive);
         assert_eq!(

@@ -755,7 +755,7 @@ def corner_normal_codes(mesh):
         raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
     codes = []
     for item in attribute.data:
-        pair = [int(value) for value in item.vector]
+        pair = [int(value) for value in item.value]
         codes.append(None if pair == [0,0] else pair)
     return codes
 
@@ -1824,7 +1824,7 @@ def corner_normal_codes(mesh):
         return None
     if attribute.domain != 'CORNER' or attribute.data_type != 'INT16_2D':
         raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
-    return [None if list(item.vector) == [0,0] else [int(value) for value in item.vector]
+    return [None if list(item.value) == [0,0] else [int(value) for value in item.value]
             for item in attribute.data]
 
 
@@ -2721,7 +2721,7 @@ def corner_normal_codes(mesh):
         return None
     if attribute.domain != 'CORNER' or attribute.data_type != 'INT16_2D':
         raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
-    return [None if list(item.vector) == [0,0] else [int(value) for value in item.vector]
+    return [None if list(item.value) == [0,0] else [int(value) for value in item.value]
             for item in attribute.data]
 
 def mesh_snapshot(mesh):
@@ -3657,7 +3657,7 @@ def corner_normal_codes(mesh):
         return None
     if attribute.domain != 'CORNER' or attribute.data_type != 'INT16_2D':
         raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
-    return [None if list(item.vector) == [0,0] else [int(value) for value in item.vector]
+    return [None if list(item.value) == [0,0] else [int(value) for value in item.value]
             for item in attribute.data]
 result = {
     'track_axis':obj.track_axis,
