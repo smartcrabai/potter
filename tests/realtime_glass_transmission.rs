@@ -110,6 +110,7 @@ fn realtime_glass_transmission_matches_eevee() -> TestResult {
     let image: Image = serde_json::from_value(read_scene(&project)?["images"]["render"].clone())?;
     let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
     for name in SPHERES {
+        eprintln!("GLASS_SPHERE {name}");
         let worst = worst_deviation(&data, &oracle["spheres"][name])?;
         assert!(
             worst.deviation <= TOLERANCE,
@@ -161,6 +162,20 @@ fn worst_deviation(
             .zip(wanted)
             .map(|(a, w)| (a - w).abs())
             .fold(0.0_f64, f64::max);
+        // Diagnostic: every checked pixel's EEVEE value (this platform's Blender) and Potter's, for measuring the
+        // platform difference against the model (`GLASS_PX uv_u uv_v eevee_r eevee_g eevee_b potter_r potter_g potter_b`).
+        eprintln!(
+            "GLASS_PX {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",
+            uv[0],
+            uv[1],
+            wanted[0],
+            wanted[1],
+            wanted[2],
+            actual[0],
+            actual[1],
+            actual[2],
+            deviation
+        );
         if deviation > worst.deviation {
             worst = Deviation {
                 deviation,
