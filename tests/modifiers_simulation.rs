@@ -3182,9 +3182,7 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
             );
             return Ok(());
         }
-        Ok(_) => panic!(
-            "recorded gap closed: the Blender fixture evaluates the Hair COLLECTION path cache; convert to parity"
-        ),
+        Ok(_) => {}
     }
     let blender: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
     let particles = injected_particles(&blender["hair_states"])?;

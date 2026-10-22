@@ -9,11 +9,10 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Edge, Face, Mesh, Vertex, edge_key,
+        Mesh,
         vdb::{VdbGrid, VdbValue, VdbVolume},
         volume::{VolumeData, VolumeGeneratedSource, VolumeGrid, VolumeSource},
     },
-    sim::ParticleState,
 };
 
 /// Resamples inline or VDB scalar volume grids using mapped texture color as a displacement vector.
@@ -448,75 +447,6 @@ fn dilate_face_edge(seeds: Vec<IVec3>, rounds: i32) -> Result<HashSet<IVec3>> {
     Ok(domain)
 }
 
-fn append_instances(mesh: &Mesh, transforms: &[(DMat4, DVec3)]) -> Result<Mesh> {
-    if transforms.is_empty() {
-        return Ok(Mesh::default());
-    }
-    let vertex_count = mesh
-        .vertices
-        .len()
-        .checked_mul(transforms.len())
-        .ok_or_else(|| invalid("particle instance vertex count overflows"))?;
-    let edge_count = mesh
-        .edges
-        .len()
-        .checked_mul(transforms.len())
-        .ok_or_else(|| invalid("particle instance edge count overflows"))?;
-    let face_count = mesh
-        .faces
-        .len()
-        .checked_mul(transforms.len())
-        .ok_or_else(|| invalid("particle instance face count overflows"))?;
-    let mut output = Mesh::default();
-    output.vertices.reserve(vertex_count);
-    output.edges.reserve(edge_count);
-    output.faces.reserve(face_count);
-    for (matrix, translation) in transforms {
-        let mut remap = BTreeMap::new();
-        for vertex in &mesh.vertices {
-            let id = take_id(&mut output.next_id.vertex)?;
-            let position = matrix.transform_point3(vertex.co) + *translation;
-            output.vertices.push(Vertex { id, co: position });
-            remap.insert(vertex.id, id);
-        }
-        for edge in &mesh.edges {
-            let id = take_id(&mut output.next_id.edge)?;
-            let vertices = [
-                *remap
-                    .get(&edge.vertices[0])
-                    .ok_or_else(|| invalid("particle instance edge references a missing vertex"))?,
-                *remap
-                    .get(&edge.vertices[1])
-                    .ok_or_else(|| invalid("particle instance edge references a missing vertex"))?,
-            ];
-            output.edges.push(Edge { id, vertices });
-        }
-        for face in &mesh.faces {
-            let id = take_id(&mut output.next_id.face)?;
-            let vertices = face
-                .vertices
-                .iter()
-                .map(|vertex_id| {
-                    remap.get(vertex_id).copied().ok_or_else(|| {
-                        invalid("particle instance face references a missing vertex")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            output.faces.push(Face {
-                id,
-                vertices,
-                material_index: face.material_index,
-            });
-        }
-    }
-    output.validate().map_err(|error| {
-        invalid(&format!(
-            "particle instancing produced invalid geometry: {error}"
-        ))
-    })?;
-    Ok(output)
-}
-
 /// `OpenVDB`'s `Mat4 * Mat4` (`openvdb/math/Mat4.h`, `operator*=`) on the memory of two float
 /// matrices: `result(i, j) = a(i, 0) b(0, j) + a(i, 1) b(1, j) + a(i, 2) b(2, j) + a(i, 3) b(3, j)`,
 /// summed left to right in `float`. Blender's `float[4][4]` has the same memory layout.
@@ -637,17 +567,6 @@ pub(super) fn invalid(message: &str) -> PotError {
 fn limit(message: &str) -> PotError {
     PotError::new(ErrorCode::LimitExceeded, message)
 }
-fn take_id(next: &mut u32) -> Result<u32> {
-    let id = *next;
-    *next = next.checked_add(1).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "modifier output exhausted mesh element IDs",
-        )
-    })?;
-    Ok(id)
-}
-
 fn unsupported(feature_id: &str, reason: &str) -> PotError {
     PotError::with_details(
         ErrorCode::UnsupportedFeature,
