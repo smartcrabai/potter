@@ -136,6 +136,9 @@ fn bake_attribute_element_count(mesh: &Mesh, domain: &str) -> Option<usize> {
     }
 }
 
+/// Structural check of an inline node-bake resource, run on every scene validation. It reads the kind, version,
+/// the frame list and each frame's socket layout, but never the baked meshes or values: a frame's contents are
+/// validated when it is read (`validate_node_bake_frame`) and when a record is written (`validate_node_bake_record`).
 pub(crate) fn validate_node_bake_resource(value: &Value) -> Result<()> {
     let invalid = || {
         PotError::new(
@@ -143,19 +146,112 @@ pub(crate) fn validate_node_bake_resource(value: &Value) -> Result<()> {
             "inline node-bake resource is invalid",
         )
     };
-    if crate::model::migrate::inline_resource_kind(value)? != Some("node_bake") {
-        return Err(invalid());
-    }
-    if value
-        .get("frames")
-        .and_then(Value::as_array)
-        .is_none_or(|frames| frames.len() > MAX_NODE_BAKE_FRAME_COUNT)
-        || estimate_json_value_heap(value) > MAX_NODE_BAKE_PACKED_BYTES
+    if crate::model::migrate::inline_resource_kind(value)? != Some("node_bake")
+        || value.get("version").and_then(Value::as_u64) != Some(1)
     {
         return Err(invalid());
     }
-    let record: NodeBakeRecord = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
-    validate_node_bake_record(&record)
+    let frames = value
+        .get("frames")
+        .and_then(Value::as_array)
+        .filter(|frames| !frames.is_empty() && frames.len() <= MAX_NODE_BAKE_FRAME_COUNT)
+        .ok_or_else(invalid)?;
+    let mut previous = None;
+    let mut socket_ids: Option<BTreeSet<&str>> = None;
+    for frame in frames {
+        let number = frame
+            .get("frame")
+            .and_then(Value::as_f64)
+            .ok_or_else(invalid)?;
+        if previous.is_some_and(|previous| number <= previous) {
+            return Err(invalid());
+        }
+        previous = Some(number);
+        let values = frame
+            .get("values")
+            .and_then(Value::as_object)
+            .filter(|values| !values.is_empty())
+            .ok_or_else(invalid)?;
+        if values.values().any(|baked| {
+            !matches!(
+                baked.get("type").and_then(Value::as_str),
+                Some("geometry" | "scalar" | "field")
+            )
+        }) {
+            return Err(invalid());
+        }
+        let keys = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if *socket_ids.get_or_insert_with(|| keys.clone()) != keys {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+/// The stored resource of a packed Bake node, named by its `resource_id`, and that ID. The resource must be a
+/// node-bake resource; its frames are checked by the caller when they are read.
+pub(crate) fn packed_node_bake_resource<'a>(
+    resources: &'a BTreeMap<Id, Value>,
+    config: &Value,
+) -> Result<(Id, &'a Value)> {
+    let resource_text = config
+        .get("resource_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                "packed node-bake resource ID is missing",
+            )
+        })?;
+    let resource_id = Id::new(resource_text.to_owned()).map_err(|_| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "packed node-bake resource ID is invalid",
+        )
+    })?;
+    let resource = resources.get(&resource_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            format!("node-bake resource `{resource_id}` is missing"),
+            serde_json::json!({"resource_id": resource_id}),
+        )
+    })?;
+    if crate::model::migrate::inline_resource_kind(resource)? != Some("node_bake") {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "packed resource is not a node-bake resource",
+        ));
+    }
+    Ok((resource_id, resource))
+}
+
+/// Whether a Bake node's settings use their own `directory` instead of the modifier's `bake_directory`.
+pub(crate) fn uses_custom_node_bake_path(config: &Value) -> bool {
+    config
+        .get("use_custom_path")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The directory a Bake node's payloads live in: its own `directory` when it uses a custom path, otherwise the
+/// modifier's `bake_directory`. `None` when that directory is empty, which names no location.
+pub(crate) fn node_bake_directory(
+    modifier: &crate::model::Modifier,
+    config: &Value,
+) -> Option<String> {
+    let directory = if uses_custom_node_bake_path(config) {
+        config
+            .get("directory")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    } else {
+        modifier
+            .params
+            .get("bake_directory")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    (!directory.is_empty()).then(|| directory.to_owned())
 }
 
 pub(crate) fn validate_node_bake_record(record: &NodeBakeRecord) -> Result<()> {
@@ -295,7 +391,6 @@ pub(crate) fn validate_node_bake_config(value: &Value) -> Result<()> {
         "frame_end",
         "use_custom_path",
         "directory",
-        "cache_directory",
     ];
     if config.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(invalid());
@@ -392,9 +487,9 @@ pub(crate) fn validate_node_bake_settings(value: &Value) -> Result<()> {
     if config
         .get("use_custom_path")
         .is_some_and(|value| !value.is_boolean())
-        || ["directory", "cache_directory"]
-            .into_iter()
-            .any(|key| config.get(key).is_some_and(|value| !value.is_string()))
+        || config
+            .get("directory")
+            .is_some_and(|value| !value.is_string())
     {
         return Err(invalid());
     }
@@ -408,10 +503,6 @@ fn valid_sha256_digest(digest: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     })
-}
-
-fn estimate_json_value_heap(value: &Value) -> usize {
-    std::mem::size_of::<Value>().saturating_add(estimate_json_value_dynamic(value))
 }
 
 fn estimate_json_value_dynamic(value: &Value) -> usize {
@@ -577,7 +668,7 @@ impl NodeBakePayloadTransaction {
         bytes: &[u8],
         expected_frame: f64,
         replace_existing: bool,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         self.require_staging()?;
         if bytes.len() > MAX_NODE_BAKE_PAYLOAD_BYTES {
             return Err(payload_limit_error());
@@ -606,7 +697,7 @@ impl NodeBakePayloadTransaction {
         let prior_digest = if let Some(current) = prior_bytes {
             let current_digest = crate::hash::sha256(&current);
             if current_digest == digest {
-                return Ok(false);
+                return Ok(());
             }
             if !replace_existing {
                 return Err(PotError::new(
@@ -652,7 +743,7 @@ impl NodeBakePayloadTransaction {
         node_id: &str,
         digest: &str,
         expected_frame: f64,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         self.require_staging()?;
         let relative = node_bake_relative_path(directory, object_id, modifier_id, node_id, digest)?;
         let (directory_key, filename) = payload_parent_and_name(&relative)?;
@@ -665,7 +756,7 @@ impl NodeBakePayloadTransaction {
             ));
         }
         if self.ensure_directory_if_present(&directory_key)?.is_none() {
-            return Ok(false);
+            return Ok(());
         }
         let directory_handle = self.directories.get(&directory_key).ok_or_else(|| {
             PotError::new(
@@ -676,7 +767,7 @@ impl NodeBakePayloadTransaction {
         let Some(bytes) =
             read_regular_file(directory_handle, &filename, MAX_NODE_BAKE_PAYLOAD_BYTES)?
         else {
-            return Ok(false);
+            return Ok(());
         };
         validate_payload_frame(&bytes, digest, expected_frame, ErrorCode::SceneInvalid)?;
         self.targets
@@ -693,7 +784,7 @@ impl NodeBakePayloadTransaction {
             backup_created: false,
             destination_published: false,
         });
-        Ok(true)
+        Ok(())
     }
 
     pub fn publish(&mut self) -> Result<()> {
@@ -1131,12 +1222,8 @@ fn directory_open_error(error: &std::io::Error) -> PotError {
             "node-bake path contains a symlink or non-directory",
         )
     } else {
-        storage_error(error)
+        PotError::io(error)
     }
-}
-
-fn storage_error(error: &std::io::Error) -> PotError {
-    PotError::io(error)
 }
 
 fn open_regular_file(directory: &File, filename: &str) -> Result<Option<File>> {
@@ -1237,11 +1324,25 @@ fn unique_backup_name() -> String {
 #[cfg(unix)]
 fn rename_noreplace(directory: &File, from: &str, to: &str) -> Result<()> {
     renameat_with(directory, from, directory, to, RenameFlags::NOREPLACE)
-        .map_err(|error| storage_error(&std::io::Error::from(error)))
+        .map_err(|error| PotError::io(&std::io::Error::from(error)))
 }
 
 #[cfg(unix)]
-fn move_to_backup(directory: &File, from: &str, to: &str, _expected_digest: &str) -> Result<()> {
+fn move_to_backup(directory: &File, from: &str, to: &str, expected_digest: &str) -> Result<()> {
+    // The digest is checked before the rename, so a changed payload is never moved away.
+    let source =
+        read_regular_file(directory, from, MAX_NODE_BAKE_PAYLOAD_BYTES)?.ok_or_else(|| {
+            PotError::io(&std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "node-bake payload disappeared before backup",
+            ))
+        })?;
+    if crate::hash::sha256(&source) != expected_digest {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "node-bake payload changed before backup",
+        ));
+    }
     rename_noreplace(directory, from, to)
 }
 
@@ -1514,92 +1615,16 @@ fn safe_path_segment(value: &str) -> Result<&str> {
     Ok(value)
 }
 
+// Node-bake disk storage needs no-follow directory-handle operations, which Unix and Windows provide. Shipped
+// targets are Unix and Windows only, so any other target fails at compile time instead of carrying stubs.
 #[cfg(not(any(unix, windows)))]
-pub struct NodeBakePayloadTransaction;
-
-#[cfg(not(any(unix, windows)))]
-impl NodeBakePayloadTransaction {
-    pub fn new(_project_root: &Path) -> Result<Self> {
-        Err(storage_platform_error())
-    }
-
-    pub fn stage_write(
-        &mut self,
-        _directory: &str,
-        _object_id: &Id,
-        _modifier_id: &Id,
-        _node_id: &str,
-        _digest: &str,
-        _bytes: &[u8],
-        _expected_frame: f64,
-        _replace_existing: bool,
-    ) -> Result<bool> {
-        Err(storage_platform_error())
-    }
-
-    pub fn stage_delete(
-        &mut self,
-        _directory: &str,
-        _object_id: &Id,
-        _modifier_id: &Id,
-        _node_id: &str,
-        _digest: &str,
-        _expected_frame: f64,
-    ) -> Result<bool> {
-        Err(storage_platform_error())
-    }
-
-    pub fn publish(&mut self) -> Result<()> {
-        Err(storage_platform_error())
-    }
-
-    pub fn commit(self) -> Result<()> {
-        Err(storage_platform_error())
-    }
-
-    pub fn rollback(self) -> Result<()> {
-        Err(storage_platform_error())
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn read_node_bake_payload(
-    _project_root: &Path,
-    _bake_directory: &str,
-    _object_id: &Id,
-    _modifier_id: &Id,
-    _node_id: &str,
-    _digest: &str,
-) -> Result<Option<Vec<u8>>> {
-    Err(storage_platform_error())
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn read_node_bake_payload_limited(
-    _project_root: &Path,
-    _bake_directory: &str,
-    _object_id: &Id,
-    _modifier_id: &Id,
-    _node_id: &str,
-    _digest: &str,
-    _max_bytes: usize,
-) -> Result<Option<Vec<u8>>> {
-    Err(storage_platform_error())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn storage_platform_error() -> PotError {
-    PotError::new(
-        ErrorCode::UnsupportedFeature,
-        "node-bake disk storage requires no-follow directory-handle operations",
-    )
-}
+compile_error!("node-bake disk storage requires a Unix or Windows target");
 
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "node-bake resource and path tests")]
 
-    use std::{fs, os::unix::fs::symlink};
+    use std::fs;
 
     use serde_json::json;
     use tempfile::tempdir;
@@ -1677,7 +1702,7 @@ mod tests {
         validate_node_bake_config(&json!({
             "storage":"disk",
             "frames":[{"frame":1,"digest":format!("sha256:{}", "0".repeat(64))}],
-            "cache_directory":"//bakes"
+            "directory":"//bakes"
         }))
         .unwrap();
         for invalid in [
@@ -1913,8 +1938,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn disk_payload_paths_reject_parent_traversal_and_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
         let project = tempdir().unwrap();
         let outside = tempdir().unwrap();
         let object_id = Id::new("object").unwrap();

@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     GraphKind, GraphNode, NodeBakeFrame, NodeBakeRecord, NodeBakeValue, NodeGroup, same_bake_frame,
-    sockets::{is_known_node_type, node_sockets},
+    sockets::{bake_item_identifier, is_known_node_type, node_sockets},
 };
 
 const MAX_GENERATED_POINTS: usize = 1_000_000;
@@ -3551,13 +3551,6 @@ fn mix_json_value(first: &Value, second: &Value, factor: f64) -> Value {
     }
 }
 
-fn bake_item_identifier(item: &Value) -> Option<String> {
-    item.get("id")
-        .or_else(|| item.get("identifier"))
-        .or_else(|| item.get("name"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
 fn mesh_evaluation_error(error: &MeshError) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, error.to_string())
 }

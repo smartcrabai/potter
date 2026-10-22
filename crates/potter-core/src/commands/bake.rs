@@ -431,15 +431,12 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     )?;
     let requested_bake_target = effective_node_bake_target(modifier, Some(&bake_settings))?;
     let mut bake_target = requested_bake_target;
-    let custom_path = bake_settings
-        .get("use_custom_path")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let custom_path = crate::graph::uses_custom_node_bake_path(&bake_settings);
     // Blender `bake_simulation_validate_paths` fills an empty modifier directory with its default
     // before a DISK bake (object_bake_simulation.cc:755-778). A custom path that is empty has no
     // location, and the bake is packed instead (get_node_bake_path, object_bake_simulation.cc:1005-1009).
     let mut default_directory = None;
-    let mut resolved_directory = effective_node_bake_directory(modifier, Some(&bake_settings))?;
+    let mut resolved_directory = crate::graph::node_bake_directory(modifier, &bake_settings);
     if bake_target == "DISK" && resolved_directory.is_none() && !custom_path {
         if let Some(directory) =
             default_modifier_bake_directory(project.path(), &object.name, &modifier.name)
@@ -712,7 +709,7 @@ fn pack_node_bake(
         ));
     }
     let bake_directory =
-        effective_node_bake_directory(modifier, Some(bake_settings))?.ok_or_else(|| {
+        crate::graph::node_bake_directory(modifier, bake_settings).ok_or_else(|| {
             PotError::new(
                 ErrorCode::InvalidOperation,
                 "a disk Bake-node cache has no directory to pack from",
@@ -882,42 +879,7 @@ fn unpack_node_bake(
             "only a packed Bake-node cache can be unpacked",
         ));
     }
-    let resource_id = config
-        .get("resource_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::SceneInvalid,
-                "packed node-bake resource ID is missing",
-            )
-        })?;
-    let resource_id = Id::new(resource_id.to_owned()).map_err(|_| {
-        PotError::new(
-            ErrorCode::SceneInvalid,
-            "packed node-bake resource ID is invalid",
-        )
-    })?;
-    let resource = doc.resources.get(&resource_id).ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::DependencyMissing,
-            format!("node-bake resource `{resource_id}` is missing"),
-            json!({"resource_id":resource_id}),
-        )
-    })?;
-    if crate::model::migrate::inline_resource_kind(resource)? != Some("node_bake") {
-        return Err(PotError::new(
-            ErrorCode::SceneInvalid,
-            "packed resource is not a node-bake resource",
-        ));
-    }
-    let record = serde_json::from_value::<NodeBakeRecord>(resource.clone()).map_err(|error| {
-        PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "packed node-bake resource is invalid",
-            json!({"cause":error.to_string()}),
-        )
-    })?;
-    crate::graph::validate_node_bake_record(&record)?;
+    let record = node_bake_packed_record(project, &config)?;
     let (bake_directory, use_custom_path, custom_directory) =
         node_bake_unpack_directory(method, modifier, bake_settings);
     let mut transaction = NodeBakePayloadTransaction::new(project.path())?;
@@ -1210,29 +1172,6 @@ fn effective_node_bake_target(
     }
 }
 
-fn effective_node_bake_directory(
-    modifier: &crate::model::Modifier,
-    config: Option<&Value>,
-) -> Result<Option<String>> {
-    // `None` means the bake has no location on disk (get_node_bake_path returns no path).
-    if config
-        .and_then(|config| config.get("use_custom_path"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Ok(config
-            .and_then(|config| config.get("directory"))
-            .and_then(Value::as_str)
-            .filter(|directory| !directory.is_empty())
-            .map(str::to_owned));
-    }
-    Ok(modifier
-        .params
-        .get("bake_directory")
-        .and_then(Value::as_str)
-        .filter(|directory| !directory.is_empty())
-        .map(str::to_owned))
-}
 fn node_bake_unpack_directory(
     method: NodeBakeUnpackMethod,
     modifier: &crate::model::Modifier,
@@ -1249,11 +1188,7 @@ fn node_bake_unpack_directory(
     match method {
         NodeBakeUnpackMethod::UseLocal | NodeBakeUnpackMethod::WriteLocal => local(),
         NodeBakeUnpackMethod::UseOriginal | NodeBakeUnpackMethod::WriteOriginal => {
-            if config
-                .get("use_custom_path")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            if crate::graph::uses_custom_node_bake_path(config) {
                 if let Some(directory) = config
                     .get("directory")
                     .and_then(Value::as_str)
@@ -1647,34 +1582,7 @@ fn node_bake_payload_is_kept(
 }
 
 fn node_bake_packed_record(project: &Project, config: &Value) -> Result<NodeBakeRecord> {
-    let resource_id = config
-        .get("resource_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::SceneInvalid,
-                "packed node-bake resource ID is missing",
-            )
-        })?;
-    let resource_id = Id::new(resource_id.to_owned()).map_err(|_| {
-        PotError::new(
-            ErrorCode::SceneInvalid,
-            "packed node-bake resource ID is invalid",
-        )
-    })?;
-    let resource = project.doc().resources.get(&resource_id).ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::DependencyMissing,
-            format!("node-bake resource `{resource_id}` is missing"),
-            json!({"resource_id":resource_id}),
-        )
-    })?;
-    if crate::model::migrate::inline_resource_kind(resource)? != Some("node_bake") {
-        return Err(PotError::new(
-            ErrorCode::SceneInvalid,
-            "packed resource is not a node-bake resource",
-        ));
-    }
+    let (_, resource) = crate::graph::packed_node_bake_resource(&project.doc().resources, config)?;
     let record = serde_json::from_value::<NodeBakeRecord>(resource.clone()).map_err(|error| {
         PotError::with_details(
             ErrorCode::SceneInvalid,
@@ -1692,42 +1600,32 @@ fn node_bake_payload_directory(
     modifier_id: &Id,
     config: &Value,
 ) -> Result<String> {
-    if config
-        .get("use_custom_path")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return config
-            .get("directory")
-            .and_then(Value::as_str)
-            .filter(|directory| !directory.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::SceneInvalid,
-                    "custom node-bake directory is missing",
-                )
-            });
-    }
-    Ok(config
-        .get("cache_directory")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            project
-                .doc()
-                .nodes
-                .get(target)
-                .and_then(|object| {
-                    object
-                        .modifiers
-                        .iter()
-                        .find(|modifier| modifier.id == *modifier_id)
-                })
-                .and_then(|modifier| modifier.params.get("bake_directory"))
-                .and_then(Value::as_str)
+    let modifier = project
+        .doc()
+        .nodes
+        .get(target)
+        .and_then(|object| {
+            object
+                .modifiers
+                .iter()
+                .find(|modifier| modifier.id == *modifier_id)
         })
-        .unwrap_or_default()
-        .to_owned())
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                "node-bake modifier was not found",
+            )
+        })?;
+    let directory = crate::graph::node_bake_directory(modifier, config);
+    if crate::graph::uses_custom_node_bake_path(config) {
+        return directory.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                "custom node-bake directory is missing",
+            )
+        });
+    }
+    Ok(directory.unwrap_or_default())
 }
 
 fn node_bake_directory_key(directory: &str) -> PathBuf {

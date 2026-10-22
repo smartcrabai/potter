@@ -87,11 +87,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             .iter()
             .map(|item| {
                 Some((
-                    item.get("id")
-                        .or_else(|| item.get("identifier"))
-                        .or_else(|| item.get("name"))?
-                        .as_str()?
-                        .to_owned(),
+                    bake_item_identifier(item)?,
                     bake_item_socket_type(item.get("socket_type")?.as_str()?)?.to_owned(),
                 ))
             })
@@ -452,6 +448,15 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         _ => return None,
     };
     Some(sockets)
+}
+
+/// The socket identifier of a Bake item: its `id`, falling back to `identifier` and then `name`.
+pub(super) fn bake_item_identifier(item: &serde_json::Value) -> Option<String> {
+    item.get("id")
+        .or_else(|| item.get("identifier"))
+        .or_else(|| item.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 fn bake_item_socket_type(value: &str) -> Option<&'static str> {
     match value {

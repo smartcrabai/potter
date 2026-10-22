@@ -1445,22 +1445,14 @@ impl Snapshot {
                             },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;
-                    node_bake_captures.extend(evaluated.bake_captures.into_iter().map(
-                        |((modifier_id, node_id), frame)| {
-                            (
-                                (id.clone(), modifier_id, node_id),
-                                bake_frame_with_material_refs(
-                                    frame,
-                                    &node.materials.iter().flatten().cloned().collect::<Vec<_>>(),
-                                ),
-                            )
-                        },
-                    ));
-                    node_bake_material_refs.extend(evaluated.bake_material_refs.into_iter().map(
-                        |((modifier_id, node_id), materials)| {
-                            ((id.clone(), modifier_id, node_id), materials)
-                        },
-                    ));
+                    key_node_bake_outputs(
+                        id,
+                        &node.materials.iter().flatten().cloned().collect::<Vec<_>>(),
+                        evaluated.bake_captures,
+                        evaluated.bake_material_refs,
+                        &mut node_bake_captures,
+                        &mut node_bake_material_refs,
+                    );
                     modifier_warnings.extend(
                         evaluated
                             .warnings
@@ -1797,22 +1789,14 @@ impl Snapshot {
                             },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;
-                    node_bake_captures.extend(evaluated.bake_captures.into_iter().map(
-                        |((modifier_id, node_id), frame)| {
-                            (
-                                (id.clone(), modifier_id, node_id),
-                                bake_frame_with_material_refs(
-                                    frame,
-                                    &node.materials.iter().flatten().cloned().collect::<Vec<_>>(),
-                                ),
-                            )
-                        },
-                    ));
-                    node_bake_material_refs.extend(evaluated.bake_material_refs.into_iter().map(
-                        |((modifier_id, node_id), materials)| {
-                            ((id.clone(), modifier_id, node_id), materials)
-                        },
-                    ));
+                    key_node_bake_outputs(
+                        id,
+                        &node.materials.iter().flatten().cloned().collect::<Vec<_>>(),
+                        evaluated.bake_captures,
+                        evaluated.bake_material_refs,
+                        &mut node_bake_captures,
+                        &mut node_bake_material_refs,
+                    );
                     modifier_warnings.extend(
                         evaluated
                             .warnings
@@ -2486,6 +2470,31 @@ impl ModifierGate<'_> {
     }
 }
 
+/// Keys one evaluated object's bake captures and material refs by object, modifier and bake node. Each captured
+/// frame also takes the object's materials.
+fn key_node_bake_outputs(
+    object_id: &Id,
+    materials: &[Id],
+    captures: BTreeMap<(Id, String), crate::graph::NodeBakeFrame>,
+    material_refs: BTreeMap<(Id, String), Vec<Id>>,
+    node_bake_captures: &mut BTreeMap<(Id, Id, String), crate::graph::NodeBakeFrame>,
+    node_bake_material_refs: &mut BTreeMap<(Id, Id, String), Vec<Id>>,
+) {
+    node_bake_captures.extend(captures.into_iter().map(|((modifier_id, node_id), frame)| {
+        (
+            (object_id.clone(), modifier_id, node_id),
+            bake_frame_with_material_refs(frame, materials),
+        )
+    }));
+    node_bake_material_refs.extend(
+        material_refs
+            .into_iter()
+            .map(|((modifier_id, node_id), refs)| {
+                ((object_id.clone(), modifier_id, node_id), refs)
+            }),
+    );
+}
+
 fn bake_frame_with_material_refs(
     mut frame: crate::graph::NodeBakeFrame,
     material_refs: &[Id],
@@ -2561,34 +2570,8 @@ fn prepare_node_bake_modifiers<'a>(
             // (`try_find_baked_data`, MOD_nodes.cc): a target change keeps the stored bake.
             let record = match storage {
                 "packed" => {
-                    let resource_text = config
-                        .get("resource_id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            PotError::new(
-                                ErrorCode::SceneInvalid,
-                                "packed node-bake resource ID is missing",
-                            )
-                        })?;
-                    let resource_id = Id::new(resource_text.to_owned()).map_err(|_| {
-                        PotError::new(
-                            ErrorCode::SceneInvalid,
-                            "packed node-bake resource ID is invalid",
-                        )
-                    })?;
-                    let resource = doc.resources.get(&resource_id).ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::DependencyMissing,
-                            format!("node-bake resource `{resource_id}` is missing"),
-                            json!({"resource_id":resource_id}),
-                        )
-                    })?;
-                    if crate::model::migrate::inline_resource_kind(resource)? != Some("node_bake") {
-                        return Err(PotError::new(
-                            ErrorCode::SceneInvalid,
-                            "packed resource is not a node-bake resource",
-                        ));
-                    }
+                    let (resource_id, resource) =
+                        crate::graph::packed_node_bake_resource(&doc.resources, config)?;
                     let invalid = || {
                         PotError::with_details(
                             ErrorCode::SceneInvalid,
@@ -2657,27 +2640,12 @@ fn prepare_node_bake_modifiers<'a>(
                     let Some(project_root) = modifier_context.project_root else {
                         continue;
                     };
-                    let bake_directory = if config
-                        .get("use_custom_path")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                    {
-                        config
-                            .get("directory")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                    } else {
-                        modifier
-                            .params
-                            .get("bake_directory")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                    };
                     // An empty directory names no location, so the payload is missing and the
                     // bake node evaluates live.
-                    if bake_directory.is_empty() {
+                    let Some(bake_directory) = crate::graph::node_bake_directory(modifier, config)
+                    else {
                         continue;
-                    }
+                    };
                     let mut numbers = Vec::with_capacity(frame_entries.len());
                     let mut digests = Vec::with_capacity(frame_entries.len());
                     for entry in frame_entries {
@@ -2716,7 +2684,7 @@ fn prepare_node_bake_modifiers<'a>(
                         let digest = digests[index];
                         let Some(bytes) = crate::graph::read_node_bake_payload_limited(
                             project_root,
-                            bake_directory,
+                            &bake_directory,
                             object_id,
                             &modifier.id,
                             node_id,

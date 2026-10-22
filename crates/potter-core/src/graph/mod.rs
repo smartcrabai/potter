@@ -5,8 +5,9 @@ mod sockets;
 
 pub(crate) use bake::{
     MAX_NODE_BAKE_FRAME_COUNT, MAX_NODE_BAKE_PACKED_BYTES, NODE_BAKE_JSON_MEMORY_MULTIPLIER,
-    bake_frame_window, node_bake_frame_memory_bytes, read_node_bake_payload_limited,
-    same_bake_frame, validate_node_bake_config, validate_node_bake_frame,
+    bake_frame_window, node_bake_directory, node_bake_frame_memory_bytes,
+    packed_node_bake_resource, read_node_bake_payload_limited, same_bake_frame,
+    uses_custom_node_bake_path, validate_node_bake_config, validate_node_bake_frame,
     validate_node_bake_record, validate_node_bake_resource, validate_node_bake_settings,
 };
 pub use bake::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord, NodeBakeValue};
