@@ -11,8 +11,8 @@ use crate::{
     blender_f32,
     blender_rng::BlenderRng,
     geom::{
-        clnor::{self, CornerNormalCode, NormalCodeOptions},
         Edge, Face, Mesh, Vertex,
+        clnor::{self, CornerNormalCode, NormalCodeOptions},
         color_layers::{self, ColorDomain},
         edge_key,
         provenance::{Origin, remap_attributes},

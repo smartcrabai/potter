@@ -1373,7 +1373,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
                 blender[mesh_key]["positions"][0][0]
                     .as_f64()
                     .ok_or("Blender unborn x")?,
--0.185_411_512_851_715_1,
+                -0.185_411_512_851_715_1,
             );
             continue;
         }
@@ -2546,7 +2546,7 @@ bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_baked_path.ble
         blender["mesh"]["positions"][0][0]
             .as_f64()
             .ok_or("Blender x")?,
--0.700_994_968_414_306_6,
+        -0.700_994_968_414_306_6,
     );
     assert_eq!(geometry["faces"], blender["mesh"]["faces"]);
     Ok(())
@@ -5000,9 +5000,8 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
     let primary_settings = properties["physics_particle_emitter"].clone();
     properties["physics_particle_systems"][primary_settings_id.as_str()] = primary_settings;
     fs::write(&scene_file, serde_json::to_vec(&stored)?)?;
-    let child_settings =
-        &stored["nodes"]["a_emitter"]["properties"]["physics_particle_systems"]
-            [primary_settings_id.as_str()];
+    let child_settings = &stored["nodes"]["a_emitter"]["properties"]["physics_particle_systems"]
+        [primary_settings_id.as_str()];
     assert_eq!(child_settings["child_seed"], 31);
     assert_eq!(child_settings["child_percent"], 2);
     assert_eq!(child_settings["rendered_child_count"], 2);
@@ -5099,11 +5098,7 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
             })
             .count()
     };
-    assert_eq!(
-        unborn_count(0),
-        3,
-        "primary particle system unborn count",
-    );
+    assert_eq!(unborn_count(0), 3, "primary particle system unborn count",);
     assert_eq!(
         unborn_count(1),
         999,
