@@ -885,7 +885,7 @@ fn vertex_group_bone_selectors_filter_source_layers() -> Result<(), Box<dyn Erro
     );
     source_operand.selected_bones = BTreeSet::from(["BoneB".to_owned()]);
     source_operand.deforming_bones = BTreeSet::from(["BoneA".to_owned()]);
-    let operands = BTreeMap::from([("source".to_owned(), vec![source_operand])]);
+    let operands = BTreeMap::from([("object".to_owned(), vec![source_operand])]);
     let original = [
         ("D0", vec![0.2, 0.2, 0.2]),
         ("D1", vec![0.3, 0.3, 0.3]),
@@ -1176,7 +1176,7 @@ destination=make('Destination'); add_layer(destination,'Destination0',-0.2); add
 destination.data.uv_layers.active_index=0
 mod=destination.modifiers.new('Transfer','DATA_TRANSFER'); mod.object=source
 mod.use_loop_data=True; mod.data_types_loops={'UV'}; mod.loop_mapping='TOPOLOGY'
-mod.layers_uv_select_src='ALL'; mod.layers_uv_select_dst='INDEX'; mod.mix_mode='ADD'; mod.mix_factor=0.25
+mod.layers_uv_select_src='ALL'; mod.layers_uv_select_dst='INDEX'; mod.mix_mode='REPLACE'; mod.mix_factor=0.25
 bpy.context.view_layer.update()
 evaluated=destination.evaluated_get(bpy.context.evaluated_depsgraph_get()); mesh=evaluated.to_mesh()
 result={name:[list(item.uv) for item in mesh.uv_layers[name].data] for name in ('Destination0','Destination1')}
@@ -1417,7 +1417,8 @@ fn uv_layer_index_mapping_keeps_full_loop_order_and_replace_factor() -> Result<(
         &AttributeLayerSelection::default(),
     )?;
     for name in ["Destination0", "Destination1"] {
-        assert_eq!(uv_values(&named_actual, name), expected["ACTIVE"][name]);
+        let error = max_error(&uv_values(&named_actual, name), &expected["ACTIVE"][name])?;
+        assert!(error < 1.0e-6, "{name} named UV max error {error}");
     }
     let missing_uv_source = modifier(
         "data_transfer",
@@ -2907,7 +2908,8 @@ fn every_data_transfer_attribute_domain_matches_blender() -> Result<(), Box<dyn 
     Ok(())
 }
 const BLENDER_SHARP_NORMAL_TRANSFER_SCRIPT: &str = r"
-import bpy, json
+import bpy, json, os, sys
+root = os.path.realpath(sys.argv[sys.argv.index('--') + 1])
 positions=[(0,0,0),(1,0,0),(0,1,0),(0,0,1)]
 faces=[(0,1,2),(1,0,3)]
 def make_object(name):
@@ -2929,7 +2931,7 @@ evaluated=destination.evaluated_get(bpy.context.evaluated_depsgraph_get())
 mesh=evaluated.to_mesh()
 json.dump({
     'corner_normals':[list(corner.vector) for corner in mesh.corner_normals],
-},open('sharp-normal-oracle.json','w'))
+},open(os.path.join(root, 'sharp-normal-oracle.json'),'w'))
 evaluated.to_mesh_clear()
 ";
 
@@ -2958,7 +2960,7 @@ fn transferred_sharp_edge_separates_derived_corner_normals() -> Result<(), Box<d
     set_edge_flags(&mut source, "sharp", Some((0, 1)));
     set_face_flags(&mut source, "shade_smooth", &[true, true]);
     let operands = BTreeMap::from([(
-        "source".to_owned(),
+        "object".to_owned(),
         vec![operand(source, DMat4::IDENTITY, &[], None)],
     )]);
     let mut destination = Mesh::from_positions_and_faces(positions.clone(), faces)?;

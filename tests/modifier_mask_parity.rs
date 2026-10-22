@@ -595,13 +595,16 @@ fn cli_armature_mask_and_blend_roundtrip_preserve_selected_bone() -> Result<(), 
         String::from_utf8_lossy(&exported.stdout)
     );
     let blender_probe = Command::new(&blender)
-        .args(["--background", "--disable-autoexec", "--python-exit-code", "1", "--python-expr"])
-        .arg("import bpy; bone=bpy.data.objects['Rig'].data.bones['MaskBone']; assert bone.select; print('selected mask bone roundtrip OK')")
+        .arg("--background")
+        .arg(&blend_file)
+        .args(["--disable-autoexec", "--python-exit-code", "1", "--python-expr"])
+        .arg("import bpy; pose_bone=bpy.data.objects['Rig'].pose.bones['MaskBone']; assert pose_bone.select; print('selected mask bone roundtrip OK')")
         .output()?;
     assert!(
         blender_probe.status.success(),
-        "{}",
-        String::from_utf8_lossy(&blender_probe.stdout)
+        "{}{}",
+        String::from_utf8_lossy(&blender_probe.stdout),
+        String::from_utf8_lossy(&blender_probe.stderr)
     );
     let imported = Command::new(env!("CARGO_BIN_EXE_pot"))
         .args(["import"])

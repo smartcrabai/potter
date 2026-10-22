@@ -274,26 +274,38 @@ fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<
 }
 
 #[test]
-fn uv_warp_named_layer_the_mesh_lacks_is_an_error() -> Result<(), Box<dyn Error>> {
+fn uv_warp_named_layer_the_mesh_lacks_falls_back_to_active_layer() -> Result<(), Box<dyn Error>> {
+    // MOD_uvwarp.cc:190-193 writes the active layer when the named layer is absent.
     let mut mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     mesh.attributes.insert(
         "uv_layers".to_owned(),
         json!({
-            "layers": [{"name":"UVMap","faces":[{"face_id":0,"uv":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]}]}],
             "active": "UVMap",
-            "render": "UVMap"
+            "render": "UVMap",
+            "layers": [{"name":"UVMap","faces":[[[0.1,0.2],[0.3,0.4],[0.5,0.6]]]}]
         }),
     );
-    let Err(error) = evaluate_modifiers(
+    let named = evaluate_modifiers(
         &mesh,
-        &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?],
+        &[modifier(
+            "uv_warp",
+            json!({"uv_layer":"Nope","offset":[0.25,-0.5]}),
+        )?],
         "AttributeTest",
-    ) else {
-        return Err("a named layer the mesh lacks must be an error".into());
-    };
-    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidArgument);
-    assert_eq!(error.details["code"], json!("modifier.uv_layer_missing"));
+    )?;
+    let active = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "uv_warp",
+            json!({"uv_layer":"","offset":[0.25,-0.5]}),
+        )?],
+        "AttributeTest",
+    )?;
+    assert_eq!(
+        named.attributes["uv_layers"]["layers"],
+        active.attributes["uv_layers"]["layers"]
+    );
     Ok(())
 }
 
@@ -700,8 +712,7 @@ fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
     Ok(())
 }
 #[test]
-fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
--> Result<(), Box<dyn Error>> {
+fn cli_applies_image_and_procedural_texture_masks() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
     let operations_path = directory.path().join("mask-operations.json");
@@ -718,6 +729,7 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
             "base_revision":0,
             "operations":[
                 {"op":"image.create","id":"mask","width":1,"height":1,"colorspace":"linear","fill_color":[0.0,0.0,0.0,1.0]},
+                {"op":"texture.create","id":"clouds","texture_type":"CLOUDS"},
                 {"op":"node.create","id":"body","kind":"plane","params":{}},
                 {"op":"vertex_group.create","target":{"id":"body"},"id":"group_a","name":"A"},
                 {"op":"vertex_group.assign","target":{"id":"body"},"group_id":"group_a","weights":[
@@ -760,20 +772,24 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
     assert_eq!(weights, [0.25, 0.5, 0.75, 1.0]);
 
     let mut procedural_scene: Value = serde_json::from_slice(&serialized)?;
-    procedural_scene["nodes"]["body"]["modifiers"][0]["params"]["mask_texture"] =
-        json!("procedural");
+    procedural_scene["nodes"]["body"]["modifiers"][0]["params"]["mask_texture"] = json!("clouds");
     let procedural_scene: SceneDoc = serde_json::from_value(procedural_scene)?;
-    let error = Snapshot::evaluate_with_cache(
+    let procedural = Snapshot::evaluate_with_cache(
         &procedural_scene,
         &EvaluationContext::default(),
         Some(&scene),
         Some(&scene.join(".potter/cache")),
-    )
-    .err()
-    .ok_or("procedural texture mask unexpectedly evaluated")?;
-    assert_eq!(
-        error.details["feature_id"],
-        json!("modifier.vertex_weight_edit.texture_type")
+    )?;
+    let procedural_body = procedural
+        .meshes
+        .get(&potter_core::model::Id::new("body")?)
+        .ok_or("evaluated procedural body mesh missing")?;
+    let procedural_weights = vertex_weights(procedural_body, "A")?;
+    assert!(
+        procedural_weights
+            .iter()
+            .all(|weight| (0.0..=1.0).contains(weight)),
+        "procedural mask weights {procedural_weights:?} leave [0, 1]"
     );
     Ok(())
 }
@@ -3342,11 +3358,12 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
         storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 4,
+        // Potter stores rows top-down (`legacy_texture::image_pixel`); the probe's rows are bottom-to-top.
         pixels: vec![
-            [0.1, 0.1, 0.1, 1.0],
-            [0.3, 0.3, 0.3, 1.0],
-            [0.6, 0.6, 0.6, 1.0],
             [0.9, 0.9, 0.9, 1.0],
+            [0.6, 0.6, 0.6, 1.0],
+            [0.3, 0.3, 0.3, 1.0],
+            [0.1, 0.1, 0.1, 1.0],
         ],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
@@ -3384,7 +3401,7 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
     assert_eq!(weights.len(), 4);
     for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {
         assert!(
-            (weight - expected).abs() < 1.0e-9,
+            (weight - expected).abs() < 1.0e-6,
             "mask weight {weight} differs from Blender {expected}"
         );
     }

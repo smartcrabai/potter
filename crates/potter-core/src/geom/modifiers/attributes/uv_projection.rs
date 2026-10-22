@@ -510,24 +510,6 @@ fn blender_rotate_z_m4(matrix: &mut [f32; 16], angle: f32) {
     }
 }
 
-/// A named UV layer that the mesh does not store, with the `modifier.uv_layer_missing` code.
-fn uv_layer_missing(modifier: &Modifier, parameter: &str, name: &str) -> PotError {
-    PotError::with_details(
-        ErrorCode::InvalidArgument,
-        format!(
-            "modifier `{}` references UV layer `{name}`, which the mesh does not have",
-            modifier.modifier_type
-        ),
-        json!({
-            "code": "modifier.uv_layer_missing",
-            "modifier_id": modifier.id,
-            "parameter": parameter,
-            "pointer": format!("/params/{parameter}"),
-            "uv_layer": name,
-        }),
-    )
-}
-
 pub(super) fn uv_warp(
     mesh: &Mesh,
     modifier: &Modifier,
@@ -535,25 +517,21 @@ pub(super) fn uv_warp(
 ) -> Result<Mesh> {
     let mut store = crate::geom::uv_layers::read(mesh);
     let requested_layer = string(modifier, "uv_layer")?;
-    let layer_index = if requested_layer.is_empty() {
-        match active_uv_layer_index(&store) {
-            Some(index) => index,
-            None => {
-                // Blender creates `UVMap`, which is both active and render, for an unnamed UV Warp
-                // on a mesh without layers.
-                store.layers.push(crate::geom::uv_layers::UvLayer::new(
-                    "UVMap",
-                    vec![None; mesh.faces.len()],
-                ));
-                store.active = Some("UVMap".to_owned());
-                store.render = Some("UVMap".to_owned());
-                0
-            }
-        }
+    // MOD_uvwarp.cc:190-193: a named layer the mesh lacks falls back to the active layer.
+    let named_index = (!requested_layer.is_empty())
+        .then(|| store.index_of(requested_layer))
+        .flatten();
+    let layer_index = if let Some(index) = named_index.or_else(|| active_uv_layer_index(&store)) {
+        index
     } else {
-        store
-            .index_of(requested_layer)
-            .ok_or_else(|| uv_layer_missing(modifier, "uv_layer", requested_layer))?
+        // Blender creates `UVMap`, which is both active and render, on a mesh without layers.
+        store.layers.push(crate::geom::uv_layers::UvLayer::new(
+            "UVMap",
+            vec![None; mesh.faces.len()],
+        ));
+        store.active = Some("UVMap".to_owned());
+        store.render = Some("UVMap".to_owned());
+        0
     };
     let matrix = if let Some(columns) = modifier.runtime.uv_warp_matrix {
         flatten_runtime_matrix(columns)

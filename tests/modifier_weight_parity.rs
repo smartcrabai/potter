@@ -451,6 +451,37 @@ for mapping in ["LOCAL", "GLOBAL", "OBJECT", "OBJECT_NULL", "UV", "UV_FALLBACK",
         evaluated.to_mesh_clear()
         results[mapping + "_" + channel] = result
 
+# Procedural (legacy) texture masks: a CLOUDS texture sampled with LOCAL coordinates.
+cloud_texture = bpy.data.textures.new("CloudsMask", type="CLOUDS")
+for channel in ["INT", "RED", "ALPHA"]:
+    name = "Owner_CLOUDS_" + channel
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    owner = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(owner)
+    group = owner.vertex_groups.new(name="A")
+    for index, weight in enumerate(weights):
+        group.add([index], weight, "REPLACE")
+    modifier = owner.modifiers.new("WeightEdit", "VERTEX_WEIGHT_EDIT")
+    modifier.vertex_group = "A"
+    modifier.falloff_type = "SHARP"
+    modifier.normalize = False
+    modifier.mask_texture = cloud_texture
+    modifier.mask_tex_use_channel = channel
+    modifier.mask_constant = 0.75
+    modifier.mask_tex_mapping = "LOCAL"
+    evaluated = owner.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    evaluated_mesh = evaluated.to_mesh()
+    evaluated_group = evaluated.vertex_groups["A"]
+    result = []
+    for vertex in evaluated_mesh.vertices:
+        result.append(next(
+            (assignment.weight for assignment in vertex.groups
+             if assignment.group == evaluated_group.index), 0.0))
+    evaluated.to_mesh_clear()
+    results["procedural_CLOUDS_" + channel] = result
+
 with open(os.path.join(root, "weight-texture-oracle.json"), "w", encoding="utf-8") as handle:
     json.dump(results, handle, sort_keys=True)
 print("WEIGHT_TEXTURE_ORACLE_WRITTEN")
@@ -1590,10 +1621,10 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
                 {"vertex_id":0,"weight":0.2},{"vertex_id":1,"weight":0.4},
                 {"vertex_id":2,"weight":0.6},{"vertex_id":3,"weight":0.8}
             ]}));
-            let texture_mapping = if matches!(mapping, "BONE" | "BONE_MISSING" | "OBJECT_NULL") {
-                "OBJECT"
-            } else {
-                mapping
+            let texture_mapping = match mapping {
+                "BONE" | "BONE_MISSING" | "OBJECT_NULL" => "OBJECT",
+                "UV_FALLBACK" => "UV",
+                other => other,
             };
             let mut params = json!({
                 "vertex_group":"A","falloff_type":"SHARP","normalize":false,
@@ -1677,7 +1708,7 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
     let snapshot = Snapshot::evaluate_with_cache(
         &document,
         &EvaluationContext::default(),
-        None,
+        Some(&scene),
         Some(&scene),
     )?;
     for mapping in mappings {
@@ -1726,5 +1757,91 @@ fn texture_weight_masks_match_blender_channels_mappings_and_bone_space()
         weights(uv_fallback_red, "A")?,
         "missing UV layer must use the active layer"
     );
+    Ok(())
+}
+
+#[test]
+fn procedural_texture_weight_mask_matches_blender_clouds_local() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let Some(expected) = texture_oracle(root)? else {
+        eprintln!("skipping procedural weight mask parity test: Blender is unavailable");
+        return Ok(());
+    };
+    let scene = root.join("scene");
+    let operations_path = root.join("procedural-mask-operations.json");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["init"])
+        .arg(&scene)
+        .arg("--json")
+        .output()?;
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
+    let channels = ["INT", "RED", "ALPHA"];
+    let mut operations =
+        vec![json!({"op":"texture.create","id":"clouds_mask","texture_type":"CLOUDS"})];
+    for channel in channels {
+        let object_id = format!("clouds_{}", channel.to_lowercase());
+        let group_id = format!("group_{object_id}");
+        operations
+            .push(json!({"op":"node.create","id":object_id,"kind":"plane","params":{"size":1.0}}));
+        operations.push(
+            json!({"op":"vertex_group.create","target":{"id":object_id},"id":group_id,"name":"A"}),
+        );
+        operations.push(json!({"op":"vertex_group.assign","target":{"id":object_id},"group_id":group_id,"weights":[
+            {"vertex_id":0,"weight":0.2},{"vertex_id":1,"weight":0.4},
+            {"vertex_id":2,"weight":0.6},{"vertex_id":3,"weight":0.8}
+        ]}));
+        operations.push(json!({
+            "op":"modifier.create","target":{"id":object_id},"id":format!("modifier_{object_id}"),
+            "type":"vertex_weight_edit","params":{
+                "vertex_group":"A","falloff_type":"SHARP","normalize":false,
+                "mask_texture":"clouds_mask","mask_tex_use_channel":channel,
+                "mask_tex_mapping":"LOCAL","mask_constant":0.75
+            }
+        }));
+    }
+    fs::write(
+        &operations_path,
+        serde_json::to_vec(&json!({
+            "schema_version":1,"base_revision":0,"operations":operations
+        }))?,
+    )?;
+    let applied = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .args(["apply"])
+        .arg(&scene)
+        .args(["--file"])
+        .arg(&operations_path)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    let document: SceneDoc = serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let snapshot = Snapshot::evaluate_with_cache(
+        &document,
+        &EvaluationContext::default(),
+        Some(&scene),
+        Some(&scene),
+    )?;
+    for channel in channels {
+        let object_id = Id::new(format!("clouds_{}", channel.to_lowercase()))?;
+        let mesh = snapshot
+            .meshes
+            .get(&object_id)
+            .ok_or("evaluated procedural mask mesh is missing")?;
+        let label = format!("procedural CLOUDS LOCAL/{channel}");
+        assert_weights(
+            &label,
+            &weights(mesh, "A")?,
+            &expected[&format!("procedural_CLOUDS_{channel}")],
+            3.0e-5,
+        )?;
+    }
     Ok(())
 }

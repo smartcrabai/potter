@@ -37,22 +37,6 @@ pub(super) fn texture_mask_weights(
             json!({"modifier_id":modifier.id,"texture_id":texture_id}),
         )
     })?;
-    // Only image textures are supported as vertex-weight masks; a Blender legacy texture is a typed
-    // unsupported feature rather than being sampled without a Blender oracle.
-    if !matches!(
-        texture.source(),
-        crate::geom::legacy_texture::TextureSource::Image(_)
-            | crate::geom::legacy_texture::TextureSource::ImageWithSettings(..)
-    ) {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "weight modifier texture is not a resolved image texture",
-            json!({
-                "feature_id": format!("modifier.{}.texture_type", modifier.modifier_type),
-                "modifier_id": modifier.id,
-            }),
-        ));
-    }
     let mapping = string(modifier, "mask_tex_mapping")?;
     let channel = string(modifier, "mask_tex_use_channel")?;
     let uv_layer = string(modifier, "mask_tex_uv_layer")?;

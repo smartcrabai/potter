@@ -2035,10 +2035,10 @@ fn validate_attribute_modifier_params_inner(
     let required: &[&str] = match modifier_type {
         "vertex_weight_edit" => &["vertex_group"],
         "vertex_weight_mix" => &["vertex_group_a", "vertex_group_b"],
-        "vertex_weight_proximity" => &["target", "vertex_group"],
+        "vertex_weight_proximity" => &["vertex_group"],
         "normal_edit" => &["target"],
         "uv_project" => &["projectors"],
-        "data_transfer" => &["object"],
+        "data_transfer" => &[],
         _ => &[],
     };
     // An explicit null is no reference at all, so a required reference counts as missing.

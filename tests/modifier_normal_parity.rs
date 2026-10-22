@@ -68,7 +68,7 @@ for case in cases:
         for i, strength in enumerate(case['face_strength']):
             layer.data[i].value = strength
     if case['custom_normals'] is not None:
-        mesh.normals_split_custom_set(case['custom_normals'])
+        mesh.normals_split_custom_set([normal for face in case['custom_normals'] for normal in face])
     mesh.attributes.new(name='corner_tag', type='FLOAT', domain='CORNER')
     tag = mesh.attributes['corner_tag']
     for i in range(len(tag.data)):
@@ -90,7 +90,7 @@ for case in cases:
     if target is not None:
         columns = lambda matrix: [[float(matrix[row][column]) for row in range(4)] for column in range(4)]
         relative = obj.matrix_world.inverted() @ target.matrix_world
-        subject_to_target = relative.inverted()
+        subject_to_target = relative.inverted_safe()
         if '_transform_matrices' not in results:
             results['_transform_matrices'] = {}
         results['_transform_matrices'][case['name']] = {
@@ -99,6 +99,7 @@ for case in cases:
             'world': columns(target.matrix_world),
             'subject_world': columns(obj.matrix_world),
         }
+    modifier = obj.modifiers.new('ProbeModifier', case['modifier_type'])
     for name, value in case['params'].items():
         if name == 'target':
             modifier.target = target
@@ -715,7 +716,7 @@ fn modifier(case: &Value) -> Result<Modifier, Box<dyn Error>> {
         modifier_type: case["modifier_type"]
             .as_str()
             .ok_or("modifier type missing")?
-            .to_owned(),
+            .to_ascii_lowercase(),
         name: "Normal modifier parity".to_owned(),
         enabled: true,
         show_viewport: true,
