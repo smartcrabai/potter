@@ -1,6 +1,7 @@
 use glam::DVec3;
 
 use crate::error::{ErrorCode, PotError, Result};
+use crate::model::RayKind;
 use crate::render::raster::Triangle;
 
 const LEAF_TRIANGLE_COUNT: usize = 4;
@@ -11,6 +12,31 @@ pub(crate) struct BvhHit {
     pub triangle_index: usize,
     pub distance: f64,
     pub barycentric: [f64; 3],
+}
+
+/// The ray a [`Bvh::walk_hits`] walk follows: where it starts, its direction, the offset it restarts past each
+/// hit, the distance left along it, and its kind: the triangles whose object hides that kind are passed through. A
+/// `None` kind is a local probe of the objects themselves (Cycles' `scene_intersect_local`), which takes every triangle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WalkRay {
+    pub origin: DVec3,
+    pub direction: DVec3,
+    pub epsilon: f64,
+    pub remaining: f64,
+    pub kind: Option<RayKind>,
+}
+
+/// A closest-hit query: the ray, its extent, whether back faces count, and which triangles it may hit. Traversal
+/// carries it as one value instead of a long argument list.
+#[derive(Clone, Copy)]
+struct RayQuery<'a> {
+    origin: DVec3,
+    direction: DVec3,
+    t_min: f64,
+    t_max: f64,
+    two_sided: bool,
+    /// Admits a triangle by its object's ray mask (`Triangle::ray_mask`).
+    accepts: &'a dyn Fn(u8) -> bool,
 }
 
 #[derive(Debug)]
@@ -28,6 +54,15 @@ struct LeafTriangle {
     positions: [DVec3; 3],
     triangle_index: usize,
     double_sided: bool,
+    ray_mask: u8,
+}
+
+/// One primitive handed to [`Bvh::build_primitives`]: its corners, its sidedness and the ray kinds its object admits.
+#[derive(Debug, Clone, Copy)]
+struct Primitive {
+    positions: [DVec3; 3],
+    double_sided: bool,
+    ray_mask: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,29 +103,34 @@ impl Bvh {
                 ));
             }
         }
-        Self::build_primitives(
-            triangles
-                .iter()
-                .map(|triangle| (triangle.positions, triangle.double_sided)),
-        )
+        Self::build_primitives(triangles.iter().map(|triangle| Primitive {
+            positions: triangle.positions,
+            double_sided: triangle.double_sided,
+            ray_mask: triangle.ray_mask,
+        }))
     }
 
     /// A BVH over triangles given by their corner positions; primitive `i` is the `i`th item. These primitives carry
-    /// no double-sided flag, so they are one-sided.
+    /// no double-sided flag, so they are one-sided, and no ray mask, so every ray kind meets them.
     pub(crate) fn build_from_positions(
         positions: impl IntoIterator<Item = [DVec3; 3]>,
     ) -> Result<Self> {
-        Self::build_primitives(positions.into_iter().map(|corners| (corners, false)))
+        Self::build_primitives(positions.into_iter().map(|corners| Primitive {
+            positions: corners,
+            double_sided: false,
+            ray_mask: RayKind::ALL_MASK,
+        }))
     }
 
-    fn build_primitives(items: impl IntoIterator<Item = ([DVec3; 3], bool)>) -> Result<Self> {
+    fn build_primitives(items: impl IntoIterator<Item = Primitive>) -> Result<Self> {
         let primitives: Vec<LeafTriangle> = items
             .into_iter()
             .enumerate()
-            .map(|(triangle_index, (positions, double_sided))| LeafTriangle {
-                positions,
+            .map(|(triangle_index, primitive)| LeafTriangle {
+                positions: primitive.positions,
                 triangle_index,
-                double_sided,
+                double_sided: primitive.double_sided,
+                ray_mask: primitive.ray_mask,
             })
             .collect();
         let primitive_bounds: Vec<Aabb> = primitives
@@ -158,31 +198,49 @@ impl Bvh {
         })
     }
 
-    pub(crate) fn closest_hit_two_sided(
+    /// The nearest hit among the triangles `accepts` admits, given each triangle's object ray mask, so a ray passes
+    /// through the others. Back faces count.
+    pub(crate) fn closest_hit_where(
         &self,
         triangles: &[Triangle],
         origin: DVec3,
         direction: DVec3,
         t_min: f64,
         t_max: f64,
+        accepts: &dyn Fn(u8) -> bool,
     ) -> Option<BvhHit> {
-        self.closest_hit_mode(triangles, origin, direction, t_min, t_max, true)
+        let query = RayQuery {
+            origin,
+            direction,
+            t_min,
+            t_max,
+            two_sided: true,
+            accepts,
+        };
+        self.closest_hit_mode(triangles, query)
     }
 
-    /// Walks the surfaces a shadow ray meets, nearest first, while `remaining` is left along it. `visit` receives each
-    /// hit and the origin the ray left from, and returns whether the walk goes on. The ray restarts `epsilon` past each
-    /// hit, and the walk ends when the distance is spent. Returns the origin and the distance where the walk stopped.
+    /// Walks the surfaces `walk` meets, nearest first, while `walk.remaining` is left along it. `visit` receives each
+    /// hit and the origin the ray left from, and returns whether the walk goes on. The ray restarts `walk.epsilon`
+    /// past each hit, and the walk ends when the distance is spent. Triangles whose object is hidden from the ray's
+    /// kind are passed through. Returns the origin and the distance where the walk stopped.
     pub(crate) fn walk_hits(
         &self,
         triangles: &[Triangle],
-        mut origin: DVec3,
-        direction: DVec3,
-        epsilon: f64,
-        mut remaining: f64,
+        walk: WalkRay,
         mut visit: impl FnMut(BvhHit, DVec3) -> bool,
     ) -> (DVec3, f64) {
+        let WalkRay {
+            mut origin,
+            direction,
+            epsilon,
+            mut remaining,
+            kind,
+        } = walk;
         while let Some(hit) =
-            self.closest_hit_two_sided(triangles, origin, direction, epsilon, remaining)
+            self.closest_hit_where(triangles, origin, direction, epsilon, remaining, &|mask| {
+                kind.is_none_or(|kind| mask & kind.bit() != 0)
+            })
         {
             if !visit(hit, origin) {
                 break;
@@ -237,21 +295,13 @@ impl Bvh {
         }
     }
 
-    fn closest_hit_mode(
-        &self,
-        triangles: &[Triangle],
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        t_max: f64,
-        two_sided: bool,
-    ) -> Option<BvhHit> {
+    fn closest_hit_mode(&self, triangles: &[Triangle], query: RayQuery<'_>) -> Option<BvhHit> {
         if triangles.len() != self.triangle_count
-            || !is_finite_vec3(origin)
-            || !is_finite_vec3(direction)
-            || t_min.is_nan()
-            || t_max.is_nan()
-            || t_min > t_max
+            || !is_finite_vec3(query.origin)
+            || !is_finite_vec3(query.direction)
+            || query.t_min.is_nan()
+            || query.t_max.is_nan()
+            || query.t_min > query.t_max
         {
             return None;
         }
@@ -261,32 +311,20 @@ impl Bvh {
             && let Some(span) = self
                 .nodes
                 .get(root)
-                .and_then(|node| node.bounds.slab_span(origin, direction))
+                .and_then(|node| node.bounds.slab_span(query.origin, query.direction))
         {
-            self.visit(
-                root,
-                span,
-                origin,
-                direction,
-                t_min,
-                t_max,
-                two_sided,
-                &mut nearest,
-            );
+            self.visit(root, span, &query, &mut nearest);
         }
         nearest
     }
 
-    fn entry(
-        &self,
-        index: usize,
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        max_distance: f64,
-    ) -> Option<ChildEntry> {
-        let span = self.nodes.get(index)?.bounds.slab_span(origin, direction)?;
-        let (near, _) = clip_span(span, t_min, max_distance)?;
+    fn entry(&self, index: usize, query: &RayQuery<'_>, max_distance: f64) -> Option<ChildEntry> {
+        let span = self
+            .nodes
+            .get(index)?
+            .bounds
+            .slab_span(query.origin, query.direction)?;
+        let (near, _) = clip_span(span, query.t_min, max_distance)?;
         Some(ChildEntry {
             node: index,
             span,
@@ -294,26 +332,18 @@ impl Bvh {
         })
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "BVH traversal carries query bounds and sidedness through recursive nodes"
-    )]
     fn visit(
         &self,
         node_index: usize,
         span: (f64, f64),
-        origin: DVec3,
-        direction: DVec3,
-        t_min: f64,
-        t_max: f64,
-        two_sided: bool,
+        query: &RayQuery<'_>,
         nearest: &mut Option<BvhHit>,
     ) {
         let Some(node) = self.nodes.get(node_index).copied() else {
             return;
         };
-        let current_max = nearest.map_or(t_max, |hit: BvhHit| hit.distance.min(t_max));
-        if clip_span(span, t_min, current_max).is_none() {
+        let current_max = nearest.map_or(query.t_max, |hit: BvhHit| hit.distance.min(query.t_max));
+        if clip_span(span, query.t_min, current_max).is_none() {
             return;
         }
 
@@ -326,9 +356,17 @@ impl Bvh {
                     let Some(leaf) = self.leaf_triangles.get(offset) else {
                         continue;
                     };
-                    let Some(hit) =
-                        intersect_triangle(leaf, origin, direction, t_min, current_max, two_sided)
-                    else {
+                    if !(query.accepts)(leaf.ray_mask) {
+                        continue;
+                    }
+                    let Some(hit) = intersect_triangle(
+                        leaf,
+                        query.origin,
+                        query.direction,
+                        query.t_min,
+                        current_max,
+                        query.two_sided,
+                    ) else {
                         continue;
                     };
                     if nearest.is_none_or(|previous| {
@@ -341,8 +379,8 @@ impl Bvh {
                 }
             }
             NodeKind::Branch { left, right } => {
-                let left_entry = self.entry(left, origin, direction, t_min, current_max);
-                let right_entry = self.entry(right, origin, direction, t_min, current_max);
+                let left_entry = self.entry(left, query, current_max);
+                let right_entry = self.entry(right, query, current_max);
                 match (left_entry, right_entry) {
                     (Some(left_entry), Some(right_entry)) => {
                         let (first, second) = if left_entry.near <= right_entry.near {
@@ -350,24 +388,12 @@ impl Bvh {
                         } else {
                             (right_entry, left_entry)
                         };
-                        self.visit(
-                            first.node, first.span, origin, direction, t_min, t_max, two_sided,
-                            nearest,
-                        );
-                        self.visit(
-                            second.node,
-                            second.span,
-                            origin,
-                            direction,
-                            t_min,
-                            t_max,
-                            two_sided,
-                            nearest,
-                        );
+                        self.visit(first.node, first.span, query, nearest);
+                        self.visit(second.node, second.span, query, nearest);
                     }
-                    (Some(entry), None) | (None, Some(entry)) => self.visit(
-                        entry.node, entry.span, origin, direction, t_min, t_max, two_sided, nearest,
-                    ),
+                    (Some(entry), None) | (None, Some(entry)) => {
+                        self.visit(entry.node, entry.span, query, nearest);
+                    }
                     (None, None) => {}
                 }
             }
@@ -620,9 +646,10 @@ mod tests {
     use glam::DVec3;
     use proptest::prelude::*;
 
+    use crate::model::RayVisibility;
     use crate::render::raster::{AlphaMode, Triangle};
 
-    use super::{Bvh, BvhHit};
+    use super::{Bvh, BvhHit, RayQuery};
 
     proptest! {
         #[test]
@@ -666,6 +693,7 @@ mod tests {
                         normals: None,
                         layer_colors: Vec::new(),
                         lit_per_pixel: false,
+                        ray_mask: RayVisibility::default().mask(),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -682,12 +710,22 @@ mod tests {
             let bvh = Bvh::build(&triangles);
             prop_assert!(bvh.is_ok(), "BVH build failed: {bvh:?}");
             let Ok(bvh) = bvh else { return Ok(()); };
-            let actual = bvh.closest_hit_mode(&triangles, origin, ray_direction, t_min, t_max, false);
+            let actual = bvh.closest_hit_mode(
+                &triangles,
+                RayQuery {
+                    origin,
+                    direction: ray_direction,
+                    t_min,
+                    t_max,
+                    two_sided: false,
+                    accepts: &|_| true,
+                },
+            );
             let expected = brute_force_hit(&triangles, origin, ray_direction, t_min, t_max, false);
             prop_assert!(expected.is_some(), "constructed ray should hit its target triangle");
             prop_assert_eq!(actual, expected);
             let actual_two_sided =
-                bvh.closest_hit_two_sided(&triangles, origin, ray_direction, t_min, t_max);
+                bvh.closest_hit_where(&triangles, origin, ray_direction, t_min, t_max, &|_| true);
             let expected_two_sided =
                 brute_force_hit(&triangles, origin, ray_direction, t_min, t_max, true);
             prop_assert_eq!(actual_two_sided, expected_two_sided);
