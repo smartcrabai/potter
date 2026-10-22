@@ -233,6 +233,20 @@ impl SceneDoc {
             }
         }
         for (node_id, node) in &self.nodes {
+            if let Some(index) = node.active_vertex_group_index {
+                let valid = node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| self.data_blocks.get(data_id))
+                    .is_some_and(|data| index < data.vertex_groups.len());
+                if !valid {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "active vertex-group index is out of range",
+                        json!({"node_id":node_id,"active_vertex_group_index":index}),
+                    ));
+                }
+            }
             if let Some(captured) = &node.blender_matrix_basis
                 && !captured.matrix_basis.iter().all(|value| value.is_finite())
             {
@@ -1833,6 +1847,9 @@ pub struct ModifierRuntime {
     pub warp_from_matrix: Option<[f64; 16]>,
     /// `inv(subject_world) * destination_world` for generic Warp destination object or pose bone.
     pub warp_to_matrix: Option<[f64; 16]>,
+    /// Complete Blender f32 UV Warp matrix in column-major order.
+    #[doc(hidden)]
+    pub uv_warp_matrix: Option<[[f32; 4]; 4]>,
     /// Raw subject-to-world and optional world-to-mapping matrices for ordered f32 texture mapping.
     #[doc(hidden)]
     pub texture_mapping: Option<TextureCoordinateMapping>,
@@ -2098,6 +2115,9 @@ pub struct Node {
     pub blender_parent_inverse: Option<[f64; 16]>,
     #[serde(default)]
     pub data: Option<Id>,
+    /// Blender's active vertex-group index; must name one of the data block's vertex groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_vertex_group_index: Option<usize>,
     /// Material slots in slot order; OBJECT-linked entries are overrides of the data material.
     /// `null` is an empty slot: a face index on it has no material, as Blender's empty material
     /// slot does. Old files holding only ids still load unchanged.
@@ -2153,6 +2173,7 @@ impl Default for Node {
             blender_matrix_basis: None,
             blender_parent_inverse: None,
             data: None,
+            active_vertex_group_index: None,
             materials: Vec::new(),
             material_links: Vec::new(),
             modifiers: Vec::new(),

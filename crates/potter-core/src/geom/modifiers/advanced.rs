@@ -1530,111 +1530,258 @@ fn find_corner(parent: &mut [usize], mut index: usize) -> usize {
     index
 }
 
-pub(super) fn mask(mesh: &Mesh, modifier: &Modifier) -> Result<Mesh> {
-    let group_name = string_param(modifier, "vertex_group")?;
-    if group_name.is_empty() {
-        return Err(invalid_parameter(
-            modifier,
-            "vertex_group",
-            "a vertex-group name",
-        ));
-    }
-    let weights = mesh
+pub(super) fn mask(
+    mesh: &Mesh,
+    modifier: &Modifier,
+    operands: &std::collections::BTreeMap<String, Vec<super::attributes::SceneOperand>>,
+) -> Result<Mesh> {
+    let groups = mesh
         .attributes
         .get("vertex_groups")
-        .and_then(Value::as_object)
-        .and_then(|groups| groups.get(group_name))
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            invalid_parameter(
-                modifier,
-                "vertex_group",
-                "a group present in mesh vertex_groups attributes",
-            )
-        })?;
-    let threshold = number_param(modifier, "threshold")?;
+        .and_then(Value::as_object);
+    let has_deform_weights = groups.is_some_and(|groups| {
+        groups.values().any(|weights| {
+            weights
+                .as_object()
+                .is_some_and(|weights| !weights.is_empty())
+        })
+    });
     let invert = bool_param(modifier, "invert_vertex_group")?;
-    let mut selected = HashSet::new();
-    for vertex in &mesh.vertices {
-        let weight = weights
-            .get(&format!("v{}", vertex.id))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
-            return Err(invalid_parameter(
-                modifier,
-                "vertex_group",
-                "finite weights in [0, 1]",
-            ));
-        }
-        if if invert {
-            1.0 - weight > threshold
+    let Some(groups) = groups.filter(|_| has_deform_weights) else {
+        return if invert {
+            Ok(mesh.clone())
         } else {
-            weight > threshold
-        } {
-            selected.insert(vertex.id);
+            build_mesh(Vec::new(), Vec::new(), Vec::new(), &Origin::default(), mesh)
+        };
+    };
+
+    let mode = string_param(modifier, "mode")?;
+    let group_name = string_param(modifier, "vertex_group")?;
+    let threshold = number_param(modifier, "threshold")?.clamp(0.0, 1.0);
+    let use_smooth = mode == "VERTEX_GROUP" && bool_param(modifier, "use_smooth")?;
+    let weights_by_group = match mode {
+        "VERTEX_GROUP" => {
+            let Some(weights) = groups.get(group_name).and_then(Value::as_object) else {
+                // Blender leaves the mesh untouched when the requested group is absent.
+                return Ok(mesh.clone());
+            };
+            vec![(group_name, weights)]
         }
+        "ARMATURE" => {
+            let Some(armature) = operands
+                .get("armature")
+                .and_then(|items| items.first())
+                .filter(|operand| operand.armature)
+            else {
+                return Ok(mesh.clone());
+            };
+            groups
+                .iter()
+                .filter(|(name, _)| armature.selected_bones.contains(*name))
+                .filter_map(|(name, value)| {
+                    value.as_object().map(|weights| (name.as_str(), weights))
+                })
+                .collect()
+        }
+        _ => return Ok(mesh.clone()),
+    };
+
+    let mut selected = Vec::with_capacity(mesh.vertices.len());
+    for vertex in &mesh.vertices {
+        let mut is_selected = false;
+        for (_, weights) in &weights_by_group {
+            let weight = weights
+                .get(&format!("v{}", vertex.id))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+                return Err(invalid_parameter(
+                    modifier,
+                    "vertex_group",
+                    "finite weights in [0, 1]",
+                ));
+            }
+            if weight > threshold {
+                is_selected = true;
+                break;
+            }
+        }
+        selected.push(if invert { !is_selected } else { is_selected });
     }
+
     let source_positions = positions(mesh);
     let source_indices = id_indices(mesh);
-    let mut keep = HashSet::new();
-    let mut retained_faces = Vec::new();
-    let mut retained_sources = Vec::new();
+    let mut vertex_map = vec![usize::MAX; source_positions.len()];
+    let mut points = Vec::with_capacity(source_positions.len());
+    let mut vertex_origins = Vec::with_capacity(source_positions.len());
+    for (source, is_selected) in selected.iter().copied().enumerate() {
+        if is_selected {
+            vertex_map[source] = points.len();
+            points.push(source_positions[source]);
+            vertex_origins.push(vec![(source, 1.0)]);
+        }
+    }
+    let mut polygons = Vec::new();
+    let mut face_origins = Vec::new();
+    let mut corner_origins = Vec::new();
+    let mut corner_offsets = Vec::with_capacity(mesh.faces.len());
+    let mut corner_offset = 0_usize;
+    for face in &mesh.faces {
+        corner_offsets.push(corner_offset);
+        corner_offset = corner_offset
+            .checked_add(face.vertices.len())
+            .ok_or_else(|| invalid_parameter(modifier, "mesh", "a valid loop count"))?;
+    }
+    let group_weights = if mode == "VERTEX_GROUP" {
+        weights_by_group.first().map(|(_, weights)| *weights)
+    } else {
+        None
+    };
+    let weight_for_index = |index: usize| {
+        let vertex_id = mesh.vertices[index].id;
+        group_weights
+            .and_then(|weights| {
+                weights
+                    .get(&format!("v{vertex_id}"))
+                    .and_then(Value::as_f64)
+            })
+            .unwrap_or(0.0)
+    };
+    let mut boundary_vertices = HashMap::<(usize, usize), usize>::new();
+    let mut boundary_vertex = |first: usize, second: usize| {
+        let key = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        if let Some(index) = boundary_vertices.get(&key) {
+            return *index;
+        }
+        let first_weight = weight_for_index(key.0);
+        let second_weight = weight_for_index(key.1);
+        let factor = (threshold - first_weight) / (second_weight - first_weight);
+        let index = points.len();
+        points.push(source_positions[key.0].lerp(source_positions[key.1], factor));
+        vertex_origins.push(vec![(key.0, 1.0 - factor), (key.1, factor)]);
+        boundary_vertices.insert(key, index);
+        index
+    };
+
     for (face_index, face) in mesh.faces.iter().enumerate() {
-        if face.vertices.iter().all(|id| selected.contains(id)) {
-            let indices = face
-                .vertices
-                .iter()
-                .map(|id| {
-                    let index = source_indices.get(id).copied().ok_or_else(|| {
-                        invalid_parameter(modifier, "mesh", "faces referencing existing vertices")
-                    })?;
-                    keep.insert(index);
-                    Ok(index)
+        let indices = face
+            .vertices
+            .iter()
+            .map(|id| {
+                source_indices.get(id).copied().ok_or_else(|| {
+                    invalid_parameter(modifier, "mesh", "faces referencing existing vertices")
                 })
-                .collect::<Result<Vec<_>>>()?;
-            retained_faces.push((indices, face.material_index));
-            retained_sources.push(Some(face_index));
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let face_selected = indices
+            .iter()
+            .map(|index| selected[*index])
+            .collect::<Vec<_>>();
+        if face_selected.iter().all(|value| *value) {
+            let output = indices.iter().map(|index| vertex_map[*index]).collect();
+            polygons.push((output, face.material_index));
+            face_origins.push(Some(face_index));
+            corner_origins.extend(
+                (0..indices.len()).map(|corner| vec![(corner_offsets[face_index] + corner, 1.0)]),
+            );
+            continue;
+        }
+        if !use_smooth || face_selected.iter().all(|value| !*value) {
+            continue;
+        }
+
+        let Some(start) = face_selected.iter().position(|value| !*value) else {
+            return Err(invalid_parameter(
+                modifier,
+                "mesh",
+                "faces referencing existing vertices",
+            ));
+        };
+        let mut fragment = Vec::<(usize, Vec<(usize, f64)>)>::new();
+        for step in 1..=indices.len() {
+            let previous = (start + step - 1) % indices.len();
+            let current = (start + step) % indices.len();
+            let was_selected = face_selected[previous];
+            let is_selected = face_selected[current];
+            if !was_selected && is_selected {
+                let previous_index = indices[previous];
+                let current_index = indices[current];
+                let boundary = boundary_vertex(previous_index, current_index);
+                let previous_weight = weight_for_index(previous_index);
+                let current_weight = weight_for_index(current_index);
+                let factor = (threshold - previous_weight) / (current_weight - previous_weight);
+                fragment.push((
+                    boundary,
+                    vec![
+                        (corner_offsets[face_index] + previous, 1.0 - factor),
+                        (corner_offsets[face_index] + current, factor),
+                    ],
+                ));
+                fragment.push((
+                    vertex_map[current_index],
+                    vec![(corner_offsets[face_index] + current, 1.0)],
+                ));
+            } else if was_selected && is_selected {
+                fragment.push((
+                    vertex_map[indices[current]],
+                    vec![(corner_offsets[face_index] + current, 1.0)],
+                ));
+            } else if was_selected && !is_selected {
+                let previous_index = indices[previous];
+                let current_index = indices[current];
+                let boundary = boundary_vertex(previous_index, current_index);
+                let previous_weight = weight_for_index(previous_index);
+                let current_weight = weight_for_index(current_index);
+                let factor = (threshold - previous_weight) / (current_weight - previous_weight);
+                fragment.push((
+                    boundary,
+                    vec![
+                        (corner_offsets[face_index] + previous, 1.0 - factor),
+                        (corner_offsets[face_index] + current, factor),
+                    ],
+                ));
+                if fragment.len() >= 3 {
+                    polygons.push((
+                        fragment.iter().map(|(index, _)| *index).collect(),
+                        face.material_index,
+                    ));
+                    face_origins.push(Some(face_index));
+                    corner_origins.extend(fragment.drain(..).map(|(_, origin)| origin));
+                } else {
+                    fragment.clear();
+                }
+            }
         }
     }
+
     let source_loose_edges = loose_edges(mesh)?;
-    for [first, second] in &source_loose_edges {
-        if selected.contains(&mesh.vertices[*first].id)
-            && selected.contains(&mesh.vertices[*second].id)
-        {
-            keep.insert(*first);
-            keep.insert(*second);
+    let mut edges = Vec::new();
+    for [first, second] in source_loose_edges {
+        match (selected[first], selected[second], use_smooth) {
+            (true, true, _) => edges.push([vertex_map[first], vertex_map[second]]),
+            (true, false, true) => {
+                let boundary = boundary_vertex(first, second);
+                edges.push([vertex_map[first], boundary]);
+            }
+            (false, true, true) => {
+                let boundary = boundary_vertex(first, second);
+                edges.push([boundary, vertex_map[second]]);
+            }
+            _ => {}
         }
     }
-    let mut remap = vec![usize::MAX; source_positions.len()];
-    let sources: Vec<usize> = (0..source_positions.len())
-        .filter(|index| keep.contains(index))
-        .collect();
-    for (output, &source) in sources.iter().enumerate() {
-        remap[source] = output;
-    }
-    let points: Vec<DVec3> = sources
-        .iter()
-        .map(|&index| source_positions[index])
-        .collect();
-    let faces = retained_faces
-        .into_iter()
-        .map(|(face, material)| {
-            (
-                face.into_iter().map(|index| remap[index]).collect(),
-                material,
-            )
-        })
-        .collect();
-    let edges = source_loose_edges
-        .into_iter()
-        .filter_map(|[first, second]| {
-            (remap[first] != usize::MAX && remap[second] != usize::MAX)
-                .then_some([remap[first], remap[second]])
-        })
-        .collect();
-    let origin = Origin::copies(sources.into_iter().map(Some), retained_sources);
-    build_mesh(points, faces, edges, &origin, mesh)
+    let origin = Origin {
+        vertices: vertex_origins,
+        source_vertices: None,
+        faces: face_origins,
+        corners: Some(corner_origins),
+        ..Default::default()
+    };
+    build_mesh(points, polygons, edges, &origin, mesh)
 }
 
 #[expect(
@@ -2930,7 +3077,7 @@ mod tests {
             binding_data: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        let result = mask(&source, &modifier).unwrap();
+        let result = mask(&source, &modifier, &std::collections::BTreeMap::new()).unwrap();
         assert_eq!(result.vertices.len(), 0);
         assert_eq!(origindex_values(&result), Some(Vec::new()));
     }

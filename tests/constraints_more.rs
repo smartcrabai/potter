@@ -2326,7 +2326,24 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
     )?;
     let document: SceneDoc = serde_json::from_slice(&fs::read(project_path.join("scene.json"))?)?;
     let oracle: Value = serde_json::from_slice(&fs::read(output_path)?)?;
-    let mut fresh_frame4_session = EvaluationSession::default();
+    let assert_frame = |snapshot: &Snapshot, frame: i32| -> TestResult {
+        let oracle_frame = &oracle["sequence"][frame.to_string()];
+        let actual = snapshot.nodes[&Id::new("owner")?].world_matrix;
+        assert!(
+            max_matrix_error(
+                DMat4::from_cols_array(&actual),
+                blender_matrix(&oracle_frame["matrix"])?
+            ) < 1.0e-5,
+            "Transform Cache differs at frame {frame}"
+        );
+        let mesh = snapshot
+            .meshes
+            .get(&Id::new("receiver")?)
+            .ok_or_else(|| io::Error::other("Mesh Sequence Cache receiver mesh is missing"))?;
+        assert_mesh_positions_match(mesh, &oracle_frame["vertices"])?;
+        Ok(())
+    };
+    let mut session = EvaluationSession::default();
     let fresh_frame4 = Snapshot::evaluate_with_cache_session(
         &document,
         &EvaluationContext {
@@ -2336,42 +2353,79 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
         },
         Some(&project_path),
         Some(&project_path.join(".potter/cache")),
-        &mut fresh_frame4_session,
+        &mut session,
     )?;
-    let mut session = EvaluationSession::default();
-    for (index, frame) in [4.0, 3.0].into_iter().enumerate() {
-        let snapshot = Snapshot::evaluate_with_cache_session(
-            &document,
-            &EvaluationContext {
-                frame: Some(frame),
-                purpose: EvaluationPurpose::Render,
-                ..EvaluationContext::default()
-            },
-            Some(&project_path),
-            Some(&project_path.join(".potter/cache")),
-            &mut session,
-        )?;
-        let actual = snapshot.nodes[&Id::new("owner")?].world_matrix;
-        let oracle_frame = &oracle["sequence"][frame.to_string()];
-        assert!(
-            max_matrix_error(
-                DMat4::from_cols_array(&actual),
-                blender_matrix(&oracle_frame["matrix"])?
-            ) < 1.0e-5,
-            "Transform Cache differs at frame {frame}"
-        );
-        if index == 0 {
-            assert_eq!(
-                snapshot.evaluation_hash, fresh_frame4.evaluation_hash,
-                "evaluating the same selected archive fresh and warm must keep its key stable"
-            );
-        }
-        let mesh = snapshot
+    let warm_frame4 = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(4.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut session,
+    )?;
+    assert_eq!(
+        fresh_frame4.evaluation_hash, warm_frame4.evaluation_hash,
+        "same-frame reevaluation with the retained reader must keep its key stable"
+    );
+    assert_frame(&fresh_frame4, 4)?;
+    assert_frame(&warm_frame4, 4)?;
+    let warm_frame3 = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(3.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut session,
+    )?;
+    assert_frame(&warm_frame3, 3)?;
+
+    let mut mesh_only_document = document.clone();
+    mesh_only_document
+        .nodes
+        .get_mut(&Id::new("owner")?)
+        .ok_or_else(|| io::Error::other("Transform Cache owner is missing"))?
+        .constraints
+        .clear();
+    let mut mesh_only_session = EvaluationSession::default();
+    let fresh_mesh_only = Snapshot::evaluate_with_cache_session(
+        &mesh_only_document,
+        &EvaluationContext {
+            frame: Some(4.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut mesh_only_session,
+    )?;
+    let warm_mesh_only = Snapshot::evaluate_with_cache_session(
+        &mesh_only_document,
+        &EvaluationContext {
+            frame: Some(4.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut mesh_only_session,
+    )?;
+    assert_eq!(
+        fresh_mesh_only.evaluation_hash, warm_mesh_only.evaluation_hash,
+        "Mesh Sequence Cache source selection must be included after modifier evaluation"
+    );
+    assert_mesh_positions_match(
+        warm_mesh_only
             .meshes
             .get(&Id::new("receiver")?)
-            .ok_or_else(|| io::Error::other("Mesh Sequence Cache receiver mesh is missing"))?;
-        assert_mesh_positions_match(mesh, &oracle_frame["vertices"])?;
-    }
+            .ok_or_else(|| io::Error::other("Mesh Sequence Cache receiver mesh is missing"))?,
+        &oracle["sequence"]["4"]["vertices"],
+    )?;
     let retained_missing = Snapshot::evaluate_with_cache_session(
         &document,
         &EvaluationContext {

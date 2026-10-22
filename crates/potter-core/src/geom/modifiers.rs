@@ -386,6 +386,11 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
     ) -> Result<Option<usize>>,
     mut modifier_parameter: impl FnMut(&Modifier, &str, f64) -> Result<Option<f64>>,
 ) -> Result<(ModifierEvaluation, Option<Vec<Option<DVec3>>>)> {
+    if subject_name.is_empty() {
+        return Err(PotError::invalid_argument(
+            "modifier evaluation requires a subject name",
+        ));
+    }
     let had_origindex = origindex_values(&evaluated).is_some();
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
@@ -540,7 +545,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             ) && modifier
                 .params
                 .get("mask_texture")
-                .is_some_and(|value| !value.is_null()));
+                .is_some_and(|value| !value.is_null()))
+            || (modifier.modifier_type == "mask"
+                && modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
+                && modifier
+                    .params
+                    .get("armature")
+                    .is_some_and(Value::is_string));
         if modifier.modifier_type == "armature"
             || modifier.modifier_type == "lattice"
             || matches!(
@@ -707,6 +718,16 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             "cast" => advanced::cast(&evaluated, modifier)?,
             "wave" => wave_textured(&evaluated, modifier, frame, None, &mut texture_rng)?,
             "warp" => warp_textured(&evaluated, modifier, None, &mut texture_rng)?,
+            // MOD_normal_edit.cc is_valid_target: DIRECTIONAL needs a target; without one Blender sets
+            // "Invalid target settings" and passes the mesh through.
+            "normal_edit" if normal_edit_target_disabled(modifier) => {
+                warnings.push(modifier_warning(
+                    modifier,
+                    "modifier.normal_edit.target",
+                    "Invalid target settings",
+                ));
+                evaluated.clone()
+            }
             "vertex_weight_edit"
             | "vertex_weight_mix"
             | "vertex_weight_proximity"
@@ -714,8 +735,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
             | "normal_edit"
             | "uv_project"
             | "uv_warp"
-            | "data_transfer" => attributes::evaluate(&evaluated, modifier)?,
-            "mask" => advanced::mask(&evaluated, modifier)?,
+            | "data_transfer"
+            | "mask" => attributes::evaluate(&evaluated, modifier, subject_name)?,
             "laplacian_smooth" => smoothing::laplacian_smooth(&evaluated, modifier)?,
             "laplacian_deform" => deform::laplacian_deform(&evaluated, modifier)?,
             "corrective_smooth" => smoothing::corrective_smooth(
@@ -1782,7 +1803,7 @@ fn array(
         }
     }
     if let Some((feature_id, message)) = fallback_warning {
-        warnings.push(array_count_warning(modifier, feature_id, message));
+        warnings.push(modifier_warning(modifier, feature_id, message));
     }
     let count_usize = usize::try_from(count).map_err(|_| mesh_error(&MeshError::IdExhausted))?;
     // Blender's 2^26-vertex limit has applied above. This budget bounds the memory the copies
@@ -2372,7 +2393,16 @@ fn array_empty_source_transform(step: Mat4, count: usize) -> Mat4 {
     result
 }
 
-fn array_count_warning(modifier: &Modifier, feature_id: &str, message: &str) -> PotError {
+/// A DIRECTIONAL normal edit with no target (`MOD_normal_edit.cc`, `is_valid_target`).
+fn normal_edit_target_disabled(modifier: &Modifier) -> bool {
+    modifier.params.get("mode").and_then(Value::as_str) == Some("DIRECTIONAL")
+        && modifier
+            .params
+            .get("target")
+            .is_none_or(|value| value.is_null() || value.as_str().is_some_and(str::is_empty))
+}
+
+fn modifier_warning(modifier: &Modifier, feature_id: &str, message: &str) -> PotError {
     PotError::with_details(
         ErrorCode::EvaluationFailed,
         message,
@@ -7071,7 +7101,8 @@ mod tests {
         let is_warped = |uv: &[f64; 2]| {
             warped
                 .iter()
-                .any(|want| (want[0] - uv[0]).abs() < 1e-9 && (want[1] - uv[1]).abs() < 1e-9)
+                // UV Warp computes in f32 (MOD_uvwarp.cc), so compare at f32 precision.
+                .any(|want| (want[0] - uv[0]).abs() < 1e-6 && (want[1] - uv[1]).abs() < 1e-6)
         };
         let layers = uv_layers::read_layers(&out);
         assert_eq!(layers.len(), 1);

@@ -1914,6 +1914,20 @@ fn operation_contract(name: &str) -> OperationContract {
             json!({}),
         ),
         "avatar.clear" => (vec![], vec!["op"], "avatar settings", "none", json!({})),
+        "node.vertex_group.active" => (
+            vec!["target", "index"],
+            vec!["op", "target", "index"],
+            "mesh object",
+            "none",
+            json!({}),
+        ),
+        "rig.bone.select" => (
+            vec!["target", "bone_ids", "select"],
+            vec!["op", "target", "bone_ids"],
+            "armature object",
+            "none",
+            json!({"select":true}),
+        ),
         "avatar.update" => (
             vec!["set"],
             vec!["op", "set"],
@@ -2128,6 +2142,8 @@ fn field_schema(operation: &str, field: &str) -> Value {
             "vertex_group.create",
             "vertex_group.assign",
             "vertex_group.remove",
+            "node.vertex_group.active",
+            "rig.bone.select",
             "driver.create",
             "driver.update",
             "driver.delete",
@@ -2146,6 +2162,12 @@ fn field_schema(operation: &str, field: &str) -> Value {
     }
     if operation == "node.join" && field == "targets" {
         return json!({"type":"array","items":id_schema(),"minItems":1,"uniqueItems":true});
+    }
+    if operation == "node.vertex_group.active" && field == "index" {
+        return json!({"type":["integer","null"],"minimum":0,"maximum":u32::MAX});
+    }
+    if operation == "rig.bone.select" && field == "select" {
+        return json!({"type":"boolean"});
     }
     if operation == "mesh.separate" && field == "mode" {
         return json!({"enum":["selection","material","loose_parts"],"default":"selection"});

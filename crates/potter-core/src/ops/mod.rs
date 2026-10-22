@@ -187,6 +187,7 @@ pub const OP_NAMES: &[&str] = &[
     "node.join",
     "node.parent",
     "node.update",
+    "node.vertex_group.active",
     "paint.texture",
     "paint.vertex",
     "paint.weight",
@@ -225,6 +226,7 @@ pub const OP_NAMES: &[&str] = &[
     "render.update",
     "resource.pack",
     "resource.unpack",
+    "rig.bone.select",
     "rig.generate_basic_human",
     "scene.create",
     "scene.marker_add",
@@ -680,9 +682,12 @@ fn apply_batch_internal(
             }
             "volume.create" | "volume.update" => volume::apply(&mut engine, name, object),
             "node.join" => node_join::apply(&mut engine, object),
-            "node.create" | "node.update" | "node.delete" | "node.duplicate" | "node.parent" => {
-                node::apply(&mut engine, name, object)
-            }
+            "node.create"
+            | "node.update"
+            | "node.delete"
+            | "node.duplicate"
+            | "node.parent"
+            | "node.vertex_group.active" => node::apply(&mut engine, name, object),
             "data.make_single_user" => node::make_single_user(&mut engine, object),
             "bone.create"
             | "bone.update"
@@ -692,6 +697,7 @@ fn apply_batch_internal(
             | "bone_collection.delete"
             | "bone_collection.assign"
             | "rig.generate_basic_human"
+            | "rig.bone.select"
             | "bone_collection.unassign"
             | "pose.set"
             | "pose.reset"

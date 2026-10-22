@@ -1390,6 +1390,13 @@ fn evaluate_modifier_output(
                     .params
                     .get("mask_tex_map_object")
                     .is_some_and(Value::is_string),
+                "mask" => {
+                    modifier.params.get("mode").and_then(Value::as_str) == Some("ARMATURE")
+                        && modifier
+                            .params
+                            .get("armature")
+                            .is_some_and(Value::is_string)
+                }
                 "array" => {
                     (modifier.params.get("fit_type").and_then(Value::as_str) == Some("FIT_CURVE")
                         && modifier.params.get("curve").is_some_and(Value::is_string))
@@ -1654,13 +1661,16 @@ fn evaluate_modifier_output(
                         | "normal_edit"
                         | "uv_project"
                         | "uv_warp"
-                        | "data_transfer" => crate::eval::apply_scene_attribute_modifier(
+                        | "data_transfer"
+                        | "mask" => crate::eval::apply_scene_attribute_modifier(
                             mesh,
                             modifier,
                             target,
                             engine.doc,
                             &world_matrices,
                             evaluated_operand_meshes,
+                            &operand_snapshot.bone_matrices,
+                            &operand_snapshot.bone_pose_matrices,
                             engine.asset_root,
                         ),
                         _ => Err(PotError::new(
@@ -2178,12 +2188,12 @@ fn validate_attribute_modifier_params_inner(
     params: &Map<String, Value>,
 ) -> Result<()> {
     let required: &[&str] = match modifier_type {
-        "vertex_weight_edit" => &["vertex_group"],
+        // Blender's object and target pointers are PROP_NONE: a null reference disables the modifier
+        // (is_disabled) rather than refusing it. normal_edit's target is needed only in DIRECTIONAL,
+        // and that case is reported at evaluation.
+        "vertex_weight_edit" | "vertex_weight_proximity" => &["vertex_group"],
         "vertex_weight_mix" => &["vertex_group_a", "vertex_group_b"],
-        "vertex_weight_proximity" => &["target", "vertex_group"],
-        "normal_edit" => &["target"],
         "uv_project" => &["projectors"],
-        "data_transfer" => &["object"],
         _ => &[],
     };
     // An explicit null is no reference at all, so a required reference counts as missing.
@@ -2486,6 +2496,10 @@ fn validate_attribute_modifier_params_inner(
             )
         })?;
         for item in items {
+            // An empty slot still occupies its position in `projectors_num` (MOD_uvproject.cc).
+            if item.is_null() {
+                continue;
+            }
             let identifier = item.as_str().ok_or_else(|| {
                 invalid_attribute_modifier_parameter(
                     modifier_type,

@@ -81,6 +81,11 @@ impl BlenderRng {
         self.step();
         (self.state >> 17) as i32
     }
+
+    /// `BLI_rng_get_float`: `float(int32) / 2^31`, never 1.0.
+    pub(crate) fn get_float(&mut self) -> f32 {
+        self.get_int32() as f32 / 2_147_483_648.0_f32
+    }
 }
 
 #[cfg(test)]

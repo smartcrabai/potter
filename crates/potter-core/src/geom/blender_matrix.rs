@@ -543,3 +543,65 @@ pub(crate) fn blender_transform_point_f32(transform: &[f32; 16], point: glam::Ve
         point.x * transform[2] + point.y * transform[6] + transform[10] * point.z + transform[14],
     )
 }
+
+/// Blender `mul_m4_m4m4` on column-major f32 matrices: `left * right` in Blender's operand order,
+/// with SIMD grouping on `x86_64`/`ARM64` and scalar elsewhere.
+pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+    let mut result = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            let term0 = right[column * 4] * left[row];
+            let term1 = right[column * 4 + 1] * left[4 + row];
+            let term2 = right[column * 4 + 2] * left[8 + row];
+            let term3 = right[column * 4 + 3] * left[12 + row];
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            let value = (term0 + term1) + (term2 + term3);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let value = term0 + term1 + term2 + term3;
+            result[column * 4 + row] = value;
+        }
+    }
+    result
+}
+
+/// Blender `invert_m4_m4` on a column-major f32 matrix. A singular matrix inverts to zero, as
+/// Blender writes it.
+pub(crate) fn blender_inverse_m4(matrix: [f32; 16]) -> [f32; 16] {
+    let columns: BlenderMat4 =
+        std::array::from_fn(|column| std::array::from_fn(|row| matrix[column * 4 + row]));
+    let Some(inverse) = blender_invert_m4(&columns) else {
+        return [0.0; 16];
+    };
+    std::array::from_fn(|index| inverse[index / 4][index % 4])
+}
+
+/// Blender `BLI_space_transform_from_matrices` on column-major f32 matrices. `local` is the object
+/// whose points are transformed and `target` the object they are expressed in: the forward matrix
+/// is `inverse(target) * local` and the inverse is its f32 inverse (`math_matrix_c.cc`).
+pub(crate) fn blender_space_transform_f32(
+    local: [f32; 16],
+    target: [f32; 16],
+) -> ([f32; 16], [f32; 16]) {
+    let forward = blender_multiply_m4(blender_inverse_m4(target), local);
+    (forward, blender_inverse_m4(forward))
+}
+
+#[cfg(test)]
+mod inverse_tests {
+    use super::blender_inverse_m4;
+
+    #[test]
+    fn inverse_of_rotated_translated_world_matches_exact_inverse() {
+        let world = glam::DMat4::from_translation(glam::DVec3::new(5.0, 0.5, 0.5))
+            * glam::DMat4::from_rotation_y(std::f64::consts::FRAC_PI_2);
+        let matrix = world.to_cols_array().map(|value| value as f32);
+        let expected = world.inverse().to_cols_array().map(|value| value as f32);
+        let inverse = blender_inverse_m4(matrix);
+        for (index, (actual, expected)) in inverse.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1.0e-5,
+                "element {index}: inverse {inverse:?} differs from exact {expected:?}"
+            );
+        }
+    }
+}

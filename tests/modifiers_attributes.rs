@@ -4,14 +4,16 @@ use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     geom::{
-        Mesh, edit,
+        Mesh, ResolvedTexture, edit,
         modifiers::{
-            attributes::{SceneOperand, evaluate_mesh_cache, evaluate_with_context},
+            attributes::{
+                AttributeLayerSelection, SceneOperand, evaluate_mesh_cache, evaluate_with_context,
+            },
             evaluate_modifiers,
         },
     },
-    image::{ImageData, ImageInterpolation},
-    model::{CameraData, Modifier, SceneDoc},
+    image::{ImageData, ImageInterpolation, Precision},
+    model::{CameraData, Modifier, SceneDoc, TextureCoordinateMapping},
 };
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -32,6 +34,7 @@ use blender_file::blender_executable;
 )]
 fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Error>> {
     Ok(Modifier {
+        baked_ocean_cache: None,
         id: potter_core::model::Id::new("test_modifier")?,
         modifier_type: modifier_type.to_owned(),
         name: modifier_type.to_owned(),
@@ -43,7 +46,6 @@ fn modifier(modifier_type: &str, params: Value) -> Result<Modifier, Box<dyn Erro
             .ok_or("modifier params must be an object")?
             .clone(),
         binding_data: None,
-        baked_ocean_cache: None,
         runtime: potter_core::model::ModifierRuntime::default(),
     })
 }
@@ -71,9 +73,26 @@ fn weights(mesh: &Mesh, group: &str) -> Result<[f64; 2], Box<dyn Error>> {
 fn scene_operand(mesh: Mesh, local_to_subject: DMat4, camera: Option<CameraData>) -> SceneOperand {
     SceneOperand {
         mesh,
-        local_to_subject,
+        local_to_subject: Some(local_to_subject),
         camera,
         armature: false,
+        blender_matrices_f32: Some(
+            potter_core::geom::modifiers::attributes::SceneOperandMatricesF32 {
+                world: Some(local_to_subject.to_cols_array().map(|value| value as f32)),
+                local_to_subject: Some(local_to_subject.to_cols_array().map(|value| value as f32)),
+                subject_to_local: Some(
+                    local_to_subject
+                        .inverse()
+                        .to_cols_array()
+                        .map(|value| value as f32),
+                ),
+            },
+        ),
+        object_scale: glam::DVec3::ONE,
+        selected_bones: std::collections::BTreeSet::new(),
+        deforming_bones: std::collections::BTreeSet::new(),
+        layer_selection: potter_core::geom::modifiers::attributes::AttributeLayerSelection::default(
+        ),
     }
 }
 
@@ -231,7 +250,8 @@ fn uv_warp_empty_layer_writes_the_active_layer() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<dyn Error>> {
+fn uv_warp_on_mesh_without_uv_layers_returns_mesh_unchanged() -> Result<(), Box<dyn Error>> {
+    // MOD_uvwarp.cc:140-142 returns the mesh when it has no UV maps; UV Warp creates no layer.
     let mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     let result = evaluate_modifiers(
@@ -242,40 +262,45 @@ fn uv_warp_empty_layer_on_mesh_without_layers_creates_uvmap() -> Result<(), Box<
         )?],
         "AttributeTest",
     )?;
-    assert_eq!(result.attributes["uv_layers"]["active"], json!("UVMap"));
-    assert_eq!(result.attributes["uv_layers"]["render"], json!("UVMap"));
-    assert_eq!(
-        result.attributes["uv_layers"]["layers"][0]["name"],
-        json!("UVMap")
-    );
-    assert_eq!(
-        result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"],
-        json!([[0.25, 0.5], [0.25, 0.5], [0.25, 0.5]])
-    );
+    assert!(result.attributes.get("uv_layers").is_none());
+    assert_eq!(result.vertices.len(), mesh.vertices.len());
+    assert_eq!(result.faces.len(), mesh.faces.len());
     Ok(())
 }
 
 #[test]
-fn uv_warp_named_layer_the_mesh_lacks_is_an_error() -> Result<(), Box<dyn Error>> {
+fn uv_warp_named_layer_the_mesh_lacks_falls_back_to_active_layer() -> Result<(), Box<dyn Error>> {
+    // MOD_uvwarp.cc:190-193 writes the active layer when the named layer is absent.
     let mut mesh =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])?;
     mesh.attributes.insert(
         "uv_layers".to_owned(),
         json!({
-            "layers": [{"name":"UVMap","faces":[{"face_id":0,"uv":[[0.0,0.0],[1.0,0.0],[0.0,1.0]]}]}],
             "active": "UVMap",
-            "render": "UVMap"
+            "render": "UVMap",
+            "layers": [{"name":"UVMap","faces":[[[0.1,0.2],[0.3,0.4],[0.5,0.6]]]}]
         }),
     );
-    let Err(error) = evaluate_modifiers(
+    let named = evaluate_modifiers(
         &mesh,
-        &[modifier("uv_warp", json!({"uv_layer":"Nope"}))?],
+        &[modifier(
+            "uv_warp",
+            json!({"uv_layer":"Nope","offset":[0.25,-0.5]}),
+        )?],
         "AttributeTest",
-    ) else {
-        return Err("a named layer the mesh lacks must be an error".into());
-    };
-    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidArgument);
-    assert_eq!(error.details["code"], json!("modifier.uv_layer_missing"));
+    )?;
+    let active = evaluate_modifiers(
+        &mesh,
+        &[modifier(
+            "uv_warp",
+            json!({"uv_layer":"","offset":[0.25,-0.5]}),
+        )?],
+        "AttributeTest",
+    )?;
+    assert_eq!(
+        named.attributes["uv_layers"]["layers"],
+        active.attributes["uv_layers"]["layers"]
+    );
     Ok(())
 }
 
@@ -320,7 +345,16 @@ fn proximity_modifier_uses_target_object_distance_and_assigns_vertex_weights()
             "normalize":false
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &proximity, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &proximity,
+        &operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_eq!(weights(&result, "A")?, [0.5, 0.5]);
     Ok(())
 }
@@ -348,7 +382,16 @@ fn normal_edit_writes_target_radial_split_normals() -> Result<(), Box<dyn Error>
             "mix_limit":std::f64::consts::PI
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &edit, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &edit,
+        &operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     let evaluated = evaluated_face_normals(&result, "f0")?;
     let normal = evaluated[0].as_array().ok_or("custom normal missing")?;
     let tolerance = exchange_normals::normal_tolerance(true);
@@ -392,7 +435,16 @@ fn uv_project_uses_camera_projection_and_writes_corner_uvs() -> Result<(), Box<d
             "uv_layer":"UVMap"
         }),
     )?;
-    let result = evaluate_with_context(&mesh, &projection, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &mesh,
+        &projection,
+        &operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     let uv = result.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"][0]
         .as_array()
         .ok_or("projected UV missing")?;
@@ -426,7 +478,16 @@ fn data_transfer_topology_replaces_vertex_group_weights() -> Result<(), Box<dyn 
             "mix_factor":1.0
         }),
     )?;
-    let result = evaluate_with_context(&destination, &transfer, &operands, None, DMat4::IDENTITY)?;
+    let result = evaluate_with_context(
+        &destination,
+        &transfer,
+        &operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     let transferred = weights(&result, "A")?;
     assert!((transferred[0] - 0.9).abs() < 1.0e-12);
     assert!((transferred[1] - 0.1).abs() < 1.0e-12);
@@ -1045,12 +1106,19 @@ fn vertex_weight_edit_blends_with_image_mask_channel() -> Result<(), Box<dyn Err
             "mask_tex_mapping":"LOCAL"
         }),
     )?;
+    let texture = ResolvedTexture::from_image(image);
     let result = evaluate_with_context(
         &source,
         &edit,
         &BTreeMap::new(),
-        Some(&image),
+        Some(&texture),
+        Some(&TextureCoordinateMapping {
+            subject_to_world_f32: DMat4::IDENTITY.to_cols_array().map(|value| value as f32),
+            world_to_mapping_f32: None,
+        }),
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_eq!(weights(&result, "A")?, [0.25, 0.75]);
     Ok(())
@@ -1242,8 +1310,7 @@ fn cli_applies_resource_backed_mesh_cache_and_inspects_interpolated_positions()
     Ok(())
 }
 #[test]
-fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
--> Result<(), Box<dyn Error>> {
+fn cli_applies_image_and_procedural_texture_masks() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let scene = directory.path().join("scene");
     let operations_path = directory.path().join("mask-operations.json");
@@ -1260,6 +1327,7 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
             "base_revision":0,
             "operations":[
                 {"op":"image.create","id":"mask","width":1,"height":1,"colorspace":"linear","fill_color":[0.0,0.0,0.0,1.0]},
+                {"op":"texture.create","id":"clouds","texture_type":"CLOUDS"},
                 {"op":"node.create","id":"body","kind":"plane","params":{}},
                 {"op":"vertex_group.create","target":{"id":"body"},"id":"group_a","name":"A"},
                 {"op":"vertex_group.assign","target":{"id":"body"},"group_id":"group_a","weights":[
@@ -1302,20 +1370,24 @@ fn cli_applies_image_texture_mask_and_procedural_masks_are_typed_unsupported()
     assert_eq!(weights, [0.25, 0.5, 0.75, 1.0]);
 
     let mut procedural_scene: Value = serde_json::from_slice(&serialized)?;
-    procedural_scene["nodes"]["body"]["modifiers"][0]["params"]["mask_texture"] =
-        json!("procedural");
+    procedural_scene["nodes"]["body"]["modifiers"][0]["params"]["mask_texture"] = json!("clouds");
     let procedural_scene: SceneDoc = serde_json::from_value(procedural_scene)?;
-    let error = Snapshot::evaluate_with_cache(
+    let procedural = Snapshot::evaluate_with_cache(
         &procedural_scene,
         &EvaluationContext::default(),
         Some(&scene),
         Some(&scene.join(".potter/cache")),
-    )
-    .err()
-    .ok_or("procedural texture mask unexpectedly evaluated")?;
-    assert_eq!(
-        error.details["feature_id"],
-        json!("modifier.vertex_weight_edit.texture_type")
+    )?;
+    let procedural_body = procedural
+        .meshes
+        .get(&potter_core::model::Id::new("body")?)
+        .ok_or("evaluated procedural body mesh missing")?;
+    let procedural_weights = vertex_weights(procedural_body, "A")?;
+    assert!(
+        procedural_weights
+            .iter()
+            .all(|weight| (0.0..=1.0).contains(weight)),
+        "procedural mask weights {procedural_weights:?} leave [0, 1]"
     );
     Ok(())
 }
@@ -2407,15 +2479,22 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         DVec3::new(2.0, -1.0, 0.0),
     );
     let proximity_target_world = DMat4::from_translation(DVec3::new(3.5, -1.0, 0.0));
-    let mut proximity_operands = BTreeMap::new();
-    proximity_operands.insert(
-        "target".to_owned(),
-        vec![scene_operand(
-            Mesh::default(),
-            proximity_subject_world.inverse() * proximity_target_world,
-            None,
-        )],
+    // OBJECT mode measures world-space origins (MOD_weightvgproximity.cc get_ob2ob_distance), so the
+    // target operand's world matrix is the target object's world transform, not its subject-relative one.
+    let mut target_operand = scene_operand(
+        Mesh::default(),
+        proximity_subject_world.inverse() * proximity_target_world,
+        None,
     );
+    if let Some(matrices) = target_operand.blender_matrices_f32.as_mut() {
+        matrices.world = Some(
+            proximity_target_world
+                .to_cols_array()
+                .map(|value| value as f32),
+        );
+    }
+    let mut proximity_operands = BTreeMap::new();
+    proximity_operands.insert("target".to_owned(), vec![target_operand]);
     let proximity = modifier(
         "vertex_weight_proximity",
         json!({"target":"target","vertex_group":"A","proximity_mode":"OBJECT","proximity_geometry":["VERTEX"],"min_dist":0.0,"max_dist":3.0,"normalize":false}),
@@ -2425,7 +2504,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &proximity,
         &proximity_operands,
         None,
+        None,
         proximity_subject_world,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "vertex_weight_proximity OBJECT",
@@ -2464,7 +2546,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &geometry_modifier,
         &geometry_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "vertex_weight_proximity GEOMETRY/VERTEX",
@@ -2527,7 +2612,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 )?,
                 &proximity_surface_operands,
                 None,
+                None,
                 DMat4::IDENTITY,
+                "TestObject",
+                &AttributeLayerSelection::default(),
             )?;
             let key = format!("{geometry}_{falloff}");
             let label = format!("vertex_weight_proximity GEOMETRY/{geometry} {falloff}");
@@ -2645,8 +2733,16 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         "normal_edit",
         json!({"mode":"RADIAL","target":"target","mix_mode":"COPY","mix_factor":1.0,"mix_limit":std::f64::consts::PI,"use_direction_parallel":false}),
     )?;
-    let normals =
-        evaluate_with_context(&quad, &normal_edit, &normal_operands, None, DMat4::IDENTITY)?;
+    let normals = evaluate_with_context(
+        &quad,
+        &normal_edit,
+        &normal_operands,
+        None,
+        None,
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     assert_normal_stimulus(
         "normal_edit RADIAL/COPY",
         &expected["baseline_normal_edit"],
@@ -2675,7 +2771,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &directional,
         &directional_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_normal_stimulus(
         "normal_edit DIRECTIONAL/ADD",
@@ -2716,11 +2815,14 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &project_mesh,
         &modifier(
             "uv_project",
-            json!({"projectors":["camera_z","camera_x"],"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
+            json!({"projectors":["camera_z","camera_x"],"projector_count":2,"uv_layer":"UVMap","aspect_x":1.0,"aspect_y":1.0,"scale_x":1.0,"scale_y":1.0}),
         )?,
         &projectors,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let projected_uvs = json!([
         flip_v(&projected.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -2769,7 +2871,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             )],
         )]),
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let orthographic_uvs = json!([
         flip_v(&orthographic.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -2812,7 +2917,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             )],
         )]),
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let orthographic_clamped_uvs = json!([
         flip_v(&orthographic_clamped.attributes["uv_layers"]["layers"][0]["faces"][0]["uv"]),
@@ -2888,7 +2996,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         )?,
         &warp_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "uv_warp object transforms and vertex group",
@@ -2926,7 +3037,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         )?,
         &source_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     assert_material_change(
         "data_transfer VGROUP_WEIGHTS/TOPOLOGY",
@@ -2983,7 +3097,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             )?,
             &point_operands,
             None,
+            None,
             DMat4::IDENTITY,
+            "TestObject",
+            &AttributeLayerSelection::default(),
         )?;
         assert_material_change(
             &format!("data_transfer VGROUP_WEIGHTS/{mapping}"),
@@ -3006,11 +3123,21 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
             "uv":flip_v(&json!([[0.25,0.25],[1.25,0.25],[1.25,1.25],[0.25,1.25]]))
         }])),
     );
-    domain_source
-        .attributes
-        .insert("sharp_edges".to_owned(), json!([2]));
+    // Edge 2 of the source is the 2-3 edge (the Blender oracle marks the same edge sharp).
+    let sharp_edges = domain_source
+        .edges
+        .iter()
+        .map(|edge| {
+            let sharp = matches!(edge.vertices, [2, 3] | [3, 2]);
+            (format!("e{}", edge.id), json!(sharp))
+        })
+        .collect::<serde_json::Map<_, _>>();
     domain_source.attributes.insert(
-        "uv_seam".to_owned(),
+        "sharp".to_owned(),
+        json!({"domain":"edge","type":"bool","values":sharp_edges}),
+    );
+    domain_source.attributes.insert(
+        "seam".to_owned(),
         json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":true,"e2":false,"e3":false}}),
     );
     domain_source.attributes.insert(
@@ -3034,7 +3161,7 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         json!({"layers":["color"],"active":"color","render":"color"}),
     );
     domain_source.attributes.insert(
-        "smooth".to_owned(),
+        "shade_smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":true}}),
     );
     domain_source.attributes.insert(
@@ -3064,7 +3191,10 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         &domain_transfer,
         &domain_operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?;
     let domain_values = transfer_domain_values(&domains)?;
     assert_material_change(
@@ -3090,11 +3220,12 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
         storage: potter_core::image::ImageStorage::default(),
         width: 2,
         height: 2,
+        // Potter stores rows top-down; the Blender oracle lists the bottom row first.
         pixels: vec![
-            [0.0, 0.0, 0.0, 1.0],
-            [0.25, 0.25, 0.25, 1.0],
             [0.6, 0.6, 0.6, 1.0],
             [1.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.25, 0.25, 0.25, 1.0],
         ],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
@@ -3143,12 +3274,27 @@ fn blender_parity_covers_all_owned_modifier_types_and_image_mask_mappings()
                 "mask_tex_map_object":"mask_object"
             }),
         )?;
+        let texture = ResolvedTexture::from_image(image.clone());
+        let texture_mapping = if mapping == "OBJECT" {
+            potter_core::eval::object_texture_mapping(
+                subject_world,
+                map_object_world.to_cols_array().map(|value| value as f32),
+            )?
+        } else {
+            TextureCoordinateMapping {
+                subject_to_world_f32: subject_world.to_cols_array().map(|value| value as f32),
+                world_to_mapping_f32: None,
+            }
+        };
         let masked = evaluate_with_context(
             &mask_mesh,
             &mask_modifier,
             &operands,
-            Some(&image),
+            Some(&texture),
+            Some(&texture_mapping),
             subject_world,
+            "TestObject",
+            &AttributeLayerSelection::default(),
         )?;
         let key = format!("texture_mask_{}", mapping.to_lowercase());
         let baseline_key = format!("baseline_{key}");
@@ -3390,6 +3536,17 @@ fn weighted_normal_mesh(sharp_edge: bool) -> Result<Mesh, Box<dyn Error>> {
         vec![vec![0, 1, 2], vec![0, 2, 3], vec![0, 3, 4]],
     )?;
     mesh.faces[2].material_index = 1;
+    // The Blender oracle smooths every face (`polygon.use_smooth = True`); a missing shade_smooth
+    // is flat in Potter (geom/normals.rs `smooth_face_flags`).
+    let smooth = mesh
+        .faces
+        .iter()
+        .map(|face| (format!("f{}", face.id), json!(true)))
+        .collect::<serde_json::Map<_, _>>();
+    mesh.attributes.insert(
+        "shade_smooth".to_owned(),
+        json!({"domain":"face","type":"bool","values":smooth}),
+    );
     if sharp_edge {
         let edge = mesh
             .edges
@@ -3399,8 +3556,16 @@ fn weighted_normal_mesh(sharp_edge: bool) -> Result<Mesh, Box<dyn Error>> {
                     || (edge.vertices[0] == 2 && edge.vertices[1] == 0)
             })
             .ok_or("weighted-normal sharp edge missing")?;
-        mesh.attributes
-            .insert("sharp_edges".to_owned(), json!([edge.id]));
+        let sharp_edge = edge.id;
+        let values = mesh
+            .edges
+            .iter()
+            .map(|edge| (format!("e{}", edge.id), json!(edge.id == sharp_edge)))
+            .collect::<serde_json::Map<_, _>>();
+        mesh.attributes.insert(
+            "sharp".to_owned(),
+            json!({"domain":"edge","type":"bool","values":values}),
+        );
     }
     Ok(mesh)
 }
@@ -3480,9 +3645,13 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
             {"face_id":1,"uv":[[0,1],[1,0],[0,0]]}
         ])),
     );
-    mesh.attributes.insert("sharp_edges".to_owned(), json!([]));
+    // The Blender oracle creates this layer on the destination (SHARP_EDGE only writes into an existing one).
     mesh.attributes.insert(
-        "uv_seam".to_owned(),
+        "sharp".to_owned(),
+        json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":false,"e2":false,"e3":false,"e4":false}}),
+    );
+    mesh.attributes.insert(
+        "seam".to_owned(),
         json!({"domain":"edge","type":"bool","values":{"e0":false,"e1":false,"e2":false,"e3":false,"e4":false}}),
     );
     mesh.attributes.insert(
@@ -3501,33 +3670,38 @@ fn transfer_domain_destination_mesh() -> Result<Mesh, Box<dyn Error>> {
         }),
     )?;
     mesh.attributes.insert(
-        "smooth".to_owned(),
+        "shade_smooth".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),
     );
     mesh.attributes.insert(
         "freestyle_face".to_owned(),
         json!({"domain":"face","type":"bool","values":{"f0":false,"f1":false}}),
     );
+    // The Blender oracle creates this colour layer on the destination before the transfer (the modifier
+    // never creates one, so the layer has to exist for COLOR_CORNER to write into it).
+    mesh.attributes.insert(
+        "color".to_owned(),
+        json!({"domain":"corner","type":"color","values":{
+            "f0":[[0.0,0.0,0.0,1.0],[0.0,0.0,0.0,1.0],[0.0,0.0,0.0,1.0]],
+            "f1":[[0.0,0.0,0.0,1.0],[0.0,0.0,0.0,1.0],[0.0,0.0,0.0,1.0]]
+        }}),
+    );
+    mesh.attributes.insert(
+        "color_layers".to_owned(),
+        json!({"layers":["color"],"active":"color","render":"color"}),
+    );
     Ok(mesh)
 }
 
 fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
-    let sharp_ids = mesh
-        .attributes
-        .get("sharp_edges")
-        .and_then(Value::as_array)
-        .ok_or("sharp edge attribute missing")?
-        .iter()
-        .filter_map(Value::as_u64)
-        .filter_map(|id| u32::try_from(id).ok())
-        .collect::<std::collections::BTreeSet<_>>();
     let edge_attributes = |name: &str| {
         mesh.attributes
             .get(name)
             .and_then(|attribute| attribute.get("values"))
             .and_then(Value::as_object)
     };
-    let seam_values = edge_attributes("uv_seam").ok_or("seam edge values missing")?;
+    let sharp_values = edge_attributes("sharp").ok_or("sharp edge values missing")?;
+    let seam_values = edge_attributes("seam").ok_or("seam edge values missing")?;
     let crease_values = edge_attributes("crease_edge").ok_or("crease edge values missing")?;
     let mut sharp = serde_json::Map::new();
     let mut seam = serde_json::Map::new();
@@ -3536,7 +3710,15 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         let first = edge.vertices[0].min(edge.vertices[1]);
         let second = edge.vertices[0].max(edge.vertices[1]);
         let key = format!("{first}-{second}");
-        sharp.insert(key.clone(), Value::Bool(sharp_ids.contains(&edge.id)));
+        sharp.insert(
+            key.clone(),
+            Value::Bool(
+                sharp_values
+                    .get(&format!("e{}", edge.id))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+        );
         seam.insert(
             key.clone(),
             Value::Bool(
@@ -3613,7 +3795,7 @@ fn transfer_domain_values(mesh: &Mesh) -> Result<Value, Box<dyn Error>> {
         "uv":uv,
         "color":corner_values("color")?,
         "normal":corner_normal_vectors_json(mesh)?,
-        "smooth":face_values("smooth")?,
+        "smooth":face_values("shade_smooth")?,
         "freestyle":face_values("freestyle_face")?
     }))
 }
@@ -3767,7 +3949,10 @@ fn run_uv_transfer(
         &transfer,
         &operands,
         None,
+        None,
         DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
     )?)
 }
 
@@ -3834,11 +4019,12 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
         storage: potter_core::image::ImageStorage::default(),
         width: 1,
         height: 4,
+        // Potter stores rows top-down (`legacy_texture::image_pixel`); the probe's rows are bottom-to-top.
         pixels: vec![
-            [0.1, 0.1, 0.1, 1.0],
-            [0.3, 0.3, 0.3, 1.0],
-            [0.6, 0.6, 0.6, 1.0],
             [0.9, 0.9, 0.9, 1.0],
+            [0.6, 0.6, 0.6, 1.0],
+            [0.3, 0.3, 0.3, 1.0],
+            [0.1, 0.1, 0.1, 1.0],
         ],
         tiles: BTreeMap::new(),
         interpolation: ImageInterpolation::Closest,
@@ -3858,15 +4044,131 @@ fn vertex_weight_mix_uv_mask_samples_blender_v_up_rows() -> Result<(), Box<dyn E
             "mask_tex_uv_layer": "UVMap"
         }),
     )?;
-    let result =
-        evaluate_with_context(&mesh, &mix, &BTreeMap::new(), Some(&image), DMat4::IDENTITY)?;
+    let texture = ResolvedTexture::from_image(image);
+    let result = evaluate_with_context(
+        &mesh,
+        &mix,
+        &BTreeMap::new(),
+        Some(&texture),
+        Some(&TextureCoordinateMapping {
+            subject_to_world_f32: DMat4::IDENTITY.to_cols_array().map(|value| value as f32),
+            world_to_mapping_f32: None,
+        }),
+        DMat4::IDENTITY,
+        "TestObject",
+        &AttributeLayerSelection::default(),
+    )?;
     let weights = vertex_weights(&result, "A")?;
     assert_eq!(weights.len(), 4);
     for (weight, expected) in weights.iter().zip([0.1, 0.3, 0.6, 0.9]) {
         assert!(
-            (weight - expected).abs() < 1.0e-9,
+            (weight - expected).abs() < 1.0e-6,
             "mask weight {weight} differs from Blender {expected}"
         );
+    }
+    Ok(())
+}
+
+/// The 2x2 8-bit sRGB straight-alpha PNG the Blender probe `tests/fixtures/attribute_mask/byte_png_mask_probe.py`
+/// builds, as Potter's loaded image: linear colour (`srgb: true`) and straight alpha, rows top-down.
+fn byte_png_mask_image() -> ImageData {
+    ImageData {
+        colour: potter_core::image::ColourCache::default(),
+        storage: potter_core::image::ImageStorage {
+            precision: Precision::Byte,
+            straight_alpha: true,
+            ..potter_core::image::ImageStorage::default()
+        },
+        width: 2,
+        height: 2,
+        pixels: vec![
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.215_860_500_113_899_26, 0.0, 0.250_980_392_156_862_74],
+            [
+                0.215_860_500_113_899_26,
+                0.051_269_458_370_440_1,
+                0.014_443_843_596_092_545,
+                0.501_960_784_313_725_5,
+            ],
+            [
+                0.577_580_440_429_650_6,
+                0.577_580_440_429_650_6,
+                0.577_580_440_429_650_6,
+                1.0,
+            ],
+        ],
+        tiles: BTreeMap::new(),
+        interpolation: ImageInterpolation::Closest,
+        srgb: true,
+        udim: false,
+    }
+}
+
+#[test]
+fn vertex_weight_edit_byte_png_mask_matches_blender_channels() -> Result<(), Box<dyn Error>> {
+    // Blender 5.2.2 probe (`byte_png_mask_probe.expected.json`): an 8-bit straight-alpha PNG texel is
+    // premultiplied on read and divided by alpha after filtering (texture_image.cc:78-81, :276-281). The RED
+    // channel of an sRGB image is read in linear light (MOD_weightvg_util.cc:164, texture_procedural.cc);
+    // INT reads the stored values.
+    let expected: Value = serde_json::from_str(include_str!(
+        "fixtures/attribute_mask/byte_png_mask_probe.expected.json"
+    ))?;
+    let mut mesh = Mesh::from_positions_and_faces(
+        vec![DVec3::ZERO, DVec3::X, DVec3::new(1.0, 1.0, 0.0), DVec3::Y],
+        vec![vec![0, 1, 2, 3]],
+    )?;
+    mesh.attributes.insert(
+        "uv_layers".to_owned(),
+        named_uv_layers(
+            "UVMap",
+            [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]],
+        ),
+    );
+    mesh.attributes.insert(
+        "vertex_groups".to_owned(),
+        json!({"A": {"v0": 0.5, "v1": 0.5, "v2": 0.5, "v3": 0.5}}),
+    );
+    for channel in ["INT", "RED"] {
+        let edit = modifier(
+            "vertex_weight_edit",
+            json!({
+                "vertex_group":"A",
+                "falloff_type":"SHARP",
+                "normalize":false,
+                "mask_texture":"image_mask",
+                "mask_tex_use_channel":channel,
+                "mask_tex_mapping":"UV",
+                "mask_tex_uv_layer":"UVMap"
+            }),
+        )?;
+        let texture = ResolvedTexture::from_image(byte_png_mask_image());
+        let result = evaluate_with_context(
+            &mesh,
+            &edit,
+            &BTreeMap::new(),
+            Some(&texture),
+            Some(&TextureCoordinateMapping {
+                subject_to_world_f32: DMat4::IDENTITY.to_cols_array().map(|value| value as f32),
+                world_to_mapping_f32: None,
+            }),
+            DMat4::IDENTITY,
+            "TestObject",
+            &AttributeLayerSelection::default(),
+        )?;
+        let weights = vertex_weights(&result, "A")?;
+        let expected_weights = expected[channel]
+            .as_array()
+            .ok_or("Blender probe weights are missing")?;
+        assert_eq!(weights.len(), expected_weights.len());
+        for (weight, expected) in weights.iter().zip(expected_weights) {
+            let expected = expected
+                .as_f64()
+                .ok_or("Blender probe weight is not a number")?;
+            assert!(
+                (weight - expected).abs() < 1.0e-4,
+                "{channel} byte PNG mask weight {weight} differs from Blender {expected}"
+            );
+        }
     }
     Ok(())
 }
