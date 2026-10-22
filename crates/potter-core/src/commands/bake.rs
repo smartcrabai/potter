@@ -9,7 +9,7 @@ use std::{
 use glam::DMat4;
 use serde_json::{Value, json};
 
-use super::util::parse_id;
+use super::util::{parse_id, with_load_warnings};
 use crate::{
     cli::{BakeArgs, BakeKind, NodeBakeMode, NodeBakeUnpackMethod},
     error::{ErrorCode, PotError, Result},
