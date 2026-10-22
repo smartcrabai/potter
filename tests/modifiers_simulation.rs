@@ -4884,8 +4884,11 @@ fn indexed_particles_lifecycle_children_and_bake_are_evaluated() -> Result<(), B
     for (object, frame, expected_faces) in [
         ("b_alive", "1", 3),
         ("c_secondary", "1", 1),
-        ("d_no_unborn", "1", 3),
-        ("g_with_unborn", "1", 6),
+        // use_children is off, so these count the two parent particles only: one alive and one
+        // unborn at frame 1. Blender 5.2.2 measured 1 face (show_unborn off) and 2 faces (show_unborn
+        // on) with this fixture (/tmp/scout-unborn/probe.json).
+        ("d_no_unborn", "1", 1),
+        ("g_with_unborn", "1", 2),
         ("e_dead", "3", 3),
         ("f_exploder", "1", 6),
     ] {
