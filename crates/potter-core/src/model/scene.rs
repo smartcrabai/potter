@@ -1545,8 +1545,8 @@ fn default_sun_angle() -> f64 {
     0.526_f64.to_radians()
 }
 
-fn is_default_sun_angle(value: &f64) -> bool {
-    value.to_bits() == default_sun_angle().to_bits()
+fn is_default_sun_angle<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_sun_angle()).abs() < 1.0e-6
 }
 fn default_volume_color() -> [f64; 3] {
     [0.5; 3]

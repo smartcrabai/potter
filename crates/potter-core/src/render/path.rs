@@ -1506,7 +1506,7 @@ pub(super) fn add_camera_light_shapes(
                 continue;
             };
             let surface = closest_hit(
-                geometry,
+                &TraceGeometry::of(geometry),
                 &bvh,
                 origin,
                 direction,
