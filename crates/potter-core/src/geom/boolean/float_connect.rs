@@ -12,52 +12,29 @@
 //! Blender's data structures are reproduced where their order is observable:
 //! - Islands come from Blender's group loop, a depth-first walk over each vertex's disk cycle
 //!   (`BM_DISK_EDGE_NEXT`), scanning `edge_arr` backwards. The disk order is modelled by [`DiskNet`].
-//! - Ray and vertex-visibility casts go through a port of Blender's `BLI_kdopbvh` tree ([`Bvh`]): the
-//!   8-ary implicit tree of `BLI_bvhtree_balance`, and the `dfs_raycast` traversal order. When two edges
-//!   are at exactly the same distance, the one the traversal reaches first wins, as in Blender.
+//! - Ray and vertex-visibility casts go through the shared Blender `BLI_kdopbvh` port ([`KdopTree`]):
+//!   the 8-ary implicit tree of `BLI_bvhtree_balance`, and the `dfs_raycast` traversal order. When two
+//!   edges are at exactly the same distance, the one the traversal reaches first wins, as in Blender.
 //!
 //! Blender's arm64 FMA contraction is not reproduced; the FLOAT path rounds each operation separately.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::geom::bvh::{Bounds, KdopTree, Ray, RayHit, kdop_bounds};
 use crate::geom::triangulate::ortho_basis;
 
 type P2 = [f32; 2];
 type P3 = [f32; 3];
-/// Slab bounds of one box, Blender `bv` for `BLI_bvhtree_new(…, axis = 8)`: `[min, max]` for `x`, `y`,
-/// `z` and `x + y + z`, in that order.
-type Bounds = [f32; 8];
 
-/// Blender `BVH_RAYCAST_DIST_MAX`.
-const RAYCAST_DIST_MAX: f32 = f32::MAX / 2.0;
 /// Blender `edge_isect_verts_point_2d` endpoint bias.
 const ENDPOINT_BIAS: f32 = 1.0e-4;
 /// Blender `BLI_bvhtree_new` epsilon (`1e-4f`, above `FLT_EPSILON`), inflating every leaf box.
 const BVH_EPSILON: f32 = 1.0e-4;
-/// Blender `BLI_bvhtree_new` `tree_type`: children per node of the implicit tree.
+/// Blender `BLI_bvhtree_new` `tree_type`: children per node of the edge tree.
 const BVH_TREE_TYPE: usize = 8;
-/// Blender `bvhtree_kdop_axes[0..4]`. The fourth slab `x + y + z` takes part in overlap tests only; the
-/// ray test and the split axis read the first three.
-const BVH_AXES: [P3; 4] = [
-    [1.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0],
-    [0.0, 0.0, 1.0],
-    [1.0, 1.0, 1.0],
-];
-/// Blender `bvhtree_kdop_axes_length`: each slab's leaf inflation is `epsilon * length`.
-const BVH_AXES_LENGTH: [f32; 4] = [1.0, 1.0, 1.0, 1.732_050_8];
-/// Blender `node_minmax_init`.
-const EMPTY_BOUNDS: Bounds = [
-    f32::MAX,
-    -f32::MAX,
-    f32::MAX,
-    -f32::MAX,
-    f32::MAX,
-    -f32::MAX,
-    f32::MAX,
-    -f32::MAX,
-];
+/// Blender `BLI_bvhtree_new` `axis`: bound entries per edge box (`x`, `y`, `z`, `x + y + z`).
+const BVH_AXIS: usize = 8;
 
 /// Returns the connection edges Blender creates for one face, in creation order, as `(origin, end)`.
 ///
@@ -128,11 +105,13 @@ pub(super) fn connect_islands(
             [dot3(n1, d), dot3(n2, d)]
         })
         .collect();
-    let bvh = Bvh::new(
+    let bvh = KdopTree::new(
         edges
             .iter()
             .map(|&(a, b)| leaf_bounds(rel[a], rel[b]))
             .collect(),
+        BVH_TREE_TYPE,
+        BVH_AXIS,
     );
 
     let mut state = Islands {
@@ -348,7 +327,7 @@ struct Islands {
     /// Blender `edge_arr_new`: connections created so far, duplicates included.
     added: Vec<(usize, usize)>,
     /// Blender `edge_arr` BVH: leaf `i` is `edges[i]`.
-    bvh: Bvh,
+    bvh: KdopTree,
 }
 
 impl Islands {
@@ -398,15 +377,12 @@ impl Islands {
     fn ray_hit(&self, origin: usize, sign: bool, island: usize) -> Option<(usize, usize)> {
         let o = self.rel[origin];
         let dir: P2 = [if sign { 1.0 } else { -1.0 }, 0.0];
-        let mut hit = RayHit {
-            index: None,
-            dist: RAYCAST_DIST_MAX,
-        };
+        let mut hit = RayHit::open();
         self.bvh.ray_cast(
             [o[0], o[1], 0.0],
             [dir[0], dir[1], 0.0],
             &mut hit,
-            &mut |id: usize, best: &mut RayHit| {
+            &mut |id: usize, _ray: &Ray, best: &mut RayHit| {
                 let e = self.edges[id];
                 if let Some(dist) = isect_ray_seg(o, dir, self.rel[e.0], self.rel[e.1])
                     && dist < best.dist
@@ -416,12 +392,12 @@ impl Islands {
                     && self.group[e.0] != island
                 {
                     best.dist = dist;
-                    best.index = Some(id);
+                    best.index = id as isize;
                 }
             },
         );
         // Blender checks the new edges only when the BVH found a hit.
-        let id = hit.index?;
+        let id = hit.leaf()?;
         let mut best = hit.dist;
         let mut e_hit = self.edges[id];
         for &e in &self.added {
@@ -444,25 +420,25 @@ impl Islands {
         let mut dir = sub2(b, a);
         let dist_orig = normalize2(&mut dir);
         let mut hit = RayHit {
-            index: None,
+            index: -1,
             dist: dist_orig,
         };
         self.bvh.ray_cast(
             [a[0], a[1], 0.0],
             [dir[0], dir[1], 0.0],
             &mut hit,
-            &mut |id: usize, best: &mut RayHit| {
+            &mut |id: usize, _ray: &Ray, best: &mut RayHit| {
                 let e = self.edges[id];
                 if let Some(co) = self.vert_edge_isect(e, origin, other) {
                     let dist_new = dist_orig * line_point_factor(co, a, b);
                     if dist_new < best.dist && dist_new > 0.0 && self.group[e.0] != island {
                         best.dist = dist_new;
-                        best.index = Some(id);
+                        best.index = id as isize;
                     }
                 }
             },
         );
-        if let Some(id) = hit.index {
+        if let Some(id) = hit.leaf() {
             return Some(self.edges[id]);
         }
         // Blender checks the new edges only when the BVH found no blocker.
@@ -495,432 +471,14 @@ impl Islands {
     }
 }
 
-/// Blender `BVHRayCastData::hit`: `index` stays `None` (Blender `-1`) until a callback accepts an edge.
-struct RayHit {
-    index: Option<usize>,
-    dist: f32,
-}
-
-/// Blender `BVHNode`'s child link: a leaf (edge index) or a branch (branch index).
-#[derive(Clone, Copy)]
-enum Child {
-    Leaf(usize),
-    Branch(usize),
-}
-
-/// Blender `BVHNode` for a branch: its box, its split axis (a slab index), and its `node_num` children.
-#[derive(Clone, Default)]
-struct BvhBranch {
-    bounds: Bounds,
-    /// Blender `main_axis`: the slab (0, 1, 2) of the split axis.
-    main_axis: usize,
-    children: Vec<Child>,
-}
-
-/// Blender `BVHTree` over the edge list: `BLI_bvhtree_insert` for each edge in `edge_arr` order, then
-/// `BLI_bvhtree_balance`. Leaf `i` is edge `i`.
-struct Bvh {
-    leaves: Vec<Bounds>,
-    /// Branch `j` is stored at index `j`, Blender's implicit numbering. The root is branch 1.
-    branches: Vec<BvhBranch>,
-}
-
-/// Blender `BVHBuildHelper`: the layout of `leafs_num` leaves in an implicit `BVH_TREE_TYPE`-ary tree.
-struct Implicit {
-    leafs_num: usize,
-    leafs_per_child: [usize; 32],
-    branches_on_level: [usize; 32],
-    remain_leafs: usize,
-}
-
-impl Implicit {
-    /// Blender `build_implicit_tree_helper`.
-    fn new(leafs_num: usize) -> Self {
-        let mut leafs_per_child = [0usize; 32];
-        let mut branches_on_level = [0usize; 32];
-        leafs_per_child[0] = 1;
-        while leafs_per_child[0] < leafs_num {
-            leafs_per_child[0] *= BVH_TREE_TYPE;
-        }
-        branches_on_level[0] = 1;
-        let mut depth = 1;
-        while depth < 32 && leafs_per_child[depth - 1] != 0 {
-            branches_on_level[depth] = branches_on_level[depth - 1] * BVH_TREE_TYPE;
-            leafs_per_child[depth] = leafs_per_child[depth - 1] / BVH_TREE_TYPE;
-            depth += 1;
-        }
-        let remain = leafs_num - leafs_per_child[1];
-        let nnodes = (remain + BVH_TREE_TYPE - 2) / (BVH_TREE_TYPE - 1);
-        Self {
-            leafs_num,
-            leafs_per_child,
-            branches_on_level,
-            remain_leafs: remain + nnodes,
-        }
-    }
-
-    /// Blender `implicit_leafs_index`: the first leaf-array position under the branch `child_index` of
-    /// the level above `depth`.
-    fn leafs_index(&self, depth: usize, child_index: usize) -> usize {
-        let min_leaf_index = child_index * self.leafs_per_child[depth - 1];
-        if min_leaf_index <= self.remain_leafs {
-            return min_leaf_index;
-        }
-        if self.leafs_per_child[depth] != 0 {
-            return self.leafs_num
-                - (self.branches_on_level[depth - 1] - child_index) * self.leafs_per_child[depth];
-        }
-        self.remain_leafs
-    }
-}
-
-/// One level of the implicit tree while it is divided.
-#[derive(Clone, Copy)]
-struct Level {
-    /// Index of the first branch on this level.
-    start: usize,
-    /// Index of the first branch on the next level (Blender `first_of_next_level`).
-    next: usize,
-    /// Blender `depth`.
-    depth: usize,
-}
-
-/// Blender `i * tree_type + tree_offset + k`, with `tree_offset = 2 - tree_type`.
-fn child_index(parent: usize, k: usize) -> usize {
-    parent * BVH_TREE_TYPE + k + 2 - BVH_TREE_TYPE
-}
-
-/// Blender `create_kdop_hull` and `bvhtree_node_inflate` for one edge's two points (`z = 0`).
+/// Blender `create_kdop_hull` and `bvhtree_node_inflate` for one edge's two points (`z = 0`), as the
+/// 8-axis leaf boxes of [`KdopTree`].
 fn leaf_bounds(a: P2, b: P2) -> Bounds {
-    kdop_bounds(&[[a[0], a[1], 0.0], [b[0], b[1], 0.0]], BVH_EPSILON)
-}
-
-/// Blender `BLI_bvhtree_insert` leaf box of `points` (`create_kdop_hull`, then `bvhtree_node_inflate`
-/// with `epsilon`).
-pub(super) fn kdop_bounds(points: &[P3], epsilon: f32) -> Bounds {
-    let mut bounds = EMPTY_BOUNDS;
-    for &p in points {
-        extend_bounds(&mut bounds, p);
-    }
-    for (axis, &length) in BVH_AXES_LENGTH.iter().enumerate() {
-        let dist = epsilon * length;
-        bounds[2 * axis] -= dist;
-        bounds[2 * axis + 1] += dist;
-    }
-    bounds
-}
-
-/// Blender `create_kdop_hull` for one point.
-fn extend_bounds(bounds: &mut Bounds, p: P3) {
-    for (axis, &axis_dir) in BVH_AXES.iter().enumerate() {
-        let d = dot3(p, axis_dir);
-        bounds[2 * axis] = d.min(bounds[2 * axis]);
-        bounds[2 * axis + 1] = d.max(bounds[2 * axis + 1]);
-    }
-}
-
-/// Blender `refit_kdop_hull`: the union of the boxes of `ids`.
-fn refit(leaves: &[Bounds], ids: &[usize]) -> Bounds {
-    let mut bounds = EMPTY_BOUNDS;
-    for &id in ids {
-        for axis in 0..4 {
-            bounds[2 * axis] = leaves[id][2 * axis].min(bounds[2 * axis]);
-            bounds[2 * axis + 1] = leaves[id][2 * axis + 1].max(bounds[2 * axis + 1]);
-        }
-    }
-    bounds
-}
-
-/// Blender `get_largest_axis`: the largest-extent axis, as its max slab index (1, 3 or 5).
-fn largest_axis(bv: &Bounds) -> usize {
-    let m0 = bv[1] - bv[0];
-    let m1 = bv[3] - bv[2];
-    let m2 = bv[5] - bv[4];
-    if m0 > m1 {
-        if m0 > m2 { 1 } else { 5 }
-    } else if m1 > m2 {
-        3
-    } else {
-        5
-    }
-}
-
-/// Blender `bvh_medianof3`: the median of three leaves by their max slab on `axis`.
-fn median_of3(
-    a: &[usize],
-    lo: usize,
-    mid: usize,
-    hi: usize,
-    axis: usize,
-    leaves: &[Bounds],
-) -> usize {
-    let key = |id: usize| leaves[id][axis];
-    if key(a[mid]) < key(a[lo]) {
-        if key(a[hi]) < key(a[mid]) {
-            return a[mid];
-        }
-        if key(a[hi]) < key(a[lo]) {
-            return a[hi];
-        }
-        return a[lo];
-    }
-    if key(a[hi]) < key(a[mid]) {
-        if key(a[hi]) < key(a[lo]) {
-            return a[lo];
-        }
-        return a[hi];
-    }
-    a[mid]
-}
-
-/// Blender `bvh_partition`: Hoare partition of `a[lo..hi]` around the pivot key.
-fn partition(
-    a: &mut [usize],
-    lo: usize,
-    hi: usize,
-    pivot_key: f32,
-    axis: usize,
-    leaves: &[Bounds],
-) -> usize {
-    let key = |id: usize| leaves[id][axis];
-    let mut i = lo;
-    let mut j = hi;
-    loop {
-        while key(a[i]) < pivot_key {
-            i += 1;
-        }
-        j -= 1;
-        while pivot_key < key(a[j]) {
-            j -= 1;
-        }
-        if i >= j {
-            return i;
-        }
-        a.swap(i, j);
-        i += 1;
-    }
-}
-
-/// Blender `bvh_insertionsort`.
-fn insertion_sort(a: &mut [usize], lo: usize, hi: usize, axis: usize, leaves: &[Bounds]) {
-    for i in lo..hi {
-        let mut j = i;
-        let t = a[i];
-        while j != lo && leaves[t][axis] < leaves[a[j - 1]][axis] {
-            a[j] = a[j - 1];
-            j -= 1;
-        }
-        a[j] = t;
-    }
-}
-
-/// Blender `partition_nth_element`: after it, every leaf left of `n` is at most the leaf at `n`.
-fn partition_nth_element(
-    a: &mut [usize],
-    mut begin: usize,
-    mut end: usize,
-    n: usize,
-    axis: usize,
-    leaves: &[Bounds],
-) {
-    while end - begin > 3 {
-        let pivot = median_of3(a, begin, usize::midpoint(begin, end), end - 1, axis, leaves);
-        let cut = partition(a, begin, end, leaves[pivot][axis], axis, leaves);
-        if cut <= n {
-            begin = cut;
-        } else {
-            end = cut;
-        }
-    }
-    insertion_sort(a, begin, end, axis, leaves);
-}
-
-/// Blender `split_leafs`: each child range gets the leaves it would get from a full sort on `axis`.
-fn split_leafs(order: &mut [usize], nth: &[usize], axis: usize, leaves: &[Bounds]) {
-    for i in 0..BVH_TREE_TYPE - 1 {
-        if nth[i] >= nth[BVH_TREE_TYPE] {
-            break;
-        }
-        partition_nth_element(order, nth[i], nth[BVH_TREE_TYPE], nth[i + 1], axis, leaves);
-    }
-}
-
-/// Blender `non_recursive_bvh_div_nodes_task_cb`: fits branch `j`, splits its leaves along its largest
-/// axis, and links its children.
-fn divide(
-    branches: &mut [BvhBranch],
-    order: &mut [usize],
-    leaves: &[Bounds],
-    implicit: &Implicit,
-    level: Level,
-    j: usize,
-) {
-    let parent_level_index = j - level.start;
-    let begin = implicit.leafs_index(level.depth, parent_level_index);
-    let end = implicit.leafs_index(level.depth, parent_level_index + 1);
-    let bounds = refit(leaves, &order[begin..end]);
-    let split_axis = largest_axis(&bounds);
-
-    let mut nth = [0usize; BVH_TREE_TYPE + 1];
-    nth[0] = begin;
-    nth[BVH_TREE_TYPE] = end;
-    for (k, slot) in nth.iter_mut().enumerate().take(BVH_TREE_TYPE).skip(1) {
-        let child_level_index = child_index(j, k) - level.next;
-        *slot = implicit.leafs_index(level.depth + 1, child_level_index);
-    }
-    split_leafs(order, &nth, split_axis, leaves);
-
-    let mut children = Vec::with_capacity(BVH_TREE_TYPE);
-    for k in 0..BVH_TREE_TYPE {
-        let index = child_index(j, k);
-        let child_level_index = index - level.next;
-        let first = implicit.leafs_index(level.depth + 1, child_level_index);
-        let last = implicit.leafs_index(level.depth + 1, child_level_index + 1);
-        match last.cmp(&(first + 1)) {
-            Ordering::Greater => children.push(Child::Branch(index)),
-            Ordering::Equal => children.push(Child::Leaf(order[first])),
-            Ordering::Less => break,
-        }
-    }
-    branches[j] = BvhBranch {
-        bounds,
-        main_axis: split_axis / 2,
-        children,
-    };
-}
-
-/// Blender `RayPrecalc` fields of `bvhtree_ray_cast_data_precalc`, for the three slabs.
-struct RayPrecalc {
-    /// Blender `ray_dot_axis`: the ray's dot product with each slab direction, zeroed when tiny.
-    dot: [f32; 3],
-    /// Blender `idot_axis`.
-    idot: [f32; 3],
-    /// Blender `index`: the bounds index of the near and far plane of each slab.
-    index: [usize; 6],
-}
-
-impl RayPrecalc {
-    fn new(dir: P3) -> Self {
-        let mut pre = Self {
-            dot: [0.0; 3],
-            idot: [0.0; 3],
-            index: [0; 6],
-        };
-        for (axis, &axis_dir) in BVH_AXES.iter().take(3).enumerate() {
-            let d = dot3(dir, axis_dir);
-            if d.abs() < f32::EPSILON {
-                pre.dot[axis] = 0.0;
-                // The sign does not matter here, because `index` is adjusted below anyway.
-                pre.idot[axis] = f32::MAX;
-            } else {
-                pre.dot[axis] = d;
-                pre.idot[axis] = 1.0 / d;
-            }
-            let near = usize::from(pre.idot[axis] < 0.0);
-            pre.index[2 * axis] = near + 2 * axis;
-            pre.index[2 * axis + 1] = (1 - near) + 2 * axis;
-        }
-        pre
-    }
-}
-
-/// Blender `fast_ray_nearest_hit` with zero radius: the slab entry distance of `bv`, or `f32::MAX` on a
-/// miss or when the box lies beyond `hit_dist`.
-fn fast_ray_nearest_hit(bv: &Bounds, origin: P3, pre: &RayPrecalc, hit_dist: f32) -> f32 {
-    let t1x = (bv[pre.index[0]] - origin[0]) * pre.idot[0];
-    let t2x = (bv[pre.index[1]] - origin[0]) * pre.idot[0];
-    let t1y = (bv[pre.index[2]] - origin[1]) * pre.idot[1];
-    let t2y = (bv[pre.index[3]] - origin[1]) * pre.idot[1];
-    let t1z = (bv[pre.index[4]] - origin[2]) * pre.idot[2];
-    let t2z = (bv[pre.index[5]] - origin[2]) * pre.idot[2];
-
-    if (t1x > t2y || t2x < t1y || t1x > t2z || t2x < t1z || t1y > t2z || t2y < t1z)
-        || (t2x < 0.0 || t2y < 0.0 || t2z < 0.0)
-        || (t1x > hit_dist || t1y > hit_dist || t1z > hit_dist)
-    {
-        return f32::MAX;
-    }
-    t1x.max(t1y).max(t1z)
-}
-
-impl Bvh {
-    /// Blender `BLI_bvhtree_balance` (`non_recursive_bvh_div_nodes`) over the leaf boxes, in insertion order.
-    fn new(leaves: Vec<Bounds>) -> Self {
-        let leafs_num = leaves.len();
-        let branches_num = ((leafs_num + BVH_TREE_TYPE - 3) / (BVH_TREE_TYPE - 1)).max(1);
-        let mut branches = vec![BvhBranch::default(); branches_num + 1];
-        if leafs_num == 1 {
-            branches[1] = BvhBranch {
-                bounds: leaves[0],
-                main_axis: largest_axis(&leaves[0]) / 2,
-                children: vec![Child::Leaf(0)],
-            };
-            return Self { leaves, branches };
-        }
-
-        let implicit = Implicit::new(leafs_num);
-        let mut order: Vec<usize> = (0..leafs_num).collect();
-        let mut start = 1;
-        let mut depth = 1;
-        while start <= branches_num {
-            let next = child_index(start, 0);
-            let stop = next.min(branches_num + 1);
-            let level = Level { start, next, depth };
-            for j in start..stop {
-                divide(&mut branches, &mut order, &leaves, &implicit, level, j);
-            }
-            start = next;
-            depth += 1;
-        }
-        Self { leaves, branches }
-    }
-
-    /// Blender `BLI_bvhtree_ray_cast_ex` with zero radius: `dfs_raycast` from the root. `callback` is
-    /// called for each leaf whose box can still hold a closer hit, and may update `hit`.
-    fn ray_cast(
-        &self,
-        origin: P3,
-        dir: P3,
-        hit: &mut RayHit,
-        callback: &mut dyn FnMut(usize, &mut RayHit),
-    ) {
-        let pre = RayPrecalc::new(dir);
-        self.dfs(Child::Branch(1), origin, &pre, hit, callback);
-    }
-
-    fn dfs(
-        &self,
-        child: Child,
-        origin: P3,
-        pre: &RayPrecalc,
-        hit: &mut RayHit,
-        callback: &mut dyn FnMut(usize, &mut RayHit),
-    ) {
-        match child {
-            Child::Leaf(id) => {
-                if fast_ray_nearest_hit(&self.leaves[id], origin, pre, hit.dist) >= hit.dist {
-                    return;
-                }
-                callback(id, hit);
-            }
-            Child::Branch(j) => {
-                let node = &self.branches[j];
-                if fast_ray_nearest_hit(&node.bounds, origin, pre, hit.dist) >= hit.dist {
-                    return;
-                }
-                // Dive in the direction of the ray along the split axis.
-                if pre.dot[node.main_axis] > 0.0 {
-                    for &next in &node.children {
-                        self.dfs(next, origin, pre, hit, callback);
-                    }
-                } else {
-                    for &next in node.children.iter().rev() {
-                        self.dfs(next, origin, pre, hit, callback);
-                    }
-                }
-            }
-        }
-    }
+    kdop_bounds(
+        &[[a[0], a[1], 0.0], [b[0], b[1], 0.0]],
+        BVH_EPSILON,
+        BVH_AXIS,
+    )
 }
 
 /// Blender `axis_pt_cmp`: lexicographic on (x, y).
@@ -1071,70 +629,12 @@ fn isect_seg_seg_point(v0: P2, v1: P2, v2: P2, v3: P2, bias: f32) -> Option<P2> 
     None
 }
 
-/// Blender `BLI_bvhtree_overlap_ex` over two `BLI_bvhtree_new(…, 8, 8)` trees: both balanced as
-/// [`Bvh::new`], then `tree_overlap_traverse` from the roots. Each pair is `(leaf of first, leaf of second)`
-/// as positions in the given box lists. Blender's `BLI_stack_pop_n` hands the pushed pairs back last-first.
-pub(super) fn overlap_pairs(first: Vec<Bounds>, second: Vec<Bounds>) -> Vec<(usize, usize)> {
-    if first.is_empty() || second.is_empty() {
-        return Vec::new();
-    }
-    let tree_a = Bvh::new(first);
-    let tree_b = Bvh::new(second);
-    let mut out = Vec::new();
-    overlap_traverse(
-        &tree_a,
-        Child::Branch(1),
-        &tree_b,
-        Child::Branch(1),
-        &mut out,
-    );
-    out.reverse();
-    out
-}
-
-/// Bounds of a child node: its leaf box, or its branch box.
-fn child_bounds(tree: &Bvh, child: Child) -> Bounds {
-    match child {
-        Child::Leaf(id) => tree.leaves[id],
-        Child::Branch(index) => tree.branches[index].bounds,
-    }
-}
-
-/// Blender `tree_overlap_traverse`: while the boxes overlap, descend the first node while it is a branch,
-/// otherwise the second node's children, and emit a pair when both are leaves.
-fn overlap_traverse(
-    tree1: &Bvh,
-    node1: Child,
-    tree2: &Bvh,
-    node2: Child,
-    out: &mut Vec<(usize, usize)>,
-) {
-    let a = child_bounds(tree1, node1);
-    let b = child_bounds(tree2, node2);
-    if !(0..4).all(|axis| a[2 * axis] <= b[2 * axis + 1] && b[2 * axis] <= a[2 * axis + 1]) {
-        return;
-    }
-    match (node1, node2) {
-        (Child::Leaf(id1), Child::Leaf(id2)) => out.push((id1, id2)),
-        (Child::Leaf(_), Child::Branch(index)) => {
-            for &child in &tree2.branches[index].children {
-                overlap_traverse(tree1, node1, tree2, child, out);
-            }
-        }
-        (Child::Branch(index), _) => {
-            for &child in &tree1.branches[index].children {
-                overlap_traverse(tree1, child, tree2, node2, out);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Bvh, Child, DiskNet, Island, P2, RAYCAST_DIST_MAX, RayHit, connect_islands, isect_ray_seg,
-        leaf_bounds,
+        BVH_AXIS, BVH_TREE_TYPE, DiskNet, Island, P2, connect_islands, isect_ray_seg, leaf_bounds,
     };
+    use crate::geom::bvh::{KdopTree, Ray, RayHit};
     use serde_json::Value;
 
     const FIXTURE: &str = include_str!(
@@ -1292,27 +792,28 @@ mod tests {
 
     /// Nearest hit along a ray over `segments`, with the connect predicates (`0 < dist < best`).
     fn cast(segments: &[(P2, P2)], origin: P2, dir: P2) -> Option<usize> {
-        let bvh = Bvh::new(segments.iter().map(|&(a, b)| leaf_bounds(a, b)).collect());
-        let mut hit = RayHit {
-            index: None,
-            dist: RAYCAST_DIST_MAX,
-        };
-        bvh.ray_cast(
+        let tree = KdopTree::new(
+            segments.iter().map(|&(a, b)| leaf_bounds(a, b)).collect(),
+            BVH_TREE_TYPE,
+            BVH_AXIS,
+        );
+        let mut hit = RayHit::open();
+        tree.ray_cast(
             [origin[0], origin[1], 0.0],
             [dir[0], dir[1], 0.0],
             &mut hit,
-            &mut |id: usize, best: &mut RayHit| {
+            &mut |id: usize, _ray: &Ray, best: &mut RayHit| {
                 let (a, b) = segments[id];
                 if let Some(dist) = isect_ray_seg(origin, dir, a, b)
                     && dist < best.dist
                     && dist > 0.0
                 {
                     best.dist = dist;
-                    best.index = Some(id);
+                    best.index = id as isize;
                 }
             },
         );
-        hit.index
+        hit.leaf()
     }
 
     /// Both segments cross the ray at exactly t = 1. The root is split on x (its largest extent), and
@@ -1333,17 +834,6 @@ mod tests {
         assert_eq!(cast(&segments, [2.0, 0.0], [-1.0, 0.0]), Some(1));
     }
 
-    fn leaves_under(bvh: &Bvh, child: Child, out: &mut Vec<usize>) {
-        match child {
-            Child::Leaf(id) => out.push(id),
-            Child::Branch(j) => {
-                for &next in &bvh.branches[j].children {
-                    leaves_under(bvh, next, out);
-                }
-            }
-        }
-    }
-
     /// The implicit 8-ary tree reaches every leaf exactly once, and the nearest hit matches a brute-force
     /// scan on tie-free random rays.
     #[test]
@@ -1357,9 +847,12 @@ mod tests {
             .map(|_| ([next(), next()], [next(), next()]))
             .collect();
 
-        let bvh = Bvh::new(segments.iter().map(|&(a, b)| leaf_bounds(a, b)).collect());
-        let mut reached = Vec::new();
-        leaves_under(&bvh, Child::Branch(1), &mut reached);
+        let tree = KdopTree::new(
+            segments.iter().map(|&(a, b)| leaf_bounds(a, b)).collect(),
+            BVH_TREE_TYPE,
+            BVH_AXIS,
+        );
+        let mut reached = tree.reachable_leaves();
         reached.sort_unstable();
         assert_eq!(reached, (0..segments.len()).collect::<Vec<_>>());
 

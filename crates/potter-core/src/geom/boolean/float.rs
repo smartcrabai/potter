@@ -35,6 +35,7 @@ use super::dissolve::Poly;
 use super::float_split_net::CornerSource;
 use super::imesh::NO_INDEX;
 use super::{BooleanOperand, Operation};
+use crate::geom::bvh::{Bounds, KdopTree, Ray, RayHit, kdop_bounds, overlap_pairs};
 use crate::geom::triangulate::ortho_basis;
 
 type P3 = [f32; 3];
@@ -2414,9 +2415,25 @@ impl TriangleIntersectScratch {
     }
 }
 
+/// Blender `BLI_bvhtree_new(looptris of one side, eps_margin, 8, 8)` (`bmesh_intersect.cc`): the triangles of
+/// `side` as leaves, in looptri order. Leaf `i` is state triangle `entries[i]`.
+struct SideTree {
+    entries: Vec<usize>,
+    tree: KdopTree,
+}
+
+/// The triangles of `side` as a [`SideTree`], with `pad` as the tree epsilon.
+fn side_tree(state: &State, side: u8, pad: f32) -> SideTree {
+    let (entries, leaves) = tri_leaf_bounds(state, side, pad);
+    SideTree {
+        entries,
+        tree: KdopTree::new(leaves, 8, 8),
+    }
+}
+
 /// Blender `BLI_bvhtree_insert` of each triangle on `side`, in looptri order, with the tree epsilon. Returns
 /// the state triangle index of each leaf.
-fn tri_leaf_bounds(state: &State, side: u8, pad: f32) -> (Vec<usize>, Vec<[f32; 8]>) {
+fn tri_leaf_bounds(state: &State, side: u8, pad: f32) -> (Vec<usize>, Vec<Bounds>) {
     state
         .tris
         .iter()
@@ -2424,30 +2441,28 @@ fn tri_leaf_bounds(state: &State, side: u8, pad: f32) -> (Vec<usize>, Vec<[f32; 
         .filter(|(_, tri)| tri.side == side)
         .map(|(index, tri)| {
             let points = tri.verts.map(|v| state.verts[v].co);
-            (index, super::float_connect::kdop_bounds(&points, pad))
+            (index, kdop_bounds(&points, pad, 8))
         })
         .unzip()
 }
 
 /// Triangle candidate pairs `(side-1 triangle, side-0 triangle)` in the order of Blender's
 /// `BLI_bvhtree_overlap_ex(tree_b, tree_a)`.
-fn blender_overlap_pairs(state: &State, pad: f32) -> Vec<(usize, usize)> {
-    let (entries_b, leaves_b) = tri_leaf_bounds(state, 1, pad);
-    let (entries_a, leaves_a) = tri_leaf_bounds(state, 0, pad);
-    super::float_connect::overlap_pairs(leaves_b, leaves_a)
+fn blender_overlap_pairs(tree_b: &SideTree, tree_a: &SideTree) -> Vec<(usize, usize)> {
+    overlap_pairs(&tree_b.tree, &tree_a.tree)
         .into_iter()
-        .map(|(b, a)| (entries_b[b], entries_a[a]))
+        .map(|(b, a)| (tree_b.entries[b], tree_a.entries[a]))
         .collect()
 }
 
-fn intersect_triangles(state: &mut State, eps: f32) -> (Bvh, Bvh) {
+fn intersect_triangles(state: &mut State, eps: f32) -> (SideTree, SideTree) {
     let eps2x = eps * 2.0;
     let eps2x_sq = eps2x * eps2x;
     let margin = eps2x * 10.0;
     let margin_sq = margin * margin;
-    let tree_a = Bvh::from_triangles(&state.tris, &state.verts, 0, margin);
-    let tree_b = Bvh::from_triangles(&state.tris, &state.verts, 1, margin);
-    let overlap = blender_overlap_pairs(state, margin);
+    let tree_a = side_tree(state, 0, margin);
+    let tree_b = side_tree(state, 1, margin);
+    let overlap = blender_overlap_pairs(&tree_b, &tree_a);
     let mut scratch = TriangleIntersectScratch::new();
     for (b_index, a_index) in overlap {
         intersect_tri_pair(
@@ -3236,7 +3251,7 @@ fn ring_edges(verts: &[usize]) -> Vec<EdgeKey> {
         .collect()
 }
 
-fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &Bvh) {
+fn classify_faces(state: &mut State, operation: Operation, bvh_a: &SideTree, bvh_b: &SideTree) {
     let mut edge_faces = HashMap::<EdgeKey, Vec<usize>>::new();
     for (fi, face) in state.faces.iter().enumerate() {
         for i in 0..face.verts.len() {
@@ -3289,7 +3304,6 @@ fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &
     let mut removed = vec![false; state.faces.len()];
     let mut ray_candidates = Vec::new();
     let mut ray_depths = Vec::new();
-    let mut ray_stack = Vec::new();
     let mut flipped = vec![false; state.faces.len()];
     let mut face_scratch = FacePointScratch::default();
     for (start, end) in groups {
@@ -3304,7 +3318,6 @@ fn classify_faces(state: &mut State, operation: Operation, bvh_a: &Bvh, bvh_b: &
             &state.verts,
             &mut ray_candidates,
             &mut ray_depths,
-            &mut ray_stack,
         );
         let odd = hits & 1 == 1;
         let (do_remove, do_flip) = match operation {
@@ -3566,15 +3579,22 @@ fn collapse_ring_corners(
 
 fn ray_hits(
     origin: P3,
-    tree: &Bvh,
+    tree: &SideTree,
     tris: &[Triangle],
     verts: &[Vertex],
     candidates: &mut Vec<usize>,
     depths: &mut Vec<f32>,
-    stack: &mut Vec<usize>,
 ) -> usize {
     candidates.clear();
-    tree.ray_candidates(origin, candidates, stack);
+    // Blender `isect_bvhtree_point_v3`: every leaf the +x ray crosses, since the callback never tightens the
+    // distance. The tree gives the leaves; their triangles are tested exactly below.
+    let mut hit = RayHit::open();
+    tree.tree.ray_cast(
+        origin,
+        [1.0, 0.0, 0.0],
+        &mut hit,
+        &mut |leaf: usize, _ray: &Ray, _hit: &mut RayHit| candidates.push(tree.entries[leaf]),
+    );
     depths.clear();
     for &index in candidates.iter() {
         let tri = tris[index];
@@ -3619,138 +3639,6 @@ fn ray_triangle(origin: P3, tri: [P3; 3]) -> Option<f32> {
     }
     let t = f * dot(e2, q);
     (t >= 0.0).then_some(t)
-}
-
-#[derive(Clone, Copy)]
-struct BvhNode {
-    min: P3,
-    max: P3,
-    start: usize,
-    count: usize,
-    right: usize,
-}
-
-struct Bvh {
-    nodes: Vec<BvhNode>,
-    entries: Vec<usize>,
-}
-
-impl Bvh {
-    fn from_triangles(tris: &[Triangle], verts: &[Vertex], side: u8, pad: f32) -> Self {
-        let entries: Vec<usize> = tris
-            .iter()
-            .enumerate()
-            .filter_map(|(index, tri)| (tri.side == side).then_some(index))
-            .collect();
-        let mut bounds = Vec::with_capacity(tris.len());
-        for tri in tris {
-            let p = tri.verts.map(|v| verts[v].co);
-            bounds.push((
-                [
-                    p[0][0].min(p[1][0]).min(p[2][0]) - pad,
-                    p[0][1].min(p[1][1]).min(p[2][1]) - pad,
-                    p[0][2].min(p[1][2]).min(p[2][2]) - pad,
-                ],
-                [
-                    p[0][0].max(p[1][0]).max(p[2][0]) + pad,
-                    p[0][1].max(p[1][1]).max(p[2][1]) + pad,
-                    p[0][2].max(p[1][2]).max(p[2][2]) + pad,
-                ],
-            ));
-        }
-        let mut tree = Self {
-            nodes: Vec::new(),
-            entries,
-        };
-        let mut boxes = bounds;
-        if !tree.entries.is_empty() {
-            let len = tree.entries.len();
-            tree.build(0, len, &mut boxes);
-        }
-        tree
-    }
-
-    fn build(&mut self, start: usize, end: usize, bounds: &mut [(P3, P3)]) -> usize {
-        let index = self.nodes.len();
-        self.nodes.push(BvhNode {
-            min: [f32::INFINITY; 3],
-            max: [f32::NEG_INFINITY; 3],
-            start,
-            count: 0,
-            right: 0,
-        });
-        let mut min = [f32::INFINITY; 3];
-        let mut max = [f32::NEG_INFINITY; 3];
-        for &entry in &self.entries[start..end] {
-            for axis in 0..3 {
-                min[axis] = min[axis].min(bounds[entry].0[axis]);
-                max[axis] = max[axis].max(bounds[entry].1[axis]);
-            }
-        }
-        if end - start <= 8 {
-            self.nodes[index] = BvhNode {
-                min,
-                max,
-                start,
-                count: end - start,
-                right: 0,
-            };
-            return index;
-        }
-        let axis = (0..3)
-            .max_by(|&a, &b| (max[a] - min[a]).total_cmp(&(max[b] - min[b])))
-            .unwrap_or(0);
-        let mid = start + (end - start) / 2;
-        self.entries[start..end].select_nth_unstable_by(mid - start, |&a, &b| {
-            #[expect(
-                clippy::manual_midpoint,
-                reason = "keeps (min + max) * 0.5 centre arithmetic bit-identical to the FLOAT kernel"
-            )]
-            let ca = (bounds[a].0[axis] + bounds[a].1[axis]) * 0.5;
-            #[expect(
-                clippy::manual_midpoint,
-                reason = "keeps (min + max) * 0.5 centre arithmetic bit-identical to the FLOAT kernel"
-            )]
-            let cb = (bounds[b].0[axis] + bounds[b].1[axis]) * 0.5;
-            ca.total_cmp(&cb)
-        });
-        self.build(start, mid, bounds);
-        let right = self.build(mid, end, bounds);
-        self.nodes[index] = BvhNode {
-            min,
-            max,
-            start: 0,
-            count: 0,
-            right,
-        };
-        index
-    }
-
-    fn ray_candidates(&self, origin: P3, out: &mut Vec<usize>, stack: &mut Vec<usize>) {
-        out.clear();
-        stack.clear();
-        if self.nodes.is_empty() {
-            return;
-        }
-        stack.push(0);
-        while let Some(index) = stack.pop() {
-            let node = self.nodes[index];
-            if node.max[0] < origin[0]
-                || origin[1] < node.min[1]
-                || origin[1] > node.max[1]
-                || origin[2] < node.min[2]
-                || origin[2] > node.max[2]
-            {
-                continue;
-            }
-            if node.count > 0 {
-                out.extend_from_slice(&self.entries[node.start..node.start + node.count]);
-            } else {
-                stack.push(node.right);
-                stack.push(index + 1);
-            }
-        }
-    }
 }
 
 #[derive(Default)]
