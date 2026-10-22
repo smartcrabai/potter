@@ -3930,9 +3930,11 @@ mod tests {
             }),
             coords,
         )?;
-        assert_rgb_close(depth_without_alpha.rgb, [0.5625; 3]);
+        // Blender 5.2.2 probe (tests/fixtures/legacy_depth/depth_alpha_probe.py, use_alpha off): RED 0.75,
+        // INT 0.75, ALPHA 1.0. The alpha is forced to 1 without dividing, so rgb keeps the texel value.
+        assert_rgb_close(depth_without_alpha.rgb, [0.75; 3]);
         assert_eq!(depth_without_alpha.alpha, 1.0);
-        assert_eq!(depth_without_alpha.intensity, 0.5625);
+        assert!((depth_without_alpha.intensity - 0.75).abs() < 1e-6);
 
         let missing_pass = sample_scene_image_record(
             &mut doc,
