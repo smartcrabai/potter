@@ -1,3 +1,8 @@
+#![expect(
+    clippy::unwrap_used,
+    reason = "integration tests assert the expected error"
+)]
+
 use std::{
     error::Error,
     fs,
@@ -40,14 +45,12 @@ fn apply(project: &Path, batch_file: &Path, operations: Value) -> Result<(), Box
     let revision = document(project)?["revision"]
         .as_u64()
         .ok_or_else(|| std::io::Error::other("scene revision is missing"))?;
-    fs::write(
-        batch_file,
-        serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "base_revision": revision,
-            "operations": operations,
-        }))?,
-    )?;
+    let document = json!({
+        "schema_version": 1,
+        "base_revision": revision,
+        "operations": operations,
+    });
+    fs::write(batch_file, serde_json::to_vec(&document)?)?;
     run_json(
         pot()
             .arg("apply")
@@ -638,12 +641,36 @@ fn files_below(directory: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(files)
 }
 
+/// Asserts that `directory` holds no files, listing whatever it does hold on failure.
+fn assert_no_files(directory: &Path) -> Result<(), Box<dyn Error>> {
+    let files = files_below(directory)?;
+    assert_eq!(
+        files,
+        Vec::<PathBuf>::new(),
+        "files left in {}",
+        directory.display()
+    );
+    Ok(())
+}
+
+/// Asserts that `directory` holds at least one file.
+fn assert_some_files(directory: &Path) -> Result<(), Box<dyn Error>> {
+    assert_ne!(
+        files_below(directory)?,
+        Vec::<PathBuf>::new(),
+        "no files in {}",
+        directory.display()
+    );
+    Ok(())
+}
+
 fn assert_project_disk_payload(project: &Path, directory: &Path) -> Result<(), Box<dyn Error>> {
     let project_root = fs::canonicalize(project)?;
     let files = files_below(directory)?;
     assert!(
         !files.is_empty(),
-        "DISK bake wrote no payload under {directory:?}"
+        "DISK bake wrote no payload under {}",
+        directory.display()
     );
     assert!(
         files.iter().any(|path| {
@@ -794,7 +821,7 @@ fn disk_node_bake_is_project_rooted_and_missing_paths_or_payloads_use_live_geome
     create_project(&project, &batch_file, "DISK", "//cache-a", false)?;
     let unbaked = inspect(&project, 1.0)?;
     assert_dimensions(&unbaked, [2.0, 2.0, 2.0])?;
-    assert!(files_below(&cache_directory)?.is_empty());
+    assert_no_files(&cache_directory)?;
 
     let baked = bake(&project, None, None, BakeAction::Bake)?;
     assert_eq!(baked["result"]["scene_modified"], true);
@@ -809,7 +836,7 @@ fn disk_node_bake_is_project_rooted_and_missing_paths_or_payloads_use_live_geome
 
     let deleted = bake(&project, None, None, BakeAction::Delete)?;
     assert_eq!(deleted["result"]["scene_modified"], true);
-    assert!(files_below(&cache_directory)?.is_empty());
+    assert_no_files(&cache_directory)?;
     let live_after_delete = inspect(&project, 1.0)?;
     assert_dimensions(&live_after_delete, [4.0, 4.0, 4.0])?;
 
@@ -821,7 +848,7 @@ fn disk_node_bake_is_project_rooted_and_missing_paths_or_payloads_use_live_geome
     assert_dimensions(&still_baked, [4.0, 4.0, 4.0])?;
 
     set_disk_directory(&project, &batch_file, "//cache-b")?;
-    assert!(!files_below(&cache_directory)?.is_empty());
+    assert_some_files(&cache_directory)?;
     let changed_path = inspect(&project, 1.0)?;
     assert_dimensions(&changed_path, [6.0, 6.0, 6.0])?;
 
@@ -834,7 +861,7 @@ fn disk_node_bake_is_project_rooted_and_missing_paths_or_payloads_use_live_geome
     for payload in files_below(&cache_b_directory)? {
         fs::remove_file(payload)?;
     }
-    assert!(files_below(&cache_b_directory)?.is_empty());
+    assert_no_files(&cache_b_directory)?;
     let missing_payload = inspect(&project, 1.0)?;
     assert_dimensions(&missing_payload, [8.0, 8.0, 8.0])?;
     Ok(())
@@ -918,8 +945,8 @@ fn packed_and_disk_node_bakes_match_blender_geometry_after_input_change_and_dele
             .collect::<Vec<_>>();
         assert_positions_equal(&mesh_positions(&live)?, &expected_after_delete);
         if target == "DISK" {
-            assert!(files_below(&project.join("cache-a"))?.is_empty());
-            assert!(files_below(&project.join(".potter/bakes"))?.is_empty());
+            assert_no_files(&project.join("cache-a"))?;
+            assert_no_files(&project.join(".potter/bakes"))?;
         }
     }
     Ok(())
@@ -1145,15 +1172,12 @@ fn imported_bake_node_settings_drive_disk_target_custom_path_and_frame_range()
     assert_eq!(config["directory"], "//node-cache");
     assert_eq!(config["cache_directory"], "//node-cache");
     assert_eq!(config["use_custom_simulation_frame_range"], true);
-    assert_eq!(
-        config["frames"].as_array().map(|frames| frames.len()),
-        Some(3)
-    );
+    assert_eq!(config["frames"].as_array().map(Vec::len), Some(3));
     assert_eq!(config["frames"][0]["frame"], 2.0);
     assert_eq!(config["frames"][1]["frame"], 3.0);
     assert_eq!(config["frames"][2]["frame"], 4.0);
     assert_project_disk_payload(&project, &project.join("node-cache"))?;
-    assert!(files_below(&project.join("modifier-cache"))?.is_empty());
+    assert_no_files(&project.join("modifier-cache"))?;
 
     set_transform_translation(&project, &batch_file, 100.0)?;
     assert_positions_equal(
@@ -1161,7 +1185,7 @@ fn imported_bake_node_settings_drive_disk_target_custom_path_and_frame_range()
         &blender_still_bake_positions()?,
     );
     bake(&project, None, None, BakeAction::Delete)?;
-    assert!(files_below(&project.join("node-cache"))?.is_empty());
+    assert_no_files(&project.join("node-cache"))?;
     Ok(())
 }
 
@@ -1179,7 +1203,7 @@ fn disk_node_bake_pack_unpack_and_delete_preserve_baked_geometry() -> Result<(),
     assert_project_disk_payload(&project, &cache_directory)?;
     set_cube_size(&project, &batch_file, 4.0)?;
     let disk_files = files_below(&cache_directory)?;
-    assert!(!disk_files.is_empty());
+    assert_some_files(&cache_directory)?;
     assert_dimensions(&inspect(&project, 1.0)?, [2.0, 2.0, 2.0])?;
 
     let packed = bake(&project, None, None, BakeAction::Pack)?;
@@ -1206,7 +1230,7 @@ fn disk_node_bake_pack_unpack_and_delete_preserve_baked_geometry() -> Result<(),
     for payload in files_below(&cache_directory)? {
         fs::remove_file(payload)?;
     }
-    assert!(files_below(&cache_directory)?.is_empty());
+    assert_no_files(&cache_directory)?;
     let packed_result = inspect(&project, 1.0)?;
     assert_dimensions(&packed_result, [2.0, 2.0, 2.0])?;
     assert_bake_record(&packed_result)?;
@@ -1249,8 +1273,8 @@ fn disk_node_bake_pack_unpack_and_delete_preserve_baked_geometry() -> Result<(),
 
     let deleted = bake(&project, None, None, BakeAction::Delete)?;
     assert_eq!(deleted["result"]["scene_modified"], true);
-    assert!(files_below(&local_cache_directory)?.is_empty());
-    assert!(files_below(&cache_directory)?.is_empty());
+    assert_no_files(&local_cache_directory)?;
+    assert_no_files(&cache_directory)?;
     assert_dimensions(&inspect(&project, 1.0)?, [4.0, 4.0, 4.0])?;
     Ok(())
 }
@@ -1296,7 +1320,7 @@ fn deleting_packed_disk_node_bake_cleans_payloads_and_uses_live_geometry()
     assert!(settings.get("storage").is_none());
     assert!(settings.get("resource_id").is_none());
     assert_eq!(settings["bake_target"], "PACKED");
-    assert!(files_below(&cache_directory)?.is_empty());
+    assert_no_files(&cache_directory)?;
     assert!(disk_files.iter().all(|path| !path.exists()));
     assert_dimensions(&inspect(&project, 1.0)?, [4.0, 4.0, 4.0])?;
     Ok(())
