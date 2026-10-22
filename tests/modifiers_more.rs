@@ -250,6 +250,13 @@ proptest! {
         z in -0.75_f64..0.75,
         size in 0.25_f64..1.5,
     ) {
+        // Restricted to operand faces at least 1e-4 from the subject's coplanar faces. Blender 5.2.2's FLOAT union
+        // at the default double_threshold (1e-6) is not the analytic union for gaps below about 1e-4: its sweep
+        // (tests/fixtures/boolean_parity/float_sliver/float_sliver_union.json, from generate_union_sliver.py) drops
+        // the subject or leaves non-manifold edges there. That band is asserted against Blender in
+        // tests/boolean_float_sliver_parity.rs, so no coverage is lost. The sweep measured the -x face; the other
+        // faces are excluded with the same margin as a conservative bound.
+        prop_assume!(face_gaps(x, y, z, size).into_iter().all(|gap| gap.abs() >= 1.0e-4));
         let source = Mesh::box_mesh(BoxParams::default()).unwrap();
         let mut operand = Mesh::box_mesh(BoxParams { size: DVec3::splat(size) }).unwrap();
         for vertex in &mut operand.vertices {
@@ -260,6 +267,20 @@ proptest! {
         prop_assert!(edge_face_counts(&result).values().all(|count| *count == 2));
         prop_assert!((signed_volume(&result) - (8.0 + size.powi(3) - intersection_volume(size, x, y, z))).abs() < 2.0e-5);
     }
+}
+
+/// The signed gap from each of the operand's six faces to the subject's face on the same side, in the
+/// order -x, +x, -y, +y, -z, +z. A zero gap is coplanar, and a negative gap is an operand face inside the subject.
+fn face_gaps(x: f64, y: f64, z: f64, size: f64) -> [f64; 6] {
+    let half = size * 0.5;
+    [
+        x - half + 1.0,
+        1.0 - (x + half),
+        y - half + 1.0,
+        1.0 - (y + half),
+        z - half + 1.0,
+        1.0 - (z + half),
+    ]
 }
 
 fn intersection_volume(size: f64, x: f64, y: f64, z: f64) -> f64 {

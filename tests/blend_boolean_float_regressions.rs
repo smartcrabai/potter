@@ -22,7 +22,7 @@ use tempfile::tempdir;
 
 const BLENDER_REQUIRED: &str = "Blender is required for Boolean FLOAT boundary parity: install Blender 5.2, or set POTTER_BLENDER to its executable";
 
-const FLOAT_CASES: [&str; 33] = [
+const FLOAT_CASES: [&str; 34] = [
     "self_difference_false",
     "self_difference_true",
     "self_union_false",
@@ -39,6 +39,7 @@ const FLOAT_CASES: [&str; 33] = [
     "collection_empty_mesh_union",
     "threshold_default",
     "threshold_high",
+    "threshold_zero_touching",
     "tiny_normal_cutoff_difference",
     "collection_wire_member_union",
     "transformed_operand_difference",
@@ -391,6 +392,10 @@ add_case("empty_collection_error", "DIFFERENCE", host, collection=True)
 near_gap = part(box(-1, 1, -1, 1, 1.0001, 3.0001))
 add_case("threshold_default", "UNION", host, [near_gap], threshold=0.000001)
 add_case("threshold_high", "UNION", host, [near_gap], threshold=0.5)
+# Coplanar touching cubes at double_threshold 0. The FLOAT trees use the epsilon Blender clamps to
+# FLT_EPSILON in BLI_bvhtree_new, not the zero threshold margin, so this row pins that clamp against Blender.
+touching = part(box(-1, 1, -1, 1, 1, 3))
+add_case("threshold_zero_touching", "UNION", host, [touching], threshold=0.0)
 transform_name = "transformed_operand_difference"
 transform_spec = make_case("float_transform", "PR17b", "FLOAT", "DIFFERENCE", host, [offset])
 transform_spec["id"] = transform_name

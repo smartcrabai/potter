@@ -25,9 +25,9 @@ use crate::{
 };
 
 use super::principled_bsdf::{
-    GlassSample, Layers, SINGULAR_MIS_WEIGHT, base_color, continuous_density, continuous_lobes,
-    diffuse_coefficient, evaluate as evaluate_bsdf, layers_at, lobe_probabilities, sample_glass,
-    sheen_coefficient, specular_eta, subsurface_closure_weight,
+    GlassSample, Layers, base_color, continuous_density, continuous_lobes, diffuse_coefficient,
+    evaluate as evaluate_bsdf, layers_at, lobe_probabilities, sample_glass, sheen_coefficient,
+    specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -629,7 +629,8 @@ fn camera_footprint(
     let mut dp = 0.0;
     let mut dd = 0.0;
     for (neighbour_x, neighbour_y) in [(right, y), (x, down)] {
-        if let Some((neighbour_origin, neighbour_direction)) = ray_for_sample(
+        if let Some((neighbour_origin, neighbour_direction)) = ray_for_sample_in_frame(
+            frame,
             camera,
             width,
             height,
@@ -3104,6 +3105,7 @@ fn make_surface(
                 object_index: frame.triangle.object_index,
                 element_index: frame.triangle.element_index,
                 triangle_index,
+                footprint,
             })
         },
     )
