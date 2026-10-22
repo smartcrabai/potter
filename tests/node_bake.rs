@@ -41,7 +41,7 @@ fn document(project: &Path) -> Result<Value, Box<dyn Error>> {
     )?)?)
 }
 
-fn apply(project: &Path, batch_file: &Path, operations: Value) -> Result<(), Box<dyn Error>> {
+fn apply(project: &Path, batch_file: &Path, operations: &Value) -> Result<(), Box<dyn Error>> {
     let revision = document(project)?["revision"]
         .as_u64()
         .ok_or_else(|| std::io::Error::other("scene revision is missing"))?;
@@ -544,7 +544,7 @@ fn create_project(
     apply(
         project,
         batch_file,
-        json!(bake_graph_operations(target, bake_directory, animation)),
+        &json!(bake_graph_operations(target, bake_directory, animation)),
     )
 }
 
@@ -552,7 +552,7 @@ fn set_cube_size(project: &Path, batch_file: &Path, size: f64) -> Result<(), Box
     apply(
         project,
         batch_file,
-        json!([{
+        &json!([{
             "op":"graph.node_update",
             "graph":"geo",
             "node_id":"cube",
@@ -565,7 +565,7 @@ fn set_translation(project: &Path, batch_file: &Path, z: f64) -> Result<(), Box<
     apply(
         project,
         batch_file,
-        json!([{
+        &json!([{
             "op":"graph.node_update",
             "graph":"geo",
             "node_id":"translate",
@@ -582,7 +582,7 @@ fn set_transform_translation(
     apply(
         project,
         batch_file,
-        json!([{
+        &json!([{
             "op":"graph.node_update",
             "graph":"geo",
             "node_id":"transform",
@@ -596,7 +596,7 @@ fn set_modifier_shift(project: &Path, batch_file: &Path, shift: f64) -> Result<(
     apply(
         project,
         batch_file,
-        json!([{
+        &json!([{
             "op":"modifier.update",
             "target":{"id":"body"},
             "modifier_id":"geometry_modifier",
@@ -615,7 +615,7 @@ fn set_disk_directory(
     apply(
         project,
         batch_file,
-        json!([{
+        &json!([{
             "op":"modifier.update",
             "target":{"id":"body"},
             "modifier_id":"geometry_modifier",
@@ -781,7 +781,11 @@ fn float_bake_value_keeps_transform_after_modifier_input_changes() -> Result<(),
     let project = directory.path().join("float-project");
     let batch_file = directory.path().join("operations.json");
     run_json(pot().arg("init").arg(&project), "initializing project")?;
-    apply(&project, &batch_file, json!(scalar_bake_graph_operations()))?;
+    apply(
+        &project,
+        &batch_file,
+        &json!(scalar_bake_graph_operations()),
+    )?;
 
     let unbaked = inspect(&project, 1.0)?;
     assert!((minimum_x(&unbaked)? + 0.5).abs() < 1.0e-9);
@@ -905,7 +909,7 @@ fn packed_and_disk_node_bakes_match_blender_geometry_after_input_change_and_dele
         apply(
             &project,
             &batch_file,
-            json!(transformed_cube_bake_operations(target, bake_directory)),
+            &json!(transformed_cube_bake_operations(target, bake_directory)),
         )?;
 
         let unbaked = inspect(&project, 1.0)?;
@@ -1055,7 +1059,7 @@ fn point_field_bake_matches_blender_and_survives_modifier_input_changes()
     apply(
         &project,
         &batch_file,
-        json!(point_field_bake_operations(false)),
+        &json!(point_field_bake_operations(false)),
     )?;
 
     let expected = blender_point_field_positions("after_bake")?;
@@ -1098,7 +1102,7 @@ fn baked_attribute_field_matches_blender_and_survives_input_changes() -> Result<
     apply(
         &project,
         &batch_file,
-        json!(point_field_bake_operations(true)),
+        &json!(point_field_bake_operations(true)),
     )?;
 
     let expected_positions = blender_attribute_field_positions("after_bake")?;
@@ -1162,7 +1166,7 @@ fn imported_bake_node_settings_drive_disk_target_custom_path_and_frame_range()
     bake_node["properties"]["frame_end"] = json!(4);
     bake_node["properties"]["use_custom_path"] = json!(true);
     bake_node["properties"]["directory"] = json!("//node-cache");
-    apply(&project, &batch_file, json!(operations))?;
+    apply(&project, &batch_file, &json!(operations))?;
 
     let baked = bake(&project, None, None, BakeAction::Bake)?;
     assert_eq!(baked["result"]["storage"], "disk");
@@ -1529,7 +1533,7 @@ fn rebaking_a_shared_packed_cache_preserves_other_resource_users() -> Result<(),
     apply(
         &project,
         &batch_file,
-        json!([{
+        &json!([{
             "op":"modifier.create",
             "target":{"id":"body"},
             "id":"geometry_modifier_copy",
@@ -1572,7 +1576,7 @@ fn packed_bake_feeds_preview_render_and_gltf_after_input_change() -> Result<(), 
     apply(
         &project,
         &batch_file,
-        json!(transformed_cube_bake_operations("PACKED", "")),
+        &json!(transformed_cube_bake_operations("PACKED", "")),
     )?;
 
     let baked = bake(&project, None, None, BakeAction::Bake)?;
@@ -1586,7 +1590,7 @@ fn packed_bake_feeds_preview_render_and_gltf_after_input_change() -> Result<(), 
     apply(
         &project,
         &batch_file,
-        json!([
+        &json!([
             {"op":"camera.create","id":"camera_main","transform":{"translation":[1.5,0.0,5.0]},"projection":"orthographic","ortho_scale":4.0},
             {"op":"light.create","id":"key_light","light_type":"point","energy":12.0,"radius":0.8,"transform":{"translation":[-1.0,-1.0,3.0]}},
             {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
