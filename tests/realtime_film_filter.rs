@@ -4,8 +4,9 @@
 //! `fixtures/native_oracle/eevee_film_filter.py` renders a white emitter whose edge lies at pixel 32.3 of a 64 px frame,
 //! once per filter size and per orientation, with EEVEE at 256 samples. Its profiles are committed in
 //! `eevee_film_filter.json`. Run with a render directory of `0`, the script only saves the two .blend files, which the
-//! test imports. The test renders each frame with `pot render --engine realtime` at 256 samples, and compares every
-//! column (vertical edge) or row (horizontal edge) with EEVEE's profile for that size.
+//! test imports. The emitter is uniform along its edge, so the test renders a thin strip at EEVEE's 256 samples: 64 by 8
+//! pixels for the vertical edge, and 8 by 64 for the horizontal edge, with the camera unchanged.
+//! Every column (vertical edge) or row (horizontal edge) is compared with EEVEE's profile for that size.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -35,8 +36,12 @@ use tempfile::tempdir;
 const SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_film_filter.py");
 const ORACLE: &str = include_str!("fixtures/native_oracle/eevee_film_filter.json");
 
-/// Render settings shared with `eevee_film_filter.py`, and the sample count of Potter's realtime render (EEVEE's count).
+/// The frame of `eevee_film_filter.py`: 64 px square, with the camera's orthographic scale of 8 m.
 const RESOLUTION: u32 = 64;
+/// The strip's thin side, in pixels. Rows (vertical edge) or columns (horizontal edge) are identical, so a strip gives the
+/// same profile as the full frame.
+const STRIP: u32 = 8;
+/// The sample count of Potter's realtime render, EEVEE's count.
 const SAMPLES: u32 = 256;
 
 /// The filter sizes compared, as the keys of the oracle's profiles. `0.01` is the point sample below the jitter
@@ -61,18 +66,26 @@ fn profile(project: &Path, id: &str, vertical: bool) -> Result<Vec<f64>, Box<dyn
     let scene = read_scene(project)?;
     let image: Image = serde_json::from_value(scene["images"][id].clone())?;
     let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
-    let size = RESOLUTION as usize;
-    let texels = f64::from(RESOLUTION);
+    let width = data.width as usize;
+    let height = data.height as usize;
     let at = |column: usize, row: usize| {
         sample(
             &data,
-            [(column as f64 + 0.5) / texels, (row as f64 + 0.5) / texels],
+            [
+                (column as f64 + 0.5) / f64::from(data.width),
+                (row as f64 + 0.5) / f64::from(data.height),
+            ],
             false,
         )[0]
     };
-    Ok((0..size)
+    let (outer_len, inner_len) = if vertical {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    Ok((0..outer_len)
         .map(|outer| {
-            let total: f64 = (0..size)
+            let total: f64 = (0..inner_len)
                 .map(|inner| {
                     if vertical {
                         at(outer, inner)
@@ -81,7 +94,7 @@ fn profile(project: &Path, id: &str, vertical: bool) -> Result<Vec<f64>, Box<dyn
                     }
                 })
                 .sum();
-            total / size as f64
+            total / inner_len as f64
         })
         .collect())
 }
@@ -124,13 +137,21 @@ fn realtime_film_filter_matches_eevee_edge_profiles() -> TestResult {
             .as_str()
             .ok_or("active scene is missing")?
             .to_owned();
+        // Potter fits the orthographic scale to the larger dimension, as Blender's AUTO sensor fit does
+        // (`render/raster.rs`, `camera_frame`). The 64 by 8 vertical strip keeps the full 8 m width and 0.125 m per pixel,
+        // and the 8 by 64 horizontal strip keeps the full 8 m height. The emitter is uniform along the other axis.
+        let (strip_width, strip_height) = if vertical {
+            (RESOLUTION, STRIP)
+        } else {
+            (STRIP, RESOLUTION)
+        };
         for (index, size) in FILTER_SIZES.iter().enumerate() {
             let filter_size: f64 = size.parse()?;
             let applied = apply_operations(
                 &project,
                 root.path(),
                 json!([
-                    {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": SAMPLES, "seed": 0, "filter_size": filter_size}}
+                    {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": strip_width, "resolution_y": strip_height, "samples": SAMPLES, "seed": 0, "filter_size": filter_size}}
                 ]),
             )?;
             assert_eq!(applied["ok"], true, "{applied}");
@@ -158,6 +179,7 @@ fn realtime_film_filter_matches_eevee_edge_profiles() -> TestResult {
 
             let actual = profile(&project, &id, vertical)?;
             let expected = floats(&oracle[key][*size])?;
+            assert_eq!(actual.len(), expected.len(), "{name} profile length");
             let tolerance = TOLERANCES[usize::from(!vertical)][index];
             let mut failures = Vec::new();
             for (position, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
