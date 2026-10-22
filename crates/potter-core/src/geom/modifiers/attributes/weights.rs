@@ -64,7 +64,15 @@ pub(super) fn texture_mask_weights(
         let sample = crate::geom::legacy_texture::sample(source, coordinate, rng)?;
         let value = match channel {
             "INT" => sample.intensity,
-            "ALPHA" => sample.alpha,
+            // Blender's scalar (non-RGB) results never write `trgba[3]` (texture_procedural.cc), and
+            // MOD_weightvg_util.cc reads it from an unset TexResult, which the oracle observes as 0.
+            "ALPHA" => {
+                if sample.is_rgb {
+                    sample.alpha
+                } else {
+                    0.0
+                }
+            }
             _ => texture_channel(
                 [sample.rgb[0], sample.rgb[1], sample.rgb[2], sample.alpha],
                 channel,

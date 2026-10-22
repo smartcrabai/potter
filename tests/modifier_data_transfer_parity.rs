@@ -2467,7 +2467,11 @@ fn edge_and_polygon_mapping_families_match_blender() -> Result<(), Box<dyn Error
         )?;
         let values = actual.attributes["blender_attributes"][0]["values"].clone();
         let error = max_error(&values, &expected["edge"][mapping])?;
-        assert!(error < 3.0e-4, "edge {mapping} max error {error}");
+        assert!(
+            error < 3.0e-4,
+            "edge {mapping} max error {error}; actual={values}, expected={}",
+            expected["edge"][mapping]
+        );
     }
     let mut radius_zero_destination =
         Mesh::from_positions_and_faces(destination_vertices.clone(), vec![vec![0, 1, 2]])?;
