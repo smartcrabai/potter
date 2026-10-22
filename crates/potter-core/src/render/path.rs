@@ -3329,7 +3329,7 @@ fn write_center_passes(
             output.ambient_occlusion[index] = finite_f32(super::raster::ambient_visibility(
                 bvh,
                 geometry.triangles,
-                geometry.prepared.as_slice(),
+                geometry.prepared,
                 surface.point,
                 surface.geometric_normal,
                 surface.normal,

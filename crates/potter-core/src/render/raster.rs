@@ -1158,7 +1158,7 @@ pub(crate) fn rasterize_wireframe(
         // Wire is never a film Beauty render, so no film filter applies.
         0.0,
         None,
-        prepared_materials,
+        &[],
         None,
     )?;
     let mut output = rasterize_with_lines(
@@ -1174,7 +1174,7 @@ pub(crate) fn rasterize_wireframe(
         0,
         0.0,
         None,
-        prepared_materials,
+        &[],
         None,
     )?;
     let frame = camera_frame(camera, width, height)?;
@@ -2404,7 +2404,6 @@ struct Layer {
 /// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
 /// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
 /// scalar composite of the layers. Returns the un-premultiplied colour and that alpha.
-
 fn composite_layers_with_background(
     layers: impl IntoIterator<Item = Layer>,
     background_alpha: f64,
@@ -3718,6 +3717,7 @@ mod visibility_tests {
         hit_opacity, intersect_triangle, nearest_visible_hit, prepare_triangles,
         ray_for_pixel_in_frame,
     };
+    use crate::error::Result;
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
     use crate::render::bvh::Bvh;
