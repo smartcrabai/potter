@@ -15,15 +15,16 @@
 //! references, `sigma_b` is Blender's per-pixel standard error, and `sigma_p` is Potter's
 //! per-pixel noise, scaled from Blender's measured per-seed deviation to 64 samples. Monte Carlo
 //! over the same noise model (300 draws) puts the standard error of `alpha` at 0.045 for
-//! Blackman-Harris against Box and 0.009 for Gaussian 2.5 against Gaussian 1.5 or Box. The
-//! wrong-filter alpha is at least 0.88 in every draw, and the correct one at most 0.15, so the
-//! threshold 0.5 is at least 11 standard errors from either hypothesis at the worst case. The
-//! threshold is not loosened to pass.
+//! Blackman-Harris 1.5 against Box and 0.009 for Gaussian 2.5 against Gaussian 1.5 or Box. For
+//! those comparisons, the wrong-filter alpha is at least 0.88 in every draw and the correct one at
+//! most 0.15, so the threshold 0.5 is at least 11 standard errors from either hypothesis. Every
+//! alternative, including Blackman-Harris 2.5, uses the measured seed noise and must have standard
+//! error below 0.1; the threshold is not loosened to pass.
 //!
-//! Alternatives: the Potter box filter (what Potter did before this filter existed) is an
-//! alternative for every kind; the Blackman-Harris filter is one for the Gaussian; the default-width
-//! Gaussian is one for `gaussian_wide` (a Gaussian of width 2.5), which is what Potter would render
-//! if it dropped `filter_width` on import.
+//! Alternatives tested: Box is compared with `blackman_harris` and `gaussian_wide`; `gaussian`
+//! (width 1.5) is compared with `gaussian_wide` to detect a dropped `filter_width`; and
+//! `blackman_harris_wide` (width 2.5) is compared with `gaussian_wide` to detect a Gaussian /
+//! Blackman-Harris filter-type swap.
 //!
 //! The round trip needs only a `.blend`, so it asks the generator for zero seeds, which saves the
 //! scene and renders nothing.
@@ -311,11 +312,14 @@ fn blackman_harris_pixel_filter_matches_cycles_and_not_box() -> TestResult {
     check_kind("blackman_harris", &["box"])
 }
 
-/// A Gaussian of width 2.5 differs from the default-width kinds, so an import that drops
-/// `filter_width` (or a table that ignores it) moves Potter onto the Gaussian 1.5 or Box reference.
+/// A Gaussian of width 2.5 is compared with the default-width Gaussian (detecting a dropped
+/// `filter_width`), Box, and a Blackman-Harris filter of the same width (detecting a type swap).
 #[test]
 fn gaussian_wide_pixel_filter_width_is_imported_and_applied() -> TestResult {
-    check_kind("gaussian_wide", &["gaussian", "box"])
+    check_kind(
+        "gaussian_wide",
+        &["gaussian", "box", "blackman_harris_wide"],
+    )
 }
 
 /// The filter type and width Potter writes to a `.blend` are the ones Blender reads back.

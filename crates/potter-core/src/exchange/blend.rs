@@ -9040,32 +9040,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             }
         }
     }
-    // Cycles' pixel filter is imported (`pixel_filter_type`, `filter_width`). EEVEE's `scene.render.filter_size`
-    // (`r.gauss`, `eevee_film.cc` `filter_radius`) is not: Potter's real-time engine has no filter of its own.
-    for scene in raw
-        .get("scenes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let render = &scene["render"];
-        // A bridge export always writes both keys; a file without them has no EEVEE filter to report.
-        let (Some(engine), Some(filter_size)) = (
-            render["engine_native"].as_str(),
-            render["filter_size"].as_f64(),
-        ) else {
-            continue;
-        };
-        // `r.gauss` is read by EEVEE's film (`eevee_film.cc`) and by Grease Pencil's renderer
-        // (`gpencil_render.cc`). Cycles and Workbench do not read it, so only EEVEE is reported.
-        if engine.starts_with("BLENDER_EEVEE") && !crate::float::equal_f64(filter_size, 1.5) {
-            losses.push(loss(
-                "blender.render.filter_size",
-                scene.get("name").and_then(Value::as_str),
-                "Blender's EEVEE filter size is not imported; Potter's real-time engine draws no filter, so the image is not filtered as in EEVEE",
-            ));
-        }
-    }
     for material in raw
         .get("materials")
         .and_then(Value::as_array)
@@ -18994,30 +18968,6 @@ mod workbench_display_loss_tests {
     #[test]
     fn factory_shading_reports_nothing() {
         assert_eq!(losses(&[]), Vec::<&str>::new());
-    }
-
-    /// `blender.render.filter_size` is reported for an EEVEE scene with a non-default `r.gauss` only.
-    #[test]
-    fn eevee_filter_size_is_reported_only_for_eevee_and_non_default() {
-        let feature = "blender.render.filter_size";
-        // Only the filter-size feature is asserted: other render losses (such as an unknown engine)
-        // are reported by their own rules and do not bear on this one.
-        let imported = |engine: &str, size: f64| {
-            import_losses(&json!({"scenes": [{
-                "name": "Scene",
-                "display_shading": factory_shading(),
-                "render": {"engine_native": engine, "filter_size": size},
-            }]}))
-            .into_iter()
-            .map(|loss| loss.feature_id)
-            .filter(|feature_id| feature_id == "blender.render.filter_size")
-            .collect::<Vec<String>>()
-        };
-        assert_eq!(imported("BLENDER_EEVEE_NEXT", 2.0), [feature]);
-        assert_eq!(imported("BLENDER_EEVEE", 2.0), [feature]);
-        assert_eq!(imported("BLENDER_EEVEE_NEXT", 1.5), Vec::<String>::new());
-        assert_eq!(imported("CYCLES", 2.0), Vec::<String>::new());
-        assert_eq!(imported("BLENDER_WORKBENCH", 2.0), Vec::<String>::new());
     }
 
     #[test]

@@ -4,16 +4,15 @@
 //! `intern/cycles/util/math_cdf.h` and `math_cdf.cpp`), and every camera sample reads its raster
 //! offset from it (`intern/cycles/kernel/camera/camera.h` `camera_sample`, `kernel/util/lookup_table.h`
 //! `lookup_table_read`). Samples are therefore distributed like the filter and carry weight 1.
+//! Potter's raster y runs top-down, so `sample` mirrors Cycles' bottom-up y offset.
 //!
 //! Two Cycles details are kept on purpose, because Blender's pixels depend on them:
 //! - the symmetric inversion reads the CDF one cell past the interval that holds each abscissa
 //!   (`util_cdf_invert`, `make_symmetric` branch), and
 //! - the table's last entry is never written, so it stays 0 and the last cell interpolates towards it.
 //!
-//! The one deliberate difference: a degenerate CDF cell (zero width) gives `t = 0`. Cycles divides
-//! by zero there, which only happens when float32 CDF cells collapse; the f64 table here does not
-//! collapse.
-
+//! A degenerate CDF cell (zero width) gives `t = 0`. Cycles divides by zero there, which only happens
+//! when float32 CDF cells collapse; the f64 table here does not collapse.
 use crate::model::PixelFilterType;
 
 /// Cycles' `FILTER_TABLE_SIZE` (`intern/cycles/kernel/types.h`).
@@ -39,15 +38,16 @@ impl PixelFilter {
     /// `u` and `v` are uniform in `[0, 1)`. Cycles' `integrate_camera_sample` gives sample 0 the
     /// parameter `(0.5, 0.5)`, and `camera_sample` still reads it through the table. So sample 0 is
     /// not exactly the pixel centre: `lookup(0.5)` interpolates between table entries 511 and 512, and
-    /// entry 512 sits one step off the centre, so the result is about 0.50049 px for Box and 0.50053 px
-    /// for Blackman-Harris at width 1.5. Offsets may leave the pixel.
+    /// entry 512 sits one step off the centre. At width 1.5 this gives about `(0.50049, 0.49951)` px
+    /// for Box and `(0.50053, 0.49947)` px for Blackman-Harris. The y offset is mirrored because
+    /// Cycles uses a bottom-up raster while Potter uses a top-down raster. Offsets may leave the pixel.
     pub(crate) fn sample(&self, sample_index: u32, u: f64, v: f64) -> (f64, f64) {
         let (u, v) = if sample_index == 0 {
             (0.5, 0.5)
         } else {
             (u, v)
         };
-        (self.lookup(u), self.lookup(v))
+        (self.lookup(u), 1.0 - self.lookup(v))
     }
 
     /// Cycles' `lookup_table_read` for the filter table: linear interpolation over `u` in `[0, 1]`.
@@ -103,8 +103,7 @@ fn filter_cdf(kind: PixelFilterType, width: f64, range: f64) -> Vec<f64> {
         let x = range * i as f64 / (samples - 1) as f64;
         cdf[i + 1] = cdf[i] + filter_value(kind, x, width).abs();
     }
-    let total = cdf[samples];
-    let scale = if total == 0.0 { 0.0 } else { 1.0 / total };
+    let scale = 1.0 / cdf[samples];
     for value in &mut cdf {
         *value *= scale;
     }
@@ -190,15 +189,16 @@ mod tests {
     fn first_sample_reads_the_table_at_one_half() {
         let filter = PixelFilter::new(PixelFilterType::Gaussian, 1.5);
         // Cycles passes (0.5, 0.5) through `lookup_table_read` for sample 0, ignoring the randoms.
+        // Potter's top-down raster mirrors Cycles' bottom-up y offset.
         let (x, y) = filter.sample(0, 0.01, 0.99);
         assert!((x - filter.lookup(0.5)).abs() < 1.0e-12);
-        assert!((y - filter.lookup(0.5)).abs() < 1.0e-12);
+        assert!((y - (1.0 - filter.lookup(0.5))).abs() < 1.0e-12);
         assert!(
             (x - 0.5).abs() > 1.0e-9,
             "sample 0 must not be the exact centre"
         );
         let (x, y) = filter.sample(1, 0.25, 0.75);
         assert!((x - filter.lookup(0.25)).abs() < 1.0e-12);
-        assert!((y - filter.lookup(0.75)).abs() < 1.0e-12);
+        assert!((y - (1.0 - filter.lookup(0.75))).abs() < 1.0e-12);
     }
 }

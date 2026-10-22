@@ -15,9 +15,10 @@ pixel the mean and standard error of the red channel over the seeds (the floor a
 With `seeds` 0 the script only saves the `.blend` and writes no JSON, so a test that needs just the
 scene does not pay for renders.
 
-Arguments after `--`: blend_out, json_out, kind (box | gaussian | gaussian_wide | blackman_harris),
-seeds. `gaussian_wide` is a Gaussian of width 2.5, so it differs from the default-width kinds and
-shows whether Potter reads `filter_width`.
+Arguments after `--`: blend_out, json_out, kind (box | gaussian | gaussian_wide | blackman_harris |
+blackman_harris_wide), seeds. `gaussian_wide` and `blackman_harris_wide` both have width 2.5, so
+they distinguish a Gaussian/Blackman-Harris filter-type swap; `gaussian_wide` also shows whether
+Potter reads `filter_width`.
 """
 
 import json
@@ -42,6 +43,7 @@ FILTERS = {
     "gaussian": ("GAUSSIAN", 1.5),
     "gaussian_wide": ("GAUSSIAN", 2.5),
     "blackman_harris": ("BLACKMAN_HARRIS", 1.5),
+    "blackman_harris_wide": ("BLACKMAN_HARRIS", 2.5),
 }
 filter_type, filter_width = FILTERS[kind]
 
