@@ -12,6 +12,7 @@ import json
 import math
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 import traceback
@@ -1652,6 +1653,7 @@ def _nodes_bakes_dump(modifier):
 
     The name is the key because it exists on every node, including nodes of files Potter did not write. Names are
     unique within a node tree; the importer maps each name to the imported node ID."""
+    bakes = {}
     packed_payloads = []
     data_blocks = []
     unmapped = []
