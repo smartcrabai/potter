@@ -1241,7 +1241,16 @@ mod tests {
         let expected_faces = [vec![0, 1, 2], vec![3, 4, 5, 6], vec![4, 7, 5]];
         assert_eq!(output.vertices.len(), expected_vertices.len());
         for (vertex, expected) in output.vertices.iter().zip(expected_vertices) {
-            assert!(vertex.co.distance(DVec3::from_array(expected)) < 1.0e-7);
+            // Blender's expected coordinates are f32 chain results: 12 half-ulps at magnitude 1
+            // (`F32_CHAIN_ROUNDINGS` in tests/modifier_param_audit.rs). The 1e-12 is Potter's own
+            // f64 error, about 1e-15 at magnitude 1.
+            let bound = 6.0 * f64::from(f32::EPSILON) + 1.0e-12;
+            assert!(
+                (vertex.co - DVec3::from_array(expected))
+                    .abs()
+                    .max_element()
+                    <= bound
+            );
         }
         assert_eq!(output.faces.len(), expected_faces.len());
         for (face, expected) in output.faces.iter().zip(expected_faces) {

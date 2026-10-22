@@ -205,6 +205,15 @@ for case in cases:
     depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh()
+    chain = 0.0
+    for vertex in mesh.vertices:
+        for component in vertex.co:
+            chain = max(chain, abs(float(component)))
+    for scene_object in bpy.context.scene.objects:
+        for system in scene_object.evaluated_get(depsgraph).particle_systems:
+            for particle in system.particles:
+                for component in particle.location:
+                    chain = max(chain, abs(float(component)))
     results.append({
         "id": case["id"],
         "state": case["state"],
@@ -214,6 +223,7 @@ for case in cases:
             "vertex_count": len(mesh.vertices),
             "edge_count": len(mesh.edges),
             "face_count": len(mesh.polygons),
+            "chain_magnitude": chain,
         },
     })
     evaluated.to_mesh_clear()
@@ -396,14 +406,20 @@ fn scenario_geometry<'a>(results: &'a BTreeMap<String, Value>, id: &str, state: 
         .expect("Blender scenario result is missing")
 }
 
-/// Blender stores positions as f32 and evaluates the particle instance transform in f32, while
-/// Potter computes in f64 and is compared after rounding to f32. Each f32 rounding in that chain
-/// (vertex rotation, scale, translation to the particle location, object transform) is at most
-/// half an ulp at the magnitude of the largest coordinate. The bound is four ulps: [INFERENCE] the
-/// chain has about four such roundings, estimated from the operations rather than counted, and the
-/// largest measured difference is 2.0 ulp (4.8e-7 after rounding Potter to f32, amount_half, where
-/// one ulp at magnitude 2-4 is 2^-22), so four ulps leaves a 2x margin over it.
-const F32_ULPS: f64 = 4.0;
+/// Blender evaluates each vertex in f32 through a chain: a quaternion rotation of the vertex, then
+/// scale and translation to the particle location. Potter computes in f64 and is compared after
+/// rounding to f32. The chain magnitude M is the largest value Blender carries through that chain:
+/// the largest output coordinate or particle location, reported by the Blender runner as
+/// `chain_magnitude`. Every rounding in the chain is at most half an ulp of its result, so the bound
+/// is F32_CHAIN_ROUNDINGS half-ulps of M. [INFERENCE] The count of 12 is an estimate of the roundings
+/// on one vertex's path (the rotation's cross products and multiply-adds, then scale and
+/// translation), not counted from the Blender source. Intermediates such as rotated cube corners
+/// (at most sqrt(3) for M = 1) stay in M's binade, so they share its ulp.
+///
+/// Measured: the explode edge-cut difference is 6 ulp at M = 1.0, which equals this bound exactly
+/// (12 half-ulps = 6 * 2^-23); particle_instance_amount_half is 2 ulp at M = 3.69. The f32 rounding
+/// of Potter's positions is included in the comparison.
+const F32_CHAIN_ROUNDINGS: f64 = 12.0;
 
 /// `value` rounded to f32, by parsing its shortest decimal form. This avoids an `as` cast, which the
 /// workspace's pedantic clippy rejects. It equals the nearest f32 except in rare double-rounding
@@ -418,10 +434,10 @@ fn f32_ulp(value: f32) -> f64 {
     f64::from(f32::from_bits(magnitude.to_bits() + 1) - magnitude)
 }
 
-/// Compares evaluated geometry at f32 precision: vertices match by position within `F32_ULPS`
-/// ulps of the largest coordinate (each used once), and faces compare as vertex sets under that
-/// matching, so storage order is ignored. Returns `None` when they match, otherwise a dump of both
-/// sides in storage order for the CI log.
+/// Compares evaluated geometry at f32 precision: vertices match by position within the chain bound
+/// (`F32_CHAIN_ROUNDINGS` half-ulps of Blender's `chain_magnitude`), each used once, and faces
+/// compare as vertex sets under that matching, so storage order is ignored. Returns `None` when
+/// they match, otherwise a dump of both sides in storage order for the CI log.
 fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
     let counts = |geometry: &Value| {
         ["vertex_count", "edge_count", "face_count"].map(|key| geometry[key].as_u64())
@@ -461,11 +477,8 @@ fn geometry_mismatch(potter: &Value, blender: &Value) -> Option<String> {
         .map(|point| point.map(|c| f64::from(f32_of(c))))
         .collect();
     let blender_points = points(blender);
-    let scale = blender_points
-        .iter()
-        .flatten()
-        .fold(0.0_f64, |max, c| max.max(c.abs()));
-    let tolerance = F32_ULPS * f32_ulp(f32_of(scale));
+    let scale = blender["chain_magnitude"].as_f64().unwrap();
+    let tolerance = F32_CHAIN_ROUNDINGS * 0.5 * f32_ulp(f32_of(scale));
     let mut matches =
         counts(potter) == counts(blender) && potter_points.len() == blender_points.len();
     let mut matched = vec![None; potter_points.len()];
