@@ -1,8 +1,8 @@
-//! Sun, point, and spot emitters, and an area light through absorbing volume, in the realtime Beauty image, checked
+//! Sun, point, and spot emitters, and an area light through absorbing voxel and mesh volumes, in the realtime Beauty image,
 //! against committed Blender 5.2.2 EEVEE captures.
 //!
 //! `fixtures/native_oracle/eevee_light_shapes_extra.py` saves three base scenes and three local-light cull variants;
-//! `eevee_light_shape_occlusion.py` saves a point-shape scene behind an opaque surface:
+//! `eevee_light_shape_occlusion.py` and `eevee_mesh_volume_gradient.py` save the opaque-surface and gradient-volume cases:
 //!
 //! - a sun of angle 8° seen by a perspective camera that looks straight at it, whose disc EEVEE draws at
 //!   `energy · (1 + 1 / r²) / π` with `r = tan(angle / 2)`;
@@ -12,10 +12,12 @@
 //!   verify that all-zero and transmission-only factors cull the shape while a volume-only factor keeps it visible;
 //! - a hard point light whose physical sphere front is in front of an opaque plane, while EEVEE's center-plane emitter
 //!   lies behind it, pinning the camera-shape depth test.
+//! - a hard point light behind a mesh-volume absorption gradient that is zero at the camera-entry face, pinning material
+//!   evaluation at occupied froxel centers and the AA-filtered emitter edge.
 //!
 //! The test imports each saved `.blend`, renders it with `pot render --engine realtime`, and compares window means with
-//! committed macOS EEVEE pixel captures. The sun and spot tolerances are 0.01; the existing absorber tolerance remains
-//! 0.03 for both froxel layouts, and each case checks that the absorber darkens the light.
+//! committed macOS EEVEE pixel captures. The sun, spot, and opaque-surface tolerances are 0.01; the existing absorber
+//! tolerance remains 0.03 for tile sizes 8 and 1 and the gradient-volume center and edge, with no tolerance change.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -66,12 +68,15 @@ const OCCLUSION_SCRIPT: &str =
     include_str!("fixtures/native_oracle/eevee_light_shape_occlusion.py");
 const EEVEE_POINT_OCCLUDED: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/point_occluded.f32le");
+const MESH_VOLUME_SCRIPT: &str =
+    include_str!("fixtures/native_oracle/eevee_mesh_volume_gradient.py");
+const EEVEE_MESH_VOLUME_GRADIENT: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/mesh_volume_gradient.f32le");
 
 /// Linear tolerance on a window mean against EEVEE, for the sun and the spot.
 const EMITTER_TOLERANCE: f64 = 0.01;
 
-/// Linear tolerance on the area light seen through the absorber, covering the froxel gap while retaining a darkening
-/// check against the clear area-light capture.
+/// The existing 0.03 linear window-mean tolerance for absorber and heterogeneous mesh-volume EEVEE comparisons.
 const ABSORBER_TOLERANCE: f64 = 0.03;
 
 /// The mean red value of the `(2 * half + 1)` square window centred on `(column, row)` (top-down) in the image `id`.
@@ -335,6 +340,52 @@ fn realtime_point_shape_uses_center_plane_depth_for_surface_occlusion() -> TestR
     assert!(
         (actual - expected).abs() <= EMITTER_TOLERANCE,
         "camera-visible point shape at the light center plane: Potter {actual} differs from EEVEE {expected}"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_point_shape_evaluates_heterogeneous_mesh_volume_per_froxel_sample() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(
+        root.path(),
+        "eevee_mesh_volume_gradient.py",
+        MESH_VOLUME_SCRIPT,
+    )?;
+    let blend = root.path().join("mesh_volume_gradient.blend");
+    let capture = root.path().join("mesh_volume_gradient.f32le");
+    run_blender_arguments(
+        &blender,
+        &script,
+        None,
+        &[blend.as_path(), capture.as_path()],
+    )?;
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "mesh_volume_gradient",
+        &blend,
+        "mesh_volume_gradient",
+        2,
+    )?;
+    let centre = RESOLUTION as usize / 2;
+    let actual_centre = window_mean(&project, "mesh_volume_gradient", centre, centre, WINDOW)?;
+    let expected_centre = oracle_window_mean(EEVEE_MESH_VOLUME_GRADIENT, centre, centre, WINDOW);
+    assert!(
+        (actual_centre - expected_centre).abs() <= ABSORBER_TOLERANCE,
+        "heterogeneous mesh-volume attenuation at the point-shape center: Potter {actual_centre} differs from EEVEE {expected_centre}"
+    );
+
+    let edge_column = centre + 7;
+    let actual_edge = window_mean(&project, "mesh_volume_gradient", edge_column, centre, 0)?;
+    let expected_edge = oracle_window_mean(EEVEE_MESH_VOLUME_GRADIENT, edge_column, centre, 0);
+    assert!(
+        (actual_edge - expected_edge).abs() <= ABSORBER_TOLERANCE,
+        "AA-filtered point-shape edge through heterogeneous volume: Potter {actual_edge} differs from EEVEE {expected_edge}"
     );
     Ok(())
 }

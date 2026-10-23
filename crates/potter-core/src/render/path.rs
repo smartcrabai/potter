@@ -19,8 +19,8 @@ use crate::{
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitFootprint, HitUvLayers, PreparedMaterial,
         ShaderClosure, SubsurfaceMethod, SurfaceShading, equirectangular_uv,
-        evaluate_displacement_with_workspace, evaluate_surface_with_workspace, heaviest,
-        height_gradient, make_orthonormals,
+        evaluate_displacement_with_workspace, evaluate_surface_with_workspace,
+        evaluate_surface_with_workspace_into, heaviest, height_gradient, make_orthonormals,
     },
 };
 
@@ -1954,6 +1954,14 @@ pub(super) struct RealtimeVolumeTransport<'a> {
     volumetric_shadows: bool,
 }
 
+const FROXEL_COLUMN_CACHE_SLOTS: usize = 4;
+
+#[derive(Clone, Copy, Default)]
+struct FroxelColumnCacheSlot {
+    column: Option<usize>,
+    last_used: u64,
+}
+
 #[derive(Default)]
 pub(super) struct RealtimeVolumeScratch {
     media: Vec<MeshMedium>,
@@ -1961,8 +1969,14 @@ pub(super) struct RealtimeVolumeScratch {
     hit_media: Vec<MeshMedium>,
     boundaries: Vec<(f64, MeshMedium)>,
     evaluator_workspace: EvaluatorWorkspace,
+    froxel_shading: SurfaceShading,
+    froxel_media: Vec<FroxelMeshMedium>,
+    froxel_initial_media: Vec<FroxelMeshMedium>,
+    froxel_hit_media: Vec<FroxelMeshMedium>,
+    froxel_mesh_boundary_hits: Vec<(f64, FroxelMeshMedium)>,
     froxel_extinction: Vec<DVec3>,
-    froxel_boundaries: Vec<(usize, MeshMedium)>,
+    froxel_prefix: Vec<DVec3>,
+    froxel_boundaries: Vec<(usize, FroxelMeshMedium)>,
     froxel_resolve: Option<RealtimeVolumeResolveCache>,
 }
 
@@ -1973,9 +1987,99 @@ struct RealtimeVolumeResolveCache {
     height: u32,
     tile_size: u32,
     slice_count: usize,
-    history_samples: u32,
+    sample_count: usize,
     depth_start: f64,
-    columns: BTreeMap<usize, Vec<DVec3>>,
+    column_slots: Vec<FroxelColumnCacheSlot>,
+    column_prefix: Vec<DVec3>,
+    column_clock: u64,
+}
+
+impl RealtimeVolumeResolveCache {
+    fn cached_column_slot(&mut self, sample: usize, column: usize) -> Option<usize> {
+        if sample >= self.sample_count {
+            return None;
+        }
+        let first = sample.checked_mul(FROXEL_COLUMN_CACHE_SLOTS)?;
+        let last = first.checked_add(FROXEL_COLUMN_CACHE_SLOTS)?;
+        for slot in first..last {
+            if self.column_slots.get(slot)?.column == Some(column) {
+                self.column_clock = self.column_clock.wrapping_add(1);
+                self.column_slots[slot].last_used = self.column_clock;
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    fn replacement_column_slot(&self, sample: usize) -> Option<usize> {
+        if sample >= self.sample_count {
+            return None;
+        }
+        let first = sample.checked_mul(FROXEL_COLUMN_CACHE_SLOTS)?;
+        let last = first.checked_add(FROXEL_COLUMN_CACHE_SLOTS)?;
+        let slots = self.column_slots.get(first..last)?;
+        for (offset, slot) in slots.iter().enumerate() {
+            if slot.column.is_none() {
+                return Some(first + offset);
+            }
+        }
+        slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, slot)| slot.last_used)
+            .map(|(offset, _)| first + offset)
+    }
+
+    fn store_column(&mut self, slot: usize, column: usize, prefix: &[DVec3]) -> Result<()> {
+        if prefix.len() != self.slice_count {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "realtime froxel prefix has an invalid slice count",
+            ));
+        }
+        let start = slot.checked_mul(self.slice_count).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "realtime froxel cache index overflowed",
+            )
+        })?;
+        let end = start.checked_add(self.slice_count).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "realtime froxel cache index overflowed",
+            )
+        })?;
+        self.column_prefix
+            .get_mut(start..end)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "realtime froxel cache slot is out of range",
+                )
+            })?
+            .copy_from_slice(prefix);
+        let entry = self.column_slots.get_mut(slot).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "realtime froxel cache slot is out of range",
+            )
+        })?;
+        self.column_clock = self.column_clock.wrapping_add(1);
+        *entry = FroxelColumnCacheSlot {
+            column: Some(column),
+            last_used: self.column_clock,
+        };
+        Ok(())
+    }
+
+    fn column_prefix(&self, slot: usize, column: usize) -> Option<&[DVec3]> {
+        if self.column_slots.get(slot)?.column != Some(column) {
+            return None;
+        }
+        let start = slot.checked_mul(self.slice_count)?;
+        let end = start.checked_add(self.slice_count)?;
+        self.column_prefix.get(start..end)
+    }
 }
 
 pub(super) struct RealtimeVolumePass<'pass, 'scene> {
@@ -2009,6 +2113,8 @@ pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
     height: u32,
     x: u32,
     y: u32,
+    /// Blender's image-render AA sample index, also the per-sample volume projection jitter.
+    sample_index: u32,
     sample_x: f64,
     sample_y: f64,
     origin: DVec3,
@@ -2065,6 +2171,7 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
             height: sample.height,
             x: sample.x,
             y: sample.y,
+            sample_index: sample.sample_index,
             sample_x: sample.sample_x,
             sample_y: sample.sample_y,
             origin: sample.ray.0,
@@ -2120,6 +2227,12 @@ impl RealtimeVolumeSample<'_, '_> {
         if !self.initialize_froxel_resolve()? {
             return Ok(DVec3::ONE);
         }
+        let sample_index = usize::try_from(self.sample_index).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "realtime sample index exceeds platform limits",
+            )
+        })?;
         let event_depth = self
             .camera
             .depth_of(self.origin + self.direction * end_distance);
@@ -2148,19 +2261,48 @@ impl RealtimeVolumeSample<'_, '_> {
         for x in [x_weights.lower_index, x_weights.upper_index] {
             for y in [y_weights.lower_index, y_weights.upper_index] {
                 let column = y * grid_width + x;
-                if !self.resolve_cache()?.columns.contains_key(&column) {
-                    let prefix = self.build_froxel_column(column)?;
-                    let _previous = self.resolve_cache_mut()?.columns.insert(column, prefix);
+                if self
+                    .resolve_cache_mut()?
+                    .cached_column_slot(sample_index, column)
+                    .is_none()
+                {
+                    let slot = self
+                        .resolve_cache()?
+                        .replacement_column_slot(sample_index)
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::InternalError,
+                                "realtime volume sample cache has no column slot",
+                            )
+                        })?;
+                    self.build_froxel_column(column)?;
+                    let scratch = &mut *self.scratch;
+                    let cache = scratch.froxel_resolve.as_mut().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "realtime volume froxel cache is unavailable",
+                        )
+                    })?;
+                    cache.store_column(slot, column, &scratch.froxel_prefix)?;
                 }
             }
         }
 
-        let cache = self.resolve_cache()?;
         let mut transmittance = DVec3::ZERO;
         for (x, x_weight) in axis_weights(x_weights) {
             for (y, y_weight) in axis_weights(y_weights) {
-                let index = y * cache.layout.dimensions[0] as usize + x;
-                let column = cache.columns.get(&index).ok_or_else(|| {
+                let index = y * grid_width + x;
+                let slot = self
+                    .resolve_cache_mut()?
+                    .cached_column_slot(sample_index, index)
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "realtime volume froxel column was not prepared",
+                        )
+                    })?;
+                let cache = self.resolve_cache()?;
+                let column = cache.column_prefix(slot, index).ok_or_else(|| {
                     PotError::new(
                         ErrorCode::InternalError,
                         "realtime volume froxel column was not prepared",
@@ -2228,6 +2370,44 @@ impl RealtimeVolumeSample<'_, '_> {
             -depth_end as f32,
             settings.eevee_volumetric_sample_distribution as f32,
         );
+        let sample_count = usize::try_from(settings.samples.max(1)).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "realtime volume sample count exceeds platform limits",
+            )
+        })?;
+        let cache_slot_count = sample_count
+            .checked_mul(FROXEL_COLUMN_CACHE_SLOTS)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "realtime volume sample cache exceeds platform limits",
+                )
+            })?;
+        let prefix_count = cache_slot_count.checked_mul(slice_count).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "realtime volume sample cache exceeds platform limits",
+            )
+        })?;
+        let mut column_slots = Vec::new();
+        column_slots
+            .try_reserve_exact(cache_slot_count)
+            .map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "cannot allocate realtime volume sample cache",
+                )
+            })?;
+        column_slots.resize(cache_slot_count, FroxelColumnCacheSlot::default());
+        let mut column_prefix = Vec::new();
+        column_prefix.try_reserve_exact(prefix_count).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "cannot allocate realtime volume sample cache",
+            )
+        })?;
+        column_prefix.resize(prefix_count, DVec3::ZERO);
         self.scratch.froxel_resolve = Some(RealtimeVolumeResolveCache {
             layout,
             depth_mapping,
@@ -2235,9 +2415,11 @@ impl RealtimeVolumeSample<'_, '_> {
             height: self.height,
             tile_size,
             slice_count,
-            history_samples: scene.render.samples.max(1),
+            sample_count,
             depth_start,
-            columns: BTreeMap::new(),
+            column_slots,
+            column_prefix,
+            column_clock: 0,
         });
         Ok(true)
     }
@@ -2285,16 +2467,91 @@ impl RealtimeVolumeSample<'_, '_> {
         Ok(())
     }
 
-    /// Builds one EEVEE froxel column from history-averaged center-sampled extinction.
-    fn build_froxel_column(&mut self, column_index: usize) -> Result<Vec<DVec3>> {
-        let (layout, width, height, slice_count, history_samples, depth_start, depth_mapping) = {
+    fn mesh_froxel_extinction_at_point(
+        &mut self,
+        geometry: &TraceGeometry<'_>,
+        point: DVec3,
+    ) -> Result<DVec3> {
+        let RealtimeVolumeScratch {
+            froxel_media,
+            evaluator_workspace,
+            froxel_shading,
+            ..
+        } = self.scratch;
+        let mut extinction = DVec3::ZERO;
+        for (index, medium) in froxel_media.iter().enumerate() {
+            if froxel_media[..index].iter().any(|previous| {
+                previous.object_index == medium.object_index
+                    && previous.material_index == medium.material_index
+            }) {
+                continue;
+            }
+            let object =
+                object_for_index(geometry.objects, medium.object_index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "froxel volume references an unmapped object",
+                    )
+                })?;
+            let material = geometry
+                .materials
+                .get(medium.material_index)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "froxel volume references an unmapped material",
+                    )
+                })?;
+            let prepared = geometry
+                .prepared
+                .get(medium.material_index)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::EvaluationFailed,
+                        "froxel volume references an unprepared material",
+                    )
+                })?;
+            let local_point = object_space(object, point);
+            let mut context =
+                HitContext::new(&self.transport.doc.node_groups).with_images(self.transport.images);
+            context.position = point;
+            context.object = local_point;
+            context.generated =
+                medium.generated_origin + local_point.component_mul(medium.generated_per_local);
+            context.generated_per_local = medium.generated_per_local;
+            context.normal = -self.direction;
+            context.view_direction = -self.direction;
+            evaluate_surface_with_workspace_into(
+                material,
+                prepared,
+                &context,
+                evaluator_workspace,
+                froxel_shading,
+            )?;
+            for active in froxel_media.iter().filter(|active| {
+                active.object_index == medium.object_index
+                    && active.material_index == medium.material_index
+            }) {
+                let Some(closure) = froxel_shading.volume.get(active.closure) else {
+                    continue;
+                };
+                let scatter = DVec3::from_array(closure.params.volume_scatter);
+                let absorption = DVec3::from_array(closure.params.volume_absorption);
+                extinction += (scatter + absorption) * closure.weight;
+            }
+        }
+        Ok(extinction)
+    }
+
+    /// Builds one native render sample's EEVEE froxel column from center-sampled extinction.
+    fn build_froxel_column(&mut self, column_index: usize) -> Result<()> {
+        let (layout, width, height, slice_count, depth_start, depth_mapping) = {
             let cache = self.resolve_cache()?;
             (
                 cache.layout,
                 cache.width,
                 cache.height,
                 cache.slice_count,
-                cache.history_samples,
                 cache.depth_start,
                 cache.depth_mapping,
             )
@@ -2324,12 +2581,12 @@ impl RealtimeVolumeSample<'_, '_> {
             ));
         };
         self.accumulate_froxel_extinction(column_index)?;
-        let inverse_history_samples = 1.0 / f64::from(history_samples);
         let mut cumulative_optical_depth = DVec3::ZERO;
         let mut previous_distance = self
             .camera
             .ray_distance_for_depth(integration_direction, depth_start);
-        let mut prefix = Vec::with_capacity(slice_count);
+        self.scratch.froxel_prefix.clear();
+        self.scratch.froxel_prefix.resize(slice_count, DVec3::ZERO);
         for slice in 0..slice_count {
             let normalized_z = (slice + 1) as f32 / slice_count as f32;
             let slice_depth = -f64::from(depth_mapping.volume_z_to_view_z(normalized_z));
@@ -2337,27 +2594,25 @@ impl RealtimeVolumeSample<'_, '_> {
                 .camera
                 .ray_distance_for_depth(integration_direction, slice_depth);
             let step_length = (end_distance - previous_distance).abs();
-            let mean_extinction = self.scratch.froxel_extinction[slice] * inverse_history_samples;
-            cumulative_optical_depth += mean_extinction * step_length;
-            prefix.push(DVec3::new(
+            cumulative_optical_depth += self.scratch.froxel_extinction[slice] * step_length;
+            self.scratch.froxel_prefix[slice] = DVec3::new(
                 (-cumulative_optical_depth.x).exp(),
                 (-cumulative_optical_depth.y).exp(),
                 (-cumulative_optical_depth.z).exp(),
-            ));
+            );
             previous_distance = end_distance;
         }
-        Ok(prefix)
+        Ok(())
     }
 
-    /// Samples occupied mesh and voxel froxel centers over EEVEE's jittered render history.
+    /// Samples occupied mesh and voxel froxel centers for this EEVEE image-render AA sample.
     fn accumulate_froxel_extinction(&mut self, column_index: usize) -> Result<()> {
-        let (layout, tile_size, slice_count, history_samples, depth_mapping, width, height) = {
+        let (layout, tile_size, slice_count, depth_mapping, width, height) = {
             let cache = self.resolve_cache()?;
             (
                 cache.layout,
                 cache.tile_size,
                 cache.slice_count,
-                cache.history_samples,
                 cache.depth_mapping,
                 cache.width,
                 cache.height,
@@ -2371,6 +2626,43 @@ impl RealtimeVolumeSample<'_, '_> {
         self.scratch
             .froxel_extinction
             .resize(slice_count, DVec3::ZERO);
+
+        let [jitter_x, jitter_y] = eevee_volume_jitter(self.sample_index);
+        let jitter_z =
+            eevee_volume_froxel_jitter(cell_x, cell_y, eevee_volume_w(self.sample_index));
+        let jitter_offset = layout.jitter_in_pixels([jitter_x, jitter_y]);
+        let pixel_x = cell_center[0] - jitter_offset[0];
+        let pixel_y = cell_center[1] + jitter_offset[1];
+        let raster_x = pixel_x.floor().clamp(0.0, f64::from(width - 1)) as u32;
+        let raster_y = pixel_y.floor().clamp(0.0, f64::from(height - 1)) as u32;
+        let sample_x = pixel_x - f64::from(raster_x);
+        let sample_y = pixel_y - f64::from(raster_y);
+        let Some((origin, direction)) = ray_for_sample_in_frame(
+            &self.frame,
+            &self.camera,
+            width,
+            height,
+            raster_x,
+            raster_y,
+            sample_x,
+            sample_y,
+        )?
+        else {
+            return Ok(());
+        };
+        let mut footprint = camera_footprint(
+            &self.frame,
+            &self.camera,
+            width,
+            height,
+            raster_x,
+            raster_y,
+            sample_x,
+            sample_y,
+            (origin, direction),
+        )?;
+        footprint.dp *= f64::from(tile_size);
+        footprint.dd *= f64::from(tile_size);
         let saved = (
             self.origin,
             self.direction,
@@ -2378,102 +2670,69 @@ impl RealtimeVolumeSample<'_, '_> {
             self.far_distance,
             self.footprint,
         );
+        self.origin = origin;
+        self.direction = direction;
+        self.near_distance = self
+            .camera
+            .ray_distance_for_depth(direction, self.camera.near);
+        self.far_distance = self
+            .camera
+            .ray_distance_for_depth(direction, self.camera.far);
+        self.footprint = footprint;
+        self.mesh_prepared = false;
+        self.prepare_froxel_mesh_boundaries()?;
 
-        for history_index in 0..history_samples {
-            let [jitter_x, jitter_y] = eevee_volume_jitter(history_index);
-            let jitter_z =
-                eevee_volume_froxel_jitter(cell_x, cell_y, eevee_volume_w(history_index));
-            let jitter_offset = layout.jitter_in_pixels([jitter_x, jitter_y]);
-            let pixel_x = cell_center[0] - jitter_offset[0];
-            let pixel_y = cell_center[1] + jitter_offset[1];
-            let raster_x = pixel_x.floor().clamp(0.0, f64::from(width - 1)) as u32;
-            let raster_y = pixel_y.floor().clamp(0.0, f64::from(height - 1)) as u32;
-            let sample_x = pixel_x - f64::from(raster_x);
-            let sample_y = pixel_y - f64::from(raster_y);
-            let Some((origin, direction)) = ray_for_sample_in_frame(
-                &self.frame,
-                &self.camera,
-                width,
-                height,
-                raster_x,
-                raster_y,
-                sample_x,
-                sample_y,
-            )?
-            else {
-                continue;
-            };
-            let mut footprint = camera_footprint(
-                &self.frame,
-                &self.camera,
-                width,
-                height,
-                raster_x,
-                raster_y,
-                sample_x,
-                sample_y,
-                (origin, direction),
-            )?;
-            footprint.dp *= f64::from(tile_size);
-            footprint.dd *= f64::from(tile_size);
-            self.origin = origin;
-            self.direction = direction;
-            self.near_distance = self
-                .camera
-                .ray_distance_for_depth(direction, self.camera.near);
-            self.far_distance = self
-                .camera
-                .ray_distance_for_depth(direction, self.camera.far);
-            self.footprint = footprint;
-            self.mesh_prepared = false;
-            self.prepare_froxel_mesh_boundaries()?;
+        let trace_geometry = TraceGeometry::of(self.geometry);
+        self.scratch.froxel_boundaries.clear();
+        if self.transport.has_mesh_volumes {
+            for (distance, medium) in &self.scratch.froxel_mesh_boundary_hits {
+                let point = origin + direction * *distance;
+                let view_z = -self.camera.depth_of(point) as f32;
+                let volume_z = depth_mapping.view_z_to_volume_z(view_z);
+                let boundary = occupancy_boundary_index(volume_z, jitter_z, slice_count);
+                self.scratch.froxel_boundaries.push((boundary, *medium));
+            }
+            self.scratch
+                .froxel_media
+                .clone_from(&self.scratch.froxel_initial_media);
+        } else {
+            self.scratch.froxel_media.clear();
+        }
 
-            self.scratch.froxel_boundaries.clear();
-            if self.transport.has_mesh_volumes {
-                for (distance, medium) in &self.scratch.boundaries {
-                    let point = origin + direction * *distance;
-                    let view_z = -self.camera.depth_of(point) as f32;
-                    let volume_z = depth_mapping.view_z_to_volume_z(view_z);
-                    let boundary = occupancy_boundary_index(volume_z, jitter_z, slice_count);
-                    self.scratch.froxel_boundaries.push((boundary, *medium));
-                }
-                self.scratch.media.clone_from(&self.scratch.initial_media);
+        let mut boundary_index = 0;
+        for slice in 0..slice_count {
+            while boundary_index < self.scratch.froxel_boundaries.len()
+                && self.scratch.froxel_boundaries[boundary_index].0 <= slice
+            {
+                let medium = self.scratch.froxel_boundaries[boundary_index].1;
+                toggle_froxel_mesh_medium(&mut self.scratch.froxel_media, &medium);
+                boundary_index += 1;
+            }
+            let normalized_z = (slice as f32 + 0.5 - jitter_z) / slice_count as f32;
+            let view_z = depth_mapping.volume_z_to_view_z(normalized_z);
+            let depth = -f64::from(view_z);
+            let distance = self.camera.ray_distance_for_depth(direction, depth);
+            let point = origin + direction * distance;
+            let mesh_extinction = if self.transport.has_mesh_volumes {
+                self.mesh_froxel_extinction_at_point(&trace_geometry, point)?
             } else {
-                self.scratch.media.clear();
-            }
-
-            let mut boundary_index = 0;
-            for slice in 0..slice_count {
-                while boundary_index < self.scratch.froxel_boundaries.len()
-                    && self.scratch.froxel_boundaries[boundary_index].0 <= slice
-                {
-                    let medium = self.scratch.froxel_boundaries[boundary_index].1;
-                    toggle_mesh_medium(&mut self.scratch.media, &medium);
-                    boundary_index += 1;
+                DVec3::ZERO
+            };
+            let mut extinction = mesh_extinction;
+            for volume in self
+                .transport
+                .volumes
+                .iter()
+                .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
+            {
+                if !volume_contains_point(volume, point) {
+                    continue;
                 }
-                let mesh_extinction = stack_medium(&self.scratch.media)
-                    .map_or(DVec3::ZERO, |medium| medium_extinction(&medium));
-                let normalized_z = (slice as f32 + 0.5 - jitter_z) / slice_count as f32;
-                let view_z = depth_mapping.volume_z_to_view_z(normalized_z);
-                let depth = -f64::from(view_z);
-                let distance = self.camera.ray_distance_for_depth(direction, depth);
-                let point = origin + direction * distance;
-                let mut extinction = mesh_extinction;
-                for volume in self
-                    .transport
-                    .volumes
-                    .iter()
-                    .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
-                {
-                    if !volume_contains_point(volume, point) {
-                        continue;
-                    }
-                    let density = volume_density_at(volume, point)?;
-                    extinction +=
-                        volume.extinction_rgb_scale * (density * self.transport.meters_per_unit);
-                }
-                self.scratch.froxel_extinction[slice] += extinction;
+                let density = volume_density_at(volume, point)?;
+                extinction +=
+                    volume.extinction_rgb_scale * (density * self.transport.meters_per_unit);
             }
+            self.scratch.froxel_extinction[slice] = extinction;
         }
 
         self.origin = saved.0;
@@ -2615,7 +2874,11 @@ fn fract_f32(value: f32) -> f32 {
 
 #[cfg(test)]
 mod volume_jitter_tests {
-    use super::{eevee_volume_froxel_jitter, eevee_volume_jitter, eevee_volume_w};
+    use super::{
+        FROXEL_COLUMN_CACHE_SLOTS, FroxelColumnCacheSlot, FroxelTextureLayout,
+        RealtimeVolumeResolveCache, VolumeDepthMapping, VolumeProjection,
+        eevee_volume_froxel_jitter, eevee_volume_jitter, eevee_volume_w,
+    };
 
     #[test]
     fn volume_projection_jitter_matches_blender_halton_sequence() {
@@ -2631,6 +2894,61 @@ mod volume_jitter_tests {
         assert!((second[1] - 2.0 / 3.0).abs() < 1.0e-6);
         assert!(eevee_volume_w(0).abs() < 1.0e-6);
         assert!((eevee_volume_froxel_jitter(0, 0, eevee_volume_w(1)) - 0.2).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn froxel_prefix_cache_isolated_by_image_render_sample() {
+        let mut cache = RealtimeVolumeResolveCache {
+            layout: FroxelTextureLayout::new(8, 8, 8),
+            depth_mapping: VolumeDepthMapping::new(
+                VolumeProjection::Orthographic,
+                -0.1,
+                -10.0,
+                0.8,
+            ),
+            width: 8,
+            height: 8,
+            tile_size: 8,
+            slice_count: 2,
+            sample_count: 2,
+            depth_start: 0.1,
+            column_slots: vec![FroxelColumnCacheSlot::default(); 2 * FROXEL_COLUMN_CACHE_SLOTS],
+            column_prefix: vec![super::DVec3::ZERO; 2 * FROXEL_COLUMN_CACHE_SLOTS * 2],
+            column_clock: 0,
+        };
+        let first_slot = cache.replacement_column_slot(0).unwrap_or(usize::MAX);
+        assert!(first_slot < cache.column_slots.len());
+        assert!(
+            cache
+                .store_column(
+                    first_slot,
+                    3,
+                    &[super::DVec3::ONE, super::DVec3::splat(0.5)]
+                )
+                .is_ok()
+        );
+        assert_eq!(cache.cached_column_slot(0, 3), Some(first_slot));
+        assert!(cache.cached_column_slot(1, 3).is_none());
+
+        let second_slot = cache.replacement_column_slot(1).unwrap_or(usize::MAX);
+        assert!(second_slot < cache.column_slots.len());
+        assert!(
+            cache
+                .store_column(
+                    second_slot,
+                    3,
+                    &[super::DVec3::splat(0.25), super::DVec3::splat(0.125)],
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            cache.column_prefix(first_slot, 3),
+            Some(&[super::DVec3::ONE, super::DVec3::splat(0.5)][..])
+        );
+        assert_eq!(
+            cache.column_prefix(second_slot, 3),
+            Some(&[super::DVec3::splat(0.25), super::DVec3::splat(0.125)][..])
+        );
     }
 }
 
@@ -2706,6 +3024,11 @@ fn prepare_realtime_mesh_sample(
         initial_media,
         hit_media,
         boundaries,
+        froxel_media,
+        froxel_initial_media,
+        froxel_hit_media,
+        froxel_mesh_boundary_hits,
+        froxel_boundaries,
         evaluator_workspace,
         ..
     } = scratch;
@@ -2719,9 +3042,14 @@ fn prepare_realtime_mesh_sample(
         media,
         hit_media,
         evaluator_workspace,
+        Some(&mut *froxel_media),
+        Some(&mut *froxel_hit_media),
     )?;
     initial_media.clone_from(media);
+    froxel_initial_media.clone_from(froxel_media);
     boundaries.clear();
+    froxel_boundaries.clear();
+    froxel_mesh_boundary_hits.clear();
     let mut travelled = 0.0;
     let mut failure = None;
     query.bvh.walk_hits(
@@ -2744,6 +3072,7 @@ fn prepare_realtime_mesh_sample(
                 transport.images,
                 Some(ray.footprint.at_distance(distance)),
                 hit_media,
+                Some(&mut *froxel_hit_media),
                 evaluator_workspace,
             ) {
                 Ok(_) => (),
@@ -2754,6 +3083,14 @@ fn prepare_realtime_mesh_sample(
             }
             if !hit_media.is_empty() {
                 boundaries.extend(hit_media.iter().copied().map(|medium| (distance, medium)));
+            }
+            if !froxel_hit_media.is_empty() {
+                froxel_mesh_boundary_hits.extend(
+                    froxel_hit_media
+                        .iter()
+                        .copied()
+                        .map(|medium| (distance, medium)),
+                );
             }
             travelled = distance + RAY_EPSILON;
             true
@@ -3508,6 +3845,8 @@ fn trace_path(
         &mut media,
         &mut hit_media,
         evaluator_workspace,
+        None,
+        None,
     )?;
     loop {
         let hit = match exit_hit.take() {
@@ -4513,6 +4852,7 @@ struct HitFrame<'a> {
     back_facing: bool,
     geometric_normal: DVec3,
     normal: DVec3,
+    object: &'a ObjectRecord,
     triangle: &'a Triangle,
     material: &'a Material,
     prepared: &'a PreparedMaterial,
@@ -4628,6 +4968,7 @@ fn with_hit_frame<T>(
         geometric_normal,
         normal,
         triangle,
+        object,
         material,
         prepared,
         context,
@@ -4674,6 +5015,29 @@ fn surface_media_into(object_index: u32, volume: &[ShaderClosure], media: &mut V
                 params,
             });
         }
+    }
+}
+
+fn surface_froxel_media_into(
+    object: &ObjectRecord,
+    triangle: &Triangle,
+    volume: &[ShaderClosure],
+    media: &mut Vec<FroxelMeshMedium>,
+) {
+    media.clear();
+    media.reserve(volume.len());
+    let generated_per_local = triangle.generated.per_local;
+    let local_origin = object_space(object, triangle.positions[0]);
+    let generated_origin =
+        triangle.generated.corners[0] - local_origin.component_mul(generated_per_local);
+    for closure in 0..volume.len() {
+        media.push(FroxelMeshMedium {
+            object_index: triangle.object_index,
+            material_index: triangle.material_index,
+            closure,
+            generated_origin,
+            generated_per_local,
+        });
     }
 }
 
@@ -4813,6 +5177,7 @@ fn shadow_hit(
         images,
         footprint,
         &mut media,
+        None,
         evaluator_workspace,
     )?;
     Ok((media, transparency, volume_boundary))
@@ -4827,6 +5192,7 @@ fn shadow_hit_into(
     images: &BTreeMap<String, ImageData>,
     footprint: Option<f64>,
     media: &mut Vec<MeshMedium>,
+    mut froxel_media: Option<&mut Vec<FroxelMeshMedium>>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, bool)> {
     with_hit_frame(
@@ -4859,6 +5225,21 @@ fn shadow_hit_into(
             );
             let volume_boundary = frame.prepared.is_volume_only();
             surface_media_into(frame.triangle.object_index, &shading.volume, media);
+            if let Some(froxel_media) = froxel_media.as_deref_mut() {
+                froxel_media.clear();
+                if frame.prepared.has_volume_output()
+                    || (frame.material.node_tree.is_none()
+                        && frame.material.volume_density.is_finite()
+                        && frame.material.volume_density > 0.0)
+                {
+                    surface_froxel_media_into(
+                        frame.object,
+                        frame.triangle,
+                        &shading.volume,
+                        froxel_media,
+                    );
+                }
+            }
             Ok((transparency, volume_boundary))
         },
     )
@@ -6634,6 +7015,15 @@ struct MeshMedium {
     params: BsdfParams,
 }
 
+#[derive(Clone, Copy)]
+struct FroxelMeshMedium {
+    object_index: u32,
+    material_index: usize,
+    closure: usize,
+    generated_origin: DVec3,
+    generated_per_local: DVec3,
+}
+
 /// How a path leaves one segment of a mesh medium (`trace_mesh_medium`).
 enum MediumOutcome {
     /// A real scattering event at this distance along the ray.
@@ -6722,6 +7112,18 @@ fn toggle_mesh_medium(media: &mut Vec<MeshMedium>, entry: &MeshMedium) {
     }
 }
 
+fn toggle_froxel_mesh_medium(media: &mut Vec<FroxelMeshMedium>, entry: &FroxelMeshMedium) {
+    if let Some(position) = media.iter().rposition(|medium| {
+        medium.object_index == entry.object_index
+            && medium.material_index == entry.material_index
+            && medium.closure == entry.closure
+    }) {
+        media.remove(position);
+    } else {
+        media.push(*entry);
+    }
+}
+
 /// The coefficients of the whole volume stack, summed as Cycles evaluates the media a segment is inside
 /// (`volume_shader_eval` over `volume_stack_read`): scatter and absorption add up over the media, and the sampling is the
 /// stack's combined method (`volume_stack_sample_method`). The phase is not combined: each medium is its own closure, as
@@ -6760,6 +7162,8 @@ fn camera_media(
     inside: &mut Vec<MeshMedium>,
     hit_media: &mut Vec<MeshMedium>,
     evaluator_workspace: &mut EvaluatorWorkspace,
+    mut froxel_inside: Option<&mut Vec<FroxelMeshMedium>>,
+    mut froxel_hit_media: Option<&mut Vec<FroxelMeshMedium>>,
 ) -> Result<()> {
     let probe = DVec3::new(
         0.267_261_241_912_424_4,
@@ -6767,6 +7171,9 @@ fn camera_media(
         0.801_783_725_737_273_2,
     );
     inside.clear();
+    if let Some(froxel_inside) = froxel_inside.as_deref_mut() {
+        froxel_inside.clear();
+    }
     let mut failure = None;
     bvh.walk_hits(
         geometry.triangles,
@@ -6788,6 +7195,7 @@ fn camera_media(
                 images,
                 Some(footprint.at_distance(hit.distance)),
                 hit_media,
+                froxel_hit_media.as_deref_mut(),
                 evaluator_workspace,
             ) {
                 Ok(_) => (),
@@ -6798,6 +7206,13 @@ fn camera_media(
             }
             for medium in hit_media.iter() {
                 toggle_mesh_medium(inside, medium);
+            }
+            if let (Some(froxel_inside), Some(froxel_hits)) =
+                (froxel_inside.as_deref_mut(), froxel_hit_media.as_deref())
+            {
+                for medium in froxel_hits {
+                    toggle_froxel_mesh_medium(froxel_inside, medium);
+                }
             }
             true
         },
