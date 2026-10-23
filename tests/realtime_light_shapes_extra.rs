@@ -74,7 +74,7 @@ const EEVEE_MESH_VOLUME_GRADIENT: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/mesh_volume_gradient.f32le");
 const EEVEE_MESH_VOLUME_PERSPECTIVE: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/mesh_volume_gradient_perspective.f32le");
-const MESH_VOLUME_PERSPECTIVE_COLUMN: usize = 18;
+const MESH_VOLUME_PERSPECTIVE_COLUMN: usize = 11;
 
 /// Linear tolerance on a window mean against EEVEE, for the sun and the spot.
 const EMITTER_TOLERANCE: f64 = 0.01;
@@ -415,7 +415,7 @@ fn realtime_perspective_mesh_volume_uses_the_sample_jittered_column_ray() -> Tes
             capture.as_path(),
             Path::new("PERSP"),
             Path::new("16"),
-            Path::new("-4.0"),
+            Path::new("-6.0"),
         ],
     )?;
 
