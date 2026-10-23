@@ -4000,6 +4000,8 @@ mod visibility_tests {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .expect("composite resolves");
                 assert_eq!(actual, expected, "pixel ({x}, {y})");
@@ -4010,17 +4012,15 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod composite_layer_tests {
-    #![expect(
-        clippy::expect_used,
-        reason = "the test background closure is constant"
-    )]
     use super::{Layer, composite_layers_with_background};
 
-    fn composite_layers(layers: impl IntoIterator<Item = Layer>, background: [f64; 4]) -> [f64; 4] {
+    fn composite_layers(
+        layers: impl IntoIterator<Item = Layer>,
+        background: [f64; 4],
+    ) -> super::Result<[f64; 4]> {
         composite_layers_with_background(layers, background[3], || {
             Ok([background[0], background[1], background[2]])
         })
-        .expect("constant test background resolves")
     }
 
     fn assert_close(actual: [f64; 4], expected: [f64; 4]) {

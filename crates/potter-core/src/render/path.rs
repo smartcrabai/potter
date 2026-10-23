@@ -1689,7 +1689,7 @@ fn realtime_volume_depth_bounds(
 
     (depth_min.is_finite() && depth_max.is_finite()).then_some((depth_min, depth_max))
 }
-fn scene_has_world_volume(doc: &SceneDoc, scene_id: &str) -> bool {
+fn scene_has_world_volume(doc: &SceneDoc, scene_id: &Id) -> bool {
     let Some(scene) = doc.scenes.get(scene_id) else {
         return false;
     };
@@ -2372,6 +2372,7 @@ fn prepare_realtime_mesh_sample(
         hit_media,
         boundaries,
         evaluator_workspace,
+        ..
     } = scratch;
     camera_media(
         transport.doc,
