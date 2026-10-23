@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::{
     compositor::{self, Image as CompositorImage},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, EvaluationSession, Snapshot},
     hash,
     image::{ImageData, ImageInterpolation, sample, storage},
     media::{AudioBuffer, decode_wav, encode_flac, encode_wav},
@@ -158,6 +158,7 @@ pub fn render_sequence(
         let mut rendered_frames = Vec::with_capacity(frames.len());
         let mut scene_hash = None;
         let mut warnings = Vec::new();
+        let mut evaluation_session = EvaluationSession::default();
         for (index, frame) in frames.iter().copied().enumerate() {
             let mut frame_context = context.clone();
             frame_context.frame = Some(frame);
@@ -166,11 +167,12 @@ pub fn render_sequence(
             })?;
             let staged_image = staging.join(filename);
             let snapshot = if uses_sequencer {
-                let snapshot = Snapshot::evaluate_with_cache(
+                let snapshot = Snapshot::evaluate_with_cache_session(
                     doc,
                     &frame_context,
                     Some(project_root),
                     Some(cache_directory),
+                    &mut evaluation_session,
                 )?;
                 let composed = render_vse_frame(
                     doc,
@@ -180,6 +182,7 @@ pub fn render_sequence(
                     height,
                     project_root,
                     cache_directory,
+                    &mut evaluation_session,
                     engine,
                     samples,
                     seed,
@@ -204,6 +207,7 @@ pub fn render_sequence(
                     render_motion_blurred_frame(
                         doc,
                         &frame_context,
+                        &mut evaluation_session,
                         project_root,
                         cache_directory,
                         camera_id,
@@ -221,6 +225,7 @@ pub fn render_sequence(
                     let (snapshot, raster, frame_warnings) = render_camera_frame(
                         doc,
                         &frame_context,
+                        &mut evaluation_session,
                         project_root,
                         cache_directory,
                         camera_id,
@@ -392,6 +397,7 @@ pub fn render_sequence(
 fn render_motion_blurred_frame(
     doc: &SceneDoc,
     context: &EvaluationContext,
+    session: &mut EvaluationSession,
     project_root: &Path,
     cache_directory: &Path,
     camera_id: &str,
@@ -423,11 +429,12 @@ fn render_motion_blurred_frame(
     let center_frame = context.frame.unwrap_or(scene.frame_current);
     let mut center_context = context.clone();
     center_context.frame = Some(center_frame);
-    let center_snapshot = Snapshot::evaluate_with_cache(
+    let center_snapshot = Snapshot::evaluate_with_cache_session(
         doc,
         &center_context,
         Some(project_root),
         Some(cache_directory),
+        session,
     )?;
     let mut accumulated = None;
     let center_sample = shutter_samples / 2;
@@ -438,6 +445,7 @@ fn render_motion_blurred_frame(
         let (_, rendered, sample_warnings) = render_camera_frame(
             doc,
             &sample_context,
+            session,
             project_root,
             cache_directory,
             camera_id,
@@ -537,6 +545,7 @@ fn render_vse_frame(
     height: u32,
     root: &Path,
     cache_directory: &Path,
+    session: &mut EvaluationSession,
     engine: &str,
     samples: u32,
     seed: u32,
@@ -598,6 +607,7 @@ fn render_vse_frame(
             scene,
             root,
             cache_directory,
+            session,
             strip,
             frame,
             width,
@@ -627,6 +637,7 @@ fn render_strip_frame(
     scene: &Scene,
     root: &Path,
     cache_directory: &Path,
+    session: &mut EvaluationSession,
     strip: &Strip,
     frame: f64,
     width: u32,
@@ -654,6 +665,7 @@ fn render_strip_frame(
         scene,
         root,
         cache_directory,
+        session,
         strip,
         frame,
         width,
@@ -684,6 +696,7 @@ fn render_strip_content(
     scene: &Scene,
     root: &Path,
     cache_directory: &Path,
+    session: &mut EvaluationSession,
     strip: &Strip,
     frame: f64,
     width: u32,
@@ -758,6 +771,7 @@ fn render_strip_content(
             let (_, raster, strip_warnings) = render_camera_frame(
                 doc,
                 &nested_context,
+                session,
                 root,
                 cache_directory,
                 camera_id,
@@ -805,6 +819,7 @@ fn render_strip_content(
             scene,
             root,
             cache_directory,
+            session,
             strip,
             strip.source_frame(frame),
             width,
@@ -843,6 +858,7 @@ fn render_strip_content(
                 scene,
                 root,
                 cache_directory,
+                session,
                 first_id,
                 frame,
                 width,
@@ -859,6 +875,7 @@ fn render_strip_content(
                 scene,
                 root,
                 cache_directory,
+                session,
                 second_id,
                 frame,
                 width,
@@ -898,6 +915,7 @@ fn render_strip_content(
                 scene,
                 root,
                 cache_directory,
+                session,
                 first_id,
                 input_frame,
                 width,
@@ -928,6 +946,7 @@ fn render_strip_content(
                     scene,
                     root,
                     cache_directory,
+                    session,
                     second_id,
                     input_frame,
                     width,
@@ -957,6 +976,7 @@ fn render_strip_input(
     scene: &Scene,
     root: &Path,
     cache_directory: &Path,
+    session: &mut EvaluationSession,
     strip_id: &str,
     frame: f64,
     width: u32,
@@ -985,6 +1005,7 @@ fn render_strip_input(
         scene,
         root,
         cache_directory,
+        session,
         strip,
         frame,
         width,
@@ -1015,6 +1036,7 @@ fn compose_meta_frame(
     scene: &Scene,
     root: &Path,
     cache_directory: &Path,
+    session: &mut EvaluationSession,
     meta: &Strip,
     frame: f64,
     width: u32,
@@ -1065,6 +1087,7 @@ fn compose_meta_frame(
             scene,
             root,
             cache_directory,
+            session,
             child,
             frame,
             width,

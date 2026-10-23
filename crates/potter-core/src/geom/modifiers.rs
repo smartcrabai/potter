@@ -7794,8 +7794,8 @@ mod tests {
         {
             let row = codes[&format!("f{}", face.id)].as_array().unwrap();
             assert!(
-                row.iter().all(serde_json::Value::is_null),
-                "screw loose-edge corner codes must be Auto"
+                row.iter().all(|code| *code == serde_json::json!([0, 0])),
+                "screw loose-edge corner codes must be Auto ([0, 0])"
             );
         }
     }

@@ -20,6 +20,8 @@ import traceback
 from mathutils import Euler, Matrix, Quaternion
 DEFERRED_ID_ASSIGNMENTS = []
 CACHE_FILES_BY_IDENTITY = {}
+# CacheFile fields that a Mesh Sequence Cache modifier mirrors as params (see blend.rs).
+SEQUENCE_CACHE_FILE_KEYS = ("is_sequence", "velocity_name", "velocity_unit")
 ALPHA_MODE_PROPERTY = "potter.alpha_mode"
 ALPHA_MODES = ("opaque", "clip", "blend")
 
@@ -926,18 +928,42 @@ def library_reference(block):
             "source_id": block.get("potter.id")}
 
 
+# Blender sets CacheFile.type from the file extension (cachefile.cc: "*.abc" is Alembic; "*.usd;*.usda;
+# *.usdc;*.usdz" is USD), matched case-insensitively (BLI_path_extension_check_glob uses FNM_CASEFOLD).
+# RNA does not expose the type, so the bridge derives it the same way.
+USD_CACHE_EXTENSIONS = (".usd", ".usda", ".usdc", ".usdz")
+
+
+def _cache_file_type(cache_file):
+    path = (cache_file.filepath or "").lower()
+    if path.endswith(".abc"):
+        return "ALEMBIC"
+    if path.endswith(USD_CACHE_EXTENSIONS):
+        return "USD"
+    return None
+
+
 def _cache_file_settings(cache_file):
-    return {key: plain(getattr(cache_file, key))
-            for key in ("is_sequence", "override_frame", "frame", "frame_offset",
-                        "forward_axis", "up_axis", "scale", "velocity_name",
-                        "velocity_unit")}
+    settings = {key: plain(getattr(cache_file, key))
+                for key in ("is_sequence", "override_frame", "frame", "frame_offset",
+                            "forward_axis", "up_axis", "scale", "velocity_name",
+                            "velocity_unit")}
+    settings["type"] = _cache_file_type(cache_file)
+    return settings
 
 
 def _cache_file_resource(cache_file):
-    record = _resource_record("alembic_cache", cache_file.name_full,
-                              cache_file.filepath)
+    # A USD cache is packed under its own kind, never as an Alembic archive; import reports it as a loss.
+    kind = "usd_cache" if _cache_file_type(cache_file) == "USD" else "alembic_cache"
+    record = _resource_record(kind, cache_file.name_full, cache_file.filepath)
     record["cache_file"] = _cache_file_settings(cache_file)
     return record
+
+
+def unsupported_cache_files_dump():
+    return [{"name": cache_file.name_full, "filepath": cache_file.filepath}
+            for cache_file in getattr(bpy.data, "cache_files", ())
+            if _cache_file_type(cache_file) == "USD"]
 
 
 def _object_solver_inverse_map(owner):
@@ -2948,6 +2974,7 @@ def dump_all():
                        "library": library_reference(x), "body": x.as_string(),
                        "custom_properties": custom_props(x), "fake_user": bool(x.use_fake_user)} for x in bpy.data.texts],
             "resources": resources_dump(),
+            "unsupported_cache_files": unsupported_cache_files_dump(),
             "libraries": libraries_dump(),
             "node_groups": _node_groups_dump(),
             "other_datablocks": other_datablocks_dump(), "unused_datablocks": []}
@@ -6103,6 +6130,11 @@ def _relative_blend_path(path, target):
 
 
 def _cache_file_for_resource(doc, reference, target, params=None):
+    # A USD cache has no Alembic CacheFile. Its modifiers and constraints are written without one (Blender's
+    # cache-less modifier does nothing), and the Rust export reports the cache.usd loss.
+    resource = _resource_record_for_reference(doc, reference)
+    if resource and resource.get("kind") == "usd_cache":
+        return None
     filepath = _resource_path(doc, reference)
     if not filepath or not os.path.isfile(filepath):
         raise ValueError("Alembic cache resource is missing: %s" % reference)
@@ -6122,8 +6154,14 @@ def _cache_file_for_resource(doc, reference, target, params=None):
     if resource:
         if identity is not None:
             cache_file.name = identity
-        set_rna(cache_file, resource.get("cache_file", {}), {}, strict=True,
-                owner="Alembic CacheFile")
+        # `type` is derived from the file extension on export, and `filepath` is the resource's own path (export_path,
+        # set above), so neither is written from the record's settings.
+        settings = {key: value for key, value in resource.get("cache_file", {}).items()
+                    if key not in ("type", "filepath")}
+        set_rna(cache_file, settings, {}, strict=True, owner="Alembic CacheFile")
+    for key in SEQUENCE_CACHE_FILE_KEYS:
+        if key in params:
+            setattr(cache_file, key, params[key])
     if "frame_offset" in params:
         cache_file.frame_offset = float(params["frame_offset"])
     if "scale" in params:

@@ -13,7 +13,7 @@ use super::util::{parse_id, with_load_warnings};
 use crate::{
     cli::{BakeArgs, BakeKind, NodeBakeMode, NodeBakeUnpackMethod},
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, EvaluationSession, Snapshot},
     geom::Mesh,
     graph::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord, same_bake_frame},
     model::{Id, Modifier, OceanBakeCache, SceneDoc},
@@ -92,14 +92,16 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     let mut stage = BakeStage::create(output)?;
     let mut files = Vec::new();
     let mut baked_frames = Vec::new();
+    let mut evaluation_session = EvaluationSession::default();
     for (frame_index, frame) in frames.into_iter().enumerate() {
         let mut frame_context = context.clone();
         frame_context.frame = Some(frame);
-        let snapshot = Snapshot::evaluate_with_cache(
+        let snapshot = Snapshot::evaluate_with_cache_session(
             doc,
             &frame_context,
             Some(project.path()),
             Some(cache_directory),
+            &mut evaluation_session,
         )?;
         match args.kind {
             BakeKind::Animation => {
@@ -458,6 +460,7 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         .transpose()?;
     let project_root = project.path();
     let cache_directory = project.cache_directory();
+    let mut evaluation_session = EvaluationSession::default();
     let mut captured_frames = Vec::with_capacity(frames.len());
     for frame in &frames {
         let context = EvaluationContext {
@@ -472,6 +475,7 @@ fn run_node_bake(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
             &context,
             Some(project_root),
             Some(cache_directory),
+            &mut evaluation_session,
             &target,
             &modifier_id,
             node_id.as_str(),

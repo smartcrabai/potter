@@ -35,11 +35,14 @@ pub fn run(args: AssetsArgs) -> Result<(Option<SceneInfo>, Value)> {
         let path = uri
             .as_deref()
             .and_then(|uri| resolve_uri(project.path(), uri));
-        let (missing, changed) = if packed {
-            packed_resource_status(value, expected.as_deref(), args.check)?
-        } else {
-            file_status(path.as_deref(), expected.as_deref(), args.check)?
-        };
+        let (missing, changed) =
+            if let Some(status) = sequence_frames_status(value, project.path(), args.check)? {
+                status
+            } else if packed {
+                packed_resource_status(value, expected.as_deref(), args.check)?
+            } else {
+                file_status(path.as_deref(), expected.as_deref(), args.check)?
+            };
         assets.push(json!({
             "uri":uri,"hash":expected,"kind":string_field(object, &["kind", "type"]).unwrap_or_else(|| "resource".to_owned()),
             "owner":string_field(object, &["owner", "owner_id"]).unwrap_or_else(|| id.to_string()),
@@ -199,6 +202,32 @@ fn resolve_uri(root: &Path, uri: &str) -> Option<PathBuf> {
     } else {
         root.join(path)
     })
+}
+
+/// Missing and changed flags across a sequence resource's frames, each checked as a packed frame (bytes) or a
+/// linked file. `None` when the resource has no `sequence_frames`.
+fn sequence_frames_status(value: &Value, root: &Path, check: bool) -> Result<Option<(bool, bool)>> {
+    let Some(frames) = value.get("sequence_frames").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let mut missing = false;
+    let mut changed = false;
+    for frame in frames.values() {
+        let expected = frame.get("hash").and_then(Value::as_str);
+        let (frame_missing, frame_changed) =
+            if frame.get("packed").and_then(Value::as_bool) == Some(true) {
+                packed_resource_status(frame, expected, check)?
+            } else {
+                let path = frame
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| resolve_uri(root, uri));
+                file_status(path.as_deref(), expected, check)?
+            };
+        missing |= frame_missing;
+        changed |= frame_changed;
+    }
+    Ok(Some((missing, changed)))
 }
 
 fn file_status(path: Option<&Path>, expected: Option<&str>, rehash: bool) -> Result<(bool, bool)> {

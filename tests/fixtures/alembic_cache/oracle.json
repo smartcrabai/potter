@@ -3,7 +3,7 @@
  "cases": [
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -1833,7 +1833,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 1.0,
@@ -3363,7 +3363,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": -0.5,
@@ -4593,7 +4593,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 2.5,
     "frame_offset": 0.0,
@@ -5823,7 +5823,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 2.5,
     "frame_offset": 0.0,
@@ -6453,7 +6453,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -7083,7 +7083,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -7713,7 +7713,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -8007,7 +8007,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -8301,7 +8301,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -8595,7 +8595,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -9225,7 +9225,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -9579,7 +9579,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -10061,7 +10061,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -10544,7 +10544,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/uv_only.abc",
+    "filepath": "uv_only.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -11026,7 +11026,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -11380,7 +11380,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -12028,7 +12028,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -12672,7 +12672,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/topo.abc",
+    "filepath": "topo.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -14614,7 +14614,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/topo.abc",
+    "filepath": "topo.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -15476,7 +15476,462 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/seq.0001.abc",
+    "filepath": "reordered.0001.abc",
+    "forward_axis": "POS_X",
+    "frame": 0.0,
+    "frame_offset": 0.0,
+    "is_sequence": true,
+    "override_frame": false,
+    "scale": 1.0,
+    "up_axis": "POS_X",
+    "velocity_name": ".velocities",
+    "velocity_unit": "SECOND"
+   },
+   "frames": [
+    {
+     "attributes": {
+      "UVMap": {
+       "domain": "CORNER",
+       "type": "FLOAT2",
+       "values": [
+        [
+         20.0,
+         -10.0
+        ],
+        [
+         21.0,
+         -11.0
+        ],
+        [
+         22.0,
+         -12.0
+        ],
+        [
+         23.0,
+         -13.0
+        ],
+        [
+         24.0,
+         -14.0
+        ],
+        [
+         25.0,
+         -15.0
+        ],
+        [
+         26.0,
+         -16.0
+        ],
+        [
+         27.0,
+         -17.0
+        ],
+        [
+         28.0,
+         -18.0
+        ],
+        [
+         29.0,
+         -19.0
+        ],
+        [
+         30.0,
+         -20.0
+        ]
+       ]
+      },
+      "sharp_face": {
+       "domain": "FACE",
+       "type": "BOOLEAN",
+       "values": [
+        true,
+        true,
+        true
+       ]
+      }
+     },
+     "corner_normals": [
+      [
+       0.0,
+       0.0,
+       1.0
+      ],
+      [
+       0.0,
+       0.0,
+       1.0
+      ],
+      [
+       0.0,
+       0.0,
+       1.0
+      ],
+      [
+       0.0,
+       0.0,
+       1.0
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ]
+     ],
+     "faces": [
+      [
+       0,
+       1,
+       2,
+       3
+      ],
+      [
+       0,
+       3,
+       4
+      ],
+      [
+       3,
+       2,
+       5,
+       4
+      ]
+     ],
+     "frame": 1,
+     "has_custom_normals": false,
+     "positions": [
+      [
+       0.0,
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       1.0,
+       0.0
+      ],
+      [
+       0.0,
+       1.0,
+       0.0
+      ],
+      [
+       -0.5,
+       1.5,
+       0.5
+      ],
+      [
+       1.5,
+       2.5,
+       -0.5
+      ]
+     ],
+     "smooth_faces": [
+      false,
+      false,
+      false
+     ]
+    },
+    {
+     "attributes": {
+      "UVMap": {
+       "domain": "CORNER",
+       "type": "FLOAT2",
+       "values": [
+        [
+         0.9470000267028809,
+         0.5690000057220459
+        ],
+        [
+         0.28299999237060547,
+         0.8809999823570251
+        ],
+        [
+         0.6190000176429749,
+         0.3569999933242798
+        ],
+        [
+         0.13699999451637268,
+         0.22300000488758087
+        ],
+        [
+         0.7310000061988831,
+         0.16300000250339508
+        ],
+        [
+         0.1940000057220459,
+         0.9070000052452087
+        ],
+        [
+         0.8529999852180481,
+         0.42100000381469727
+        ],
+        [
+         0.367000013589859,
+         0.6890000104904175
+        ],
+        [
+         0.5210000276565552,
+         0.2409999966621399
+        ],
+        [
+         0.06300000101327896,
+         0.7730000019073486
+        ],
+        [
+         0.9169999957084656,
+         0.4869999885559082
+        ]
+       ]
+      },
+      "custom_normal": {
+       "domain": "CORNER",
+       "type": "INT16_2D",
+       "values": [
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ]
+       ]
+      },
+      "material_index": {
+       "domain": "FACE",
+       "type": "INT",
+       "values": [
+        0,
+        0,
+        0
+       ]
+      },
+      "sharp_edge": {
+       "domain": "EDGE",
+       "type": "BOOLEAN",
+       "values": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false
+       ]
+      },
+      "sharp_face": {
+       "domain": "FACE",
+       "type": "BOOLEAN",
+       "values": [
+        false,
+        false,
+        false
+       ]
+      }
+     },
+     "corner_normals": [
+      [
+       0.0,
+       0.0,
+       -1.0
+      ],
+      [
+       0.0,
+       0.0,
+       -1.0
+      ],
+      [
+       0.0,
+       0.0,
+       -1.0
+      ],
+      [
+       0.0,
+       0.0,
+       -1.0
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ]
+     ],
+     "faces": [
+      [
+       3,
+       2,
+       1,
+       0
+      ],
+      [
+       0,
+       3,
+       4
+      ],
+      [
+       3,
+       2,
+       5,
+       4
+      ]
+     ],
+     "frame": 2,
+     "has_custom_normals": true,
+     "positions": [
+      [
+       0.0,
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       1.0,
+       0.0
+      ],
+      [
+       0.0,
+       1.0,
+       0.0
+      ],
+      [
+       -0.5,
+       1.5,
+       0.5
+      ],
+      [
+       1.5,
+       2.5,
+       -0.5
+      ]
+     ],
+     "smooth_faces": [
+      true,
+      true,
+      true
+     ]
+    }
+   ],
+   "id": "sequence_same_size_reordered_connectivity",
+   "modifier": {
+    "object_path": "/Reordered/Reordered",
+    "read_data": [
+     "VERT"
+    ],
+    "use_vertex_interpolation": false,
+    "velocity_scale": 1.0
+   },
+   "modifier_error": null
+  },
+  {
+   "cache_file": {
+    "filepath": "seq.0001.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -16706,7 +17161,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/seq.0001.abc",
+    "filepath": "seq.0001.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 10.0,
@@ -17336,7 +17791,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/seq.0001.abc",
+    "filepath": "seq.0001.abc",
     "forward_axis": "POS_X",
     "frame": 3.0,
     "frame_offset": 0.0,
@@ -17966,7 +18421,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/seq.0001.abc",
+    "filepath": "seq.0001.abc",
     "forward_axis": "POS_X",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -18124,7 +18579,7 @@
   },
   {
    "cache_file": {
-    "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+    "filepath": "animated.abc",
     "forward_axis": "POS_Y",
     "frame": 0.0,
     "frame_offset": 0.0,
@@ -18751,11 +19206,466 @@
     "velocity_scale": 1.0
    },
    "modifier_error": null
+  },
+  {
+   "cache_file": {
+    "filepath": "reordered_animated.abc",
+    "forward_axis": "POS_X",
+    "frame": 0.0,
+    "frame_offset": 0.0,
+    "is_sequence": false,
+    "override_frame": false,
+    "scale": 1.0,
+    "up_axis": "POS_X",
+    "velocity_name": ".velocities",
+    "velocity_unit": "SECOND"
+   },
+   "frames": [
+    {
+     "attributes": {
+      "UVMap": {
+       "domain": "CORNER",
+       "type": "FLOAT2",
+       "values": [
+        [
+         20.0,
+         -10.0
+        ],
+        [
+         21.0,
+         -11.0
+        ],
+        [
+         22.0,
+         -12.0
+        ],
+        [
+         23.0,
+         -13.0
+        ],
+        [
+         24.0,
+         -14.0
+        ],
+        [
+         25.0,
+         -15.0
+        ],
+        [
+         26.0,
+         -16.0
+        ],
+        [
+         27.0,
+         -17.0
+        ],
+        [
+         28.0,
+         -18.0
+        ],
+        [
+         29.0,
+         -19.0
+        ],
+        [
+         30.0,
+         -20.0
+        ]
+       ]
+      },
+      "sharp_face": {
+       "domain": "FACE",
+       "type": "BOOLEAN",
+       "values": [
+        true,
+        true,
+        true
+       ]
+      }
+     },
+     "corner_normals": [
+      [
+       0.0,
+       0.0,
+       1.0
+      ],
+      [
+       0.0,
+       0.0,
+       1.0
+      ],
+      [
+       0.0,
+       0.0,
+       1.0
+      ],
+      [
+       0.0,
+       0.0,
+       1.0
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ]
+     ],
+     "faces": [
+      [
+       0,
+       1,
+       2,
+       3
+      ],
+      [
+       0,
+       3,
+       4
+      ],
+      [
+       3,
+       2,
+       5,
+       4
+      ]
+     ],
+     "frame": 1,
+     "has_custom_normals": false,
+     "positions": [
+      [
+       0.0,
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       1.0,
+       0.0
+      ],
+      [
+       0.0,
+       1.0,
+       0.0
+      ],
+      [
+       -0.5,
+       1.5,
+       0.5
+      ],
+      [
+       1.5,
+       2.5,
+       -0.5
+      ]
+     ],
+     "smooth_faces": [
+      false,
+      false,
+      false
+     ]
+    },
+    {
+     "attributes": {
+      "UVMap": {
+       "domain": "CORNER",
+       "type": "FLOAT2",
+       "values": [
+        [
+         0.13699999451637268,
+         0.22300000488758087
+        ],
+        [
+         0.9470000267028809,
+         0.5690000057220459
+        ],
+        [
+         0.28299999237060547,
+         0.8809999823570251
+        ],
+        [
+         0.6190000176429749,
+         0.3569999933242798
+        ],
+        [
+         0.7310000061988831,
+         0.16300000250339508
+        ],
+        [
+         0.1940000057220459,
+         0.9070000052452087
+        ],
+        [
+         0.8529999852180481,
+         0.42100000381469727
+        ],
+        [
+         0.367000013589859,
+         0.6890000104904175
+        ],
+        [
+         0.5210000276565552,
+         0.2409999966621399
+        ],
+        [
+         0.06300000101327896,
+         0.7730000019073486
+        ],
+        [
+         0.9169999957084656,
+         0.4869999885559082
+        ]
+       ]
+      },
+      "custom_normal": {
+       "domain": "CORNER",
+       "type": "INT16_2D",
+       "values": [
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ],
+        [
+         0.0,
+         0.0
+        ]
+       ]
+      },
+      "material_index": {
+       "domain": "FACE",
+       "type": "INT",
+       "values": [
+        0,
+        0,
+        0
+       ]
+      },
+      "sharp_edge": {
+       "domain": "EDGE",
+       "type": "BOOLEAN",
+       "values": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false
+       ]
+      },
+      "sharp_face": {
+       "domain": "FACE",
+       "type": "BOOLEAN",
+       "values": [
+        false,
+        false,
+        false
+       ]
+      }
+     },
+     "corner_normals": [
+      [
+       0.0,
+       0.0,
+       -1.0
+      ],
+      [
+       0.0,
+       0.0,
+       -1.0
+      ],
+      [
+       0.0,
+       0.0,
+       -1.0
+      ],
+      [
+       0.0,
+       0.0,
+       -1.0
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.7071067690849304,
+       0.0,
+       0.7071067690849304
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ],
+      [
+       0.2156655490398407,
+       0.10783277451992035,
+       0.9704949855804443
+      ]
+     ],
+     "faces": [
+      [
+       0,
+       3,
+       2,
+       1
+      ],
+      [
+       0,
+       3,
+       4
+      ],
+      [
+       3,
+       2,
+       5,
+       4
+      ]
+     ],
+     "frame": 2,
+     "has_custom_normals": true,
+     "positions": [
+      [
+       0.0,
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       1.0,
+       0.0
+      ],
+      [
+       0.0,
+       1.0,
+       0.0
+      ],
+      [
+       -0.5,
+       1.5,
+       0.5
+      ],
+      [
+       1.5,
+       2.5,
+       -0.5
+      ]
+     ],
+     "smooth_faces": [
+      true,
+      true,
+      true
+     ]
+    }
+   ],
+   "id": "nonsequence_animated_same_size_reordered_connectivity",
+   "modifier": {
+    "object_path": "/Reordered/Reordered",
+    "read_data": [
+     "VERT"
+    ],
+    "use_vertex_interpolation": false,
+    "velocity_scale": 1.0
+   },
+   "modifier_error": null
   }
  ],
  "defaults": {
   "cache_file": {
-   "filepath": "/Users/admin/apps/potter-pr18q/tests/fixtures/alembic_cache/animated.abc",
+   "filepath": "animated.abc",
    "forward_axis": "POS_X",
    "frame": 0.0,
    "frame_offset": 0.0,

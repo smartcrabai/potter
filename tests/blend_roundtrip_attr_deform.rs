@@ -1723,9 +1723,10 @@ fn blender_mesh_cache_pc2_mdd_and_alembic_sequence_round_trip_resources()
                 "{name}: Alembic frame offset"
             );
             assert_eq!(
-                modifier.params["scale"],
+                scene.resources[&potter_core::model::Id::new(resource_id.to_owned())?]["cache_file"]
+                    ["scale"],
                 json!(1.25),
-                "{name}: Alembic time scale"
+                "{name}: CacheFile time scale"
             );
         }
         let actual = snapshot
