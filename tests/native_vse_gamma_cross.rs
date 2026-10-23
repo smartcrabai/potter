@@ -1,4 +1,4 @@
-//! The imported Blender VSE GammaCross strip renders through Potter's CLI against a saved Blender EXR.
+//! The imported Blender VSE `GammaCross` strip renders through Potter's CLI against a saved Blender EXR.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
