@@ -410,7 +410,10 @@ pub(crate) fn render_camera_frame(
             doc,
             &snapshot,
             realtime_volume_transport.as_ref(),
-        ))
+            &camera.camera,
+            width,
+            height,
+        )?)
     } else {
         None
     };

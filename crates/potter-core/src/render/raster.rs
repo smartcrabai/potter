@@ -487,6 +487,68 @@ pub(crate) struct CameraFrame {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct CameraFrustum {
+    corners: [DVec3; 8],
+    planes: [FrustumPlane; 6],
+}
+
+#[derive(Clone, Copy)]
+struct FrustumPlane {
+    normal: DVec3,
+    offset: f64,
+}
+
+impl FrustumPlane {
+    fn distance(self, point: DVec3) -> f64 {
+        self.normal.dot(point) + self.offset
+    }
+}
+
+impl CameraFrustum {
+    pub(crate) fn intersects_sphere(self, center: DVec3, radius: f64) -> bool {
+        self.planes
+            .iter()
+            .all(|plane| plane.distance(center) >= -radius)
+    }
+
+    pub(crate) fn intersects_pyramid(self, corners: [DVec3; 5]) -> bool {
+        if self
+            .planes
+            .iter()
+            .any(|plane| corners.iter().all(|corner| plane.distance(*corner) <= 0.0))
+        {
+            return false;
+        }
+
+        let apex = corners[0];
+        let first = corners[1];
+        let second = corners[2];
+        let third = corners[3];
+        let fourth = corners[4];
+        let pyramid_planes = [
+            frustum_plane(apex, second - apex, first - apex),
+            frustum_plane(apex, third - apex, second - apex),
+            frustum_plane(apex, fourth - apex, third - apex),
+            frustum_plane(apex, first - apex, fourth - apex),
+            frustum_plane(first, second - first, fourth - first),
+        ];
+        !pyramid_planes.iter().any(|plane| {
+            self.corners
+                .iter()
+                .all(|corner| plane.distance(*corner) <= 0.0)
+        })
+    }
+}
+
+fn frustum_plane(point: DVec3, first: DVec3, second: DVec3) -> FrustumPlane {
+    let normal = first.cross(second).normalize_or_zero();
+    FrustumPlane {
+        normal,
+        offset: -normal.dot(point),
+    }
+}
+
+#[derive(Clone, Copy)]
 enum ProjectionFrame {
     Orthographic {
         half_width: f64,
@@ -650,6 +712,46 @@ pub(super) fn rasterize_with_samples(
     camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
+    rasterize_with_samples_for_eye(
+        triangles,
+        camera,
+        width,
+        height,
+        mode,
+        background,
+        world,
+        samples,
+        seed,
+        filter_size,
+        shader,
+        prepared_materials,
+        camera_lights.map(|lights| lights.view(0)),
+        0,
+        volume_pass,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "raster configuration is explicit at this low-level boundary"
+)]
+fn rasterize_with_samples_for_eye(
+    triangles: &[Triangle],
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    mode: Mode,
+    background: [u8; 4],
+    world: Option<WorldRadiance<'_>>,
+    samples: u32,
+    seed: u32,
+    filter_size: f64,
+    shader: Option<&dyn SurfaceShader>,
+    prepared_materials: &[crate::shader::PreparedMaterial],
+    camera_lights: Option<super::path::RealtimeCameraLightView<'_, '_>>,
+    view_index: usize,
+    volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
+) -> Result<RasterOutput> {
     if samples == 0 {
         return Err(PotError::invalid_argument(
             "sample count must be greater than zero",
@@ -659,7 +761,7 @@ pub(super) fn rasterize_with_samples(
     if camera.stereo_mode == StereoMode::Anaglyph {
         let left_camera = camera_eye(camera, -1.0);
         let right_camera = camera_eye(camera, 1.0);
-        let mut left_output = rasterize_with_samples(
+        let mut left_output = rasterize_with_samples_for_eye(
             triangles,
             &left_camera,
             width,
@@ -672,13 +774,11 @@ pub(super) fn rasterize_with_samples(
             filter_size,
             shader,
             prepared_materials,
-            camera_lights,
+            camera_lights.map(|lights| lights.for_eye(0)),
+            0,
             volume_pass.as_deref_mut(),
         )?;
-        if let Some(volume_pass) = volume_pass.as_deref_mut() {
-            volume_pass.reset_column_cache();
-        }
-        let right_output = rasterize_with_samples(
+        let right_output = rasterize_with_samples_for_eye(
             triangles,
             &right_camera,
             width,
@@ -691,7 +791,8 @@ pub(super) fn rasterize_with_samples(
             filter_size,
             shader,
             prepared_materials,
-            camera_lights,
+            camera_lights.map(|lights| lights.for_eye(1)),
+            1,
             volume_pass.as_deref_mut(),
         )?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
@@ -897,9 +998,23 @@ pub(super) fn rasterize_with_samples(
                                     ray: (sample_ray.origin, sample_ray.direction),
                                     sample_index,
                                     sample_count: samples,
+                                    view_index: if camera.stereo_mode == StereoMode::SideBySide
+                                        && x >= width / 2
+                                    {
+                                        1
+                                    } else {
+                                        view_index
+                                    },
                                 })
                             })
                             .transpose()?;
+                        let camera_light_view = camera_lights.map(|lights| {
+                            if camera.stereo_mode == StereoMode::SideBySide && x >= width / 2 {
+                                lights.for_eye(1)
+                            } else {
+                                lights
+                            }
+                        });
                         composite_sample(
                             &prepared,
                             &visibility,
@@ -911,7 +1026,7 @@ pub(super) fn rasterize_with_samples(
                             world,
                             shader,
                             sample_hit,
-                            camera_lights,
+                            camera_light_view,
                             volume_sample.as_mut(),
                         )?
                     } else {
@@ -1708,6 +1823,79 @@ pub(crate) fn camera_frame(camera: &Camera, width: u32, height: u32) -> Result<C
     })
 }
 
+/// The camera's geometric frustum for one rendered view; unbounded projections conservatively
+/// return `None`.
+pub(crate) fn camera_frustum(
+    camera: &Camera,
+    width: u32,
+    height: u32,
+) -> Result<Option<CameraFrustum>> {
+    let frame = camera_frame(camera, width, height)?;
+    let point = |depth: f64, x: f64, y: f64| {
+        let (half_width, half_height) = match frame.projection {
+            ProjectionFrame::Orthographic {
+                half_width,
+                half_height,
+            } => (half_width, half_height),
+            ProjectionFrame::Perspective {
+                horizontal_scale,
+                vertical_scale,
+            } => (horizontal_scale * depth, vertical_scale * depth),
+            _ => unreachable!("non-planar projections have no culling frustum"),
+        };
+        camera.position
+            + frame.forward * depth
+            + frame.right * ((x + 2.0 * frame.shift[0]) * half_width)
+            + frame.up * ((y + 2.0 * frame.shift[1]) * half_height)
+    };
+    if !matches!(
+        frame.projection,
+        ProjectionFrame::Orthographic { .. } | ProjectionFrame::Perspective { .. }
+    ) {
+        return Ok(None);
+    }
+    let corners = [
+        point(frame.near, -1.0, -1.0),
+        point(frame.near, -1.0, 1.0),
+        point(frame.far, -1.0, 1.0),
+        point(frame.far, -1.0, -1.0),
+        point(frame.near, 1.0, -1.0),
+        point(frame.near, 1.0, 1.0),
+        point(frame.far, 1.0, 1.0),
+        point(frame.far, 1.0, -1.0),
+    ];
+    if corners
+        .iter()
+        .copied()
+        .any(|corner| !is_finite_vec3(corner))
+    {
+        return Ok(None);
+    }
+    let center = corners.iter().copied().sum::<DVec3>() / corners.len() as f64;
+    let inward_plane = |point: DVec3, first: DVec3, second: DVec3| {
+        let mut plane = frustum_plane(point, first - point, second - point);
+        if plane.distance(center) < 0.0 {
+            plane.normal = -plane.normal;
+            plane.offset = -plane.offset;
+        }
+        plane
+    };
+    let planes = [
+        inward_plane(corners[0], corners[1], corners[3]),
+        inward_plane(corners[0], corners[4], corners[3]),
+        inward_plane(corners[0], corners[1], corners[4]),
+        inward_plane(corners[4], corners[5], corners[7]),
+        inward_plane(corners[1], corners[2], corners[5]),
+        inward_plane(corners[3], corners[2], corners[7]),
+    ];
+    if planes.iter().any(|plane| {
+        plane.normal == DVec3::ZERO || !is_finite_vec3(plane.normal) || !plane.offset.is_finite()
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(CameraFrustum { corners, planes }))
+}
+
 fn is_valid_fov(fov: f64) -> bool {
     fov.is_finite() && fov > 0.0 && fov <= crate::model::FISHEYE_FOV_MAX
 }
@@ -2282,7 +2470,7 @@ fn composite_sample(
     world: Option<WorldRadiance<'_>>,
     shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
-    camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
+    camera_lights: Option<super::path::RealtimeCameraLightView<'_, '_>>,
     mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
 ) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
@@ -2404,7 +2592,7 @@ fn composite_sample(
         let far_distance = camera.ray_distance_for_depth(ray.direction, camera.far);
         let layers = &hits[..hit_count];
         let mut light_radiance = DVec3::ZERO;
-        for event in camera_lights.local_events(camera, ray.origin, ray.direction, far_distance) {
+        for event in camera_lights.local_events(ray.origin, ray.direction, far_distance) {
             light_radiance += camera_light_event_radiance(
                 triangles,
                 layers,

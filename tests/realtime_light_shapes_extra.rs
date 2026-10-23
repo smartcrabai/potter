@@ -2,7 +2,8 @@
 //! against committed Blender 5.2.2 EEVEE captures.
 //!
 //! `fixtures/native_oracle/eevee_light_shapes_extra.py` saves three base scenes and three local-light cull variants;
-//! `eevee_light_shape_boundaries.py` saves the odd-viewport, scaled-spot, and small-area boundary cases:
+//! `eevee_light_shape_boundaries.py` saves odd-viewport, scaled-spot, and area-cutoff scenes plus the four new boundary
+//! cases:
 //!
 //! - a sun of angle 8° seen by a perspective camera that looks straight at it, whose disc EEVEE draws at
 //!   `energy · (1 + 1 / r²) / π` with `r = tan(angle / 2)`;
@@ -14,13 +15,14 @@
 //!   lies behind it, pinning the camera-shape depth test.
 //! - orthographic and wide-FOV perspective point lights behind a mesh-volume absorption gradient that is zero at camera
 //!   entry, pinning per-froxel material evaluation and jittered perspective prefix steps at the AA-filtered edge.
-//! - a 101×65 perspective point shape through a heterogeneous mesh volume at tile size 16, plus a scaled off-axis spot
-//!   and a square area light below EEVEE's half-extent cutoff.
+//! - a 101×65 perspective point shape through a heterogeneous mesh volume at tile size 16, plus a scaled off-axis spot,
+//!   an orthographic off-centre on-axis spot, a perspective spot whose attenuation varies across its disc, a surviving
+//!   0.002×2 rectangle, and a 0.004-square area light below EEVEE's half-extent cutoff.
+//! - a full-size-4 area rectangle whose outline overlaps the orthographic view but whose 0.1 influence sphere is culled.
 //!
 //! The test imports each saved `.blend`, renders it with `pot render --engine realtime`, and compares window means with
-//! committed macOS EEVEE pixel captures. The sun, spot, and opaque-surface tolerances are 0.01; the existing absorber
+//! committed macOS EEVEE pixel captures. The sun, spots, and opaque-surface tolerances are 0.01; the existing absorber
 //! tolerance remains 0.03 for tile sizes 8 and 1 and the gradient-volume center and edge, with no tolerance change.
-//!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
 #[path = "common/blender_checked.rs"]
@@ -34,7 +36,10 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{error::Error, path::Path};
+use std::{
+    error::Error,
+    path::{Path, PathBuf},
+};
 
 use native_oracle::{
     TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
@@ -59,6 +64,59 @@ const EEVEE_SPOT_SCALED_OFFAXIS: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/spot_scaled_offaxis.f32le");
 const EEVEE_AREA_SMALL_CUTOFF: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/area_small_cutoff.f32le");
+const EEVEE_SPOT_ORTHO_OFFCENTER: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/spot_ortho_offcenter.f32le");
+const EEVEE_SPOT_PERSPECTIVE_RAY: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/spot_perspective_ray.f32le");
+const EEVEE_AREA_SMALL_SURVIVOR: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/area_small_survivor.f32le");
+const EEVEE_AREA_INFLUENCE_CULLED: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/area_influence_culled.f32le");
+
+struct BoundaryScenes {
+    odd_viewport: PathBuf,
+    scaled_spot: PathBuf,
+    small_area_cutoff: PathBuf,
+    ortho_spot_offcenter: PathBuf,
+    perspective_spot: PathBuf,
+    small_area_survivor: PathBuf,
+    area_influence_culled: PathBuf,
+}
+
+fn generate_boundary_scenes(blender: &Path, root: &Path) -> Result<BoundaryScenes, Box<dyn Error>> {
+    let script = write_script(root, "eevee_light_shape_boundaries.py", BOUNDARY_SCRIPT)?;
+    let scenes = BoundaryScenes {
+        odd_viewport: root.join("odd_viewport.blend"),
+        scaled_spot: root.join("scaled_spot.blend"),
+        small_area_cutoff: root.join("small_area.blend"),
+        ortho_spot_offcenter: root.join("ortho_spot_offcenter.blend"),
+        perspective_spot: root.join("perspective_spot.blend"),
+        small_area_survivor: root.join("small_area_survivor.blend"),
+        area_influence_culled: root.join("area_influence_culled.blend"),
+    };
+    run_blender_arguments(
+        blender,
+        &script,
+        None,
+        &[
+            scenes.odd_viewport.as_path(),
+            scenes.scaled_spot.as_path(),
+            scenes.small_area_cutoff.as_path(),
+            scenes.ortho_spot_offcenter.as_path(),
+            scenes.perspective_spot.as_path(),
+            scenes.small_area_survivor.as_path(),
+            scenes.area_influence_culled.as_path(),
+            Path::new("-"),
+            Path::new("-"),
+            Path::new("-"),
+            Path::new("-"),
+            Path::new("-"),
+            Path::new("-"),
+            Path::new("-"),
+        ],
+    )?;
+    Ok(scenes)
+}
 
 /// The mean red value of the `(2 * half + 1)` square window centred on `(column, row)` (top-down) in the image `id`.
 fn window_mean(
@@ -546,33 +604,13 @@ fn realtime_light_shape_boundaries_match_eevee() -> TestResult {
         return Ok(());
     };
     let root = tempdir()?;
-    let script = write_script(
-        root.path(),
-        "eevee_light_shape_boundaries.py",
-        BOUNDARY_SCRIPT,
-    )?;
-    let odd_blend = root.path().join("odd_viewport.blend");
-    let spot_blend = root.path().join("scaled_spot.blend");
-    let area_blend = root.path().join("small_area.blend");
-    run_blender_arguments(
-        &blender,
-        &script,
-        None,
-        &[
-            odd_blend.as_path(),
-            spot_blend.as_path(),
-            area_blend.as_path(),
-            Path::new("-"),
-            Path::new("-"),
-            Path::new("-"),
-        ],
-    )?;
+    let scenes = generate_boundary_scenes(&blender, root.path())?;
 
     let project = render_realtime_at(
         &blender,
         root.path(),
         "odd_viewport",
-        &odd_blend,
+        &scenes.odd_viewport,
         "odd_viewport",
         ODD_VIEWPORT_WIDTH as u32,
         ODD_VIEWPORT_HEIGHT as u32,
@@ -608,7 +646,7 @@ fn realtime_light_shape_boundaries_match_eevee() -> TestResult {
         &blender,
         root.path(),
         "scaled_spot",
-        &spot_blend,
+        &scenes.scaled_spot,
         "scaled_spot",
         8,
     )?;
@@ -627,7 +665,7 @@ fn realtime_light_shape_boundaries_match_eevee() -> TestResult {
         &blender,
         root.path(),
         "small_area",
-        &area_blend,
+        &scenes.small_area_cutoff,
         "small_area",
         8,
     )?;
@@ -640,6 +678,105 @@ fn realtime_light_shape_boundaries_match_eevee() -> TestResult {
     assert!(
         (area_center - expected_area_center).abs() <= EMITTER_TOLERANCE,
         "small square area-light cutoff: Potter {area_center} differs from EEVEE {expected_area_center}"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_spot_shapes_match_native_camera_ray_attenuation() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let scenes = generate_boundary_scenes(&blender, root.path())?;
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "ortho_spot_offcenter",
+        &scenes.ortho_spot_offcenter,
+        "ortho_spot_offcenter",
+        8,
+    )?;
+    let ortho_spot = window_mean(&project, "ortho_spot_offcenter", 56, 32, 0)?;
+    let expected_ortho_spot = oracle_window_mean(EEVEE_SPOT_ORTHO_OFFCENTER, 56, 32, 0);
+    assert!(
+        expected_ortho_spot > 0.0,
+        "the native off-centre orthographic spot must retain its on-axis radiance"
+    );
+    assert!(
+        (ortho_spot - expected_ortho_spot).abs() <= EMITTER_TOLERANCE,
+        "off-centre orthographic spot: Potter {ortho_spot} differs from EEVEE {expected_ortho_spot}"
+    );
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "perspective_spot",
+        &scenes.perspective_spot,
+        "perspective_spot",
+        8,
+    )?;
+    let expected_left = oracle_window_mean(EEVEE_SPOT_PERSPECTIVE_RAY, 29, 32, 0);
+    let expected_right = oracle_window_mean(EEVEE_SPOT_PERSPECTIVE_RAY, 35, 32, 0);
+    assert!(
+        expected_left > 0.0 && expected_right == 0.0,
+        "the native perspective spot must attenuate across its disc: left {expected_left}, right {expected_right}"
+    );
+    for (column, expected) in [(29, expected_left), (35, expected_right)] {
+        let actual = window_mean(&project, "perspective_spot", column, 32, 0)?;
+        assert!(
+            (actual - expected).abs() <= EMITTER_TOLERANCE,
+            "perspective spot at column {column}: Potter {actual} differs from EEVEE {expected}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn realtime_area_shapes_match_native_size_and_influence_culls() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let scenes = generate_boundary_scenes(&blender, root.path())?;
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "small_area_survivor",
+        &scenes.small_area_survivor,
+        "small_area_survivor",
+        8,
+    )?;
+    let survivor = window_mean(&project, "small_area_survivor", 32, 32, 0)?;
+    let expected_survivor = oracle_window_mean(EEVEE_AREA_SMALL_SURVIVOR, 32, 32, 0);
+    assert!(
+        expected_survivor > 0.0,
+        "the native 0.002 x 2 rectangle survives the half-extent cutoff and display clamp"
+    );
+    assert!(
+        (survivor - expected_survivor).abs() <= EMITTER_TOLERANCE,
+        "small surviving rectangle: Potter {survivor} differs from EEVEE {expected_survivor}"
+    );
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "area_influence_culled",
+        &scenes.area_influence_culled,
+        "area_influence_culled",
+        8,
+    )?;
+    let culled_edge = window_mean(&project, "area_influence_culled", 60, 32, 0)?;
+    let expected_culled_edge = oracle_window_mean(EEVEE_AREA_INFLUENCE_CULLED, 60, 32, 0);
+    assert_eq!(
+        expected_culled_edge, 0.0,
+        "EEVEE culls the area light's influence sphere even where its rectangle overlaps the view"
+    );
+    assert!(
+        (culled_edge - expected_culled_edge).abs() <= EMITTER_TOLERANCE,
+        "influence-culled area rectangle at the in-frame edge: Potter {culled_edge} differs from EEVEE {expected_culled_edge}"
     );
     Ok(())
 }

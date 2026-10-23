@@ -51,9 +51,9 @@ use super::{
     },
     pixel_filter::PixelFilter,
     raster::{
-        Camera, CameraFrame, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals,
-        camera_eye, camera_frame, rasterize_with_lines, ray_for_sample_in_frame,
-        smooth_shadow_origin,
+        Camera, CameraFrame, CameraFrustum, Mode, RasterOutput, StereoMode, Triangle,
+        blend_corner_normals, camera_eye, camera_frame, camera_frustum, rasterize_with_lines,
+        ray_for_sample_in_frame, smooth_shadow_origin,
     },
     scene::{
         ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space,
@@ -669,6 +669,7 @@ impl CameraFootprint {
 /// A perspective camera has `dP = 0` and an orthographic camera `dD = 0`. Panoramic, fisheye and depth-of-field
 /// cameras use the same finite difference rather than Cycles' per-projection formulas, and a one-pixel-wide or
 /// one-pixel-high image has no neighbour along that axis, which contributes nothing.
+/// A side-by-side stereo footprint keeps its horizontal neighbour in the same packed eye.
 fn camera_footprint(
     frame: &CameraFrame,
     camera: &Camera,
@@ -680,11 +681,22 @@ fn camera_footprint(
     sample_y: f64,
     (origin, direction): (DVec3, DVec3),
 ) -> Result<CameraFootprint> {
-    let direction = direction.normalize_or_zero();
-    let right = if x + 1 < width {
-        x + 1
+    let (view_start, view_end) = if frame.stereo_mode == StereoMode::SideBySide {
+        let split = width / 2;
+        if x < split {
+            (0, split)
+        } else {
+            (split, width)
+        }
     } else {
-        x.saturating_sub(1)
+        (0, width)
+    };
+    let right = if x + 1 < view_end {
+        x + 1
+    } else if x > view_start {
+        x - 1
+    } else {
+        x
     };
     let down = if y + 1 < height {
         y + 1
@@ -1522,9 +1534,34 @@ enum RealtimeCameraLights<'a> {
     Owned(Vec<PointLight>),
 }
 
+enum RealtimeCameraLightInput<'a> {
+    Borrowed(&'a [PointLight], &'a [CameraLightPrepared]),
+    Owned(Vec<PointLight>, Vec<CameraLightPrepared>),
+}
+
+#[derive(Clone, Copy)]
+struct CameraLightPrepared {
+    influence_radius_max: f64,
+    area_display: Option<AreaShape>,
+}
+
 pub(super) struct RealtimeCameraLightContext<'a> {
     lights: RealtimeCameraLights<'a>,
+    cameras: [Camera; 2],
+    culling: Vec<CameraLightCull>,
     suns: Vec<SunDisc>,
+}
+
+#[derive(Clone, Copy)]
+struct CameraLightCull {
+    area_display: Option<AreaShape>,
+    visible: [bool; 2],
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RealtimeCameraLightView<'context, 'lights> {
+    context: &'context RealtimeCameraLightContext<'lights>,
+    eye: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1533,7 +1570,7 @@ pub(super) struct CameraLightEvent {
     pub(super) radiance: DVec3,
 }
 
-impl RealtimeCameraLightContext<'_> {
+impl<'lights> RealtimeCameraLightContext<'lights> {
     fn lights(&self) -> &[PointLight] {
         match &self.lights {
             RealtimeCameraLights::Borrowed(lights) => lights,
@@ -1541,16 +1578,35 @@ impl RealtimeCameraLightContext<'_> {
         }
     }
 
-    pub(super) fn local_events<'a>(
+    pub(super) fn view(&self, eye: usize) -> RealtimeCameraLightView<'_, 'lights> {
+        RealtimeCameraLightView {
+            context: self,
+            eye: eye.min(1),
+        }
+    }
+
+    fn local_events<'a>(
         &'a self,
-        camera: &'a Camera,
+        eye: usize,
         origin: DVec3,
         direction: DVec3,
         far_distance: f64,
     ) -> impl Iterator<Item = CameraLightEvent> + 'a {
-        self.lights().iter().filter_map(move |light| {
-            camera_light_shape_hit(light, camera, origin, direction, far_distance)
-        })
+        self.lights()
+            .iter()
+            .zip(&self.culling)
+            .filter_map(move |(light, culling)| {
+                culling.visible[eye].then(|| {
+                    camera_light_shape_hit_with_area(
+                        light,
+                        culling.area_display,
+                        &self.cameras[eye],
+                        origin,
+                        direction,
+                        far_distance,
+                    )
+                })?
+            })
     }
 
     pub(super) fn sun_radiance(&self, direction: DVec3) -> DVec3 {
@@ -1561,19 +1617,178 @@ impl RealtimeCameraLightContext<'_> {
     }
 }
 
+impl RealtimeCameraLightView<'_, '_> {
+    pub(super) fn for_eye(self, eye: usize) -> Self {
+        Self {
+            eye: eye.min(1),
+            ..self
+        }
+    }
+
+    pub(super) fn local_events<'a>(
+        &'a self,
+        origin: DVec3,
+        direction: DVec3,
+        far_distance: f64,
+    ) -> impl Iterator<Item = CameraLightEvent> + 'a {
+        self.context
+            .local_events(self.eye, origin, direction, far_distance)
+    }
+
+    pub(super) fn sun_radiance(&self, direction: DVec3) -> DVec3 {
+        self.context.sun_radiance(direction)
+    }
+}
+
 pub(super) fn prepare_realtime_camera_light_context<'a>(
     doc: &SceneDoc,
     snapshot: &Snapshot,
     transport: Option<&'a RealtimeVolumeTransport<'_>>,
-) -> RealtimeCameraLightContext<'a> {
-    let lights = transport.map_or_else(
-        || RealtimeCameraLights::Owned(collect_lights(doc, snapshot)),
-        |transport| RealtimeCameraLights::Borrowed(&transport.lights),
+    camera: &Camera,
+    width: u32,
+    height: u32,
+) -> Result<RealtimeCameraLightContext<'a>> {
+    let light_input = transport.map_or_else(
+        || {
+            let (lights, prepared) = collect_lights_with_camera_data(doc, snapshot);
+            RealtimeCameraLightInput::Owned(lights, prepared)
+        },
+        |transport| {
+            RealtimeCameraLightInput::Borrowed(&transport.lights, &transport.camera_light_prepared)
+        },
     );
-    RealtimeCameraLightContext {
+    let light_slice = match &light_input {
+        RealtimeCameraLightInput::Borrowed(lights, _) => *lights,
+        RealtimeCameraLightInput::Owned(lights, _) => lights,
+    };
+    let prepared = match &light_input {
+        RealtimeCameraLightInput::Borrowed(_, prepared) => *prepared,
+        RealtimeCameraLightInput::Owned(_, prepared) => prepared,
+    };
+    let cameras = camera_light_cameras(camera);
+    let frusta = camera_light_frusta(camera, &cameras, width, height)?;
+    let culling = light_slice
+        .iter()
+        .zip(prepared.iter().copied())
+        .map(|(light, prepared)| CameraLightCull {
+            area_display: prepared.area_display,
+            visible: [
+                camera_light_visible_in_view(light, prepared.influence_radius_max, frusta[0]),
+                camera_light_visible_in_view(light, prepared.influence_radius_max, frusta[1]),
+            ],
+        })
+        .collect();
+    let lights = match light_input {
+        RealtimeCameraLightInput::Borrowed(lights, _) => RealtimeCameraLights::Borrowed(lights),
+        RealtimeCameraLightInput::Owned(lights, _) => RealtimeCameraLights::Owned(lights),
+    };
+    Ok(RealtimeCameraLightContext {
         lights,
+        cameras,
+        culling,
         suns: camera_sun_discs(doc, snapshot),
+    })
+}
+
+fn camera_light_cameras(camera: &Camera) -> [Camera; 2] {
+    match camera.stereo_mode {
+        StereoMode::None => [*camera, *camera],
+        StereoMode::SideBySide | StereoMode::Anaglyph => {
+            [camera_eye(camera, -1.0), camera_eye(camera, 1.0)]
+        }
     }
+}
+
+fn camera_light_frusta(
+    camera: &Camera,
+    cameras: &[Camera; 2],
+    width: u32,
+    height: u32,
+) -> Result<[Option<CameraFrustum>; 2]> {
+    let mut frusta = [None, None];
+    match camera.stereo_mode {
+        StereoMode::None => frusta[0] = camera_frustum(&cameras[0], width, height)?,
+        StereoMode::SideBySide => {
+            let split = width / 2;
+            frusta[0] = camera_frustum(&cameras[0], split, height)?;
+            frusta[1] = camera_frustum(&cameras[1], split, height)?;
+        }
+        StereoMode::Anaglyph => {
+            frusta[0] = camera_frustum(&cameras[0], width, height)?;
+            frusta[1] = camera_frustum(&cameras[1], width, height)?;
+        }
+    }
+    Ok(frusta)
+}
+
+fn camera_light_visible_in_view(
+    light: &PointLight,
+    influence_radius_max: f64,
+    frustum: Option<CameraFrustum>,
+) -> bool {
+    if !light.camera_shape_eligible
+        || light.ray_mask & RayKind::Camera.bit() == 0
+        || influence_radius_max < 1.0e-8
+    {
+        return false;
+    }
+    let Some(frustum) = frustum else {
+        return true;
+    };
+    if light.kind == LightType::Spot
+        && let Some(pyramid) = camera_light_spot_pyramid(light, influence_radius_max)
+        && !frustum.intersects_pyramid(pyramid)
+    {
+        return false;
+    }
+    frustum.intersects_sphere(light.position, influence_radius_max)
+}
+
+fn camera_light_spot_pyramid(light: &PointLight, influence_radius_max: f64) -> Option<[DVec3; 5]> {
+    let spot_tan = (light.spot_size * 0.5)
+        .min(std::f64::consts::FRAC_PI_2 - 1.0e-4)
+        .tan();
+    if !influence_radius_max.is_finite()
+        || !spot_tan.is_finite()
+        || spot_tan <= 0.0
+        || spot_tan >= 10.0
+    {
+        return None;
+    }
+    let transform = light.world_transform;
+    let mut x_axis = transform.x_axis.truncate();
+    let mut y_axis = transform.y_axis.truncate();
+    let z_axis = transform.z_axis.truncate();
+    let scale_x = x_axis.length();
+    let scale_y = y_axis.length();
+    let scale_z = z_axis.length();
+    if !scale_x.is_finite()
+        || !scale_y.is_finite()
+        || !scale_z.is_finite()
+        || scale_x <= 1.0e-8
+        || scale_y <= 1.0e-8
+        || scale_z <= 1.0e-8
+    {
+        return None;
+    }
+    x_axis = x_axis.normalize_or_zero();
+    y_axis = y_axis.normalize_or_zero();
+    z_axis = z_axis.normalize_or_zero();
+    if x_axis.cross(y_axis).dot(z_axis) < 0.0 {
+        y_axis = -y_axis;
+    }
+    let spot_size_inv_x = scale_z / scale_x.max(1.0e-8);
+    let spot_size_inv_y = scale_z / scale_y.max(1.0e-8);
+    let half_x = x_axis * (influence_radius_max * spot_tan / spot_size_inv_x);
+    let half_y = y_axis * (influence_radius_max * spot_tan / spot_size_inv_y);
+    let base = light.position - z_axis * influence_radius_max;
+    Some([
+        light.position,
+        base - half_x - half_y,
+        base + half_x - half_y,
+        base + half_x + half_y,
+        base - half_x + half_y,
+    ])
 }
 
 /// A sun light's disc, as EEVEE draws it (`eevee_light_shape_display.bsl.hh`, `shape_display_light_radiance_get`).
@@ -1627,8 +1842,35 @@ fn camera_sun_discs(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<SunDisc> {
 /// The camera-visible local-light shape from EEVEE's `shape_display_light_position_get` and
 /// `shape_display_light_radiance_get`. This intentionally does not apply Cycles' physical spread
 /// eligibility or EEVEE's diffuse/specular/transmission/volume power factors.
+#[cfg(test)]
 fn camera_light_shape_hit(
     light: &PointLight,
+    camera: &Camera,
+    origin: DVec3,
+    direction: DVec3,
+    limit: f64,
+) -> Option<CameraLightEvent> {
+    let area_display = if light.camera_shape_eligible {
+        light.area.map(camera_light_display_area)
+    } else {
+        None
+    };
+    camera_light_shape_hit_with_area(light, area_display, camera, origin, direction, limit)
+}
+
+fn camera_light_display_area(shape: AreaShape) -> AreaShape {
+    AreaShape::new(
+        shape.axis_u,
+        shape.axis_v,
+        shape.half_u.max(0.003),
+        shape.half_v.max(0.003),
+        shape.ellipse,
+    )
+}
+
+fn camera_light_shape_hit_with_area(
+    light: &PointLight,
+    area_display: Option<AreaShape>,
     camera: &Camera,
     origin: DVec3,
     direction: DVec3,
@@ -1638,9 +1880,9 @@ fn camera_light_shape_hit(
         return None;
     }
 
-    if let Some(shape) = light.area {
+    if let Some(display_shape) = area_display {
         let cos_light = -light.direction.dot(direction);
-        if shape.area <= 0.0 || cos_light <= 0.0 {
+        if display_shape.area <= 0.0 || cos_light <= 0.0 {
             return None;
         }
         let (distance, point) = ray_plane_intersection(
@@ -1651,12 +1893,12 @@ fn camera_light_shape_hit(
             cos_light,
             limit,
         )?;
-        if !inside_emitter(&shape, light.position, point) {
+        if !inside_emitter(&display_shape, light.position, point) {
             return None;
         }
         return Some(CameraLightEvent {
             distance,
-            radiance: light.color * area_radiance(light.energy, shape.area),
+            radiance: light.color * area_radiance(light.energy, display_shape.area),
         });
     }
 
@@ -1693,7 +1935,7 @@ fn camera_light_shape_hit(
     let spot = if light.kind == LightType::Spot {
         spot_cone(
             &light.world_transform,
-            (light.position - camera.position).normalize_or_zero(),
+            direction,
             light.spot_size,
             light.spot_blend,
         )
@@ -1985,6 +2227,7 @@ pub(super) struct RealtimeVolumeTransport<'a> {
     bvh: Option<&'a Bvh>,
     volumes: Vec<VolumeInstance<'a>>,
     lights: Vec<PointLight>,
+    camera_light_prepared: Vec<CameraLightPrepared>,
     fallback: DVec3,
     meters_per_unit: f64,
     has_mesh_volumes: bool,
@@ -2014,7 +2257,7 @@ pub(super) struct RealtimeVolumeScratch {
     froxel_extinction: Vec<DVec3>,
     froxel_prefix: Vec<DVec3>,
     froxel_boundaries: Vec<(usize, FroxelMeshMedium)>,
-    froxel_resolve: Option<RealtimeVolumeResolveCache>,
+    froxel_resolve: [Option<RealtimeVolumeResolveCache>; 2],
 }
 
 struct RealtimeVolumeResolveCache {
@@ -2118,7 +2361,8 @@ impl RealtimeVolumeResolveCache {
         self.column_prefix.get(start..end)
     }
 
-    // Preserve the allocated prefix buffers while invalidating eye-specific column keys.
+    // Preserve the allocated prefix buffers while invalidating cached column keys.
+    #[cfg(test)]
     fn clear_columns(&mut self) {
         self.column_slots.fill(FroxelColumnCacheSlot::default());
         self.column_clock = 0;
@@ -2145,6 +2389,7 @@ pub(super) struct RealtimeVolumeSampleInfo<'a> {
     pub(super) ray: (DVec3, DVec3),
     pub(super) sample_index: u32,
     pub(super) sample_count: u32,
+    pub(super) view_index: usize,
 }
 
 pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
@@ -2155,13 +2400,13 @@ pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
     frame: CameraFrame,
     width: u32,
     height: u32,
-    x: u32,
-    y: u32,
+    layout_x: u32,
+    layout_width: u32,
+    packed_x_offset: u32,
+    resolve_view: usize,
     /// Blender's image-render AA sample index, also the per-sample volume projection jitter.
     sample_index: u32,
     sample_count: u32,
-    sample_x: f64,
-    sample_y: f64,
     origin: DVec3,
     direction: DVec3,
     pub(super) far_distance: f64,
@@ -2179,18 +2424,12 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
         scratch: &'pass mut RealtimeVolumeScratch,
         seed: u32,
     ) -> Self {
-        scratch.froxel_resolve = None;
+        scratch.froxel_resolve = [None, None];
         Self {
             transport,
             geometry,
             scratch,
             seed,
-        }
-    }
-
-    pub(super) fn reset_column_cache(&mut self) {
-        if let Some(cache) = self.scratch.froxel_resolve.as_mut() {
-            cache.clear_columns();
         }
     }
 
@@ -2201,6 +2440,17 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
     where
         'pass: 'sample,
     {
+        let (resolve_view, layout_x, layout_width, packed_x_offset) =
+            if sample.camera.stereo_mode == StereoMode::SideBySide {
+                let split = sample.width / 2;
+                if sample.x < split {
+                    (0, sample.x, split, 0)
+                } else {
+                    (1, sample.x - split, sample.width - split, split)
+                }
+            } else {
+                (sample.view_index, sample.x, sample.width, 0)
+            };
         let footprint = camera_footprint(
             sample.frame,
             sample.camera,
@@ -2220,12 +2470,13 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
             frame: *sample.frame,
             width: sample.width,
             height: sample.height,
-            x: sample.x,
+            layout_x,
+            layout_width,
+            packed_x_offset,
+            resolve_view,
             y: sample.y,
             sample_index: sample.sample_index,
             sample_count: sample.sample_count,
-            sample_x: sample.sample_x,
-            sample_y: sample.sample_y,
             origin: sample.ray.0,
             direction: sample.ray.1,
             far_distance: sample
@@ -2257,21 +2508,25 @@ impl RealtimeVolumeSample<'_, '_> {
     }
 
     fn resolve_cache(&self) -> Result<&RealtimeVolumeResolveCache> {
-        self.scratch.froxel_resolve.as_ref().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "realtime volume froxel cache is unavailable",
-            )
-        })
+        self.scratch.froxel_resolve[self.resolve_view]
+            .as_ref()
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "realtime volume froxel cache is unavailable",
+                )
+            })
     }
 
     fn resolve_cache_mut(&mut self) -> Result<&mut RealtimeVolumeResolveCache> {
-        self.scratch.froxel_resolve.as_mut().ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InternalError,
-                "realtime volume froxel cache is unavailable",
-            )
-        })
+        self.scratch.froxel_resolve[self.resolve_view]
+            .as_mut()
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "realtime volume froxel cache is unavailable",
+                )
+            })
     }
 
     /// Resolves the cumulative froxel transmittance with EEVEE's XY/Z texture filtering.
@@ -2295,7 +2550,7 @@ impl RealtimeVolumeSample<'_, '_> {
                 cache.slice_count,
             );
             let screen_uv = [
-                (f64::from(self.x) + 0.5) / f64::from(cache.width),
+                (f64::from(self.layout_x) + 0.5) / f64::from(cache.width),
                 1.0 - (f64::from(self.y) + 0.5) / f64::from(cache.height),
             ];
             let resolve_uv = screen_uv_to_resolve_uv(
@@ -2329,12 +2584,14 @@ impl RealtimeVolumeSample<'_, '_> {
                         })?;
                     self.build_froxel_column(column)?;
                     let scratch = &mut *self.scratch;
-                    let cache = scratch.froxel_resolve.as_mut().ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InternalError,
-                            "realtime volume froxel cache is unavailable",
-                        )
-                    })?;
+                    let cache = scratch.froxel_resolve[self.resolve_view]
+                        .as_mut()
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::InternalError,
+                                "realtime volume froxel cache is unavailable",
+                            )
+                        })?;
                     cache.store_column(slot, column, &scratch.froxel_prefix)?;
                 }
             }
@@ -2368,7 +2625,7 @@ impl RealtimeVolumeSample<'_, '_> {
     }
 
     fn initialize_froxel_resolve(&mut self) -> Result<bool> {
-        if self.scratch.froxel_resolve.is_some() {
+        if self.scratch.froxel_resolve[self.resolve_view].is_some() {
             return Ok(true);
         }
         let scene = self
@@ -2404,7 +2661,7 @@ impl RealtimeVolumeSample<'_, '_> {
         }
 
         let tile_size = settings.eevee_volumetric_tile_size;
-        let layout = FroxelTextureLayout::new(self.width, self.height, tile_size);
+        let layout = FroxelTextureLayout::new(self.layout_width, self.height, tile_size);
         let slice_count = settings.eevee_volumetric_samples as usize;
         let projection = if matches!(
             self.camera.projection,
@@ -2460,10 +2717,10 @@ impl RealtimeVolumeSample<'_, '_> {
             )
         })?;
         column_prefix.resize(prefix_count, DVec3::ZERO);
-        self.scratch.froxel_resolve = Some(RealtimeVolumeResolveCache {
+        self.scratch.froxel_resolve[self.resolve_view] = Some(RealtimeVolumeResolveCache {
             layout,
             depth_mapping,
-            width: self.width,
+            width: self.layout_width,
             height: self.height,
             tile_size,
             slice_count,
@@ -2662,15 +2919,16 @@ impl RealtimeVolumeSample<'_, '_> {
         let jitter_offset = layout.jitter_in_pixels([jitter_x, jitter_y]);
         let pixel_x = cell_center[0] - jitter_offset[0];
         let pixel_y = cell_center[1] + jitter_offset[1];
-        let raster_x = pixel_x.floor().clamp(0.0, f64::from(width - 1)) as u32;
+        let local_raster_x = pixel_x.floor().clamp(0.0, f64::from(width - 1)) as u32;
+        let raster_x = local_raster_x + self.packed_x_offset;
         let raster_y = pixel_y.floor().clamp(0.0, f64::from(height - 1)) as u32;
-        let sample_x = pixel_x - f64::from(raster_x);
+        let sample_x = pixel_x - f64::from(local_raster_x);
         let sample_y = pixel_y - f64::from(raster_y);
         let Some((origin, direction)) = ray_for_sample_in_frame(
             &self.frame,
             &self.camera,
-            width,
-            height,
+            self.width,
+            self.height,
             raster_x,
             raster_y,
             sample_x,
@@ -2682,8 +2940,8 @@ impl RealtimeVolumeSample<'_, '_> {
         let mut footprint = camera_footprint(
             &self.frame,
             &self.camera,
-            width,
-            height,
+            self.width,
+            self.height,
             raster_x,
             raster_y,
             sample_x,
@@ -3019,13 +3277,15 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
         .map_or(DVec3::ZERO, |world| {
             DVec3::from_array(world.color) * world.strength
         });
+    let (lights, camera_light_prepared) = collect_lights_with_camera_data(doc, snapshot);
     Ok(Some(RealtimeVolumeTransport {
         doc,
         snapshot,
         images,
         bvh,
         volumes,
-        lights: collect_lights(doc, snapshot),
+        lights,
+        camera_light_prepared,
         fallback,
         meters_per_unit: scene.unit.scale_length,
         has_mesh_volumes,
@@ -6670,6 +6930,23 @@ fn reflect(direction: DVec3, normal: DVec3) -> DVec3 {
 }
 
 fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
+    collect_lights_impl(doc, snapshot, None)
+}
+
+fn collect_lights_with_camera_data(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+) -> (Vec<PointLight>, Vec<CameraLightPrepared>) {
+    let mut camera_light_prepared = Vec::new();
+    let lights = collect_lights_impl(doc, snapshot, Some(&mut camera_light_prepared));
+    (lights, camera_light_prepared)
+}
+
+fn collect_lights_impl(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    mut camera_light_prepared: Option<&mut Vec<CameraLightPrepared>>,
+) -> Vec<PointLight> {
     // EEVEE's light threshold sets the volume influence radius of a local light; the path tracer does not read it.
     let threshold = doc
         .scenes
@@ -6690,24 +6967,41 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
             let color = DVec3::from_array(data.color).max(DVec3::ZERO);
             let energy = data.energy.max(0.0);
             let area = (data.light_type == LightType::Area).then(|| area_shape(data, &matrix));
+            let volume_radius_squared = if data.light_type == LightType::Sun {
+                f64::INFINITY
+            } else {
+                local_light_influence_radius_squared(data, data.volume_factor, threshold)
+            };
+            let local_influence_radius_squared = if data.light_type == LightType::Sun {
+                0.0
+            } else {
+                local_light_influence_radius_squared(
+                    data,
+                    data.diffuse_factor.max(data.specular_factor),
+                    threshold,
+                )
+                .max(volume_radius_squared)
+            };
             let camera_shape_eligible = if data.light_type == LightType::Sun {
                 true
             } else {
                 // EEVEE's culler compares the product of half-extents (`eevee_light.cc:219-235`).
                 let area_shape_has_power_area =
                     area.is_none_or(|shape| shape.half_u * shape.half_v >= 1.0e-5);
-                let local_influence_radius_squared = local_light_influence_radius_squared(
-                    data,
-                    data.diffuse_factor.max(data.specular_factor),
-                    threshold,
-                )
-                .max(local_light_influence_radius_squared(
-                    data,
-                    data.volume_factor,
-                    threshold,
-                ));
                 area_shape_has_power_area && local_influence_radius_squared > 0.0
             };
+            if let Some(prepared) = camera_light_prepared.as_mut() {
+                prepared.push(CameraLightPrepared {
+                    influence_radius_max: if data.light_type == LightType::Sun {
+                        0.0
+                    } else {
+                        local_influence_radius_squared.max(0.0).sqrt()
+                    },
+                    area_display: camera_shape_eligible
+                        .then(|| area.map(camera_light_display_area))
+                        .flatten(),
+                });
+            }
             Some(PointLight {
                 position: matrix.transform_point3(DVec3::ZERO),
                 direction: matrix.transform_vector3(-DVec3::Z).normalize_or_zero(),
@@ -6723,11 +7017,7 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 spread: Spread::new(data.spread),
                 use_mis: data.use_multiple_importance_sampling,
                 volume_factor: data.volume_factor.max(0.0),
-                volume_radius_squared: if data.light_type == LightType::Sun {
-                    f64::INFINITY
-                } else {
-                    local_light_influence_radius_squared(data, data.volume_factor, threshold)
-                },
+                volume_radius_squared,
                 ray_mask: node.resolved_ray_visibility().mask(),
                 camera_shape_eligible,
             })

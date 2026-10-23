@@ -24,6 +24,7 @@ fn camera_volume_doc(grid: Value, render_samples: u32) -> Result<SceneDoc, Box<d
             "operations": [
                 {"op":"camera.create","id":"camera_main","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2},
                 {"op":"camera.create","id":"camera_stereo","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2,"stereo_mode":"anaglyph","interocular_distance":EYE_OFFSET * 2.0},
+                {"op":"camera.create","id":"camera_stereo_sbs","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2,"stereo_mode":"side_by_side","interocular_distance":EYE_OFFSET * 2.0},
                 {"op":"camera.create","id":"camera_left","transform":{"translation":[-EYE_OFFSET,0,4]},"projection":"orthographic","ortho_scale":2},
                 {"op":"camera.create","id":"camera_right","transform":{"translation":[EYE_OFFSET,0,4]},"projection":"orthographic","ortho_scale":2},
                 {"op":"light.create","id":"emitter","light_type":"point","energy":100,"radius":2,"transform":{"translation":[0,0,0]}},
@@ -38,12 +39,14 @@ fn camera_volume_doc(grid: Value, render_samples: u32) -> Result<SceneDoc, Box<d
     Ok(outcome.doc)
 }
 
-fn render_realtime_pixel(
+fn render_realtime_image(
     doc: &SceneDoc,
     root: &Path,
     camera_id: &str,
+    width: u32,
+    height: u32,
     samples: u32,
-) -> Result<[f32; 4], Box<dyn Error>> {
+) -> Result<Vec<[f32; 4]>, Box<dyn Error>> {
     let context = EvaluationContext {
         scene_id: Some(doc.active_scene.clone()),
         frame: Some(1.0),
@@ -59,15 +62,24 @@ fn render_realtime_pixel(
         root,
         &cache_directory,
         camera_id,
-        1,
-        1,
+        width,
+        height,
         "beauty",
         "realtime",
         false,
         samples,
         0,
     )?;
-    Ok(raster.linear_rgba[0])
+    Ok(raster.linear_rgba)
+}
+
+fn render_realtime_pixel(
+    doc: &SceneDoc,
+    root: &Path,
+    camera_id: &str,
+    samples: u32,
+) -> Result<[f32; 4], Box<dyn Error>> {
+    Ok(render_realtime_image(doc, root, camera_id, 1, 1, samples)?[0])
 }
 
 fn strip(id: &str, kind: StripType, channel: u32) -> Strip {
@@ -342,6 +354,110 @@ fn anaglyph_realtime_volume_resolves_each_eye_column_independently() -> Result<(
     assert!(
         anaglyph[0] > anaglyph[1],
         "the right-eye column was reused from the left eye: {anaglyph:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn side_by_side_realtime_volume_odd_seam_matches_each_eye() -> Result<(), Box<dyn Error>> {
+    const PACKED_WIDTH: u32 = 65;
+    const SPLIT: u32 = PACKED_WIDTH / 2;
+    const HEIGHT: u32 = 1;
+    const SAMPLES: u32 = 1;
+
+    let values = (0..3)
+        .flat_map(|_| (0..7).flat_map(|_| (0..7).map(|x| x as f32 * 0.8)))
+        .collect::<Vec<_>>();
+    let grid = json!({
+        "dims": [7, 7, 3],
+        "voxel_size": 0.5,
+        "origin": [-1.5, -1.5, 1.0],
+        "values": values
+    });
+    let mut doc = camera_volume_doc(grid, SAMPLES)?;
+    let scene_id = doc.active_scene.clone();
+    doc.scenes
+        .get_mut(&scene_id)
+        .unwrap()
+        .render
+        .eevee_volumetric_tile_size = 16;
+
+    let mut clear_doc = doc.clone();
+    clear_doc
+        .data_blocks
+        .values_mut()
+        .find_map(|block| block.volume.as_mut())
+        .and_then(|volume| volume.grids.first_mut())
+        .and_then(|grid| grid.values.as_mut())
+        .unwrap()
+        .fill(0.0);
+
+    let directory = tempdir()?;
+    let packed = render_realtime_image(
+        &doc,
+        directory.path(),
+        "camera_stereo_sbs",
+        PACKED_WIDTH,
+        HEIGHT,
+        SAMPLES,
+    )?;
+    let clear = render_realtime_image(
+        &clear_doc,
+        directory.path(),
+        "camera_stereo_sbs",
+        PACKED_WIDTH,
+        HEIGHT,
+        SAMPLES,
+    )?;
+    let left = render_realtime_image(
+        &doc,
+        directory.path(),
+        "camera_left",
+        SPLIT,
+        HEIGHT,
+        SAMPLES,
+    )?;
+    let right = render_realtime_image(
+        &doc,
+        directory.path(),
+        "camera_right",
+        PACKED_WIDTH - SPLIT,
+        HEIGHT,
+        SAMPLES,
+    )?;
+
+    let left_seam = packed[(SPLIT - 1) as usize];
+    let right_seam = packed[SPLIT as usize];
+    let clear_left_seam = clear[(SPLIT - 1) as usize];
+    let clear_right_seam = clear[SPLIT as usize];
+    for (actual, expected, description) in [
+        (left_seam, left[(SPLIT - 1) as usize], "left-eye seam"),
+        (right_seam, right[0], "right-eye seam"),
+    ] {
+        assert!(
+            actual.into_iter().all(f32::is_finite),
+            "{description}: {actual:?}"
+        );
+        assert!(
+            actual[..3].iter().any(|channel| *channel > 0.0),
+            "{description} lost the camera-visible emitter: {actual:?}"
+        );
+        for channel in 0..3 {
+            assert!(
+                (actual[channel] - expected[channel]).abs() < 1.0e-5,
+                "{description} channel {channel} is {}, expected independent-eye value {}; left={left_seam:?}, right={right_seam:?}",
+                actual[channel],
+                expected[channel]
+            );
+        }
+    }
+    assert!(
+        clear_left_seam[0] > left_seam[0],
+        "the spatially varying volume must attenuate the left seam: {left_seam:?} vs {clear_left_seam:?}"
+    );
+    assert!(
+        clear_right_seam[0] > right_seam[0],
+        "the volume must attenuate the right seam: {right_seam:?} vs {clear_right_seam:?}"
     );
     Ok(())
 }
