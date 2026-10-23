@@ -25,17 +25,46 @@ fn test_node(node_type: &str, properties: Value) -> GraphNode {
     node
 }
 
+fn test_node_with_inputs(node_type: &str, inputs: Value) -> GraphNode {
+    let mut node = GraphNode::new(node_type);
+    node.inputs = inputs.as_object().unwrap().clone().into_iter().collect();
+    node
+}
+
 fn graph_with_node(node: GraphNode, output_socket: &str) -> NodeGroup {
     let mut graph = NodeGroup::new("compositor test", GraphKind::Compositor);
     let source_id = Id::from_static("source");
+    let layers_id = Id::from_static("a_layers");
     let output_id = Id::from_static("z_output");
+    let is_file_output = matches!(
+        node.node_type.as_str(),
+        "CompositorNodeOutputFile" | "OutputFile"
+    );
+    let needs_image_input =
+        is_file_output || matches!(node.node_type.as_str(), "CompositorNodeBlur" | "Blur");
     graph.nodes.insert(source_id.clone(), node);
     graph
         .nodes
         .insert(output_id.clone(), GraphNode::new("CompositorNodeComposite"));
+    if needs_image_input {
+        graph
+            .nodes
+            .insert(layers_id.clone(), GraphNode::new("CompositorNodeRLayers"));
+        graph.links.push(GraphLink {
+            from_node: layers_id.clone(),
+            from_socket: "Image".to_owned(),
+            to_node: source_id.clone(),
+            to_socket: "Image".to_owned(),
+        });
+    }
+    let (from_node, from_socket) = if is_file_output {
+        (&layers_id, "Image")
+    } else {
+        (&source_id, output_socket)
+    };
     graph.links.push(GraphLink {
-        from_node: source_id,
-        from_socket: output_socket.to_owned(),
+        from_node: from_node.clone(),
+        from_socket: from_socket.to_owned(),
         to_node: output_id,
         to_socket: "Image".to_owned(),
     });
@@ -117,9 +146,12 @@ fn alpha_over_graph() -> NodeGroup {
         .insert(layers_id.clone(), GraphNode::new("CompositorNodeRLayers"));
     graph.nodes.insert(
         alpha_over_id.clone(),
-        test_node(
+        test_node_with_inputs(
             "CompositorNodeAlphaOver",
-            json!({"background": [0.1, 0.25, 0.5]}),
+            json!({
+                "Factor": 1.0,
+                "Background": [0.1, 0.25, 0.5, 1.0]
+            }),
         ),
     );
     graph
@@ -130,7 +162,7 @@ fn alpha_over_graph() -> NodeGroup {
             from_node: layers_id,
             from_socket: "Image".to_owned(),
             to_node: alpha_over_id.clone(),
-            to_socket: "Image".to_owned(),
+            to_socket: "Foreground".to_owned(),
         },
         GraphLink {
             from_node: alpha_over_id,
@@ -207,10 +239,12 @@ fn associated_blur_and_defocus_filter_zero_alpha_radiance_without_reassociation(
         "CompositorNodeDefocus",
         "Defocus",
     ] {
-        let output = run_associated_graph(
-            graph_with_node(test_node(node_type, json!({"radius": 1})), "Image"),
-            &input,
-        )?;
+        let node = if matches!(node_type, "CompositorNodeBlur" | "Blur") {
+            test_node_with_inputs(node_type, json!({"Size": [1.0, 1.0]}))
+        } else {
+            test_node(node_type, json!({"radius": 1}))
+        };
+        let output = run_associated_graph(graph_with_node(node, "Image"), &input)?;
         assert_eq!(output, expected, "{node_type}");
     }
     Ok(())
@@ -321,26 +355,37 @@ fn supported_pixel_nodes_produce_their_numeric_results() -> Result<()> {
         }),
         [0.25, 0.45, 0.65, 1.5],
     )?;
+    for node_type in ["CompositorNodeAlphaOver", "AlphaOver"] {
+        let output = run_node(
+            test_node_with_inputs(
+                node_type,
+                json!({
+                    "Foreground": [1.0, 0.0, 0.0],
+                    "Background": [0.0, 0.0, 1.0],
+                    "Factor": 0.25
+                }),
+            ),
+            "Image",
+            &base,
+            None,
+            &doc,
+        )?;
+        assert_pixel(output.pixels[0], [0.25, 0.0, 0.75, 1.0]);
+    }
+    for node_type in ["CompositorNodeBlur", "Blur"] {
+        let output = run_node(
+            test_node_with_inputs(node_type, json!({"Size": [1.0, 1.0]})),
+            "Image",
+            &base,
+            None,
+            &doc,
+        )?;
+        assert_pixel(output.pixels[0], BASE_PIXEL);
+    }
     assert_node_types(
         &doc,
         &base,
-        &["CompositorNodeAlphaOver", "AlphaOver"],
-        json!({
-            "foreground": [1.0, 0.0, 0.0],
-            "background": [0.0, 0.0, 1.0],
-            "factor": 0.25
-        }),
-        [0.25, 0.0, 0.75, 1.0],
-    )?;
-    assert_node_types(
-        &doc,
-        &base,
-        &[
-            "CompositorNodeBlur",
-            "Blur",
-            "CompositorNodeDefocus",
-            "Defocus",
-        ],
+        &["CompositorNodeDefocus", "Defocus"],
         json!({"radius": 1}),
         BASE_PIXEL,
     )?;
