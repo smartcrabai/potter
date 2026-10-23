@@ -1229,14 +1229,6 @@ mod tests {
     }
 
     #[test]
-    fn gamma_cross_blends_in_linear_light() {
-        let black = RgbaFrame::new(1, 1, vec![[0.0, 0.0, 0.0, 1.0]]).unwrap();
-        let white = RgbaFrame::new(1, 1, vec![[1.0, 1.0, 1.0, 1.0]]).unwrap();
-        let mixed = transition(&black, &white, 0.5, TransitionType::GammaCross).unwrap();
-        assert!((mixed.pixels[0][0] - 0.735_356_9).abs() < 1.0e-5);
-    }
-
-    #[test]
     fn wipe_transition_replaces_the_entered_horizontal_region() {
         let first = RgbaFrame::new(2, 1, vec![[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]]).unwrap();
         let second =

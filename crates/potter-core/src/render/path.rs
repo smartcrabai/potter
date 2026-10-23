@@ -5076,7 +5076,7 @@ mod overlay_tests {
     #[test]
     fn physical_light_survives_fractional_stroke_in_producer_overlay_and_byte_encoding()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let doc = SceneDoc::default();
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000001".to_owned());
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
         let camera = Camera {
             position: DVec3::ZERO,

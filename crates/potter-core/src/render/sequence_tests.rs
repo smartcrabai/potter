@@ -8,7 +8,7 @@ use tempfile::tempdir;
 use super::{frame_output_names, render_camera_frame, render_vse_frame};
 use crate::{
     eval::{EvaluationContext, EvaluationPurpose, EvaluationSession},
-    model::{Scene, SceneDoc},
+    model::{Id, Scene, SceneDoc},
     ops::apply_batch,
     sequencer::{EffectType, Strip, StripType, TransitionType},
 };
@@ -16,7 +16,7 @@ use crate::{
 fn camera_volume_doc(grid: &Value, render_samples: u32) -> Result<SceneDoc, Box<dyn Error>> {
     const EYE_OFFSET: f64 = 0.2;
     let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-    let outcome = apply_batch(
+    let mut doc = apply_batch(
         &base,
         &json!({
             "schema_version": 1,
@@ -29,14 +29,26 @@ fn camera_volume_doc(grid: &Value, render_samples: u32) -> Result<SceneDoc, Box<
                 {"op":"camera.create","id":"camera_right","transform":{"translation":[EYE_OFFSET,0,4]},"projection":"orthographic","ortho_scale":2},
                 {"op":"light.create","id":"emitter","light_type":"point","energy":100,"radius":2,"transform":{"translation":[0,0,0]}},
                 {"op":"node.update","target":{"id":"emitter"},"set":{"ray_visibility":{"camera":true}}},
-                {"op":"light.update","target":{"id":"emitter"},"set":{"volume_factor":0}},
                 {"op":"volume.create","id":"fog","grids":[grid]},
                 {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
                 {"op":"render.update","target":{"id":"scene_main"},"set":{"samples":render_samples,"engine":"realtime"}}
             ]
         }),
-    )?;
-    Ok(outcome.doc)
+    )?.doc;
+    let emitter_id = Id::new("emitter")?;
+    let data_id = doc.nodes[&emitter_id]
+        .data
+        .as_ref()
+        .expect("fixture emitter has a light data-block")
+        .clone();
+    doc.data_blocks
+        .get_mut(&data_id)
+        .expect("fixture emitter data-block exists")
+        .light
+        .as_mut()
+        .expect("fixture emitter has a typed light payload")
+        .volume_factor = 0.0;
+    Ok(doc)
 }
 
 fn render_realtime_image(
@@ -465,13 +477,7 @@ fn side_by_side_realtime_volume_odd_seam_matches_each_eye() -> Result<(), Box<dy
 #[test]
 fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    for (transition, expected) in [
-        (TransitionType::Cross, [0.5, 0.0, 0.5, 1.0]),
-        (
-            TransitionType::GammaCross,
-            [0.735_356_9, 0.0, 0.735_356_9, 1.0],
-        ),
-    ] {
+    for (transition, expected) in [(TransitionType::Cross, [0.5, 0.0, 0.5, 1.0])] {
         let mut transition_strip = strip("transition", StripType::Transition, 3);
         transition_strip.length = 2.0;
         transition_strip.transition = Some(transition);

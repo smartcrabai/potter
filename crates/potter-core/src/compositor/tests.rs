@@ -58,6 +58,9 @@ fn run_node(
     scene.use_compositing = true;
     scene.compositor = Some(graph_id);
     let scene = doc.scenes.get(&scene_id).unwrap();
+    if passes.is_none() {
+        return super::apply_image_with_association(base.clone(), &doc, scene, 1.0, false);
+    }
 
     let pixel_count = base.pixels.len();
     let mut output = RasterOutput {
