@@ -5267,7 +5267,7 @@ mod overlay_tests {
             f64::from(pixel[3]),
         );
         assert_eq!(output.rgba[0], to_srgb_byte(display_rgb[0]));
-        assert_eq!(&output.rgba[1..], &[0, 0, 128]);
+        assert_eq!(&output.rgba[1..4], &[0, 0, 128]);
         Ok(())
     }
 }
