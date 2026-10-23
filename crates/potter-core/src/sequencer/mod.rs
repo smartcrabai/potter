@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    color::linear_to_srgb_f32,
     error::{ErrorCode, PotError, Result},
     media::AudioBuffer,
 };
@@ -315,6 +314,7 @@ impl StripModifier {
     }
 }
 
+/// Float RGBA with associated RGB; RGB at alpha zero is retained as additive radiance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RgbaFrame {
     pub width: u32,
@@ -399,34 +399,49 @@ pub fn blend_frames(
         .zip(&second.pixels)
         .map(|(destination, source)| {
             let source_alpha = source[3] * opacity;
-            let mut result = [0.0; 4];
-            if blend_type == StripBlendType::AlphaOver {
-                let output_alpha = source_alpha + destination[3] * (1.0 - source_alpha);
-                result[3] = output_alpha;
-                if output_alpha > 0.0 {
-                    for channel in 0..3 {
-                        result[channel] = (source[channel] * source_alpha
-                            + destination[channel] * destination[3] * (1.0 - source_alpha))
-                            / output_alpha;
-                    }
+            match blend_type {
+                StripBlendType::AlphaOver => {
+                    let destination_factor = 1.0 - source_alpha;
+                    [
+                        source[0] * opacity + destination[0] * destination_factor,
+                        source[1] * opacity + destination[1] * destination_factor,
+                        source[2] * opacity + destination[2] * destination_factor,
+                        source_alpha + destination[3] * destination_factor,
+                    ]
                 }
-            } else if blend_type == StripBlendType::Replace {
-                for channel in 0..4 {
-                    result[channel] = lerp(destination[channel], source[channel], opacity);
+                StripBlendType::Replace => std::array::from_fn(|channel| {
+                    lerp(destination[channel], source[channel], opacity)
+                }),
+                // Blender's float Add/Sub/Mul helpers gate on the factor-scaled alpha, but use the
+                // source's already-associated RGB values directly.
+                StripBlendType::Add if source_alpha != 0.0 => [
+                    destination[0] + source[0] * destination[3],
+                    destination[1] + source[1] * destination[3],
+                    destination[2] + source[2] * destination[3],
+                    destination[3],
+                ],
+                StripBlendType::Subtract if source_alpha != 0.0 => [
+                    (destination[0] - source[0] * destination[3]).max(0.0),
+                    (destination[1] - source[1] * destination[3]).max(0.0),
+                    (destination[2] - source[2] * destination[3]).max(0.0),
+                    destination[3],
+                ],
+                StripBlendType::Multiply if source_alpha != 0.0 => {
+                    let source_factor = 1.0 - source_alpha;
+                    [
+                        source_factor * destination[0]
+                            + destination[0] * source[0] * destination[3],
+                        source_factor * destination[1]
+                            + destination[1] * source[1] * destination[3],
+                        source_factor * destination[2]
+                            + destination[2] * source[2] * destination[3],
+                        destination[3],
+                    ]
                 }
-            } else {
-                for channel in 0..3 {
-                    let blended = match blend_type {
-                        StripBlendType::Subtract => destination[channel] - source[channel],
-                        StripBlendType::Multiply => destination[channel] * source[channel],
-                        StripBlendType::Add => destination[channel] + source[channel],
-                        StripBlendType::Replace | StripBlendType::AlphaOver => destination[channel],
-                    };
-                    result[channel] = lerp(destination[channel], blended, source_alpha);
+                StripBlendType::Add | StripBlendType::Subtract | StripBlendType::Multiply => {
+                    *destination
                 }
-                result[3] = source_alpha + destination[3] * (1.0 - source_alpha);
             }
-            result
         })
         .collect();
     RgbaFrame::new(first.width, first.height, pixels)
@@ -624,11 +639,9 @@ pub fn gaussian_blur(frame: RgbaFrame, radius: u32) -> Result<RgbaFrame> {
                     .saturating_sub(radius)
                     .min(width - 1);
                 let source = frame.pixels[y * width + sample_x];
-                let alpha = f64::from(source[3]);
-                for channel in 0..3 {
-                    sum[channel] += f64::from(source[channel]) * alpha * weight;
+                for channel in 0..4 {
+                    sum[channel] += f64::from(source[channel]) * weight;
                 }
-                sum[3] += alpha * weight;
             }
             horizontal[y * width + x] = sum;
         }
@@ -648,11 +661,8 @@ pub fn gaussian_blur(frame: RgbaFrame, radius: u32) -> Result<RgbaFrame> {
                 }
             }
             let destination = &mut pixels[y * width + x];
-            destination[3] = sum[3] as f32;
-            if sum[3] > 0.0 {
-                for channel in 0..3 {
-                    destination[channel] = (sum[channel] / sum[3]) as f32;
-                }
+            for channel in 0..4 {
+                destination[channel] = sum[channel] as f32;
             }
         }
     }
@@ -676,18 +686,13 @@ pub fn apply_glow(frame: &RgbaFrame, settings: GlowSettings) -> Result<RgbaFrame
         .pixels
         .iter()
         .map(|pixel| {
-            let brightness = pixel[0].max(pixel[1]).max(pixel[2]);
-            let factor = if brightness > settings.threshold && brightness > 0.0 {
-                (brightness - settings.threshold) / brightness
+            let intensity = pixel[0] + pixel[1] + pixel[2] - settings.threshold;
+            if intensity > 0.0 {
+                let factor = settings.intensity * intensity;
+                std::array::from_fn(|channel| (pixel[channel] * factor).min(1.0))
             } else {
-                0.0
-            };
-            [
-                pixel[0] * factor,
-                pixel[1] * factor,
-                pixel[2] * factor,
-                pixel[3] * factor,
-            ]
+                [0.0; 4]
+            }
         })
         .collect();
     let bright = RgbaFrame::new(frame.width, frame.height, bright_pixels)?;
@@ -696,14 +701,7 @@ pub fn apply_glow(frame: &RgbaFrame, settings: GlowSettings) -> Result<RgbaFrame
         .pixels
         .iter()
         .zip(glow.pixels)
-        .map(|(base, glow)| {
-            [
-                base[0] + glow[0] * settings.intensity,
-                base[1] + glow[1] * settings.intensity,
-                base[2] + glow[2] * settings.intensity,
-                base[3],
-            ]
-        })
+        .map(|(base, glow)| std::array::from_fn(|channel| (base[channel] + glow[channel]).min(1.0)))
         .collect();
     RgbaFrame::new(frame.width, frame.height, pixels)
 }
@@ -778,25 +776,32 @@ fn gamma_cross(first: &RgbaFrame, second: &RgbaFrame, factor: f64) -> Result<Rgb
         .pixels
         .iter()
         .zip(&second.pixels)
-        .map(|(a, b)| {
-            let mut pixel = [0.0; 4];
-            for channel in 0..3 {
-                let first_linear = srgb_to_linear(a[channel]);
-                let second_linear = srgb_to_linear(b[channel]);
-                pixel[channel] = linear_to_srgb_f32(lerp(first_linear, second_linear, amount));
-            }
-            pixel[3] = lerp(a[3], b[3], amount);
-            pixel
+        .map(|(first, second)| {
+            std::array::from_fn(|channel| {
+                gamma_correct(lerp(
+                    inverse_gamma_correct(first[channel]),
+                    inverse_gamma_correct(second[channel]),
+                    amount,
+                ))
+            })
         })
         .collect();
     RgbaFrame::new(first.width, first.height, pixels)
 }
 
-fn srgb_to_linear(value: f32) -> f32 {
-    if value <= 0.04045 {
-        value / 12.92
+fn gamma_correct(value: f32) -> f32 {
+    if value < 0.0 {
+        -(value * value)
     } else {
-        ((value + 0.055) / 1.055).powf(2.4)
+        value * value
+    }
+}
+
+fn inverse_gamma_correct(value: f32) -> f32 {
+    if value < 0.0 {
+        -(-value).sqrt()
+    } else {
+        value.sqrt()
     }
 }
 
@@ -1204,14 +1209,14 @@ mod tests {
     #[test]
     fn alpha_over_composites_using_source_alpha_and_strip_opacity() {
         let base = RgbaFrame::new(1, 1, vec![[0.2, 0.4, 0.6, 1.0]]).unwrap();
-        let overlay = RgbaFrame::new(1, 1, vec![[1.0, 0.0, 0.0, 0.5]]).unwrap();
+        let overlay = RgbaFrame::new(1, 1, vec![[0.5, 0.0, 0.0, 0.5]]).unwrap();
         let mixed = blend_frames(&base, &overlay, StripBlendType::AlphaOver, 0.5).unwrap();
         assert_pixel_close(mixed.pixels[0], [0.4, 0.3, 0.45, 1.0]);
     }
 
     #[test]
     fn strip_modifiers_apply_brightness_balance_and_curve() {
-        let frame = RgbaFrame::new(1, 1, vec![[0.25, 0.5, 0.75, 0.4]]).unwrap();
+        let frame = RgbaFrame::new(1, 1, vec![[0.1, 0.2, 0.3, 0.4]]).unwrap();
         let modifier = StripModifier {
             brightness: 0.25,
             color_balance: [2.0, 1.0, 1.0],
@@ -1219,9 +1224,9 @@ mod tests {
             ..StripModifier::default()
         };
         let adjusted = apply_modifiers(&frame, &[modifier]).unwrap();
-        assert!((adjusted.pixels[0][0] - 0.5).abs() < 1.0e-6);
-        assert!((adjusted.pixels[0][1] - 0.375).abs() < 1.0e-6);
-        assert!((adjusted.pixels[0][2] - 0.5).abs() < 1.0e-6);
+        assert!((adjusted.pixels[0][0] - 0.35).abs() < 1.0e-6);
+        assert!((adjusted.pixels[0][1] - 0.225).abs() < 1.0e-6);
+        assert!((adjusted.pixels[0][2] - 0.275).abs() < 1.0e-6);
         assert_eq!(adjusted.pixels[0][3], 0.4);
     }
 

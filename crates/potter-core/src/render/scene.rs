@@ -914,13 +914,13 @@ pub(super) fn extract_geometry(
                                 _ => match material.alpha_mode.as_str() {
                                     "blend" => AlphaMode::Blend,
                                     "clip" => AlphaMode::Clip,
-                                    // EEVEE dithers a DITHERED graph's transparency; blending its alpha matches the dither's
-                                    // expectation. Potter's raster has no per-sample dither, so the blend stands in for it.
+                                    // Potter keeps the DITHERED graph's expected coverage in the existing opacity/tint
+                                    // model while retaining its separate depth-writing class for camera light shapes.
                                     "opaque"
                                         if matches!(mode, Mode::Beauty)
                                             && material.node_tree.is_some() =>
                                     {
-                                        AlphaMode::Blend
+                                        AlphaMode::Dithered
                                     }
                                     _ => AlphaMode::Opaque,
                                 },

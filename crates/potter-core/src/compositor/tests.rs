@@ -92,6 +92,7 @@ fn raster_passes() -> RasterOutput {
     RasterOutput {
         rgba: vec![0; 4],
         linear_rgba: vec![BASE_PIXEL],
+        linear_rgba_associated: false,
         ids: vec![7],
         depths: vec![4.0],
         elements: vec![11],

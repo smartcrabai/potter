@@ -18,11 +18,14 @@
 //! - a 101×65 perspective point shape through a heterogeneous mesh volume at tile size 16, plus a scaled off-axis spot,
 //!   an orthographic off-centre on-axis spot, a perspective spot whose attenuation varies across its disc, a surviving
 //!   0.002×2 rectangle, and a 0.004-square area light below EEVEE's half-extent cutoff.
-//! - a full-size-4 area rectangle whose outline overlaps the orthographic view but whose 0.1 influence sphere is culled.
+//! - a BLENDED half-pane with a tinted Transparent BSDF on the left half of the frame: Blender draws the point shape
+//!   above the pane's forward-transparency pass, so its radiance matches the pane-free ray. The test writes a real
+//!   Combined+Depth multilayer EXR and checks raw channels at alpha 0, 0.5, and 1, plus a nonzero fractional-alpha
+//!   base-only control, against Blender readback captures.
 //!
-//! The test imports each saved `.blend`, renders it with `pot render --engine realtime`, and compares window means with
-//! committed macOS EEVEE pixel captures. The sun, spots, and opaque-surface tolerances are 0.01; the existing absorber
-//! tolerance remains 0.03 for tile sizes 8 and 1 and the gradient-volume center and edge, with no tolerance change.
+//! The test imports each saved `.blend`, renders it with `pot render --engine realtime`, and compares against committed
+//! macOS EEVEE pixel and transparent-film EXR readback captures. The sun, spots, and opaque-surface tolerances are 0.01;
+//! the existing absorber tolerance remains 0.03 for tile sizes 8 and 1 and the gradient-volume center and edge.
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
 #[path = "common/blender_checked.rs"]
@@ -38,6 +41,7 @@ mod process;
 
 use std::{
     error::Error,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -45,8 +49,8 @@ use native_oracle::{
     TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
     write_script,
 };
-use potter_core::image::{ImageInterpolation, load_image_data, sample};
-use potter_core::model::Image;
+use potter_core::image::{ImageInterpolation, decode_pixels, load_image_data, sample};
+use potter_core::model::{Image, ImageColorspace};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -72,6 +76,16 @@ const EEVEE_AREA_SMALL_SURVIVOR: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/area_small_survivor.f32le");
 const EEVEE_AREA_INFLUENCE_CULLED: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/area_influence_culled.f32le");
+const BLEND_TRANSPARENCY_SCRIPT: &str =
+    include_str!("fixtures/native_oracle/eevee_light_shape_transparency.py");
+const EEVEE_BLEND_CLEAR_EXR: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/light_shape_blend_clear.exr");
+const EEVEE_BLEND_PANE_EXR: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/light_shape_blend_pane.exr");
+const FRACTIONAL_BASE_SCRIPT: &str =
+    include_str!("fixtures/native_oracle/eevee_light_shape_fractional_base.py");
+const EEVEE_BLEND_FRACTIONAL_BASE_EXR: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/light_shape_blend_fractional_base.exr");
 
 struct BoundaryScenes {
     odd_viewport: PathBuf,
@@ -113,6 +127,59 @@ fn generate_boundary_scenes(blender: &Path, root: &Path) -> Result<BoundaryScene
             Path::new("-"),
             Path::new("-"),
             Path::new("-"),
+        ],
+    )?;
+    Ok(scenes)
+}
+
+struct TransparencyScenes {
+    clear: PathBuf,
+    pane: PathBuf,
+}
+
+fn generate_transparency_scenes(
+    blender: &Path,
+    root: &Path,
+) -> Result<TransparencyScenes, Box<dyn Error>> {
+    let script = write_script(
+        root,
+        "eevee_light_shape_transparency.py",
+        BLEND_TRANSPARENCY_SCRIPT,
+    )?;
+    let pane_source = root.join("blend_pane.blend");
+    let scenes = TransparencyScenes {
+        clear: root.join("blend_clear.blend"),
+        pane: root.join("blend_pane_with_fractional_base.blend"),
+    };
+    let unused_clear = root.join("unused_clear.exr");
+    let unused_pane = root.join("unused_pane.exr");
+    run_blender_arguments(
+        blender,
+        &script,
+        None,
+        &[
+            scenes.clear.as_path(),
+            unused_clear.as_path(),
+            pane_source.as_path(),
+            unused_pane.as_path(),
+            Path::new("0"),
+        ],
+    )?;
+    let base_script = write_script(
+        root,
+        "eevee_light_shape_fractional_base.py",
+        FRACTIONAL_BASE_SCRIPT,
+    )?;
+    let unused_base = root.join("unused_fractional_base.exr");
+    run_blender_arguments(
+        blender,
+        &base_script,
+        None,
+        &[
+            pane_source.as_path(),
+            scenes.pane.as_path(),
+            unused_base.as_path(),
+            Path::new("0"),
         ],
     )?;
     Ok(scenes)
@@ -267,6 +334,67 @@ fn render_realtime_at(
     )?;
     assert_eq!(loaded["ok"], true, "{loaded}");
     Ok(project)
+}
+
+fn decode_exr_pixels(bytes: &[u8], label: &str) -> TestResult<Vec<[f64; 4]>> {
+    assert_eq!(
+        bytes.get(..4),
+        Some(&[0x76, 0x2f, 0x31, 0x01][..]),
+        "{label} is not an OpenEXR file"
+    );
+    let (width, height, pixels) = decode_pixels(bytes, ImageColorspace::Linear)?;
+    assert_eq!((width, height), (RESOLUTION, RESOLUTION));
+    Ok(pixels)
+}
+
+fn decode_multilayer_exr(bytes: &[u8], label: &str) -> TestResult<Vec<[f64; 4]>> {
+    for layer in ["Combined", "Depth"] {
+        assert!(
+            bytes
+                .windows(layer.len())
+                .any(|window| window == layer.as_bytes()),
+            "{label} EXR is missing its `{layer}` layer",
+        );
+    }
+    decode_exr_pixels(bytes, label)
+}
+
+fn render_multilayer_realtime(
+    blender: &Path,
+    root: &Path,
+    name: &str,
+    blend: &Path,
+) -> TestResult<Vec<[f64; 4]>> {
+    let (project, _) = import_blend(blender, root, name, blend)?;
+    let scene = read_scene(&project)?;
+    let active = scene["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?
+        .to_owned();
+    let applied = apply_operations(
+        &project,
+        root,
+        json!([
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": 64, "seed": 0, "film_transparent": true}},
+            {"op": "render.passes_update", "target": {"id": active}, "set": {"passes": ["combined", "z"]}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let frames = root.join(format!("frames_{name}"));
+    let rendered = pot()
+        .arg("render")
+        .arg(&project)
+        .args(["--engine", "realtime", "--format", "exr", "--out"])
+        .arg(&frames)
+        .arg("--json")
+        .output()?;
+    assert!(
+        rendered.status.success(),
+        "realtime multilayer render failed: {}",
+        String::from_utf8_lossy(&rendered.stdout)
+    );
+    let bytes = fs::read(frames.join("frame_0001.exr"))?;
+    decode_multilayer_exr(&bytes, name)
 }
 
 /// Render settings shared with `eevee_light_shapes_extra.py`.
@@ -473,8 +601,182 @@ fn realtime_point_shape_uses_center_plane_depth_for_surface_occlusion() -> TestR
     let actual = window_mean(&project, "point_occluded", centre, centre, WINDOW)?;
     let expected = oracle_window_mean(EEVEE_POINT_OCCLUDED, centre, centre, WINDOW);
     assert!(
+        expected.abs() <= 1.0e-6,
+        "Blender's opaque depth oracle should contain no point-shape radiance, found {expected}"
+    );
+    assert!(
         (actual - expected).abs() <= EMITTER_TOLERANCE,
         "camera-visible point shape at the light center plane: Potter {actual} differs from EEVEE {expected}"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_blended_pane_preserves_camera_shape_radiance_in_multilayer_exr() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let scenes = generate_transparency_scenes(&blender, root.path())?;
+    let native_clear = decode_exr_pixels(EEVEE_BLEND_CLEAR_EXR, "EEVEE pane-free")?;
+    let native_pane = decode_exr_pixels(EEVEE_BLEND_PANE_EXR, "EEVEE BLENDED pane")?;
+    let native_fractional_base = decode_exr_pixels(
+        EEVEE_BLEND_FRACTIONAL_BASE_EXR,
+        "EEVEE fractional-alpha base-only",
+    )?;
+    let clear = render_multilayer_realtime(&blender, root.path(), "blend_clear", &scenes.clear)?;
+    let pane = render_multilayer_realtime(&blender, root.path(), "blend_pane", &scenes.pane)?;
+
+    let pixel = |pixels: &[[f64; 4]], x: usize, y: usize| pixels[y * RESOLUTION as usize + x];
+    let clear_alpha_zero_site = pixel(&native_clear, 30, 32);
+    let native_fractional_site = pixel(&native_pane, 30, 32);
+    let native_alpha_zero_site = pixel(&native_pane, 33, 32);
+    let clear_shape_at_opaque_site = pixel(&native_clear, 25, 32);
+    let native_shape_at_opaque_site = pixel(&native_pane, 25, 32);
+    let native_opaque_base_site = pixel(&native_pane, 52, 32);
+    let native_fractional_base_site = pixel(&native_fractional_base, 52, 12);
+    let native_control_frame_shape_site = pixel(&native_fractional_base, 30, 32);
+    let potter_clear_site = pixel(&clear, 30, 32);
+    let potter_fractional_site = pixel(&pane, 30, 32);
+    let potter_alpha_zero_site = pixel(&pane, 33, 32);
+    let potter_shape_at_opaque_site = pixel(&pane, 25, 32);
+    let potter_opaque_base_site = pixel(&pane, 52, 32);
+    let potter_fractional_base_site = pixel(&pane, 52, 12);
+
+    assert!(clear_alpha_zero_site[3].abs() <= 1.0e-6);
+    assert!(
+        (native_fractional_site[3] - 0.5).abs() <= EMITTER_TOLERANCE,
+        "native pane sample should have alpha 0.5: {}",
+        native_fractional_site[3]
+    );
+    assert!(native_alpha_zero_site[3].abs() <= 1.0e-6);
+    assert!(
+        (native_shape_at_opaque_site[3] - 1.0).abs() <= 1.0e-6,
+        "native opaque backing sample should have alpha 1: {}",
+        native_shape_at_opaque_site[3]
+    );
+    assert!(
+        (native_opaque_base_site[3] - 1.0).abs() <= 1.0e-6,
+        "native opaque base sample should have alpha 1: {}",
+        native_opaque_base_site[3]
+    );
+    for (channel, expected) in [0.25, 0.1, 0.05].into_iter().enumerate() {
+        assert!(
+            (native_opaque_base_site[channel] - expected).abs() <= 1.0e-3,
+            "native opaque base channel {channel} is {}, expected {expected}",
+            native_opaque_base_site[channel]
+        );
+    }
+    assert!(
+        (native_fractional_base_site[3] - 0.5).abs() <= EMITTER_TOLERANCE,
+        "native no-shape control should have alpha 0.5: {}",
+        native_fractional_base_site[3]
+    );
+    for (channel, expected) in [0.125, 0.05, 0.025].into_iter().enumerate() {
+        assert!(
+            (native_fractional_base_site[channel] - expected).abs() <= 1.0e-3,
+            "native no-shape base channel {channel} is {}, expected {expected}",
+            native_fractional_base_site[channel]
+        );
+    }
+    assert!(
+        (native_control_frame_shape_site[3] - 0.5).abs() <= EMITTER_TOLERANCE,
+        "fractional-base control frame should retain its pane alpha at the emitter: {}",
+        native_control_frame_shape_site[3]
+    );
+    for channel in 0..3 {
+        assert!(
+            native_control_frame_shape_site[channel] > 0.01
+                && (native_control_frame_shape_site[channel] - native_fractional_site[channel])
+                    .abs()
+                    <= EMITTER_TOLERANCE,
+            "fractional-base control frame lost the camera-visible shape on channel {channel}"
+        );
+    }
+    for channel in 0..3 {
+        for (label, sample) in [
+            ("fractional-alpha pane", native_fractional_site),
+            ("alpha-zero pane", native_alpha_zero_site),
+            ("opaque backing", native_shape_at_opaque_site),
+        ] {
+            assert!(
+                sample[channel] > 0.01,
+                "native EXR lost {label} camera-shape radiance on channel {channel}"
+            );
+        }
+        assert!(
+            (native_fractional_site[channel] - clear_alpha_zero_site[channel]).abs()
+                <= EMITTER_TOLERANCE,
+            "Blender tinted the light shape through its BLENDED pane on channel {channel}"
+        );
+        assert!(
+            (native_shape_at_opaque_site[channel] - clear_shape_at_opaque_site[channel]).abs()
+                <= EMITTER_TOLERANCE,
+            "opaque backing changed additive camera-shape radiance on channel {channel}"
+        );
+    }
+    for (label, expected, actual) in [
+        (
+            "pane-free alpha zero",
+            clear_alpha_zero_site,
+            potter_clear_site,
+        ),
+        (
+            "BLENDED pane alpha 0.5",
+            native_fractional_site,
+            potter_fractional_site,
+        ),
+        (
+            "BLENDED pane alpha zero",
+            native_alpha_zero_site,
+            potter_alpha_zero_site,
+        ),
+        (
+            "opaque alpha-one light shape",
+            native_shape_at_opaque_site,
+            potter_shape_at_opaque_site,
+        ),
+        (
+            "opaque alpha-one base",
+            native_opaque_base_site,
+            potter_opaque_base_site,
+        ),
+        (
+            "fractional-alpha base-only",
+            native_fractional_base_site,
+            potter_fractional_base_site,
+        ),
+    ] {
+        for channel in 0..4 {
+            assert!(
+                (actual[channel] - expected[channel]).abs() <= EMITTER_TOLERANCE,
+                "{label} raw Combined channel {channel}: Potter stored {}, EEVEE stored {}",
+                actual[channel],
+                expected[channel]
+            );
+        }
+    }
+    assert!(
+        (potter_fractional_site[3] - 0.5).abs() <= EMITTER_TOLERANCE,
+        "Potter pane sample should retain alpha 0.5: {}",
+        potter_fractional_site[3]
+    );
+    assert!(
+        potter_alpha_zero_site[3].abs() <= 1.0e-6,
+        "Potter alpha-zero sample should remain transparent: {}",
+        potter_alpha_zero_site[3]
+    );
+    assert!(
+        (potter_fractional_base_site[3] - 0.5).abs() <= EMITTER_TOLERANCE,
+        "Potter no-shape control should retain alpha 0.5: {}",
+        potter_fractional_base_site[3]
+    );
+    assert!(
+        (potter_shape_at_opaque_site[3] - 1.0).abs() <= 1.0e-6
+            && (potter_opaque_base_site[3] - 1.0).abs() <= 1.0e-6,
+        "Potter opaque samples should retain alpha 1: shape {}, base {}",
+        potter_shape_at_opaque_site[3],
+        potter_opaque_base_site[3]
     );
     Ok(())
 }

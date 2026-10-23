@@ -3439,7 +3439,7 @@ fn build_imported_graph(
             color_management: parse_color_management(item.get("color_management"))?,
             markers,
             rigid_body_world,
-            sequencer: parse_sequencer(item, &mut mappings)?,
+            sequencer: parse_sequencer(item, &scene_ids, &mut mappings)?,
             // Active Movie Clip is mapped by the adapter pass that maps tracking data.
             active_clip: None,
         };
@@ -5792,6 +5792,7 @@ fn parse_force_field(value: &Value) -> ForceField {
 }
 fn parse_sequencer(
     scene: &Value,
+    scene_ids: &BTreeMap<String, Id>,
     mappings: &mut BTreeMap<String, String>,
 ) -> Result<crate::sequencer::Sequencer> {
     let Some(raw) = scene.get("sequencer").filter(|value| !value.is_null()) else {
@@ -5902,6 +5903,24 @@ fn parse_sequencer(
                 .collect();
             let color =
                 vec4_field(strip, "color", [0.0, 0.0, 0.0, 1.0]).map(|component| component as f32);
+            let source = strip
+                .get("source")
+                .and_then(Value::as_str)
+                .map(|source| {
+                    if strip.get("type").and_then(Value::as_str) == Some("scene") {
+                        scene_ids
+                            .get(source)
+                            .map(|scene_id| scene_id.as_str().to_owned())
+                            .ok_or_else(|| {
+                                invalid_intermediate(
+                                    "sequencer Scene strip references an unknown scene",
+                                )
+                            })
+                    } else {
+                        Ok(source.to_owned())
+                    }
+                })
+                .transpose()?;
             Ok(SequenceStrip {
                 id,
                 name: name.to_owned(),
@@ -5920,10 +5939,7 @@ fn parse_sequencer(
                 sound_volume: number_field(strip, "sound_volume", 1.0),
                 sound_pan: number_field(strip, "sound_pan", 0.0),
                 sound_pitch: number_field(strip, "sound_pitch", 1.0),
-                source: strip
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                source,
                 color,
                 text: strip.get("text").and_then(Value::as_str).map(str::to_owned),
                 transition,

@@ -2877,9 +2877,10 @@ def _sequencer_dump(scene):
             "GLOW": "glow", "GAUSSIAN_BLUR": "gaussian_blur",
         }.get(kind)
         color = list(plain(getattr(strip, "color", (0.0, 0.0, 0.0, 1.0))))
-        if len(color) != 4:
+        if len(color) == 3:
+            color.append(1.0)
+        elif len(color) != 4:
             color = [0.0, 0.0, 0.0, 1.0]
-        retiming = []
         for key in getattr(strip, "retiming_keys", ()):
             retiming.append({"frame": float(getattr(key, "timeline_frame", 0.0)),
                              "source_frame": float(getattr(key, "source_frame", 0.0))})
@@ -7279,7 +7280,10 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                 if hasattr(strip, "pitch"):
                     strip.pitch = float(source.get("sound_pitch", 1.0))
                 if hasattr(strip, "color"):
-                    strip.color = source.get("color", (0.0, 0.0, 0.0, 1.0))
+                    color = source.get("color", (0.0, 0.0, 0.0, 1.0))
+                    if kind == "color" and len(color) == 4:
+                        color = color[:3]
+                    strip.color = color
                 if hasattr(strip, "text"):
                     strip.text = source.get("text") or ""
                 created[source.get("id")] = strip

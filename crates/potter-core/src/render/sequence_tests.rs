@@ -178,7 +178,7 @@ fn color_text_image_image_sequence_and_meta_strips_render_numeric_pixels()
         ..strip("title", StripType::Text, 1)
     }]);
     let text = render(&doc, &scene, directory.path(), 1.0, 5, 7)?;
-    assert_pixel(text.pixels[1], [0.8, 0.4, 0.2, 0.75]);
+    assert_pixel(text.pixels[1], [0.6, 0.3, 0.15, 0.75]);
     assert_pixel(text.pixels[0], [0.0, 0.0, 0.0, 0.0]);
 
     write_red_png(&directory.path().join("still.png"))?;
@@ -555,24 +555,31 @@ fn unsupported_movie_and_unresolved_scene_strips_report_errors() -> Result<(), B
     Ok(())
 }
 
-/// Potter's EXR writer stores associated alpha, as Blender's `OpenEXR` path does (`openexr_api.cpp`): a straight colour
-/// `[0.8, 0.4, 0.2]` with alpha 0.5 is stored as `[0.4, 0.2, 0.1, 0.5]`. Reloading the file gives the stored values
-/// (premultiplied), and `straight_pixels` returns the straight colour again. The Blender side of this file is the
-/// `exr32` premultiplied oracle in `tests/fixtures/alpha_texture` with texels `potter` (`generate_alpha_oracle.py`).
+/// Potter's VSE `RgbaFrame` pixels are associated RGBA; the EXR writer stores them directly as Blender does. Reloading
+/// the file gives the stored premultiplied channels, and `straight_pixels` recovers straight colour for nonzero alpha.
+/// The Blender side uses the `exr32` premultiplied oracle in `tests/fixtures/alpha_texture`.
 #[test]
-fn potter_exr_writer_stores_associated_alpha_and_reloads_the_straight_colour()
+fn potter_exr_writer_preserves_associated_alpha_and_alpha_zero_radiance()
 -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    let path = directory.path().join("alpha_half.exr");
-    super::write_exr(&path, &[[0.8, 0.4, 0.2, 0.5]], 1, 1)?;
+    let path = directory.path().join("alpha_half_and_zero.exr");
+    let associated = [[0.4, 0.2, 0.1, 0.5], [0.75, 0.5, 0.25, 0.0]];
+    super::write_exr(&path, &associated, 2, 1)?;
     let (width, height, stored) =
         crate::image::decode_pixels(&fs::read(&path)?, crate::model::ImageColorspace::Linear)?;
-    assert_eq!((width, height), (1, 1));
-    for (channel, expected) in [0.4, 0.2, 0.1, 0.5].into_iter().enumerate() {
+    assert_eq!((width, height), (2, 1));
+    for (channel, expected) in associated[0].into_iter().enumerate() {
         assert!(
             (stored[0][channel] - expected).abs() < 1.0e-6,
             "stored channel {channel} is {}, expected {expected}",
             stored[0][channel]
+        );
+    }
+    for (channel, expected) in associated[1].into_iter().enumerate() {
+        assert!(
+            (stored[1][channel] - expected).abs() < 1.0e-6,
+            "alpha-zero stored channel {channel} is {}, expected {expected}",
+            stored[1][channel]
         );
     }
     let image = crate::image::ImageData {

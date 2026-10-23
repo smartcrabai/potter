@@ -1392,6 +1392,7 @@ pub(super) fn render(
     let mut output = RasterOutput {
         rgba: allocate(rgba_len, 0_u8, "RGBA image")?,
         linear_rgba: allocate(pixel_count, [0.0_f32; 4], "linear RGBA image")?,
+        linear_rgba_associated: false,
         ids: allocate(pixel_count, 0_u32, "object ID buffer")?,
         depths: allocate(pixel_count, 0.0_f32, "depth buffer")?,
         elements: allocate(pixel_count, 0_u32, "element ID buffer")?,
@@ -1758,7 +1759,7 @@ fn camera_light_spot_pyramid(light: &PointLight, influence_radius_max: f64) -> O
     let transform = light.world_transform;
     let mut x_axis = transform.x_axis.truncate();
     let mut y_axis = transform.y_axis.truncate();
-    let z_axis = transform.z_axis.truncate();
+    let mut z_axis = transform.z_axis.truncate();
     let scale_x = x_axis.length();
     let scale_y = y_axis.length();
     let scale_z = z_axis.length();

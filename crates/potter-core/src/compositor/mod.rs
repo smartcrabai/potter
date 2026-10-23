@@ -46,18 +46,27 @@ pub(crate) fn apply(
                 "scene compositor reference must identify a compositor node group",
             ));
         }
-        let base = Image {
+        let associated = output.linear_rgba_associated;
+        let mut base = Image {
             width,
             height,
             pixels: output.linear_rgba.clone(),
         };
-        let composite = evaluate_graph(graph, &base, Some(output), doc, frame)?;
+        if associated {
+            unassociate_pixels(&mut base.pixels);
+        }
+        let composite =
+            evaluate_graph_with_association(graph, &base, Some(output), doc, frame, associated)?;
         output.linear_rgba = composite.pixels;
+        if associated {
+            associate_pixels(&mut output.linear_rgba);
+        }
     }
     encode_display(
         &mut output.rgba,
         &output.linear_rgba,
         &scene.color_management,
+        output.linear_rgba_associated,
     )?;
     Ok(())
 }
@@ -68,6 +77,26 @@ pub(crate) fn apply_image(
     doc: &SceneDoc,
     scene: &Scene,
     frame: f64,
+) -> Result<Image> {
+    apply_image_with_association(image, doc, scene, frame, false)
+}
+
+/// Applies the scene compositor to associated float RGBA, preserving additive RGB at alpha zero.
+pub(crate) fn apply_associated_image(
+    image: Image,
+    doc: &SceneDoc,
+    scene: &Scene,
+    frame: f64,
+) -> Result<Image> {
+    apply_image_with_association(image, doc, scene, frame, true)
+}
+
+fn apply_image_with_association(
+    mut image: Image,
+    doc: &SceneDoc,
+    scene: &Scene,
+    frame: f64,
+    associated_alpha: bool,
 ) -> Result<Image> {
     if !scene.use_compositing {
         return Ok(image);
@@ -88,7 +117,15 @@ pub(crate) fn apply_image(
             "scene compositor reference must identify a compositor node group",
         ));
     }
-    evaluate_graph(graph, &image, None, doc, frame)
+    if associated_alpha {
+        unassociate_pixels(&mut image.pixels);
+    }
+    let mut composite =
+        evaluate_graph_with_association(graph, &image, None, doc, frame, associated_alpha)?;
+    if associated_alpha {
+        associate_pixels(&mut composite.pixels);
+    }
+    Ok(composite)
 }
 
 enum NodeOutput {
@@ -102,6 +139,17 @@ fn evaluate_graph(
     passes: Option<&RasterOutput>,
     doc: &SceneDoc,
     frame: f64,
+) -> Result<Image> {
+    evaluate_graph_with_association(graph, base, passes, doc, frame, false)
+}
+
+fn evaluate_graph_with_association(
+    graph: &NodeGroup,
+    base: &Image,
+    passes: Option<&RasterOutput>,
+    doc: &SceneDoc,
+    frame: f64,
+    associated_alpha: bool,
 ) -> Result<Image> {
     let mut pending: BTreeSet<Id> = graph.nodes.keys().cloned().collect();
     let mut rendered: BTreeMap<Id, NodeOutput> = BTreeMap::new();
@@ -154,7 +202,7 @@ fn evaluate_graph(
                     image
                 }
                 "CompositorNodeOutputFile" | "OutputFile" => {
-                    write_file_output(node, &image)?;
+                    write_file_output(node, &image, associated_alpha)?;
                     image
                 }
                 "CompositorNodeMixRGB" | "MixRGB" => mix_images(node, &inputs, base)?,
@@ -853,8 +901,8 @@ pub(crate) fn write_multilayer_exr(
                                 .linear_rgba
                                 .iter()
                                 .map(|pixel| {
-                                    // Associated alpha, as Blender's EXR reader expects: colour times alpha, alpha as is.
-                                    if index < 3 {
+                                    // EEVEE associated RGB before film resolve; path output is straight.
+                                    if index < 3 && !output.linear_rgba_associated {
                                         pixel[index] * pixel[3]
                                     } else {
                                         pixel[index]
@@ -1007,7 +1055,7 @@ fn validate_pass_length<T>(name: &str, values: &[T], expected: usize) -> Result<
     Ok(())
 }
 
-fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
+fn write_file_output(node: &GraphNode, image: &Image, associated_alpha: bool) -> Result<()> {
     let path = property_text(node, &["path", "base_path", "file_path"])?.ok_or_else(|| {
         PotError::invalid_argument("compositor output file node requires a path property")
     })?;
@@ -1022,13 +1070,15 @@ fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
             image.height as usize,
             |x, y| {
                 let pixel = image.pixels[y * image.width as usize + x];
-                // Associated alpha, as Blender's EXR reader expects (the colour is multiplied by alpha).
-                (
-                    pixel[0] * pixel[3],
-                    pixel[1] * pixel[3],
-                    pixel[2] * pixel[3],
-                    pixel[3],
-                )
+                let associated = |channel| {
+                    if associated_alpha && pixel[3] <= 0.0 {
+                        // Additive camera-shape radiance may remain at zero film alpha.
+                        pixel[channel]
+                    } else {
+                        pixel[channel] * pixel[3]
+                    }
+                };
+                (associated(0), associated(1), associated(2), pixel[3])
             },
         )
         .map_err(|error| {
@@ -1070,7 +1120,12 @@ pub(crate) fn encode_display_output(
     output: &mut RasterOutput,
     settings: &ColorManagement,
 ) -> Result<()> {
-    encode_display(&mut output.rgba, &output.linear_rgba, settings)
+    encode_display(
+        &mut output.rgba,
+        &output.linear_rgba,
+        settings,
+        output.linear_rgba_associated,
+    )
 }
 
 /// Applies scene color management and returns the image's display-encoded RGBA8 pixels.
@@ -1082,11 +1137,54 @@ pub(crate) fn encode_image_display(image: &Image, settings: &ColorManagement) ->
         )
     })?;
     let mut bytes = vec![0; length];
-    encode_display(&mut bytes, &image.pixels, settings)?;
+    encode_display(&mut bytes, &image.pixels, settings, false)?;
     Ok(bytes)
 }
 
-fn encode_display(bytes: &mut [u8], pixels: &[[f32; 4]], settings: &ColorManagement) -> Result<()> {
+/// Applies scene color management to associated float RGBA and returns display-encoded pixels.
+pub(crate) fn encode_associated_image_display(
+    image: &Image,
+    settings: &ColorManagement,
+) -> Result<Vec<u8>> {
+    let length = image.pixels.len().checked_mul(4).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "display image dimensions exceed platform limits",
+        )
+    })?;
+    let mut bytes = vec![0; length];
+    encode_display(&mut bytes, &image.pixels, settings, true)?;
+    Ok(bytes)
+}
+
+fn unassociate_pixels(pixels: &mut [[f32; 4]]) {
+    for pixel in pixels {
+        let alpha = pixel[3];
+        if alpha > 0.0 {
+            for channel in &mut pixel[..3] {
+                *channel /= alpha;
+            }
+        }
+    }
+}
+
+fn associate_pixels(pixels: &mut [[f32; 4]]) {
+    for pixel in pixels {
+        let alpha = pixel[3];
+        if alpha > 0.0 {
+            for channel in &mut pixel[..3] {
+                *channel *= alpha;
+            }
+        }
+    }
+}
+
+fn encode_display(
+    bytes: &mut [u8],
+    pixels: &[[f32; 4]],
+    settings: &ColorManagement,
+    associated_alpha: bool,
+) -> Result<()> {
     if bytes.len() != pixels.len().saturating_mul(4) {
         return Err(PotError::new(
             ErrorCode::RenderFailed,
@@ -1102,7 +1200,13 @@ fn encode_display(bytes: &mut [u8], pixels: &[[f32; 4]], settings: &ColorManagem
     }
     let encoder = settings.display_encoder()?;
     for (pixel, linear) in encoded_pixels.iter_mut().zip(pixels) {
-        let display = encoder.encode([linear[0], linear[1], linear[2]])?;
+        let alpha = linear[3];
+        let rgb = if associated_alpha && alpha > 0.0 {
+            [linear[0] / alpha, linear[1] / alpha, linear[2] / alpha]
+        } else {
+            [linear[0], linear[1], linear[2]]
+        };
+        let display = encoder.encode(rgb)?;
         for channel in 0..3 {
             pixel[channel] = (display[channel] * 255.0).round() as u8;
         }

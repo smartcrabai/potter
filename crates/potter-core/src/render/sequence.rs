@@ -13,7 +13,7 @@ use crate::{
     hash,
     image::{ImageData, ImageInterpolation, sample, storage},
     media::{AudioBuffer, decode_wav, encode_flac, encode_wav},
-    model::{Id, ImageColorspace, Scene, SceneDoc},
+    model::{Id, Scene, SceneDoc},
     sequencer::{
         AudioTrack, EffectType, RgbaFrame, Strip, StripType, apply_blend_effect, apply_effect,
         apply_modifiers, blend_frames, mix_audio, transition,
@@ -191,7 +191,10 @@ pub fn render_sequence(
                 )?;
                 if format == "png" {
                     let image = CompositorImage::new(width, height, composed.pixels)?;
-                    let rgba = compositor::encode_image_display(&image, &scene.color_management)?;
+                    let rgba = compositor::encode_associated_image_display(
+                        &image,
+                        &scene.color_management,
+                    )?;
                     let bytes = encode_png(&rgba, width, height)?;
                     fs::write(&staged_image, bytes).map_err(|error| PotError::io(&error))?;
                 } else {
@@ -533,6 +536,16 @@ fn validate_vse_exr_passes(passes: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn associate_straight_frame(mut frame: RgbaFrame) -> Result<RgbaFrame> {
+    for pixel in &mut frame.pixels {
+        let alpha = pixel[3];
+        for channel in &mut pixel[..3] {
+            *channel *= alpha;
+        }
+    }
+    RgbaFrame::new(frame.width, frame.height, frame.pixels)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "VSE output depends on resolved scene, render, and output settings"
@@ -624,7 +637,7 @@ fn render_vse_frame(
         }
     }
     let input = CompositorImage::new(width, height, composite.pixels)?;
-    let output = compositor::apply_image(input, doc, scene, frame)?;
+    let output = compositor::apply_associated_image(input, doc, scene, frame)?;
     RgbaFrame::new(output.width, output.height, output.pixels)
 }
 
@@ -784,7 +797,13 @@ fn render_strip_content(
                 seed,
             )?;
             push_new_warnings(warnings, strip_warnings);
-            Some(RgbaFrame::new(width, height, raster.linear_rgba)?)
+            let associated_alpha = raster.linear_rgba_associated;
+            let pixels = RgbaFrame::new(width, height, raster.linear_rgba)?;
+            Some(if associated_alpha {
+                pixels
+            } else {
+                associate_straight_frame(pixels)?
+            })
         }
         StripType::Color => {
             let width_usize = usize::try_from(width).map_err(|_| {
@@ -802,7 +821,8 @@ fn render_strip_content(
             let count = width_usize.checked_mul(height_usize).ok_or_else(|| {
                 PotError::new(ErrorCode::LimitExceeded, "render dimensions overflow")
             })?;
-            Some(RgbaFrame::new(width, height, vec![strip.color; count])?)
+            let pixels = RgbaFrame::new(width, height, vec![strip.color; count])?;
+            Some(associate_straight_frame(pixels)?)
         }
         StripType::Text => {
             let text = strip.text.as_deref().ok_or_else(|| {
@@ -812,7 +832,12 @@ fn render_strip_content(
                     json!({"strip_id":strip.id}),
                 )
             })?;
-            Some(render_text_frame(text, strip.color, width, height)?)
+            Some(associate_straight_frame(render_text_frame(
+                text,
+                strip.color,
+                width,
+                height,
+            )?)?)
         }
         StripType::Meta => Some(compose_meta_frame(
             doc,
@@ -1122,8 +1147,8 @@ fn load_strip_image(
     }
     let path = resolve_image_sequence_path(root, source, source_frame)?;
     let bytes = fs::read(&path).map_err(|error| PotError::io(&error))?;
-    let (image_width, image_height, pixels) =
-        storage::decode_pixels(&bytes, ImageColorspace::Srgb)?;
+    let (colorspace, image_width, image_height, pixels) =
+        storage::decode_pixels_with_default_colorspace(&bytes, None)?;
     let data = ImageData {
         colour: crate::image::ColourCache::default(),
         storage: crate::image::ImageStorage {
@@ -1133,7 +1158,7 @@ fn load_strip_image(
         },
         width: image_width,
         height: image_height,
-        srgb: storage::decodes_srgb(ImageColorspace::Srgb),
+        srgb: storage::decodes_srgb(colorspace),
         udim: false,
         pixels,
         tiles: std::collections::BTreeMap::new(),
@@ -1148,28 +1173,18 @@ fn resize_image_data(data: &ImageData, width: u32, height: u32) -> Result<RgbaFr
             "image strip source and output dimensions must be non-zero",
         ));
     }
-    // Resizing samples straight colour. A straight or data image is sampled as stored, so it is not copied. A
-    // premultiplied image is unpremultiplied into a new buffer, which the temporary image owns.
-    match data.straight_pixels() {
-        std::borrow::Cow::Borrowed(_) => resample_image(data, width, height),
-        std::borrow::Cow::Owned(pixels) => {
-            let straight = ImageData {
-                width: data.width,
-                height: data.height,
-                pixels,
-                tiles: std::collections::BTreeMap::new(),
-                interpolation: data.interpolation,
-                srgb: data.srgb,
-                udim: data.udim,
-                colour: crate::image::ColourCache::default(),
-                storage: crate::image::ImageStorage::default(),
-            };
-            resample_image(&straight, width, height)
-        }
-    }
+    // Straight inputs are associated after sampling; premultiplied inputs stay in their stored form,
+    // including RGB at alpha zero.
+    let associate = data.storage.straight_alpha && !data.storage.ignore_alpha;
+    resample_image(data, width, height, associate)
 }
 
-fn resample_image(source: &ImageData, width: u32, height: u32) -> Result<RgbaFrame> {
+fn resample_image(
+    source: &ImageData,
+    width: u32,
+    height: u32,
+    associate: bool,
+) -> Result<RgbaFrame> {
     let count = usize::try_from(width)
         .ok()
         .and_then(|width| {
@@ -1194,11 +1209,24 @@ fn resample_image(source: &ImageData, width: u32, height: u32) -> Result<RgbaFra
                 ],
                 false,
             );
+            let alpha = sampled[3];
             pixels.push([
-                finite_f64_to_f32(sampled[0])?,
-                finite_f64_to_f32(sampled[1])?,
-                finite_f64_to_f32(sampled[2])?,
-                finite_f64_to_f32(sampled[3])?,
+                finite_f64_to_f32(if associate {
+                    sampled[0] * alpha
+                } else {
+                    sampled[0]
+                })?,
+                finite_f64_to_f32(if associate {
+                    sampled[1] * alpha
+                } else {
+                    sampled[1]
+                })?,
+                finite_f64_to_f32(if associate {
+                    sampled[2] * alpha
+                } else {
+                    sampled[2]
+                })?,
+                finite_f64_to_f32(alpha)?,
             ]);
         }
     }
@@ -1518,14 +1546,8 @@ fn write_exr(path: &Path, rgba: &[[f32; 4]], width: u32, height: u32) -> Result<
     }
     exr::prelude::write_rgba_file(path, width_usize, height_usize, |x, y| {
         let pixel = rgba[y * width_usize + x];
-        // EXR stores associated alpha: Blender reads an EXR as premultiplied (its default `alpha_mode` for a file
-        // without `oiio:UnassociatedAlpha`), so the colour is multiplied by alpha, as its OpenEXR writer expects.
-        (
-            pixel[0] * pixel[3],
-            pixel[1] * pixel[3],
-            pixel[2] * pixel[3],
-            pixel[3],
-        )
+        // The VSE frame is associated; alpha-zero RGB can contain additive camera-shape radiance.
+        (pixel[0], pixel[1], pixel[2], pixel[3])
     })
     .map_err(|error| {
         PotError::new(

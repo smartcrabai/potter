@@ -239,6 +239,7 @@ pub(crate) enum Mode {
 pub(crate) enum AlphaMode {
     Opaque,
     Blend,
+    Dithered,
     Clip,
 }
 #[derive(Debug, Clone)]
@@ -459,6 +460,8 @@ pub(crate) struct Line {
 pub(crate) struct RasterOutput {
     pub(crate) rgba: Vec<u8>,
     pub(crate) linear_rgba: Vec<[f32; 4]>,
+    /// Whether `linear_rgba` stores associated RGB with additive camera-shape radiance.
+    pub(crate) linear_rgba_associated: bool,
     pub(crate) ids: Vec<u32>,
     pub(crate) depths: Vec<f32>,
     pub(crate) elements: Vec<u32>,
@@ -856,6 +859,7 @@ fn rasterize_with_samples_for_eye(
         linear_color_to_f32(background_linear),
         "linear RGBA image",
     )?;
+    let linear_rgba_associated = matches!(mode, Mode::Beauty);
     let mut ids = allocate_filled(pixel_count, 0_u32, "object ID buffer")?;
     let mut depths = allocate_filled(pixel_count, 0_f32, "depth buffer")?;
     let mut elements = allocate_filled(pixel_count, 0_u32, "element ID buffer")?;
@@ -943,6 +947,9 @@ fn rasterize_with_samples_for_eye(
 
             if matches!(mode, Mode::Solid | Mode::Beauty | Mode::Wire) {
                 let mut average = [0.0_f64; 4];
+                let display_average_needed = film.is_none();
+                let associated_average_needed = linear_rgba_associated && display_average_needed;
+                let mut average_associated = [0.0_f64; 4];
                 for sample_index in 0..samples {
                     // Without a film the pixel keeps its own pattern, whose first sample is the centre. A film sample is
                     // jittered over its pixel, the first included, as EEVEE jitters every sample (`pixel_jitter_get`).
@@ -976,19 +983,19 @@ fn rasterize_with_samples_for_eye(
                         };
                         (ray, hit)
                     };
-                    let sample_color = if matches!(mode, Mode::Wire) {
-                        sample_hit.map_or(background_linear, |visible_hit| {
+                    let (sample_color, sample_linear) = if matches!(mode, Mode::Wire) {
+                        let color = sample_hit.map_or(background_linear, |visible_hit| {
                             let triangle = &prepared[visible_hit.triangle_index];
                             if is_wire_edge(triangle, visible_hit.hit, &frame, width, height) {
                                 triangle.source.color
                             } else {
                                 background_linear
                             }
-                        })
+                        });
+                        (color, color)
                     } else if let Some(sample_ray) = sample_ray {
-                        // The composite walks every surface along the ray, nearest first. A transparent pane that only
-                        // tints sits in front of an opaque surface and is not the opacity hit, so the opacity hit alone
-                        // cannot decide the colour: an opaque front layer ends the walk inside `composite_layers`.
+                        // Camera shapes are drawn after the forward blend pass, so their surface depth comes from the
+                        // opaque/DITHERED geometry rather than BLENDED color or tint.
                         let mut volume_sample = volume_pass
                             .as_deref_mut()
                             .map(|volume_pass| {
@@ -1021,7 +1028,7 @@ fn rasterize_with_samples_for_eye(
                                 lights
                             }
                         });
-                        composite_sample(
+                        let color = composite_sample_with_association(
                             &prepared,
                             &visibility,
                             &mut candidates,
@@ -1034,23 +1041,52 @@ fn rasterize_with_samples_for_eye(
                             sample_hit,
                             camera_light_view,
                             volume_sample.as_mut(),
-                        )?
+                        )?;
+                        (
+                            color.straight,
+                            if linear_rgba_associated {
+                                color.associated
+                            } else {
+                                color.straight
+                            },
+                        )
                     } else {
-                        sample_background(background_linear, world, None)?
+                        let color = sample_background(background_linear, world, None)?;
+                        (
+                            color,
+                            if linear_rgba_associated {
+                                associated_rgba(color)
+                            } else {
+                                color
+                            },
+                        )
                     };
                     let count = f64::from(sample_index + 1);
                     let previous_weight = 1.0 - 1.0 / count;
                     for channel in 0..4 {
-                        average[channel] =
-                            average[channel] * previous_weight + sample_color[channel] / count;
+                        if display_average_needed {
+                            average[channel] =
+                                average[channel] * previous_weight + sample_color[channel] / count;
+                        }
+                        if associated_average_needed {
+                            average_associated[channel] = average_associated[channel]
+                                * previous_weight
+                                + sample_linear[channel] / count;
+                        }
                     }
                     if let Some(film) = film.as_mut() {
-                        film.splat(x, y, sample_x, sample_y, sample_index, sample_color);
+                        film.splat(x, y, sample_x, sample_y, sample_index, sample_linear);
                     }
                 }
-                let color = color_to_srgba(average);
-                rgba[pixel_index * 4..pixel_index * 4 + 4].copy_from_slice(&color);
-                linear_rgba[pixel_index] = linear_color_to_f32(average);
+                if display_average_needed {
+                    let color = color_to_srgba(average);
+                    rgba[pixel_index * 4..pixel_index * 4 + 4].copy_from_slice(&color);
+                    linear_rgba[pixel_index] = linear_color_to_f32(if associated_average_needed {
+                        average_associated
+                    } else {
+                        average
+                    });
+                }
             } else if let Some(visible_hit) = center_hit {
                 let triangle = &prepared[visible_hit.triangle_index];
                 let hit = visible_hit.hit;
@@ -1078,15 +1114,27 @@ fn rasterize_with_samples_for_eye(
 
     if let Some(film) = &film {
         for (pixel_index, (colour, weight)) in film.colour.iter().zip(&film.weight).enumerate() {
-            let average = colour.map(|sum| sum / weight.max(f64::MIN_POSITIVE));
-            rgba[pixel_index * 4..pixel_index * 4 + 4].copy_from_slice(&color_to_srgba(average));
-            linear_rgba[pixel_index] = linear_color_to_f32(average);
+            let associated = colour.map(|sum| sum / weight.max(f64::MIN_POSITIVE));
+            let alpha = associated[3];
+            let display = if alpha > 0.0 {
+                [
+                    associated[0] / alpha,
+                    associated[1] / alpha,
+                    associated[2] / alpha,
+                    alpha,
+                ]
+            } else {
+                associated
+            };
+            rgba[pixel_index * 4..pixel_index * 4 + 4].copy_from_slice(&color_to_srgba(display));
+            linear_rgba[pixel_index] = linear_color_to_f32(associated);
         }
     }
 
     Ok(RasterOutput {
         rgba,
         linear_rgba,
+        linear_rgba_associated,
         ids,
         depths,
         elements,
@@ -1239,7 +1287,11 @@ pub(super) fn rasterize_with_lines(
                 output.rgba[rgba_index..rgba_index + 4].copy_from_slice(&encoded);
                 output.linear_rgba[pixel_index] =
                     if matches!(mode, Mode::Solid | Mode::Beauty | Mode::Wire) {
-                        linear_color_to_f32(color)
+                        linear_color_to_f32(if output.linear_rgba_associated {
+                            associated_rgba(color)
+                        } else {
+                            color
+                        })
                     } else {
                         display_color_to_float(encoded)
                     };
@@ -2161,9 +2213,8 @@ fn sample_offset(seed: u32, x: u32, y: u32, sample_index: u32) -> (f64, f64) {
     (x_offset, y_offset)
 }
 
-/// EEVEE's film reconstruction for realtime Beauty (`eevee_film.cc`): every shaded sample is splatted into the output
-/// pixels whose centres lie within `radius` of it, weighted by `film_filter_weight`, and an output pixel is the weighted
-/// mean of the samples that reached it. `colour` and `weight` are per output pixel.
+/// EEVEE's film reconstruction for realtime Beauty (`eevee_film.cc`): every associated sample is splatted into the output
+/// pixels whose centres lie within `radius` of it, weighted by `film_filter_weight`; `colour` and `weight` are per output pixel.
 struct FilmFilter {
     radius: f64,
     width: usize,
@@ -2171,6 +2222,7 @@ struct FilmFilter {
     /// The column where the right eye starts, in a side-by-side stereo frame. A sample splats only into its own eye's
     /// columns, as each eye has its own film in EEVEE (`ShadingView::update_view` per view).
     eye_split: Option<usize>,
+    /// Weighted associated RGBA sum for each output pixel.
     colour: Vec<[f64; 4]>,
     weight: Vec<f64>,
 }
@@ -2237,15 +2289,15 @@ impl FilmFilter {
         }
     }
 
-    fn accumulate(&mut self, px: usize, py: usize, weight: f64, shaded: [f64; 4]) {
+    fn accumulate(&mut self, px: usize, py: usize, weight: f64, associated: [f64; 4]) {
         let index = py * self.width + px;
-        for (sum, value) in self.colour[index].iter_mut().zip(shaded) {
+        for (sum, value) in self.colour[index].iter_mut().zip(associated) {
             *sum += weight * value;
         }
         self.weight[index] += weight;
     }
 
-    /// Splats the shaded sample of frame `sample_index`, taken at `(sample_x, sample_y)` inside pixel `(x, y)`. Below
+    /// Splats the associated sample of frame `sample_index`, taken at `(sample_x, sample_y)` inside pixel `(x, y)`. Below
     /// `LARGE_FILTER_RADIUS` it reaches the output pixels whose centres lie within the radius. From there on it reaches
     /// EEVEE's 16 table taps (`large_filter_taps`), each weighted from its distance to the sample, with no radius test.
     /// Either way the output stays in the sample's own eye's columns.
@@ -2256,7 +2308,7 @@ impl FilmFilter {
         sample_x: f64,
         sample_y: f64,
         sample_index: u32,
-        shaded: [f64; 4],
+        associated: [f64; 4],
     ) {
         let sample = (f64::from(x) + sample_x, f64::from(y) + sample_y);
         let (lo, hi) = self.eye_columns(x);
@@ -2278,7 +2330,7 @@ impl FilmFilter {
                         continue;
                     }
                     let weight = film_filter_weight(self.radius, distance_squared);
-                    self.accumulate(px as usize, py as usize, weight, shaded);
+                    self.accumulate(px as usize, py as usize, weight, associated);
                 }
             }
         } else {
@@ -2293,7 +2345,7 @@ impl FilmFilter {
                 let distance_squared =
                     (centre.0 - sample.0).powi(2) + (centre.1 - sample.1).powi(2);
                 let weight = film_filter_weight(self.radius, distance_squared);
-                self.accumulate(px as usize, py as usize, weight, shaded);
+                self.accumulate(px as usize, py as usize, weight, associated);
             }
         }
     }
@@ -2377,7 +2429,7 @@ fn mix_sample_hash(mut value: u32) -> u32 {
 fn hit_opacity(triangle: &Triangle, color: [f64; 4]) -> f64 {
     match triangle.alpha_mode {
         AlphaMode::Opaque => 1.0,
-        AlphaMode::Blend => color[3].clamp(0.0, 1.0),
+        AlphaMode::Blend | AlphaMode::Dithered => color[3].clamp(0.0, 1.0),
         AlphaMode::Clip => {
             if color[3] >= triangle.alpha_threshold {
                 1.0
@@ -2485,8 +2537,39 @@ fn composite_sample(
     shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
     camera_lights: Option<super::path::RealtimeCameraLightView<'_, '_>>,
-    mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
+    volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
 ) -> Result<[f64; 4]> {
+    composite_sample_with_association(
+        triangles,
+        visibility,
+        candidates,
+        ray,
+        frame,
+        camera,
+        background,
+        world,
+        shader,
+        cached_hit,
+        camera_lights,
+        volume_sample,
+    )
+    .map(|color| color.straight)
+}
+
+fn composite_sample_with_association(
+    triangles: &[PreparedTriangle],
+    visibility: &super::bvh::Bvh,
+    candidates: &mut Vec<usize>,
+    ray: Ray,
+    frame: &CameraFrame,
+    camera: &Camera,
+    background: [f64; 4],
+    world: Option<WorldRadiance<'_>>,
+    shader: Option<&dyn SurfaceShader>,
+    cached_hit: Option<VisibleHit>,
+    camera_lights: Option<super::path::RealtimeCameraLightView<'_, '_>>,
+    mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
+) -> Result<CompositeColor> {
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
     let mut hit_count = 0;
@@ -2579,12 +2662,15 @@ fn composite_sample(
         };
         premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
         let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
-        let color = if alpha <= f64::MIN_POSITIVE {
+        let straight = if alpha <= f64::MIN_POSITIVE {
             premultiplied + DVec3::from_array(background_rgb)
         } else {
             premultiplied / alpha
         };
-        [color.x, color.y, color.z, alpha]
+        CompositeColor {
+            straight: [straight.x, straight.y, straight.z, alpha],
+            associated: [premultiplied.x, premultiplied.y, premultiplied.z, alpha],
+        }
     } else {
         let layers = hits.iter().take(hit_count).flatten().map(|visible_hit| {
             let triangle = &triangles[visible_hit.triangle_index];
@@ -2595,7 +2681,7 @@ fn composite_sample(
                 tint: visible_hit.transparent_tint,
             }
         });
-        composite_layers_with_background(layers, background[3], || {
+        composite_layers_with_association(layers, background[3], || {
             let background = sample_background(background, world, Some(ray.direction))?;
             Ok([background[0], background[1], background[2]])
         })?
@@ -2624,9 +2710,12 @@ fn composite_sample(
             near_distance,
             &mut volume_sample,
         )?;
-        color[0] += light_radiance.x;
-        color[1] += light_radiance.y;
-        color[2] += light_radiance.z;
+        color.straight[0] += light_radiance.x;
+        color.straight[1] += light_radiance.y;
+        color.straight[2] += light_radiance.z;
+        color.associated[0] += light_radiance.x;
+        color.associated[1] += light_radiance.y;
+        color.associated[2] += light_radiance.z;
     }
     Ok(color)
 }
@@ -2648,8 +2737,26 @@ fn camera_light_event_radiance(
             break;
         }
         let triangle = &triangles[visible_hit.triangle_index];
-        let passed = 1.0 - hit_opacity(&triangle.source, visible_hit.color);
-        surface_transmittance *= DVec3::from_array(visible_hit.transparent_tint) * passed;
+        // EEVEE draws camera shapes after Forward.Transparent; BLENDED fragments do not write depth.
+        match triangle.source.alpha_mode {
+            AlphaMode::Blend => continue,
+            AlphaMode::Opaque => {
+                surface_transmittance = DVec3::ZERO;
+                break;
+            }
+            AlphaMode::Clip => {
+                if hit_opacity(&triangle.source, visible_hit.color) > 0.0 {
+                    surface_transmittance = DVec3::ZERO;
+                    break;
+                }
+            }
+            AlphaMode::Dithered => {
+                // DITHERED hashes use scalar average transmittance, not the RGB tint.
+                let pass = 1.0 - hit_opacity(&triangle.source, visible_hit.color);
+                let tint = visible_hit.transparent_tint.iter().sum::<f64>() / 3.0;
+                surface_transmittance *= DVec3::splat(tint * pass);
+            }
+        }
         if surface_transmittance == DVec3::ZERO {
             break;
         }
@@ -2662,6 +2769,21 @@ fn camera_light_event_radiance(
         None => DVec3::ONE,
     };
     Ok(radiance * surface_transmittance * volume_transmittance)
+}
+/// Both the straight color used by display consumers and its associated Combined render-target value.
+#[derive(Clone, Copy)]
+struct CompositeColor {
+    straight: [f64; 4],
+    associated: [f64; 4],
+}
+
+fn associated_rgba(color: [f64; 4]) -> [f64; 4] {
+    [
+        color[0] * color[3],
+        color[1] * color[3],
+        color[2] * color[3],
+        color[3],
+    ]
 }
 
 /// One surface of a pixel's stack, for `composite_layers`.
@@ -2682,12 +2804,21 @@ struct Layer {
 /// by the mean of its passed transmittance, `mean(tint) * (1 - opacity)` (`eevee_surf_forward.bsl.hh`, `combined_a` is
 /// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
 /// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
-/// scalar composite of the layers. Returns the un-premultiplied colour and that alpha.
+/// scalar composite of the layers. Returns straight display colour and associated Combined RGB.
 fn composite_layers_with_background(
     layers: impl IntoIterator<Item = Layer>,
     background_alpha: f64,
     background_rgb: impl FnOnce() -> Result<[f64; 3]>,
 ) -> Result<[f64; 4]> {
+    composite_layers_with_association(layers, background_alpha, background_rgb)
+        .map(|color| color.straight)
+}
+
+fn composite_layers_with_association(
+    layers: impl IntoIterator<Item = Layer>,
+    background_alpha: f64,
+    background_rgb: impl FnOnce() -> Result<[f64; 3]>,
+) -> Result<CompositeColor> {
     let mut transmittance = DVec3::ONE;
     let mut alpha_transmittance = 1.0;
     let mut premultiplied = DVec3::ZERO;
@@ -2710,16 +2841,21 @@ fn composite_layers_with_background(
     };
     premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
     let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
-    if alpha <= f64::MIN_POSITIVE {
-        return Ok([
+    let straight = if alpha <= f64::MIN_POSITIVE {
+        [
             background_rgb[0],
             background_rgb[1],
             background_rgb[2],
             alpha,
-        ]);
-    }
-    let color = premultiplied / alpha;
-    Ok([color.x, color.y, color.z, alpha])
+        ]
+    } else {
+        let color = premultiplied / alpha;
+        [color.x, color.y, color.z, alpha]
+    };
+    Ok(CompositeColor {
+        straight,
+        associated: [premultiplied.x, premultiplied.y, premultiplied.z, alpha],
+    })
 }
 
 /// Primary-ray triangles. Realtime Beauty leaves out objects hidden from camera rays; the other
