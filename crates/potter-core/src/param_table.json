@@ -409,13 +409,10 @@
         },
         "resource": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
-          "description": "Potter resource ID for the cache filepath."
+          "pattern": "^([a-z][a-z0-9_-]{0,63})?$",
+          "description": "Potter resource ID for the cache filepath. An empty or absent resource disables the modifier, as Blender's MeshCache is_disabled does for an empty filepath."
         }
-      },
-      "required": [
-        "resource"
-      ]
+      }
     },
     "mesh_sequence_cache": {
       "properties": {
@@ -478,16 +475,12 @@
         },
         "resource": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "pattern": "^([a-z][a-z0-9_-]{0,63})?$",
           "description": "Potter resource ID for the cache filepath."
         },
         "frame_offset": {
           "type": "number",
           "default": 0.0
-        },
-        "scale": {
-          "type": "number",
-          "default": 1.0
         },
         "override_frame": {
           "type": [
@@ -495,10 +488,21 @@
             "null"
           ],
           "default": null
+        },
+        "is_sequence": {
+          "type": "boolean",
+          "default": false
+        },
+        "velocity_name": {
+          "type": "string",
+          "default": ".velocities"
+        },
+        "velocity_unit": {
+          "enum": ["SECOND", "FRAME"],
+          "default": "SECOND"
         }
       },
       "required": [
-        "resource",
         "object_path"
       ]
     },

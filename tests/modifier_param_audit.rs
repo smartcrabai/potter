@@ -114,6 +114,7 @@ fn param_table_defaults_match_blender_fixture() {
     let fixture: Value = serde_json::from_str(BLENDER_DEFAULTS).unwrap();
     assert_eq!(fixture["blender_version"], "5.2.2 LTS");
     let exceptions = fixture["exceptions"].as_object().unwrap();
+
     let mut mismatches = Vec::new();
     for modifier in F_MODIFIERS {
         let Some(spec) = table["modifiers"].get(*modifier) else {

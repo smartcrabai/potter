@@ -260,7 +260,7 @@ pub fn value_at<'a>(attribute: &'a Value, key: &str) -> TestResult<&'a Value> {
 /// One corner of a stored `normal_code` layer (`custom_normal.values`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredCorner {
-    /// `null`: Auto, Blender code pair `(0, 0)`.
+    /// `[0, 0]` (or `null` from older output): Auto, Blender's "use the loop's normal space" code.
     Auto,
     /// `[i16, i16]`: an authored, nonzero Blender fan-space code pair.
     Code([i64; 2]),
@@ -293,10 +293,11 @@ fn stored_corner(value: &Value) -> TestResult<StoredCorner> {
         Value::String(name) if name == "explicit_zero" => Ok(StoredCorner::ExplicitZero),
         Value::Array(_) => {
             let code = code_pair(value)?;
-            if code == [0, 0] {
-                return Err(format!("stored pair {value} must be canonicalized to null").into());
-            }
-            Ok(StoredCorner::Code(code))
+            Ok(if code == [0, 0] {
+                StoredCorner::Auto
+            } else {
+                StoredCorner::Code(code)
+            })
         }
         other => Err(format!("unexpected stored corner {other}").into()),
     }

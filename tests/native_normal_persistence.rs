@@ -1081,7 +1081,7 @@ fn nonmanifold_subdivision_auto_codes_match_blenders_evaluated_fan() -> TestResu
                 "source loop {source_loop} matched twice"
             );
             let raw = &source_loops[source_loop]["code"];
-            let expected_code = if raw.is_null() {
+            let expected_code = if raw.is_null() || raw == &json!([0, 0]) {
                 StoredCorner::Auto
             } else {
                 StoredCorner::Code(code_pair(raw)?)

@@ -303,6 +303,11 @@ fn configure_blender_resources(
         if inline_resource_kind(&source)?.is_some() {
             continue;
         }
+        // A packed sequence carries every frame's bytes in `sequence_frames`, so it is kept as imported: no top-level
+        // file is copied and its packed state is not rewritten.
+        if source["packed"] == true && source.get("sequence_frames").is_some() {
+            continue;
+        }
         let original_path = source
             .get("original_path")
             .and_then(Value::as_str)

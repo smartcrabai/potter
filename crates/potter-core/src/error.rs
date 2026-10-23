@@ -129,6 +129,16 @@ impl PotError {
             json!({ "kind": format!("{:?}", error.kind()) }),
         )
     }
+
+    /// An I/O failure on `path`: the message names the path, so `NotFound` says what was missing.
+    #[must_use]
+    pub fn io_at(error: &std::io::Error, path: &std::path::Path) -> Self {
+        Self::with_details(
+            ErrorCode::IoError,
+            format!("{}: {error}", path.display()),
+            json!({ "kind": format!("{:?}", error.kind()), "path": path }),
+        )
+    }
 }
 
 impl std::fmt::Display for PotError {

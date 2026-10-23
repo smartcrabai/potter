@@ -688,22 +688,19 @@ fn prepare_blend_export_resources(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let source_path = resolve_export_resource_path(project, uri);
-        let bytes = if let Some(packed) = resource.get("bytes").and_then(Value::as_array) {
-            let mut bytes = Vec::with_capacity(packed.len());
-            for value in packed {
-                let byte = value
-                    .as_u64()
-                    .filter(|value| *value <= u8::MAX.into())
-                    .and_then(|value| u8::try_from(value).ok())
-                    .ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::SceneInvalid,
-                            "packed resource contains a byte outside 0..255",
-                        )
-                    })?;
-                bytes.push(byte);
+        if let Some(frames) = resource.get("sequence_frames").and_then(Value::as_object) {
+            let first = export_sequence_frame_files(project, &id, frames, &sidecar, &mut files)?;
+            if let Some(resource) = document
+                .get_mut("resources")
+                .and_then(Value::as_object_mut)
+                .and_then(|resources| resources.get_mut(&id))
+            {
+                resource["export_path"] = json!(first);
             }
-            Some(bytes)
+            continue;
+        }
+        let bytes = if let Some(packed) = resource.get("bytes").and_then(Value::as_array) {
+            Some(packed_resource_bytes(packed)?)
         } else if let Some(path) = &source_path {
             match fs::read(path) {
                 Ok(bytes) => Some(bytes),
@@ -1637,6 +1634,136 @@ fn resolve_export_resource_path(project: &Project, uri: &str) -> Option<PathBuf>
     } else {
         project.path().join(path)
     })
+}
+
+/// Decodes a packed resource's inline byte array.
+fn packed_resource_bytes(packed: &[Value]) -> Result<Vec<u8>> {
+    packed
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "packed resource contains a byte outside 0..255",
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Writes a sequence resource's frame files into a folder named for the resource inside the sidecar. The frames keep
+/// their file names, so Blender's `CacheFile` finds the rest of the sequence beside its first frame. Returns that first
+/// frame's path, which becomes the resource's export path.
+fn export_sequence_frame_files(
+    project: &Project,
+    id: &str,
+    frames: &Map<String, Value>,
+    sidecar: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<PathBuf> {
+    let mut ordered = frames
+        .iter()
+        .map(|(key, record)| {
+            key.parse::<i64>()
+                .map(|frame| (frame, record))
+                .map_err(|_| {
+                    PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "sequence frame key is not a frame number",
+                        json!({"resource_id":id,"frame":key}),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_by_key(|(frame, _)| *frame);
+    let folder = sidecar.join(id);
+    fs::create_dir_all(&folder).map_err(|error| PotError::io_at(&error, &folder))?;
+    let mut first = None;
+    for (frame, record) in ordered {
+        let bytes = sequence_frame_bytes(project, id, frame, record)?;
+        let uri = record
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = Path::new(uri)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "sequence frame has no file name",
+                    json!({"resource_id":id,"frame":frame,"uri":uri}),
+                )
+            })?;
+        let destination = folder.join(name);
+        if destination.exists() {
+            if fs::read(&destination).map_err(|error| PotError::io_at(&error, &destination))?
+                != bytes
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::ExportFailed,
+                    "sequence frame file already exists with different content",
+                    json!({"resource_id":id,"frame":frame,"path":destination}),
+                ));
+            }
+        } else {
+            write_asset_sidecar(&destination, &bytes)?;
+        }
+        let absolute = fs::canonicalize(&destination)
+            .map_err(|error| PotError::io_at(&error, &destination))?;
+        first.get_or_insert(absolute);
+        if !files.contains(&destination) {
+            files.push(destination);
+        }
+    }
+    first.ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "sequence resource has no frames",
+            json!({"resource_id":id}),
+        )
+    })
+}
+
+/// The bytes of one sequence frame: its packed bytes, or its file when unpacked, checked against its hash.
+fn sequence_frame_bytes(
+    project: &Project,
+    id: &str,
+    frame: i64,
+    record: &Value,
+) -> Result<Vec<u8>> {
+    let bytes = if let Some(packed) = record.get("bytes").and_then(Value::as_array) {
+        packed_resource_bytes(packed)?
+    } else {
+        let uri = record
+            .get("uri")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = resolve_export_resource_path(project, uri).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::ExportFailed,
+                "sequence frame URI cannot be resolved as a local file",
+                json!({"resource_id":id,"frame":frame,"uri":uri}),
+            )
+        })?;
+        fs::read(&path).map_err(|error| PotError::io_at(&error, &path))?
+    };
+    let digest = crate::hash::sha256(&bytes);
+    if record
+        .get("hash")
+        .and_then(Value::as_str)
+        .is_some_and(|expected| expected != digest)
+    {
+        return Err(PotError::with_details(
+            ErrorCode::ValidationFailed,
+            "sequence frame content does not match its expected hash",
+            json!({"resource_id":id,"frame":frame,"hash":digest}),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn sidecar_destination(
@@ -2770,11 +2897,11 @@ fn write_asset_sidecar(path: &Path, bytes: &[u8]) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| PotError::io(&error))?;
+        .map_err(|error| PotError::io_at(&error, path))?;
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = fs::remove_file(path);
-        return Err(PotError::io(&error));
+        return Err(PotError::io_at(&error, path));
     }
     Ok(())
 }
@@ -6521,6 +6648,42 @@ fn import_blender_resources(
             "source_packed": source_packed,
             "status": status,
         });
+        // A sequence CacheFile names its first frame, and its other frames sit beside it. The sequence is imported as a
+        // packed sequence, as `resource.pack` stores one: every frame's bytes and the inclusive frame range.
+        if kind == "alembic_cache"
+            && source
+                .get("cache_file")
+                .and_then(|cache_file| cache_file.get("is_sequence"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && let Some(path) = &resolved_path
+        {
+            let manifest = crate::cache_sequence::cache_sequence_manifest(path, None)?;
+            if let (Some(start), Some(end)) = (
+                manifest.files.keys().next(),
+                manifest.files.keys().next_back(),
+            ) {
+                let mut frames = Map::new();
+                for (frame, frame_path) in &manifest.files {
+                    let frame_bytes = fs::read(frame_path)
+                        .map_err(|error| PotError::io_at(&error, frame_path))?;
+                    let digest = crate::hash::sha256(&frame_bytes);
+                    frames.insert(
+                        frame.to_string(),
+                        crate::cache_sequence::cache_sequence_resource_record(
+                            &frame_path.to_string_lossy(),
+                            kind,
+                            &digest,
+                            Some(frame_bytes.as_slice()),
+                        ),
+                    );
+                }
+                resource["packed"] = json!(true);
+                resource["sequence_start"] = json!(start);
+                resource["sequence_end"] = json!(end);
+                resource["sequence_frames"] = Value::Object(frames);
+            }
+        }
         if let Some(cache_file) = source.get("cache_file") {
             resource["cache_file"] = cache_file.clone();
         }
@@ -8268,6 +8431,32 @@ fn parse_mesh_sequence_cache_params(
     params.insert("resource".to_owned(), json!(resource));
     params.insert("object_path".to_owned(), json!(object_path));
     insert_cache_settings_params(&mut params, cache_settings);
+    // The Alembic reader takes these from the CacheFile, so they are mirrored onto the modifier.
+    let setting = |name: &str| cache_settings.and_then(|settings| settings.get(name));
+    params.insert(
+        "is_sequence".to_owned(),
+        json!(
+            setting("is_sequence")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        ),
+    );
+    params.insert(
+        "velocity_name".to_owned(),
+        json!(
+            setting("velocity_name")
+                .and_then(Value::as_str)
+                .unwrap_or(".velocities")
+        ),
+    );
+    params.insert(
+        "velocity_unit".to_owned(),
+        json!(
+            setting("velocity_unit")
+                .and_then(Value::as_str)
+                .unwrap_or("SECOND")
+        ),
+    );
     Ok(params)
 }
 
@@ -8282,15 +8471,6 @@ fn insert_cache_settings_params(
                 .and_then(|settings| settings.get("frame_offset"))
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
-        ),
-    );
-    params.insert(
-        "scale".to_owned(),
-        json!(
-            settings
-                .and_then(|settings| settings.get("scale"))
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0)
         ),
     );
     params.insert(
@@ -8432,6 +8612,16 @@ fn parse_transform_cache_params(
     params.insert("resource".to_owned(), json!(resource));
     params.insert("object_path".to_owned(), json!(object_path));
     insert_cache_settings_params(&mut params, settings);
+    // Blender applies CacheFile.scale only through a Transform Cache constraint.
+    params.insert(
+        "scale".to_owned(),
+        json!(
+            settings
+                .and_then(|settings| settings.get("scale"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0)
+        ),
+    );
     Ok(params)
 }
 
@@ -9094,6 +9284,21 @@ fn imported_fisheye_lens(item: &Value) -> Option<f64> {
 
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // Blender's USD CacheFiles are not read: their Mesh Cache and Mesh Sequence Cache modifiers would fail at
+    // evaluation, so the import reports each one (gated by --allow-lossy) instead of packing it as Alembic.
+    for cache in raw
+        .get("unsupported_cache_files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = cache.get("name").and_then(Value::as_str);
+        losses.push(loss(
+            "cache.usd",
+            name,
+            "Blender's USD cache file is not supported; the cache resource is kept but its Mesh Cache and Mesh Sequence Cache modifiers fail at evaluation",
+        ));
+    }
     // The importer maps a Blender Collection pointer to a Potter collection only when the raw `collections` array names it.
     let collection_names: BTreeSet<&str> = raw
         .get("collections")
@@ -10198,6 +10403,17 @@ fn socket_rgb(
 /// they are never a loss. Any other mesh attribute is a loss.
 pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
+    // A USD cache resource has no Blender CacheFile to become: the exporter does not create an Alembic CacheFile
+    // on a USD path, so its modifiers are written without a cache file (a no-op in Blender).
+    for (resource_id, resource) in &doc.resources {
+        if resource.get("kind").and_then(Value::as_str) == Some("usd_cache") {
+            losses.push(loss(
+                "cache.usd",
+                Some(resource_id.as_str()),
+                "USD cache files are not exported; the cache resource is written without a Blender CacheFile, so its modifiers do nothing",
+            ));
+        }
+    }
     for (image_id, image) in &doc.images {
         if image.base_is_missing() {
             losses.push(loss(
@@ -11064,6 +11280,29 @@ fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss
 mod tests {
     #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
     use super::*;
+    #[test]
+    fn usd_cache_resources_export_as_cache_usd_losses() {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        doc.resources.insert(
+            Id::new("usd_cache_id").unwrap(),
+            json!({"kind": "usd_cache", "uri": "/x/a.usdc", "hash": "x", "packed": false}),
+        );
+        let losses = export_losses(&doc);
+        assert!(losses.iter().any(|loss| loss.feature_id == "cache.usd"
+            && loss.data_id.as_deref() == Some("usd_cache_id")));
+    }
+
+    #[test]
+    fn usd_cache_files_import_as_cache_usd_losses() {
+        let raw =
+            json!({"unsupported_cache_files": [{"name": "CacheFile", "filepath": "/x/a.usdc"}]});
+        let losses = import_losses(&raw);
+        assert!(
+            losses.iter().any(|loss| loss.feature_id == "cache.usd"
+                && loss.data_id.as_deref() == Some("CacheFile"))
+        );
+        assert!(import_losses(&json!({})).is_empty());
+    }
 
     #[test]
     fn color_curve_extension_serializes_as_bridge_boolean() -> Result<()> {

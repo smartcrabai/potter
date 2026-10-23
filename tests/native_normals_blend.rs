@@ -195,7 +195,7 @@ fn subdivision_then_displace_keeps_every_corner_normal_as_blender_computes_it() 
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
 
-    // Automatic corners must stay automatic after the topology change: `null`, not frozen codes.
+    // Automatic corners must stay automatic after the topology change: `[0, 0]`, not frozen codes.
     let scene = read_scene(&project)?;
     let mut nulls = 0;
     let mut codes = 0;

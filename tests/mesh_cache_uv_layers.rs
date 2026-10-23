@@ -405,8 +405,8 @@ fn cache_writes_named_layers_past_the_first_and_reports_the_one_without_room() -
     operations.extend(names.iter().map(|name| layer_op("uv.layer_create", name)));
     scene_with_cache(&scene, operations)?;
     let before = evaluate_body(&scene)?;
-    // Without topology reads the mesh keeps its own layers, so the limit applies to the store.
-    apply(&scene, &json!([cache_modifier(&["UV"])]))?;
+    // With polygons read, the cache writes every named layer (Blender's UV-only read writes just one).
+    apply(&scene, &json!([cache_modifier(&["UV", "POLY"])]))?;
     let after = evaluate_body(&scene)?;
 
     let before_layers = layers(&before.store)?;
@@ -476,6 +476,9 @@ fn static_vertex_only_cache_preserves_receiver_faces_and_uv_associations() -> Te
         face.material_index = 1;
         face.vertices.rotate_left(1);
     }
+    // Custom normal rows are keyed by face ID and corner order, and this receiver renumbers and
+    // rotates both. The test checks face connectivity and UV association, so the rows are dropped.
+    receiver.attributes.remove("custom_normal");
     receiver.next_id.face = receiver
         .faces
         .iter()
