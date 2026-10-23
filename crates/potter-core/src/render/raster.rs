@@ -1438,17 +1438,7 @@ struct RasterSampleContext<
     linear_rgba_associated: bool,
 }
 
-impl<'scene, 'light_context, 'lights, 'volume_pass, 'volume_scene, 'pass_borrow, 'borrow>
-    RasterSampleContext<
-        'scene,
-        'light_context,
-        'lights,
-        'volume_pass,
-        'volume_scene,
-        'pass_borrow,
-        'borrow,
-    >
-{
+impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
     fn shade(&mut self, sample: RasterPixelSample) -> Result<([f64; 4], [f64; 4])> {
         let (sample_ray, sample_hit) = if let Some(cached) = sample.cached {
             cached
@@ -1972,7 +1962,6 @@ fn rasterize_with_samples_for_eye(
     clippy::too_many_arguments,
     reason = "line rasterization uses the same explicit configuration as triangle rasterization"
 )]
-
 pub(super) fn rasterize_with_lines(
     triangles: &[Triangle],
     lines: &[Line],
@@ -3159,7 +3148,7 @@ impl FilmFilter {
             } else {
                 let radius = self.radius as f32;
                 let jitter_x = 0.5 - sample_x as f32;
-                let jitter_y = 0.5 - sample_y as f32;
+                let jitter_y = sample_y as f32 - 0.5;
                 let reach = radius.ceil() as i64;
                 let radius_squared = radius * radius;
                 let mut count = 0;
@@ -3190,7 +3179,7 @@ impl FilmFilter {
             }
         } else {
             let jitter_x = 0.5 - sample_x as f32;
-            let jitter_y = 0.5 - sample_y as f32;
+            let jitter_y = sample_y as f32 - 0.5;
             for (tap, (x, y)) in taps
                 .iter_mut()
                 .zip(large_filter_taps(self.radius, sample_index))
@@ -3248,7 +3237,7 @@ impl FilmFilter {
                     color = [0.0, 0.0, 0.0, 1.0];
                 }
                 for channel in &mut color {
-                    if !(*channel > 0.0) {
+                    if (*channel).partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
                         *channel = 0.0;
                     }
                 }
