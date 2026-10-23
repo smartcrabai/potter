@@ -99,6 +99,9 @@ impl SceneDoc {
                 frame_current: 1.0,
                 frame_start: 1,
                 frame_end: 250,
+                use_custom_simulation_range: false,
+                simulation_frame_start: 1,
+                simulation_frame_end: 250,
                 fps: 24,
                 fps_base: 1.0,
                 sequencer: Sequencer::default(),
@@ -191,6 +194,9 @@ impl SceneDoc {
             }
             if resource_kind == Some(crate::geom::legacy_texture::LEGACY_TEXTURE_KIND) {
                 crate::geom::legacy_texture::validate_record_in_scene(self, resource_id, resource)?;
+            }
+            if resource_kind == Some("node_bake") {
+                crate::graph::validate_node_bake_resource(resource)?;
             }
         }
         for clip in self.movie_clips.values() {
@@ -624,6 +630,14 @@ pub struct Scene {
     pub frame_current: f64,
     pub frame_start: i32,
     pub frame_end: i32,
+    /// Blender `SCE_CUSTOM_SIMULATION_RANGE`: bakes without their own range use
+    /// `simulation_frame_start..=simulation_frame_end` instead of the scene frame range.
+    #[serde(default)]
+    pub use_custom_simulation_range: bool,
+    #[serde(default = "default_simulation_frame_start")]
+    pub simulation_frame_start: i32,
+    #[serde(default = "default_simulation_frame_end")]
+    pub simulation_frame_end: i32,
     pub fps: u32,
     pub fps_base: f64,
     pub camera: Option<Id>,
@@ -2044,6 +2058,10 @@ pub struct ModifierRuntime {
     /// Raw subject-to-world and optional world-to-mapping matrices for ordered f32 texture mapping.
     #[doc(hidden)]
     pub texture_mapping: Option<TextureCoordinateMapping>,
+    /// Bake-node records for this modifier's node group, keyed by Potter node id.
+    pub node_bakes: BTreeMap<String, crate::graph::NodeBakeRecord>,
+    /// Bake nodes whose frame the evaluation captures (explicit bake action).
+    pub capture_node_bakes: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2656,6 +2674,14 @@ fn matrix_basis_fingerprint_matches(fingerprint: &str, digest: &[u8; 32]) -> boo
             hex[index * 2] == HEX[usize::from(byte >> 4)]
                 && hex[index * 2 + 1] == HEX[usize::from(byte & 0x0f)]
         })
+}
+
+fn default_simulation_frame_start() -> i32 {
+    1
+}
+
+fn default_simulation_frame_end() -> i32 {
+    250
 }
 
 fn default_true() -> bool {

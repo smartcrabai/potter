@@ -620,6 +620,8 @@ def modifier_params(modifier):
     )
     if modifier.type == "PARTICLE_INSTANCE":
         omitted += ("particle_system",)
+    if modifier.type == "NODES":
+        omitted += ("bakes",)
     if modifier.type in ("VERTEX_WEIGHT_EDIT", "VERTEX_WEIGHT_PROXIMITY"):
         omitted += ("map_curve",)
     if modifier.type in ("HOOK", "WARP"):
@@ -767,6 +769,24 @@ def tree_dump(tree):
         node_id = custom_properties.pop("potter.id", None)
         simple_material = custom_properties.pop("potter_simple_material", False)
         properties = rna_props(node, ("inputs", "outputs", "internal_links", "parent", "select", "location", "dimensions"))
+        if node.bl_idname == "GeometryNodeBake":
+            bake_items = []
+            for index, item in enumerate(getattr(node, "bake_items", ())):
+                bake_type = getattr(item, "socket_type", "")
+                socket_key = {"INT": "integer", "BOOLEAN": "boolean", "RGBA": "color"}.get(
+                    bake_type, bake_type.lower())
+                socket_type = POTTER_TO_BLENDER_NODE_SOCKET_TYPE.get(
+                    socket_key, getattr(item, "bl_socket_idname", "") or
+                    (bake_type if bake_type.startswith("NodeSocket") else ""))
+                # The item's socket identifier is its persistent ID; positions change when items are removed.
+                entry = {"id": node.inputs[index].identifier,
+                         "name": item.name, "socket_type": socket_type}
+                if hasattr(item, "is_attribute"):
+                    entry["is_attribute"] = bool(item.is_attribute)
+                if hasattr(item, "attribute_domain"):
+                    entry["attribute_domain"] = str(item.attribute_domain)
+                bake_items.append(entry)
+            properties["bake_items"] = bake_items
         if node.bl_idname == "GeometryNodeMeshCube":
             properties = {}
         if simple_material is True and not _matches_blender_defaults(node):
@@ -1642,6 +1662,86 @@ def _modifier_node_inputs(modifier):
     return result
 
 
+# Settings Potter keeps on a Geometry Nodes bake entry. The payload (storage, resource_id, frames) is Potter's own
+# store and is never written to Blender.
+NODES_BAKE_SETTINGS = (
+    "bake_mode", "bake_target", "use_custom_path", "directory",
+    "use_custom_simulation_frame_range", "frame_start", "frame_end",
+)
+
+
+def _nodes_bake_potter_id(bake):
+    potter_id = bake.node.get("potter.id") if bake.node is not None else None
+    return potter_id if isinstance(potter_id, str) else None
+
+
+
+
+
+def _nodes_bakes_dump(modifier):
+    """Settings of every Blender bake entry keyed by the name of its bake node, and the facts Potter cannot keep.
+
+    The name is the key because it exists on every node, including nodes of files Potter did not write. Names are
+    unique within a node tree; the importer maps each name to the imported node ID."""
+    bakes = {}
+    bake_ids = []
+    data_blocks = []
+    unmapped = []
+    owner = modifier.id_data
+    library = owner.library
+    source_file = _library_resolved_path(library) if library else bpy.path.abspath(bpy.data.filepath)
+    for bake in modifier.bakes:
+        if bake.node is None:
+            unmapped.append("bake %d" % bake.bake_id)
+            bake_ids.append({"bake_id": int(bake.bake_id), "node_name": None})
+            continue
+        node_name = bake.node.name
+        bakes[node_name] = {
+            "bake_mode": bake.bake_mode,
+            "bake_target": bake.bake_target,
+            "use_custom_path": bool(bake.use_custom_path),
+            "directory": bake.directory,
+            "use_custom_simulation_frame_range": bool(bake.use_custom_simulation_frame_range),
+            "frame_start": int(bake.frame_start),
+            "frame_end": int(bake.frame_end),
+        }
+        bake_ids.append({"bake_id": int(bake.bake_id), "node_name": node_name})
+        if len(bake.data_blocks):
+            data_blocks.append(node_name)
+    return bakes, {
+        "owner_name": owner.name,
+        "source_file": source_file,
+        "bake_ids": bake_ids,
+        "data_blocks": data_blocks,
+        "unmapped": unmapped,
+    }
+
+
+def _apply_nodes_bakes(modifier, bakes):
+    """Writes Potter's settings onto the bake entries of the assigned node group.
+
+    Blender creates one entry per bake node as soon as the node group is assigned, and keeps it when the tree changes.
+    A key that matches no bake node is the exporter's nodes_bake_unmapped loss and is not written."""
+    entries = {}
+    for bake in modifier.bakes:
+        potter_id = _nodes_bake_potter_id(bake)
+        if potter_id is not None:
+            entries[potter_id] = bake
+    for potter_id, settings in bakes.items():
+        bake = entries.get(potter_id)
+        if bake is None:
+            continue
+        for key in NODES_BAKE_SETTINGS:
+            if key not in settings:
+                continue
+            value = settings[key]
+            if key in ("frame_start", "frame_end"):
+                value = int(value)
+            elif key in ("use_custom_path", "use_custom_simulation_frame_range"):
+                value = bool(value)
+            setattr(bake, key, value)
+
+
 def _uv_layer_index(layers, attribute):
     index = getattr(layers, attribute, None)
     if index is None or not 0 <= index < len(layers):
@@ -1945,9 +2045,11 @@ def object_dump(obj):
     modifiers = []
     for modifier in obj.modifiers:
         properties = modifier_params(modifier)
+        bake_losses = None
         if modifier.type == "NODES":
             properties["node_group"] = modifier.node_group.name_full if modifier.node_group else None
             properties["inputs"] = _modifier_node_inputs(modifier)
+            properties["bakes"], bake_losses = _nodes_bakes_dump(modifier)
         if modifier.type == "MESH_SEQUENCE_CACHE":
             cache_file = getattr(modifier, "cache_file", None)
             properties["cache_filepath"] = (
@@ -1971,16 +2073,19 @@ def object_dump(obj):
             metadata = {"id": metadata, "name": modifier.name}
         if not isinstance(metadata, dict):
             metadata = {}
-        modifiers.append({"name": metadata.get("name", modifier.name),
-                          "blender_name": modifier.name, "type": modifier.type,
-                          "potter_id": metadata.get("id"),
-                          "enabled": True,  # Blender has no global switch; always on.
-                          "show_viewport": bool(modifier.show_viewport),
-                          "show_render": bool(modifier.show_render),
-                          "properties": properties,
-                          "native_target_mesh": native_target_mesh,
-                          "physics_settings": _physics_modifier_settings(obj, modifier),
-                          "custom_properties": custom_props(modifier)})
+        record = {"name": metadata.get("name", modifier.name),
+                  "blender_name": modifier.name, "type": modifier.type,
+                  "potter_id": metadata.get("id"),
+                  "enabled": True,  # Blender has no global switch; always on.
+                  "show_viewport": bool(modifier.show_viewport),
+                  "show_render": bool(modifier.show_render),
+                  "properties": properties,
+                  "native_target_mesh": native_target_mesh,
+                  "physics_settings": _physics_modifier_settings(obj, modifier),
+                  "custom_properties": custom_props(modifier)}
+        if bake_losses is not None:
+            record["bake_losses"] = bake_losses
+        modifiers.append(record)
     inverse_map = _object_solver_inverse_map(obj).get("objects", {})
     constraints = [
         _constraint_dump(constraint, inverse_map.get(constraint.name))
@@ -2576,6 +2681,9 @@ def dump_scene(scene):
     return {"name": scene.name_full, "potter_id": scene.get("potter.id"),
             "frame_current": float(scene.frame_current) + float(getattr(scene, "frame_subframe", 0.0)),
             "frame_start": int(scene.frame_start), "frame_end": int(scene.frame_end), "fps": int(scene.render.fps),
+            "use_custom_simulation_range": bool(scene.use_custom_simulation_range),
+            "simulation_frame_start": int(scene.simulation_frame_start),
+            "simulation_frame_end": int(scene.simulation_frame_end),
             "fps_base": float(scene.render.fps_base), "camera": camera,
             "active_clip": (scene.active_clip.name_full
                             if getattr(scene, "active_clip", None) else None),
@@ -3629,6 +3737,7 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         "map_curve",
         "falloff_curve",
         "falloff_curve_settings",
+        "bakes",
     ):
         rna_params.pop(parameter, None)
     texture_id = params.get("texture")
@@ -4702,6 +4811,32 @@ def _resolve_deferred_id_assignments(id_lookup):
             raise ValueError("%s references unavailable ID %s" % (owner, reference))
         _set_required(block, key, candidate, owner)
     DEFERRED_ID_ASSIGNMENTS.clear()
+# Blender's bake item enum for each Potter socket key (the values bake_items.new accepts).
+BLENDER_BAKE_ITEM_TYPES = {
+    "geometry": "GEOMETRY", "float": "FLOAT", "integer": "INT", "boolean": "BOOLEAN",
+    "vector": "VECTOR", "rotation": "ROTATION", "color": "RGBA", "matrix": "MATRIX", "string": "STRING",
+}
+
+
+def _restore_bake_items(node, items, owner):
+    """Rebuild a Bake node's items in order. Blender assigns each item a fresh socket identifier, so
+    the saved identifier of each item is mapped to its new one and returned for link resolution."""
+    socket_keys = {socket: key for key, socket in POTTER_TO_BLENDER_NODE_SOCKET_TYPE.items()}
+    while len(node.bake_items):
+        node.bake_items.remove(node.bake_items[0])
+    identifiers = {}
+    for position, entry in enumerate(items):
+        key = socket_keys.get(entry.get("socket_type"), entry.get("socket_type"))
+        enum = BLENDER_BAKE_ITEM_TYPES.get(key)
+        if enum is None:
+            raise ValueError("%s has a bake item with unsupported socket type %s" % (owner, entry.get("socket_type")))
+        item = node.bake_items.new(enum, entry.get("name", ""))
+        if "is_attribute" in entry:
+            item.is_attribute = bool(entry["is_attribute"])
+        if "attribute_domain" in entry:
+            item.attribute_domain = entry["attribute_domain"]
+        identifiers[entry.get("id")] = node.inputs[position].identifier
+    return identifiers
 
 def _restore_node_tree(tree, raw, id_lookup, owner):
     if raw.get("name"):
@@ -4724,8 +4859,14 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
                 except Exception as error:
                     raise ValueError("%s cannot restore interface socket %s" %
                                      (owner, entry.get("name", ""))) from error
+        # A geometry graph with no declared outputs has an implicit Geometry output that its group output node links to
+        # (sockets.rs `NodeGroupOutput`), so Blender needs the socket for those links.
+        if tree.bl_idname == "GeometryNodeTree" and not raw.get("interface", {}).get("outputs"):
+            interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
     tree.nodes.clear()
     nodes = {}
+    # Saved socket identifiers of Bake items, per node name, mapped to the identifiers Blender assigned.
+    identifier_remaps = {}
     for source in raw.get("nodes", []):
         try:
             node = tree.nodes.new(blender_node_type(source["type"], tree.bl_rna.identifier))
@@ -4737,11 +4878,17 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
         if source.get("location") is not None:
             node.location = source["location"]
         node_properties = dict(source.get("properties", {}))
+        if node.bl_idname == "GeometryNodeBake" and "bake_items" in node_properties:
+            identifier_remaps[node.name] = _restore_bake_items(
+                node, node_properties.pop("bake_items") or [], owner)
         simple_material = node_properties.pop("potter_simple_material", False) is True
         node_color = node_properties.get("color")
         if node_color is not None and (not isinstance(node_color, list) or len(node_color) != 3):
             # Node color is display-only; discard malformed legacy presentation metadata.
             node_properties.pop("color", None)
+        if node.bl_idname == "GeometryNodeMeshCube" and "size" in node_properties:
+            # Blender 5.2 has no RNA for a cube's size: it is the Size input, which is the only place it can live.
+            node.inputs["Size"].default_value = tuple(node_properties.pop("size"))
         set_rna(node, node_properties, id_lookup, strict=True,
                 owner="%s node %s" % (owner, node.name))
         set_id(node, source.get("potter_id"))
@@ -4750,8 +4897,10 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             custom_properties["potter_simple_material"] = True
         set_props(node, custom_properties)
         for socket_source in source.get("inputs", []):
+            identifier = identifier_remaps.get(node.name, {}).get(
+                socket_source.get("identifier"), socket_source.get("identifier"))
             socket = next((value for value in node.inputs
-                           if value.identifier == socket_source.get("identifier")), None)
+                           if value.identifier == identifier), None)
             if socket is None:
                 socket = next((value for value in node.inputs
                                if value.name == socket_source.get("name")), None)
@@ -4768,18 +4917,25 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
         to_node = nodes.get(source.get("to_node"))
         if from_node is None or to_node is None:
             raise ValueError("%s has a link to an unavailable node" % owner)
+        from_identifier = identifier_remaps.get(from_node.name, {}).get(
+            source.get("from_socket"), source.get("from_socket"))
+        to_identifier = identifier_remaps.get(to_node.name, {}).get(
+            source.get("to_socket"), source.get("to_socket"))
         from_socket = next((value for value in from_node.outputs
-                            if value.identifier == source.get("from_socket")), None)
+                            if value.identifier == from_identifier), None)
         if from_socket is None:
             from_socket = next((value for value in from_node.outputs
                                 if value.name == source.get("from_socket")), None)
         to_socket = next((value for value in to_node.inputs
-                          if value.identifier == source.get("to_socket")), None)
+                          if value.identifier == to_identifier), None)
         if to_socket is None:
             to_socket = next((value for value in to_node.inputs
                               if value.name == source.get("to_socket")), None)
         if from_socket is None or to_socket is None:
-            raise ValueError("%s has an unavailable node socket" % owner)
+            raise ValueError("%s has an unavailable node socket on link %s.%s -> %s.%s (outputs: %s, inputs: %s)" % (
+                owner, source.get("from_node"), source.get("from_socket"), source.get("to_node"),
+                source.get("to_socket"), [s.identifier for s in from_node.outputs],
+                [s.identifier for s in to_node.inputs]))
         tree.links.new(from_socket, to_socket)
     return socket_map
 
@@ -7400,6 +7556,9 @@ def export_doc(doc, target, pack, scene_hash, context):
         set_scene_frame(scene, item["frame_current"])
         scene.frame_start = item["frame_start"]
         scene.frame_end = item["frame_end"]
+        scene.use_custom_simulation_range = item["use_custom_simulation_range"]
+        scene.simulation_frame_start = item["simulation_frame_start"]
+        scene.simulation_frame_end = item["simulation_frame_end"]
         for marker in source.get("markers", []):
             scene.timeline_markers.new(marker["name"], frame=int(marker["frame"]))
         scene.render.fps = item["fps"]
@@ -8129,6 +8288,7 @@ def export_doc(doc, target, pack, scene_hash, context):
                             modifier[target_id] = _resolve_compat_value(value, id_lookup)
                         except Exception as error:
                             raise ValueError("cannot restore Geometry Nodes modifier input %s" % socket_id) from error
+                    _apply_nodes_bakes(modifier, model_params.get("bakes", {}))
                 set_props(modifier, source_modifier.get("custom_properties", {}))
             except Exception as error:
                 raise RuntimeError(
