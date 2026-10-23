@@ -2326,6 +2326,40 @@ def _eevee_use_volumetric_shadows(scene):
     return bool(getattr(eevee, "use_volumetric_shadows", False)) if eevee is not None else False
 
 
+def _eevee_volumetric_tile_size(scene):
+    eevee = getattr(scene, "eevee", None)
+    return int(getattr(eevee, "volumetric_tile_size", "8")) if eevee is not None else 8
+
+
+def _eevee_volumetric_samples(scene):
+    eevee = getattr(scene, "eevee", None)
+    return int(getattr(eevee, "volumetric_samples", 64)) if eevee is not None else 64
+
+
+def _eevee_volumetric_sample_distribution(scene):
+    eevee = getattr(scene, "eevee", None)
+    return (
+        float(getattr(eevee, "volumetric_sample_distribution", 0.8))
+        if eevee is not None
+        else 0.8
+    )
+
+
+def _eevee_use_volume_custom_range(scene):
+    eevee = getattr(scene, "eevee", None)
+    return bool(getattr(eevee, "use_volume_custom_range", False)) if eevee is not None else False
+
+
+def _eevee_volumetric_start(scene):
+    eevee = getattr(scene, "eevee", None)
+    return float(getattr(eevee, "volumetric_start", 0.1)) if eevee is not None else 0.1
+
+
+def _eevee_volumetric_end(scene):
+    eevee = getattr(scene, "eevee", None)
+    return float(getattr(eevee, "volumetric_end", 100.0)) if eevee is not None else 100.0
+
+
 def _cryptomatte_accurate(scene):
     return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
@@ -2567,6 +2601,12 @@ def dump_scene(scene):
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
                 "eevee_light_threshold": _eevee_light_threshold(scene),
                 "eevee_use_volumetric_shadows": _eevee_use_volumetric_shadows(scene),
+                "eevee_volumetric_tile_size": _eevee_volumetric_tile_size(scene),
+                "eevee_volumetric_samples": _eevee_volumetric_samples(scene),
+                "eevee_volumetric_sample_distribution": _eevee_volumetric_sample_distribution(scene),
+                "eevee_use_volume_custom_range": _eevee_use_volume_custom_range(scene),
+                "eevee_volumetric_start": _eevee_volumetric_start(scene),
+                "eevee_volumetric_end": _eevee_volumetric_end(scene),
                 "use_simplify": bool(scene.render.use_simplify),
                 "simplify_volumes": float(scene.render.simplify_volumes),
             },
@@ -7390,6 +7430,18 @@ def export_doc(doc, target, pack, scene_hash, context):
         if hasattr(scene, "eevee"):
             scene.eevee.light_threshold = float(render.get("eevee_light_threshold", 0.01))
             scene.eevee.use_volumetric_shadows = bool(render.get("eevee_use_volumetric_shadows", False))
+            scene.eevee.volumetric_tile_size = str(
+                int(render.get("eevee_volumetric_tile_size", 8))
+            )
+            scene.eevee.volumetric_samples = int(render.get("eevee_volumetric_samples", 64))
+            scene.eevee.volumetric_sample_distribution = float(
+                render.get("eevee_volumetric_sample_distribution", 0.8)
+            )
+            scene.eevee.use_volume_custom_range = bool(
+                render.get("eevee_use_volume_custom_range", False)
+            )
+            scene.eevee.volumetric_start = float(render.get("eevee_volumetric_start", 0.1))
+            scene.eevee.volumetric_end = float(render.get("eevee_volumetric_end", 100.0))
         unit = item.get("unit", {})
         try:
             scene.unit_settings.system = unit.get("system", "metric").upper()

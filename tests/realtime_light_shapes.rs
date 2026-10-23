@@ -30,7 +30,7 @@ use native_oracle::{
 };
 use potter_core::image::{ImageInterpolation, load_image_data, sample};
 use potter_core::model::Image;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 /// The scene generator (`eevee_light_shapes.py`).
@@ -165,5 +165,92 @@ fn realtime_camera_visible_lights_match_eevee_emitters() -> TestResult {
             "{name}: Potter {actual} differs from EEVEE {expected}"
         );
     }
+    Ok(())
+}
+fn render_overlap_case(root: &Path, name: &str, lights: &[Value]) -> TestResult<[f64; 3]> {
+    let project = root.join(name);
+    let initialized = pot().arg("init").arg(&project).arg("--json").output()?;
+    assert!(
+        initialized.status.success(),
+        "scene initialization failed: {}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
+    let mut operations = vec![
+        json!({"op":"world.create","id":"world_main","color":[0.0,0.0,0.0],"strength":0.0}),
+        json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,10.0]},"projection":"orthographic","ortho_scale":8.0}),
+    ];
+    operations.extend(lights.iter().cloned());
+    operations.extend([
+        json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":RESOLUTION,"resolution_y":RESOLUTION,"samples":1,"seed":0,"max_bounces":0}}),
+    ]);
+    let applied = apply_operations(&project, root, json!(operations))?;
+    assert_eq!(applied["ok"], true, "{applied}");
+
+    let frames = root.join(format!("frames_{name}"));
+    let rendered = pot()
+        .arg("render")
+        .arg(&project)
+        .args(["--engine", "realtime", "--format", "exr", "--out"])
+        .arg(&frames)
+        .arg("--json")
+        .output()?;
+    assert!(
+        rendered.status.success(),
+        "realtime render failed: {}",
+        String::from_utf8_lossy(&rendered.stdout)
+    );
+    let loaded = apply_operations(
+        &project,
+        root,
+        json!([{"op":"image.load","id":"render","path":frames.join("frame_0001.exr").to_string_lossy()}]),
+    )?;
+    assert_eq!(loaded["ok"], true, "{loaded}");
+    let scene = read_scene(&project)?;
+    let image: Image = serde_json::from_value(scene["images"]["render"].clone())?;
+    let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
+    let center = (f64::from(RESOLUTION / 2) + 0.5) / f64::from(RESOLUTION);
+    let color = sample(&data, [center, center], false);
+    Ok([color[0], color[1], color[2]])
+}
+
+fn point_light_operations(id: &str, color: [f64; 3], energy: f64, depth: f64) -> [Value; 2] {
+    [
+        json!({
+            "op":"light.create",
+            "id":id,
+            "light_type":"point",
+            "color":color,
+            "energy":energy,
+            "radius":0.5,
+            "transform":{"translation":[0.0,0.0,depth]}
+        }),
+        json!({"op":"node.update","target":{"id":id},"set":{"ray_visibility":{"camera":true}}}),
+    ]
+}
+
+/// EEVEE adds every camera-visible shape independently; an overlapping shape at another depth must not occlude it.
+#[test]
+fn overlapping_camera_visible_lights_add_in_linear_space() -> TestResult {
+    let root = tempdir()?;
+    let red = point_light_operations("red", [1.0, 0.0, 0.0], 1.0, 5.0);
+    let blue = point_light_operations("blue", [0.0, 0.0, 1.0], 2.0, 0.0);
+    let red_only = render_overlap_case(root.path(), "red_only", &red)?;
+    let blue_only = render_overlap_case(root.path(), "blue_only", &blue)?;
+    let both_lights = [
+        red[0].clone(),
+        red[1].clone(),
+        blue[0].clone(),
+        blue[1].clone(),
+    ];
+    let both = render_overlap_case(root.path(), "both", &both_lights)?;
+    for channel in 0..3 {
+        let expected = red_only[channel] + blue_only[channel];
+        assert!(
+            (both[channel] - expected).abs() <= 1.0e-5,
+            "channel {channel}: overlapping lights {both:?}, isolated sum {expected} (red {red_only:?}, blue {blue_only:?})"
+        );
+    }
+    assert!(red_only[0] > 0.0 && blue_only[2] > 0.0);
     Ok(())
 }

@@ -32,6 +32,12 @@ const SET_FIELDS: &[&str] = &[
     "max_subdivisions",
     "offscreen_dicing_scale",
     "eevee_use_volumetric_shadows",
+    "eevee_volumetric_tile_size",
+    "eevee_volumetric_samples",
+    "eevee_volumetric_sample_distribution",
+    "eevee_use_volume_custom_range",
+    "eevee_volumetric_start",
+    "eevee_volumetric_end",
     "dicing_camera",
 ];
 
@@ -214,6 +220,47 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
             })
         })
         .transpose()?;
+    let eevee_volumetric_tile_size =
+        optional_u32(engine, set, "eevee_volumetric_tile_size", 1, 16)?;
+    if eevee_volumetric_tile_size
+        .is_some_and(|value| !matches!(value, 1 | 2 | 4 | 8 | 16))
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "eevee_volumetric_tile_size must be 1, 2, 4, 8, or 16",
+            &operation_pointer(
+                engine.operation_index,
+                "set/eevee_volumetric_tile_size",
+            ),
+        ));
+    }
+    let eevee_volumetric_samples =
+        optional_u32(engine, set, "eevee_volumetric_samples", 1, 256)?;
+    let eevee_volumetric_sample_distribution = optional_f64(
+        engine,
+        set,
+        "eevee_volumetric_sample_distribution",
+        0.0,
+        1.0,
+    )?;
+    let eevee_use_volume_custom_range = set
+        .get("eevee_use_volume_custom_range")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "eevee_use_volume_custom_range must be a boolean",
+                    &operation_pointer(
+                        engine.operation_index,
+                        "set/eevee_use_volume_custom_range",
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+    let eevee_volumetric_start =
+        optional_positive_f64(engine, set, "eevee_volumetric_start")?;
+    let eevee_volumetric_end = optional_positive_f64(engine, set, "eevee_volumetric_end")?;
     let shutter = set
         .get("shutter")
         .map(|value| {
@@ -340,6 +387,24 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         if let Some(value) = eevee_use_volumetric_shadows {
             scene.render.eevee_use_volumetric_shadows = value;
         }
+        if let Some(value) = eevee_volumetric_tile_size {
+            scene.render.eevee_volumetric_tile_size = value;
+        }
+        if let Some(value) = eevee_volumetric_samples {
+            scene.render.eevee_volumetric_samples = value;
+        }
+        if let Some(value) = eevee_volumetric_sample_distribution {
+            scene.render.eevee_volumetric_sample_distribution = value;
+        }
+        if let Some(value) = eevee_use_volume_custom_range {
+            scene.render.eevee_use_volume_custom_range = value;
+        }
+        if let Some(value) = eevee_volumetric_start {
+            scene.render.eevee_volumetric_start = value;
+        }
+        if let Some(value) = eevee_volumetric_end {
+            scene.render.eevee_volumetric_end = value;
+        }
         if let Some(value) = filter_size {
             scene.render.filter_size = value;
         }
@@ -437,6 +502,27 @@ fn optional_f64(
                     &operation_pointer(engine.operation_index, &format!("set/{key}")),
                 )
             })
+        })
+        .transpose()
+}
+
+fn optional_positive_f64(
+    engine: &Engine<'_>,
+    set: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<f64>> {
+    set.get(key)
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|number| number.is_finite() && *number > 0.0)
+                .ok_or_else(|| {
+                    engine.error(
+                        ErrorCode::InvalidOperation,
+                        format!("{key} must be a finite positive number"),
+                        &operation_pointer(engine.operation_index, &format!("set/{key}")),
+                    )
+                })
         })
         .transpose()
 }

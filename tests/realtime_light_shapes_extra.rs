@@ -8,11 +8,11 @@
 //! - a spot light facing an orthographic camera, next to the area and point lights, whose disc EEVEE draws at the
 //!   sphere emitter radiance `P / (4 π² r²)` on axis;
 //! - the area light behind a slab of absorbing volume, where EEVEE attenuates the light shape by the transmittance in
-//!   front of it.
+//!   front of it; the default tile-size-8 and tile-size-1 EEVEE captures exercise different froxel layouts.
 //!
 //! The test imports each saved `.blend`, renders it with `pot render --engine realtime`, and compares window means with
-//! committed macOS EEVEE pixel captures. The sun and spot tolerances are 0.01. The absorber's tolerance covers the
-//! difference between EEVEE's froxel volume and Potter's realtime volume; the test also checks that it darkens the light.
+//! committed macOS EEVEE pixel captures. The sun and spot tolerances are 0.01; the existing absorber tolerance remains
+//! 0.03 for both froxel layouts, and each case checks that the absorber darkens the light.
 //!
 //! Blender-gated: with `POTTER_REQUIRE_BLENDER` set, a missing Blender fails the test.
 
@@ -49,6 +49,8 @@ const WINDOW: usize = 2;
 const EEVEE_SUN: &[u8] = include_bytes!("fixtures/native_oracle/eevee_macos/sun.f32le");
 const EEVEE_SPOT: &[u8] = include_bytes!("fixtures/native_oracle/eevee_macos/spot.f32le");
 const EEVEE_ABSORBER: &[u8] = include_bytes!("fixtures/native_oracle/eevee_macos/absorber.f32le");
+const EEVEE_ABSORBER_TILE1: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/absorber_tile1.f32le");
 
 /// Linear tolerance on a window mean against EEVEE, for the sun and the spot.
 const EMITTER_TOLERANCE: f64 = 0.01;
@@ -110,6 +112,7 @@ fn render_realtime(
     name: &str,
     blend: &Path,
     id: &str,
+    volumetric_tile_size: u32,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let (project, _) = import_blend(blender, root, name, blend)?;
     let scene = read_scene(&project)?;
@@ -121,7 +124,7 @@ fn render_realtime(
         &project,
         root,
         json!([
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": 4, "seed": 0}}
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": 64, "seed": 0, "eevee_volumetric_tile_size": volumetric_tile_size}}
         ]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
@@ -148,7 +151,7 @@ fn render_realtime(
 }
 
 #[test]
-fn realtime_sun_disc_and_spot_emitter_match_eevee() -> TestResult {
+fn realtime_sun_spot_and_absorber_match_eevee() -> TestResult {
     let Some(blender) = blender_checked::blender_executable() else {
         return Ok(());
     };
@@ -169,12 +172,13 @@ fn realtime_sun_disc_and_spot_emitter_match_eevee() -> TestResult {
             Path::new("-"),
             Path::new("-"),
             Path::new("-"),
+            Path::new("-"),
         ],
     )?;
     let centre = RESOLUTION as usize / 2;
 
     // The sun: the centre of the disc and a corner outside it.
-    let project = render_realtime(&blender, root.path(), "sun", &sun_blend, "sun")?;
+    let project = render_realtime(&blender, root.path(), "sun", &sun_blend, "sun", 8)?;
     let sun_centre = window_mean(&project, "sun", centre, centre, WINDOW)?;
     let sun_corner = window_mean(&project, "sun", 8, 8, WINDOW)?;
     let expected_sun_centre = oracle_window_mean(EEVEE_SUN, centre, centre, WINDOW);
@@ -189,7 +193,7 @@ fn realtime_sun_disc_and_spot_emitter_match_eevee() -> TestResult {
     );
 
     // The spot emitter on axis and the area light beside it.
-    let project = render_realtime(&blender, root.path(), "spot", &spot_blend, "spot")?;
+    let project = render_realtime(&blender, root.path(), "spot", &spot_blend, "spot", 8)?;
     let spot = window_mean(&project, "spot", 32, 12, WINDOW)?;
     let expected_spot = oracle_window_mean(EEVEE_SPOT, 32, 12, WINDOW);
     assert!(
@@ -210,6 +214,7 @@ fn realtime_sun_disc_and_spot_emitter_match_eevee() -> TestResult {
         "absorber",
         &absorber_blend,
         "absorber",
+        8,
     )?;
     let through = window_mean(&project, "absorber", 20, centre, WINDOW)?;
     let expected_through = oracle_window_mean(EEVEE_ABSORBER, 20, centre, WINDOW);
@@ -220,6 +225,25 @@ fn realtime_sun_disc_and_spot_emitter_match_eevee() -> TestResult {
     assert!(
         (through - expected_through).abs() <= ABSORBER_TOLERANCE,
         "area light through the absorber: Potter {through} differs from EEVEE {expected_through}"
+    );
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "absorber_tile1",
+        &absorber_blend,
+        "absorber_tile1",
+        1,
+    )?;
+    let through_tile1 = window_mean(&project, "absorber_tile1", 20, centre, WINDOW)?;
+    let expected_through_tile1 = oracle_window_mean(EEVEE_ABSORBER_TILE1, 20, centre, WINDOW);
+    assert!(
+        through_tile1 < 0.9 * expected_area_clear,
+        "the absorber must darken the tile-1 area light, got {through_tile1}"
+    );
+    assert!(
+        (through_tile1 - expected_through_tile1).abs() <= ABSORBER_TOLERANCE,
+        "area light through the absorber at tile size 1: Potter {through_tile1} differs from EEVEE {expected_through_tile1}"
     );
     Ok(())
 }

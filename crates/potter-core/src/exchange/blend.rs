@@ -3039,6 +3039,29 @@ fn build_imported_graph(
                 .get("eevee_use_volumetric_shadows")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            eevee_volumetric_tile_size: u32::try_from(integer_field(
+                &render,
+                "eevee_volumetric_tile_size",
+                8,
+            ))
+            .map_err(|_| invalid_intermediate("render eevee_volumetric_tile_size is out of range"))?,
+            eevee_volumetric_samples: u32::try_from(integer_field(
+                &render,
+                "eevee_volumetric_samples",
+                64,
+            ))
+            .map_err(|_| invalid_intermediate("render eevee_volumetric_samples is out of range"))?,
+            eevee_volumetric_sample_distribution: number_field(
+                &render,
+                "eevee_volumetric_sample_distribution",
+                0.8,
+            ),
+            eevee_use_volume_custom_range: render
+                .get("eevee_use_volume_custom_range")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            eevee_volumetric_start: number_field(&render, "eevee_volumetric_start", 0.1),
+            eevee_volumetric_end: number_field(&render, "eevee_volumetric_end", 100.0),
             motion_blur: render
                 .get("motion_blur")
                 .and_then(Value::as_bool)
@@ -3337,7 +3360,6 @@ fn build_imported_graph(
                             spread
                         }
                     },
-                    sun_angle: number_field(item, "sun_angle", 0.526_f64.to_radians()),
                     use_custom_distance: item
                         .get("use_custom_distance")
                         .and_then(Value::as_bool)

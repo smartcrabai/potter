@@ -298,6 +298,18 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
     render["properties"]["eevee_use_volumetric_shadows"] =
         json!({"type":"boolean","default":false});
+    render["properties"]["eevee_volumetric_tile_size"] =
+        json!({"type":"integer","enum":[1,2,4,8,16],"default":8});
+    render["properties"]["eevee_volumetric_samples"] =
+        json!({"type":"integer","minimum":1,"maximum":256,"default":64});
+    render["properties"]["eevee_volumetric_sample_distribution"] =
+        json!({"type":"number","minimum":0,"maximum":1,"default":0.8});
+    render["properties"]["eevee_use_volume_custom_range"] =
+        json!({"type":"boolean","default":false});
+    render["properties"]["eevee_volumetric_start"] =
+        json!({"type":"number","exclusiveMinimum":0,"default":0.1});
+    render["properties"]["eevee_volumetric_end"] =
+        json!({"type":"number","exclusiveMinimum":0,"default":100.0});
     render["required"] = json!([
         "resolution_x",
         "resolution_y",
@@ -2557,6 +2569,12 @@ fn set_schema(operation: &str) -> Value {
             "filter_glossy":{"type":"number","minimum":0,"maximum":10},
             "film_transparent":{"type":"boolean"},
             "eevee_use_volumetric_shadows":{"type":"boolean","default":false},
+            "eevee_volumetric_tile_size":{"type":"integer","enum":[1,2,4,8,16]},
+            "eevee_volumetric_samples":{"type":"integer","minimum":1,"maximum":256},
+            "eevee_volumetric_sample_distribution":{"type":"number","minimum":0,"maximum":1},
+            "eevee_use_volume_custom_range":{"type":"boolean"},
+            "eevee_volumetric_start":{"type":"number","exclusiveMinimum":0},
+            "eevee_volumetric_end":{"type":"number","exclusiveMinimum":0},
             "filter_size":{"type":"number","minimum":0,"maximum":500},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},

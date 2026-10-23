@@ -647,6 +647,7 @@ pub(super) fn rasterize_with_samples(
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
     prepared_materials: &[crate::shader::PreparedMaterial],
+    camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
@@ -671,6 +672,7 @@ pub(super) fn rasterize_with_samples(
             filter_size,
             shader,
             prepared_materials,
+            camera_lights,
             volume_pass.as_deref_mut(),
         )?;
         let right_output = rasterize_with_samples(
@@ -686,6 +688,7 @@ pub(super) fn rasterize_with_samples(
             filter_size,
             shader,
             prepared_materials,
+            camera_lights,
             volume_pass.as_deref_mut(),
         )?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
@@ -899,10 +902,12 @@ pub(super) fn rasterize_with_samples(
                             &mut candidates,
                             sample_ray,
                             &frame,
+                            camera,
                             background_linear,
                             world,
                             shader,
                             sample_hit,
+                            camera_lights,
                             volume_sample.as_mut(),
                         )?
                     } else {
@@ -985,6 +990,7 @@ pub(super) fn rasterize_with_lines(
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
     prepared_materials: &[crate::shader::PreparedMaterial],
+    camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     let mut output = rasterize_with_samples(
@@ -1000,6 +1006,7 @@ pub(super) fn rasterize_with_lines(
         filter_size,
         shader,
         prepared_materials,
+        camera_lights,
         volume_pass,
     )?;
     if lines.is_empty() {
@@ -1159,6 +1166,7 @@ pub(crate) fn rasterize_wireframe(
         None,
         &[],
         None,
+        None,
     )?;
     let mut output = rasterize_with_lines(
         triangles,
@@ -1174,6 +1182,7 @@ pub(crate) fn rasterize_wireframe(
         0.0,
         None,
         &[],
+        None,
         None,
     )?;
     let frame = camera_frame(camera, width, height)?;
@@ -2264,11 +2273,13 @@ fn composite_sample(
     candidates: &mut Vec<usize>,
     ray: Ray,
     frame: &CameraFrame,
+    camera: &Camera,
     background: [f64; 4],
     world: Option<WorldRadiance<'_>>,
     shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
-    volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
+    camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
+    mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
 ) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
@@ -2323,7 +2334,7 @@ fn composite_sample(
         hits[insert_at] = Some(visible_hit);
         hit_count = next_count;
     }
-    if let Some(volume_sample) = volume_sample {
+    let mut color = if let Some(volume_sample) = volume_sample.as_deref_mut() {
         let mut transmittance = DVec3::ONE;
         let mut alpha_transmittance = 1.0;
         let mut premultiplied = DVec3::ZERO;
@@ -2367,21 +2378,84 @@ fn composite_sample(
         } else {
             premultiplied / alpha
         };
-        return Ok([color.x, color.y, color.z, alpha]);
-    }
-    let layers = hits.iter().take(hit_count).flatten().map(|visible_hit| {
-        let triangle = &triangles[visible_hit.triangle_index];
-        let color = visible_hit.color;
-        Layer {
-            rgb: [color[0], color[1], color[2]],
-            opacity: hit_opacity(&triangle.source, color),
-            tint: visible_hit.transparent_tint,
+        [color.x, color.y, color.z, alpha]
+    } else {
+        let layers = hits.iter().take(hit_count).flatten().map(|visible_hit| {
+            let triangle = &triangles[visible_hit.triangle_index];
+            let color = visible_hit.color;
+            Layer {
+                rgb: [color[0], color[1], color[2]],
+                opacity: hit_opacity(&triangle.source, color),
+                tint: visible_hit.transparent_tint,
+            }
+        });
+        composite_layers_with_background(layers, background[3], || {
+            let background = sample_background(background, world, Some(ray.direction))?;
+            Ok([background[0], background[1], background[2]])
+        })?
+    };
+
+    if let Some(camera_lights) = camera_lights {
+        let near_distance = camera.ray_distance_for_depth(ray.direction, camera.near);
+        let far_distance = camera.ray_distance_for_depth(ray.direction, camera.far);
+        let layers = &hits[..hit_count];
+        let mut light_radiance = DVec3::ZERO;
+        for event in camera_lights.local_events(ray.origin, ray.direction, far_distance) {
+            light_radiance += camera_light_event_radiance(
+                triangles,
+                layers,
+                event.distance,
+                event.radiance,
+                near_distance,
+                &mut volume_sample,
+            )?;
         }
-    });
-    composite_layers_with_background(layers, background[3], || {
-        let background = sample_background(background, world, Some(ray.direction))?;
-        Ok([background[0], background[1], background[2]])
-    })
+        light_radiance += camera_light_event_radiance(
+            triangles,
+            layers,
+            far_distance,
+            camera_lights.sun_radiance(ray.direction),
+            near_distance,
+            &mut volume_sample,
+        )?;
+        color[0] += light_radiance.x;
+        color[1] += light_radiance.y;
+        color[2] += light_radiance.z;
+    }
+    Ok(color)
+}
+
+fn camera_light_event_radiance(
+    triangles: &[PreparedTriangle],
+    layers: &[Option<VisibleHit>],
+    distance: f64,
+    radiance: DVec3,
+    near_distance: f64,
+    volume_sample: &mut Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
+) -> Result<DVec3> {
+    if distance < near_distance || radiance.max_element() <= 0.0 {
+        return Ok(DVec3::ZERO);
+    }
+    let mut surface_transmittance = DVec3::ONE;
+    for visible_hit in layers.iter().flatten() {
+        if visible_hit.hit.distance >= distance {
+            break;
+        }
+        let triangle = &triangles[visible_hit.triangle_index];
+        let passed = 1.0 - hit_opacity(&triangle.source, visible_hit.color);
+        surface_transmittance *= DVec3::from_array(visible_hit.transparent_tint) * passed;
+        if surface_transmittance == DVec3::ZERO {
+            break;
+        }
+    }
+    if surface_transmittance == DVec3::ZERO {
+        return Ok(DVec3::ZERO);
+    }
+    let volume_transmittance = match volume_sample {
+        Some(volume_sample) => volume_sample.transmittance_to(distance)?,
+        None => DVec3::ONE,
+    };
+    Ok(radiance * surface_transmittance * volume_transmittance)
 }
 
 /// One surface of a pixel's stack, for `composite_layers`.
@@ -3231,6 +3305,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )?;
         assert!(
             output.ids.contains(&7),
@@ -3270,6 +3345,7 @@ mod tests {
             1.5,
             None,
             &[],
+            None,
             None,
         )?;
         let mut drawn = 0_usize;
@@ -3341,6 +3417,7 @@ mod line_tests {
             1.5,
             None,
             &[],
+            None,
             None,
         );
         assert!(output.is_ok());
@@ -3473,6 +3550,7 @@ mod smooth_shading_tests {
             1.5,
             shader,
             &[],
+            None,
             None,
         )
         .expect("triangle rasterizes")
@@ -3917,7 +3995,9 @@ mod visibility_tests {
                     &mut candidates,
                     ray,
                     &frame,
+                    &camera,
                     BACKGROUND,
+                    None,
                     None,
                     None,
                     None,
@@ -3962,7 +4042,7 @@ mod composite_layer_tests {
     /// Background (0.5,0.5,0.5), alpha 0.6: colour += (0.5,0.5,0.5) * (0.1,0.1,0) * 0.6 = (0.03,0.03,0).
     /// So the colour sums to (0.53,0.03,0) and the alpha is 1 - (0.25 * 1.4/3) * (1 - 0.6).
     #[test]
-    fn coloured_layers_over_a_partly_transparent_background() -> super::Result<()> {
+    fn coloured_layers_over_a_partly_transparent_background() {
         let layers = [
             Layer {
                 rgb: [1.0, 0.0, 0.0],
@@ -3976,15 +4056,14 @@ mod composite_layer_tests {
             },
         ];
         let alpha = 1.0 - (0.25 * 1.4 / 3.0) * (1.0 - 0.6);
-        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 0.6])?;
+        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 0.6]);
         assert_close(actual, [0.53 / alpha, 0.03 / alpha, 0.0, alpha]);
-        Ok(())
     }
 
     /// Two panes that tint different channels over a transparent film. Each mean is 1/3, so the alpha is
     /// 1 - (1/3) * (1/3) = 8/9. A product of the colour vectors would give zero transmittance and alpha 1.
     #[test]
-    fn overlapping_panes_multiply_their_alpha_means() -> super::Result<()> {
+    fn overlapping_panes_multiply_their_alpha_means() {
         let layers = [
             Layer {
                 rgb: [0.0; 3],
@@ -3997,30 +4076,27 @@ mod composite_layer_tests {
                 tint: [0.0, 1.0, 0.0],
             },
         ];
-        let actual = composite_layers(layers, [0.0; 4])?;
+        let actual = composite_layers(layers, [0.0; 4]);
         assert_close(actual, [0.0, 0.0, 0.0, 8.0 / 9.0]);
-        Ok(())
     }
 
     /// A white layer is the scalar composite: colour (0.8,0.2,0.4) at opacity 0.25 over an opaque background of
     /// (0.5,0.5,0.5). The colour is 0.25 * (0.8,0.2,0.4) + 0.75 * (0.5,0.5,0.5) = (0.575,0.425,0.475), alpha 1.
     #[test]
-    fn white_layer_is_the_scalar_composite() -> super::Result<()> {
+    fn white_layer_is_the_scalar_composite() {
         let layers = [Layer {
             rgb: [0.8, 0.2, 0.4],
             opacity: 0.25,
             tint: [1.0; 3],
         }];
-        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 1.0])?;
+        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 1.0]);
         assert_close(actual, [0.575, 0.425, 0.475, 1.0]);
-        Ok(())
     }
 
     /// No layer over a fully transparent background is that background, as the film has nothing to show.
     #[test]
-    fn empty_stack_over_transparent_background_is_the_background() -> super::Result<()> {
-        let actual = composite_layers(std::iter::empty(), [0.3, 0.4, 0.5, 0.0])?;
+    fn empty_stack_over_transparent_background_is_the_background() {
+        let actual = composite_layers(std::iter::empty(), [0.3, 0.4, 0.5, 0.0]);
         assert_close(actual, [0.3, 0.4, 0.5, 0.0]);
-        Ok(())
     }
 }

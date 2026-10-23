@@ -12,9 +12,11 @@ Three scenes, each on a black world, rendered by EEVEE and saved as `.blend` for
   spot's radiance on axis is the sphere-light formula `P / (4 π² r²)`.
 
 Rows are reported top-down, as Potter's images are indexed. Passing `-` for each render output saves the three `.blend`
-files without rendering; tests use the committed macOS f32le captures.
+files without rendering; tests use the committed macOS f32le captures. The absorber has a second render at froxel tile
+size 1, in addition to the default tile size 8.
 
-Arguments after `--`: sun_blend, spot_blend, absorber_blend, json_out, sun_exr, spot_exr, absorber_exr.
+Arguments after `--`: sun_blend, spot_blend, absorber_blend, json_out, sun_exr, spot_exr, absorber_exr,
+absorber_tile1_exr.
 """
 
 import json
@@ -46,9 +48,9 @@ SPOT_ENERGY = 5.0
 SLAB_DENSITY = 0.5
 SLAB_THICKNESS = 2.0
 
-sun_blend, spot_blend, absorber_blend, json_out, sun_exr, spot_exr, absorber_exr = sys.argv[
+sun_blend, spot_blend, absorber_blend, json_out, sun_exr, spot_exr, absorber_exr, absorber_tile1_exr = sys.argv[
     sys.argv.index("--") + 1 :
-][:7]
+][:8]
 render_eevee = all(path != "-" for path in (sun_exr, spot_exr, absorber_exr))
 
 
@@ -205,6 +207,13 @@ result["absorber_transmittance"] = result["area_through_absorber_mean_red"] / re
 result["absorber_density"] = SLAB_DENSITY
 result["absorber_thickness"] = SLAB_THICKNESS
 result["beer_lambert_reference"] = math.exp(-SLAB_DENSITY * SLAB_THICKNESS)
+
+if absorber_tile1_exr != "-":
+    scene.eevee.volumetric_tile_size = "1"
+    absorber_tile1_pixels = render_and_read(scene, absorber_tile1_exr)
+    result["absorber_tile1_mean_red"] = window_mean(
+        absorber_tile1_pixels, area_column, RESOLUTION // 2
+    )
 with open(json_out, "w") as handle:
     json.dump(result, handle, indent=2)
 print("WROTE", json_out, json.dumps(result))

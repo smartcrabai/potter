@@ -38,6 +38,10 @@ use super::subsurface_walk::{
     walk_radius, walk_uses_van_de_hulst,
 };
 use super::{
+    eevee_volume_resolve::{
+        FroxelTextureLayout, LinearSampleWeights, VolumeDepthMapping, VolumeProjection,
+        linear_sample_weights, resolve_z_with_end_of_slice_bias, screen_uv_to_resolve_uv,
+    },
     bvh::{Bvh, BvhHit, WalkRay},
     light_model::{
         AreaShape, Spread, area_radiance, area_shape, emitter_radiance, influence_fade,
@@ -47,8 +51,8 @@ use super::{
     pixel_filter::PixelFilter,
     raster::{
         Camera, CameraFrame, Mode, RasterOutput, StereoMode, Triangle, blend_corner_normals,
-        camera_eye, camera_frame, color_to_srgba, rasterize_with_lines, ray_for_sample,
-        ray_for_sample_in_frame, smooth_shadow_origin,
+        camera_eye, camera_frame, rasterize_with_lines, ray_for_sample_in_frame,
+        smooth_shadow_origin,
     },
     scene::{
         ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space,
@@ -1504,78 +1508,69 @@ pub(super) fn render(
     Ok(output)
 }
 
-/// Draws the camera-visible lights into the realtime Beauty image, as EEVEE's light shape display does
-/// (`eevee_light_shape_display.bsl.hh`, `eevee_light.cc` `shape_display_ps_`, blended additively over the combined
-/// buffer). A pixel whose camera ray meets a light with camera visibility on, before any surface, takes the light's
-/// emitter radiance. That is `nearest_light_hit`, the path tracer's camera-ray meeting, so both engines share one
-/// emitter radiance (`emitter_radiance` for points and spots, `area_radiance` for area lights).
-pub(super) fn add_camera_light_shapes(
-    doc: &SceneDoc,
-    snapshot: &Snapshot,
-    geometry: &Geometry,
-    camera: &Camera,
-    width: u32,
-    height: u32,
-    output: &mut RasterOutput,
-) -> Result<()> {
-    let lights = collect_lights(doc, snapshot);
-    let suns = camera_sun_discs(doc, snapshot);
-    if !lights.iter().any(|light| light.intersects(RayKind::Camera)) && suns.is_empty() {
-        return Ok(());
-    }
-    let bvh = Bvh::build(&geometry.triangles)?;
-    for y in 0..height {
-        for x in 0..width {
-            let Some((origin, direction)) = ray_for_sample(camera, width, height, x, y, 0.5, 0.5)?
-            else {
-                continue;
-            };
-            let surface = closest_hit(
-                &TraceGeometry::of(geometry),
-                &bvh,
-                origin,
-                direction,
-                RAY_EPSILON,
-                f64::INFINITY,
-                RayKind::Camera,
-            )
-            .map_or(f64::INFINITY, |hit| hit.distance);
-            let mut radiance =
-                nearest_light_hit(&lights, origin, direction, origin, surface, RayKind::Camera)
-                    .map_or(DVec3::ZERO, |light| light.radiance);
-            // A sun is at infinity, so its disc is behind every surface: EEVEE's depth test is against the far plane.
-            if surface.is_infinite() {
-                for sun in &suns {
-                    if direction.dot(sun.to_sun) >= sun.cos_half_angle {
-                        radiance += sun.radiance;
-                    }
-                }
-            }
-            if radiance.max_element() <= 0.0 {
-                continue;
-            }
-            let index = usize::try_from(y)
-                .ok()
-                .and_then(|row| row.checked_mul(usize::try_from(width).ok()?))
-                .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "pixel index exceeds platform limits",
-                    )
-                })?;
-            let [red, green, blue, alpha] = output.linear_rgba[index];
-            let linear = [
-                f64::from(red) + radiance.x,
-                f64::from(green) + radiance.y,
-                f64::from(blue) + radiance.z,
-                f64::from(alpha),
-            ];
-            output.linear_rgba[index] = linear.map(|value| value as f32);
-            output.rgba[index * 4..index * 4 + 4].copy_from_slice(&color_to_srgba(linear));
+/// Per-render camera light data. Realtime volume transport already owns the collected point lights; otherwise the
+/// camera pass collects them once here.
+enum RealtimeCameraLights<'a> {
+    Borrowed(&'a [PointLight]),
+    Owned(Vec<PointLight>),
+}
+
+pub(super) struct RealtimeCameraLightContext<'a> {
+    lights: RealtimeCameraLights<'a>,
+    suns: Vec<SunDisc>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CameraLightEvent {
+    pub(super) distance: f64,
+    pub(super) radiance: DVec3,
+}
+
+impl RealtimeCameraLightContext<'_> {
+    fn lights(&self) -> &[PointLight] {
+        match &self.lights {
+            RealtimeCameraLights::Borrowed(lights) => lights,
+            RealtimeCameraLights::Owned(lights) => lights,
         }
     }
-    Ok(())
+
+    pub(super) fn local_events(
+        &self,
+        origin: DVec3,
+        direction: DVec3,
+        far_distance: f64,
+    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
+        self.lights().iter().filter_map(move |light| {
+            if !light.intersects(RayKind::Camera) {
+                return None;
+            }
+            let (distance, radiance, _) =
+                light_hit(light, origin, direction, origin, far_distance)?;
+            Some(CameraLightEvent { distance, radiance })
+        })
+    }
+
+    pub(super) fn sun_radiance(&self, direction: DVec3) -> DVec3 {
+        self.suns
+            .iter()
+            .filter(|sun| direction.dot(sun.to_sun) >= sun.cos_half_angle)
+            .fold(DVec3::ZERO, |radiance, sun| radiance + sun.radiance)
+    }
+}
+
+pub(super) fn prepare_realtime_camera_light_context<'a>(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    transport: Option<&'a RealtimeVolumeTransport<'_>>,
+) -> RealtimeCameraLightContext<'a> {
+    let lights = transport.map_or_else(
+        || RealtimeCameraLights::Owned(collect_lights(doc, snapshot)),
+        |transport| RealtimeCameraLights::Borrowed(&transport.lights),
+    );
+    RealtimeCameraLightContext {
+        lights,
+        suns: camera_sun_discs(doc, snapshot),
+    }
 }
 
 /// A sun light's disc, as EEVEE draws it (`eevee_light_shape_display.bsl.hh`, `shape_display_light_radiance_get`).
@@ -1643,6 +1638,85 @@ fn geometry_has_volume_material(geometry: &Geometry) -> bool {
                 && material.volume_density > 0.0)
     })
 }
+/// The view-depth extent of all camera-visible volume objects, matching EEVEE's object integration bounds.
+fn realtime_volume_depth_bounds(
+    geometry: &Geometry,
+    volumes: &[VolumeInstance<'_>],
+    camera: Camera,
+) -> Option<(f64, f64)> {
+    let mut depth_min = f64::INFINITY;
+    let mut depth_max = f64::NEG_INFINITY;
+    let mut include_point = |point: DVec3| {
+        let depth = camera.depth_of(point);
+        depth_min = depth_min.min(depth);
+        depth_max = depth_max.max(depth);
+    };
+
+    for triangle in &geometry.triangles {
+        if triangle.ray_mask & RayKind::Camera.bit() == 0 {
+            continue;
+        }
+        let Some(material) = geometry.materials.get(triangle.material_index) else {
+            continue;
+        };
+        let is_volume = geometry
+            .prepared
+            .get(triangle.material_index)
+            .is_some_and(PreparedMaterial::has_volume_output)
+            || (material.node_tree.is_none()
+                && material.volume_density.is_finite()
+                && material.volume_density > 0.0);
+        if is_volume {
+            for point in triangle.positions {
+                include_point(point);
+            }
+        }
+    }
+
+    for volume in volumes {
+        if volume.ray_mask & RayKind::Camera.bit() == 0 {
+            continue;
+        }
+        let local_to_world = volume.world_to_local.inverse();
+        for x in [volume.bounds_min.x, volume.bounds_max.x] {
+            for y in [volume.bounds_min.y, volume.bounds_max.y] {
+                for z in [volume.bounds_min.z, volume.bounds_max.z] {
+                    include_point(local_to_world.transform_point3(DVec3::new(x, y, z)));
+                }
+            }
+        }
+    }
+
+    (depth_min.is_finite() && depth_max.is_finite()).then_some((depth_min, depth_max))
+}
+fn scene_has_world_volume(doc: &SceneDoc, scene_id: &str) -> bool {
+    let Some(scene) = doc.scenes.get(scene_id) else {
+        return false;
+    };
+    let Some(world) = scene
+        .world
+        .as_ref()
+        .and_then(|world_id| doc.worlds.get(world_id))
+    else {
+        return false;
+    };
+    let Some(tree) = world
+        .node_tree
+        .as_ref()
+        .and_then(|tree_id| doc.node_groups.get(tree_id))
+    else {
+        return false;
+    };
+    tree.links.iter().any(|link| {
+        link.to_socket == "Volume"
+            && tree
+                .nodes
+                .get(&link.to_node)
+                .is_some_and(|node| node.node_type == "ShaderNodeOutputWorld")
+    })
+}
+
+
 pub(super) struct RealtimeVolumeTransport<'a> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
@@ -1663,7 +1737,22 @@ pub(super) struct RealtimeVolumeScratch {
     hit_media: Vec<MeshMedium>,
     boundaries: Vec<(f64, MeshMedium)>,
     evaluator_workspace: EvaluatorWorkspace,
+    froxel_optical_depth: Vec<DVec3>,
+    froxel_resolve: Option<RealtimeVolumeResolveCache>,
 }
+
+struct RealtimeVolumeResolveCache {
+    layout: FroxelTextureLayout,
+    depth_mapping: VolumeDepthMapping,
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    slice_count: usize,
+    history_samples: u32,
+    depth_start: f64,
+    columns: BTreeMap<usize, Vec<DVec3>>,
+}
+
 
 pub(super) struct RealtimeVolumePass<'pass, 'scene> {
     transport: &'pass RealtimeVolumeTransport<'scene>,
@@ -1690,6 +1779,15 @@ pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
     transport: &'sample RealtimeVolumeTransport<'scene>,
     geometry: &'sample Geometry,
     scratch: &'sample mut RealtimeVolumeScratch,
+    camera: Camera,
+    frame: CameraFrame,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    sample_x: f64,
+    sample_y: f64,
+    seed: u32,
     origin: DVec3,
     direction: DVec3,
     pub(super) far_distance: f64,
@@ -1707,6 +1805,7 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
         scratch: &'pass mut RealtimeVolumeScratch,
         seed: u32,
     ) -> Self {
+        scratch.froxel_resolve = None;
         Self {
             transport,
             geometry,
@@ -1737,6 +1836,15 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
             transport: self.transport,
             geometry: self.geometry,
             scratch: &mut *self.scratch,
+            camera: *sample.camera,
+            frame: *sample.frame,
+            width: sample.width,
+            height: sample.height,
+            x: sample.x,
+            y: sample.y,
+            sample_x: sample.sample_x,
+            sample_y: sample.sample_y,
+            seed: self.seed,
             origin: sample.ray.0,
             direction: sample.ray.1,
             far_distance: sample
@@ -1753,11 +1861,308 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
     }
 }
 
+
 impl RealtimeVolumeSample<'_, '_> {
     pub(super) fn integrate_segment(
         &mut self,
         start_distance: f64,
         end_distance: f64,
+    ) -> Result<(DVec3, DVec3)> {
+        self.integrate_segment_with_sources(start_distance, end_distance, true)
+    }
+
+    /// Returns EEVEE's filtered cumulative froxel attenuation to a camera-visible light event.
+    pub(super) fn transmittance_to(&mut self, end_distance: f64) -> Result<DVec3> {
+        self.resolve_froxel_transmittance_to(end_distance)
+    }
+
+    /// Resolves the cumulative froxel transmittance with EEVEE's XY/Z texture filtering.
+    fn resolve_froxel_transmittance_to(&mut self, end_distance: f64) -> Result<DVec3> {
+        if !self.initialize_froxel_resolve()? {
+            return Ok(DVec3::ONE);
+        }
+        let event_depth = self.camera.depth_of(self.origin + self.direction * end_distance);
+        let (x_weights, y_weights, z_weights, grid_width) = {
+            let cache = self
+                .scratch
+                .froxel_resolve
+                .as_ref()
+                .expect("initialized froxel resolve cache");
+            let coord_z = resolve_z_with_end_of_slice_bias(
+                cache
+                    .depth_mapping
+                    .view_z_to_volume_z(-event_depth as f32),
+                cache.slice_count,
+            );
+            let screen_uv = [
+                (f64::from(self.x) + self.sample_x) / f64::from(cache.width),
+                1.0 - (f64::from(self.y) + self.sample_y) / f64::from(cache.height),
+            ];
+            let resolve_uv = screen_uv_to_resolve_uv(
+                [screen_uv[0] as f32, screen_uv[1] as f32],
+                cache.layout.coord_scale,
+            );
+            (
+                linear_sample_weights(resolve_uv[0], cache.layout.dimensions[0] as usize),
+                linear_sample_weights(resolve_uv[1], cache.layout.dimensions[1] as usize),
+                linear_sample_weights(coord_z, cache.slice_count),
+                cache.layout.dimensions[0] as usize,
+            )
+        };
+
+        for x in [x_weights.lower_index, x_weights.upper_index] {
+            for y in [y_weights.lower_index, y_weights.upper_index] {
+                let column = y * grid_width + x;
+                let column_is_missing = !self
+                    .scratch
+                    .froxel_resolve
+                    .as_ref()
+                    .expect("initialized froxel resolve cache")
+                    .columns
+                    .contains_key(&column);
+                if column_is_missing {
+                    let prefix = self.build_froxel_column(column)?;
+                    let _ = self
+                        .scratch
+                        .froxel_resolve
+                        .as_mut()
+                        .expect("initialized froxel resolve cache")
+                        .columns
+                        .insert(column, prefix);
+                }
+            }
+        }
+
+        let cache = self.scratch.froxel_resolve.as_ref().unwrap();
+        let mut transmittance = DVec3::ZERO;
+        for (x, x_weight) in axis_weights(x_weights) {
+            for (y, y_weight) in axis_weights(y_weights) {
+                let column = cache
+                    .columns
+                    .get(&(y * cache.layout.dimensions[0] as usize + x))
+                    .expect("queried froxel column was prepared");
+                let z_value = axis_sample(column, z_weights);
+                transmittance += z_value * (x_weight * y_weight);
+            }
+        }
+        Ok(transmittance)
+    }
+
+    fn initialize_froxel_resolve(&mut self) -> Result<bool> {
+        if self.scratch.froxel_resolve.is_some() {
+            return Ok(true);
+        }
+        let scene = self
+            .transport
+            .doc
+            .scenes
+            .get(&self.transport.snapshot.scene_id)
+            .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
+        let settings = &scene.render;
+        let mut depth_start = if settings.eevee_use_volume_custom_range {
+            settings.eevee_volumetric_start
+        } else {
+            self.camera.near
+        };
+        let mut depth_end = if settings.eevee_use_volume_custom_range {
+            settings.eevee_volumetric_end
+        } else {
+            self.camera.far
+        };
+        if !scene_has_world_volume(
+            self.transport.doc,
+            &self.transport.snapshot.scene_id,
+        ) {
+            if let Some((object_depth_min, object_depth_max)) =
+                realtime_volume_depth_bounds(self.geometry, &self.transport.volumes, self.camera)
+            {
+                depth_start = depth_start.max(object_depth_min);
+                depth_end = depth_end.min(object_depth_max);
+            }
+        }
+        depth_start = depth_start.max(self.camera.near - 1.0e-4);
+        depth_end = depth_end.min(self.camera.far + 1.0e-4);
+        if !depth_start.is_finite() || !depth_end.is_finite() || depth_end <= depth_start {
+            return Ok(false);
+        }
+
+        let tile_size = settings.eevee_volumetric_tile_size;
+        let layout = FroxelTextureLayout::new(self.width, self.height, tile_size);
+        let slice_count = settings.eevee_volumetric_samples as usize;
+        let projection = if matches!(
+            self.camera.projection,
+            super::raster::Projection::Perspective { .. }
+        ) {
+            VolumeProjection::Perspective
+        } else {
+            VolumeProjection::Orthographic
+        };
+        // EEVEE's view-space Z is negative in front of the camera. Its range is clipped to the
+        // camera and, without a world volume, to `VolumePipeline::object_integration_range()`.
+        let depth_mapping = VolumeDepthMapping::new(
+            projection,
+            -depth_start as f32,
+            -depth_end as f32,
+            settings.eevee_volumetric_sample_distribution as f32,
+        );
+        self.scratch.froxel_resolve = Some(RealtimeVolumeResolveCache {
+            layout,
+            depth_mapping,
+            width: self.width,
+            height: self.height,
+            tile_size,
+            slice_count,
+            history_samples: scene.render.samples.max(1),
+            depth_start,
+            columns: BTreeMap::new(),
+        });
+        Ok(true)
+    }
+
+    /// Builds one EEVEE froxel column by averaging per-cell extinction over the native Halton
+    /// projection jitters before integrating prefix transmittance.
+    fn build_froxel_column(&mut self, column_index: usize) -> Result<Vec<DVec3>> {
+        let slice_count = self
+            .scratch
+            .froxel_resolve
+            .as_ref()
+            .expect("froxel resolve cache is initialized")
+            .slice_count;
+        self.accumulate_froxel_extinction(column_index)?;
+        let inverse_history_samples = 1.0
+            / f64::from(
+                self.scratch
+                    .froxel_resolve
+                    .as_ref()
+                    .expect("froxel resolve cache is initialized")
+                    .history_samples,
+            );
+        let mut cumulative_optical_depth = DVec3::ZERO;
+        let mut prefix = Vec::with_capacity(slice_count);
+        for slice_optical_depth in &self.scratch.froxel_optical_depth {
+            cumulative_optical_depth += *slice_optical_depth * inverse_history_samples;
+            prefix.push(DVec3::new(
+                (-cumulative_optical_depth.x).exp(),
+                (-cumulative_optical_depth.y).exp(),
+                (-cumulative_optical_depth.z).exp(),
+            ));
+        }
+        Ok(prefix)
+    }
+
+    /// Accumulates each froxel's extinction over EEVEE's native Halton projection jitters.
+    fn accumulate_froxel_extinction(&mut self, column_index: usize) -> Result<()> {
+        let cache = self
+            .scratch
+            .froxel_resolve
+            .as_ref()
+            .expect("froxel resolve cache is initialized");
+        let dimensions = cache.layout.dimensions;
+        let tile_size = cache.tile_size;
+        let slice_count = cache.slice_count;
+        let history_samples = cache.history_samples;
+        let depth_start = cache.depth_start;
+        let depth_mapping = cache.depth_mapping;
+        let width = cache.width;
+        let height = cache.height;
+        let cell_x = column_index as u32 % dimensions[0];
+        let cell_y = column_index as u32 / dimensions[0];
+        let cell_y_from_top = dimensions[1] - 1 - cell_y;
+        self.scratch.froxel_optical_depth.clear();
+        self.scratch
+            .froxel_optical_depth
+            .resize(slice_count, DVec3::ZERO);
+        let saved = (
+            self.origin,
+            self.direction,
+            self.near_distance,
+            self.far_distance,
+            self.footprint,
+            self.rng.clone(),
+            self.ambient,
+        );
+
+        for history_index in 0..history_samples {
+            let [jitter_x, jitter_y] = eevee_volume_jitter(history_index);
+            let pixel_x =
+                (f64::from(cell_x) + 0.5) * f64::from(tile_size)
+                    - jitter_x * f64::from(tile_size) * 0.5;
+            let pixel_y = (f64::from(cell_y_from_top) + 0.5) * f64::from(tile_size)
+                + jitter_y * f64::from(tile_size) * 0.5;
+            let raster_x = pixel_x.floor().clamp(0.0, f64::from(width - 1)) as u32;
+            let raster_y = pixel_y.floor().clamp(0.0, f64::from(height - 1)) as u32;
+            let sample_x = pixel_x - f64::from(raster_x);
+            let sample_y = pixel_y - f64::from(raster_y);
+            let Some((origin, direction)) = ray_for_sample_in_frame(
+                &self.frame,
+                &self.camera,
+                width,
+                height,
+                raster_x,
+                raster_y,
+                sample_x,
+                sample_y,
+            )?
+            else {
+                continue;
+            };
+            let footprint = camera_footprint(
+                &self.frame,
+                &self.camera,
+                width,
+                height,
+                raster_x,
+                raster_y,
+                sample_x,
+                sample_y,
+                (origin, direction),
+            )?;
+            self.origin = origin;
+            self.direction = direction;
+            self.near_distance = self.camera.ray_distance_for_depth(direction, self.camera.near);
+            self.far_distance = self.camera.ray_distance_for_depth(direction, self.camera.far);
+            self.footprint = footprint;
+            self.rng = Pcg32::for_sample(self.seed, raster_x, raster_y, history_index);
+            self.ambient = None;
+            self.mesh_prepared = false;
+
+            for slice in 0..slice_count {
+                let z_end = (slice + 1) as f32 / slice_count as f32;
+                let slice_depth = -f64::from(depth_mapping.volume_z_to_view_z(z_end));
+                let slice_start_depth = if slice == 0 {
+                    depth_start
+                } else {
+                    -f64::from(
+                        depth_mapping
+                            .volume_z_to_view_z(slice as f32 / slice_count as f32),
+                    )
+                };
+                let start_distance =
+                    self.camera.ray_distance_for_depth(direction, slice_start_depth);
+                let end_distance = self.camera.ray_distance_for_depth(direction, slice_depth);
+                let (_, transmittance) =
+                    self.integrate_segment_with_sources(start_distance, end_distance, false)?;
+                self.scratch.froxel_optical_depth[slice] +=
+                    transmittance_optical_depth(transmittance);
+            }
+        }
+
+        self.origin = saved.0;
+        self.direction = saved.1;
+        self.near_distance = saved.2;
+        self.far_distance = saved.3;
+        self.footprint = saved.4;
+        self.rng = saved.5;
+        self.ambient = saved.6;
+        self.mesh_prepared = false;
+        Ok(())
+    }
+
+    fn integrate_segment_with_sources(
+        &mut self,
+        start_distance: f64,
+        end_distance: f64,
+        include_sources: bool,
     ) -> Result<(DVec3, DVec3)> {
         if end_distance <= start_distance {
             return Ok((DVec3::ZERO, DVec3::ONE));
@@ -1814,12 +2219,82 @@ impl RealtimeVolumeSample<'_, '_> {
                 self.scratch,
                 &mut self.rng,
                 &mut self.ambient,
+                include_sources,
             )
         } else {
-            let (radiance, transmittance) =
-                realtime_voxel_integral(transport, ray, &mut self.rng, &mut self.ambient)?;
+            let (radiance, transmittance) = realtime_voxel_integral(
+                transport,
+                ray,
+                &mut self.rng,
+                &mut self.ambient,
+                include_sources,
+            )?;
             Ok((radiance, DVec3::splat(transmittance)))
         }
+    }
+}
+
+fn axis_weights(weights: LinearSampleWeights) -> [(usize, f64); 2] {
+    let upper = f64::from(weights.upper_weight);
+    [
+        (weights.lower_index, 1.0 - upper),
+        (weights.upper_index, upper),
+    ]
+}
+
+fn axis_sample(values: &[DVec3], weights: LinearSampleWeights) -> DVec3 {
+    let [(lower_index, lower_weight), (upper_index, upper_weight)] = axis_weights(weights);
+    values[lower_index] * lower_weight + values[upper_index] * upper_weight
+}
+
+fn transmittance_optical_depth(transmittance: DVec3) -> DVec3 {
+    DVec3::new(
+        -transmittance.x.max(f64::MIN_POSITIVE).ln(),
+        -transmittance.y.max(f64::MIN_POSITIVE).ln(),
+        -transmittance.z.max(f64::MIN_POSITIVE).ln(),
+    )
+}
+
+/// EEVEE's volume projection jitter, from `eevee_sampling.cc:231-241` and
+/// `eevee_volume.cc:413-421`.
+fn eevee_volume_jitter(sample_index: u32) -> [f64; 2] {
+    let index = sample_index + 1;
+    let volume_u = fract(halton(index, 2) + 0.5);
+    let volume_v = fract(halton(index, 3) + 2.0 / 3.0);
+    [
+        fract(volume_u + 0.5) * 2.0 - 1.0,
+        fract(volume_v + 0.5) * 2.0 - 1.0,
+    ]
+}
+
+fn halton(mut index: u32, base: u32) -> f64 {
+    let reciprocal_base = 1.0 / f64::from(base);
+    let mut fraction = reciprocal_base;
+    let mut value = 0.0;
+    while index != 0 {
+        value += f64::from(index % base) * fraction;
+        index /= base;
+        fraction *= reciprocal_base;
+    }
+    value
+}
+
+fn fract(value: f64) -> f64 {
+    value - value.floor()
+}
+
+#[cfg(test)]
+mod volume_jitter_tests {
+    use super::eevee_volume_jitter;
+
+    #[test]
+    fn volume_projection_jitter_matches_blender_halton_sequence() {
+        let first = eevee_volume_jitter(0);
+        assert!(first.into_iter().all(|coordinate| coordinate.abs() <= f64::EPSILON));
+
+        let second = eevee_volume_jitter(1);
+        assert!((second[0] + 0.5).abs() < 1.0e-15);
+        assert!((second[1] - 2.0 / 3.0).abs() < 1.0e-15);
     }
 }
 
@@ -1959,6 +2434,7 @@ fn realtime_mesh_volume_integral(
     scratch: &mut RealtimeVolumeScratch,
     rng: &mut Pcg32,
     ambient_cache: &mut Option<DVec3>,
+    include_sources: bool,
 ) -> Result<(DVec3, DVec3)> {
     let transport = query.transport;
     let origin = ray.origin;
@@ -1980,7 +2456,7 @@ fn realtime_mesh_volume_integral(
             .any(|(distance, _)| *distance <= max_distance);
     if !has_mesh_medium {
         let (radiance, transmittance) =
-            realtime_voxel_integral(transport, ray, rng, ambient_cache)?;
+            realtime_voxel_integral(transport, ray, rng, ambient_cache, include_sources)?;
         return Ok((radiance, DVec3::splat(transmittance)));
     }
 
@@ -2037,7 +2513,7 @@ fn realtime_mesh_volume_integral(
     let exit = mesh_exit.max(voxel_exit).min(max_distance);
     if !entry.is_finite() || exit <= entry {
         let (radiance, transmittance) =
-            realtime_voxel_integral(transport, ray, rng, ambient_cache)?;
+            realtime_voxel_integral(transport, ray, rng, ambient_cache, include_sources)?;
         return Ok((radiance, DVec3::splat(transmittance)));
     }
     let voxel_step = if minimum_step.is_finite() {
@@ -2054,7 +2530,11 @@ fn realtime_mesh_volume_integral(
     };
     let step = voxel_step.min(mesh_step).min((exit - entry) / 64.0);
     let meters_per_unit = transport.meters_per_unit;
-    let ambient = realtime_world_ambient(transport, -direction, ambient_cache)?;
+    let ambient = if include_sources {
+        realtime_world_ambient(transport, -direction, ambient_cache)?
+    } else {
+        DVec3::ZERO
+    };
     let mut integrator = RealtimeMeshIntegrator {
         query,
         origin,
@@ -2067,6 +2547,7 @@ fn realtime_mesh_volume_integral(
         step,
         rng,
         evaluator_workspace,
+        include_sources,
         radiance: DVec3::ZERO,
         transmittance: DVec3::ONE,
     };
@@ -2118,6 +2599,7 @@ struct RealtimeMeshIntegrator<'a, 'v, 'r> {
     voxel_exit: f64,
     step: f64,
     rng: &'r mut Pcg32,
+    include_sources: bool,
     evaluator_workspace: &'r mut EvaluatorWorkspace,
     radiance: DVec3,
     transmittance: DVec3,
@@ -2133,12 +2615,20 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
         let step = length / steps as f64;
         let stack = stack_medium(media);
         let mesh_extinction = stack.map_or(DVec3::ZERO, |medium| medium_extinction(&medium));
-        let mesh_emission = stack.map_or(DVec3::ZERO, |medium| {
-            DVec3::from_array(medium.volume_emission)
-        });
-        let mesh_scatter = stack.map_or(DVec3::ZERO, |medium| {
-            DVec3::from_array(medium.volume_scatter)
-        });
+        let mesh_emission = if self.include_sources {
+            stack.map_or(DVec3::ZERO, |medium| {
+                DVec3::from_array(medium.volume_emission)
+            })
+        } else {
+            DVec3::ZERO
+        };
+        let mesh_scatter = if self.include_sources {
+            stack.map_or(DVec3::ZERO, |medium| {
+                DVec3::from_array(medium.volume_scatter)
+            })
+        } else {
+            DVec3::ZERO
+        };
         for index in 0..steps {
             let distance = start + (index as f64 + 0.5) * step;
             let point = self.origin + self.direction * distance;
@@ -2156,9 +2646,16 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                     let density = volume_density_at(instance, point)?;
                     let extinction = volume_extinction_density(instance, density);
                     voxel_extinction += extinction;
-                    let scattering = if instance.scattering { extinction } else { 0.0 };
-                    voxel_source += instance.emission + self.ambient * instance.albedo * scattering;
-                    if scattering > 0.0 {
+                    let scattering = if self.include_sources && instance.scattering {
+                        extinction
+                    } else {
+                        0.0
+                    };
+                    if self.include_sources {
+                        voxel_source +=
+                            instance.emission + self.ambient * instance.albedo * scattering;
+                    }
+                    if self.include_sources && scattering > 0.0 {
                         for light in &self.query.transport.lights {
                             if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
                                 continue;
@@ -2192,7 +2689,7 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                     }
                 }
             }
-            if mesh_scatter != DVec3::ZERO {
+            if self.include_sources && mesh_scatter != DVec3::ZERO {
                 let scene = self.query.scene;
                 for light in &self.query.transport.lights {
                     if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
@@ -2236,17 +2733,25 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
             }
             let extinction =
                 mesh_extinction + DVec3::splat(voxel_extinction * self.meters_per_unit);
-            let source = mesh_source + voxel_source * self.meters_per_unit;
-            let (attenuation_x, source_distance_x) =
-                homogeneous_segment_integral(extinction.x, step);
-            let (attenuation_y, source_distance_y) =
-                homogeneous_segment_integral(extinction.y, step);
-            let (attenuation_z, source_distance_z) =
-                homogeneous_segment_integral(extinction.z, step);
-            let attenuation = DVec3::new(attenuation_x, attenuation_y, attenuation_z);
-            let source_distance =
-                DVec3::new(source_distance_x, source_distance_y, source_distance_z);
-            self.radiance += self.transmittance * source * source_distance;
+            let attenuation = if self.include_sources {
+                let source = mesh_source + voxel_source * self.meters_per_unit;
+                let (attenuation_x, source_distance_x) =
+                    homogeneous_segment_integral(extinction.x, step);
+                let (attenuation_y, source_distance_y) =
+                    homogeneous_segment_integral(extinction.y, step);
+                let (attenuation_z, source_distance_z) =
+                    homogeneous_segment_integral(extinction.z, step);
+                let source_distance =
+                    DVec3::new(source_distance_x, source_distance_y, source_distance_z);
+                self.radiance += self.transmittance * source * source_distance;
+                DVec3::new(attenuation_x, attenuation_y, attenuation_z)
+            } else {
+                DVec3::new(
+                    homogeneous_segment_transmittance(extinction.x, step),
+                    homogeneous_segment_transmittance(extinction.y, step),
+                    homogeneous_segment_transmittance(extinction.z, step),
+                )
+            };
             self.transmittance *= attenuation;
         }
         Ok(())
@@ -2258,6 +2763,7 @@ fn realtime_voxel_integral(
     ray: RealtimeVolumeRay,
     rng: &mut Pcg32,
     ambient_cache: &mut Option<DVec3>,
+    include_sources: bool,
 ) -> Result<(DVec3, f64)> {
     let RealtimeVolumeRay {
         origin,
@@ -2299,7 +2805,11 @@ fn realtime_voxel_integral(
         .volumes
         .first()
         .map_or(1.0, |instance| instance.meters_per_unit);
-    let ambient = realtime_world_ambient(transport, -direction, ambient_cache)?;
+    let ambient = if include_sources {
+        realtime_world_ambient(transport, -direction, ambient_cache)?
+    } else {
+        DVec3::ZERO
+    };
     let mut transmittance = 1.0;
     let mut radiance = DVec3::ZERO;
     for index in 0..step_count {
@@ -2315,50 +2825,57 @@ fn realtime_voxel_integral(
             let density = volume_density_at(instance, point)?;
             let extinction_coefficient = volume_extinction_density(instance, density);
             extinction += extinction_coefficient;
-            let scattering_coefficient = if instance.scattering {
+            let scattering_coefficient = if include_sources && instance.scattering {
                 extinction_coefficient
             } else {
                 0.0
             };
-            source += instance.emission;
-            if instance.scattering {
-                source += ambient * instance.albedo * scattering_coefficient;
-                for light in &transport.lights {
-                    if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
-                        continue;
+            if include_sources {
+                source += instance.emission;
+                if instance.scattering {
+                    source += ambient * instance.albedo * scattering_coefficient;
+                    for light in &transport.lights {
+                        if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
+                            continue;
+                        }
+                        // EEVEE's volume in-scatter of a light is its power per class, `volume_factor`, times its influence.
+                        let gain = light.volume_factor * light.volume_fade(point);
+                        if gain <= 0.0 {
+                            continue;
+                        }
+                        let Some(sample) = sample_light(light, point, rng) else {
+                            continue;
+                        };
+                        let visibility = if transport.volumetric_shadows {
+                            march_volumes_with_budget(
+                                &transport.volumes,
+                                point,
+                                sample.direction,
+                                sample.distance,
+                                Some(rng),
+                                16,
+                                RayKind::Shadow,
+                            )?
+                        } else {
+                            1.0
+                        };
+                        let phase = instance.phase_density(direction.dot(sample.direction));
+                        source += instance.albedo
+                            * sample.radiance
+                            * (scattering_coefficient * phase * visibility * gain);
                     }
-                    // EEVEE's volume in-scatter of a light is its power per class, `volume_factor`, times its influence.
-                    let gain = light.volume_factor * light.volume_fade(point);
-                    if gain <= 0.0 {
-                        continue;
-                    }
-                    let Some(sample) = sample_light(light, point, rng) else {
-                        continue;
-                    };
-                    let visibility = if transport.volumetric_shadows {
-                        march_volumes_with_budget(
-                            &transport.volumes,
-                            point,
-                            sample.direction,
-                            sample.distance,
-                            Some(rng),
-                            16,
-                            RayKind::Shadow,
-                        )?
-                    } else {
-                        1.0
-                    };
-                    let phase = instance.phase_density(direction.dot(sample.direction));
-                    source += instance.albedo
-                        * sample.radiance
-                        * (scattering_coefficient * phase * visibility * gain);
                 }
             }
         }
         let step_in_meters = step * meters_per_unit;
-        let (attenuation, source_distance) =
-            homogeneous_segment_integral(extinction, step_in_meters);
-        radiance += source * (transmittance * source_distance);
+        let attenuation = if include_sources {
+            let (attenuation, source_distance) =
+                homogeneous_segment_integral(extinction, step_in_meters);
+            radiance += source * (transmittance * source_distance);
+            attenuation
+        } else {
+            homogeneous_segment_transmittance(extinction, step_in_meters)
+        };
         transmittance *= attenuation;
     }
     Ok((radiance, transmittance.clamp(0.0, 1.0)))
@@ -3509,6 +4026,7 @@ fn overlay_rasterized_lines(
         0.0,
         None,
         geometry.prepared.as_slice(),
+        None,
         None,
     )?;
     for index in 0..output.ids.len() {
@@ -5713,10 +6231,14 @@ fn collect_volumes<'a>(
     Ok(volumes)
 }
 
+fn homogeneous_segment_transmittance(extinction: f64, distance: f64) -> f64 {
+    (-extinction.max(0.0) * distance.max(0.0)).exp()
+}
+
 fn homogeneous_segment_integral(extinction: f64, distance: f64) -> (f64, f64) {
     let extinction = extinction.max(0.0);
     let distance = distance.max(0.0);
-    let transmittance = (-extinction * distance).exp();
+    let transmittance = homogeneous_segment_transmittance(extinction, distance);
     let source_distance = if extinction > 0.0 {
         -(-extinction * distance).exp_m1() / extinction
     } else {

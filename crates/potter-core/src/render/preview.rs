@@ -240,6 +240,7 @@ pub fn render_previews(
                 scene.render.filter_size,
                 shader.as_deref(),
                 None,
+                None,
             )?
         };
         match mode {
@@ -402,6 +403,15 @@ pub(crate) fn render_camera_frame(
     } else {
         None
     };
+    let realtime_camera_lights = if engine == "realtime" && matches!(mode, Mode::Beauty) {
+        Some(super::path::prepare_realtime_camera_light_context(
+            doc,
+            &snapshot,
+            realtime_volume_transport.as_ref(),
+        ))
+    } else {
+        None
+    };
     let mut volume_scratch = super::path::RealtimeVolumeScratch::default();
     let mut volume_pass = realtime_volume_transport.as_ref().map(|transport| {
         super::path::RealtimeVolumePass::new(transport, &geometry, &mut volume_scratch, seed)
@@ -438,21 +448,11 @@ pub(crate) fn render_camera_frame(
             seed,
             scene.render.filter_size,
             shader.as_deref(),
+            realtime_camera_lights.as_ref(),
             volume_pass.as_mut(),
         )?
     };
     drop(shader);
-    if engine == "realtime" && matches!(mode, Mode::Beauty) {
-        super::path::add_camera_light_shapes(
-            doc,
-            &snapshot,
-            &geometry,
-            &camera.camera,
-            width,
-            height,
-            &mut raster,
-        )?;
-    }
     crate::compositor::apply(
         &mut raster,
         doc,
@@ -703,6 +703,7 @@ fn rasterize_view(
     seed: u32,
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
+    camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     if !matches!(mode, Mode::Wire) {
@@ -720,6 +721,7 @@ fn rasterize_view(
             filter_size,
             shader,
             geometry.prepared.as_slice(),
+            camera_lights,
             volume_pass,
         );
     }
