@@ -225,10 +225,12 @@ fn sequencer_srgb_roundtrip_and_byte_transitions_preserve_storage_semantics()
 fn color_gamma_strip_values_round_trip_through_byte_and_sequencer_spaces()
 -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
+    // COLOR_GAMMA reaches the bridge as native f32 before the f64 scene-linear decode.
+    let gamma = [0.1_f32, 0.2, 0.3];
     let color = [
-        super::finite_f64_to_f32(crate::color::srgb_to_linear(0.1))?,
-        super::finite_f64_to_f32(crate::color::srgb_to_linear(0.2))?,
-        super::finite_f64_to_f32(crate::color::srgb_to_linear(0.3))?,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(f64::from(gamma[0])))?,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(f64::from(gamma[1])))?,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(f64::from(gamma[2])))?,
         1.0,
     ];
     let (doc, mut scene) = scene_with_strips(vec![color_strip(
