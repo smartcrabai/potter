@@ -131,7 +131,7 @@ struct WorldEvaluator<'a> {
     active: BTreeSet<(Id, String)>,
 }
 
-impl WorldEvaluator<'_> {
+impl<'a> WorldEvaluator<'a> {
     fn input(&mut self, id: &Id, socket: &str, fallback: WorldValue) -> Result<WorldValue> {
         if let Some(link) = self
             .group
@@ -141,7 +141,7 @@ impl WorldEvaluator<'_> {
         {
             return self.output(&link.from_node, &link.from_socket);
         }
-        let node = self.node(id)?;
+        let node = Self::node(self.group, id)?;
         let raw = node
             .inputs
             .iter()
@@ -158,14 +158,14 @@ impl WorldEvaluator<'_> {
                 format!("world graph cycle at node `{id}`"),
             ));
         }
-        let node = self.node(id)?.clone();
-        let result = self.eval_node(id, &node, socket);
+        let group = self.group;
+        let node = Self::node(group, id)?;
+        let result = self.eval_node(id, node, socket);
         self.active.remove(&key);
         result
     }
-
-    fn node(&self, id: &Id) -> Result<&GraphNode> {
-        self.group.nodes.get(id).ok_or_else(|| {
+    fn node(group: &'a NodeGroup, id: &Id) -> Result<&'a GraphNode> {
+        group.nodes.get(id).ok_or_else(|| {
             PotError::new(
                 ErrorCode::InvalidOperation,
                 format!("world graph references missing node `{id}`"),
