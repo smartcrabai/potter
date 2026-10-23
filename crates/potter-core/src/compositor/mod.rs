@@ -182,7 +182,7 @@ fn evaluate_graph_with_association(
                     alpha_over(node, &inputs, base, associated_alpha)?
                 }
                 "CompositorNodeBlur" | "Blur" => {
-                    let radius = property_u32(node, &["size_x", "radius"], 1)?.min(256);
+                    let radius = blur_radius(node)?.min(256);
                     gaussian_blur(&image, radius)?
                 }
                 "CompositorNodeGlare" | "Glare" => glare(node, &image)?,
@@ -509,17 +509,17 @@ fn alpha_over(
     base: &Image,
     associated_alpha: bool,
 ) -> Result<Image> {
-    let foreground = match inputs.get("Image").or_else(|| inputs.get("Foreground")) {
+    let foreground = match inputs.get("Foreground") {
         Some(image) => image.clone(),
         None => color_image(node, "foreground", base, [0.0; 3])?,
     };
-    let background = match inputs.get("Image_001").or_else(|| inputs.get("Background")) {
+    let background = match inputs.get("Background") {
         Some(image) => image.clone(),
         None => color_image(node, "background", base, [0.0; 3])?,
     };
     ensure_same_dimensions(&foreground, &background)?;
-    let factor =
-        scalar_default_value(node, &["Fac", "factor"], &["factor", "fac"], 1.0)?.clamp(0.0, 1.0);
+    let factor = scalar_default_value(node, &["Factor"], &["factor"], 1.0)?.clamp(0.0, 1.0);
+
     let pixels = foreground
         .pixels
         .iter()
@@ -536,6 +536,28 @@ fn alpha_over(
         })
         .collect();
     Image::new(foreground.width, foreground.height, pixels)
+}
+
+fn blur_radius(node: &GraphNode) -> Result<u32> {
+    let Some(size) = node.inputs.get("Size") else {
+        return Ok(1);
+    };
+    let size = size
+        .as_array()
+        .filter(|size| size.len() == 2)
+        .ok_or_else(|| {
+            PotError::invalid_argument("compositor Blur Size must contain two values")
+        })?;
+    let radius = size[0]
+        .as_f64()
+        .filter(|radius| radius.is_finite())
+        .ok_or_else(|| PotError::invalid_argument("compositor Blur Size must be finite"))?;
+    if radius < 0.0 || radius.fract() != 0.0 || radius > f64::from(u32::MAX) {
+        return Err(PotError::invalid_argument(
+            "compositor Blur Size must be a nonnegative integer",
+        ));
+    }
+    Ok(radius as u32)
 }
 
 fn glare(node: &GraphNode, image: &Image) -> Result<Image> {

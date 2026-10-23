@@ -150,9 +150,9 @@ fn camera_light_alpha_survives_native_compositor_and_saved_exr_consumers() -> Te
         json!([
             {"op": "graph.create", "id": "camera_light_alpha_over", "kind": "compositor"},
             {"op": "compositor.node_add", "graph": "camera_light_alpha_over", "id": "layers", "type": "CompositorNodeRLayers"},
-            {"op": "compositor.node_add", "graph": "camera_light_alpha_over", "id": "over", "type": "CompositorNodeAlphaOver", "properties": {"background": [0.1, 0.25, 0.5]}},
+            {"op": "compositor.node_add", "graph": "camera_light_alpha_over", "id": "over", "type": "CompositorNodeAlphaOver", "inputs": {"Factor": 1.0, "Background": [0.1, 0.25, 0.5, 1.0]}},
             {"op": "compositor.node_add", "graph": "camera_light_alpha_over", "id": "composite", "type": "CompositorNodeComposite"},
-            {"op": "compositor.link", "graph": "camera_light_alpha_over", "from_node": "layers", "from_socket": "Image", "to_node": "over", "to_socket": "Image"},
+            {"op": "compositor.link", "graph": "camera_light_alpha_over", "from_node": "layers", "from_socket": "Image", "to_node": "over", "to_socket": "Foreground"},
             {"op": "compositor.link", "graph": "camera_light_alpha_over", "from_node": "over", "from_socket": "Image", "to_node": "composite", "to_socket": "Image"},
             {"op": "compositor.enable", "target": {"id": alpha_scene_id}, "set": {"enabled": true, "graph": "camera_light_alpha_over"}}
         ]),
@@ -182,7 +182,7 @@ fn camera_light_alpha_survives_native_compositor_and_saved_exr_consumers() -> Te
         json!([
             {"op": "graph.create", "id": "camera_light_blur", "kind": "compositor"},
             {"op": "compositor.node_add", "graph": "camera_light_blur", "id": "layers", "type": "CompositorNodeRLayers"},
-            {"op": "compositor.node_add", "graph": "camera_light_blur", "id": "blur", "type": "CompositorNodeBlur", "properties": {"radius": 2}},
+            {"op": "compositor.node_add", "graph": "camera_light_blur", "id": "blur", "type": "CompositorNodeBlur", "inputs": {"Size": [2.0, 2.0]}},
             {"op": "compositor.node_add", "graph": "camera_light_blur", "id": "file", "type": "CompositorNodeOutputFile", "properties": {"path": saved_exr.to_string_lossy().into_owned()}},
             {"op": "compositor.node_add", "graph": "camera_light_blur", "id": "composite", "type": "CompositorNodeComposite"},
             {"op": "compositor.link", "graph": "camera_light_blur", "from_node": "layers", "from_socket": "Image", "to_node": "blur", "to_socket": "Image"},

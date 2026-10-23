@@ -2881,6 +2881,7 @@ def _sequencer_dump(scene):
             color.append(1.0)
         elif len(color) != 4:
             color = [0.0, 0.0, 0.0, 1.0]
+        retiming = []
         for key in getattr(strip, "retiming_keys", ()):
             retiming.append({"frame": float(getattr(key, "timeline_frame", 0.0)),
                              "source_frame": float(getattr(key, "source_frame", 0.0))})
