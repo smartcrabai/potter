@@ -103,7 +103,10 @@ pub fn explode(
     let emitter_points: Vec<[f32; 3]> = parents
         .iter()
         .map(|particle| {
-            let local = inverse_world.transform_point3(DVec3::from_array(particle.birth_position));
+            let local = particle.birth_position_local.map_or_else(
+                || inverse_world.transform_point3(DVec3::from_array(particle.birth_position)),
+                DVec3::from_array,
+            );
             [local.x as f32, local.y as f32, local.z as f32]
         })
         .collect();

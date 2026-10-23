@@ -1379,7 +1379,7 @@ fn evaluate_modifier_output(
                 "uv_warp" => ["object_from", "object_to"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                "armature" | "displace" | "wave" | "warp" => true,
+                "armature" | "displace" | "wave" | "warp" | "particle_instance" | "explode" => true,
                 "cast" | "screw" => modifier.params.get("object").is_some_and(Value::is_string),
                 "simple_deform" => modifier.params.get("origin").is_some_and(Value::is_string),
                 "mirror" => modifier
@@ -1554,6 +1554,13 @@ fn evaluate_modifier_output(
                 evaluated_meshes: evaluated_operand_meshes,
                 project_root: engine.asset_root,
             };
+            let suppressed_nodes = std::collections::BTreeSet::new();
+            let modifier_context = crate::eval::ModifierEvaluationContext {
+                purpose: crate::eval::EvaluationPurpose::Preview,
+                project_root: engine.asset_root,
+                cache_directory: engine.cache_directory,
+                material_slot_count,
+            };
             let texture_seed = crate::geom::modifiers::TextureSeed::new(
                 crate::eval::EvaluationPurpose::Preview,
                 0,
@@ -1571,12 +1578,7 @@ fn evaluate_modifier_output(
                 &base_object_meshes,
                 evaluated_operand_meshes,
                 &curve_path_lengths,
-                crate::eval::ModifierEvaluationContext {
-                    purpose: crate::eval::EvaluationPurpose::Preview,
-                    project_root: engine.asset_root,
-                    cache_directory: engine.cache_directory,
-                    material_slot_count,
-                },
+                modifier_context,
                 |_, modifier| modifier.enabled,
                 texture_seed,
                 None,
@@ -1673,6 +1675,38 @@ fn evaluate_modifier_output(
                             &operand_snapshot.bone_pose_matrices,
                             engine.asset_root,
                         ),
+                        "particle_system" => Ok(()),
+                        "explode" => {
+                            let gate = crate::eval::ModifierGate::for_modifier_apply(
+                                modifier_context,
+                                &suppressed_nodes,
+                            );
+                            crate::eval::apply_explode_modifier(
+                                mesh,
+                                modifier,
+                                target,
+                                engine.doc,
+                                gate,
+                                frame,
+                                &world_matrices,
+                                &operand_snapshot.simulated_particles,
+                            )
+                        }
+                        "particle_instance" => {
+                            let gate = crate::eval::ModifierGate::for_modifier_apply(
+                                modifier_context,
+                                &suppressed_nodes,
+                            );
+                            crate::eval::apply_particle_instance_modifier(
+                                mesh,
+                                modifier,
+                                target,
+                                engine.doc,
+                                gate,
+                                &world_matrices,
+                                &operand_snapshot.simulated_particles,
+                            )
+                        }
                         _ => Err(PotError::new(
                             ErrorCode::InternalError,
                             "custom modifier callback received an unexpected type",

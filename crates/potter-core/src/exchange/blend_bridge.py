@@ -260,6 +260,11 @@ def plain(value, depth=0):
         return [float(value.x), float(value.y), float(value.z)]
     if hasattr(value, "w") and hasattr(value, "to_euler"):
         return [value.x, value.y, value.z, value.w]
+    if isinstance(value, dict):
+        return {str(k): plain(v, depth + 1) for k, v in value.items()}
+    # Blender's IDPropertyGroup is iterable, but its custom-property data is a mapping.
+    if type(value).__name__ == "IDPropertyGroup":
+        return {str(key): plain(value[key], depth + 1) for key in value.keys()}
     if hasattr(value, "to_list"):
         try:
             return [plain(v, depth + 1) for v in value.to_list()]
@@ -275,8 +280,6 @@ def plain(value, depth=0):
             return [plain(v, depth + 1) for v in value]
         except Exception:
             pass
-    if isinstance(value, dict):
-        return {str(k): plain(v, depth + 1) for k, v in value.items()}
     try:
         return repr(value)
     except Exception:
@@ -2971,6 +2974,7 @@ def dump_scene(scene):
             "simulation_frame_start": int(scene.simulation_frame_start),
             "simulation_frame_end": int(scene.simulation_frame_end),
             "fps_base": float(scene.render.fps_base), "camera": camera,
+            "use_gravity": bool(scene.use_gravity),
             "active_clip": (scene.active_clip.name_full
                             if getattr(scene, "active_clip", None) else None),
             "render": {
@@ -3017,7 +3021,7 @@ def dump_scene(scene):
             "sequencer": _sequencer_dump(scene),
             "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
             "world": world_info, "custom_properties": custom_props(scene),
-            "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings"))}
+            "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings", "use_gravity"))}
 
 
 def _camera_dof_enabled(camera):
@@ -3379,7 +3383,8 @@ def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup,
     for key, value in params.items():
         if not hasattr(modifier, key):
             continue
-        pointer_type = _blender_id_pointer_type(modifier, key, getattr(modifier, key))
+        current = getattr(modifier, key)
+        pointer_type = _blender_id_pointer_type(modifier, key, current)
         if pointer_type not in ("Object", "Collection", "Texture") or value is None:
             continue
         name = value.get("name") if isinstance(value, dict) else value
@@ -3395,6 +3400,10 @@ def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup,
             raise ValueError(
                 "modifier %s property %s references unavailable %s ID %s"
                 % (modifier.name, key, pointer_type, name))
+        # Some Blender RNA ID pointer setters reject assigning the current datablock to itself.
+        if current is candidate or (current is not None
+                                    and current.as_pointer() == candidate.as_pointer()):
+            continue
         setattr(modifier, key, candidate)
 
 
@@ -4128,7 +4137,14 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
     node_properties = node.get("properties", {})
     settings_id = params.get("settings_id")
     if kind == "particle_system":
-        settings = node_properties.get("physics_particle_systems", {}).get(settings_id, {})
+        settings = node_properties.get("physics_particle_systems", {}).get(settings_id)
+        if settings is None:
+            # The native single-emitter operation stores primary settings outside the registry.
+            primary_settings_id = node_properties.get("physics_particle_emitter_modifier_id")
+            if primary_settings_id is None or primary_settings_id == settings_id:
+                settings = node_properties.get("physics_particle_emitter", {})
+            else:
+                settings = {}
     elif physics_property:
         settings = node_properties.get(physics_property, {})
     else:
@@ -4245,6 +4261,19 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         particle_child_seed = (settings.pop("child_seed", None)
                                if kind == "particle_system" else None)
         particle_type = settings.pop("type", None) if kind == "particle_system" else None
+        particle_child_nbr = (
+            settings.pop("child_nbr", None)
+            if kind == "particle_system"
+            else None
+        )
+        if particle_child_nbr is not None:
+            if (
+                isinstance(particle_child_nbr, bool)
+                or not isinstance(particle_child_nbr, int)
+                or not 0 <= particle_child_nbr <= 100000
+            ):
+                raise ValueError("Particle child_nbr must be an integer in [0, 100000]")
+            settings["child_percent"] = particle_child_nbr
         particle_hair_key_data = (settings.pop("_potter_hair_key_data", None)
                                   if kind == "particle_system" else None)
         particle_density_group = (settings.pop("vertex_group_density", None)
@@ -8026,6 +8055,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene["potter.root_collection"] = collections_raw[item["root_collection"]]["name"]
         set_scene_frame(scene, item["frame_current"])
         scene.frame_start = item["frame_start"]
+        scene.use_gravity = bool(item.get("use_gravity", True))
         scene.frame_end = item["frame_end"]
         scene.use_custom_simulation_range = item["use_custom_simulation_range"]
         scene.simulation_frame_start = item["simulation_frame_start"]

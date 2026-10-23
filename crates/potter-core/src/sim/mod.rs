@@ -212,6 +212,9 @@ pub enum ParticlePathInterpolation {
 pub struct ParticleState {
     pub position: [f64; 3],
     pub birth_position: [f64; 3],
+    /// Exact emitter-local source point when available for this particle.
+    #[serde(default, skip_serializing)]
+    pub birth_position_local: Option<[f64; 3]>,
     pub normal: [f64; 3],
     /// Rotation quaternion in XYZW order from emitter-local to particle orientation.
     pub rotation: [f64; 4],
@@ -248,6 +251,7 @@ impl Default for ParticleState {
             normal: [0.0, 0.0, 1.0],
             rotation: DQuat::IDENTITY.to_array(),
             birth_rotation: DQuat::IDENTITY.to_array(),
+            birth_position_local: None,
             path_root_rotation: None,
             velocity: [0.0; 3],
             birth_frame: 0.0,
@@ -274,11 +278,25 @@ fn particle_orientation(normal: [f64; 3]) -> [f64; 4] {
         DQuat::from_rotation_arc(DVec3::X, normal.normalize()).to_array()
     }
 }
-fn particle_state(particle: particles::Particle, system_index: u32) -> ParticleState {
-    // Hair path keys carry Bishop frames, not the current Hair particle orientation.
-    let rotation = if particle.path.is_empty() {
+fn particle_state(
+    particle: particles::Particle,
+    system_index: u32,
+    frame: f64,
+    use_rotations: bool,
+) -> ParticleState {
+    let at_birth = frame
+        .partial_cmp(&particle.birth_frame)
+        .is_some_and(std::cmp::Ordering::is_eq);
+    let rotation = if !use_rotations {
+        if particle.path.is_empty() && at_birth {
+            particle.birth_rotation
+        } else {
+            DQuat::IDENTITY.to_array()
+        }
+    } else if particle.path.is_empty() {
         particles::blender_velocity_orientation(particle.velocity)
     } else {
+        // Hair path keys carry Bishop frames, not the current Hair particle orientation.
         match particle.path_interpolation {
             ParticlePathInterpolation::HairCardinal
             | ParticlePathInterpolation::HairBspline
@@ -292,6 +310,7 @@ fn particle_state(particle: particles::Particle, system_index: u32) -> ParticleS
     ParticleState {
         position: particle.position,
         birth_position: particle.birth_position,
+        birth_position_local: particle.birth_position_local,
         normal: particle.normal,
         rotation,
         birth_rotation: particle.birth_rotation,
@@ -539,6 +558,10 @@ pub(crate) fn evaluate_stack_modifier(
             set_vertex_positions(&mut mesh, positions, node_id)?;
         }
         "particle_system" => {
+            let use_rotations = settings
+                .get("use_rotations")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let seed = setting_u32(settings, "seed").unwrap_or(context.seed);
             let triangles =
                 collider_triangles(doc, matrices, &members, gate, ColliderConsumer::Point)?;
@@ -552,7 +575,6 @@ pub(crate) fn evaluate_stack_modifier(
                 &solver_settings,
                 matrix,
                 frame,
-                context.fps,
                 context.gravity,
                 seed,
                 &fields,
@@ -560,7 +582,7 @@ pub(crate) fn evaluate_stack_modifier(
                 &slots,
             )?
             .into_iter()
-            .map(|particle| particle_state(particle, system_index))
+            .map(|particle| particle_state(particle, system_index, frame, use_rotations))
             .collect::<Vec<_>>();
             particles = Some(states);
         }
@@ -878,7 +900,6 @@ fn evaluate_physics(
                 settings,
                 matrix,
                 frame,
-                context.fps,
                 context.gravity,
                 seed,
                 &force_fields,
@@ -900,9 +921,13 @@ fn evaluate_physics(
                 .get("physics_particle_emitter_modifier_id")
                 .and_then(Value::as_str)
                 .map_or(0, |modifier_id| particle_system_index(node, modifier_id));
+            let use_rotations = settings
+                .get("use_rotations")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let states = particles
                 .into_iter()
-                .map(|particle| particle_state(particle, system_index))
+                .map(|particle| particle_state(particle, system_index, frame, use_rotations))
                 .collect::<Vec<_>>();
             if !particle_states_valid(&states) {
                 return Err(PotError::new(
@@ -1470,6 +1495,20 @@ fn point_colliders(triangles: &[(Id, ColliderTriangle)], subject: &Id) -> Vec<[D
         .collect()
 }
 
+fn effective_scene_gravity(scene: &crate::model::Scene) -> DVec3 {
+    let gravity = scene
+        .rigid_body_world
+        .as_ref()
+        .map_or(DVec3::new(0.0, 0.0, -9.81), |world| {
+            DVec3::from_array(world.gravity)
+        });
+    if scene.use_gravity {
+        gravity
+    } else {
+        DVec3::ZERO
+    }
+}
+
 /// Scene inputs that every physics evaluation at one frame shares.
 #[derive(Clone, Copy)]
 struct FrameContext<'a> {
@@ -1504,12 +1543,11 @@ impl<'a> FrameContext<'a> {
                 "physics frame rate and frame must be finite and positive",
             ));
         }
-        let (gravity, seed) = scene
+        let gravity = effective_scene_gravity(scene);
+        let seed = scene
             .rigid_body_world
             .as_ref()
-            .map_or((DVec3::new(0.0, 0.0, -9.81), 0), |world| {
-                (DVec3::from_array(world.gravity), world.seed)
-            });
+            .map_or(0, |world| world.seed);
         Ok(Self {
             doc,
             matrices,
@@ -2164,6 +2202,7 @@ mod tests {
         Particle {
             position: [0.0; 3],
             birth_position: [0.0; 3],
+            birth_position_local: None,
             normal: [0.0, 0.0, 1.0],
             birth_rotation,
             current_path_rotation: Some(current_path_rotation),
@@ -2207,6 +2246,8 @@ mod tests {
                     current_path_rotation,
                 ),
                 0,
+                0.0,
+                true,
             );
             assert_eq!(state.rotation, birth_rotation);
         }
@@ -2218,6 +2259,8 @@ mod tests {
                 current_path_rotation,
             ),
             0,
+            0.0,
+            true,
         );
         assert_eq!(keyed.rotation, current_path_rotation);
 
@@ -2229,6 +2272,8 @@ mod tests {
                 current_path_rotation,
             ),
             0,
+            0.0,
+            true,
         );
         let normal_orientation = particle_orientation([0.0, 0.0, 1.0]);
         assert_eq!(linear.rotation, normal_orientation);
@@ -2240,7 +2285,7 @@ mod tests {
         );
         moving.velocity = [1.0, 2.0, 3.0];
         let heading = DVec3::new(1.0, 2.0, 3.0).normalize();
-        let oriented = DQuat::from_array(particle_state(moving, 0).rotation);
+        let oriented = DQuat::from_array(particle_state(moving, 0, 0.0, true).rotation);
         // The orientation is Blender's f32 `vec_to_quat`, so local +X matches the heading to f32.
         assert!((oriented * DVec3::X - heading).length() < 1.0e-6);
         let stationary = particle_state(
@@ -2251,7 +2296,49 @@ mod tests {
                 current_path_rotation,
             ),
             0,
+            0.0,
+            true,
         );
         assert_eq!(stationary.rotation, DQuat::IDENTITY.to_array());
+        let disabled_path_rotations = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Hermite,
+                path.clone(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.0,
+            false,
+        );
+        assert_eq!(disabled_path_rotations.rotation, DQuat::IDENTITY.to_array());
+
+        let disabled_rotations_at_birth = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Hermite,
+                Vec::new(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.0,
+            false,
+        );
+        assert_eq!(disabled_rotations_at_birth.rotation, birth_rotation);
+        let disabled_rotations_after_birth = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Hermite,
+                Vec::new(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.5,
+            false,
+        );
+        assert_eq!(
+            disabled_rotations_after_birth.rotation,
+            DQuat::IDENTITY.to_array()
+        );
     }
 }

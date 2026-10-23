@@ -315,6 +315,38 @@ impl FaceEmitter {
         }
         weights
     }
+    /// Samples child roots on legacy tessfaces. The emitter flag controls face assignment; the
+    /// chosen face always uses Blender's `PART_DISTR_RAND` coordinates.
+    pub(crate) fn sample_interpolated_children(
+        &self,
+        count: usize,
+        system_seed: u32,
+        child_seed: u32,
+        use_emit_random: bool,
+    ) -> Vec<DVec3> {
+        let weights = self.element_weights(true, count, None);
+        let (elements, _) = assign_elements(
+            &weights,
+            count,
+            system_seed.wrapping_add(child_seed),
+            use_emit_random,
+        );
+        if elements.len() != count {
+            return Vec::new();
+        }
+        let mut coordinates = BlenderRng::seed(31_415_926_u32.wrapping_add(system_seed));
+        let mut roots = Vec::with_capacity(count);
+        for element in elements {
+            let face = self.tessfaces[element];
+            let u = coordinates.get_float();
+            let v = coordinates.get_float();
+            coordinates.skip(1);
+            let fuv = uv_weights(u, v, face.quad);
+            let (corners, count) = gather(&self.positions, &face);
+            roots.push(to_dvec3(interpolate(&corners[..count], &fuv[..count])));
+        }
+        roots
+    }
 
     /// Blender's `area_tri_v3` or `area_quad_v3` for the tessface.
     fn area(&self, face: &Tessface) -> f32 {

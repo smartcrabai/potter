@@ -104,6 +104,7 @@ impl SceneDoc {
                 simulation_frame_end: 250,
                 fps: 24,
                 fps_base: 1.0,
+                use_gravity: true,
                 sequencer: Sequencer::default(),
                 camera: None,
                 world: None,
@@ -640,6 +641,8 @@ pub struct Scene {
     pub simulation_frame_end: i32,
     pub fps: u32,
     pub fps_base: f64,
+    #[serde(default = "default_true")]
+    pub use_gravity: bool,
     pub camera: Option<Id>,
     pub world: Option<Id>,
     /// Active Movie Clip used by constraints with `use_active_clip`.

@@ -16,6 +16,9 @@ use serde_json::{Map, Value, json};
 use tempfile::tempdir;
 #[path = "common/blender_file.rs"]
 mod blender_file;
+#[path = "common/normal_codes.rs"]
+mod normal_codes;
+use normal_codes::is_auto_code;
 
 use blender_file::blender_executable;
 
@@ -80,14 +83,35 @@ fn apply(
     operations: &Value,
     revision: u64,
 ) -> Result<(), Box<dyn Error>> {
-    fs::write(
-        batch_path,
-        serde_json::to_vec(&json!({
-            "schema_version":1,
-            "base_revision":revision,
-            "operations":operations,
-        }))?,
-    )?;
+    apply_with_frame(scene, batch_path, operations, revision, None)
+}
+
+fn apply_at_frame(
+    scene: &Path,
+    batch_path: &Path,
+    operations: &Value,
+    revision: u64,
+    frame: f64,
+) -> Result<(), Box<dyn Error>> {
+    apply_with_frame(scene, batch_path, operations, revision, Some(frame))
+}
+
+fn apply_with_frame(
+    scene: &Path,
+    batch_path: &Path,
+    operations: &Value,
+    revision: u64,
+    evaluation_frame: Option<f64>,
+) -> Result<(), Box<dyn Error>> {
+    let mut batch = json!({
+        "schema_version":1,
+        "base_revision":revision,
+        "operations":operations,
+    });
+    if let Some(frame) = evaluation_frame {
+        batch["evaluation"] = json!({"frame":frame});
+    }
+    fs::write(batch_path, serde_json::to_vec(&batch)?)?;
     run(
         pot()
             .arg("apply")
@@ -116,7 +140,7 @@ fn physics_operations_create_stack_entries_linked_to_their_settings() -> Result<
             {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"goal_default":0.7}},
             {"op":"physics.dynamic_paint.create","target":{"id":"body"},"settings":{"role":"canvas"}},
             {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"domain_type":"LIQUID","resolution_max":4}},
-            {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"count":1,"lifetime":12.0}},
+            {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"count":1,"lifetime":12.0,"child_nbr":2}},
             {"op":"physics.collision.create","target":{"id":"body"},"settings":{"thickness_outer":0.01}}
         ]),
         0,
@@ -167,6 +191,97 @@ fn physics_operations_create_stack_entries_linked_to_their_settings() -> Result<
         updated["nodes"]["body"]["properties"]["physics_cloth"]["compression_stiffness"],
         10.0
     );
+    Ok(())
+}
+#[test]
+fn particle_emitter_operations_reject_blender_child_count_fields() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    for (field, operations) in [
+        (
+            "child_percent",
+            json!([
+                {"op":"node.create","id":"emitter","kind":"plane","params":{}},
+                {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"child_percent":2}}
+            ]),
+        ),
+        (
+            "rendered_child_count",
+            json!([
+                {"op":"node.create","id":"emitter","kind":"plane","params":{}},
+                {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"rendered_child_count":2}}
+            ]),
+        ),
+    ] {
+        let scene = directory.path().join(field);
+        let batch = directory.path().join(format!("{field}.json"));
+        initialize(&scene)?;
+        let error = apply(&scene, &batch, &operations, 0)
+            .expect_err("Blender ParticleSettings fields are not emitter operation inputs");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown particle_emitter setting") && message.contains(field),
+            "{message}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn particle_instance_native_emitter_child_nbr_exports_as_blender_child_percent()
+-> Result<(), Box<dyn Error>> {
+    let Some(blender_path) = blender_executable() else {
+        eprintln!("skipping native particle child-count export; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let scene = directory.path().join("native-particle-child-count");
+    let batch = directory.path().join("native-particle-child-count.json");
+    initialize(&scene)?;
+    apply(
+        &scene,
+        &batch,
+        &json!([
+            {"op":"node.create","id":"emitter","kind":"plane","params":{}},
+            {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"count":1,"lifetime":5.0,"frame_start":1.0,"frame_end":1.0,"physics_type":"NO","child_type":"SIMPLE","child_nbr":2}}
+        ]),
+        0,
+    )?;
+
+    let exported = directory.path().join("native-particle-child-count.blend");
+    let mut export = pot();
+    export
+        .arg("export")
+        .arg(&scene)
+        .args(["--format", "blend", "--out"])
+        .arg(&exported)
+        .arg("--blender")
+        .arg(&blender_path)
+        .arg("--json");
+    run(&mut export, "exporting native particle child count")?;
+
+    let readback_script = directory.path().join("read_native_particle_child_count.py");
+    let readback_path = directory.path().join("native_particle_child_count.json");
+    fs::write(
+        &readback_script,
+        r"
+import bpy, json, sys
+output = sys.argv[sys.argv.index('--') + 1]
+settings = bpy.data.objects['emitter'].particle_systems[0].settings
+with open(output, 'w', encoding='utf-8') as handle:
+    json.dump({'child_percent':int(settings.child_percent)}, handle, allow_nan=False)
+",
+    )?;
+    let mut reopen = Command::new(&blender_path);
+    reopen
+        .args(["--background", "--disable-autoexec"])
+        .arg(&exported)
+        .args(["--python-exit-code", "1", "--python"])
+        .arg(&readback_script)
+        .arg("--")
+        .arg(&readback_path);
+    run(&mut reopen, "reading exported native particle child count")?;
+    let readback: Value = serde_json::from_slice(&fs::read(readback_path)?)?;
+    assert_eq!(readback["child_percent"], 2);
     Ok(())
 }
 
@@ -574,7 +689,11 @@ fn assert_ordered_mesh_matches_blender(
                     .and_then(|order| order.get(corner))
                     .and_then(Value::as_u64)
                     .map_or(offset + corner, |value| value as usize);
-                actual_codes[ordinal] = code.clone();
+                actual_codes[ordinal] = if is_auto_code(code) {
+                    Value::Null
+                } else {
+                    code.clone()
+                };
             }
             offset += face.vertices.len();
         }
@@ -691,6 +810,162 @@ fn snapshot_mesh(
         .get(&id)
         .ok_or("evaluated particle mesh is missing")?
         .clone())
+}
+
+/// Blender readback shape for a Potter-evaluated mesh, used as the round-trip baseline.
+fn particle_mesh_snapshot(mesh: &potter_core::geom::Mesh) -> Value {
+    let vertex_indices = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex.id, index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let faces = mesh
+        .faces
+        .iter()
+        .map(|face| {
+            face.vertices
+                .iter()
+                .map(|id| vertex_indices[id])
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let uv_layers = mesh
+        .attributes
+        .get("uv_layers")
+        .and_then(|store| store.get("layers"))
+        .and_then(Value::as_array)
+        .map(|layers| {
+            layers
+                .iter()
+                .map(|layer| {
+                    let name = layer["name"].as_str().expect("UV layer name");
+                    let face_layers = layer["faces"].as_array().expect("UV face entries");
+                    let values = mesh
+                        .faces
+                        .iter()
+                        .flat_map(|face| {
+                            let row = face_layers
+                                .iter()
+                                .find(|entry| entry["face_id"].as_u64() == Some(u64::from(face.id)))
+                                .and_then(|entry| entry["uv"].as_array())
+                                .expect("UV values for each face");
+                            row.iter().map(|uv| {
+                                let uv = uv.as_array().expect("UV pair");
+                                json!([
+                                    uv[0].as_f64().expect("UV u"),
+                                    1.0 - uv[1].as_f64().expect("UV v")
+                                ])
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (name.to_owned(), Value::Array(values))
+                })
+                .collect::<Map<_, _>>()
+        })
+        .unwrap_or_default();
+    let custom_normal_codes =
+        mesh.attributes
+            .get("custom_normal")
+            .map_or(Value::Null, |normal_state| {
+                let values = normal_state["values"].as_object().expect("normal codes");
+                let corner_order = normal_state.get("corner_order").and_then(Value::as_object);
+                let corner_count = mesh
+                    .faces
+                    .iter()
+                    .map(|face| face.vertices.len())
+                    .sum::<usize>();
+                let mut codes = vec![Value::Null; corner_count];
+                let mut offset = 0;
+                for face in &mesh.faces {
+                    let key = format!("f{}", face.id);
+                    let row = values
+                        .get(&key)
+                        .and_then(Value::as_array)
+                        .expect("face normals");
+                    let order = corner_order
+                        .and_then(|orders| orders.get(&key))
+                        .and_then(Value::as_array);
+                    for (corner, code) in row.iter().enumerate() {
+                        let ordinal = order
+                            .and_then(|order| order.get(corner))
+                            .and_then(Value::as_u64)
+                            .map_or(offset + corner, |value| value as usize);
+                        codes[ordinal] = if is_auto_code(code) {
+                            Value::Null
+                        } else {
+                            code.clone()
+                        };
+                    }
+                    offset += face.vertices.len();
+                }
+                Value::Array(codes)
+            });
+    let color_layer_names = mesh
+        .attributes
+        .get("color_layers")
+        .and_then(|registry| registry.get("layers"))
+        .and_then(Value::as_array)
+        .map(|layers| {
+            layers
+                .iter()
+                .map(|name| name.as_str().expect("color layer name").to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut color_attributes = Map::new();
+    for name in &color_layer_names {
+        let attribute = mesh.attributes.get(name).expect("color layer attribute");
+        let values = attribute["values"].as_object().expect("color face values");
+        let values = mesh
+            .faces
+            .iter()
+            .flat_map(|face| {
+                values
+                    .get(&format!("f{}", face.id))
+                    .and_then(Value::as_array)
+                    .expect("color values for each face")
+                    .iter()
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let data_type = mesh.attributes["blender_metadata"]["color_data_types"][name].clone();
+        color_attributes.insert(
+            name.clone(),
+            json!({"domain":"CORNER","data_type":data_type,"values":values}),
+        );
+    }
+    let mut vertex_groups = Map::new();
+    if let Some(groups) = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+    {
+        for (name, weights) in groups {
+            let weights = weights.as_object().expect("vertex group weights");
+            let values = mesh
+                .vertices
+                .iter()
+                .map(|vertex| {
+                    weights
+                        .get(&format!("v{}", vertex.id))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0)
+                })
+                .collect::<Vec<_>>();
+            vertex_groups.insert(name.clone(), json!(values));
+        }
+    }
+    json!({
+        "positions": mesh.vertices.iter().map(|vertex| vertex.co.to_array()).collect::<Vec<_>>(),
+        "faces": faces,
+        "materials": mesh.faces.iter().map(|face| face.material_index).collect::<Vec<_>>(),
+        "uv_layers": uv_layers,
+        "custom_normal_codes": custom_normal_codes,
+        "color_layer_names": color_layer_names,
+        "color_attributes": color_attributes,
+        "vertex_groups": vertex_groups,
+    })
 }
 
 fn assert_snapshot_mesh_matches_blender(
@@ -865,7 +1140,8 @@ particle_settings.child_size = 1.0
 scene.frame_set(1)
 bpy.context.view_layer.update()
 birth_graph = bpy.context.evaluated_depsgraph_get()
-emitter_births = particle_births(emitter.evaluated_get(birth_graph).particle_systems[0])
+evaluated_emitter_birth = emitter.evaluated_get(birth_graph)
+emitter_births = particle_births(evaluated_emitter_birth.particle_systems[0])
 scene.frame_set(2)
 bpy.context.view_layer.update()
 depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -964,35 +1240,35 @@ def evaluated_points(obj):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
-    points = [list(vertex.co) for vertex in mesh.vertices]
-    evaluated.to_mesh_clear()
-    return points
+    try:
+        return [list(vertex.co) for vertex in mesh.vertices]
+    finally:
+        evaluated.to_mesh_clear()
 def evaluated_mesh_snapshot(obj):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
-    snapshot = mesh_snapshot(mesh, evaluated)
-    evaluated.to_mesh_clear()
-    return snapshot
+    try:
+        return mesh_snapshot(mesh, evaluated)
+    finally:
+        evaluated.to_mesh_clear()
 
 
 unborn_instance = make_visibility_instance('InstanceUnborn', False, False, True)
 scene.frame_set(0)
 bpy.context.view_layer.update()
-unborn_particles = particle_states(
-    emitter.evaluated_get(bpy.context.evaluated_depsgraph_get()).particle_systems[0],
-    emitter_births,
-)
+unborn_depsgraph = bpy.context.evaluated_depsgraph_get()
+unborn_evaluated_emitter = emitter.evaluated_get(unborn_depsgraph)
+unborn_particles = particle_states(unborn_evaluated_emitter.particle_systems[0], emitter_births)
 unborn_instance_points = evaluated_points(unborn_instance)
 unborn_instance_mesh_snapshot = evaluated_mesh_snapshot(unborn_instance)
 
 dead_instance = make_visibility_instance('InstanceDead', False, True, False)
 scene.frame_set(14)
 bpy.context.view_layer.update()
-dead_particles = particle_states(
-    emitter.evaluated_get(bpy.context.evaluated_depsgraph_get()).particle_systems[0],
-    emitter_births,
-)
+dead_depsgraph = bpy.context.evaluated_depsgraph_get()
+dead_evaluated_emitter = emitter.evaluated_get(dead_depsgraph)
+dead_particles = particle_states(dead_evaluated_emitter.particle_systems[0], emitter_births)
 dead_instance_points = evaluated_points(dead_instance)
 dead_instance_mesh_snapshot = evaluated_mesh_snapshot(dead_instance)
 
@@ -1048,7 +1324,8 @@ explode.particle_uv = 'ParticleUV'
 scene.frame_set(1)
 bpy.context.view_layer.update()
 birth_graph = bpy.context.evaluated_depsgraph_get()
-explode_births = particle_births(exploder.evaluated_get(birth_graph).particle_systems[0])
+evaluated_explode_birth = exploder.evaluated_get(birth_graph)
+explode_births = particle_births(evaluated_explode_birth.particle_systems[0])
 scene.frame_set(2)
 bpy.context.view_layer.update()
 depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -1103,7 +1380,8 @@ cube_explode.particle_uv = 'ParticleUV'
 scene.frame_set(1)
 bpy.context.view_layer.update()
 cube_birth_graph = bpy.context.evaluated_depsgraph_get()
-cube_births = particle_births(cube_exploder.evaluated_get(cube_birth_graph).particle_systems[0])
+evaluated_cube_birth = cube_exploder.evaluated_get(cube_birth_graph)
+cube_births = particle_births(evaluated_cube_birth.particle_systems[0])
 cube_inverse = cube_exploder.matrix_world.inverted()
 cube_birth_local = []
 for birth in cube_births:
@@ -1114,28 +1392,6 @@ for birth in cube_births:
     )
     cube_birth_local.append(source_vertex.co.copy())
     birth['position'] = list(cube_exploder.matrix_world @ source_vertex.co)
-cube_face_owners = []
-cube_vertex_owners = [len(cube_births)] * len(cube_mesh_data.vertices)
-for polygon in cube_mesh_data.polygons:
-    center = sum(
-        (cube_mesh_data.vertices[index].co for index in polygon.vertices),
-        Vector((0,0,0)),
-    ) / len(polygon.vertices)
-    owner = min(
-        range(len(cube_birth_local)),
-        key=lambda index: (cube_birth_local[index] - center).length_squared,
-    )
-    cube_face_owners.append(owner)
-    for index in polygon.vertices:
-        cube_vertex_owners[index] = owner
-cube_cut_masks = []
-for polygon in cube_mesh_data.polygons:
-    mask = 0
-    vertices = list(polygon.vertices)
-    for index in range(len(vertices)):
-        if cube_vertex_owners[vertices[index]] != cube_vertex_owners[vertices[(index + 1) % len(vertices)]]:
-            mask |= 1 << index
-    cube_cut_masks.append(mask)
 scene.frame_set(2)
 bpy.context.view_layer.update()
 cube_depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -1151,6 +1407,65 @@ cube_world_points = [
 cube_face_count = len(cube_mesh.polygons)
 cube_mesh_snapshot = mesh_snapshot(cube_mesh, evaluated_cube_exploder)
 evaluated_cube_exploder.to_mesh_clear()
+cli_cube_mesh = bpy.data.meshes.new('CliSmokeBoxMesh')
+cli_cube_mesh.from_pydata(
+    [(-1,-1,-1), (-1,-1,1), (-1,1,-1), (-1,1,1),
+     (1,-1,-1), (1,-1,1), (1,1,-1), (1,1,1)],
+    [],
+    [(0,1,3,2), (2,3,7,6), (6,7,5,4), (4,5,1,0), (2,6,4,0), (7,3,1,5)],
+)
+cli_cube = bpy.data.objects.new('CliSmokeBox', cli_cube_mesh)
+scene.collection.objects.link(cli_cube)
+for selected in list(bpy.context.selected_objects):
+    selected.select_set(False)
+cli_cube.select_set(True)
+bpy.context.view_layer.objects.active = cli_cube
+bpy.ops.object.particle_system_add()
+cli_cube_system = cli_cube.particle_systems[0]
+cli_cube_system.seed = 29
+cli_cube_settings = cli_cube_system.settings
+cli_cube_settings.count = 256
+cli_cube_settings.emit_from = 'VERT'
+cli_cube_settings.frame_start = 1.0
+cli_cube_settings.frame_end = 1.0
+cli_cube_settings.lifetime = 12.0
+cli_cube_settings.time_tweak = 2.0
+cli_cube_settings.physics_type = 'NEWTON'
+cli_cube_settings.normal_factor = 1.1
+cli_cube_settings.factor_random = 0.0
+cli_cube_settings.particle_size = 0.05
+cli_cube_settings.size_random = 0.0
+cli_cube_settings.child_type = 'NONE'
+cli_cube_settings.use_emit_random = True
+cli_cube_settings.render_type = 'NONE'
+cli_cube_explode = cli_cube.modifiers.new('CLI edge-cut explode', 'EXPLODE')
+cli_cube_explode.use_edge_cut = True
+cli_cube_explode.use_size = False
+cli_cube_explode.show_alive = True
+cli_cube_explode.show_dead = False
+cli_cube_explode.show_unborn = False
+cli_cube_explode.protect = 0.0
+scene.frame_set(1)
+bpy.context.view_layer.update()
+cli_cube_depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated_cli_cube = cli_cube.evaluated_get(cli_cube_depsgraph)
+cli_cube_births = particle_births(evaluated_cli_cube.particle_systems[0])
+cli_cube_birth_local = []
+for birth in cli_cube_births:
+    sampled_position = Vector(birth['position'])
+    source_vertex = min(
+        cli_cube_mesh.vertices,
+        key=lambda vertex: (vertex.co - sampled_position).length_squared,
+    )
+    cli_cube_birth_local.append(list(source_vertex.co))
+cli_cube_mesh_eval = evaluated_cli_cube.to_mesh(
+    preserve_all_data_layers=True, depsgraph=cli_cube_depsgraph)
+cli_cube_explode_face_count = len(cli_cube_mesh_eval.polygons)
+evaluated_cli_cube.to_mesh_clear()
+if len(cli_cube_birth_local) != 256 or len({tuple(point) for point in cli_cube_birth_local}) != 8:
+    raise RuntimeError('CLI cube smoke births must match the eight-vertex default-random fixture')
+if cli_cube_explode_face_count <= 6:
+    raise RuntimeError('CLI cube smoke must exercise Explode edge cuts')
 with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as output:
     json.dump({
         'instance_points':instance_points,
@@ -1183,10 +1498,10 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         'cube_explode_world_points':cube_world_points,
         'cube_explode_particle_states':cube_particles,
         'cube_exploder_world_matrix':cube_matrix,
-        'cube_face_owners':cube_face_owners,
-        'cube_cut_masks':cube_cut_masks,
         'cube_birth_local':[list(position) for position in cube_birth_local],
         'cube_explode_face_count':cube_face_count,
+        'cli_cube_birth_local':cli_cube_birth_local,
+        'cli_cube_explode_face_count':cli_cube_explode_face_count,
     }, output)
 ",
     )?;
@@ -1511,80 +1826,8 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     assert_eq!(cube_local_births.len(), cube_particles.len());
     for (particle, birth_position) in cube_particles.iter_mut().zip(&cube_local_births) {
         particle.birth_position = cube_world.transform_point3(*birth_position).to_array();
+        particle.birth_position_local = Some(birth_position.to_array());
     }
-    let cube_positions = cube_source
-        .vertices
-        .iter()
-        .map(|vertex| (vertex.id, vertex.co))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let cube_face_owners = cube_source
-        .faces
-        .iter()
-        .map(|face| {
-            let points = face
-                .vertices
-                .iter()
-                .map(|id| {
-                    cube_positions.get(id).copied().ok_or_else(|| {
-                        std::io::Error::other("cube face references a missing vertex").into()
-                    })
-                })
-                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-            let center = points.iter().copied().sum::<DVec3>() / points.len() as f64;
-            let mut nearest = 0;
-            let mut nearest_distance = f32::INFINITY;
-            for (index, position) in cube_local_births.iter().enumerate() {
-                let distance = center.as_vec3().distance_squared(position.as_vec3());
-                if index == 0 || distance < nearest_distance {
-                    nearest = index;
-                    nearest_distance = distance;
-                }
-            }
-            Ok(nearest)
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    assert_eq!(cube_face_owners, [0, 0, 0, 0, 1, 1]);
-    let blender_cube_face_owners: Vec<usize> =
-        serde_json::from_value(blender["cube_face_owners"].clone())?;
-    assert_eq!(
-        cube_face_owners, blender_cube_face_owners,
-        "local births={cube_local_births:?}, world={cube_world:?}",
-    );
-    let cube_vertex_indices = cube_source
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, index))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut cube_vertex_owners = vec![cube_particles.len(); cube_source.vertices.len()];
-    for (face, owner) in cube_source.faces.iter().zip(&cube_face_owners) {
-        for vertex in &face.vertices {
-            cube_vertex_owners[cube_vertex_indices[vertex]] = *owner;
-        }
-    }
-    let cube_masks = cube_source
-        .faces
-        .iter()
-        .map(|face| {
-            let mut mask = 0_usize;
-            for index in 0..face.vertices.len() {
-                let first = face.vertices[index];
-                let second = face.vertices[(index + 1) % face.vertices.len()];
-                if cube_vertex_owners[cube_vertex_indices[&first]]
-                    != cube_vertex_owners[cube_vertex_indices[&second]]
-                {
-                    mask |= 1_usize << index;
-                }
-            }
-            mask
-        })
-        .collect::<Vec<_>>();
-    let blender_cube_masks: Vec<usize> = serde_json::from_value(blender["cube_cut_masks"].clone())?;
-    assert_eq!(cube_masks, [12, 3, 5, 5, 0, 0]);
-    assert_eq!(
-        cube_masks, blender_cube_masks,
-        "face split masks must match Blender's particle-owner classification",
-    );
     let cube_seed = blender["cube_explode_seed"]
         .as_u64()
         .ok_or("Blender cube explode particle-system seed is missing")? as u32;
@@ -1613,7 +1856,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     assert_eq!(
         cube_explode.faces.len(),
         blender["cube_explode_face_count"],
-        "edge-cut cube face count, particles={cube_particles:?}, local births={cube_local_births:?}, owners={cube_face_owners:?}, masks={cube_masks:?}",
+        "edge-cut cube face count, particles={cube_particles:?}, local births={cube_local_births:?}",
     );
     let cube_explode_world = cube_explode
         .vertices
@@ -1625,7 +1868,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     assert_eq!(
         cube_explode_world.len(),
         blender_cube_points.len(),
-        "edge-cut cube vertices Potter={}, Blender={}, owners={cube_face_owners:?}, masks={cube_masks:?}",
+        "edge-cut cube vertices Potter={}, Blender={}, particles={cube_particles:?}, local births={cube_local_births:?}",
         cube_explode_world.len(),
         blender_cube_points.len(),
     );
@@ -1638,20 +1881,78 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let scene_path = root.join("potter-scene");
     let batch_path = root.join("operations.json");
     initialize(&scene_path)?;
+    // The CLI smoke uses Potter's built-in BMO cube order; its Blender probe below uses the same
+    // vertex/face order and default random-emission behavior as the model input.
     apply(
         &scene_path,
         &batch_path,
         &json!([
             {"op":"node.create","id":"a_emitter","kind":"plane","params":{},"transform":{"translation":[3.0,-1.0,0.5],"scale":[1.3,0.8,1.1]}},
-            {"op":"physics.particle_emitter.create","target":{"id":"a_emitter"},"settings":{"emit_from":"VERT","count":3,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.8,"particle_size":0.7,"seed":3}},
+            {"op":"physics.particle_emitter.create","target":{"id":"a_emitter"},"settings":{"emit_from":"VERT","count":3,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.8,"particle_size":0.7,"seed":3,"render_type":"NONE"}},
             {"op":"node.create","id":"b_instance","kind":"plane","params":{}},
             {"op":"modifier.create","target":{"id":"b_instance"},"id":"particle_copy","type":"particle_instance","params":{"object":"a_emitter","particle_system_index":1,"use_normal":true,"use_children":false,"use_size":true,"show_alive":true,"show_dead":false,"show_unborn":false,"position":0,"random_position":0.0,"axis":"X","space":"WORLD","use_path":false}},
             {"op":"node.create","id":"c_exploder","kind":"box","params":{}},
-            {"op":"physics.particle_emitter.create","target":{"id":"c_exploder"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":1.1,"seed":29}},
-            {"op":"modifier.create","target":{"id":"c_exploder"},"id":"explode_faces","type":"explode","params":{"use_edge_cut":true,"show_alive":true,"show_dead":false,"show_unborn":false,"use_size":false,"protect":0.0}}
+            {"op":"physics.particle_emitter.create","target":{"id":"c_exploder"},"settings":{"emit_from":"VERT","count":256,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"time_tweak":2.0,"physics_type":"NEWTON","normal_factor":1.1,"factor_random":0.0,"particle_size":0.05,"size_random":0.0,"seed":29,"child_type":"NONE","render_type":"NONE"}},
+            {"op":"modifier.create","target":{"id":"c_exploder"},"id":"explode_faces","type":"explode","params":{"use_edge_cut":true,"show_alive":true,"show_dead":false,"show_unborn":false,"use_size":false,"protect":0.0}},
+            {"op":"node.create","id":"d_self_instance","kind":"plane","params":{}},
+            {"op":"physics.particle_emitter.create","target":{"id":"d_self_instance"},"settings":{"emit_from":"VERT","count":1,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":0.0,"particle_size":0.05,"render_type":"NONE","child_type":"NONE"}},
+            {"op":"modifier.create","target":{"id":"d_self_instance"},"id":"self_particle","type":"particle_instance","params":{"object":"d_self_instance","particle_system_index":1,"use_normal":true,"use_children":false,"use_size":false,"show_alive":true,"show_dead":false,"show_unborn":false,"use_path":false,"axis":"Z","space":"WORLD"}}
         ]),
         0,
     )?;
+    let scene_document: Value = serde_json::from_slice(&fs::read(scene_path.join("scene.json"))?)?;
+    let typed_scene_document: potter_core::model::SceneDoc =
+        serde_json::from_value(scene_document.clone())?;
+    let cli_snapshot = potter_core::eval::Snapshot::evaluate(
+        &typed_scene_document,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let c_exploder_id = potter_core::model::Id::new("c_exploder".to_owned())?;
+    let cli_exploder_states = cli_snapshot
+        .simulated_particles
+        .get(&c_exploder_id)
+        .ok_or("CLI Explode particle states are missing")?;
+    assert_eq!(cli_exploder_states.len(), 256);
+    let emitted_vertices = cli_exploder_states
+        .iter()
+        .map(|particle| particle.birth_position.map(f64::to_bits))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        emitted_vertices.len(),
+        8,
+        "CLI edge-cut fixture must emit from every built-in box vertex",
+    );
+    let cli_birth_positions = cli_exploder_states
+        .iter()
+        .map(|particle| particle.birth_position)
+        .collect::<Vec<_>>();
+    assert_numeric_rows(
+        &json!(cli_birth_positions),
+        &blender["cli_cube_birth_local"],
+        "CLI built-in cube particle births match the identical Blender fixture",
+    );
+    let self_instance_id = potter_core::model::Id::new("d_self_instance".to_owned())?;
+    let self_instance_node = typed_scene_document
+        .nodes
+        .get(&self_instance_id)
+        .ok_or("self-referencing particle instance node is missing")?;
+    let self_instance_data_id = self_instance_node
+        .data
+        .as_ref()
+        .ok_or("self-referencing particle instance mesh is missing")?;
+    let self_instance_mesh = typed_scene_document
+        .data_blocks
+        .get(self_instance_data_id)
+        .and_then(|data| data.mesh.as_ref())
+        .ok_or("self-referencing particle instance source mesh is missing")?;
+    assert_eq!(
+        cli_snapshot.meshes.get(&self_instance_id),
+        Some(self_instance_mesh),
+        "self-referencing Particle Instance is Blender's unchanged-mesh no-op",
+    );
     let instance_output = run(
         pot()
             .arg("inspect")
@@ -1687,11 +1988,17 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     let exploded_faces = explode_json["result"]["items"][0]["evaluated_geometry"]["face_count"]
         .as_u64()
         .ok_or("CLI explode face count is missing")?;
+    assert_eq!(
+        exploded_faces,
+        blender["cli_cube_explode_face_count"]
+            .as_u64()
+            .ok_or("Blender CLI cube Explode face count is missing")?,
+        "CLI Explode matches the identical Blender cube fixture",
+    );
     assert!(
         exploded_faces > 6,
         "CLI explode should split the six source cube faces: {exploded_faces}",
     );
-    let scene_document: Value = serde_json::from_slice(&fs::read(scene_path.join("scene.json"))?)?;
     let revision = scene_document["revision"]
         .as_u64()
         .ok_or("scene revision is missing")?;
@@ -1779,6 +2086,21 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         expected_faces.push(polygon);
     }
     let expected_faces = json!(expected_faces);
+    // Blender 5.2.2 rejects self-object Particle Instance links; remove this Potter-only no-op before the Explode export.
+    let applied_revision = applied_document["revision"]
+        .as_u64()
+        .ok_or("applied scene revision is missing")?;
+    let remove_self_instance_batch = root.join("remove_self_instance.json");
+    apply(
+        &scene_path,
+        &remove_self_instance_batch,
+        &json!([{
+            "op":"modifier.delete",
+            "target":{"id":"d_self_instance"},
+            "id":"self_particle"
+        }]),
+        applied_revision,
+    )?;
     let exported = root.join("explode_cli_roundtrip.blend");
     let blender_path = blender_executable().ok_or("Blender is unavailable")?;
     let mut export = pot();
@@ -1840,9 +2162,9 @@ with open(output, 'w', encoding='utf-8') as handle:
     Ok(())
 }
 
-/// Recorded gaps: native child-instance corner data differs from Blender by +0.25 at frame 1 and +0.39
-/// at frame 2. The child-count fixture separately records face-count differences; their relationship is
-/// unconfirmed. The test also checks the round-trip track axis.
+/// The earlier unkeyed INTERPOLATED fixture was not a valid Blender state oracle: `MOD_particleinstance.cc`
+/// consumed an uninitialized child `ParticleKey` after `psys_get_particle_state` returned false. This
+/// round-trip uses SIMPLE children so its native reference is defined.
 #[test]
 fn particle_instance_cli_frames_apply_export_reimport_preserves_track_axis()
 -> Result<(), Box<dyn Error>> {
@@ -1931,12 +2253,13 @@ settings.emit_from = 'VERT'
 settings.frame_start = 1.0
 settings.frame_end = 2.0
 settings.lifetime = 8.0
+settings.time_tweak = 2.0
 settings.physics_type = 'NEWTON'
 settings.normal_factor = 0.8
 settings.factor_random = 0.0
 settings.particle_size = 0.65
 settings.size_random = 0.0
-settings.child_type = 'INTERPOLATED'
+settings.child_type = 'SIMPLE'
 settings.child_percent = 25
 settings.rendered_child_count = 3
 settings.child_radius = 0.25
@@ -1970,20 +2293,64 @@ modifier.show_unborn = False
 modifier.index_layer_name = 'InstanceIndex'
 modifier.value_layer_name = 'InstanceValue'
 
-def evaluated_mesh(obj, frame):
-    scene.frame_set(frame)
-    bpy.context.view_layer.update()
+def particle_parent_states(evaluated_emitter):
+    evaluated_system = evaluated_emitter.particle_systems[0]
+    return [{
+        'birth_frame':float(particle.birth_time),
+        'position':list(particle.location),
+        'velocity':list(particle.velocity),
+        'rotation_xyzw':[float(particle.rotation[1]), float(particle.rotation[2]),
+                         float(particle.rotation[3]), float(particle.rotation[0])],
+    } for particle in evaluated_system.particles]
+def evaluated_mesh(obj):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
+    evaluated_emitter = emitter.evaluated_get(depsgraph)
+    parent_states = particle_parent_states(evaluated_emitter)
     mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
     try:
-        return mesh_snapshot(mesh)
+        snapshot = mesh_snapshot(mesh)
+        return snapshot, parent_states
     finally:
         evaluated.to_mesh_clear()
 
-frames = {str(frame):evaluated_mesh(instancer, frame) for frame in (1,2)}
+
+
 scene.frame_set(1)
 bpy.context.view_layer.update()
+frames = {}
+frame_parent_states = {}
+frame_one_mesh, frame_one_parents = evaluated_mesh(instancer)
+frames['1'] = frame_one_mesh
+frame_parent_states['1'] = frame_one_parents
+frame_one_parent_state = frame_one_parents[0]
+if frame_one_parent_state['birth_frame'] != 1.0:
+    raise RuntimeError('the first CLI reference parent must be born at frame one')
+for frame in (2,3):
+    scene.frame_set(frame)
+    bpy.context.view_layer.update()
+    frame_mesh, parents = evaluated_mesh(instancer)
+    frames[str(frame)] = frame_mesh
+    frame_parent_states[str(frame)] = parents
+frame_two_parent_state = frame_parent_states['2'][0]
+if not all(state['birth_frame'] < 2.0 for state in frame_parent_states['2']):
+    raise RuntimeError('all CLI geometry reference parents must be born before frame two')
+parent_states = frame_parent_states['3']
+scene.use_gravity = True
+scene.frame_set(1)
+bpy.context.view_layer.update()
+for frame in (2,3):
+    scene.frame_set(frame)
+    bpy.context.view_layer.update()
+gravity_enabled_parent_states = particle_parent_states(
+    emitter.evaluated_get(bpy.context.evaluated_depsgraph_get())
+)
+scene.use_gravity = False
+scene.frame_set(1)
+bpy.context.view_layer.update()
+for frame in (2,3):
+    scene.frame_set(frame)
+    bpy.context.view_layer.update()
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_cli_source.blend'))
 with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8') as output:
     json.dump({
@@ -1991,9 +2358,18 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         'track_axis':instancer.track_axis,
         'particle_seed':system.seed,
         'child_seed':system.child_seed,
+        'child_type':settings.child_type,
         'child_percent':settings.child_percent,
+        'child_roundness':float(settings.child_roundness),
+        'child_radius':float(settings.child_radius),
         'rendered_child_count':settings.rendered_child_count,
-    }, output)
+        'time_tweak':float(settings.time_tweak),
+        'use_rotations':settings.use_rotations,
+        'parent_states':parent_states,
+        'frame_one_parent_state':frame_one_parent_state,
+        'frame_two_parent_state':frame_two_parent_state,
+        'gravity_enabled_parent_states':gravity_enabled_parent_states,
+    }, output, allow_nan=False)
 ",
     )?;
     let mut create_fixture = Command::new(&blender_path);
@@ -2011,17 +2387,21 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
     let blender_output = run(&mut create_fixture, "Blender particle CLI fixture")?;
     let blender: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
     assert_eq!(blender["track_axis"], "POS_Z");
+    assert_eq!(blender["child_type"], "SIMPLE");
     assert_eq!(blender["child_seed"], 67);
     assert_eq!(blender["child_percent"], 25);
     assert_eq!(blender["rendered_child_count"], 3);
+    assert_eq!(blender["time_tweak"], 2.0);
+    assert_eq!(blender["use_rotations"], false);
     let blender_frame_one = &blender["frames"]["1"];
     let blender_frame_two = &blender["frames"]["2"];
+    let blender_frame_three = &blender["frames"]["3"];
     assert_ne!(
-        blender_frame_one["positions"],
-        blender_frame_two["positions"]
+        blender_frame_two["positions"],
+        blender_frame_three["positions"]
     );
     assert!(
-        blender_frame_two["positions"]
+        blender_frame_three["positions"]
             .as_array()
             .is_some_and(|positions| positions.len() > 4),
         "Blender fixture must evaluate parent and child instances",
@@ -2065,7 +2445,6 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
     let instancer_id = node_id_by_name("ParticleInstancer")?;
     let emitter_id = node_id_by_name("ParticleEmitter")?;
     let instancer_node = &document["nodes"][instancer_id.as_str()];
-    assert_eq!(instancer_node["track_axis"], "POS_Z",);
     let emitter_node = &document["nodes"][emitter_id.as_str()];
     let particle_settings = emitter_node["properties"]["physics_particle_systems"]
         .as_object()
@@ -2075,12 +2454,20 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
                 .find(|settings| settings["seed"] == blender["particle_seed"])
         })
         .ok_or("imported particle-system settings are not serialized")?;
+    assert_eq!(particle_settings["child_type"], "SIMPLE");
     assert_eq!(particle_settings["child_seed"], blender["child_seed"]);
     assert_eq!(particle_settings["child_percent"], blender["child_percent"]);
+    assert_eq!(
+        particle_settings["child_roundness"],
+        blender["child_roundness"]
+    );
+    assert_eq!(particle_settings["child_radius"], blender["child_radius"]);
     assert_eq!(
         particle_settings["rendered_child_count"],
         blender["rendered_child_count"]
     );
+    assert_eq!(particle_settings["time_tweak"], blender["time_tweak"]);
+    assert_eq!(particle_settings["use_rotations"], blender["use_rotations"]);
     let modifier = instancer_node["modifiers"]
         .as_array()
         .and_then(|modifiers| {
@@ -2093,54 +2480,309 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         .as_str()
         .ok_or("particle modifier ID is missing")?;
     let typed_document: potter_core::model::SceneDoc = serde_json::from_value(document.clone())?;
-    // These committed Blender offsets remain the only recorded differences; use the pre-apply Potter
-    // snapshots as strict baselines for the CLI, apply, export, and reimport paths.
-    let potter_frame_one = snapshot_mesh(&typed_document, &instancer_id, 1.0)?;
-    let potter_first = potter_frame_one
-        .vertices
-        .first()
-        .ok_or("frame-one particle mesh has no vertices")?
-        .co
-        .to_array();
-    assert_recorded_gap(
-        "native child-instance frame 1 corner data row 0 x",
-        potter_first[0],
-        blender_frame_one["positions"][0][0]
-            .as_f64()
-            .ok_or("Blender frame-1 x")?,
-        0.25,
+    assert!(
+        !typed_document
+            .scenes
+            .get(&typed_document.active_scene)
+            .ok_or("imported scene is missing")?
+            .use_gravity,
+        "Blender's disabled scene gravity must survive import",
     );
-    let mut expected_frame_one = blender_frame_one.clone();
-    expected_frame_one["positions"][0][0] = json!(potter_first[0]);
+    let emitter_model_id = potter_core::model::Id::new(emitter_id.clone())?;
+    let instancer_model_id = potter_core::model::Id::new(instancer_id.clone())?;
+    let frame_one_snapshot = potter_core::eval::Snapshot::evaluate(
+        &typed_document,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let frame_one_particles = frame_one_snapshot
+        .simulated_particles
+        .get(&emitter_model_id)
+        .ok_or("Potter frame-one particle states are missing")?;
+    let potter_frame_one_parent = frame_one_particles
+        .first()
+        .ok_or("Potter frame-one parent state is missing")?;
+    let blender_frame_one_parent = &blender["frame_one_parent_state"];
+    assert_numeric_rows(
+        &json!([[potter_frame_one_parent.birth_frame]]),
+        &json!([[blender_frame_one_parent["birth_frame"]]]),
+        "frame-one birth parent frame",
+    );
+    assert_numeric_rows(
+        &json!([potter_frame_one_parent.position]),
+        &json!([blender_frame_one_parent["position"]]),
+        "frame-one birth parent position",
+    );
+    assert_numeric_rows(
+        &json!([potter_frame_one_parent.velocity]),
+        &json!([blender_frame_one_parent["velocity"]]),
+        "frame-one birth parent velocity",
+    );
+    assert_numeric_rows(
+        &json!([potter_frame_one_parent.rotation]),
+        &json!([blender_frame_one_parent["rotation_xyzw"]]),
+        "frame-one birth parent rotation",
+    );
+    let potter_frame_one = frame_one_snapshot
+        .meshes
+        .get(&instancer_model_id)
+        .ok_or("frame-one birth particle mesh is missing")?;
     assert_ordered_mesh_matches_blender(
-        &potter_frame_one,
-        &expected_frame_one,
-        "Potter pre-apply frame 1",
+        potter_frame_one,
+        blender_frame_one,
+        "Potter birth-frame Particle Instance",
     );
-    let potter_frame_two = snapshot_mesh(&typed_document, &instancer_id, 2.0)?;
-    let potter_second = potter_frame_two
-        .vertices
+    let frame_two_snapshot = potter_core::eval::Snapshot::evaluate(
+        &typed_document,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(2.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let frame_two_particles = frame_two_snapshot
+        .simulated_particles
+        .get(&emitter_model_id)
+        .ok_or("Potter frame-two particle states are missing")?;
+    let potter_frame_two_parent = frame_two_particles
         .first()
-        .ok_or("frame-two particle mesh has no vertices")?
-        .co
-        .to_array();
-    // Recorded gap: native child-instance frame 2 row 0 x differs by +0.39 (measured in CI on 0643cd36);
-    // cause unconfirmed.
-    assert_recorded_gap(
-        "native child-instance frame 2 corner data row 0 x",
-        potter_second[0],
-        blender_frame_two["positions"][0][0]
-            .as_f64()
-            .ok_or("Blender frame-2 x")?,
-        0.39,
+        .ok_or("Potter frame-two parent state is missing")?;
+    let blender_frame_two_parent = &blender["frame_two_parent_state"];
+    assert_numeric_rows(
+        &json!([[potter_frame_two_parent.birth_frame]]),
+        &json!([[blender_frame_two_parent["birth_frame"]]]),
+        "frame-two parent birth frame",
     );
-    let mut expected_frame_two = blender_frame_two.clone();
-    expected_frame_two["positions"][0][0] = json!(potter_second[0]);
+    assert_numeric_rows(
+        &json!([potter_frame_two_parent.position]),
+        &json!([blender_frame_two_parent["position"]]),
+        "frame-two parent direct state position",
+    );
+    assert_numeric_rows(
+        &json!([potter_frame_two_parent.velocity]),
+        &json!([blender_frame_two_parent["velocity"]]),
+        "frame-two parent direct state velocity",
+    );
+    assert_numeric_rows(
+        &json!([potter_frame_two_parent.rotation]),
+        &json!([blender_frame_two_parent["rotation_xyzw"]]),
+        "frame-two parent direct state rotation",
+    );
+
+    let frame_three_snapshot = potter_core::eval::Snapshot::evaluate(
+        &typed_document,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(3.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let particle_states = frame_three_snapshot
+        .simulated_particles
+        .get(&emitter_model_id)
+        .ok_or("Potter simple-child particle states are missing")?;
+    let blender_parent_states = blender["parent_states"]
+        .as_array()
+        .ok_or("Blender parent particle states are missing")?;
+    assert_eq!(blender_parent_states.len(), 4);
+    for (index, (particle, expected)) in particle_states
+        .iter()
+        .take(4)
+        .zip(blender_parent_states)
+        .enumerate()
+    {
+        assert_numeric_rows(
+            &json!([[particle.birth_frame]]),
+            &json!([[expected["birth_frame"]]]),
+            &format!("parent {index} birth frame"),
+        );
+        assert_numeric_rows(
+            &json!([particle.position]),
+            &json!([expected["position"]]),
+            &format!("parent {index} direct state position"),
+        );
+        assert_numeric_rows(
+            &json!([particle.velocity]),
+            &json!([expected["velocity"]]),
+            &format!(
+                "parent {index} velocity Potter={:?} Blender={:?}",
+                particle.velocity, expected["velocity"],
+            ),
+        );
+        assert_numeric_rows(
+            &json!([particle.rotation]),
+            &json!([expected["rotation_xyzw"]]),
+            &format!("parent {index} direct state rotation"),
+        );
+    }
+    let mut gravity_enabled_document = typed_document.clone();
+    let active_scene_id = gravity_enabled_document.active_scene.clone();
+    gravity_enabled_document
+        .scenes
+        .get_mut(&active_scene_id)
+        .ok_or("gravity-enabled scene is missing")?
+        .use_gravity = true;
+    let gravity_enabled_snapshot = potter_core::eval::Snapshot::evaluate(
+        &gravity_enabled_document,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(3.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let gravity_enabled_states = gravity_enabled_snapshot
+        .simulated_particles
+        .get(&emitter_model_id)
+        .ok_or("Potter gravity-enabled particle states are missing")?;
+    let blender_gravity_enabled_parents = blender["gravity_enabled_parent_states"]
+        .as_array()
+        .ok_or("Blender gravity-enabled parent states are missing")?;
+    assert_ne!(
+        blender["parent_states"], blender["gravity_enabled_parent_states"],
+        "Blender scene gravity must affect particle trajectories",
+    );
+    assert_eq!(blender_gravity_enabled_parents.len(), 4);
+    for (index, (particle, expected)) in gravity_enabled_states
+        .iter()
+        .take(4)
+        .zip(blender_gravity_enabled_parents)
+        .enumerate()
+    {
+        assert_numeric_rows(
+            &json!([particle.position]),
+            &json!([expected["position"]]),
+            &format!("gravity-enabled parent {index} position"),
+        );
+        assert_numeric_rows(
+            &json!([particle.velocity]),
+            &json!([expected["velocity"]]),
+            &format!("gravity-enabled parent {index} velocity"),
+        );
+    }
+    let potter_frame_two = frame_two_snapshot
+        .meshes
+        .get(&instancer_model_id)
+        .ok_or("frame-two particle mesh is missing")?
+        .clone();
+    let expected_frame_two = particle_mesh_snapshot(&potter_frame_two);
+    let potter_index_colors = expected_frame_two["color_attributes"]["InstanceIndex"]["values"]
+        .as_array()
+        .ok_or("Potter InstanceIndex color values are missing")?;
+    let blender_index_colors = blender_frame_two["color_attributes"]["InstanceIndex"]["values"]
+        .as_array()
+        .ok_or("Blender InstanceIndex color values are missing")?;
+    let frame_two_state_head = frame_two_particles
+        .iter()
+        .take(8)
+        .map(|state| (state.is_child, state.position, state.rotation))
+        .collect::<Vec<_>>();
+    // Direct Blender parity stays separate; all CLI/apply/export/reimport checks use this exact pre-apply Potter snapshot.
     assert_ordered_mesh_matches_blender(
         &potter_frame_two,
-        &expected_frame_two,
-        "Potter pre-apply frame 2",
+        blender_frame_two,
+        &format!(
+            "Potter pre-apply frame 2; first four Potter={:?} Blender={:?}; index colors Potter={:?} Blender={:?}; states={frame_two_state_head:?}; Blender parent0 rotation={:?}",
+            potter_frame_two
+                .vertices
+                .iter()
+                .take(4)
+                .map(|vertex| vertex.co.to_array())
+                .collect::<Vec<_>>(),
+            blender_frame_two["positions"]
+                .as_array()
+                .expect("Blender frame positions")
+                .iter()
+                .take(4)
+                .collect::<Vec<_>>(),
+            potter_index_colors.iter().take(4).collect::<Vec<_>>(),
+            blender_index_colors.iter().take(4).collect::<Vec<_>>(),
+            blender_frame_two_parent["rotation_xyzw"],
+        ),
     );
+    let potter_frame_three = frame_three_snapshot
+        .meshes
+        .get(&instancer_model_id)
+        .ok_or("frame-three particle mesh is missing")?
+        .clone();
+    assert_ordered_mesh_matches_blender(
+        &potter_frame_three,
+        blender_frame_three,
+        "Potter pre-apply frame 3",
+    );
+    let expected_frame_three = particle_mesh_snapshot(&potter_frame_three);
+    let assert_mesh_snapshot = |actual: &Value, expected: &Value, context: &str| {
+        assert_numeric_rows(
+            &actual["positions"],
+            &expected["positions"],
+            &format!("{context} positions"),
+        );
+        for field in [
+            "faces",
+            "materials",
+            "custom_normal_codes",
+            "color_layer_names",
+        ] {
+            assert_eq!(actual[field], expected[field], "{context} {field}");
+        }
+        let actual_uvs = actual["uv_layers"].as_object().expect("reopened UV layers");
+        let expected_uvs = expected["uv_layers"]
+            .as_object()
+            .expect("expected UV layers");
+        assert_eq!(
+            actual_uvs.len(),
+            expected_uvs.len(),
+            "{context} UV layer count"
+        );
+        for (name, expected_uvs) in expected_uvs {
+            let actual_uvs = actual_uvs
+                .get(name)
+                .unwrap_or_else(|| panic!("{context}: missing UV layer {name}"));
+            assert_numeric_rows(actual_uvs, expected_uvs, &format!("{context} UV {name}"));
+        }
+        let actual_colors = actual["color_attributes"]
+            .as_object()
+            .expect("reopened color attributes");
+        let expected_colors = expected["color_attributes"]
+            .as_object()
+            .expect("expected color attributes");
+        assert_eq!(
+            actual_colors.len(),
+            expected_colors.len(),
+            "{context} color attribute count",
+        );
+        for (name, expected_color) in expected_colors {
+            let actual_color = actual_colors
+                .get(name)
+                .unwrap_or_else(|| panic!("{context}: missing color attribute {name}"));
+            assert_eq!(actual_color["domain"], expected_color["domain"]);
+            assert_eq!(actual_color["data_type"], expected_color["data_type"]);
+            assert_numeric_rows(
+                &actual_color["values"],
+                &expected_color["values"],
+                &format!("{context} color attribute {name}"),
+            );
+        }
+        let actual_groups = actual["vertex_groups"]
+            .as_object()
+            .expect("reopened vertex groups");
+        let expected_groups = expected["vertex_groups"]
+            .as_object()
+            .expect("expected vertex groups");
+        assert_eq!(
+            actual_groups.len(),
+            expected_groups.len(),
+            "{context} vertex group count",
+        );
+        for (name, expected_weights) in expected_groups {
+            let actual_weights = actual_groups
+                .get(name)
+                .unwrap_or_else(|| panic!("{context}: missing vertex group {name}"));
+            assert_numeric_rows(
+                actual_weights,
+                expected_weights,
+                &format!("{context} vertex group {name}"),
+            );
+        }
+    };
     let assert_cli_mesh = |actual: &Value, expected: &Value, context: &str| {
         let geometry = &actual["result"]["items"][0]["evaluated_geometry"];
         assert_numeric_rows(
@@ -2153,13 +2795,13 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
             "{context} ordered faces"
         );
     };
-    let frame_one = inspect(&project, &instancer_id, "1")?;
     let frame_two = inspect(&project, &instancer_id, "2")?;
-    assert_cli_mesh(&frame_one, &expected_frame_one, "Potter CLI frame 1");
+    let frame_three = inspect(&project, &instancer_id, "3")?;
     assert_cli_mesh(&frame_two, &expected_frame_two, "Potter CLI frame 2");
+    assert_cli_mesh(&frame_three, &expected_frame_three, "Potter CLI frame 3");
     assert_ne!(
-        frame_one["result"]["items"][0]["evaluated_geometry"]["positions"],
         frame_two["result"]["items"][0]["evaluated_geometry"]["positions"],
+        frame_three["result"]["items"][0]["evaluated_geometry"]["positions"],
         "native particle evaluation must change across frames",
     );
 
@@ -2167,22 +2809,22 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
         .as_u64()
         .ok_or("imported scene revision is missing")?;
     let batch = root.join("apply_particle_instance.json");
-    apply(
+    apply_at_frame(
         &project,
         &batch,
         &json!([{"op":"modifier.apply","target":{"id":instancer_id},"modifier_id":modifier_id}]),
         revision,
+        2.0,
     )?;
     let applied_document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     let typed_applied_document: potter_core::model::SceneDoc =
         serde_json::from_value(applied_document.clone())?;
-    assert_snapshot_mesh_matches_blender(
-        &typed_applied_document,
-        &instancer_id,
-        1.0,
-        &expected_frame_one,
-        "applied particle corner data",
-    )?;
+    let applied_mesh = snapshot_mesh(&typed_applied_document, &instancer_id, 2.0)?;
+    assert_ordered_mesh_matches_blender(
+        &applied_mesh,
+        &expected_frame_two,
+        "applied frame-two particle snapshot",
+    );
     assert_eq!(
         applied_document["nodes"][instancer_id.as_str()]["track_axis"],
         "POS_Z",
@@ -2195,8 +2837,50 @@ with open(os.path.join(root, 'particle_cli_expected.json'), 'w', encoding='utf-8
                 .all(|modifier| modifier["id"] != modifier_id)),
         "applying the particle modifier must persist its evaluated mesh and remove the stack entry",
     );
-    let applied = inspect(&project, &instancer_id, "1")?;
-    assert_cli_mesh(&applied, &expected_frame_one, "applied particle mesh");
+    let applied = inspect(&project, &instancer_id, "2")?;
+    assert_cli_mesh(
+        &applied,
+        &expected_frame_two,
+        "applied frame-two particle mesh",
+    );
+    let applied_revision = applied_document["revision"]
+        .as_u64()
+        .ok_or("applied scene revision is missing")?;
+    let update_batch = root.join("update_particle_child_count.json");
+    apply(
+        &project,
+        &update_batch,
+        &json!([{
+            "op":"physics.particle_emitter.update",
+            "target":{"id":emitter_id.as_str()},
+            "set":{"child_nbr":2}
+        }]),
+        applied_revision,
+    )?;
+    let updated_document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let emitter_properties = &updated_document["nodes"][emitter_id.as_str()]["properties"];
+    let primary_settings_id = emitter_properties["physics_particle_emitter_modifier_id"]
+        .as_str()
+        .ok_or("updated primary particle settings ID is missing")?;
+    let updated_particle_settings =
+        &emitter_properties["physics_particle_systems"][primary_settings_id];
+    assert_eq!(updated_particle_settings["child_nbr"], 2);
+    assert_eq!(
+        updated_particle_settings["child_percent"],
+        blender["child_percent"]
+    );
+    assert_eq!(
+        updated_particle_settings["rendered_child_count"],
+        blender["rendered_child_count"]
+    );
+    assert_eq!(
+        updated_particle_settings["time_tweak"],
+        blender["time_tweak"]
+    );
+    assert_eq!(
+        updated_particle_settings["use_rotations"],
+        blender["use_rotations"]
+    );
 
     let exported = root.join("particle_cli_roundtrip.blend");
     let mut export = pot();
@@ -2218,11 +2902,44 @@ import bpy, json, sys
 output = sys.argv[sys.argv.index('--') + 1]
 obj = bpy.data.objects['ParticleInstancer']
 mesh = obj.data
+emitter_settings = bpy.data.objects['ParticleEmitter'].particle_systems[0].settings
+def corner_normal_codes(mesh):
+    attribute = mesh.attributes.get('custom_normal')
+    if attribute is None:
+        return None
+    if attribute.domain != 'CORNER' or attribute.data_type != 'INT16_2D':
+        raise RuntimeError('custom normals must be Blender INT16_2D CORNER codes')
+    return [None if list(item.value) == [0,0] else [int(value) for value in item.value]
+            for item in attribute.data]
+vertex_groups = {}
+for group in obj.vertex_groups:
+    values = []
+    for vertex in mesh.vertices:
+        weight = next((item.weight for item in vertex.groups if item.group == group.index), 0.0)
+        values.append(weight)
+    vertex_groups[group.name] = values
 result = {
     'track_axis':obj.track_axis,
     'modifier_count':len(obj.modifiers),
+    'scene_use_gravity':bpy.context.scene.use_gravity,
+    'particle_settings':{
+        'child_percent':int(emitter_settings.child_percent),
+        'rendered_child_count':int(emitter_settings.rendered_child_count),
+        'time_tweak':float(emitter_settings.time_tweak),
+        'use_rotations':bool(emitter_settings.use_rotations),
+    },
     'positions':[list(vertex.co) for vertex in mesh.vertices],
     'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+    'materials':[int(polygon.material_index) for polygon in mesh.polygons],
+    'uv_layers':{layer.name:[list(item.uv) for item in layer.data] for layer in mesh.uv_layers},
+    'custom_normal_codes':corner_normal_codes(mesh),
+    'color_layer_names':[layer.name for layer in mesh.color_attributes if layer.domain == 'CORNER'],
+    'color_attributes':{
+        layer.name:{'domain':layer.domain, 'data_type':layer.data_type,
+                    'values':[list(item.color) for item in layer.data]}
+        for layer in mesh.color_attributes if layer.domain == 'CORNER'
+    },
+    'vertex_groups':vertex_groups,
 }
 with open(output, 'w', encoding='utf-8') as handle:
     json.dump(result, handle, allow_nan=False)
@@ -2240,12 +2957,18 @@ with open(output, 'w', encoding='utf-8') as handle:
     let reopened: Value = serde_json::from_slice(&fs::read(&reopened_path)?)?;
     assert_eq!(reopened["track_axis"], "POS_Z");
     assert_eq!(reopened["modifier_count"], 0);
-    assert_numeric_rows(
-        &reopened["positions"],
-        &expected_frame_one["positions"],
-        "reopened Blender mesh",
+    assert_eq!(reopened["scene_use_gravity"], false);
+    assert_eq!(reopened["particle_settings"]["child_percent"], 2);
+    assert_eq!(
+        reopened["particle_settings"]["rendered_child_count"],
+        blender["rendered_child_count"]
     );
-    assert_eq!(reopened["faces"], expected_frame_one["faces"]);
+    assert_eq!(
+        reopened["particle_settings"]["time_tweak"],
+        blender["time_tweak"]
+    );
+    assert_eq!(reopened["particle_settings"]["use_rotations"], false);
+    assert_mesh_snapshot(&reopened, &expected_frame_two, "reopened Blender mesh");
 
     let reimport_project = root.join("particle-reimport-project");
     initialize(&reimport_project)?;
@@ -2273,6 +2996,45 @@ with open(output, 'w', encoding='utf-8') as handle:
         serde_json::from_slice(&fs::read(reimport_project.join("scene.json"))?)?;
     let typed_reimported_document: potter_core::model::SceneDoc =
         serde_json::from_value(reimported_document.clone())?;
+    assert!(
+        !typed_reimported_document
+            .scenes
+            .get(&typed_reimported_document.active_scene)
+            .ok_or("reimported scene is missing")?
+            .use_gravity,
+        "disabled scene gravity must survive Blender export and reimport",
+    );
+    let reimported_emitter_id = reimported_document["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(_, node)| node["name"] == "ParticleEmitter")
+                .map(|(id, _)| id.clone())
+        })
+        .ok_or("reimported ParticleEmitter is missing")?;
+    let emitter_properties =
+        &reimported_document["nodes"][reimported_emitter_id.as_str()]["properties"];
+    let primary_settings_id = emitter_properties["physics_particle_emitter_modifier_id"]
+        .as_str()
+        .ok_or("reimported primary particle settings ID is missing")?;
+    let reimported_particle_settings =
+        &emitter_properties["physics_particle_systems"][primary_settings_id];
+    assert_eq!(reimported_particle_settings["child_percent"], 2);
+    assert_eq!(
+        reimported_particle_settings["rendered_child_count"],
+        blender["rendered_child_count"]
+    );
+    assert_eq!(
+        reimported_particle_settings["time_tweak"],
+        blender["time_tweak"]
+    );
+    assert_eq!(
+        reimported_particle_settings["use_rotations"],
+        blender["use_rotations"]
+    );
+    assert!(reimported_particle_settings.get("child_nbr").is_none());
+
     let reimported_instancer_id = reimported_document["nodes"]
         .as_object()
         .and_then(|nodes| {
@@ -2292,28 +3054,376 @@ with open(output, 'w', encoding='utf-8') as handle:
             .is_some_and(Vec::is_empty),
         "reimported applied particle object must stay modifier-free",
     );
-    let after_reimport = inspect(&reimport_project, &reimported_instancer_id, "1")?;
-    assert_snapshot_mesh_matches_blender(
-        &typed_reimported_document,
-        &reimported_instancer_id,
-        1.0,
-        &expected_frame_one,
-        "reimported applied corner data",
-    )?;
+    let after_reimport = inspect(&reimport_project, &reimported_instancer_id, "2")?;
+    let reimported_mesh = snapshot_mesh(&typed_reimported_document, &reimported_instancer_id, 2.0)?;
+    assert_ordered_mesh_matches_blender(
+        &reimported_mesh,
+        &expected_frame_two,
+        "reimported particle snapshot",
+    );
     assert_cli_mesh(
         &after_reimport,
-        &expected_frame_one,
+        &expected_frame_two,
         "Potter reimported applied mesh",
     );
     let _ = blender_output;
     Ok(())
 }
 
-/// Recorded gap: the baked-path CLI instance has row 0 x = 0.0 where Blender gives 0.7009949684143066.
-/// Every path key carries x = 0.7009949684143066 with zero x-velocity, and the Potter bridge reproduces
-/// Blender's keys exactly, so the 0 is the instancer returning the source vertex at the origin. Cause
-/// not yet confirmed: `particle_instance.rs` (no parent states) or an emitter error suppressed in
-/// `eval.rs`. The test runs both sides and asserts the measured difference; a fix must make it parity.
+/// Hair sets `PSYS_HAIR_DONE`, while `render_type=NONE` leaves child paths uncached. The native
+/// `use_path` query therefore evaluates each INTERPOLATED child from its weighted parent paths.
+#[test]
+fn particle_instance_interpolated_path_parent_weights_match_blender() -> Result<(), Box<dyn Error>>
+{
+    let Some(blender_path) = blender_executable() else {
+        eprintln!("skipping interpolated particle path parity; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let fixture_script = root.join("particle_interpolated_path.py");
+    let expected_path = root.join("particle_interpolated_path.json");
+    fs::write(
+        &fixture_script,
+        r"
+import bpy, json, os, sys
+from mathutils import Matrix, Vector
+if tuple(bpy.app.version[:3]) != (5,2,2):
+    raise RuntimeError('interpolated particle path parity requires Blender 5.2.2')
+root = sys.argv[sys.argv.index('--') + 1]
+scene = bpy.context.scene
+scene.use_gravity = False
+scene.frame_start = 1
+scene.frame_end = 2
+scene.frame_set(1)
+
+emitter_mesh = bpy.data.meshes.new('InterpolatedPathEmitterMesh')
+emitter_mesh.from_pydata(
+    [(0,0,0), (1,0,0), (0,1,0), (0,0,1)],
+    [],
+    [(0,2,1), (0,1,3), (1,2,3), (2,0,3)],
+)
+emitter = bpy.data.objects.new('InterpolatedPathEmitter', emitter_mesh)
+scene.collection.objects.link(emitter)
+for selected in list(bpy.context.selected_objects):
+    selected.select_set(False)
+emitter.select_set(True)
+bpy.context.view_layer.objects.active = emitter
+bpy.ops.object.particle_system_add()
+system = emitter.particle_systems[0]
+system.seed = 17
+system.child_seed = 41
+settings = system.settings
+settings.type = 'HAIR'
+settings.count = 4
+settings.emit_from = 'VERT'
+settings.use_emit_random = False
+settings.frame_start = 1.0
+settings.frame_end = 1.0
+settings.hair_length = 1.0
+settings.hair_step = 2
+settings.particle_size = 1.0
+settings.size_random = 0.0
+settings.child_type = 'INTERPOLATED'
+settings.child_percent = 1
+settings.rendered_child_count = 1
+settings.child_radius = 0.0
+settings.child_size = 1.0
+settings.child_size_random = 0.0
+settings.render_type = 'NONE'
+settings.display_step = 2
+
+instancer_mesh = bpy.data.meshes.new('InterpolatedPathInstancerMesh')
+instancer_mesh.from_pydata([(0,0,0)], [], [])
+instancer = bpy.data.objects.new('InterpolatedPathInstancer', instancer_mesh)
+scene.collection.objects.link(instancer)
+instancer.track_axis = 'POS_Z'
+modifier = instancer.modifiers.new('Interpolated Path Instance', 'PARTICLE_INSTANCE')
+modifier.object = emitter
+modifier.particle_system_index = 1
+modifier.axis = 'Z'
+modifier.space = 'WORLD'
+modifier.use_normal = True
+modifier.use_children = True
+modifier.use_size = False
+modifier.use_path = True
+modifier.use_preserve_shape = True
+modifier.position = 0.0
+modifier.random_position = 0.0
+modifier.rotation = 0.0
+modifier.random_rotation = 0.0
+modifier.particle_amount = 1.0
+modifier.particle_offset = 0.0
+modifier.show_alive = True
+modifier.show_dead = True
+modifier.show_unborn = True
+
+scene.frame_set(1)
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated_emitter = emitter.evaluated_get(depsgraph)
+evaluated_system = evaluated_emitter.particle_systems[0]
+parent_positions = [
+    list(evaluated_emitter.matrix_world @ Vector(particle.hair_keys[0].co))
+    for particle in evaluated_system.particles
+]
+child_count = len(evaluated_system.child_particles)
+if len(parent_positions) != 4 or child_count != 4:
+    raise RuntimeError('the path fixture must have four parents and four interpolated children')
+evaluated_instancer = instancer.evaluated_get(depsgraph)
+mesh = evaluated_instancer.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+try:
+    positions = [list(vertex.co) for vertex in mesh.vertices]
+finally:
+    evaluated_instancer.to_mesh_clear()
+if len(positions) != len(parent_positions) + child_count:
+    raise RuntimeError('the native path instance must emit all parents and interpolated children')
+matrix = Matrix(tuple(
+    tuple(parent_positions[column][axis] - parent_positions[0][axis] for column in (1,2,3))
+    for axis in range(3)
+))
+if abs(matrix.determinant()) < 1.0e-8:
+    raise RuntimeError('the native parent roots must form a non-degenerate tetrahedron')
+inverse = matrix.inverted()
+child_parent_weights = []
+for position in positions[len(parent_positions):]:
+    coefficients = inverse @ (Vector(position) - Vector(parent_positions[0]))
+    child_parent_weights.append([
+        1.0 - sum(coefficients),
+        float(coefficients.x),
+        float(coefficients.y),
+        float(coefficients.z),
+    ])
+with open(os.path.join(root, 'particle_interpolated_path.json'), 'w', encoding='utf-8') as output:
+    json.dump({
+        'parent_count':len(parent_positions),
+        'child_count':child_count,
+        'use_path':modifier.use_path,
+        'render_type':settings.render_type,
+        'parent_positions':parent_positions,
+        'positions':positions,
+        'child_parent_weights':child_parent_weights,
+        'parent_path_key_count':[len(particle.hair_keys) for particle in evaluated_system.particles],
+    }, output, allow_nan=False)
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_interpolated_path.blend'))
+",
+    )?;
+    let mut create_fixture = Command::new(&blender_path);
+    create_fixture
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(&fixture_script)
+        .arg("--")
+        .arg(root);
+    run(
+        &mut create_fixture,
+        "Blender interpolated particle path fixture",
+    )?;
+    let blender: Value = serde_json::from_slice(&fs::read(&expected_path)?)?;
+    let parent_count = usize::try_from(
+        blender["parent_count"]
+            .as_u64()
+            .ok_or("Blender parent count is missing")?,
+    )?;
+    let child_count = usize::try_from(
+        blender["child_count"]
+            .as_u64()
+            .ok_or("Blender interpolated child count is missing")?,
+    )?;
+    assert_eq!(parent_count, 4);
+    assert_eq!(child_count, 4);
+    assert_eq!(blender["use_path"], true);
+    assert_eq!(blender["render_type"], "NONE");
+    assert!(
+        blender["parent_path_key_count"]
+            .as_array()
+            .is_some_and(|paths| paths
+                .iter()
+                .all(|path| path.as_u64().is_some_and(|len| len >= 2))),
+        "Blender Hair parents must provide defined path states",
+    );
+
+    let project = root.join("particle-interpolated-path-project");
+    initialize(&project)?;
+    let mut import = pot();
+    import
+        .arg("import")
+        .arg(&project)
+        .arg("--file")
+        .arg(root.join("particle_interpolated_path.blend"))
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender_path)
+        .arg("--json");
+    let imported: Value = serde_json::from_slice(
+        &run(&mut import, "importing interpolated particle path fixture")?.stdout,
+    )?;
+    assert_eq!(imported["result"]["losses"], json!([]), "{imported}");
+    let document: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let node_id_by_name = |name: &str| -> Result<potter_core::model::Id, Box<dyn Error>> {
+        let id = document["nodes"]
+            .as_object()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|(_, node)| node["name"] == name)
+                    .map(|(id, _)| id.clone())
+            })
+            .ok_or_else(|| format!("imported Blender object `{name}` is missing"))?;
+        Ok(potter_core::model::Id::new(id)?)
+    };
+    let emitter_id = node_id_by_name("InterpolatedPathEmitter")?;
+    let instancer_id = node_id_by_name("InterpolatedPathInstancer")?;
+    let emitter_settings =
+        document["nodes"][emitter_id.as_str()]["properties"]["physics_particle_systems"]
+            .as_object()
+            .and_then(|systems| systems.values().find(|settings| settings["seed"] == 17))
+            .ok_or("imported interpolated particle settings are missing")?;
+    assert_eq!(emitter_settings["child_type"], "INTERPOLATED");
+    assert_eq!(emitter_settings["render_type"], "NONE");
+    assert_eq!(emitter_settings["use_emit_random"], false);
+    assert_eq!(
+        emitter_settings["_potter_path_keys"]
+            .as_array()
+            .map(Vec::len),
+        Some(parent_count),
+        "Blender Hair parent paths must be imported",
+    );
+    assert!(
+        emitter_settings.get("_potter_child_path_keys").is_none(),
+        "the uncached Blender child path must be evaluated from parent weights",
+    );
+    let typed_document: potter_core::model::SceneDoc = serde_json::from_value(document)?;
+    let snapshot = potter_core::eval::Snapshot::evaluate(
+        &typed_document,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(1.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let emitter_node = typed_document
+        .nodes
+        .get(&emitter_id)
+        .ok_or("Potter interpolated path emitter node is missing")?;
+    let emitter_data_id = emitter_node
+        .data
+        .as_ref()
+        .ok_or("Potter interpolated path emitter mesh is missing")?;
+    let emitter_mesh = typed_document
+        .data_blocks
+        .get(emitter_data_id)
+        .and_then(|data| data.mesh.as_ref())
+        .ok_or("Potter interpolated path emitter source mesh is missing")?;
+    assert_eq!(
+        snapshot.meshes.get(&emitter_id),
+        Some(emitter_mesh),
+        "Blender render_type NONE must leave the emitter geometry unchanged",
+    );
+    let native_positions = snapshot
+        .meshes
+        .get(&instancer_id)
+        .ok_or("Potter interpolated path instance mesh is missing")?
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.to_array())
+        .collect::<Vec<_>>();
+    let particle_states = snapshot
+        .simulated_particles
+        .get(&emitter_id)
+        .ok_or("Potter interpolated path particle states are missing")?;
+    assert_eq!(particle_states.len(), parent_count + child_count);
+    assert!(
+        particle_states[..parent_count]
+            .iter()
+            .all(|particle| !particle.is_child)
+            && particle_states[parent_count..]
+                .iter()
+                .all(|particle| particle.is_child),
+        "interpolated path states must keep Blender's parent-then-child order",
+    );
+    for (index, particle) in particle_states[..parent_count].iter().enumerate() {
+        let root = particle
+            .path
+            .first()
+            .ok_or("Potter Hair parent path is missing")?
+            .position;
+        assert_numeric_rows(
+            &json!([root]),
+            &json!([blender["parent_positions"][index]]),
+            &format!("Potter Hair parent path root {index}"),
+        );
+    }
+    let expected_child_weights = blender["child_parent_weights"]
+        .as_array()
+        .ok_or("Blender child parent weights are missing")?;
+    assert_eq!(expected_child_weights.len(), child_count);
+    for (index, child) in particle_states[parent_count..].iter().enumerate() {
+        let child_parent_count = usize::from(child.parent_count);
+        assert_eq!(
+            child_parent_count, 3,
+            "interpolated child {index} parent count"
+        );
+        assert!(
+            child.path.len() >= 2,
+            "interpolated child {index} must use the native parent paths",
+        );
+        let mut actual_weights = [0.0; 4];
+        let mut weighted_root = DVec3::ZERO;
+        for (&parent_index, &weight) in child.parent_indices[..child_parent_count]
+            .iter()
+            .zip(&child.parent_weights[..child_parent_count])
+        {
+            let parent = usize::try_from(parent_index)?;
+            assert!(parent < parent_count, "interpolated child parent index");
+            actual_weights[parent] = weight;
+            let parent_root = particle_states[parent]
+                .path
+                .first()
+                .ok_or("Potter interpolated child parent path is missing")?
+                .position;
+            weighted_root += DVec3::from_array(parent_root) * weight;
+        }
+        let child_root = DVec3::from_array(
+            child
+                .path
+                .first()
+                .ok_or("Potter interpolated child path root is missing")?
+                .position,
+        );
+        assert!(
+            weighted_root.distance(child_root) <= MODIFIER_POSITION_TOLERANCE,
+            "interpolated child {index} root must match its weighted native parent paths",
+        );
+        assert_numeric_rows(
+            &json!([actual_weights]),
+            &json!([expected_child_weights[index]]),
+            &format!(
+                "interpolated child {index} nearest-parent weights Potter={actual_weights:?} Blender={:?}",
+                expected_child_weights[index],
+            ),
+        );
+    }
+    assert_numeric_rows(
+        &json!(native_positions),
+        &blender["positions"],
+        "Potter defined INTERPOLATED path instance",
+    );
+    Ok(())
+}
+/// A baked point-cache path supplies valid Particle Instance state even when the emitter render type is
+/// `NONE`; the scene-aware dependency path keeps the source transform available.
 #[test]
 fn particle_instance_baked_path_velocity_matches_blender() -> Result<(), Box<dyn Error>> {
     let Some(blender_path) = blender_executable() else {
@@ -2412,7 +3522,8 @@ def evaluate_mesh(frame):
 scene.frame_set(1)
 bpy.context.view_layer.update()
 depsgraph = bpy.context.evaluated_depsgraph_get()
-particle = emitter.evaluated_get(depsgraph).particle_systems[0].particles[0]
+evaluated_emitter = emitter.evaluated_get(depsgraph)
+particle = evaluated_emitter.particle_systems[0].particles[0]
 birth_time = float(particle.birth_time)
 die_time = float(particle.die_time)
 duration = die_time - birth_time
@@ -2446,7 +3557,8 @@ else:
         scene.frame_set(frame, subframe=float(sample_time - frame))
         bpy.context.view_layer.update()
         depsgraph = bpy.context.evaluated_depsgraph_get()
-        particle = emitter.evaluated_get(depsgraph).particle_systems[0].particles[0]
+        evaluated_emitter = emitter.evaluated_get(depsgraph)
+        particle = evaluated_emitter.particle_systems[0].particles[0]
         path_keys.append({
             'time':(sample_time - birth_time) / duration,
             'position':[float(value) for value in particle.location],
@@ -2560,15 +3672,10 @@ bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, 'particle_baked_path.ble
     }
     let inspection = inspect(&project, &instancer_id, "2")?;
     let geometry = &inspection["result"]["items"][0]["evaluated_geometry"];
-    // Recorded gap (see the CHANGELOG): the instance is at the origin, x 0, where Blender gives
-    // 0.7009949684143066. The measured difference is -0.7009949684143066.
-    assert_recorded_gap(
-        "baked path CLI particle position row 0 x",
-        geometry["positions"][0][0].as_f64().ok_or("Potter x")?,
-        blender["mesh"]["positions"][0][0]
-            .as_f64()
-            .ok_or("Blender x")?,
-        -0.700_994_968_414_306_6,
+    assert_numeric_rows(
+        &geometry["positions"],
+        &blender["mesh"]["positions"],
+        "baked path CLI particle positions",
     );
     assert_eq!(geometry["faces"], blender["mesh"]["faces"]);
     Ok(())
@@ -3305,7 +4412,6 @@ with open(os.path.join(root, 'particle_hair_path.json'), 'w', encoding='utf-8') 
         &simulation_settings,
         source_world,
         1.0,
-        24.0,
         DVec3::ZERO,
         system_seed,
         &[],
@@ -4072,7 +5178,6 @@ with open(os.path.join(root, 'particle_emission.json'), 'w', encoding='utf-8') a
             &settings,
             emitter_world,
             frame,
-            24.0,
             DVec3::ZERO,
             37,
             &[],

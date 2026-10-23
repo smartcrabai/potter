@@ -13,6 +13,7 @@ use glam::{DMat4, DQuat, DVec3};
 use serde_json::{Map, Value};
 
 use crate::{
+    blender_f32,
     blender_rng::{hash_frand, psys_frand},
     error::{ErrorCode, PotError, Result},
     geom::{
@@ -252,15 +253,17 @@ pub fn particle_instance(
         let state = state_at(number);
         let has_path = use_path && !state.path.is_empty();
         let particle_rotation = if has_path {
-            DQuat::IDENTITY
+            [1.0, 0.0, 0.0, 0.0]
         } else {
-            let rotation = DQuat::from_array(state.rotation);
-            if !rotation.is_finite() || rotation.length_squared() <= 1.0e-20 {
+            let [x, y, z, w] = state.rotation.map(|value| value as f32);
+            let rotation = [w, x, y, z];
+            let length_squared = rotation.iter().map(|value| value * value).sum::<f32>();
+            if !rotation.iter().all(|value| value.is_finite()) || length_squared <= 1.0e-20 {
                 return Err(invalid(
                     "particle instance rotation must be finite and nonzero",
                 ));
             }
-            rotation.normalize()
+            rotation
         };
         let path_frame_seed = if has_path {
             let rotation =
@@ -274,7 +277,6 @@ pub fn particle_instance(
         } else {
             DQuat::IDENTITY
         };
-        let particle_translation = DVec3::from_array(state.position);
         // Blender scales by `size[p]`, one array filled with parent sizes (if used) then child sizes
         // (if used). Without parents that array starts at child 0, so child number p reads the
         // size of child p, while the instanced state is child p - totpart.
@@ -306,7 +308,7 @@ pub fn particle_instance(
         let base = output.vertices.len();
         for (source, vertex) in mesh.vertices.iter().enumerate() {
             let mut oriented = orient(vertex.co, axis, track);
-            let (orientation, translation) = if has_path {
+            let transform = if has_path {
                 let mut path_time = if preserve_shape {
                     position * (1.0 - random_position_offset)
                 } else if !max_co.total_cmp(&min_co).is_eq() {
@@ -343,11 +345,25 @@ pub fn particle_instance(
                 };
                 path_frame = Some(frame);
                 previous_direction = Some(direction);
-                (frame, position)
+                Some((frame, position))
             } else {
-                (particle_rotation, particle_translation)
+                None
             };
-            let mut point = orientation * oriented * scale + translation;
+            let mut point = if let Some((orientation, translation)) = transform {
+                orientation * oriented * scale + translation
+            } else {
+                let source_position = blender_f32::vec3(oriented.to_array());
+                let mut point = blender_f32::mul_qt_v3(particle_rotation, source_position);
+                if use_size {
+                    point = blender_f32::scale3(point, scale as f32);
+                }
+                let translation = state.position.map(|value| value as f32);
+                DVec3::from_array([
+                    f64::from(point[0] + translation[0]),
+                    f64::from(point[1] + translation[1]),
+                    f64::from(point[2] + translation[2]),
+                ])
+            };
             if let Some(inverse) = source_inverse {
                 point = inverse.transform_point3(point);
             }

@@ -3378,6 +3378,15 @@ fn build_imported_graph(
             simulation_frame_end,
             fps,
             fps_base: number_field(item, "fps_base", 1.0),
+            use_gravity: item
+                .get("use_gravity")
+                .and_then(Value::as_bool)
+                .or_else(|| {
+                    item.get("rna_properties")
+                        .and_then(|properties| properties.get("use_gravity"))
+                        .and_then(Value::as_bool)
+                })
+                .unwrap_or(true),
             camera: None,
             world: None,
             unit: UnitSettings {

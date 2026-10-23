@@ -19,6 +19,7 @@ const SCENE_UPDATE_FIELDS: &[&str] = &[
     "simulation_frame_end",
     "fps",
     "fps_base",
+    "use_gravity",
     "camera",
     "world",
     "active_clip",
@@ -136,6 +137,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         simulation_frame_end: 250,
         fps: 24,
         fps_base: 1.0,
+        use_gravity: true,
         camera: None,
         world: None,
         active_clip: None,
@@ -326,6 +328,18 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             Ok(number)
         })
         .transpose()?;
+    let use_gravity = set
+        .get("use_gravity")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "use_gravity must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/use_gravity"),
+                )
+            })
+        })
+        .transpose()?;
     let read_optional_id = |field: &str| -> Result<Option<Option<crate::model::Id>>> {
         set.get(field)
             .map(|value| {
@@ -495,6 +509,12 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         && !crate::float::equal_f64(scene.fps_base, value)
     {
         scene.fps_base = value;
+        changed = true;
+    }
+    if let Some(value) = use_gravity
+        && scene.use_gravity != value
+    {
+        scene.use_gravity = value;
         changed = true;
     }
     if let Some(value) = camera

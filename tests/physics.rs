@@ -162,6 +162,67 @@ fn box_drop_rests_on_passive_plane_and_bake_keeps_scene_unchanged() {
             .is_some()
     );
 }
+
+#[test]
+fn scene_gravity_flag_gates_rigid_body_motion_without_changing_world_gravity() {
+    let directory = tempdir().unwrap();
+    let simulate = |name: &str, use_gravity: bool| {
+        let scene = directory.path().join(name);
+        init_scene(&scene);
+        apply(
+            &scene,
+            &json!({
+                "schema_version":1,
+                "base_revision":0,
+                "operations":[
+                    {"op":"node.create","id":"body","kind":"box","params":{"size":1.0},"transform":{"translation":[0.0,0.0,5.0]}},
+                    {"op":"physics.world.update","target":{"id":"scene_main"},"set":{"enabled":true,"gravity":[0.0,0.0,-9.81],"substeps":4,"solver_iterations":8,"frame_start":1,"frame_end":2}},
+                    {"op":"physics.rigid_body.create","target":{"id":"body"},"type":"active","mass":1.0,"shape":"box","friction":0.0,"restitution":0.0,"linear_damping":0.0,"angular_damping":0.0},
+                    {"op":"scene.update","target":{"id":"scene_main"},"set":{"use_gravity":use_gravity}}
+                ]
+            }),
+        );
+        let document: Value =
+            serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+        assert_eq!(
+            document["scenes"]["scene_main"]["rigid_body_world"]["gravity"],
+            json!([0.0, 0.0, -9.81]),
+        );
+        assert_eq!(
+            document["scenes"]["scene_main"]["use_gravity"],
+            json!(use_gravity),
+        );
+        let out = directory.path().join(format!("{name}_bake"));
+        let (output, _) = bake(&scene, &out, "1:2");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        let last = manifest["frames"].as_array().unwrap().last().unwrap();
+        let frame: Value =
+            serde_json::from_slice(&fs::read(out.join(last["file"].as_str().unwrap())).unwrap())
+                .unwrap();
+        let body = &frame["transforms"]["body"];
+        (
+            body["world_matrix"][14].as_f64().unwrap(),
+            body["linear_velocity"][2].as_f64().unwrap(),
+        )
+    };
+    let disabled = simulate("gravity_disabled", false);
+    let enabled = simulate("gravity_enabled", true);
+    assert_eq!(disabled, (5.0, 0.0));
+    assert!(
+        enabled.0 < disabled.0,
+        "gravity did not move the body down: {enabled:?}"
+    );
+    assert!(
+        enabled.1 < 0.0,
+        "gravity did not accelerate the body down: {enabled:?}"
+    );
+}
 #[test]
 fn wind_force_field_accelerates_a_rigid_body() {
     let directory = tempdir().unwrap();
@@ -637,7 +698,6 @@ fn particles_are_seeded_and_born_by_count_over_frames() {
         &settings,
         DMat4::IDENTITY,
         4.0,
-        24.0,
         DVec3::new(0.0, 0.0, -9.81),
         71,
         &[],
@@ -649,7 +709,6 @@ fn particles_are_seeded_and_born_by_count_over_frames() {
         &settings,
         DMat4::IDENTITY,
         4.0,
-        24.0,
         DVec3::new(0.0, 0.0, -9.81),
         71,
         &[],

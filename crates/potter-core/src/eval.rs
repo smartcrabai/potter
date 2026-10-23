@@ -2381,7 +2381,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
-        "armature" | "hook" | "lattice" | "screw" => &["object"],
+        "armature" | "hook" | "lattice" | "screw" | "particle_instance" => &["object"],
         "mask" => &["armature"],
         "mirror" => &["mirror_object"],
         "uv_project" => &["projectors"],
@@ -2492,7 +2492,17 @@ pub(crate) struct ModifierGate<'a> {
     modifier_prefix: Option<ModifierPrefix<'a>>,
 }
 
-impl ModifierGate<'_> {
+impl<'a> ModifierGate<'a> {
+    pub(crate) fn for_modifier_apply(
+        context: ModifierEvaluationContext<'a>,
+        suppressed: &'a BTreeSet<Id>,
+    ) -> Self {
+        Self {
+            context,
+            suppressed,
+            modifier_prefix: None,
+        }
+    }
     fn stack_modifiers<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> &'m [Modifier] {
         match self.modifier_prefix {
             Some(prefix) if prefix.node_id == node_id => {
@@ -3097,13 +3107,16 @@ fn object_mesh_dependencies(
                 "shrinkwrap" => &["target", "auxiliary_target"],
                 "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
                 "array" => &["start_cap", "end_cap"],
+                "particle_instance" => &["object"],
                 _ => &[],
             };
             for parameter in parameters {
                 let value = modifier.params.get(*parameter);
-                // Blender disables a Shrinkwrap aimed at its own object: no dependency.
-                if modifier.modifier_type == "shrinkwrap"
-                    && value.and_then(serde_json::Value::as_str) == Some(owner_id.as_str())
+                // Shrinkwrap ignores its own target, and Particle Instance returns its source mesh unchanged.
+                if matches!(
+                    modifier.modifier_type.as_str(),
+                    "shrinkwrap" | "particle_instance"
+                ) && value.and_then(serde_json::Value::as_str) == Some(owner_id.as_str())
                 {
                     continue;
                 }
@@ -4459,16 +4472,7 @@ fn render_simulated_particles(
                     .push(state);
             }
         }
-        let particle_count = visible_states_by_system
-            .values()
-            .fold(0_usize, |count, states| count.saturating_add(states.len()));
-        if particle_count > MAX_RENDERED_PARTICLES {
-            return Err(PotError::with_details(
-                ErrorCode::LimitExceeded,
-                "particle visualization exceeds the 100000 particle limit",
-                json!({"node_id":emitter_id,"count":particle_count}),
-            ));
-        }
+        let mut particle_count = 0_usize;
         for (system_index, visible_states) in visible_states_by_system {
             let has_stack_system = usize::try_from(system_index).is_ok_and(|index| {
                 gate.stack_modifiers(emitter_id, &node.modifiers)
@@ -4506,6 +4510,7 @@ fn render_simulated_particles(
                 Some("PATH") => "hair_curves",
                 Some("OBJECT") => "object",
                 Some("COLLECTION") => "collection",
+                Some("NONE") => "none",
                 Some(_) => {
                     return Err(PotError::with_details(
                         ErrorCode::UnsupportedFeature,
@@ -4518,6 +4523,19 @@ fn render_simulated_particles(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("points"),
             };
+            // Blender's NONE mode adds no rendered particle geometry, but its states remain
+            // available to Particle Instance and other scene consumers.
+            if mode == "none" {
+                continue;
+            }
+            particle_count = particle_count.saturating_add(visible_states.len());
+            if particle_count > MAX_RENDERED_PARTICLES {
+                return Err(PotError::with_details(
+                    ErrorCode::LimitExceeded,
+                    "particle visualization exceeds the 100000 particle limit",
+                    json!({"node_id":emitter_id,"count":particle_count}),
+                ));
+            }
             let emitter_world = matrices.get(emitter_id).copied().ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::EvaluationFailed,
@@ -4755,7 +4773,7 @@ fn apply_stack_physics_modifier(
     Ok(())
 }
 
-fn apply_particle_instance_modifier(
+pub(crate) fn apply_particle_instance_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     node_id: &Id,
@@ -4808,7 +4826,7 @@ fn apply_particle_instance_modifier(
     Ok(())
 }
 
-fn apply_explode_modifier(
+pub(crate) fn apply_explode_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     node_id: &Id,

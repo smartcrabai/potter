@@ -30,6 +30,9 @@ const MAX_SIMULATION_WORK: usize = 50_000_000;
 pub struct Particle {
     pub position: [f64; 3],
     pub birth_position: [f64; 3],
+    /// Exact emitter-local source point when sampled from the emitter mesh.
+    #[serde(default, skip_serializing)]
+    pub birth_position_local: Option<[f64; 3]>,
     pub normal: [f64; 3],
     pub birth_rotation: [f64; 4],
     /// Current interpolated path rotation, when path keys are available.
@@ -75,6 +78,7 @@ struct ChildSettings {
     lifetime_random: f64,
     interpolated: bool,
     use_emit_random: bool,
+    use_rotations: bool,
     virtual_parents: f64,
 }
 
@@ -84,7 +88,6 @@ struct Triangle {
     normal: DVec3,
     frame_tangent: DVec3,
     frame_normal: DVec3,
-    cumulative_area: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -139,12 +142,12 @@ impl Random {
 /// `velocity`, and `random_velocity` are emitter-local velocities in meters per second.
 /// `force_fields` use world-space origins and radial falloff (zero means unlimited range);
 /// `colliders` are static world-space triangles.
+/// Live dynamics use Blender's particle-specific `0.04 * time_tweak` seconds per frame, independent of Scene FPS.
 pub fn simulate(
     mesh: &Mesh,
     settings: &Value,
     world: DMat4,
     frame: f64,
-    fps: f64,
     gravity: DVec3,
     seed: u32,
     force_fields: &[(DVec3, &str, f64, f64)],
@@ -155,7 +158,6 @@ pub fn simulate(
         settings,
         world,
         frame,
-        fps,
         gravity,
         seed,
         force_fields,
@@ -170,7 +172,6 @@ pub fn simulate_textured(
     settings: &Value,
     world: DMat4,
     frame: f64,
-    fps: f64,
     gravity: DVec3,
     seed: u32,
     force_fields: &[(DVec3, &str, f64, f64)],
@@ -182,7 +183,6 @@ pub fn simulate_textured(
         settings,
         world,
         frame,
-        fps,
         gravity,
         seed,
         force_fields,
@@ -198,7 +198,6 @@ pub fn simulate_lifecycle(
     settings: &Value,
     world: DMat4,
     frame: f64,
-    fps: f64,
     gravity: DVec3,
     seed: u32,
     force_fields: &[(DVec3, &str, f64, f64)],
@@ -209,7 +208,6 @@ pub fn simulate_lifecycle(
         settings,
         world,
         frame,
-        fps,
         gravity,
         seed,
         force_fields,
@@ -224,7 +222,6 @@ pub fn simulate_lifecycle_textured(
     settings: &Value,
     world: DMat4,
     frame: f64,
-    fps: f64,
     gravity: DVec3,
     seed: u32,
     force_fields: &[(DVec3, &str, f64, f64)],
@@ -236,7 +233,6 @@ pub fn simulate_lifecycle_textured(
         settings,
         world,
         frame,
-        fps,
         gravity,
         seed,
         force_fields,
@@ -251,7 +247,6 @@ fn simulate_with_lifecycle(
     settings: &Value,
     world: DMat4,
     frame: f64,
-    fps: f64,
     gravity: DVec3,
     seed: u32,
     force_fields: &[(DVec3, &str, f64, f64)],
@@ -261,9 +256,6 @@ fn simulate_with_lifecycle(
 ) -> Result<Vec<Particle>> {
     if !frame.is_finite() || frame < 0.0 {
         return Err(invalid("particle frame must be finite and non-negative"));
-    }
-    if !fps.is_finite() || fps <= 0.0 {
-        return Err(invalid("particle frame rate must be finite and positive"));
     }
     if !world.is_finite() || !gravity.is_finite() {
         return Err(invalid("particle transform and gravity must be finite"));
@@ -331,6 +323,11 @@ fn simulate_with_lifecycle(
 
     let lifetime = setting_alias_number(settings, &["lifetime"], 50.0)?;
     let lifetime_random = setting_alias_number(settings, &["lifetime_random"], 0.0)?;
+    let time_tweak = setting_alias_number(settings, &["time_tweak"], 1.0)?;
+    if !(0.0..=100.0).contains(&time_tweak) {
+        return Err(invalid("particle time_tweak must be between 0 and 100"));
+    }
+    let particle_timestep = f64::from(0.04_f32 * time_tweak as f32);
     let is_hair = settings.get("type").and_then(Value::as_str) == Some("HAIR");
     let path_interpolation = if let Some(value) = settings.get("_potter_path_interpolation") {
         serde_json::from_value(value.clone())
@@ -501,6 +498,12 @@ fn simulate_with_lifecycle(
     } else {
         None
     };
+    let child_face_emitter =
+        if child_settings.is_some_and(|child| child.interpolated && child.count > 0) {
+            Some(particle_distribution::FaceEmitter::new(mesh)?)
+        } else {
+            None
+        };
     let output_len = usize::try_from(output_count)
         .map_err(|_| limit("particle output exceeds supported limits"))?;
     let child_output_count = child_settings
@@ -643,9 +646,6 @@ fn simulate_with_lifecycle(
     }
 
     let mut output = Vec::with_capacity(output_len);
-    let total_area = triangles
-        .last()
-        .map_or(0.0, |triangle| triangle.cumulative_area);
     let mut texture_rng = BlenderRng::seed_random(system_seed);
     // Blender's `distribute_particles`: particle `p` is emitted from vertex `vertex_elements[p]`, or
     // from its face or volume sample `face_samples[p]`.
@@ -749,7 +749,7 @@ fn simulate_with_lifecycle(
                 return Err(invalid("particle emission produced a non-finite value"));
             }
             let birth_rotation = blender_velocity_orientation(velocity.to_array());
-            Some((start, velocity, normal, birth_rotation))
+            Some((start, velocity, normal, birth_rotation, local_position))
         } else {
             None
         };
@@ -827,6 +827,9 @@ fn simulate_with_lifecycle(
         } else {
             gravity
         };
+        let birth_position_local = sampled
+            .as_ref()
+            .map(|(_, _, _, _, local_position)| local_position.to_array());
         let (start, normal, birth_rotation, mut position, mut final_velocity) =
             if let (Some(birth), Some(current)) = (path.first(), current_path) {
                 let normal = (DQuat::from_array(birth.rotation) * DVec3::X).normalize_or_zero();
@@ -839,13 +842,13 @@ fn simulate_with_lifecycle(
                     DVec3::from_array(current.velocity),
                 )
             } else {
-                let (start, velocity, normal, birth_rotation) =
+                let (start, velocity, normal, birth_rotation, _) =
                     sampled.ok_or_else(|| invalid("particle emission sample is missing"))?;
                 let (position, final_velocity) = integrate_particle(
                     start,
                     velocity,
                     age_frames,
-                    fps,
+                    particle_timestep,
                     particle_gravity,
                     &fields,
                     &world_colliders,
@@ -877,6 +880,7 @@ fn simulate_with_lifecycle(
         output.push(Particle {
             position: position.to_array(),
             birth_position: start.to_array(),
+            birth_position_local,
             normal: normal.to_array(),
             birth_rotation,
             current_path_rotation: current_path.map(|key| key.rotation),
@@ -901,8 +905,7 @@ fn simulate_with_lifecycle(
             child_settings,
             frame,
             world,
-            &triangles,
-            total_area,
+            child_face_emitter.as_ref(),
             &mut output,
         )?;
         if let Some(child_paths) = settings.get("_potter_child_path_keys") {
@@ -981,18 +984,18 @@ fn integrate_particle(
     mut position: DVec3,
     mut velocity: DVec3,
     age_frames: f64,
-    fps: f64,
+    timestep_per_frame: f64,
     gravity: DVec3,
     fields: &[ForceField],
     colliders: &[ColliderTriangle],
 ) -> Result<(DVec3, DVec3)> {
     let whole_steps = age_frames.floor() as usize;
-    let fixed_dt = 1.0 / fps;
+    let fixed_dt = timestep_per_frame;
     for _ in 0..whole_steps {
         (position, velocity) =
             integrate_step(position, velocity, fixed_dt, gravity, fields, colliders)?;
     }
-    let remainder = (age_frames - whole_steps as f64) / fps;
+    let remainder = (age_frames - whole_steps as f64) * timestep_per_frame;
     if remainder > 0.0 {
         (position, velocity) =
             integrate_step(position, velocity, remainder, gravity, fields, colliders)?;
@@ -1185,7 +1188,6 @@ fn prepare_geometry(mesh: &Mesh) -> Result<(Vec<Triangle>, Vec<DVec3>)> {
             normal,
             frame_tangent,
             frame_normal,
-            cumulative_area,
         });
     })
     .map_err(|error| invalid(&format!("particle emitter mesh is invalid: {error}")))?;
@@ -1714,19 +1716,25 @@ fn parse_child_settings(settings: &Value, system_seed: u32) -> Result<Option<Chi
             ));
         }
     };
-    let count = settings
-        .get("child_percent")
+    // A native update must override any imported Blender value for the same setting.
+    let child_count = settings
+        .get("child_nbr")
+        .or_else(|| settings.get("child_percent"))
         .map(|value| {
             value
                 .as_u64()
-                .ok_or_else(|| invalid("child_percent must be a non-negative integer"))
+                .ok_or_else(|| invalid("particle child count must be a non-negative integer"))
         })
         .transpose()?
         .unwrap_or(10);
-    if count == 0 {
+    if child_count > 100_000 {
+        return Err(invalid("particle child count exceeds supported limits"));
+    }
+    if child_count == 0 {
         return Ok(None);
     }
-    let count = usize::try_from(count).map_err(|_| limit("child particle count exceeds limits"))?;
+    let count =
+        usize::try_from(child_count).map_err(|_| limit("child particle count exceeds limits"))?;
     let radius = setting_alias_number(settings, &["child_radius", "childrad"], 0.2)?;
     let flat = setting_alias_number(settings, &["child_roundness", "childflat"], 0.0)?;
     let size = setting_alias_number(settings, &["child_size", "childsize"], 1.0)?;
@@ -1759,6 +1767,24 @@ fn parse_child_settings(settings: &Value, system_seed: u32) -> Result<Option<Chi
         })
         .transpose()?
         .unwrap_or(0);
+    let use_emit_random = settings
+        .get("use_emit_random")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| invalid("use_emit_random must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(true);
+    let use_rotations = settings
+        .get("use_rotations")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| invalid("use_rotations must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
     Ok(Some(ChildSettings {
         count,
         radius,
@@ -1769,12 +1795,10 @@ fn parse_child_settings(settings: &Value, system_seed: u32) -> Result<Option<Chi
         system_seed,
         lifetime,
         lifetime_random,
-        virtual_parents,
         interpolated,
-        use_emit_random: settings
-            .get("use_emit_random")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        use_emit_random,
+        use_rotations,
+        virtual_parents,
     }))
 }
 
@@ -1782,8 +1806,7 @@ fn append_children(
     settings: Option<ChildSettings>,
     frame: f64,
     world: DMat4,
-    triangles: &[Triangle],
-    total_area: f64,
+    child_face_emitter: Option<&particle_distribution::FaceEmitter>,
     parents: &mut Vec<Particle>,
 ) -> Result<()> {
     let Some(settings) = settings else {
@@ -1806,6 +1829,20 @@ fn append_children(
     }
     let mut children = Vec::with_capacity(child_count);
     if settings.interpolated {
+        let emitter = child_face_emitter.ok_or_else(|| {
+            invalid("interpolated particle children require emitter face geometry")
+        })?;
+        let child_roots = emitter.sample_interpolated_children(
+            child_count,
+            settings.system_seed,
+            settings.child_seed,
+            settings.use_emit_random,
+        );
+        if child_roots.len() != child_count {
+            return Err(invalid(
+                "interpolated particle children require emitter face geometry",
+            ));
+        }
         let inverse = world.inverse();
         let use_local_space = inverse.is_finite();
         let parent_positions = parents
@@ -1828,8 +1865,7 @@ fn append_children(
             frame,
             world,
             use_local_space,
-            triangles,
-            total_area,
+            child_roots,
             &parent_positions,
             parents,
             &mut children,
@@ -1863,71 +1899,124 @@ fn append_simple_children(
             let child_number = u32::try_from(child_number)
                 .map_err(|_| limit("child particle ID exceeds supported range"))?;
             let local_offset = loop {
-                let x = random.get_float() * 2.0 - 1.0;
-                let y = random.get_float() * 2.0 - 1.0;
-                let z = random.get_float() * 2.0 - 1.0;
-                if (x * x + y * y + z * z).sqrt() < 1.0 {
-                    break DVec3::new(
-                        f64::from(x * flat * radius),
-                        f64::from(y * radius),
-                        f64::from(z * radius),
-                    );
+                let mut offset = [
+                    random.get_float() * 2.0 - 1.0,
+                    random.get_float() * 2.0 - 1.0,
+                    random.get_float() * 2.0 - 1.0,
+                ];
+                if (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt()
+                    < 1.0
+                {
+                    offset = blender_f32::scale3(offset, radius);
+                    offset[0] *= flat;
+                    break offset;
                 }
             };
             let parent_index = u32::try_from(parent_slot)
                 .map_err(|_| limit("child particle parent ID exceeds supported range"))?;
-            let parent_rotation = DQuat::from_array(
+            let to_blender_quat = |rotation: [f64; 4]| {
+                let [x, y, z, w] = rotation.map(|value| value as f32);
+                [w, x, y, z]
+            };
+            // Blender's `offset_child` applies ParticleKey.rot directly, without normalization.
+            let parent_rotation = to_blender_quat(
                 parent
                     .path
                     .first()
                     .map_or(parent.birth_rotation, |key| key.rotation),
             );
-            if !parent_rotation.is_finite() || parent_rotation.length_squared() <= 1.0e-20 {
+            let pathless_birth_frame = parent.path.is_empty()
+                && frame
+                    .partial_cmp(&parent.birth_frame)
+                    .is_some_and(std::cmp::Ordering::is_eq);
+            let valid_rotation = |rotation: blender_f32::Quatf| {
+                rotation.iter().all(|value| value.is_finite())
+                    && rotation.iter().map(|value| value * value).sum::<f32>() > 1.0e-20
+            };
+            if !valid_rotation(parent_rotation) {
                 return Err(invalid("particle path rotation must be finite and nonzero"));
             }
-            let parent_rotation = parent_rotation.normalize();
+            let offset_parent_rotation = if settings.use_rotations || pathless_birth_frame {
+                parent_rotation
+            } else {
+                [1.0, 0.0, 0.0, 0.0]
+            };
             let mut path = Vec::with_capacity(parent.path.len());
             for (key_index, key) in parent.path.iter().enumerate() {
                 let rotation = if key_index == 0 {
                     parent_rotation
                 } else {
-                    DQuat::from_array(key.rotation) * parent_rotation
+                    blender_f32::mul_qt_qtqt(to_blender_quat(key.rotation), parent_rotation)
                 };
-                if !rotation.is_finite() || rotation.length_squared() <= 1.0e-20 {
+                if !valid_rotation(rotation) {
                     return Err(invalid("particle path rotation must be finite and nonzero"));
                 }
-                let rotation = rotation.normalize();
-                let position = DVec3::from_array(key.position) + rotation * local_offset;
-                if !position.is_finite() {
+                let offset_rotation = if settings.use_rotations {
+                    rotation
+                } else {
+                    [1.0, 0.0, 0.0, 0.0]
+                };
+                let offset = blender_f32::mul_qt_v3(offset_rotation, local_offset);
+                let source_position = key.position.map(|value| value as f32);
+                let position = [
+                    f64::from(source_position[0] + offset[0]),
+                    f64::from(source_position[1] + offset[1]),
+                    f64::from(source_position[2] + offset[2]),
+                ];
+                if !position.iter().all(|value| value.is_finite()) {
                     return Err(invalid("child particle path produced a non-finite value"));
                 }
                 path.push(ParticlePathKey {
                     time: key.time,
-                    position: position.to_array(),
+                    position,
                     velocity: key.velocity,
-                    rotation: rotation.to_array(),
+                    rotation: blender_f32::quat_to_xyzw(rotation).map(f64::from),
                 });
             }
             let age_time = particle_path_time(frame, parent.birth_frame, parent.death_frame);
             let current = sample_path(&path, age_time, parent.path_interpolation);
             let birth_position = path.first().map_or_else(
                 || {
-                    (DVec3::from_array(parent.birth_position) + parent_rotation * local_offset)
-                        .to_array()
+                    let offset = blender_f32::mul_qt_v3(offset_parent_rotation, local_offset);
+                    let source_position = parent.birth_position.map(|value| value as f32);
+                    [
+                        f64::from(source_position[0] + offset[0]),
+                        f64::from(source_position[1] + offset[1]),
+                        f64::from(source_position[2] + offset[2]),
+                    ]
                 },
                 |key| key.position,
             );
-            let current_rotation =
-                current.map_or(parent_rotation, |key| DQuat::from_array(key.rotation));
-            children.push(Particle {
-                position: current.map_or_else(
+            let current_rotation = if settings.use_rotations {
+                to_blender_quat(current.map_or_else(
                     || {
-                        (DVec3::from_array(parent.position) + current_rotation * local_offset)
-                            .to_array()
+                        parent
+                            .current_path_rotation
+                            .unwrap_or_else(|| blender_velocity_orientation(parent.velocity))
                     },
-                    |key| key.position,
-                ),
+                    |key| key.rotation,
+                ))
+            } else if pathless_birth_frame {
+                parent_rotation
+            } else {
+                [1.0, 0.0, 0.0, 0.0]
+            };
+            let current_position = current.map_or_else(
+                || {
+                    let offset = blender_f32::mul_qt_v3(current_rotation, local_offset);
+                    let source_position = parent.position.map(|value| value as f32);
+                    [
+                        f64::from(source_position[0] + offset[0]),
+                        f64::from(source_position[1] + offset[1]),
+                        f64::from(source_position[2] + offset[2]),
+                    ]
+                },
+                |key| key.position,
+            );
+            children.push(Particle {
+                position: current_position,
                 birth_position,
+                birth_position_local: None,
                 normal: parent.normal,
                 birth_rotation: parent.birth_rotation,
                 current_path_rotation: current.map(|key| key.rotation),
@@ -1963,44 +2052,25 @@ fn append_interpolated_children(
     frame: f64,
     world: DMat4,
     use_local_space: bool,
-    triangles: &[Triangle],
-    total_area: f64,
+    mut child_roots: Vec<DVec3>,
     parent_positions: &[DVec3],
     parents: &[Particle],
     children: &mut Vec<Particle>,
 ) -> Result<()> {
-    if triangles.is_empty() || total_area <= 0.0 {
-        return Err(invalid(
-            "interpolated particle children require emitter face geometry",
-        ));
-    }
-    let rng_seed = 31_415_926_u32
-        .wrapping_add(settings.system_seed)
-        .wrapping_add(settings.child_seed);
-    let mut distribution_random = BlenderRng::seed_random(rng_seed);
-    let mut coordinate_random = BlenderRng::seed(31_415_926_u32.wrapping_add(settings.system_seed));
     let child_count = parents
         .len()
         .checked_mul(settings.count)
         .ok_or_else(|| limit("child particle count exceeds limits"))?;
-    let mut child_roots = Vec::with_capacity(child_count);
-    for child_number in 0..child_count {
-        let local_root = sample_interpolated_root(
-            triangles,
-            total_area,
-            child_number,
-            child_count,
-            settings.use_emit_random,
-            &mut distribution_random,
-            &mut coordinate_random,
-        );
-        let child_root = world.transform_point3(local_root);
-        let query_point = if use_local_space {
-            local_root
-        } else {
-            child_root
-        };
-        child_roots.push(query_point);
+    if child_roots.len() != child_count {
+        return Err(invalid(
+            "interpolated particle roots do not match the child count",
+        ));
+    }
+    for (child_number, local_root) in child_roots.iter_mut().enumerate() {
+        let root = *local_root;
+        let child_root = world.transform_point3(root);
+        let query_point = if use_local_space { root } else { child_root };
+        *local_root = query_point;
         let (parent_indices, parent_weights, parent_count) =
             nearest_parent_weights(query_point, parent_positions)?;
         let child_index = u32::try_from(child_number)
@@ -2033,13 +2103,7 @@ fn append_interpolated_children(
                     )));
         let death_frame = birth_frame + lifetime;
         let life_state = parents[representative].life_state;
-        let path = interpolated_child_path(
-            parents,
-            parent_indices,
-            parent_weights,
-            parent_count,
-            child_root,
-        )?;
+        let path = interpolated_child_path(parents, parent_indices, parent_weights, parent_count)?;
         if let Some(first) = path.first() {
             birth_position = DVec3::from_array(first.position);
         }
@@ -2058,6 +2122,7 @@ fn append_interpolated_children(
         children.push(Particle {
             position: current.map_or_else(|| current_position.to_array(), |key| key.position),
             birth_position: birth_position.to_array(),
+            birth_position_local: None,
             normal: normal.normalize_or_zero().to_array(),
             birth_rotation: parents[representative].birth_rotation,
             current_path_rotation: current.map(|key| key.rotation),
@@ -2113,48 +2178,6 @@ fn append_interpolated_children(
     Ok(())
 }
 
-fn sample_interpolated_root(
-    triangles: &[Triangle],
-    total_area: f64,
-    child_number: usize,
-    child_count: usize,
-    random_order: bool,
-    distribution_random: &mut BlenderRng,
-    coordinate_random: &mut BlenderRng,
-) -> DVec3 {
-    let distribution_position = if random_order {
-        f64::from(distribution_random.get_float())
-    } else {
-        let step = if child_count < 2 {
-            0.5
-        } else {
-            1.0 / child_count as f64
-        };
-        let first = if child_count < triangles.len() {
-            0.5 / triangles.len() as f64
-        } else {
-            step * 0.5
-        };
-        first + child_number as f64 * step
-    };
-    let sample = (distribution_position * total_area).clamp(0.0, total_area);
-    let triangle_index = triangles
-        .partition_point(|triangle| triangle.cumulative_area < sample)
-        .min(triangles.len() - 1);
-    let triangle = triangles[triangle_index];
-    let mut first = f64::from(coordinate_random.get_float());
-    let mut second = f64::from(coordinate_random.get_float());
-    let _ = coordinate_random.get_float();
-    if first + second > 1.0 {
-        first = 1.0 - first;
-        second = 1.0 - second;
-    }
-    let weights = [1.0 - first - second, first, second];
-    triangle.points[0] * weights[0]
-        + triangle.points[1] * weights[1]
-        + triangle.points[2] * weights[2]
-}
-
 /// Parent association from Blender's interpolated-child distribution.
 fn nearest_parent_weights(
     point: DVec3,
@@ -2165,36 +2188,36 @@ fn nearest_parent_weights(
             "interpolated children require at least one parent particle",
         ));
     }
-    // Blender's KDTreeNearest stores squared binary32 distance, which `distribute_children_exec`
-    // uses directly in the parent-weight exponent.
+    // The KDTree orders by squared f32 distance but returns `sqrtf(dist_sq)` for the weight formula.
     let point = point.as_vec3();
     let mut nearest = [(usize::MAX, f32::INFINITY); 3];
     for (index, parent) in parents.iter().enumerate() {
         let delta = parent.as_vec3() - point;
-        let distance = (delta.x * delta.x + delta.y * delta.y) + delta.z * delta.z;
-        if !distance.is_finite() {
+        let squared_distance = (delta.x * delta.x + delta.y * delta.y) + delta.z * delta.z;
+        if !squared_distance.is_finite() {
             return Err(invalid("interpolated child parent distance is non-finite"));
         }
         for slot in 0..nearest.len() {
-            if distance < nearest[slot].1
-                || (distance.total_cmp(&nearest[slot].1).is_eq() && index < nearest[slot].0)
+            if squared_distance < nearest[slot].1
+                || (squared_distance.total_cmp(&nearest[slot].1).is_eq() && index < nearest[slot].0)
             {
                 for displaced in (slot + 1..nearest.len()).rev() {
                     nearest[displaced] = nearest[displaced - 1];
                 }
-                nearest[slot] = (index, distance);
+                nearest[slot] = (index, squared_distance);
                 break;
             }
         }
     }
     let count = parents.len().min(3);
-    let maximum_distance = nearest[count - 1].1;
+    let maximum_distance = nearest[count - 1].1.sqrt();
     let mut indices = [usize::MAX; 3];
     let mut weights = [0.0_f32; 3];
     let mut total_weight = 0.0_f32;
     for slot in 0..count {
         indices[slot] = nearest[slot].0;
-        let exponent = -6.0_f32 * nearest[slot].1 / maximum_distance;
+        let distance = nearest[slot].1.sqrt();
+        let exponent = -6.0_f32 * distance / maximum_distance;
         weights[slot] = 2.0_f64.powf(f64::from(exponent)) as f32;
         total_weight += weights[slot];
     }
@@ -2211,7 +2234,6 @@ fn interpolated_child_path(
     indices: [usize; 3],
     weights: [f64; 3],
     parent_count: usize,
-    child_root: DVec3,
 ) -> Result<Vec<ParticlePathKey>> {
     if parents[indices[0]].path.is_empty()
         || (0..parent_count).any(|slot| parents[indices[slot]].path.is_empty())
@@ -2230,8 +2252,7 @@ fn interpolated_child_path(
             else {
                 return Err(invalid("interpolated child parent path is empty"));
             };
-            let root = DVec3::from_array(parent.path[0].position);
-            position += (DVec3::from_array(sample.position) + child_root - root) * weights[slot];
+            position += DVec3::from_array(sample.position) * weights[slot];
             velocity += DVec3::from_array(sample.velocity) * weights[slot];
             if slot == 0 {
                 rotation = DQuat::from_array(sample.rotation);
@@ -2473,7 +2494,6 @@ mod tests {
             &settings,
             DMat4::IDENTITY,
             3.0,
-            24.0,
             DVec3::ZERO,
             7,
             &[],
@@ -2485,7 +2505,6 @@ mod tests {
             &settings,
             DMat4::IDENTITY,
             3.0,
-            24.0,
             DVec3::ZERO,
             7,
             &[],
@@ -2540,7 +2559,7 @@ mod tests {
             },
             ..Mesh::default()
         };
-        let settings = json!({"count": 2, "frame_start": 1.0, "frame_end": 3.0, "lifetime": 5.0, "speed": 0.0});
+        let settings = json!({"count": 2, "frame_start": 1.0, "frame_end": 3.0, "lifetime": 5.0, "speed": 0.0, "time_tweak": 25.0});
         let colliders = [[
             DVec3::new(0.0, 0.0, 0.5),
             DVec3::new(1.0, 0.0, 0.5),
@@ -2551,7 +2570,6 @@ mod tests {
             &settings,
             DMat4::IDENTITY,
             2.0,
-            1.0,
             DVec3::ZERO,
             3,
             &[(DVec3::ZERO, "wind", 1.0, 0.0)],
@@ -2620,7 +2638,6 @@ mod tests {
             }),
             DMat4::IDENTITY,
             2.0,
-            1.0,
             DVec3::ZERO,
             4,
             &[],
@@ -2683,7 +2700,6 @@ mod tests {
             &settings,
             DMat4::IDENTITY,
             2.0,
-            24.0,
             DVec3::ZERO,
             7,
             &[],
@@ -2701,6 +2717,7 @@ mod tests {
         let parent = Particle {
             position: [0.0, 0.0, 0.4],
             birth_position: [0.0; 3],
+            birth_position_local: None,
             normal: [0.0, 0.0, 1.0],
             birth_rotation: DQuat::IDENTITY.to_array(),
             current_path_rotation: None,
@@ -2743,8 +2760,9 @@ mod tests {
             lifetime: 5.0,
             lifetime_random: 0.0,
             virtual_parents: 0.0,
+            use_emit_random: true,
+            use_rotations: false,
             interpolated: false,
-            use_emit_random: false,
         };
         let mut children = Vec::new();
         append_simple_children(settings, 6.0, &[parent], &mut children)
@@ -2757,7 +2775,102 @@ mod tests {
         assert_eq!(child.death_frame, 12.0);
         assert_eq!(child.size, 1.5);
         assert_eq!(child.birth_position, child.path[0].position);
-        assert!((child.position[2] - child.path[0].position[2] - 0.4).abs() < 1.0e-12);
+        let expected_position = sample_path(&child.path, 0.4, child.path_interpolation)
+            .expect("child path samples at current age");
+        assert_eq!(child.position, expected_position.position);
+    }
+    #[test]
+    fn simple_children_use_pathless_parent_birth_rotation_only_at_birth() {
+        let parent = Particle {
+            position: [0.0; 3],
+            birth_position: [0.0; 3],
+            birth_position_local: None,
+            normal: [0.0, 0.0, 1.0],
+            birth_rotation: DQuat::IDENTITY.to_array(),
+            current_path_rotation: None,
+            path_root_rotation: None,
+            path_interpolation: ParticlePathInterpolation::Hermite,
+            velocity: [0.0; 3],
+            birth_frame: 2.0,
+            death_frame: 12.0,
+            life_state: ParticleLifeState::Alive,
+            is_child: false,
+            parent_index: None,
+            parent_indices: [0; 3],
+            parent_weights: [0.0; 3],
+            parent_count: 0,
+            path: Vec::new(),
+            size: 1.0,
+            mass: 1.0,
+        };
+        let rotated_parent = Particle {
+            birth_rotation: DQuat::from_rotation_z(0.7).to_array(),
+            ..parent.clone()
+        };
+        let settings = ChildSettings {
+            count: 1,
+            radius: 0.5,
+            flat: 0.0,
+            size: 1.0,
+            size_random: 0.0,
+            child_seed: 0,
+            system_seed: 7,
+            lifetime: 5.0,
+            lifetime_random: 0.0,
+            virtual_parents: 0.0,
+            use_emit_random: true,
+            use_rotations: false,
+            interpolated: false,
+        };
+        let child_at = |parent: &Particle, frame| {
+            let mut children = Vec::new();
+            append_simple_children(settings, frame, std::slice::from_ref(parent), &mut children)
+                .expect("Simple child state is valid");
+            children.remove(0)
+        };
+
+        let identity_birth = child_at(&parent, 2.0);
+        let rotated_birth = child_at(&rotated_parent, 2.0);
+        let expected_position = DQuat::from_array(rotated_parent.birth_rotation)
+            * DVec3::from_array(identity_birth.position);
+        assert!((DVec3::from_array(rotated_birth.position) - expected_position).length() < 1.0e-6);
+        assert_eq!(rotated_birth.position, rotated_birth.birth_position);
+
+        let identity_later = child_at(&parent, 6.0);
+        let rotated_later = child_at(&rotated_parent, 6.0);
+        assert_eq!(rotated_later.position, identity_later.position);
+        assert_eq!(rotated_later.birth_position, identity_later.birth_position);
+    }
+
+    #[test]
+    fn native_child_nbr_controls_simple_child_state_count() {
+        let mesh = Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            vec![vec![0, 1, 2]],
+        )
+        .expect("valid emitter mesh");
+        let settings = json!({
+            "count": 1,
+            "frame_start": 1.0,
+            "frame_end": 1.0,
+            "lifetime": 5.0,
+            "physics_type": "NO",
+            "child_type": "SIMPLE",
+            "child_percent": 1,
+            "child_nbr": 2,
+        });
+        let particles = super::simulate_lifecycle(
+            &mesh,
+            &settings,
+            DMat4::IDENTITY,
+            1.0,
+            DVec3::ZERO,
+            7,
+            &[],
+            &[],
+        )
+        .expect("native child count produces simple children");
+        assert_eq!(particles.len(), 3);
     }
     #[test]
     fn cached_hair_parent_and_child_paths_are_sampled_without_path_mode() {
@@ -2810,7 +2923,6 @@ mod tests {
             &settings,
             DMat4::IDENTITY,
             1.0,
-            24.0,
             DVec3::ZERO,
             7,
             &[],
@@ -2851,7 +2963,6 @@ mod tests {
             &settings,
             DMat4::IDENTITY,
             1.0,
-            24.0,
             DVec3::ZERO,
             7,
             &[],

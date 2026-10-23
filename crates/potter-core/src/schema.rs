@@ -284,6 +284,7 @@ fn complete_scene_schema(root: &mut Value) {
         "sequencer"
     ]);
     scene["properties"]["active_clip"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
+    scene["properties"]["use_gravity"] = json!({"type":"boolean"});
     scene["properties"]["use_compositing"] = json!({"type":"boolean"});
     scene["properties"]["compositor"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
     scene["properties"]["color_management"] = json!({"$ref":"#/$defs/color_management"});
@@ -2538,6 +2539,7 @@ fn set_schema(operation: &str) -> Value {
             "name":{"type":"string"},"frame_current":{"type":"number"},
             "frame_start":{"type":"integer"},"frame_end":{"type":"integer"},
             "fps":{"type":"integer","minimum":1},"fps_base":{"type":"number","exclusiveMinimum":0},
+            "use_gravity":{"type":"boolean"},
             "camera":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},
             "world":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},
             "clip":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},
@@ -2757,33 +2759,26 @@ fn physics_native_properties(system: &str) -> Value {
         }),
         "particle_emitter" => json!({
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
-            "type":{"enum":["EMITTER","HAIR"]},
-            "child_seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
             "lifetime":{"type":"number","exclusiveMinimum":0},
+            "time_tweak":{"type":"number","minimum":0,"maximum":100},
             "speed":{"type":"number","minimum":0},
             "random_velocity":{"oneOf":[{"type":"number","minimum":0},vec_schema(3)]},
             "count":{"type":"integer","minimum":0,"maximum":1_000_000},
+            "rate":{"type":"number","minimum":0,"maximum":1_000_000},
+            "emission_rate":{"type":"number","minimum":0,"maximum":1_000_000},
             "lifetime_random":{"type":"number","minimum":0,"maximum":1},
             "normal_factor":{"type":"number","minimum":0},
             "factor_random":{"type":"number","minimum":0},
             "emit_from":{"enum":["VERT","FACE","VOLUME"]},
             "physics_type":{"enum":["NEWTON","NO"]},
             "mass":{"type":"number","exclusiveMinimum":0},
-            "render_type":{"enum":["HALO","PATH","OBJECT","COLLECTION"]},
+            "render_type":{"enum":["NONE","HALO","PATH","OBJECT","COLLECTION"]},
             "instance_collection":id_schema(),
             "particle_size":{"type":"number","exclusiveMinimum":0},
             "size_random":{"type":"number","minimum":0,"maximum":1},
-            "child_percent":{"type":"integer","minimum":0,"maximum":100_000},
-            "rendered_child_count":{"type":"integer","minimum":0,"maximum":100_000},
+            "child_nbr":{"type":"integer","minimum":0,"maximum":100_000},
             "child_radius":{"type":"number","minimum":0,"maximum":100_000},
             "child_type":{"enum":["NONE","SIMPLE","INTERPOLATED"]},
-            "child_size":{"type":"number","exclusiveMinimum":0,"maximum":100_000},
-            "child_size_random":{"type":"number","minimum":0,"maximum":1},
-            "child_roundness":{"type":"number","minimum":0,"maximum":1},
-            "virtual_parents":{"type":"number","minimum":0,"maximum":1},
-            "use_emit_random":{"type":"boolean"},
-            "vertex_group_density":{"type":"string"},
-            "invert_vertex_group_density":{"type":"boolean"},
             "frame_start":{"type":"number"},
             "frame_end":{"type":"number"},
             "source":{"enum":["faces","vertices"]},
