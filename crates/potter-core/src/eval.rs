@@ -22,7 +22,7 @@ use crate::{
     hash,
     model::{
         ArmatureData, CameraData, ConstraintType, DataBlock, Id, Modifier, Node, Scene, SceneDoc,
-        TextureCoordinateMapping, VertexGroup,
+        TextureCoordinateMapping, TrackAxis, VertexGroup,
     },
     params::{self, ParameterFamily},
 };
@@ -1460,8 +1460,6 @@ impl Snapshot {
                                         id,
                                         doc,
                                         gate,
-                                        frame,
-                                        f64::from(scene.fps) / scene.fps_base,
                                         &matrices,
                                         &simulated_particles,
                                     ),
@@ -1814,8 +1812,6 @@ impl Snapshot {
                                         id,
                                         doc,
                                         gate,
-                                        frame,
-                                        f64::from(scene.fps) / scene.fps_base,
                                         &matrices,
                                         &simulated_particles,
                                     ),
@@ -2385,7 +2381,7 @@ fn modifier_transform_references(modifier: &Modifier) -> BTreeSet<Id> {
     }
 
     let parameters: &[&str] = match modifier.modifier_type.as_str() {
-        "armature" | "hook" | "lattice" | "screw" => &["object"],
+        "armature" | "hook" | "lattice" | "screw" | "particle_instance" => &["object"],
         "mask" => &["armature"],
         "mirror" => &["mirror_object"],
         "uv_project" => &["projectors"],
@@ -2496,7 +2492,17 @@ pub(crate) struct ModifierGate<'a> {
     modifier_prefix: Option<ModifierPrefix<'a>>,
 }
 
-impl ModifierGate<'_> {
+impl<'a> ModifierGate<'a> {
+    pub(crate) fn for_modifier_apply(
+        context: ModifierEvaluationContext<'a>,
+        suppressed: &'a BTreeSet<Id>,
+    ) -> Self {
+        Self {
+            context,
+            suppressed,
+            modifier_prefix: None,
+        }
+    }
     fn stack_modifiers<'m>(&self, node_id: &Id, modifiers: &'m [Modifier]) -> &'m [Modifier] {
         match self.modifier_prefix {
             Some(prefix) if prefix.node_id == node_id => {
@@ -3101,13 +3107,16 @@ fn object_mesh_dependencies(
                 "shrinkwrap" => &["target", "auxiliary_target"],
                 "surface_deform" | "vertex_weight_proximity" | "normal_edit" => &["target"],
                 "array" => &["start_cap", "end_cap"],
+                "particle_instance" => &["object"],
                 _ => &[],
             };
             for parameter in parameters {
                 let value = modifier.params.get(*parameter);
-                // Blender disables a Shrinkwrap aimed at its own object: no dependency.
-                if modifier.modifier_type == "shrinkwrap"
-                    && value.and_then(serde_json::Value::as_str) == Some(owner_id.as_str())
+                // Shrinkwrap ignores its own target, and Particle Instance returns its source mesh unchanged.
+                if matches!(
+                    modifier.modifier_type.as_str(),
+                    "shrinkwrap" | "particle_instance"
+                ) && value.and_then(serde_json::Value::as_str) == Some(owner_id.as_str())
                 {
                     continue;
                 }
@@ -4463,16 +4472,7 @@ fn render_simulated_particles(
                     .push(state);
             }
         }
-        let particle_count = visible_states_by_system
-            .values()
-            .fold(0_usize, |count, states| count.saturating_add(states.len()));
-        if particle_count > MAX_RENDERED_PARTICLES {
-            return Err(PotError::with_details(
-                ErrorCode::LimitExceeded,
-                "particle visualization exceeds the 100000 particle limit",
-                json!({"node_id":emitter_id,"count":particle_count}),
-            ));
-        }
+        let mut particle_count = 0_usize;
         for (system_index, visible_states) in visible_states_by_system {
             let has_stack_system = usize::try_from(system_index).is_ok_and(|index| {
                 gate.stack_modifiers(emitter_id, &node.modifiers)
@@ -4510,6 +4510,7 @@ fn render_simulated_particles(
                 Some("PATH") => "hair_curves",
                 Some("OBJECT") => "object",
                 Some("COLLECTION") => "collection",
+                Some("NONE") => "none",
                 Some(_) => {
                     return Err(PotError::with_details(
                         ErrorCode::UnsupportedFeature,
@@ -4522,6 +4523,19 @@ fn render_simulated_particles(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("points"),
             };
+            // Blender's NONE mode adds no rendered particle geometry, but its states remain
+            // available to Particle Instance and other scene consumers.
+            if mode == "none" {
+                continue;
+            }
+            particle_count = particle_count.saturating_add(visible_states.len());
+            if particle_count > MAX_RENDERED_PARTICLES {
+                return Err(PotError::with_details(
+                    ErrorCode::LimitExceeded,
+                    "particle visualization exceeds the 100000 particle limit",
+                    json!({"node_id":emitter_id,"count":particle_count}),
+                ));
+            }
             let emitter_world = matrices.get(emitter_id).copied().ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::EvaluationFailed,
@@ -4759,14 +4773,12 @@ fn apply_stack_physics_modifier(
     Ok(())
 }
 
-fn apply_particle_instance_modifier(
+pub(crate) fn apply_particle_instance_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     node_id: &Id,
     doc: &SceneDoc,
     gate: ModifierGate<'_>,
-    frame: f64,
-    fps: f64,
     matrices: &BTreeMap<Id, DMat4>,
     particles: &BTreeMap<Id, Vec<crate::sim::ParticleState>>,
 ) -> Result<()> {
@@ -4782,13 +4794,15 @@ fn apply_particle_instance_modifier(
             json!({"modifier_id":modifier.id,"object":object_text}),
         )
     })?;
+    if &object_id == node_id {
+        return Ok(());
+    }
     let index = particle_system_index(modifier)?;
-    let (system_modifier, _) = particle_system_for_index(doc, &object_id, index, gate)?;
-    let particle_states = if gate.is_active(&object_id, system_modifier) {
-        select_particle_states(particles.get(&object_id), index)
-    } else {
-        Vec::new()
-    };
+    let (system_modifier, settings) = particle_system_for_index(doc, &object_id, index, gate)?;
+    if !gate.is_active(&object_id, system_modifier) {
+        return Ok(());
+    }
+    let particle_states = select_particle_states(particles.get(&object_id), index);
     let source_world = matrices.get(&object_id).copied().ok_or_else(|| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -4796,26 +4810,23 @@ fn apply_particle_instance_modifier(
             json!({"modifier_id":modifier.id,"object":object_id}),
         )
     })?;
-    let target_world = matrices.get(node_id).copied().ok_or_else(|| {
-        PotError::with_details(
-            ErrorCode::EvaluationFailed,
-            "particle instance target transform is missing",
-            json!({"node_id":node_id}),
-        )
-    })?;
-    *mesh = crate::geom::modifiers::simulation::particle_instance(
+    let track_flag = doc
+        .nodes
+        .get(node_id)
+        .map(object_track_flag)
+        .unwrap_or_default();
+    *mesh = crate::geom::modifiers::particle_instance::particle_instance(
         mesh,
         &particle_states,
+        particle_system_seed(settings)?,
         source_world,
-        target_world,
+        track_flag,
         &modifier.params,
-        frame,
-        fps,
     )?;
     Ok(())
 }
 
-fn apply_explode_modifier(
+pub(crate) fn apply_explode_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
     node_id: &Id,
@@ -4826,12 +4837,11 @@ fn apply_explode_modifier(
     particles: &BTreeMap<Id, Vec<crate::sim::ParticleState>>,
 ) -> Result<()> {
     let index = particle_system_index(modifier)?;
-    let (system_modifier, _) = particle_system_for_index(doc, node_id, index, gate)?;
-    let particle_states = if gate.is_active(node_id, system_modifier) {
-        select_particle_states(particles.get(node_id), index)
-    } else {
-        Vec::new()
-    };
+    let (system_modifier, settings) = particle_system_for_index(doc, node_id, index, gate)?;
+    if !gate.is_active(node_id, system_modifier) {
+        return Ok(());
+    }
+    let particle_states = select_particle_states(particles.get(node_id), index);
     let matrix = matrices.get(node_id).copied().ok_or_else(|| {
         PotError::with_details(
             ErrorCode::EvaluationFailed,
@@ -4839,15 +4849,41 @@ fn apply_explode_modifier(
             json!({"node_id":node_id}),
         )
     })?;
-    *mesh = crate::geom::modifiers::simulation::explode(
+    *mesh = crate::geom::modifiers::explode::explode(
         mesh,
         &particle_states,
+        particle_system_seed(settings)?,
         matrix,
         &modifier.params,
         frame,
-        50.0,
     )?;
     Ok(())
+}
+
+fn particle_system_seed(settings: &serde_json::Value) -> Result<u32> {
+    let seed = settings
+        .get("seed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    u32::try_from(seed).map_err(|_| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "particle system seed must fit in a 32-bit unsigned integer",
+            json!({"seed":seed}),
+        )
+    })
+}
+
+/// Blender `Object.track_axis` (`trackflag`) as the modifier's track byte; the `NEG_*` axes add 3.
+fn object_track_flag(node: &Node) -> u32 {
+    match node.track_axis {
+        TrackAxis::PosX => 0,
+        TrackAxis::PosY => 1,
+        TrackAxis::PosZ => 2,
+        TrackAxis::NegX => 3,
+        TrackAxis::NegY => 4,
+        TrackAxis::NegZ => 5,
+    }
 }
 
 fn particle_system_index(modifier: &Modifier) -> Result<u32> {
@@ -7855,7 +7891,8 @@ mod tests {
         },
         model::{
             Collection, DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer,
-            GreasePencilPoint, GreasePencilStroke, Id, MaterialLink, Node, SceneDoc, Transform,
+            GreasePencilPoint, GreasePencilStroke, Id, MaterialLink, Modifier, Node, SceneDoc,
+            Transform,
         },
     };
 
@@ -7867,18 +7904,64 @@ mod tests {
     fn particle_render_limit_counts_all_systems_for_each_emitter()
     -> std::result::Result<(), &'static str> {
         let emitter_id = Id::new("emitter").unwrap();
+        let data_id = Id::new("emitter_mesh").unwrap();
         let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(
+                    Mesh::box_mesh(BoxParams {
+                        size: DVec3::splat(2.0),
+                    })
+                    .unwrap(),
+                ),
+                ..DataBlock::default()
+            },
+        );
+        let modifiers = ["system0", "system1"]
+            .into_iter()
+            .map(|settings_id| Modifier {
+                id: Id::new(settings_id.to_owned()).unwrap(),
+                modifier_type: "particle_system".to_owned(),
+                name: settings_id.to_owned(),
+                enabled: true,
+                show_viewport: true,
+                show_render: true,
+                params: json!({"settings_id":settings_id})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                baked_ocean_cache: None,
+                binding_data: None,
+                runtime: crate::model::ModifierRuntime::default(),
+            })
+            .collect::<Vec<_>>();
+        let properties = json!({
+            "physics_particle_emitter": {"render_type":"HALO"},
+            "physics_particle_emitter_modifier_id": "system0",
+            "physics_particle_systems": {
+                "system0": {"render_type":"HALO"},
+                "system1": {"render_type":"HALO"}
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
         doc.nodes.insert(
             emitter_id.clone(),
             Node {
                 name: "Emitter".to_owned(),
                 kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                properties,
+                modifiers,
                 ..Node::default()
             },
         );
-        let mut states = Vec::with_capacity(120_002);
-        for system_index in 0..2 {
-            for _ in 0..60_001 {
+        let mut states = Vec::with_capacity(100_001);
+        for (system_index, count) in [(0, 1), (1, 100_000)] {
+            for _ in 0..count {
                 states.push(crate::sim::ParticleState {
                     system_index,
                     ..crate::sim::ParticleState::default()
@@ -7898,20 +7981,43 @@ mod tests {
             modifier_prefix: None,
         };
         let evaluated_nodes = std::collections::BTreeSet::from([emitter_id.clone()]);
+        let matrices = BTreeMap::from([(emitter_id.clone(), DMat4::IDENTITY)]);
+        let emitter_mesh = doc
+            .data_blocks
+            .get(&data_id)
+            .and_then(|data| data.mesh.as_ref())
+            .unwrap()
+            .clone();
+        let mut meshes = BTreeMap::from([(emitter_id.clone(), emitter_mesh)]);
+        let mut nodes = BTreeMap::from([(
+            emitter_id.clone(),
+            super::EvaluatedNode {
+                world_matrix: DMat4::IDENTITY.to_cols_array(),
+                bounds: None,
+                dimensions: None,
+                materials: Vec::new(),
+                mesh_materials: Vec::new(),
+            },
+        )]);
+        let mut adaptive_normals = BTreeMap::new();
         let Err(error) = super::render_simulated_particles(
             &doc,
             gate,
             &particles,
-            &std::collections::BTreeMap::new(),
-            &mut std::collections::BTreeMap::new(),
-            &mut std::collections::BTreeMap::new(),
+            &matrices,
+            &mut meshes,
+            &mut nodes,
             &evaluated_nodes,
-            &mut std::collections::BTreeMap::new(),
+            &mut adaptive_normals,
         ) else {
             return Err("combined visible systems must exceed the per-emitter limit");
         };
-        assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
-        assert_eq!(error.details["count"], serde_json::json!(120_002));
+        assert_eq!(
+            error.code,
+            crate::error::ErrorCode::LimitExceeded,
+            "unexpected particle render error: {error:?}",
+        );
+        assert_eq!(error.details["count"], serde_json::json!(100_001));
         Ok(())
     }
     fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {

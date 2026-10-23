@@ -17,8 +17,9 @@ import struct
 import sys
 import tempfile
 import traceback
-from mathutils import Euler, Matrix, Quaternion
+from mathutils import Euler, Matrix, Quaternion, Vector
 DEFERRED_ID_ASSIGNMENTS = []
+DEFERRED_HAIR_KEY_RESTORATIONS = []
 CACHE_FILES_BY_IDENTITY = {}
 # CacheFile fields that a Mesh Sequence Cache modifier mirrors as params (see blend.rs).
 SEQUENCE_CACHE_FILE_KEYS = ("is_sequence", "velocity_name", "velocity_unit")
@@ -259,6 +260,11 @@ def plain(value, depth=0):
         return [float(value.x), float(value.y), float(value.z)]
     if hasattr(value, "w") and hasattr(value, "to_euler"):
         return [value.x, value.y, value.z, value.w]
+    if isinstance(value, dict):
+        return {str(k): plain(v, depth + 1) for k, v in value.items()}
+    # Blender's IDPropertyGroup is iterable, but its custom-property data is a mapping.
+    if type(value).__name__ == "IDPropertyGroup":
+        return {str(key): plain(value[key], depth + 1) for key in value.keys()}
     if hasattr(value, "to_list"):
         try:
             return [plain(v, depth + 1) for v in value.to_list()]
@@ -274,8 +280,6 @@ def plain(value, depth=0):
             return [plain(v, depth + 1) for v in value]
         except Exception:
             pass
-    if isinstance(value, dict):
-        return {str(k): plain(v, depth + 1) for k, v in value.items()}
     try:
         return repr(value)
     except Exception:
@@ -456,6 +460,229 @@ def _physics_point_cache(block):
     result["is_baked"] = bool(getattr(cache, "is_baked", False))
     return result
 
+MAX_PARTICLE_PATH_KEYS = 1_000_000
+
+
+def _particle_pathcache_keys(obj, particle_system, particle_no, segments, rotation=None):
+    if segments is None:
+        return None
+    try:
+        positions = [
+            [float(value) for value in particle_system.co_hair(obj, particle_no, step)]
+            for step in range(segments + 1)
+        ]
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    path = []
+    path_rotation = plain(rotation) if rotation is not None else [0.0, 0.0, 0.0, 1.0]
+    for step, position in enumerate(positions):
+        previous = positions[step - 1] if step else position
+        following = positions[step + 1] if step == 0 else position
+        velocity = [(following[axis] - previous[axis]) * segments for axis in range(3)]
+        path.append({
+            "time": step / segments,
+            "position": position,
+            "velocity": velocity,
+            "rotation": path_rotation,
+        })
+    return path
+
+
+def _path_has_nonzero_position(path):
+    return any(value != 0.0 for key in path for value in key["position"])
+
+def _normalized_path_velocity(velocity, duration, time_tweak):
+    """Convert Blender's velocity to a normalized-lifetime path derivative."""
+    # Blender's keyed/cache interpolation scales tangents by dfra * 0.04 * time_tweak.
+    scale = duration * 0.04 * time_tweak
+    return [float(value) * scale for value in velocity]
+
+
+def _particle_path_keys(obj, particle_system, source_obj, source_system, system_index):
+    particles = particle_system.particles
+    settings = getattr(source_system, "settings", None)
+    time_tweak = float(getattr(settings, "time_tweak", 1.0)) if settings else 1.0
+    render_type = getattr(settings, "render_type", None) if settings is not None else None
+    is_hair = settings is not None and getattr(settings, "type", None) == "HAIR"
+    hair_key_data = None
+    hair_current_states = None
+    # Keep editable HairKey controls separately; evaluated path-cache samples cannot rebuild them.
+    if is_hair:
+        hair_key_data = []
+        hair_current_states = []
+        hair_key_count = 0
+        for particle in particles:
+            keys = [
+                {"time":float(key.time), "weight":float(key.weight),
+                 "co_local":[float(value) for value in key.co_local]}
+                for key in getattr(particle, "hair_keys", ())
+            ]
+            hair_key_count += len(keys)
+            if hair_key_count > MAX_PARTICLE_PATH_KEYS:
+                raise ValueError("Hair key data exceeds the particle path key limit")
+            hair_key_data.append(keys)
+            hair_current_states.append({
+                "position":[float(value) for value in particle.location],
+                "velocity":[float(value) for value in particle.velocity],
+            })
+        if not any(hair_key_data):
+            hair_key_data = None
+        if not hair_current_states:
+            hair_current_states = None
+    cache_segments = None
+    if is_hair or render_type not in ("NONE", "OBJECT", "COLLECTION"):
+        try:
+            display_step = int(settings.display_step)
+            if display_step >= 0:
+                cache_segments = 1 << display_step
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    cached_paths = None
+    if cache_segments is not None:
+        if len(particles) * (cache_segments + 1) > MAX_PARTICLE_PATH_KEYS:
+            raise ValueError("particle path cache exceeds the particle path key limit")
+        candidates = [
+            _particle_pathcache_keys(
+                obj, particle_system, index, cache_segments, particle.rotation)
+            for index, particle in enumerate(particles)
+        ]
+        if candidates and all(path is not None for path in candidates) and any(
+                _path_has_nonzero_position(path) for path in candidates):
+            cached_paths = candidates
+
+    paths = []
+    if cached_paths is not None:
+        paths = cached_paths
+    else:
+        for particle in particles:
+            hair_keys = getattr(particle, "hair_keys", ())
+            if hair_keys:
+                path = []
+                time_start = float(hair_keys[0].time)
+                time_span = float(hair_keys[-1].time) - time_start
+                path_rotation = plain(particle.rotation)
+                for key in hair_keys:
+                    position = obj.matrix_world @ Vector(key.co)
+                    path.append({"time": ((float(key.time) - time_start) / time_span
+                                           if time_span else 0.0),
+                                 "position": [float(value) for value in position],
+                                 "rotation": path_rotation})
+            else:
+                path = []
+                particle_keys = getattr(particle, "particle_keys", ())
+                if particle_keys:
+                    time_start = float(particle_keys[0].time)
+                    time_span = float(particle_keys[-1].time) - time_start
+                    for key in particle_keys:
+                        path.append({"time": ((float(key.time) - time_start) / time_span
+                                               if time_span else 0.0),
+                                     "position": [float(value) for value in key.location],
+                                     "velocity": _normalized_path_velocity(
+                                         key.velocity, time_span, time_tweak),
+                                     "rotation": plain(key.rotation)})
+            paths.append(path)
+
+    children = getattr(particle_system, "child_particles", ())
+    child_paths = None
+    if cache_segments is not None and len(children):
+        if (len(particles) + len(children)) * (cache_segments + 1) > MAX_PARTICLE_PATH_KEYS:
+            raise ValueError("particle and child path caches exceed the particle path key limit")
+        candidates = [
+            _particle_pathcache_keys(
+                obj, particle_system, len(particles) + index, cache_segments)
+            for index in range(len(children))
+        ]
+        if all(path is not None for path in candidates) and any(
+                _path_has_nonzero_position(path) for path in candidates):
+            child_paths = candidates
+
+    missing = [index for index, path in enumerate(paths) if not path]
+    cache = getattr(source_system, "point_cache", None)
+    if missing and cache is not None and bool(getattr(cache, "is_baked", False)):
+        frame_start = int(cache.frame_start)
+        frame_end = int(cache.frame_end)
+        frame_step = int(cache.frame_step)
+        if frame_end >= frame_start:
+            if frame_step <= 0:
+                raise ValueError("baked particle cache has an invalid frame step")
+            frame_count = (frame_end - frame_start) // frame_step + 1
+            if frame_count > MAX_PARTICLE_PATH_KEYS:
+                raise ValueError("baked particle cache exceeds the particle path frame limit")
+
+            lifetimes = {}
+            key_count = 0
+            for index in missing:
+                particle = particles[index]
+                birth_time = float(particle.birth_time)
+                die_time = float(particle.die_time)
+                if not math.isfinite(birth_time) or not math.isfinite(die_time) or die_time <= birth_time:
+                    continue
+                first = max(0, math.ceil((birth_time - frame_start) / frame_step))
+                last = min(frame_count - 1, math.floor((die_time - frame_start) / frame_step))
+                sample_times = [
+                    frame_start + frame_index * frame_step
+                    for frame_index in range(first, last + 1)
+                ] if first <= last else []
+                for endpoint in (birth_time, die_time):
+                    if frame_start <= endpoint <= frame_end and not any(
+                            math.isclose(endpoint, sample_time, rel_tol=0.0, abs_tol=1e-6)
+                            for sample_time in sample_times):
+                        sample_times.append(endpoint)
+                sample_times.sort()
+                if sample_times:
+                    duration = die_time - birth_time
+                    lifetimes[index] = (birth_time, die_time, duration, sample_times)
+                    key_count += len(sample_times)
+                    if key_count > MAX_PARTICLE_PATH_KEYS:
+                        raise ValueError("baked particle cache exceeds the particle path key limit")
+
+            if lifetimes:
+                samples_by_time = {}
+                for index, (_, _, _, sample_times) in lifetimes.items():
+                    for sample_time in sample_times:
+                        samples_by_time.setdefault(sample_time, []).append(index)
+
+                scene = bpy.context.scene
+                object_scenes = source_obj.users_scene
+                if scene not in object_scenes and object_scenes:
+                    scene = object_scenes[0]
+                previous_frame = scene.frame_current
+                previous_subframe = scene.frame_subframe
+                try:
+                    for sample_time in sorted(samples_by_time):
+                        indices = samples_by_time[sample_time]
+                        frame = math.floor(sample_time)
+                        scene.frame_set(frame, subframe=float(sample_time - frame))
+                        evaluated_obj = source_obj.evaluated_get(
+                            bpy.context.evaluated_depsgraph_get())
+                        evaluated_system = evaluated_obj.particle_systems[system_index]
+                        particles_at_frame = evaluated_system.particles
+                        if len(particles_at_frame) != len(paths):
+                            raise ValueError("baked particle cache changed parent particle ordering")
+                        for index in indices:
+                            birth_time, _, duration, _ = lifetimes[index]
+                            particle = particles_at_frame[index]
+                            time = max(0.0, min(1.0, (sample_time - birth_time) / duration))
+                            paths[index].append({
+                                "time": time,
+                                "position": [float(value) for value in particle.location],
+                                "velocity": _normalized_path_velocity(
+                                    particle.velocity, duration, time_tweak),
+                                "rotation": plain(particle.rotation),
+                            })
+                finally:
+                    scene.frame_set(previous_frame, subframe=previous_subframe)
+
+    cache_interpolation = None
+    if cached_paths is not None:
+        cache_interpolation = (
+            "hair_cache"
+            if getattr(settings, "type", None) == "HAIR"
+            else "linear"
+        )
+    return paths if any(paths) else None, child_paths, cache_interpolation, hair_key_data, hair_current_states
+
 
 def _physics_modifier_settings(obj, modifier):
     result = {}
@@ -479,8 +706,48 @@ def _physics_modifier_settings(obj, modifier):
         particle_system = getattr(modifier, "particle_system", None)
         settings = getattr(particle_system, "settings", None) if particle_system else None
         result = _physics_rna_values(settings)
+        if settings is not None:
+            # Fluid particle systems (FLIP/SPRAY/FOAM/BUBBLE/TRACER) are created by the fluid domain flags.
+            result["type"] = str(settings.type)
+            result["texture_slots"] = _particle_texture_slots(settings)
         if particle_system:
             result["seed"] = int(particle_system.seed)
+            result["child_seed"] = int(particle_system.child_seed)
+            # The density group belongs to the particle system (`psys->vgroup`), not its settings.
+            result["vertex_group_density"] = particle_system.vertex_group_density
+            result["invert_vertex_group_density"] = bool(
+                particle_system.invert_vertex_group_density)
+            source_systems = obj.particle_systems
+            system_index = next(
+                (index for index, system in enumerate(source_systems)
+                 if system == particle_system),
+                None,
+            )
+            if system_index is None:
+                system_name = particle_system.name
+                system_index = next(
+                    (index for index, system in enumerate(source_systems)
+                     if system.name == system_name),
+                    None,
+                )
+            if system_index is None:
+                raise ValueError("particle system is missing from its owning object")
+            evaluated_obj = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+            if system_index >= len(evaluated_obj.particle_systems):
+                raise ValueError("evaluated particle system is missing from its owning object")
+            evaluated_system = evaluated_obj.particle_systems[system_index]
+            path_keys, child_path_keys, path_interpolation, hair_key_data, hair_current_states = _particle_path_keys(
+                evaluated_obj, evaluated_system, obj, particle_system, system_index)
+            if path_keys is not None:
+                result["_potter_path_keys"] = path_keys
+            if child_path_keys is not None:
+                result["_potter_child_path_keys"] = child_path_keys
+            if path_interpolation is not None:
+                result["_potter_path_interpolation"] = path_interpolation
+            if hair_key_data is not None:
+                result["_potter_hair_key_data"] = hair_key_data
+            if hair_current_states is not None:
+                result["_potter_hair_current_states"] = hair_current_states
             point_cache = _physics_point_cache(particle_system)
             if point_cache is not None:
                 result["point_cache"] = point_cache
@@ -505,6 +772,47 @@ def _physics_modifier_settings(obj, modifier):
     if point_cache is not None:
         result["point_cache"] = point_cache
     return result
+
+
+PARTICLE_USE_MAP_KEYS = (
+    "use_map_time", "use_map_life", "use_map_density", "use_map_size", "use_map_velocity",
+    "use_map_field", "use_map_gravity", "use_map_damp", "use_map_clump", "use_map_kink_amp",
+    "use_map_kink_freq", "use_map_rough", "use_map_length", "use_map_twist",
+)
+
+
+def _particle_texture_slots(settings):
+    """Particle texture slots (`psys_get_texture`): each slot with a texture, its coordinates, placement, blend, default, and mapped channels."""
+    slots = []
+    for index, slot in enumerate(settings.texture_slots):
+        if slot is None or slot.texture is None:
+            continue
+        record = {
+            "slot": index,
+            "texture": plain(slot.texture),
+            "texture_type": slot.texture.type,
+            "texture_coords": slot.texture_coords,
+            "mapping": slot.mapping,
+            "object": plain(slot.object) if slot.object else None,
+            "mapping_x": slot.mapping_x,
+            "mapping_y": slot.mapping_y,
+            "mapping_z": slot.mapping_z,
+            "offset": [float(value) for value in slot.offset],
+            "scale": [float(value) for value in slot.scale],
+            "default_value": float(slot.default_value),
+            "blend_type": slot.blend_type,
+            "time_factor": float(slot.time_factor),
+            "life_factor": float(slot.life_factor),
+            "density_factor": float(slot.density_factor),
+            "size_factor": float(slot.size_factor),
+            "texture_exported": _legacy_texture_record(slot.texture) is not None,
+            "texture_image": plain(slot.texture.image) if slot.texture.type == "IMAGE" and slot.texture.image else None,
+        }
+        for key in PARTICLE_USE_MAP_KEYS:
+            record[key] = bool(getattr(slot, key))
+        slots.append(record)
+    return slots
+
 def _color_ramp_settings(ramp):
     return {
         "color_mode": ramp.color_mode,
@@ -614,7 +922,6 @@ def _legacy_texture_record(texture):
     if texture.type == "IMAGE":
         record["image"] = plain(texture.image)
     return record
-
 
 def modifier_params(modifier):
     omitted = (
@@ -2153,6 +2460,7 @@ def object_dump(obj):
             "library": library_reference(obj), "override_library": _override_dump(obj),
             "data_name": data.name_full if data else None, "parent": obj.parent.name_full if obj.parent else None,
             "parent_type": obj.parent_type, "parent_bone": obj.parent_bone,
+            "track_axis": obj.track_axis, "up_axis": obj.up_axis,
             "instance_collection": obj.instance_collection.name_full
             if getattr(obj, "instance_collection", None) else None,
             "matrix_parent_inverse": matrix_rows(obj.matrix_parent_inverse),
@@ -2176,7 +2484,7 @@ def object_dump(obj):
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
             "volume_bounds": volume_bounds,
-            "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots"))}
+            "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots", "track_axis", "up_axis", "dimensions"))}
 
 
 def _action_slot_assigned_objects(action, slot):
@@ -2677,6 +2985,7 @@ def dump_scene(scene):
             "simulation_frame_start": int(scene.simulation_frame_start),
             "simulation_frame_end": int(scene.simulation_frame_end),
             "fps_base": float(scene.render.fps_base), "camera": camera,
+            "use_gravity": bool(scene.use_gravity),
             "active_clip": (scene.active_clip.name_full
                             if getattr(scene, "active_clip", None) else None),
             "render": {
@@ -2725,7 +3034,7 @@ def dump_scene(scene):
             "sequencer": _sequencer_dump(scene),
             "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
             "world": world_info, "custom_properties": custom_props(scene),
-            "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings"))}
+            "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings", "use_gravity"))}
 
 
 def _camera_dof_enabled(camera):
@@ -3095,7 +3404,8 @@ def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup,
     for key, value in params.items():
         if not hasattr(modifier, key):
             continue
-        pointer_type = _blender_id_pointer_type(modifier, key, getattr(modifier, key))
+        current = getattr(modifier, key)
+        pointer_type = _blender_id_pointer_type(modifier, key, current)
         if pointer_type not in ("Object", "Collection", "Texture") or value is None:
             continue
         name = value.get("name") if isinstance(value, dict) else value
@@ -3111,6 +3421,10 @@ def _restore_modifier_id_references(modifier, params, id_lookup, texture_lookup,
             raise ValueError(
                 "modifier %s property %s references unavailable %s ID %s"
                 % (modifier.name, key, pointer_type, name))
+        # Some Blender RNA ID pointer setters reject assigning the current datablock to itself.
+        if current is candidate or (current is not None
+                                    and current.as_pointer() == candidate.as_pointer()):
+            continue
         setattr(modifier, key, candidate)
 
 
@@ -3458,6 +3772,105 @@ def _execute_stack_op(obj, operation, modifiers_by_id):
         raise RuntimeError("cannot reconstruct modifier %s" % identifier) from error
 
 
+# Blender's fluid domain flags that create a fluid particle system (`rna_fluid.cc`: each update calls
+# `BKE_fluid_particle_system_create`, or `BKE_fluid_particle_system_destroy` when the flag is cleared).
+FLUID_PARTICLE_FLAGS = {
+    "FLIP": "use_flip_particles",
+    "SPRAY": "use_spray_particles",
+    "FOAM": "use_foam_particles",
+    "BUBBLE": "use_bubble_particles",
+    "TRACER": "use_tracer_particles",
+}
+
+
+def _fluid_particle_type(doc, node_id, item):
+    """The fluid particle type of a particle system item, or None for an emitter or hair system."""
+    if item.get("type") != "particle_system":
+        return None
+    node_properties = doc.get("nodes", {}).get(node_id, {}).get("properties", {})
+    settings_id = item.get("params", {}).get("settings_id")
+    settings = node_properties.get("physics_particle_systems", {}).get(settings_id, {})
+    particle_type = settings.get("type")
+    return particle_type if particle_type in FLUID_PARTICLE_FLAGS else None
+
+
+def _set_fluid_particle_flag(obj, particle_type, present):
+    """Make the fluid domain flag for `particle_type` match `present`, recreating a missing system.
+
+    Setting a flag that is already set deletes its system (the update callback sees it exists), so the
+    flag is only written when the system's state differs: clear it to remove, or clear then set to create.
+    """
+    domain = next((modifier for modifier in obj.modifiers
+                   if modifier.type == "FLUID" and modifier.fluid_type == "DOMAIN"), None)
+    if domain is None:
+        if present:
+            raise ValueError("fluid particle system %s on %s needs a fluid domain"
+                             % (particle_type, obj.name))
+        return
+    flag = FLUID_PARTICLE_FLAGS[particle_type]
+    settings = domain.domain_settings
+    has_system = any(system.settings.type == particle_type for system in obj.particle_systems)
+    if present and has_system and getattr(settings, flag):
+        return
+    if getattr(settings, flag) or has_system:
+        setattr(settings, flag, False)
+    if present:
+        setattr(settings, flag, True)
+        if not any(system.settings.type == particle_type for system in obj.particle_systems):
+            raise ValueError("Blender did not create the %s particle system on %s; the fluid "
+                             "domain must be a Liquid domain" % (particle_type, obj.name))
+
+
+def _finish_fluid_particle_systems(obj, modifier_items, fluid_items, modifiers_by_id, doc, node_id,
+                                   id_lookup, texture_lookup, target, pack, custom_properties_by_id):
+    """Create the fluid particle systems through the domain flags, then bind, configure, and order them.
+
+    Runs after the domain is configured, so the Liquid domain check sees the Potter domain type.
+    """
+    present_types = {}
+    for item in fluid_items:
+        particle_type = _fluid_particle_type(doc, node_id, item)
+        if particle_type in present_types:
+            raise ValueError("%s has two %s particle systems; Blender allows one per fluid type"
+                             % (obj.name, particle_type))
+        present_types[particle_type] = item
+    for particle_type in FLUID_PARTICLE_FLAGS:
+        _set_fluid_particle_flag(obj, particle_type, particle_type in present_types)
+    for particle_type, item in present_types.items():
+        systems = [system for system in obj.particle_systems
+                   if system.settings.type == particle_type]
+        if len(systems) != 1:
+            raise ValueError("%s must have exactly one %s particle system, found %d"
+                             % (obj.name, particle_type, len(systems)))
+        system = systems[0]
+        modifier = next(modifier for modifier in obj.modifiers
+                        if modifier.type == "PARTICLE_SYSTEM" and modifier.particle_system == system)
+        modifier.name = item["name"]
+        modifiers_by_id[item["id"]] = modifier
+        modifier.show_viewport = bool(item.get("enabled", True) and item.get("show_viewport", True))
+        modifier.show_render = bool(item.get("enabled", True) and item.get("show_render", True))
+        rna_item = dict(item, params={key: value for key, value in item.get("params", {}).items()
+                                      if key != "use_pin_to_last"})
+        set_modifier_params(modifier, rna_item, id_lookup, texture_lookup, doc, target, node_id,
+                            obj, pack)
+        set_props(modifier, custom_properties_by_id.get(item["id"], {}))
+        modifier.use_pin_to_last = bool(item.get("params", {}).get("use_pin_to_last", False))
+    expected = [modifiers_by_id[item["id"]] for item in modifier_items]
+    for index, modifier in enumerate(expected):
+        current = [candidate.name for candidate in obj.modifiers].index(modifier.name)
+        if current != index:
+            try:
+                obj.modifiers.move(current, index)
+            except RuntimeError:
+                pass
+    if [candidate.name for candidate in obj.modifiers] != [modifier.name for modifier in expected]:
+        raise ValueError("%s modifier order cannot match Potter's stack after fluid particle systems"
+                         % obj.name)
+    annotations = {modifier.name: {"id": item["id"], "name": item["name"]}
+                   for modifier, item in zip(expected, modifier_items)}
+    obj["potter.modifier_ids_json"] = json.dumps(annotations, sort_keys=True)
+
+
 def _restore_modifier_stack(obj, modifier_items):
     """Make Blender's stack equal Potter's order and pin flags, or raise a precise ValueError.
 
@@ -3592,6 +4005,62 @@ def _bake_point_cache(obj, cache):
             scene.collection.objects.unlink(obj)
 
 
+def _restore_particle_hair_key_data(obj, particle_system, hair_key_data):
+    if hair_key_data is None:
+        return
+    if not isinstance(hair_key_data, list):
+        raise ValueError("Hair key data must be a particle-ordered array")
+    object_scenes = list(obj.users_scene)
+    if not object_scenes:
+        raise ValueError("Hair key restoration requires a linked emitter")
+    scene = bpy.context.scene if bpy.context.scene in object_scenes else object_scenes[0]
+    view_layer = next((layer for layer in scene.view_layers
+                       if layer.objects.get(obj.name) is not None), None)
+    if view_layer is None:
+        raise ValueError("Hair emitter is absent from its linked view layers")
+    with bpy.context.temp_override(scene=scene, view_layer=view_layer, object=obj, active_object=obj):
+        previous_frame = scene.frame_current
+        previous_subframe = scene.frame_subframe
+        try:
+            scene.frame_set(int(scene.frame_start))
+            view_layer.update()
+            particles = particle_system.particles
+            if len(particles) != len(hair_key_data):
+                raise ValueError("Hair key data does not match the particle count")
+            for particle_index, (particle, source_keys) in enumerate(zip(particles, hair_key_data)):
+                if not isinstance(source_keys, list):
+                    raise ValueError("Hair key list %d is invalid" % particle_index)
+                if not source_keys:
+                    continue
+                keys = particle.hair_keys
+                if len(keys) != len(source_keys):
+                    raise ValueError("Hair key data count changed for particle %d" % particle_index)
+                for key_index, (key, source_key) in enumerate(zip(keys, source_keys)):
+                    if not isinstance(source_key, dict):
+                        raise ValueError("Hair key %d for particle %d is invalid" % (key_index, particle_index))
+                    co_local = source_key.get("co_local")
+                    if not isinstance(co_local, (list, tuple)) or len(co_local) != 3:
+                        raise ValueError("Hair key %d for particle %d has invalid local coordinates" % (key_index, particle_index))
+                    co_local = [float(value) for value in co_local]
+                    time = float(source_key.get("time"))
+                    weight = float(source_key.get("weight"))
+                    if not all(math.isfinite(value) for value in co_local + [time, weight]) or not 0.0 <= weight <= 1.0:
+                        raise ValueError("Hair key %d for particle %d contains an invalid value" % (key_index, particle_index))
+                    key.co_local = co_local
+                    key.time = time
+                    key.weight = weight
+            view_layer.update()
+        finally:
+            scene.frame_set(previous_frame, subframe=previous_subframe)
+            view_layer.update()
+
+
+def _restore_deferred_particle_hair_key_data():
+    for obj, particle_system, hair_key_data in DEFERRED_HAIR_KEY_RESTORATIONS:
+        _restore_particle_hair_key_data(obj, particle_system, hair_key_data)
+    DEFERRED_HAIR_KEY_RESTORATIONS.clear()
+
+
 def _owning_scene(obj, default=None):
     scenes = obj.users_scene
     return scenes[0] if scenes else default
@@ -3689,7 +4158,14 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
     node_properties = node.get("properties", {})
     settings_id = params.get("settings_id")
     if kind == "particle_system":
-        settings = node_properties.get("physics_particle_systems", {}).get(settings_id, {})
+        settings = node_properties.get("physics_particle_systems", {}).get(settings_id)
+        if settings is None:
+            # The native single-emitter operation stores primary settings outside the registry.
+            primary_settings_id = node_properties.get("physics_particle_emitter_modifier_id")
+            if primary_settings_id is None or primary_settings_id == settings_id:
+                settings = node_properties.get("physics_particle_emitter", {})
+            else:
+                settings = {}
     elif physics_property:
         settings = node_properties.get(physics_property, {})
     else:
@@ -3793,12 +4269,43 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
                 raise ValueError("UV Project projector references missing object %s" % reference)
             modifier.projectors[index].object = candidate
     if physics_property:
-        settings = dict(settings)
         settings.pop("role", None)
+        if kind == "fluid":
+            # The domain's particle flags create or remove fluid particle systems; they are applied after the
+            # domain is configured (`_finish_fluid_particle_systems`), so they are not set here.
+            for flag in FLUID_PARTICLE_FLAGS.values():
+                settings.pop(flag, None)
         canvas_surfaces = settings.pop("canvas_surfaces", [])
         point_cache = settings.pop("point_cache", None)
         collision_settings = settings.pop("collision_settings", None)
         particle_seed = settings.pop("seed", None) if kind == "particle_system" else None
+        particle_child_seed = (settings.pop("child_seed", None)
+                               if kind == "particle_system" else None)
+        particle_type = settings.pop("type", None) if kind == "particle_system" else None
+        particle_child_nbr = (
+            settings.pop("child_nbr", None)
+            if kind == "particle_system"
+            else None
+        )
+        if particle_child_nbr is not None:
+            if (
+                isinstance(particle_child_nbr, bool)
+                or not isinstance(particle_child_nbr, int)
+                or not 0 <= particle_child_nbr <= 100000
+            ):
+                raise ValueError("Particle child_nbr must be an integer in [0, 100000]")
+            settings["child_percent"] = particle_child_nbr
+        particle_hair_key_data = (settings.pop("_potter_hair_key_data", None)
+                                  if kind == "particle_system" else None)
+        particle_density_group = (settings.pop("vertex_group_density", None)
+                                  if kind == "particle_system" else None)
+        particle_density_invert = (settings.pop("invert_vertex_group_density", None)
+                                   if kind == "particle_system" else None)
+        for internal_key in (
+            "_potter_path_keys", "_potter_child_path_keys", "_potter_path_interpolation",
+            "_potter_hair_current_states",
+        ):
+            settings.pop(internal_key, None)
         particle_system = None
         if kind in ("cloth", "soft_body", "collision"):
             settings_block = getattr(modifier, "settings", None)
@@ -3817,10 +4324,30 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         else:
             particle_system = getattr(modifier, "particle_system", None)
             settings_block = getattr(particle_system, "settings", None) if particle_system else None
+        if settings_block is not None and particle_type in FLUID_PARTICLE_FLAGS:
+            # Blender creates fluid particle systems through the domain flags; they are never assigned.
+            if settings_block.type != particle_type:
+                raise ValueError("%s particle settings are %s, not %s"
+                                 % (obj.name, settings_block.type, particle_type))
+        elif settings_block is not None and particle_type is not None:
+            if particle_type not in settings_block.bl_rna.properties["type"].enum_items.keys():
+                raise ValueError("particle settings type %r is not a ParticleSettings type"
+                                 % particle_type)
+            settings_block.type = particle_type
         if settings_block is not None:
             set_rna(settings_block, _rna_writable(settings_block, settings), id_lookup)
         if particle_system is not None and particle_seed is not None:
             particle_system.seed = int(particle_seed)
+        if particle_system is not None and particle_child_seed is not None:
+            particle_system.child_seed = int(particle_child_seed)
+        if particle_system is not None and particle_density_group is not None:
+            particle_system.vertex_group_density = str(particle_density_group)
+        if particle_system is not None and particle_density_invert is not None:
+            particle_system.invert_vertex_group_density = bool(particle_density_invert)
+        if particle_hair_key_data is not None:
+            if particle_system is None or particle_type != "HAIR":
+                raise ValueError("Hair key data requires a Hair particle system")
+            DEFERRED_HAIR_KEY_RESTORATIONS.append((obj, particle_system, particle_hair_key_data))
         if collision_settings is not None:
             collision_block = getattr(modifier, "collision_settings", None)
             set_rna(collision_block, _rna_writable(collision_block, collision_settings), id_lookup)
@@ -7507,6 +8034,7 @@ def _placeholder_udim_image(name):
 def export_doc(doc, target, pack, scene_hash, context):
     CACHE_FILES_BY_IDENTITY.clear()
     DEFERRED_ID_ASSIGNMENTS.clear()
+    DEFERRED_HAIR_KEY_RESTORATIONS.clear()
     DEFERRED_MDISPS_FILEPATHS.clear()
     RESTORED_MDISPS_MESHES.clear()
     MULTIRES_MASK_LEVEL_BY_MESH.clear()
@@ -7552,6 +8080,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene["potter.root_collection"] = collections_raw[item["root_collection"]]["name"]
         set_scene_frame(scene, item["frame_current"])
         scene.frame_start = item["frame_start"]
+        scene.use_gravity = bool(item.get("use_gravity", True))
         scene.frame_end = item["frame_end"]
         scene.use_custom_simulation_range = item["use_custom_simulation_range"]
         scene.simulation_frame_start = item["simulation_frame_start"]
@@ -8081,6 +8610,8 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj.hide_viewport = not item.get("visible", True)
         obj.hide_render = not item.get("render_visible", True)
         obj.hide_select = not item.get("selectable", True)
+        obj.track_axis = item.get("track_axis", "POS_Y")
+        obj.up_axis = item.get("up_axis", "Z")
         set_props(obj, item.get("properties", {}))
         hide_rna = {
             key: value for key, value in (metadata.get("rna_properties") or {}).items()
@@ -8223,8 +8754,14 @@ def export_doc(doc, target, pack, scene_hash, context):
             for modifier in source_object.get("modifiers", [])
         }
         modifier_items = item.get("modifiers", [])
-        modifiers_by_id = _restore_modifier_stack(obj, modifier_items)
+        fluid_items = [item for item in modifier_items
+                       if _fluid_particle_type(doc, node_id, item) is not None]
+        fluid_ids = {item["id"] for item in fluid_items}
+        modifiers_by_id = _restore_modifier_stack(
+            obj, [item for item in modifier_items if item["id"] not in fluid_ids])
         for modifier_item in modifier_items:
+            if modifier_item["id"] in fluid_ids:
+                continue
             try:
                 params = modifier_item.get("params", {})
                 modifier = modifiers_by_id[modifier_item["id"]]
@@ -8277,6 +8814,17 @@ def export_doc(doc, target, pack, scene_hash, context):
                 raise RuntimeError(
                     "cannot reconstruct modifier %s (%s)" % (modifier_item.get("name"), modifier_item.get("type"))
                 ) from error
+        if fluid_items:
+            custom_properties_by_id = {
+                fluid_item["id"]: (
+                    source_modifiers.get(fluid_item.get("id"))
+                    or source_modifiers_by_rna_name.get(fluid_item.get("name"))
+                    or {}).get("custom_properties", {})
+                for fluid_item in fluid_items
+            }
+            _finish_fluid_particle_systems(
+                obj, modifier_items, fluid_items, modifiers_by_id, doc, node_id, id_lookup,
+                texture_map, target, pack, custom_properties_by_id)
     for node_id, item in doc.get("nodes", {}).items():
         obj = object_map[node_id]
         is_linked = node_id in linked_maps["nodes"]
@@ -8364,6 +8912,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         if obj.type == "MESH":
             mesh_source = compatibility_block(doc, "meshes", "Mesh", item.get("data"))
             _restore_skin_vertices(obj, mesh_source.get("skin_vertices", []))
+    _restore_deferred_particle_hair_key_data()
     _bind_blender_modifiers(doc, object_map, preserved_native_binds)
     for scene_id, scene_item in scenes_raw.items():
         source_scene = compatibility_block(doc, "scenes", "Scene", scene_id)

@@ -9,7 +9,7 @@ use std::{
 use glam::DMat4;
 use serde_json::json;
 
-use super::{SOLVER_VERSION, SimulationResult};
+use super::{PARTICLE_STATE_VERSION, SOLVER_VERSION, SimulationResult};
 use crate::geom::Mesh;
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -58,8 +58,10 @@ pub(super) fn load_modifier_simulation(
                 particle
                     .position
                     .iter()
+                    .chain(&particle.birth_position)
                     .chain(&particle.velocity)
                     .chain(&particle.normal)
+                    .chain(particle.birth_position_local.iter().flatten())
                     .any(|value| !value.is_finite())
                     || !particle.birth_frame.is_finite()
                     || !particle.death_frame.is_finite()
@@ -138,7 +140,8 @@ pub(super) fn cache_key(
 
     let input = json!({
         "solver_version": SOLVER_VERSION,
-        "build_identity": crate::BUILD_IDENTITY,
+    "particle_state_version": PARTICLE_STATE_VERSION,
+    "build_identity": crate::BUILD_IDENTITY,
         "scene_id": scene_id.as_str(),
         "frame": frame,
         "purpose": gate.context.purpose,
@@ -205,6 +208,8 @@ fn valid_result(result: &SimulationResult, key: &str) -> bool {
                     .position
                     .iter()
                     .chain(&state.velocity)
+                    .chain(&state.birth_position)
+                    .chain(state.birth_position_local.iter().flatten())
                     .chain(&state.normal)
                     .all(|value| value.is_finite())
                     && state.birth_frame.is_finite()

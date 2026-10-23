@@ -931,16 +931,40 @@ impl Mesh {
                 .checked_add(face.vertices.len() - 2)
                 .ok_or(MeshError::IdExhausted)
         })?;
-        let positions: HashMap<_, _> = self
-            .vertices
+        let positions = self.vertex_positions();
+        let mut result = Vec::with_capacity(capacity);
+        self.for_each_triangle_with_positions(&positions, |_, triangle| result.push(triangle))?;
+        Ok(result)
+    }
+
+    /// Visits each tessellated face and retains its source face index without a second triangle buffer.
+    pub(crate) fn for_each_triangle_with_face(
+        &self,
+        visit: impl FnMut(usize, [u32; 3]),
+    ) -> Result<(), MeshError> {
+        self.validate()?;
+        let positions = self.vertex_positions();
+        self.for_each_triangle_with_positions(&positions, visit)
+    }
+
+    fn vertex_positions(&self) -> HashMap<u32, DVec3> {
+        self.vertices
             .iter()
             .map(|vertex| (vertex.id, vertex.co))
-            .collect();
-        let mut result = Vec::with_capacity(capacity);
-        for face in &self.faces {
-            result.extend(tessellate_face(face, &positions)?);
+            .collect()
+    }
+
+    fn for_each_triangle_with_positions(
+        &self,
+        positions: &HashMap<u32, DVec3>,
+        mut visit: impl FnMut(usize, [u32; 3]),
+    ) -> Result<(), MeshError> {
+        for (face_index, face) in self.faces.iter().enumerate() {
+            for triangle in tessellate_face(face, positions)? {
+                visit(face_index, triangle);
+            }
         }
-        Ok(result)
+        Ok(())
     }
 
     /// Create a Blender-default or customized box mesh.

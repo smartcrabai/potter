@@ -233,7 +233,77 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     if value.get("schema_version").and_then(Value::as_u64) == Some(8) {
         upgrade_v8(value);
     }
+    upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
+}
+
+/// Promotes the pretyped Blender Scene gravity flag from an older import's retained RNA metadata.
+fn upgrade_scene_gravity_from_blender_metadata(value: &mut Value) {
+    let Some(scenes) = value.get("scenes").and_then(Value::as_object) else {
+        return;
+    };
+    if scenes
+        .values()
+        .all(|scene| scene.get("use_gravity").is_some())
+    {
+        return;
+    }
+    let Some(adapter) = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+    else {
+        return;
+    };
+    let Some(raw_scenes) = adapter
+        .get("intermediate")
+        .and_then(|intermediate| intermediate.get("scenes"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let mappings = adapter.get("id_mappings").and_then(Value::as_object);
+    let mut recovered = Vec::new();
+    for (scene_id, scene) in scenes {
+        if scene.get("use_gravity").is_some() {
+            continue;
+        }
+        let raw_scene = raw_scenes.iter().find(|raw| {
+            if raw.get("potter_id").and_then(Value::as_str) == Some(scene_id.as_str()) {
+                return true;
+            }
+            let Some(name) = raw.get("name").and_then(Value::as_str) else {
+                return false;
+            };
+            mappings
+                .and_then(|mappings| mappings.get(&format!("Scene:{name}")))
+                .and_then(Value::as_str)
+                == Some(scene_id.as_str())
+        });
+        let Some(raw_scene) = raw_scene else {
+            continue;
+        };
+        let gravity = raw_scene
+            .get("use_gravity")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                raw_scene
+                    .get("rna_properties")
+                    .and_then(|properties| properties.get("use_gravity"))
+                    .and_then(Value::as_bool)
+            });
+        if let Some(gravity) = gravity {
+            recovered.push((scene_id.clone(), gravity));
+        }
+    }
+    if let Some(scenes) = value.get_mut("scenes").and_then(Value::as_object_mut) {
+        for (scene_id, gravity) in recovered {
+            if let Some(scene) = scenes.get_mut(&scene_id)
+                && scene.get("use_gravity").is_none()
+            {
+                scene["use_gravity"] = json!(gravity);
+            }
+        }
+    }
 }
 
 /// Upgrades a schema-version-1 scene document to version 2.
@@ -1857,6 +1927,41 @@ mod tests {
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
         assert_eq!(scene["schema_version"], json!(9));
         assert_eq!(scene["materials"], before["materials"]);
+    }
+
+    #[test]
+    fn old_blender_scene_gravity_moves_from_rna_metadata_into_the_typed_field() {
+        let mut scene =
+            serde_json::to_value(crate::model::SceneDoc::new("legacy-gravity".to_owned()))
+                .expect("scene document serializes");
+        scene["scenes"]["scene_main"]
+            .as_object_mut()
+            .expect("scene object")
+            .remove("use_gravity");
+        scene["compatibility"] = json!({
+            "blender_adapter": {
+                "intermediate": {
+                    "scenes": [{
+                        "name": "Scene",
+                        "rna_properties": {"use_gravity": false}
+                    }]
+                },
+                "id_mappings": {"Scene:Scene": "scene_main"}
+            }
+        });
+
+        upgrade_scene(&mut scene, no_assets()).expect("scene upgrade");
+
+        assert_eq!(scene["scenes"]["scene_main"]["use_gravity"], json!(false));
+        let scene: crate::model::SceneDoc =
+            serde_json::from_value(scene).expect("typed scene parses");
+        assert!(
+            !scene
+                .scenes
+                .get(&scene.active_scene)
+                .expect("active scene exists")
+                .use_gravity
+        );
     }
 
     #[test]

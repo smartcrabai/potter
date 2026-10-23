@@ -3383,6 +3383,15 @@ fn build_imported_graph(
             simulation_frame_end,
             fps,
             fps_base: number_field(item, "fps_base", 1.0),
+            use_gravity: item
+                .get("use_gravity")
+                .and_then(Value::as_bool)
+                .or_else(|| {
+                    item.get("rna_properties")
+                        .and_then(|properties| properties.get("use_gravity"))
+                        .and_then(Value::as_bool)
+                })
+                .unwrap_or(true),
             camera: None,
             world: None,
             unit: UnitSettings {
@@ -4416,6 +4425,7 @@ fn build_imported_graph(
                         &movie_clip_ids,
                         &action_ids,
                     )?;
+                    canonicalize_particle_texture_slots(&mut settings, &resource_ids, &image_ids);
                     if let (Some(system), Some(block)) = (blender_system, settings.as_object_mut())
                     {
                         resolve_physics_collection_references(system, block, &collection_ids);
@@ -4668,6 +4678,8 @@ fn build_imported_graph(
             },
             parent_bone,
             parent_inverse,
+            track_axis: object_axis(item, "track_axis")?,
+            up_axis: object_axis(item, "up_axis")?,
             transform,
             data: data_id,
             active_vertex_group_index: None,
@@ -5672,6 +5684,15 @@ fn optional_array<'a>(raw: &'a Value, key: &str) -> Result<&'a [Value]> {
         None => Ok(&[]),
         Some(Value::Array(values)) => Ok(values),
         Some(_) => Err(invalid_intermediate(&format!("invalid `{key}` array"))),
+    }
+}
+/// Reads an optional Blender axis enum through its typed `Node` representation; absent keys take
+/// Blender's new-object default.
+fn object_axis<T: serde::de::DeserializeOwned + Default>(raw: &Value, key: &str) -> Result<T> {
+    match raw.get(key) {
+        None => Ok(T::default()),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| invalid_intermediate(&format!("invalid `{key}` axis"))),
     }
 }
 fn parse_rigid_body_world(value: &Value) -> Result<RigidBodyWorld> {
@@ -9301,6 +9322,61 @@ fn imported_fisheye_lens(item: &Value) -> Option<f64> {
     }
 }
 
+/// Particle texture channels that Potter does not apply, with the Blender name each reports.
+const PARTICLE_UNSUPPORTED_CHANNELS: [(&str, &str); 10] = [
+    ("use_map_velocity", "velocity"),
+    ("use_map_field", "force fields"),
+    ("use_map_gravity", "gravity"),
+    ("use_map_damp", "damping"),
+    ("use_map_clump", "clumping"),
+    ("use_map_kink_amp", "kink amplitude"),
+    ("use_map_kink_freq", "kink frequency"),
+    ("use_map_rough", "roughness"),
+    ("use_map_length", "length"),
+    ("use_map_twist", "twist"),
+];
+
+/// Particle texture slots name their texture by Blender data name. A slot whose texture was not exported
+/// as a Potter record is unset here, and `import_losses` reports it.
+fn canonicalize_particle_texture_slots(
+    settings: &mut Value,
+    resource_ids: &BTreeMap<String, String>,
+    image_ids: &BTreeMap<String, Id>,
+) {
+    let Some(slots) = settings
+        .get_mut("texture_slots")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for slot in slots {
+        let Some(slot) = slot.as_object_mut() else {
+            continue;
+        };
+        let noise = slot.get("texture_type").and_then(Value::as_str) == Some("NOISE");
+        let resource = slot
+            .get("texture")
+            .and_then(|reference| reference.get("name"))
+            .and_then(Value::as_str)
+            .filter(|_| !noise)
+            .and_then(|name| resource_ids.get(name))
+            .cloned()
+            .or_else(|| {
+                // A default image texture is exported as its image (Blender's image fast path).
+                slot.get("texture_image")
+                    .and_then(|reference| reference.get("name"))
+                    .and_then(Value::as_str)
+                    .filter(|_| !noise)
+                    .and_then(|name| image_ids.get(name))
+                    .map(|id| id.as_str().to_owned())
+            });
+        slot.insert(
+            "texture".to_owned(),
+            resource.map_or(Value::Null, Value::String),
+        );
+    }
+}
+
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
     // Blender's USD CacheFiles are not read: their Mesh Cache and Mesh Sequence Cache modifiers would fail at
@@ -9326,6 +9402,106 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         .flatten()
         .filter_map(|item| item.get("name").and_then(Value::as_str))
         .collect();
+    // Particle texture slots (`psys_get_texture`) that Potter cannot apply are reported. Potter applies
+    // the time, life, density, and size channels with GLOBAL or OBJECT coordinates; a texture without a
+    // Potter record is not applied. A slot that maps no channel does nothing and is not reported.
+    for object in raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = object.get("name").and_then(Value::as_str);
+        for modifier in object
+            .get("modifiers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(settings) = modifier.get("physics_settings") else {
+                continue;
+            };
+            for slot in settings
+                .get("texture_slots")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let mapped = |key: &str| slot.get(key).and_then(Value::as_bool) == Some(true);
+                let unsupported = PARTICLE_UNSUPPORTED_CHANNELS
+                    .iter()
+                    .filter(|(key, _)| mapped(key))
+                    .map(|(_, label)| *label)
+                    .collect::<Vec<_>>();
+                let supported_mapped = [
+                    "use_map_time",
+                    "use_map_life",
+                    "use_map_density",
+                    "use_map_size",
+                ]
+                .iter()
+                .any(|key| mapped(key));
+                if unsupported.is_empty() && !supported_mapped {
+                    continue;
+                }
+                let index = slot.get("slot").and_then(Value::as_u64).unwrap_or(0);
+                let texture = slot
+                    .get("texture")
+                    .and_then(|reference| reference.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if slot.get("texture_type").and_then(Value::as_str) == Some("NOISE") {
+                    losses.push(loss(
+                        "blender.particle_system.texture_noise",
+                        name,
+                        &format!(
+                            "Blender's particle texture slot {index} (texture `{texture}`) is a Noise texture, which Blender seeds from the process clock, so its values cannot be reproduced; the slot is not applied and the particle settings stay constant"
+                        ),
+                    ));
+                    continue;
+                }
+                let image_fast_path = slot
+                    .get("texture_image")
+                    .is_some_and(|reference| !reference.is_null());
+                if slot.get("texture_exported").and_then(Value::as_bool) != Some(true)
+                    && !image_fast_path
+                {
+                    losses.push(loss(
+                        "blender.particle_system.texture_slot",
+                        name,
+                        &format!(
+                            "Blender's particle texture slot {index} (texture `{texture}`) has no Potter texture record, so the slot is not applied and the particle settings stay constant"
+                        ),
+                    ));
+                    continue;
+                }
+                let coords = slot
+                    .get("texture_coords")
+                    .and_then(Value::as_str)
+                    .unwrap_or("GLOBAL");
+                if !matches!(coords, "GLOBAL" | "OBJECT") {
+                    losses.push(loss(
+                        "blender.particle_system.texture_coords",
+                        name,
+                        &format!(
+                            "Blender's particle texture slot {index} (texture `{texture}`) uses {coords} coordinates; Potter evaluates GLOBAL and OBJECT particle texture coordinates, so the slot is not applied"
+                        ),
+                    ));
+                    continue;
+                }
+                if !unsupported.is_empty() {
+                    losses.push(loss(
+                        "blender.particle_system.texture_channel",
+                        name,
+                        &format!(
+                            "Blender's particle texture slot {index} (texture `{texture}`) maps {}; Potter applies particle texture influence to time, life, density, and size only, so those channels stay constant",
+                            unsupported.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     // Blender stores every panorama setting on every camera, so a value Potter cannot hold is reported whatever the camera's
     // type: the import never changes a camera silently.
     for camera in raw

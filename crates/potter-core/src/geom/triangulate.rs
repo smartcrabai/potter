@@ -359,6 +359,13 @@ pub(super) fn triangulate_ngon(
     triangles
 }
 
+/// Tessface n-gon fill (`mesh_tessface_calc`): clip polyfill on the face projected along its
+/// Newell normal, without beauty flips. A zero-area face projects onto +Z.
+pub(crate) fn tessellate_ngon(corners: &[[f32; 3]]) -> Vec<[usize; 3]> {
+    let normal = face_normal(corners).unwrap_or([0.0, 0.0, 1.0]);
+    triangulate_ngon(corners, normal, NgonMethod::Clip)
+}
+
 /// Blender `BLI_polyfill_calc` then `BLI_polyfill_beautify` on clockwise projected coordinates: the
 /// n-gon fill of Decimate's COLLAPSE (`BM_mesh_decimate_collapse`, called from
 /// `modifiers/intern/MOD_decimate.cc:177`).

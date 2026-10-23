@@ -48,12 +48,14 @@ mod bevel_vmesh;
 mod decimate;
 pub(crate) mod deform;
 pub(crate) mod displacement;
+pub mod explode;
 pub(crate) use displacement::{
     displace_textured, load_modifier_texture, warp_textured, wave_textured,
 };
 mod mirror;
 pub(crate) mod multires;
 mod ocean;
+pub mod particle_instance;
 pub(crate) use ocean::{OceanBakeImage, OceanBakeSequence, ocean_cache_directory};
 pub(crate) mod remesh_modes;
 pub(crate) mod shrinkwrap;

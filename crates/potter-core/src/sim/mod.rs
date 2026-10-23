@@ -4,6 +4,9 @@ mod cache;
 pub mod cloth;
 pub mod dynamic_paint;
 pub mod fluid;
+mod particle_distribution;
+mod particle_jitter;
+mod particle_textures;
 pub mod particles;
 pub mod softbody;
 mod solver;
@@ -75,6 +78,7 @@ pub(crate) fn nonnegative_setting(
 }
 
 const MAX_TOTAL_STEPS: usize = 8_192;
+const PARTICLE_STATE_VERSION: &str = "particle-state-7";
 
 /// Substep budget for a solver advancing `frame` with `substeps` steps per frame.
 ///
@@ -173,22 +177,68 @@ pub enum ParticleLifeState {
     Dead,
 }
 
+/// A world-space trajectory sample with time normalized to the particle's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ParticlePathKey {
+    pub time: f64,
+    pub position: [f64; 3],
+    /// World-space derivative with respect to normalized lifetime time.
+    /// Cubic Hermite interpolation uses this value at each key.
+    pub velocity: [f64; 3],
+    /// Bishop-frame rotation in XYZW order.
+    pub rotation: [f64; 4],
+}
+
+/// Interpolation used to evaluate a particle's path controls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticlePathInterpolation {
+    /// Cubic Hermite using each key's normalized-time derivative.
+    #[default]
+    Hermite,
+    /// Direct interpolation of source path-cache samples and their derivatives.
+    Linear,
+    /// Linear interpolation of Hair pathcache samples; key rotations are not current-state orientation.
+    HairCache,
+    /// Hair's default cardinal interpolation, represented by Hermite tangents.
+    HairCardinal,
+    /// Blender's cubic B-spline interpolation for hair control keys.
+    HairBspline,
+}
+
 /// One particle's world-space lifecycle state at a selected frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ParticleState {
     pub position: [f64; 3],
     pub birth_position: [f64; 3],
+    /// Exact emitter-local source point when available for this particle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birth_position_local: Option<[f64; 3]>,
     pub normal: [f64; 3],
     /// Rotation quaternion in XYZW order from emitter-local to particle orientation.
     pub rotation: [f64; 4],
     pub birth_rotation: [f64; 4],
+    /// Emitter-face frame used only to seed Particle Instance's path Bishop frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_root_rotation: Option<[f64; 4]>,
+    /// World-space velocity in meters per second, except path-sampled values use normalized-lifetime derivatives.
     pub velocity: [f64; 3],
     pub birth_frame: f64,
     pub death_frame: f64,
     pub life_state: ParticleLifeState,
     pub system_index: u32,
     pub is_child: bool,
+    /// Parent-system index for child particles; `None` for regular particles.
+    pub parent_index: Option<u32>,
+    /// Weighted parent-system indices for interpolated children, in Blender nearest-parent order.
+    pub parent_indices: [u32; 3],
+    pub parent_weights: [f64; 3],
+    pub parent_count: u8,
+    /// Imported full-lifetime cache keys used for current-state sampling and path instances.
+    pub path: Vec<ParticlePathKey>,
+    /// Interpolation for `path`; omitted serialized states default to keyed/baked Hermite.
+    pub path_interpolation: ParticlePathInterpolation,
     pub size: f64,
     pub mass: f64,
 }
@@ -201,12 +251,20 @@ impl Default for ParticleState {
             normal: [0.0, 0.0, 1.0],
             rotation: DQuat::IDENTITY.to_array(),
             birth_rotation: DQuat::IDENTITY.to_array(),
+            birth_position_local: None,
+            path_root_rotation: None,
             velocity: [0.0; 3],
             birth_frame: 0.0,
             death_frame: 0.0,
             life_state: ParticleLifeState::Alive,
             system_index: 0,
             is_child: false,
+            parent_index: None,
+            parent_indices: [0; 3],
+            parent_weights: [0.0; 3],
+            parent_count: 0,
+            path: Vec::new(),
+            path_interpolation: ParticlePathInterpolation::Hermite,
             size: 1.0,
             mass: 1.0,
         }
@@ -219,6 +277,126 @@ fn particle_orientation(normal: [f64; 3]) -> [f64; 4] {
     } else {
         DQuat::from_rotation_arc(DVec3::X, normal.normalize()).to_array()
     }
+}
+fn particle_state(
+    particle: particles::Particle,
+    system_index: u32,
+    frame: f64,
+    use_rotations: bool,
+    no_physics: bool,
+) -> ParticleState {
+    let at_birth = frame
+        .partial_cmp(&particle.birth_frame)
+        .is_some_and(std::cmp::Ordering::is_eq);
+    let rotation = if !use_rotations {
+        if particle.path.is_empty() && (at_birth || no_physics) {
+            particle.birth_rotation
+        } else {
+            DQuat::IDENTITY.to_array()
+        }
+    } else if particle.path.is_empty() {
+        particles::blender_velocity_orientation(particle.velocity)
+    } else {
+        // Hair path keys carry Bishop frames, not the current Hair particle orientation.
+        match particle.path_interpolation {
+            ParticlePathInterpolation::HairCardinal
+            | ParticlePathInterpolation::HairBspline
+            | ParticlePathInterpolation::HairCache => particle.birth_rotation,
+            ParticlePathInterpolation::Hermite => particle
+                .current_path_rotation
+                .unwrap_or_else(|| particle_orientation(particle.normal)),
+            ParticlePathInterpolation::Linear => particle_orientation(particle.normal),
+        }
+    };
+    ParticleState {
+        position: particle.position,
+        birth_position: particle.birth_position,
+        birth_position_local: particle.birth_position_local,
+        normal: particle.normal,
+        rotation,
+        birth_rotation: particle.birth_rotation,
+        path_root_rotation: particle.path_root_rotation,
+        velocity: particle.velocity,
+        birth_frame: particle.birth_frame,
+        death_frame: particle.death_frame,
+        life_state: particle.life_state,
+        system_index,
+        is_child: particle.is_child,
+        parent_index: particle.parent_index,
+        parent_indices: particle.parent_indices,
+        parent_weights: particle.parent_weights,
+        parent_count: particle.parent_count,
+        path: particle.path,
+        path_interpolation: particle.path_interpolation,
+        size: particle.size,
+        mass: particle.mass,
+    }
+}
+
+fn particle_states_valid(states: &[ParticleState]) -> bool {
+    let parents_len = states.iter().take_while(|state| !state.is_child).count();
+    states.iter().all(|state| {
+        let parent_count = usize::from(state.parent_count);
+        let parent_associations_valid = parent_count <= 3
+            && state.parent_indices[..parent_count]
+                .iter()
+                .all(|index| usize::try_from(*index).is_ok_and(|index| index < parents_len))
+            && state.parent_weights[..parent_count]
+                .iter()
+                .all(|weight| weight.is_finite() && *weight >= 0.0)
+            && (parent_count == 0
+                || (state.parent_weights[..parent_count].iter().sum::<f64>() - 1.0).abs()
+                    <= 1.0e-6);
+        let parent_link_valid = match (state.is_child, state.parent_index) {
+            (false, None) => parent_count == 0,
+            (true, Some(parent_index)) => {
+                usize::try_from(parent_index).is_ok_and(|index| index < parents_len)
+                    && (parent_count == 0 || parent_associations_valid)
+            }
+            _ => false,
+        };
+        let path_valid = state.path.iter().all(|key| {
+            let rotation = DQuat::from_array(key.rotation);
+            key.time.is_finite()
+                && (0.0..=1.0).contains(&key.time)
+                && key.position.iter().all(|value| value.is_finite())
+                && key.velocity.iter().all(|value| value.is_finite())
+                && rotation.is_finite()
+                && rotation.length_squared() > 1.0e-20
+        }) && state
+            .path
+            .windows(2)
+            .all(|keys| keys[0].time <= keys[1].time);
+        let rotation = DQuat::from_array(state.rotation);
+        let birth_rotation = DQuat::from_array(state.birth_rotation);
+        let path_root_valid = state.path_root_rotation.is_none_or(|rotation| {
+            let rotation = DQuat::from_array(rotation);
+            rotation.is_finite() && rotation.length_squared() > 1.0e-20
+        });
+        state
+            .position
+            .iter()
+            .chain(&state.birth_position)
+            .chain(&state.normal)
+            .chain(&state.velocity)
+            .chain(state.birth_position_local.iter().flatten())
+            .all(|value| value.is_finite())
+            && rotation.is_finite()
+            && rotation.length_squared() > 1.0e-20
+            && birth_rotation.is_finite()
+            && birth_rotation.length_squared() > 1.0e-20
+            && path_root_valid
+            && state.birth_frame.is_finite()
+            && state.death_frame.is_finite()
+            && state.death_frame >= state.birth_frame
+            && state.size.is_finite()
+            && state.size >= 0.0
+            && state.mass.is_finite()
+            && state.mass > 0.0
+            && parent_link_valid
+            && parent_associations_valid
+            && path_valid
+    })
 }
 
 fn scene_members(doc: &SceneDoc, scene_id: &Id) -> Result<BTreeSet<Id>> {
@@ -320,10 +498,7 @@ pub(crate) fn evaluate_stack_modifier(
                     .checked_sub(1)
                     .and_then(|index| u32::try_from(index).ok())
                     == Some(system_index);
-                let requests_unborn =
-                    candidate.params.get("show_unborn").and_then(Value::as_bool) == Some(true);
-                requests_unborn
-                    && gate.is_active(target_id, candidate)
+                gate.is_active(target_id, candidate)
                     && same_system_index
                     && ((candidate.modifier_type == "particle_instance"
                         && candidate.params.get("object").and_then(Value::as_str)
@@ -360,6 +535,7 @@ pub(crate) fn evaluate_stack_modifier(
     }))?);
     if let Some(directory) = cache_directory
         && let Some((mesh, particles)) = cache::load_modifier_simulation(directory, &cache_key)?
+        && particles.as_deref().is_none_or(particle_states_valid)
     {
         return Ok(StackModifierResult { mesh, particles });
     }
@@ -384,37 +560,33 @@ pub(crate) fn evaluate_stack_modifier(
             set_vertex_positions(&mut mesh, positions, node_id)?;
         }
         "particle_system" => {
+            let use_rotations = settings
+                .get("use_rotations")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let no_physics = settings.get("physics_type").and_then(Value::as_str) == Some("NO");
             let seed = setting_u32(settings, "seed").unwrap_or(context.seed);
             let triangles =
                 collider_triangles(doc, matrices, &members, gate, ColliderConsumer::Point)?;
             let colliders = point_colliders(&triangles, node_id);
             let fields = force_field_inputs(doc, matrices, &members)?;
-            let states = particles::simulate_lifecycle(
+            let textures =
+                load_particle_textures(&solver_settings, doc, gate.context.project_root)?;
+            let slots = particle_textures::texture_slots(&solver_settings, &textures, matrices)?;
+            let states = particles::simulate_lifecycle_textured(
                 &mesh,
                 &solver_settings,
                 matrix,
                 frame,
-                context.fps,
                 context.gravity,
                 seed,
                 &fields,
                 &colliders,
+                &slots,
             )?
             .into_iter()
-            .map(|particle| ParticleState {
-                position: particle.position,
-                birth_position: particle.birth_position,
-                normal: particle.normal,
-                rotation: particle_orientation(particle.normal),
-                birth_rotation: particle.birth_rotation,
-                velocity: particle.velocity,
-                birth_frame: particle.birth_frame,
-                death_frame: particle.death_frame,
-                life_state: particle.life_state,
-                system_index,
-                is_child: particle.is_child,
-                size: particle.size,
-                mass: particle.mass,
+            .map(|particle| {
+                particle_state(particle, system_index, frame, use_rotations, no_physics)
             })
             .collect::<Vec<_>>();
             particles = Some(states);
@@ -504,6 +676,21 @@ fn particle_system_index(node: &Node, modifier_id: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Resolves the texture resources that a particle system's supported texture slots refer to.
+fn load_particle_textures(
+    settings: &Value,
+    doc: &SceneDoc,
+    project_root: Option<&std::path::Path>,
+) -> Result<BTreeMap<String, crate::geom::legacy_texture::ResolvedTexture>> {
+    let mut textures = BTreeMap::new();
+    for name in particle_textures::texture_ids(settings) {
+        let id = Id::new(name.clone())?;
+        let resolved = crate::geom::legacy_texture::resolve_texture(doc, &id, project_root)?;
+        textures.insert(name, resolved);
+    }
+    Ok(textures)
+}
+
 fn normalize_solver_settings(settings: &Value, system: &str) -> Value {
     let mut normalized = settings.clone();
     let Some(properties) = normalized.as_object_mut() else {
@@ -559,7 +746,7 @@ pub(crate) fn evaluate(
 ) -> Result<Option<SimulationResult>> {
     let cache_directory = gate.context.cache_directory;
     let key = cache::cache_key(scene_hash, scene_id, frame, base_world_matrices, gate)?;
-    let mut result = solver::evaluate(
+    let result = solver::evaluate(
         doc,
         scene_id,
         frame,
@@ -585,25 +772,34 @@ pub(crate) fn evaluate(
         })
     });
     if !has_physics {
-        return Ok(result);
-    }
-    if result
-        .as_ref()
-        .is_some_and(|cached| cached.physics_cache_key.as_deref() == Some(key.as_str()))
-    {
-        return Ok(result);
-    }
-    if result.is_none()
-        && let Some(directory) = cache_directory
-        && let Some(cached) = cache::load(directory, &key)?
-    {
-        if cached.physics_cache_key.as_deref() == Some(key.as_str()) {
-            return Ok(Some(cached));
+        if let Some(mut result) = result {
+            result.cache_key = key;
+            return Ok(Some(result));
         }
-        result = Some(cached);
+        return Ok(None);
+    }
+    if let Some(directory) = cache_directory
+        && let Some(cached) = cache::load(directory, &key)?
+        && cached.physics_cache_key.as_deref() == Some(key.as_str())
+        && cached
+            .particle_states
+            .values()
+            .all(|states| particle_states_valid(states))
+    {
+        return Ok(Some(cached));
+    }
+    if result.as_ref().is_some_and(|cached| {
+        cached.physics_cache_key.as_deref() == Some(key.as_str())
+            && cached
+                .particle_states
+                .values()
+                .all(|states| particle_states_valid(states))
+    }) {
+        return Ok(result);
     }
     let physics = evaluate_physics(doc, scene_id, frame, base_world_matrices, &members, gate)?;
     let mut result = result.unwrap_or_else(|| empty_result(key.clone()));
+    result.cache_key.clone_from(&key);
     result.deformed_vertices = physics.deformed_vertices;
     result.fluid_particles = physics.fluid_particles;
     result.fluid_warnings = physics.fluid_warnings;
@@ -702,16 +898,18 @@ fn evaluate_physics(
             let triangles =
                 collider_triangles(doc, matrices, members, gate, ColliderConsumer::Point)?;
             let colliders = point_colliders(&triangles, id);
-            let particles = particles::simulate(
+            let textures = load_particle_textures(settings, doc, gate.context.project_root)?;
+            let slots = particle_textures::texture_slots(settings, &textures, matrices)?;
+            let particles = particles::simulate_textured(
                 mesh,
                 settings,
                 matrix,
                 frame,
-                context.fps,
                 context.gravity,
                 seed,
                 &force_fields,
                 &colliders,
+                &slots,
             )?;
             if particles.iter().any(|particle| {
                 particle.position.iter().any(|value| !value.is_finite())
@@ -728,27 +926,24 @@ fn evaluate_physics(
                 .get("physics_particle_emitter_modifier_id")
                 .and_then(Value::as_str)
                 .map_or(0, |modifier_id| particle_system_index(node, modifier_id));
-            result.particles.insert(
-                id.clone(),
-                particles
-                    .into_iter()
-                    .map(|particle| ParticleState {
-                        position: particle.position,
-                        birth_position: particle.birth_position,
-                        normal: particle.normal,
-                        rotation: particle_orientation(particle.normal),
-                        birth_rotation: particle.birth_rotation,
-                        velocity: particle.velocity,
-                        birth_frame: particle.birth_frame,
-                        death_frame: particle.death_frame,
-                        life_state: particle.life_state,
-                        system_index,
-                        is_child: particle.is_child,
-                        size: particle.size,
-                        mass: particle.mass,
-                    })
-                    .collect(),
-            );
+            let use_rotations = settings
+                .get("use_rotations")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let no_physics = settings.get("physics_type").and_then(Value::as_str) == Some("NO");
+            let states = particles
+                .into_iter()
+                .map(|particle| {
+                    particle_state(particle, system_index, frame, use_rotations, no_physics)
+                })
+                .collect::<Vec<_>>();
+            if !particle_states_valid(&states) {
+                return Err(PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    format!("particle state for `{id}` is invalid"),
+                ));
+            }
+            result.particles.insert(id.clone(), states);
         }
         if let Some(settings) = node.properties.get("physics_fluid")
             && let Some(modifier) = active_modifier(id, node, "fluid", gate)
@@ -1308,6 +1503,20 @@ fn point_colliders(triangles: &[(Id, ColliderTriangle)], subject: &Id) -> Vec<[D
         .collect()
 }
 
+fn effective_scene_gravity(scene: &crate::model::Scene) -> DVec3 {
+    let gravity = scene
+        .rigid_body_world
+        .as_ref()
+        .map_or(DVec3::new(0.0, 0.0, -9.81), |world| {
+            DVec3::from_array(world.gravity)
+        });
+    if scene.use_gravity {
+        gravity
+    } else {
+        DVec3::ZERO
+    }
+}
+
 /// Scene inputs that every physics evaluation at one frame shares.
 #[derive(Clone, Copy)]
 struct FrameContext<'a> {
@@ -1342,12 +1551,11 @@ impl<'a> FrameContext<'a> {
                 "physics frame rate and frame must be finite and positive",
             ));
         }
-        let (gravity, seed) = scene
+        let gravity = effective_scene_gravity(scene);
+        let seed = scene
             .rigid_body_world
             .as_ref()
-            .map_or((DVec3::new(0.0, 0.0, -9.81), 0), |world| {
-                (DVec3::from_array(world.gravity), world.seed)
-            });
+            .map_or(0, |world| world.seed);
         Ok(Self {
             doc,
             matrices,
@@ -1968,5 +2176,197 @@ mod dynamic_paint_frame_tests {
         assert_eq!(paint_frame_in_tenths(&canvas, 21.0)?, Some(200));
         assert_eq!(paint_frame_in_tenths(&canvas, 300.0)?, Some(200));
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use glam::{DQuat, DVec3};
+
+    use super::{
+        ParticleLifeState, ParticlePathInterpolation, ParticlePathKey, ParticleState,
+        particle_orientation, particle_state, particle_states_valid, particles::Particle,
+    };
+
+    #[test]
+    fn interpolated_child_allows_virtual_representative_parent() {
+        let mut states = vec![ParticleState::default(), ParticleState::default()];
+        states.push(ParticleState {
+            is_child: true,
+            parent_index: Some(1),
+            parent_indices: [0, 1, 0],
+            parent_weights: [0.75, 0.25, 0.0],
+            parent_count: 2,
+            ..ParticleState::default()
+        });
+
+        assert!(particle_states_valid(&states));
+    }
+    fn particle_for_state(
+        path_interpolation: ParticlePathInterpolation,
+        path: Vec<ParticlePathKey>,
+        birth_rotation: [f64; 4],
+        current_path_rotation: [f64; 4],
+    ) -> Particle {
+        Particle {
+            position: [0.0; 3],
+            birth_position: [0.0; 3],
+            birth_position_local: None,
+            normal: [0.0, 0.0, 1.0],
+            birth_rotation,
+            current_path_rotation: Some(current_path_rotation),
+            path_root_rotation: None,
+            path_interpolation,
+            velocity: [0.0; 3],
+            birth_frame: 0.0,
+            death_frame: 1.0,
+            life_state: ParticleLifeState::Alive,
+            is_child: false,
+            parent_index: None,
+            parent_indices: [0; 3],
+            parent_weights: [0.0; 3],
+            parent_count: 0,
+            path,
+            size: 1.0,
+            mass: 1.0,
+        }
+    }
+
+    #[test]
+    fn particle_current_rotation_is_independent_of_path_frames() {
+        let birth_rotation = DQuat::from_rotation_z(0.7).to_array();
+        let current_path_rotation = DQuat::from_rotation_y(0.4).to_array();
+        let path = vec![ParticlePathKey {
+            time: 0.0,
+            position: [0.0; 3],
+            velocity: [0.0; 3],
+            rotation: current_path_rotation,
+        }];
+        for interpolation in [
+            ParticlePathInterpolation::HairCardinal,
+            ParticlePathInterpolation::HairBspline,
+            ParticlePathInterpolation::HairCache,
+        ] {
+            let state = particle_state(
+                particle_for_state(
+                    interpolation,
+                    path.clone(),
+                    birth_rotation,
+                    current_path_rotation,
+                ),
+                0,
+                0.0,
+                true,
+                false,
+            );
+            assert_eq!(state.rotation, birth_rotation);
+        }
+        let keyed = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Hermite,
+                path.clone(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.0,
+            true,
+            false,
+        );
+        assert_eq!(keyed.rotation, current_path_rotation);
+
+        let linear = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Linear,
+                path.clone(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.0,
+            true,
+            false,
+        );
+        let normal_orientation = particle_orientation([0.0, 0.0, 1.0]);
+        assert_eq!(linear.rotation, normal_orientation);
+        let mut moving = particle_for_state(
+            ParticlePathInterpolation::HairCache,
+            Vec::new(),
+            birth_rotation,
+            current_path_rotation,
+        );
+        moving.velocity = [1.0, 2.0, 3.0];
+        let heading = DVec3::new(1.0, 2.0, 3.0).normalize();
+        let oriented = DQuat::from_array(particle_state(moving, 0, 0.0, true, false).rotation);
+        // The orientation is Blender's f32 `vec_to_quat`, so local +X matches the heading to f32.
+        assert!((oriented * DVec3::X - heading).length() < 1.0e-6);
+        let stationary = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::HairCache,
+                Vec::new(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.0,
+            true,
+            false,
+        );
+        assert_eq!(stationary.rotation, DQuat::IDENTITY.to_array());
+        let disabled_path_rotations = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Hermite,
+                path.clone(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.0,
+            false,
+            false,
+        );
+        assert_eq!(disabled_path_rotations.rotation, DQuat::IDENTITY.to_array());
+
+        let disabled_rotations_at_birth = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Hermite,
+                Vec::new(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.0,
+            false,
+            false,
+        );
+        assert_eq!(disabled_rotations_at_birth.rotation, birth_rotation);
+        let disabled_rotations_after_birth = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Hermite,
+                Vec::new(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.5,
+            false,
+            false,
+        );
+        assert_eq!(
+            disabled_rotations_after_birth.rotation,
+            DQuat::IDENTITY.to_array()
+        );
+        let no_physics_after_birth = particle_state(
+            particle_for_state(
+                ParticlePathInterpolation::Hermite,
+                Vec::new(),
+                birth_rotation,
+                current_path_rotation,
+            ),
+            0,
+            0.5,
+            false,
+            true,
+        );
+        assert_eq!(no_physics_after_birth.rotation, birth_rotation);
     }
 }

@@ -1379,7 +1379,7 @@ fn evaluate_modifier_output(
                 "uv_warp" => ["object_from", "object_to"]
                     .iter()
                     .any(|key| modifier.params.get(*key).is_some_and(Value::is_string)),
-                "armature" | "displace" | "wave" | "warp" => true,
+                "armature" | "displace" | "wave" | "warp" | "particle_instance" | "explode" => true,
                 "cast" | "screw" => modifier.params.get("object").is_some_and(Value::is_string),
                 "simple_deform" => modifier.params.get("origin").is_some_and(Value::is_string),
                 "mirror" => modifier
@@ -1554,6 +1554,13 @@ fn evaluate_modifier_output(
                 evaluated_meshes: evaluated_operand_meshes,
                 project_root: engine.asset_root,
             };
+            let suppressed_nodes = std::collections::BTreeSet::new();
+            let modifier_context = crate::eval::ModifierEvaluationContext {
+                purpose: crate::eval::EvaluationPurpose::Preview,
+                project_root: engine.asset_root,
+                cache_directory: engine.cache_directory,
+                material_slot_count,
+            };
             let texture_seed = crate::geom::modifiers::TextureSeed::new(
                 crate::eval::EvaluationPurpose::Preview,
                 0,
@@ -1571,12 +1578,7 @@ fn evaluate_modifier_output(
                 &base_object_meshes,
                 evaluated_operand_meshes,
                 &curve_path_lengths,
-                crate::eval::ModifierEvaluationContext {
-                    purpose: crate::eval::EvaluationPurpose::Preview,
-                    project_root: engine.asset_root,
-                    cache_directory: engine.cache_directory,
-                    material_slot_count,
-                },
+                modifier_context,
                 |_, modifier| modifier.enabled,
                 texture_seed,
                 None,
@@ -1673,6 +1675,38 @@ fn evaluate_modifier_output(
                             &operand_snapshot.bone_pose_matrices,
                             engine.asset_root,
                         ),
+                        "particle_system" => Ok(()),
+                        "explode" => {
+                            let gate = crate::eval::ModifierGate::for_modifier_apply(
+                                modifier_context,
+                                &suppressed_nodes,
+                            );
+                            crate::eval::apply_explode_modifier(
+                                mesh,
+                                modifier,
+                                target,
+                                engine.doc,
+                                gate,
+                                frame,
+                                &world_matrices,
+                                &operand_snapshot.simulated_particles,
+                            )
+                        }
+                        "particle_instance" => {
+                            let gate = crate::eval::ModifierGate::for_modifier_apply(
+                                modifier_context,
+                                &suppressed_nodes,
+                            );
+                            crate::eval::apply_particle_instance_modifier(
+                                mesh,
+                                modifier,
+                                target,
+                                engine.doc,
+                                gate,
+                                &world_matrices,
+                                &operand_snapshot.simulated_particles,
+                            )
+                        }
                         _ => Err(PotError::new(
                             ErrorCode::InternalError,
                             "custom modifier callback received an unexpected type",
@@ -2708,7 +2742,7 @@ fn validate_particle_modifier_params(
     modifier_type: &str,
     params: &Map<String, Value>,
 ) -> Result<()> {
-    if modifier_type != "particle_instance" {
+    if !matches!(modifier_type, "particle_instance" | "explode") {
         return Ok(());
     }
     if modifier_type == "particle_instance" {
@@ -2752,6 +2786,13 @@ fn validate_particle_modifier_params(
                 &operation_pointer(engine.operation_index, "params/particle_system_index"),
             )
         })?;
+        if index == 0 || index > 32_767 {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "particle_system_index must be between 1 and 32767",
+                "/params/particle_system_index",
+            ));
+        }
         if modifier_type == "particle_instance" {
             let object_id = params
                 .get("object")
@@ -2787,7 +2828,9 @@ fn validate_particle_modifier_params(
         "show_dead",
         "show_unborn",
         "use_path",
+        "use_preserve_shape",
         "use_edge_cut",
+        "invert_vertex_group",
     ] {
         if params.get(field).is_some_and(|value| !value.is_boolean()) {
             return Err(engine.error(
@@ -2800,6 +2843,8 @@ fn validate_particle_modifier_params(
     for field in [
         "position",
         "random_position",
+        "particle_amount",
+        "particle_offset",
         "protect",
         "rotation",
         "random_rotation",
@@ -2812,6 +2857,19 @@ fn validate_particle_modifier_params(
                 ErrorCode::InvalidOperation,
                 format!("{modifier_type} `{field}` must be finite"),
                 &operation_pointer(engine.operation_index, &format!("params/{field}")),
+            ));
+        }
+    }
+    for field in ["position", "rotation", "particle_amount", "particle_offset"] {
+        if params
+            .get(field)
+            .and_then(Value::as_f64)
+            .is_some_and(|value| !(0.0..=1.0).contains(&value))
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("{modifier_type} `{field}` must be in [0, 1]"),
+                &format!("/params/{field}"),
             ));
         }
     }
@@ -2868,13 +2926,35 @@ fn validate_particle_modifier_params(
     }
     if params
         .get("vertex_group")
-        .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
+        .is_some_and(|value| value.as_str().is_none())
     {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("{modifier_type} `vertex_group` must be a non-empty group name"),
             &operation_pointer(engine.operation_index, "params/vertex_group"),
         ));
+    }
+    if params
+        .get("particle_uv")
+        .is_some_and(|value| value.as_str().is_none())
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "explode `particle_uv` must be a string",
+            "/params/particle_uv",
+        ));
+    }
+    for field in ["index_layer_name", "value_layer_name"] {
+        if params
+            .get(field)
+            .is_some_and(|value| value.as_str().is_none())
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("particle_instance `{field}` must be a string"),
+                &format!("/params/{field}"),
+            ));
+        }
     }
     Ok(())
 }

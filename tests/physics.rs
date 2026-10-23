@@ -162,6 +162,67 @@ fn box_drop_rests_on_passive_plane_and_bake_keeps_scene_unchanged() {
             .is_some()
     );
 }
+
+#[test]
+fn scene_gravity_flag_gates_rigid_body_motion_without_changing_world_gravity() {
+    let directory = tempdir().unwrap();
+    let simulate = |name: &str, use_gravity: bool| {
+        let scene = directory.path().join(name);
+        init_scene(&scene);
+        apply(
+            &scene,
+            &json!({
+                "schema_version":1,
+                "base_revision":0,
+                "operations":[
+                    {"op":"node.create","id":"body","kind":"box","params":{"size":1.0},"transform":{"translation":[0.0,0.0,5.0]}},
+                    {"op":"physics.world.update","target":{"id":"scene_main"},"set":{"enabled":true,"gravity":[0.0,0.0,-9.81],"substeps":4,"solver_iterations":8,"frame_start":1,"frame_end":2}},
+                    {"op":"physics.rigid_body.create","target":{"id":"body"},"type":"active","mass":1.0,"shape":"box","friction":0.0,"restitution":0.0,"linear_damping":0.0,"angular_damping":0.0},
+                    {"op":"scene.update","target":{"id":"scene_main"},"set":{"use_gravity":use_gravity}}
+                ]
+            }),
+        );
+        let document: Value =
+            serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+        assert_eq!(
+            document["scenes"]["scene_main"]["rigid_body_world"]["gravity"],
+            json!([0.0, 0.0, -9.81]),
+        );
+        assert_eq!(
+            document["scenes"]["scene_main"]["use_gravity"],
+            json!(use_gravity),
+        );
+        let out = directory.path().join(format!("{name}_bake"));
+        let (output, _) = bake(&scene, &out, "1:2");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        let last = manifest["frames"].as_array().unwrap().last().unwrap();
+        let frame: Value =
+            serde_json::from_slice(&fs::read(out.join(last["file"].as_str().unwrap())).unwrap())
+                .unwrap();
+        let body = &frame["transforms"]["body"];
+        (
+            body["world_matrix"][14].as_f64().unwrap(),
+            body["linear_velocity"][2].as_f64().unwrap(),
+        )
+    };
+    let disabled = simulate("gravity_disabled", false);
+    let enabled = simulate("gravity_enabled", true);
+    assert_eq!(disabled, (5.0, 0.0));
+    assert!(
+        enabled.0 < disabled.0,
+        "gravity did not move the body down: {enabled:?}"
+    );
+    assert!(
+        enabled.1 < 0.0,
+        "gravity did not accelerate the body down: {enabled:?}"
+    );
+}
 #[test]
 fn wind_force_field_accelerates_a_rigid_body() {
     let directory = tempdir().unwrap();
@@ -310,7 +371,7 @@ fn physics_system_operations_persist_update_and_delete_settings() {
             "operations":[
                 {"op":"physics.cloth.create","target":{"id":"body"},"settings":{"vertex_group_mass":"pinned","quality":4}},
                 {"op":"physics.soft_body.create","target":{"id":"body"},"settings":{"vertex_group_goal":"goal","friction":0.4}},
-                {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"rate":3,"lifetime":20},"seed":17},
+                {"op":"physics.particle_emitter.create","target":{"id":"body"},"settings":{"count":3,"lifetime":20},"seed":17},
                 {"op":"physics.fluid.create","target":{"id":"body"},"settings":{"domain_type":"LIQUID","resolution":8}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"body"},"settings":{"role":"canvas","radius":0.5,"color":[0.2,0.4,0.8,1.0]}}
             ]
@@ -362,7 +423,7 @@ fn physics_system_operations_persist_update_and_delete_settings() {
             "operations":[
                 {"op":"physics.cloth.update","target":{"id":"body"},"set":{"tension_stiffness":0.7}},
                 {"op":"physics.soft_body.update","target":{"id":"body"},"set":{"friction":0.8}},
-                {"op":"physics.particle_emitter.update","target":{"id":"body"},"set":{"rate":6}},
+                {"op":"physics.particle_emitter.update","target":{"id":"body"},"set":{"count":6}},
                 {"op":"physics.fluid.update","target":{"id":"body"},"set":{"viscosity":0.1}},
                 {"op":"physics.dynamic_paint.update","target":{"id":"body"},"set":{"strength":0.5}}
             ]
@@ -379,7 +440,7 @@ fn physics_system_operations_persist_update_and_delete_settings() {
         0.8
     );
     assert_eq!(
-        updated["nodes"]["body"]["properties"]["physics_particle_emitter"]["rate"],
+        updated["nodes"]["body"]["properties"]["physics_particle_emitter"]["count"],
         6
     );
     assert_eq!(
@@ -623,20 +684,20 @@ fn soft_body_sphere_on_collider_sticks_at_contact_as_blender_does() {
 }
 
 #[test]
-fn particles_are_seeded_and_emitted_at_rate_times_frames() {
+fn particles_are_seeded_and_born_by_count_over_frames() {
     use glam::{DMat4, DVec3};
     use potter_core::geom::Mesh;
 
     let emitter =
         Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
             .unwrap();
-    let settings = json!({"rate":3,"lifetime":20,"speed":1,"source":"faces"});
+    let settings =
+        json!({"count":12,"frame_start":1,"frame_end":1,"lifetime":20,"speed":1,"source":"faces"});
     let first = potter_core::sim::particles::simulate(
         &emitter,
         &settings,
         DMat4::IDENTITY,
         4.0,
-        24.0,
         DVec3::new(0.0, 0.0, -9.81),
         71,
         &[],
@@ -648,7 +709,6 @@ fn particles_are_seeded_and_emitted_at_rate_times_frames() {
         &settings,
         DMat4::IDENTITY,
         4.0,
-        24.0,
         DVec3::new(0.0, 0.0, -9.81),
         71,
         &[],
@@ -766,7 +826,7 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
                 {"op":"node.create","id":"weight_canvas","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}},
                 {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1}},
                 {"op":"physics.cloth.create","target":{"id":"cloth"}},
-                {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"rate":2,"lifetime":10,"speed":0.5},"seed":17},
+                {"op":"physics.particle_emitter.create","target":{"id":"emitter"},"settings":{"count":2,"frame_start":1,"frame_end":1,"lifetime":10,"speed":0.5},"seed":17},
                 {"op":"physics.fluid.create","target":{"id":"domain"},"settings":{"domain_type":"LIQUID","resolution":4}},
                 {"op":"physics.fluid.create","target":{"id":"flow"},"settings":{}},
                 {"op":"modifier.update","target":{"id":"flow"},"modifier_id":"physics_fluid","set":{"params":{"fluid_type":"FLOW"}}},
@@ -852,7 +912,7 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
             "schema_version":1,
             "base_revision":1,
             "operations":[
-                {"op":"physics.particle_emitter.update","target":{"id":"emitter"},"set":{"rate":3}}
+                {"op":"physics.particle_emitter.update","target":{"id":"emitter"},"set":{"count":3}}
             ]
         }),
     );

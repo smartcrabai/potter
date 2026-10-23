@@ -1,0 +1,56 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "emitter": {
+    "1": [
+      {
+        "alive": [
+          "ALIVE",
+          "UNBORN"
+        ],
+        "totchild": 0,
+        "totpart": 2
+      },
+      {
+        "alive": [
+          "ALIVE",
+          "UNBORN"
+        ],
+        "totchild": 0,
+        "totpart": 1000
+      }
+    ],
+    "3": [
+      {
+        "alive": [
+          "DEAD"
+        ],
+        "totchild": 0,
+        "totpart": 2
+      },
+      {
+        "alive": [
+          "ALIVE",
+          "UNBORN"
+        ],
+        "totchild": 0,
+        "totpart": 1000
+      }
+    ]
+  },
+  "faces": {
+    "1": {
+      "b_alive": 1,
+      "c_secondary": 1,
+      "d_no_unborn": 1,
+      "e_dead": 0,
+      "g_with_unborn": 2
+    },
+    "3": {
+      "b_alive": 0,
+      "c_secondary": 11,
+      "d_no_unborn": 0,
+      "e_dead": 2,
+      "g_with_unborn": 0
+    }
+  }
+}

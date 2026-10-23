@@ -686,10 +686,14 @@ fn apply_physics_system(
             if canonical_system == "dynamic_paint" {
                 validate_dynamic_paint_settings_role(engine, &dynamic_role, updates)?;
             }
+            // Particle updates validate incoming fields while preserving imported RNA in storage.
             validate_physics_settings(
                 engine,
                 canonical_system,
-                if matches!(canonical_system, "dynamic_paint" | "fluid") {
+                if matches!(
+                    canonical_system,
+                    "dynamic_paint" | "fluid" | "particle_emitter"
+                ) {
                     updates
                 } else {
                     &settings
@@ -697,12 +701,38 @@ fn apply_physics_system(
             )?;
             validate_physics_references(engine, canonical_system, &target, &settings)?;
             let mut changed = current != Some(&Value::Object(settings.clone()));
-            if changed {
+            let primary_settings_id = if canonical_system == "particle_emitter" {
+                node.properties
+                    .get("physics_particle_emitter_modifier_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            if changed || primary_settings_id.is_some() {
                 let node = engine.doc.nodes.get_mut(&target).ok_or_else(|| {
                     PotError::new(ErrorCode::InternalError, "physics target disappeared")
                 })?;
-                node.properties
-                    .insert(property.to_owned(), Value::Object(settings));
+                if changed {
+                    node.properties
+                        .insert(property.to_owned(), Value::Object(settings));
+                }
+                // Modifier evaluation and export resolve the primary particle settings by ID.
+                if let Some(settings_id) = primary_settings_id
+                    && let Some(primary_settings) = node
+                        .properties
+                        .get_mut("physics_particle_systems")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|systems| systems.get_mut(&settings_id))
+                        .and_then(Value::as_object_mut)
+                {
+                    for (field, value) in updates {
+                        if primary_settings.get(field) != Some(value) {
+                            primary_settings.insert(field.clone(), value.clone());
+                            changed = true;
+                        }
+                    }
+                }
             }
             changed |= ensure_physics_stack_modifier(engine, &target, canonical_system, "NONE")?;
             if !changed {
@@ -1478,6 +1508,7 @@ const PARTICLE_SETTINGS: &[&str] = &[
     "lifetime",
     "lifetime_random",
     "speed",
+    "time_tweak",
     "normal_factor",
     "factor_random",
     "random_velocity",
@@ -1493,6 +1524,7 @@ const PARTICLE_SETTINGS: &[&str] = &[
     "hair_length",
     "particle_size",
     "size_random",
+    // Native operation name; Blender's ParticleSettings field is `child_percent`.
     "child_nbr",
     "child_radius",
     "child_type",
@@ -1743,9 +1775,11 @@ fn native_setting_valid(field: &str, value: &Value) -> bool {
         "resolution" => value
             .as_u64()
             .is_some_and(|count| (1..=10).contains(&count)),
-        "count" | "child_nbr" => value.as_u64().is_some_and(|count| count <= 1_000_000),
+        "count" => value.as_u64().is_some_and(|count| count <= 1_000_000),
+        "child_nbr" => value.as_u64().is_some_and(|count| count <= 100_000),
         "rate" | "emission_rate" => number.is_some_and(|rate| (0.0..=1_000_000.0).contains(&rate)),
         "lifetime" => number.is_some_and(|number| number > 0.0 && number <= 1_000_000.0),
+        "time_tweak" => number.is_some_and(|value| (0.0..=100.0).contains(&value)),
         "start_frame" | "end_frame" | "frame_start" | "frame_end" => number.is_some(),
         "smoothing_length" | "radius" | "hair_length" | "particle_size" | "mass" => {
             number.is_some_and(|number| number > 0.0)
@@ -1787,7 +1821,7 @@ fn native_setting_valid(field: &str, value: &Value) -> bool {
             .is_some_and(|mode| matches!(mode, "points" | "object" | "hair_curves")),
         "render_type" => value
             .as_str()
-            .is_some_and(|mode| matches!(mode, "HALO" | "PATH" | "OBJECT" | "COLLECTION")),
+            .is_some_and(|mode| matches!(mode, "NONE" | "HALO" | "PATH" | "OBJECT" | "COLLECTION")),
         "physics_type" => value
             .as_str()
             .is_some_and(|kind| matches!(kind, "NEWTON" | "NO")),

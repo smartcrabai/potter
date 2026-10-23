@@ -181,6 +181,9 @@ fn scene_schema() -> Value {
         "type":"array",
         "items":{"enum":["data","object"]}
     });
+    root["$defs"]["node"]["properties"]["track_axis"] =
+        json!({"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]});
+    root["$defs"]["node"]["properties"]["up_axis"] = json!({"enum":["X","Y","Z"]});
     root["$defs"]["node"]["properties"]["ray_visibility"] = json!({
         "oneOf":[{"type":"null"},{"type":"object","required":["camera","diffuse","glossy","transmission","volume_scatter","shadow"],"properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false}]
     });
@@ -281,6 +284,7 @@ fn complete_scene_schema(root: &mut Value) {
         "sequencer"
     ]);
     scene["properties"]["active_clip"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
+    scene["properties"]["use_gravity"] = json!({"type":"boolean"});
     scene["properties"]["use_compositing"] = json!({"type":"boolean"});
     scene["properties"]["compositor"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
     scene["properties"]["color_management"] = json!({"$ref":"#/$defs/color_management"});
@@ -965,6 +969,8 @@ fn operation_contract(name: &str) -> OperationContract {
                 "visible",
                 "render_visible",
                 "selectable",
+                "track_axis",
+                "up_axis",
             ],
             vec!["op", "id", "kind"],
             "object",
@@ -2385,6 +2391,10 @@ fn field_schema(operation: &str, field: &str) -> Value {
             "metaball","lattice","pointcloud","volume","armature","grease_pencil",
             "collection_instance"
         ]}),
+        "track_axis" if operation.starts_with("node.") => {
+            json!({"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]})
+        }
+        "up_axis" if operation.starts_with("node.") => json!({"enum":["X","Y","Z"]}),
         "kind" => {
             json!({"enum":["group","empty","mesh","camera","light","box","sphere","uv_sphere","cylinder","plane","cone","torus","icosphere","circle","grid"]})
         }
@@ -2546,6 +2556,7 @@ fn set_schema(operation: &str) -> Value {
             "name":{"type":"string"},"frame_current":{"type":"number"},
             "frame_start":{"type":"integer"},"frame_end":{"type":"integer"},
             "fps":{"type":"integer","minimum":1},"fps_base":{"type":"number","exclusiveMinimum":0},
+            "use_gravity":{"type":"boolean"},
             "camera":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},
             "world":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},
             "clip":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},
@@ -2558,6 +2569,7 @@ fn set_schema(operation: &str) -> Value {
             "transform":{"type":"object","properties":{"translation":vec_schema(3),"rotation_deg":vec_schema(3),"rotation":vec_schema(4),"scale":vec_schema(3)},"additionalProperties":false},
             "params":{"type":"object"},"materials":{"type":"array","items":{"oneOf":[id_schema(),{"type":"null"}]}},
             "visible":{"type":"boolean"},"render_visible":{"type":"boolean"},"selectable":{"type":"boolean"},
+            "track_axis":{"enum":["POS_X","POS_Y","POS_Z","NEG_X","NEG_Y","NEG_Z"]},"up_axis":{"enum":["X","Y","Z"]},
             "ray_visibility":{"type":"object","properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false},
             "action":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]}
         }),
@@ -2765,24 +2777,25 @@ fn physics_native_properties(system: &str) -> Value {
         }),
         "particle_emitter" => json!({
             "seed":{"type":"integer","minimum":0,"maximum":u32::MAX},
-            "rate":{"type":"number","minimum":0,"maximum":1_000_000},
-            "emission_rate":{"type":"number","minimum":0,"maximum":1_000_000},
             "lifetime":{"type":"number","exclusiveMinimum":0},
+            "time_tweak":{"type":"number","minimum":0,"maximum":100},
             "speed":{"type":"number","minimum":0},
             "random_velocity":{"oneOf":[{"type":"number","minimum":0},vec_schema(3)]},
             "count":{"type":"integer","minimum":0,"maximum":1_000_000},
+            "rate":{"type":"number","minimum":0,"maximum":1_000_000},
+            "emission_rate":{"type":"number","minimum":0,"maximum":1_000_000},
             "lifetime_random":{"type":"number","minimum":0,"maximum":1},
             "normal_factor":{"type":"number","minimum":0},
             "factor_random":{"type":"number","minimum":0},
             "emit_from":{"enum":["VERT","FACE","VOLUME"]},
             "physics_type":{"enum":["NEWTON","NO"]},
             "mass":{"type":"number","exclusiveMinimum":0},
-            "render_type":{"enum":["HALO","PATH","OBJECT","COLLECTION"]},
+            "render_type":{"enum":["NONE","HALO","PATH","OBJECT","COLLECTION"]},
             "instance_collection":id_schema(),
             "particle_size":{"type":"number","exclusiveMinimum":0},
             "size_random":{"type":"number","minimum":0,"maximum":1},
-            "child_nbr":{"type":"integer","minimum":0,"maximum":1_000_000},
-            "child_radius":{"type":"number","minimum":0},
+            "child_nbr":{"type":"integer","minimum":0,"maximum":100_000},
+            "child_radius":{"type":"number","minimum":0,"maximum":100_000},
             "child_type":{"enum":["NONE","SIMPLE","INTERPOLATED"]},
             "frame_start":{"type":"number"},
             "frame_end":{"type":"number"},
