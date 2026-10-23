@@ -329,7 +329,7 @@ pub fn explode(
     }
     origin.corners = Some(output_corner_copies);
     remap_attributes(mesh, &mut output, &origin)?;
-    // Blender rebuilds Explode loops from legacy MFace data, so their custom-normal codes are Auto.
+    // Blender's output short2 storage is undefined; Potter retains semantic Auto normal codes.
     if clnor::corner_codes(mesh)?.is_some() {
         let automatic =
             vec![CornerNormalCode::Auto; output.faces.iter().map(|face| face.vertices.len()).sum()];
@@ -1126,6 +1126,12 @@ mod tests {
             "blender_metadata".into(),
             json!({"color_data_types":{"FixtureCornerColor":"BYTE_COLOR"}}),
         );
+        let authored_normals = [crate::geom::clnor::CornerNormalCode::Authored([1200, -600]); 6];
+        crate::geom::clnor::write_codes(
+            &mut mesh,
+            Some(&authored_normals),
+            crate::geom::clnor::NormalCodeOptions::default(),
+        )?;
         let particles = [
             particle([2.0 / 3.0, 1.0 / 3.0, 0.0]),
             particle([1.0 / 3.0, 2.0 / 3.0, 0.0]),
@@ -1166,6 +1172,56 @@ mod tests {
                 }
             }
             assert_eq!(white_slots, usize::from(face.vertices.len() == 4));
+        }
+        let automatic_codes = crate::geom::clnor::corner_codes(&output)?
+            .ok_or_else(|| crate::error::PotError::invalid_argument("Explode lost normal state"))?;
+        let corner_count = output
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum::<usize>();
+        assert_eq!(automatic_codes.len(), corner_count);
+        assert!(
+            automatic_codes
+                .iter()
+                .all(|code| *code == crate::geom::clnor::CornerNormalCode::Auto)
+        );
+        let positions = output
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>();
+        let vertex_indices = output
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(index, vertex)| (vertex.id, index))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let consumed_normals = crate::geom::normals::corner_normals(&output, &positions)?;
+        assert_eq!(consumed_normals.len(), corner_count);
+        let mut corner_offset = 0;
+        for face in &output.faces {
+            let points = face
+                .vertices
+                .iter()
+                .map(|vertex_id| {
+                    let index = vertex_indices.get(vertex_id).copied().ok_or_else(|| {
+                        crate::error::PotError::invalid_argument(
+                            "Explode face references a missing vertex",
+                        )
+                    })?;
+                    Ok(positions[index])
+                })
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let geometric = crate::geom::normals::face_normal(&points);
+            for normal in consumed_normals
+                .iter()
+                .skip(corner_offset)
+                .take(face.vertices.len())
+            {
+                assert_eq!(*normal, geometric, "Explode Auto normal consumer");
+            }
+            corner_offset += face.vertices.len();
         }
         Ok(())
     }

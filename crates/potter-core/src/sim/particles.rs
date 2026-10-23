@@ -79,6 +79,7 @@ struct ChildSettings {
     interpolated: bool,
     use_emit_random: bool,
     use_rotations: bool,
+    no_physics: bool,
     virtual_parents: f64,
 }
 
@@ -329,6 +330,7 @@ fn simulate_with_lifecycle(
     }
     let particle_timestep = f64::from(0.04_f32 * time_tweak as f32);
     let is_hair = settings.get("type").and_then(Value::as_str) == Some("HAIR");
+    let no_physics = settings.get("physics_type").and_then(Value::as_str) == Some("NO");
     let path_interpolation = if let Some(value) = settings.get("_potter_path_interpolation") {
         serde_json::from_value(value.clone())
             .map_err(|_| invalid("particle path interpolation mode is invalid"))?
@@ -821,12 +823,7 @@ fn simulate_with_lifecycle(
             (age_frames / actual_lifetime).clamp(0.0, 1.0)
         };
         let current_path = sample_path(&path, path_time, path_interpolation);
-        let particle_gravity = if settings.get("physics_type").and_then(Value::as_str) == Some("NO")
-        {
-            DVec3::ZERO
-        } else {
-            gravity
-        };
+        // Pathless Blender PART_PHYS_NO particles reset from birth state on each evaluation frame.
         let birth_position_local = sampled
             .as_ref()
             .map(|(_, _, _, _, local_position)| local_position.to_array());
@@ -844,15 +841,19 @@ fn simulate_with_lifecycle(
             } else {
                 let (start, velocity, normal, birth_rotation, _) =
                     sampled.ok_or_else(|| invalid("particle emission sample is missing"))?;
-                let (position, final_velocity) = integrate_particle(
-                    start,
-                    velocity,
-                    age_frames,
-                    particle_timestep,
-                    particle_gravity,
-                    &fields,
-                    &world_colliders,
-                )?;
+                let (position, final_velocity) = if no_physics {
+                    (start, velocity)
+                } else {
+                    integrate_particle(
+                        start,
+                        velocity,
+                        age_frames,
+                        particle_timestep,
+                        gravity,
+                        &fields,
+                        &world_colliders,
+                    )?
+                };
                 (start, normal, birth_rotation, position, final_velocity)
             };
         if let Some(states) = hair_current_states {
@@ -1785,6 +1786,7 @@ fn parse_child_settings(settings: &Value, system_seed: u32) -> Result<Option<Chi
         })
         .transpose()?
         .unwrap_or(false);
+    let no_physics = settings.get("physics_type").and_then(Value::as_str) == Some("NO");
     Ok(Some(ChildSettings {
         count,
         radius,
@@ -1798,6 +1800,7 @@ fn parse_child_settings(settings: &Value, system_seed: u32) -> Result<Option<Chi
         interpolated,
         use_emit_random,
         use_rotations,
+        no_physics,
         virtual_parents,
     }))
 }
@@ -1925,10 +1928,11 @@ fn append_simple_children(
                     .first()
                     .map_or(parent.birth_rotation, |key| key.rotation),
             );
-            let pathless_birth_frame = parent.path.is_empty()
-                && frame
-                    .partial_cmp(&parent.birth_frame)
-                    .is_some_and(std::cmp::Ordering::is_eq);
+            let pathless_birth_rotation = parent.path.is_empty()
+                && (settings.no_physics
+                    || frame
+                        .partial_cmp(&parent.birth_frame)
+                        .is_some_and(std::cmp::Ordering::is_eq));
             let valid_rotation = |rotation: blender_f32::Quatf| {
                 rotation.iter().all(|value| value.is_finite())
                     && rotation.iter().map(|value| value * value).sum::<f32>() > 1.0e-20
@@ -1936,7 +1940,7 @@ fn append_simple_children(
             if !valid_rotation(parent_rotation) {
                 return Err(invalid("particle path rotation must be finite and nonzero"));
             }
-            let offset_parent_rotation = if settings.use_rotations || pathless_birth_frame {
+            let offset_parent_rotation = if settings.use_rotations || pathless_birth_rotation {
                 parent_rotation
             } else {
                 [1.0, 0.0, 0.0, 0.0]
@@ -1996,7 +2000,7 @@ fn append_simple_children(
                     },
                     |key| key.rotation,
                 ))
-            } else if pathless_birth_frame {
+            } else if pathless_birth_rotation {
                 parent_rotation
             } else {
                 [1.0, 0.0, 0.0, 0.0]
@@ -2762,6 +2766,7 @@ mod tests {
             virtual_parents: 0.0,
             use_emit_random: true,
             use_rotations: false,
+            no_physics: false,
             interpolated: false,
         };
         let mut children = Vec::new();
@@ -2780,7 +2785,7 @@ mod tests {
         assert_eq!(child.position, expected_position.position);
     }
     #[test]
-    fn simple_children_use_pathless_parent_birth_rotation_only_at_birth() {
+    fn simple_children_follow_pathless_parent_rotation_lifecycle() {
         let parent = Particle {
             position: [0.0; 3],
             birth_position: [0.0; 3],
@@ -2820,6 +2825,7 @@ mod tests {
             virtual_parents: 0.0,
             use_emit_random: true,
             use_rotations: false,
+            no_physics: false,
             interpolated: false,
         };
         let child_at = |parent: &Particle, frame| {
@@ -2840,6 +2846,38 @@ mod tests {
         let rotated_later = child_at(&rotated_parent, 6.0);
         assert_eq!(rotated_later.position, identity_later.position);
         assert_eq!(rotated_later.birth_position, identity_later.birth_position);
+        let no_physics_settings = ChildSettings {
+            no_physics: true,
+            ..settings
+        };
+        let mut no_physics_identity_children = Vec::new();
+        append_simple_children(
+            no_physics_settings,
+            6.0,
+            &[parent],
+            &mut no_physics_identity_children,
+        )
+        .expect("no-physics Simple child state is valid");
+        let mut no_physics_rotated_children = Vec::new();
+        append_simple_children(
+            no_physics_settings,
+            6.0,
+            std::slice::from_ref(&rotated_parent),
+            &mut no_physics_rotated_children,
+        )
+        .expect("rotated no-physics Simple child state is valid");
+        let [x, y, z, w] = rotated_parent.birth_rotation.map(|value| value as f32);
+        let expected_no_physics_position = super::blender_f32::mul_qt_v3(
+            [w, x, y, z],
+            no_physics_identity_children[0]
+                .position
+                .map(|value| value as f32),
+        )
+        .map(f64::from);
+        assert_eq!(
+            no_physics_rotated_children[0].position,
+            expected_no_physics_position,
+        );
     }
 
     #[test]

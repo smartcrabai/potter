@@ -7891,7 +7891,8 @@ mod tests {
         },
         model::{
             Collection, DataBlock, GreasePencilData, GreasePencilFrame, GreasePencilLayer,
-            GreasePencilPoint, GreasePencilStroke, Id, MaterialLink, Node, SceneDoc, Transform,
+            GreasePencilPoint, GreasePencilStroke, Id, MaterialLink, Modifier, Node, SceneDoc,
+            Transform,
         },
     };
 
@@ -7903,18 +7904,64 @@ mod tests {
     fn particle_render_limit_counts_all_systems_for_each_emitter()
     -> std::result::Result<(), &'static str> {
         let emitter_id = Id::new("emitter").unwrap();
+        let data_id = Id::new("emitter_mesh").unwrap();
         let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "mesh".to_owned(),
+                mesh: Some(
+                    Mesh::box_mesh(BoxParams {
+                        size: DVec3::splat(2.0),
+                    })
+                    .unwrap(),
+                ),
+                ..DataBlock::default()
+            },
+        );
+        let modifiers = ["system0", "system1"]
+            .into_iter()
+            .map(|settings_id| Modifier {
+                id: Id::new(settings_id.to_owned()).unwrap(),
+                modifier_type: "particle_system".to_owned(),
+                name: settings_id.to_owned(),
+                enabled: true,
+                show_viewport: true,
+                show_render: true,
+                params: json!({"settings_id":settings_id})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                baked_ocean_cache: None,
+                binding_data: None,
+                runtime: crate::model::ModifierRuntime::default(),
+            })
+            .collect::<Vec<_>>();
+        let properties = json!({
+            "physics_particle_emitter": {"render_type":"HALO"},
+            "physics_particle_emitter_modifier_id": "system0",
+            "physics_particle_systems": {
+                "system0": {"render_type":"HALO"},
+                "system1": {"render_type":"HALO"}
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
         doc.nodes.insert(
             emitter_id.clone(),
             Node {
                 name: "Emitter".to_owned(),
                 kind: "mesh".to_owned(),
+                data: Some(data_id.clone()),
+                properties,
+                modifiers,
                 ..Node::default()
             },
         );
-        let mut states = Vec::with_capacity(120_002);
-        for system_index in 0..2 {
-            for _ in 0..60_001 {
+        let mut states = Vec::with_capacity(100_001);
+        for (system_index, count) in [(0, 1), (1, 100_000)] {
+            for _ in 0..count {
                 states.push(crate::sim::ParticleState {
                     system_index,
                     ..crate::sim::ParticleState::default()
@@ -7934,20 +7981,43 @@ mod tests {
             modifier_prefix: None,
         };
         let evaluated_nodes = std::collections::BTreeSet::from([emitter_id.clone()]);
+        let matrices = BTreeMap::from([(emitter_id.clone(), DMat4::IDENTITY)]);
+        let emitter_mesh = doc
+            .data_blocks
+            .get(&data_id)
+            .and_then(|data| data.mesh.as_ref())
+            .unwrap()
+            .clone();
+        let mut meshes = BTreeMap::from([(emitter_id.clone(), emitter_mesh)]);
+        let mut nodes = BTreeMap::from([(
+            emitter_id.clone(),
+            super::EvaluatedNode {
+                world_matrix: DMat4::IDENTITY.to_cols_array(),
+                bounds: None,
+                dimensions: None,
+                materials: Vec::new(),
+                mesh_materials: Vec::new(),
+            },
+        )]);
+        let mut adaptive_normals = BTreeMap::new();
         let Err(error) = super::render_simulated_particles(
             &doc,
             gate,
             &particles,
-            &std::collections::BTreeMap::new(),
-            &mut std::collections::BTreeMap::new(),
-            &mut std::collections::BTreeMap::new(),
+            &matrices,
+            &mut meshes,
+            &mut nodes,
             &evaluated_nodes,
-            &mut std::collections::BTreeMap::new(),
+            &mut adaptive_normals,
         ) else {
             return Err("combined visible systems must exceed the per-emitter limit");
         };
-        assert_eq!(error.code, crate::error::ErrorCode::LimitExceeded);
-        assert_eq!(error.details["count"], serde_json::json!(120_002));
+        assert_eq!(
+            error.code,
+            crate::error::ErrorCode::LimitExceeded,
+            "unexpected particle render error: {error:?}",
+        );
+        assert_eq!(error.details["count"], serde_json::json!(100_001));
         Ok(())
     }
     fn grease_pencil_scene(data: GreasePencilData, transform: Transform) -> (SceneDoc, Id) {

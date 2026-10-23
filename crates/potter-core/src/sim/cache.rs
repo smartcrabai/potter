@@ -58,8 +58,10 @@ pub(super) fn load_modifier_simulation(
                 particle
                     .position
                     .iter()
+                    .chain(&particle.birth_position)
                     .chain(&particle.velocity)
                     .chain(&particle.normal)
+                    .chain(particle.birth_position_local.iter().flatten())
                     .any(|value| !value.is_finite())
                     || !particle.birth_frame.is_finite()
                     || !particle.death_frame.is_finite()
@@ -206,6 +208,8 @@ fn valid_result(result: &SimulationResult, key: &str) -> bool {
                     .position
                     .iter()
                     .chain(&state.velocity)
+                    .chain(&state.birth_position)
+                    .chain(state.birth_position_local.iter().flatten())
                     .chain(&state.normal)
                     .all(|value| value.is_finite())
                     && state.birth_frame.is_finite()

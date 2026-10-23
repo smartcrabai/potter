@@ -657,7 +657,36 @@ fn assert_ordered_mesh_matches_blender(
     }
 
     let normal_state = mesh.attributes.get("custom_normal");
-    if let Some(expected_codes) = expected["custom_normal_codes"].as_array() {
+    let corner_count = mesh
+        .faces
+        .iter()
+        .map(|face| face.vertices.len())
+        .sum::<usize>();
+    if let Some(expected_count) = expected["custom_normal_uninitialized_count"].as_u64() {
+        let normal_state = normal_state.expect("Blender Explode custom-normal layer");
+        assert_eq!(normal_state["domain"], "corner", "{context} normal domain");
+        assert_eq!(
+            normal_state["type"], "normal_code",
+            "{context} normal code type"
+        );
+        let values = normal_state["values"].as_object().unwrap();
+        let mut actual_count = 0;
+        for face in &mesh.faces {
+            let row = values
+                .get(&format!("f{}", face.id))
+                .and_then(Value::as_array)
+                .unwrap();
+            assert_eq!(
+                row.len(),
+                face.vertices.len(),
+                "{context} custom-normal corner count for face {}",
+                face.id,
+            );
+            actual_count += row.len();
+        }
+        assert_eq!(actual_count, usize::try_from(expected_count).unwrap());
+        assert_eq!(actual_count, corner_count);
+    } else if let Some(expected_codes) = expected["custom_normal_codes"].as_array() {
         let normal_state = normal_state.expect("canonical custom-normal state");
         assert_eq!(normal_state["domain"], "corner", "{context} normal domain");
         assert_eq!(
@@ -666,11 +695,6 @@ fn assert_ordered_mesh_matches_blender(
         );
         let values = normal_state["values"].as_object().unwrap();
         let corner_order = normal_state.get("corner_order").and_then(Value::as_object);
-        let corner_count = mesh
-            .faces
-            .iter()
-            .map(|face| face.vertices.len())
-            .sum::<usize>();
         let mut actual_codes = vec![Value::Null; corner_count];
         let mut offset = 0;
         for face in &mesh.faces {
@@ -1081,7 +1105,7 @@ def corner_normal_codes(mesh):
     return codes
 
 
-def mesh_snapshot(mesh, obj):
+def mesh_snapshot(mesh, obj, uninitialized_explode_custom_normals=False):
     vertex_groups = {}
     for group in obj.vertex_groups:
         values = []
@@ -1089,12 +1113,27 @@ def mesh_snapshot(mesh, obj):
             weight = next((item.weight for item in vertex.groups if item.group == group.index), 0.0)
             values.append(weight)
         vertex_groups[group.name] = values
+    if uninitialized_explode_custom_normals:
+        # Blender's zero-corner template leaves the grown short2 values undefined.
+        normal_attribute = mesh.attributes.get('custom_normal')
+        if normal_attribute is None:
+            raise RuntimeError('Explode output lost its custom_normal attribute')
+        if normal_attribute.domain != 'CORNER' or normal_attribute.data_type != 'INT16_2D':
+            raise RuntimeError('Explode output custom normals must be Blender INT16_2D CORNER codes')
+        if len(normal_attribute.data) != len(mesh.loops):
+            raise RuntimeError('Explode output custom-normal count differs from its loops')
+        custom_normal_codes = None
+        custom_normal_uninitialized_count = len(normal_attribute.data)
+    else:
+        custom_normal_codes = corner_normal_codes(mesh)
+        custom_normal_uninitialized_count = None
     return {
         'positions':[list(vertex.co) for vertex in mesh.vertices],
         'faces':[list(polygon.vertices) for polygon in mesh.polygons],
         'materials':[int(polygon.material_index) for polygon in mesh.polygons],
         'uv_layers':{layer.name:[list(item.uv) for item in layer.data] for layer in mesh.uv_layers},
-        'custom_normal_codes':corner_normal_codes(mesh),
+        'custom_normal_codes':custom_normal_codes,
+        'custom_normal_uninitialized_count':custom_normal_uninitialized_count,
         'color_layer_names':[layer.name for layer in mesh.color_attributes if layer.domain == 'CORNER'],
         'color_attributes':{
             layer.name:{'domain':layer.domain, 'data_type':layer.data_type,
@@ -1339,7 +1378,7 @@ explode_world_points = [
     list(evaluated_exploder.matrix_world @ vertex.co) for vertex in exploded_mesh.vertices
 ]
 face_count = len(exploded_mesh.polygons)
-explode_mesh_snapshot = mesh_snapshot(exploded_mesh, evaluated_exploder)
+explode_mesh_snapshot = mesh_snapshot(exploded_mesh, evaluated_exploder, uninitialized_explode_custom_normals=True)
 evaluated_exploder.to_mesh_clear()
 
 bpy.context.view_layer.objects.active = None
@@ -1405,7 +1444,7 @@ cube_world_points = [
     list(evaluated_cube_exploder.matrix_world @ vertex.co) for vertex in cube_mesh.vertices
 ]
 cube_face_count = len(cube_mesh.polygons)
-cube_mesh_snapshot = mesh_snapshot(cube_mesh, evaluated_cube_exploder)
+cube_mesh_snapshot = mesh_snapshot(cube_mesh, evaluated_cube_exploder, uninitialized_explode_custom_normals=True)
 evaluated_cube_exploder.to_mesh_clear()
 cli_cube_mesh = bpy.data.meshes.new('CliSmokeBoxMesh')
 cli_cube_mesh.from_pydata(
@@ -1792,7 +1831,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         explode_error <= MODIFIER_POSITION_TOLERANCE,
         "explode per-vertex geometric error {explode_error} exceeds {MODIFIER_POSITION_TOLERANCE}",
     );
-    let mut cube_particles = injected_particles(&blender["cube_explode_particle_states"])?;
+    let cube_particles = injected_particles(&blender["cube_explode_particle_states"])?;
     let cube_columns: [f64; 16] =
         serde_json::from_value(blender["cube_exploder_world_matrix"].clone())?;
     let cube_world = DMat4::from_cols_array(&cube_columns);
@@ -1822,12 +1861,6 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
         true,
         false,
     );
-    let cube_local_births = blender_points(&blender["cube_birth_local"])?;
-    assert_eq!(cube_local_births.len(), cube_particles.len());
-    for (particle, birth_position) in cube_particles.iter_mut().zip(&cube_local_births) {
-        particle.birth_position = cube_world.transform_point3(*birth_position).to_array();
-        particle.birth_position_local = Some(birth_position.to_array());
-    }
     let cube_seed = blender["cube_explode_seed"]
         .as_u64()
         .ok_or("Blender cube explode particle-system seed is missing")? as u32;
@@ -1856,7 +1889,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     assert_eq!(
         cube_explode.faces.len(),
         blender["cube_explode_face_count"],
-        "edge-cut cube face count, particles={cube_particles:?}, local births={cube_local_births:?}",
+        "edge-cut cube face count",
     );
     let cube_explode_world = cube_explode
         .vertices
@@ -1868,7 +1901,7 @@ with open(os.path.join(root, 'blender_expected.json'), 'w', encoding='utf-8') as
     assert_eq!(
         cube_explode_world.len(),
         blender_cube_points.len(),
-        "edge-cut cube vertices Potter={}, Blender={}, particles={cube_particles:?}, local births={cube_local_births:?}",
+        "edge-cut cube vertices Potter={}, Blender={}",
         cube_explode_world.len(),
         blender_cube_points.len(),
     );
@@ -6766,6 +6799,338 @@ fn affine_inline_volume_displacement_preserves_sampling_and_mesh_space()
         max_surface_correspondence_error(&affine_points, &expected_points)?
             <= MODIFIER_POSITION_TOLERANCE,
         "volume mesh vertices must use the full affine index-to-local transform",
+    );
+    Ok(())
+}
+#[test]
+fn no_physics_particle_instance_keeps_birth_rotation_after_birth() -> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping no-physics particle parity; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let fixture_script = root.join("no_physics_particle.py");
+    let expected_path = root.join("no_physics_particle.json");
+    fs::write(
+        &fixture_script,
+        r"
+import bpy, json, sys
+
+if tuple(bpy.app.version[:3]) != (5,2,2):
+    raise RuntimeError('no-physics particle parity requires Blender 5.2.2')
+output = sys.argv[sys.argv.index('--') + 1]
+scene = bpy.context.scene
+scene.use_gravity = False
+scene.frame_set(1)
+
+def plane_mesh(name):
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata([(-1,-1,0), (1,-1,0), (-1,1,0), (1,1,0)], [], [(0,1,3,2)])
+    mesh.update()
+    return mesh
+
+emitter = bpy.data.objects.new('NoPhysicsEmitter', plane_mesh('NoPhysicsEmitterMesh'))
+scene.collection.objects.link(emitter)
+emitter.select_set(True)
+bpy.context.view_layer.objects.active = emitter
+bpy.ops.object.particle_system_add()
+system = emitter.particle_systems[0]
+system.seed = 19
+settings = system.settings
+settings.count = 1
+settings.frame_start = 1
+settings.frame_end = 1
+settings.lifetime = 12
+settings.emit_from = 'VERT'
+settings.physics_type = 'NO'
+settings.normal_factor = 1.0
+settings.factor_random = 0.0
+settings.use_rotations = False
+settings.child_type = 'NONE'
+settings.render_type = 'NONE'
+emitter.select_set(False)
+bpy.context.view_layer.objects.active = None
+
+scene.frame_set(1)
+bpy.context.view_layer.update()
+birth_particle = emitter.evaluated_get(bpy.context.evaluated_depsgraph_get()).particle_systems[0].particles[0]
+birth = {
+    'position':list(birth_particle.location),
+    'rotation':[birth_particle.rotation.x, birth_particle.rotation.y,
+                birth_particle.rotation.z, birth_particle.rotation.w],
+}
+scene.frame_set(2)
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated_emitter = emitter.evaluated_get(depsgraph)
+particle = evaluated_emitter.particle_systems[0].particles[0]
+state = {
+    'position':list(particle.location),
+    'birth_position':birth['position'],
+    'velocity':list(particle.velocity),
+    'rotation':[particle.rotation.x, particle.rotation.y, particle.rotation.z, particle.rotation.w],
+    'birth_rotation':birth['rotation'],
+}
+
+instance = bpy.data.objects.new('NoPhysicsInstance', plane_mesh('NoPhysicsInstanceMesh'))
+scene.collection.objects.link(instance)
+instance.track_axis = 'POS_Z'
+modifier = instance.modifiers.new('No Physics Particle Instance', 'PARTICLE_INSTANCE')
+modifier.object = emitter
+modifier.particle_system_index = 1
+modifier.axis = 'X'
+modifier.use_normal = True
+modifier.use_children = False
+modifier.use_size = False
+modifier.use_path = False
+modifier.show_alive = True
+modifier.show_dead = False
+modifier.show_unborn = False
+modifier.space = 'WORLD'
+modifier.rotation = 0.0
+modifier.random_position = 0.0
+modifier.random_rotation = 0.0
+modifier.index_layer_name = 'NoPhysicsIndex'
+modifier.value_layer_name = 'NoPhysicsValue'
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = instance.evaluated_get(depsgraph)
+mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+color_layers = [layer for layer in mesh.color_attributes if layer.domain == 'CORNER']
+mesh_snapshot = {
+    'positions':[list(vertex.co) for vertex in mesh.vertices],
+    'faces':[list(polygon.vertices) for polygon in mesh.polygons],
+    'materials':[int(polygon.material_index) for polygon in mesh.polygons],
+    'uv_layers':{layer.name:[list(item.uv) for item in layer.data] for layer in mesh.uv_layers},
+    'custom_normal_codes':None,
+    'color_layer_names':[layer.name for layer in color_layers],
+    'color_attributes':{
+        layer.name:{'domain':layer.domain, 'data_type':layer.data_type,
+                    'values':[list(item.color) for item in layer.data]}
+        for layer in color_layers
+    },
+    'vertex_groups':{},
+}
+evaluated.to_mesh_clear()
+with open(output, 'w', encoding='utf-8') as handle:
+    json.dump({'state':state, 'mesh':mesh_snapshot}, handle, allow_nan=False)
+",
+    )?;
+    let mut blender_command = Command::new(&blender);
+    blender_command
+        .args(["--background", "--factory-startup", "--python"])
+        .arg(&fixture_script)
+        .arg("--")
+        .arg(&expected_path);
+    run(&mut blender_command, "Blender no-physics particle fixture")?;
+    let blender: Value = serde_json::from_slice(&fs::read(expected_path)?)?;
+    let native_state = &blender["state"];
+    assert_ne!(
+        native_state["rotation"],
+        json!([0.0, 0.0, 0.0, 1.0]),
+        "the native no-physics birth rotation must remain non-identity after birth",
+    );
+    let native_velocity: [f64; 3] = serde_json::from_value(native_state["velocity"].clone())?;
+    assert!(
+        DVec3::from_array(native_velocity).length_squared() > 0.0,
+        "the native fixture must have nonzero birth velocity",
+    );
+    assert_eq!(native_state["position"], native_state["birth_position"]);
+    assert_eq!(native_state["rotation"], native_state["birth_rotation"]);
+
+    let scene = root.join("no-physics-scene");
+    let batch = root.join("no-physics-operations.json");
+    initialize(&scene)?;
+    apply(
+        &scene,
+        &batch,
+        &json!([
+            {"op":"scene.update","target":{"id":"scene_main"},"set":{"use_gravity":false}},
+            {"op":"node.create","id":"no_physics_emitter","kind":"plane","params":{}},
+            {"op":"physics.particle_emitter.create","target":{"id":"no_physics_emitter"},"settings":{"emit_from":"VERT","count":1,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NO","normal_factor":1.0,"factor_random":0.0,"seed":19,"child_type":"NONE","render_type":"NONE"}},
+            {"op":"node.create","id":"no_physics_instance","kind":"plane","params":{},"track_axis":"POS_Z"},
+            {"op":"modifier.create","target":{"id":"no_physics_instance"},"id":"no_physics_copy","type":"particle_instance","params":{"object":"no_physics_emitter","particle_system_index":1,"use_normal":true,"use_children":false,"use_size":false,"show_alive":true,"show_dead":false,"show_unborn":false,"use_path":false,"axis":"X","space":"WORLD","rotation":0.0,"random_position":0.0,"random_rotation":0.0,"index_layer_name":"NoPhysicsIndex","value_layer_name":"NoPhysicsValue"}}
+        ]),
+        0,
+    )?;
+    let document: potter_core::model::SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let snapshot = potter_core::eval::Snapshot::evaluate(
+        &document,
+        &potter_core::eval::EvaluationContext {
+            frame: Some(2.0),
+            ..potter_core::eval::EvaluationContext::default()
+        },
+    )?;
+    let emitter_id = potter_core::model::Id::new("no_physics_emitter".to_owned())?;
+    let states = snapshot
+        .simulated_particles
+        .get(&emitter_id)
+        .ok_or("no-physics particle states are missing")?;
+    let state = states.first().ok_or("no-physics parent state is missing")?;
+    assert_eq!(states.len(), 1);
+    assert_eq!(state.position, state.birth_position);
+    assert_ne!(state.rotation, DQuat::IDENTITY.to_array());
+    assert_eq!(state.rotation, state.birth_rotation);
+    assert!(
+        DVec3::from_array(state.velocity).length_squared() > 0.0,
+        "the Potter fixture must keep nonzero birth velocity",
+    );
+    assert_numeric_rows(
+        &json!([state.rotation]),
+        &json!([native_state["rotation"]]),
+        "no-physics post-birth particle rotation",
+    );
+    assert_numeric_rows(
+        &json!([state.position]),
+        &json!([native_state["position"]]),
+        "no-physics post-birth particle position",
+    );
+    assert_numeric_rows(
+        &json!([state.velocity]),
+        &json!([native_state["velocity"]]),
+        "no-physics post-birth particle velocity",
+    );
+    let instance_id = potter_core::model::Id::new("no_physics_instance".to_owned())?;
+    let instance_mesh = snapshot
+        .meshes
+        .get(&instance_id)
+        .ok_or("no-physics particle instance mesh is missing")?;
+    assert_ordered_mesh_matches_blender(
+        instance_mesh,
+        &blender["mesh"],
+        "NO particle instance after birth",
+    );
+    Ok(())
+}
+
+#[test]
+fn explode_modifier_cache_reload_preserves_local_birth_geometry() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let scene = root.join("explode-cache-scene");
+    let batch = root.join("explode-cache-operations.json");
+    let cache_directory = root.join("simulation-cache");
+    initialize(&scene)?;
+    apply(
+        &scene,
+        &batch,
+        &json!([
+            {"op":"scene.update","target":{"id":"scene_main"},"set":{"use_gravity":false}},
+            {"op":"node.create","id":"cache_exploder","kind":"box","params":{"size":0.00002},"transform":{"translation":[1_000_000_000_000.0,-1_000_000_000_000.0,1_000_000_000_000.0]}},
+            {"op":"physics.particle_emitter.create","target":{"id":"cache_exploder"},"settings":{"emit_from":"VERT","count":2,"frame_start":1.0,"frame_end":1.0,"lifetime":12.0,"physics_type":"NEWTON","normal_factor":1.1,"factor_random":0.0,"seed":29,"child_type":"NONE","render_type":"NONE"}},
+            {"op":"modifier.create","target":{"id":"cache_exploder"},"id":"cache_explode","type":"explode","params":{"use_edge_cut":true,"show_alive":true,"show_dead":false,"show_unborn":false,"use_size":true,"protect":0.0}}
+        ]),
+        0,
+    )?;
+    let mut document: potter_core::model::SceneDoc =
+        serde_json::from_slice(&fs::read(scene.join("scene.json"))?)?;
+    let emitter_id = potter_core::model::Id::new("cache_exploder".to_owned())?;
+    let mesh_data_id = document
+        .nodes
+        .get(&emitter_id)
+        .and_then(|node| node.data.as_ref())
+        .cloned()
+        .ok_or("cache Explode mesh Data-Block is missing")?;
+    document
+        .data_blocks
+        .get_mut(&mesh_data_id)
+        .ok_or("cache Explode mesh Data-Block is missing")?
+        .mesh = Some(potter_core::geom::Mesh::from_positions_and_faces(
+        vec![
+            DVec3::new(-1.0e-5, -1.0e-5, -1.0e-5),
+            DVec3::new(1.0e-5, -1.0e-5, -1.0e-5),
+            DVec3::new(1.0e-5, 1.0e-5, -1.0e-5),
+            DVec3::new(-1.0e-5, 1.0e-5, -1.0e-5),
+            DVec3::new(-1.0e-5, -1.0e-5, 1.0e-5),
+            DVec3::new(1.0e-5, -1.0e-5, 1.0e-5),
+            DVec3::new(1.0e-5, 1.0e-5, 1.0e-5),
+            DVec3::new(-1.0e-5, 1.0e-5, 1.0e-5),
+        ],
+        vec![
+            vec![0, 3, 2, 1],
+            vec![4, 5, 6, 7],
+            vec![0, 1, 5, 4],
+            vec![1, 2, 6, 5],
+            vec![2, 3, 7, 6],
+            vec![3, 0, 4, 7],
+        ],
+    )?);
+    let context = potter_core::eval::EvaluationContext {
+        frame: Some(2.0),
+        ..potter_core::eval::EvaluationContext::default()
+    };
+    let cold = potter_core::eval::Snapshot::evaluate_with_cache(
+        &document,
+        &context,
+        Some(&scene),
+        Some(&cache_directory),
+    )?;
+    let cold_mesh = cold
+        .meshes
+        .get(&emitter_id)
+        .ok_or("cold Explode mesh is missing")?
+        .clone();
+    assert!(
+        cold_mesh.faces.len() > 6,
+        "the cold fixture must exercise Explode edge-cut topology",
+    );
+    let cold_particles = cold
+        .simulated_particles
+        .get(&emitter_id)
+        .ok_or("cold Explode particle states are missing")?;
+    let parents = cold_particles
+        .iter()
+        .filter(|particle| !particle.is_child)
+        .collect::<Vec<_>>();
+    assert_eq!(parents.len(), 2);
+    let collapsed_birth = parents[0].birth_position;
+    assert_eq!(
+        collapsed_birth,
+        [1.0e12, -1.0e12, 1.0e12],
+        "the large object translation collapses the tiny emitter-local births in world space",
+    );
+    assert!(
+        parents
+            .iter()
+            .all(|particle| particle.birth_position.map(f64::to_bits)
+                == collapsed_birth.map(f64::to_bits)),
+        "all cached world-space birth positions must collapse",
+    );
+    let local_births = parents
+        .iter()
+        .map(|particle| {
+            particle
+                .birth_position_local
+                .expect("emitter vertices have exact local birth points")
+                .map(f64::to_bits)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        local_births.len() > 1,
+        "the emitter-local source points must remain distinct",
+    );
+    let cached_files = fs::read_dir(&cache_directory)?.collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        !cached_files.is_empty(),
+        "the cold evaluation must write disk cache entries"
+    );
+
+    let hot = potter_core::eval::Snapshot::evaluate_with_cache(
+        &document,
+        &context,
+        Some(&scene),
+        Some(&cache_directory),
+    )?;
+    let hot_mesh = hot
+        .meshes
+        .get(&emitter_id)
+        .ok_or("hot Explode mesh is missing")?;
+    assert_eq!(
+        particle_mesh_snapshot(hot_mesh),
+        particle_mesh_snapshot(&cold_mesh),
+        "cold and hot Explode consumers preserve complete geometry and attributes",
     );
     Ok(())
 }
