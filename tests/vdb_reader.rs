@@ -372,7 +372,6 @@ fn assert_volume_pixels(path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 // VDB interpolation and sampling give this density field soft support rather than a binary-disc pixel area.
-
 fn assert_volume_shape(
     volume_path: &Path,
     empty_path: &Path,
@@ -402,8 +401,9 @@ fn assert_volume_shape(
             });
             if changed {
                 if let Some((support_x, support_y)) = support {
-                    let pixel_x = f64::from(u32::try_from(x)?) + 0.5;
-                    let pixel_y = f64::from(u32::try_from(y)?) + 0.5;
+                    // Keep support checks in pixel-index coordinates, matching the centroid below.
+                    let pixel_x = f64::from(u32::try_from(x)?);
+                    let pixel_y = f64::from(u32::try_from(y)?);
                     assert!(
                         (pixel_x - center_x).abs() <= support_x
                             && (pixel_y - center_y).abs() <= support_y,
@@ -472,7 +472,7 @@ fn assert_volume_shape(
 
 /// Project active VDB bounds through the fixture's orthographic camera. Linear sampling can
 /// contribute one index voxel beyond the active bounds; then the caller supplies only the
-/// remaining sample-space support (the realtime film radius or the path pixel's half-width).
+/// remaining sample-space support (the realtime film radius or path pixel-filter support).
 fn projected_vdb_support(
     active_min: DVec3,
     active_max: DVec3,
@@ -841,6 +841,17 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
     let filter_size = render_settings["filter_size"]
         .as_f64()
         .ok_or("imported film filter size is missing")?;
+    let path_filter_width = render_settings["filter_width"].as_f64().unwrap_or(1.5);
+    let path_filter_type = render_settings
+        .get("pixel_filter_type")
+        .and_then(Value::as_str)
+        .unwrap_or("BLACKMAN_HARRIS");
+    let path_filter_support = match path_filter_type {
+        "BOX" => 0.5,
+        "GAUSSIAN" => 1.5 * path_filter_width,
+        "BLACKMAN_HARRIS" => path_filter_width,
+        _ => return Err("imported path pixel filter type is unknown".into()),
+    };
     let expected_min = DVec3::from_array(serde_json::from_value(expected_bounds(
         directory.path(),
         "sphere_min",
@@ -871,7 +882,7 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
         volume_offset,
         camera_center,
         pixels_per_world_unit,
-        0.5,
+        path_filter_support,
     );
     let realtime_filter_radius = if render_samples > 1 {
         filter_size.clamp(0.0, 100.0).max(1.0e-4)

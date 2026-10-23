@@ -3716,7 +3716,6 @@ mod visibility_tests {
         hit_opacity, intersect_triangle, nearest_visible_hit, prepare_triangles,
         ray_for_pixel_in_frame,
     };
-    use crate::error::Result;
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
     use crate::render::bvh::Bvh;
