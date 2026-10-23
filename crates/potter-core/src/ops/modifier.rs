@@ -1483,6 +1483,7 @@ fn evaluate_modifier_output(
         } else {
             let frame = engine.evaluation_frame;
             let driver_values = crate::eval::rig::evaluate_drivers(engine.doc, frame)?;
+            let mut transform_cache_session = crate::eval::EvaluationSession::default();
             let operand_snapshot = crate::eval::Snapshot::evaluate_modifier_operands_with_cache(
                 engine.doc,
                 &crate::eval::EvaluationContext {
@@ -1491,6 +1492,7 @@ fn evaluate_modifier_output(
                 },
                 engine.asset_root,
                 engine.cache_directory,
+                &mut transform_cache_session,
                 target,
                 modifier_id,
                 &driver_values,
@@ -1602,6 +1604,7 @@ fn evaluate_modifier_output(
                                 .map_or(1.0, |scene| scene.fps_base),
                             evaluated_operand_meshes,
                             multi_input,
+                            &mut transform_cache_session,
                         ),
                         "lattice" => crate::eval::apply_lattice_modifier(
                             mesh,
@@ -2074,16 +2077,33 @@ fn validate_modifier_resource(
         engine.operation_index,
         &format!("{}/resource", base_pointer.trim_start_matches('/')),
     );
-    let resource_text = params
-        .get("resource")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            engine.error(
-                ErrorCode::InvalidArgument,
-                "resource must be a Potter resource ID",
-                &resource_pointer,
-            )
-        })?;
+    // Blender's is_disabled: a disabled cache is a no-op, so its resource is not checked. A Mesh
+    // Cache is disabled by a zero factor, and both cache types by a missing filepath or object path.
+    let is_disabled = match modifier_type {
+        "mesh_cache" => params
+            .get("factor")
+            .and_then(Value::as_f64)
+            .is_some_and(|factor| factor <= 0.0),
+        "mesh_sequence_cache" => params
+            .get("object_path")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty),
+        _ => false,
+    };
+    let resource_text = params.get("resource").and_then(Value::as_str);
+    if is_disabled
+        || (matches!(modifier_type, "mesh_cache" | "mesh_sequence_cache")
+            && resource_text.is_none_or(str::is_empty))
+    {
+        return Ok(());
+    }
+    let resource_text = resource_text.ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidArgument,
+            "resource must be a Potter resource ID",
+            &resource_pointer,
+        )
+    })?;
     let resource_id = Id::new(resource_text.to_owned()).map_err(|_| {
         engine.error(
             ErrorCode::InvalidArgument,

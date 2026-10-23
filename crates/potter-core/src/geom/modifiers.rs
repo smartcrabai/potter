@@ -142,11 +142,13 @@ pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16
     result
 }
 
-/// Result of evaluating a modifier stack, including realized graph instance paths.
+/// Result of evaluating a modifier stack, including realized graph instance paths and bake captures.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModifierEvaluation {
     pub mesh: Mesh,
     pub instance_paths: Vec<Vec<Id>>,
+    pub bake_captures: BTreeMap<(Id, String), graph::NodeBakeFrame>,
+    pub bake_material_refs: BTreeMap<(Id, String), Vec<Id>>,
     pub warnings: Vec<PotError>,
 }
 
@@ -409,6 +411,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
     let mut context = context;
     let mut instance_paths = Vec::new();
     let mut adaptive_normals = None;
+    let mut bake_captures = BTreeMap::new();
+    let mut bake_material_refs = BTreeMap::new();
     let mut warnings = Vec::new();
     // Blender's `vert_coords_prev`: positions before a deform that a following multi-input armature reads.
     let mut run_input: Option<Rc<Vec<DVec3>>> = None;
@@ -613,10 +617,29 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                     ));
                 }
             };
-            let graph_result =
-                graph::evaluate_at_frame(group, Some(&evaluated), &overrides, frame, subject_name)?;
+            let graph_result = graph::evaluate_at_frame_with_bakes(
+                group,
+                Some(&evaluated),
+                &overrides,
+                frame,
+                &modifier.runtime.node_bakes,
+                &modifier.runtime.capture_node_bakes,
+                subject_name,
+            )?;
             evaluated = graph_result.mesh;
             instance_paths.extend(graph_result.instance_paths);
+            bake_captures.extend(
+                graph_result
+                    .bake_captures
+                    .into_iter()
+                    .map(|(node_id, frame)| ((modifier.id.clone(), node_id), frame)),
+            );
+            bake_material_refs.extend(
+                graph_result
+                    .bake_material_refs
+                    .into_iter()
+                    .map(|(node_id, materials)| ((modifier.id.clone(), node_id), materials)),
+            );
             continue;
         }
         if modifier.modifier_type == "mesh_to_volume" {
@@ -781,6 +804,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
         ModifierEvaluation {
             mesh: evaluated,
             instance_paths,
+            bake_captures,
+            bake_material_refs,
             warnings,
         },
         adaptive_normals,
@@ -7771,8 +7796,8 @@ mod tests {
         {
             let row = codes[&format!("f{}", face.id)].as_array().unwrap();
             assert!(
-                row.iter().all(serde_json::Value::is_null),
-                "screw loose-edge corner codes must be Auto"
+                row.iter().all(|code| *code == serde_json::json!([0, 0])),
+                "screw loose-edge corner codes must be Auto ([0, 0])"
             );
         }
     }

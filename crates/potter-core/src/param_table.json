@@ -409,13 +409,10 @@
         },
         "resource": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
-          "description": "Potter resource ID for the cache filepath."
+          "pattern": "^([a-z][a-z0-9_-]{0,63})?$",
+          "description": "Potter resource ID for the cache filepath. An empty or absent resource disables the modifier, as Blender's MeshCache is_disabled does for an empty filepath."
         }
-      },
-      "required": [
-        "resource"
-      ]
+      }
     },
     "mesh_sequence_cache": {
       "properties": {
@@ -478,16 +475,12 @@
         },
         "resource": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "pattern": "^([a-z][a-z0-9_-]{0,63})?$",
           "description": "Potter resource ID for the cache filepath."
         },
         "frame_offset": {
           "type": "number",
           "default": 0.0
-        },
-        "scale": {
-          "type": "number",
-          "default": 1.0
         },
         "override_frame": {
           "type": [
@@ -495,10 +488,21 @@
             "null"
           ],
           "default": null
+        },
+        "is_sequence": {
+          "type": "boolean",
+          "default": false
+        },
+        "velocity_name": {
+          "type": "string",
+          "default": ".velocities"
+        },
+        "velocity_unit": {
+          "enum": ["SECOND", "FRAME"],
+          "default": "SECOND"
         }
       },
       "required": [
-        "resource",
         "object_path"
       ]
     },
@@ -2154,6 +2158,141 @@
             "DISK"
           ],
           "default": "PACKED"
+        },
+        "bakes": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "storage": {
+                "enum": [
+                  "packed",
+                  "disk"
+                ]
+              },
+              "resource_id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+              },
+              "frames": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "frame": {
+                      "type": "number"
+                    },
+                    "digest": {
+                      "type": "string",
+                      "pattern": "^sha256:[0-9a-f]{64}$"
+                    }
+                  },
+                  "required": [
+                    "frame",
+                    "digest"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "bake_mode": {
+                "enum": [
+                  "STILL",
+                  "ANIMATION"
+                ]
+              },
+              "bake_target": {
+                "enum": [
+                  "INHERIT",
+                  "PACKED",
+                  "DISK"
+                ]
+              },
+              "use_custom_simulation_frame_range": {
+                "type": "boolean"
+              },
+              "frame_start": {
+                "type": "integer"
+              },
+              "frame_end": {
+                "type": "integer"
+              },
+              "use_custom_path": {
+                "type": "boolean"
+              },
+              "directory": {
+                "type": "string"
+              },
+              "cache_directory": {
+                "type": "string"
+              }
+            },
+            "oneOf": [
+              {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "storage"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "resource_id"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "frames"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "cache_directory"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "storage": {
+                    "const": "packed"
+                  }
+                },
+                "required": [
+                  "storage",
+                  "resource_id"
+                ],
+                "not": {
+                  "required": [
+                    "frames"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "storage": {
+                    "const": "disk"
+                  }
+                },
+                "required": [
+                  "storage",
+                  "frames"
+                ],
+                "not": {
+                  "required": [
+                    "resource_id"
+                  ]
+                }
+              }
+            ],
+            "additionalProperties": false
+          },
+          "default": {}
         },
         "show_group_selector": {
           "type": "boolean",

@@ -18,8 +18,8 @@ use crate::{
 };
 
 use super::{
-    GraphKind, GraphNode, NodeGroup,
-    sockets::{is_known_node_type, node_sockets},
+    GraphKind, GraphNode, NodeBakeFrame, NodeBakeRecord, NodeBakeValue, NodeGroup, same_bake_frame,
+    sockets::{bake_item_identifier, is_known_node_type, node_sockets},
 };
 
 const MAX_GENERATED_POINTS: usize = 1_000_000;
@@ -32,11 +32,12 @@ type SimulationCache = Mutex<BTreeMap<(String, Id, i64), GeometryValue>>;
 
 static SIMULATION_CACHE: LazyLock<SimulationCache> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-/// Evaluated geometry plus stable paths for realized geometry-node instances.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphEvaluation {
     pub mesh: Mesh,
     pub instance_paths: Vec<Vec<Id>>,
+    pub bake_captures: BTreeMap<String, NodeBakeFrame>,
+    pub bake_material_refs: BTreeMap<String, Vec<Id>>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +109,10 @@ struct Evaluator<'a> {
     repeat_iterations: HashMap<Id, i64>,
     active: BTreeSet<Id>,
     cache: BTreeMap<(Id, String), EvalValue>,
+    bake_records: &'a BTreeMap<String, NodeBakeRecord>,
+    capture_bake_nodes: &'a BTreeSet<String>,
+    bake_captures: BTreeMap<String, NodeBakeFrame>,
+    bake_material_refs: BTreeMap<String, Vec<Id>>,
 }
 
 /// Evaluate a geometry node group against an optional incoming mesh.
@@ -143,6 +148,28 @@ pub fn evaluate_at_frame(
     input: Option<&Mesh>,
     overrides: &Map<String, Value>,
     frame: f64,
+    subject_name: &str,
+) -> Result<GraphEvaluation> {
+    evaluate_at_frame_with_bakes(
+        group,
+        input,
+        overrides,
+        frame,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+        subject_name,
+    )
+}
+
+/// Evaluate a geometry node group with modifier-owned Bake-node data and optional capture targets.
+/// `subject_name` is forwarded to modifier nodes, which use it to seed texture noise.
+pub fn evaluate_at_frame_with_bakes(
+    group: &NodeGroup,
+    input: Option<&Mesh>,
+    overrides: &Map<String, Value>,
+    frame: f64,
+    bake_records: &BTreeMap<String, NodeBakeRecord>,
+    capture_bake_nodes: &BTreeSet<String>,
     subject_name: &str,
 ) -> Result<GraphEvaluation> {
     if !frame.is_finite() {
@@ -248,6 +275,10 @@ pub fn evaluate_at_frame(
         repeat_iterations: HashMap::new(),
         active: BTreeSet::new(),
         cache: BTreeMap::new(),
+        bake_records,
+        capture_bake_nodes,
+        bake_material_refs: BTreeMap::new(),
+        bake_captures: BTreeMap::new(),
     };
     let value = evaluator.input_value(
         &output_node,
@@ -257,16 +288,39 @@ pub fn evaluate_at_frame(
             instance_paths: Vec::new(),
         }),
     )?;
-    match value {
-        EvalValue::Geometry(value) => Ok(GraphEvaluation {
-            mesh: value.mesh,
-            instance_paths: value.instance_paths,
-        }),
-        _ => Err(PotError::new(
+    let EvalValue::Geometry(geometry) = value else {
+        return Err(PotError::new(
             ErrorCode::EvaluationFailed,
             "geometry group output is not geometry",
-        )),
+        ));
+    };
+    for node_id in capture_bake_nodes {
+        let parsed_id = Id::new(node_id.clone()).map_err(|_| {
+            PotError::invalid_argument(format!("bake node ID `{node_id}` is invalid"))
+        })?;
+        let node = group.nodes.get(&parsed_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                format!("Bake node `{node_id}` was not found"),
+            )
+        })?;
+        if node.node_type != "GeometryNodeBake" {
+            return Err(PotError::invalid_argument(format!(
+                "node `{node_id}` is not a Bake node"
+            )));
+        }
+        let (_, outputs) = node_sockets(group, &parsed_id)
+            .ok_or_else(|| evaluation("Bake node has invalid bake items"))?;
+        if let Some((socket, _)) = outputs.first() {
+            let _ = evaluator.output_value(&parsed_id, socket)?;
+        }
     }
+    Ok(GraphEvaluation {
+        mesh: geometry.mesh,
+        instance_paths: geometry.instance_paths,
+        bake_captures: evaluator.bake_captures,
+        bake_material_refs: evaluator.bake_material_refs,
+    })
 }
 
 fn validate_graph(group: &NodeGroup) -> Result<()> {
@@ -404,6 +458,7 @@ impl Evaluator<'_> {
             "ShaderNodeCombineXYZ" => self.combine_xyz(id, node),
             "ShaderNodeSeparateXYZ" => self.separate_xyz(id, node, socket),
             "FunctionNodeRandomValue" => self.random_node(id, node, socket),
+            "GeometryNodeBake" => self.bake_node(id, node, socket),
             "GeometryNodeRepeatInput" => self.repeat_input_value(id, node, socket),
             "GeometryNodeRepeatOutput" => self.repeat_output_value(id, node, socket),
             "GeometryNodeSimulationInput" => self.simulation_input_value(id, node, socket),
@@ -416,6 +471,138 @@ impl Evaluator<'_> {
                 ),
             )),
         }
+    }
+
+    fn bake_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        let node_id = id.as_str();
+        if let Some(record) = self.bake_records.get(node_id) {
+            let baked = read_bake_value(record, self.frame, socket)?;
+            if let Some(baked) = baked {
+                if let NodeBakeValue::Geometry { material_refs, .. } = &baked {
+                    self.bake_material_refs
+                        .insert(node_id.to_owned(), material_refs.clone());
+                }
+                return Ok(baked.into_eval_value());
+            }
+        }
+        let items = node
+            .properties
+            .get("bake_items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| evaluation("Bake node has no bake items"))?;
+        let socket_type = node_sockets(self.group, id)
+            .and_then(|(inputs, _)| {
+                inputs
+                    .into_iter()
+                    .find(|(identifier, _)| identifier == socket)
+                    .map(|(_, socket_type)| socket_type)
+            })
+            .ok_or_else(|| evaluation("Bake node output socket is unknown"))?;
+        let fallback = if socket_type == "geometry" {
+            EvalValue::Geometry(GeometryValue {
+                mesh: self.input.cloned().unwrap_or_default(),
+                instance_paths: Vec::new(),
+            })
+        } else {
+            EvalValue::Scalar(Value::Null)
+        };
+        let value = self.input_value_with_node(id, node, socket, fallback)?;
+        if self.capture_bake_nodes.contains(node_id) {
+            let mut inputs = Vec::with_capacity(items.len());
+            for item in items {
+                let identifier = bake_item_identifier(item)
+                    .ok_or_else(|| evaluation("Bake item has no socket identifier"))?;
+                let item_type = node_sockets(self.group, id)
+                    .and_then(|(input_sockets, _)| {
+                        input_sockets
+                            .into_iter()
+                            .find(|(candidate, _)| candidate == &identifier)
+                            .map(|(_, socket_type)| socket_type)
+                    })
+                    .ok_or_else(|| evaluation("Bake item has an unsupported socket type"))?;
+                let input_fallback = if item_type == "geometry" {
+                    EvalValue::Geometry(GeometryValue {
+                        mesh: self.input.cloned().unwrap_or_default(),
+                        instance_paths: Vec::new(),
+                    })
+                } else {
+                    EvalValue::Scalar(Value::Null)
+                };
+                let input_value =
+                    self.input_value_with_node(id, node, &identifier, input_fallback)?;
+                inputs.push((item, identifier, item_type, input_value));
+            }
+            let geometry_index = inputs
+                .iter()
+                .position(|(_, _, _, value)| matches!(value, EvalValue::Geometry(_)));
+            let geometry = geometry_index.and_then(|index| match &inputs[index].3 {
+                EvalValue::Geometry(geometry) => Some(geometry),
+                _ => None,
+            });
+            let geometry_identifier = geometry_index.map(|index| inputs[index].1.clone());
+            let mut captured_attributes = Vec::new();
+            let mut values = BTreeMap::new();
+            for (item, identifier, socket_type, input) in &inputs {
+                let baked = match input {
+                    EvalValue::Geometry(geometry) => NodeBakeValue::Geometry {
+                        mesh: geometry.mesh.clone(),
+                        instance_paths: geometry.instance_paths.clone(),
+                        material_refs: Vec::new(),
+                    },
+                    EvalValue::Scalar(value) => NodeBakeValue::Scalar {
+                        value: value.clone(),
+                    },
+                    EvalValue::Field(field) => {
+                        let geometry = geometry.ok_or_else(|| {
+                            evaluation("Bake node field items require a geometry bake item")
+                        })?;
+                        let domain = item
+                            .get("attribute_domain")
+                            .and_then(Value::as_str)
+                            .unwrap_or("POINT")
+                            .to_owned();
+                        let count = domain_element_count(&geometry.mesh, &domain)?;
+                        let mut field_values = Vec::with_capacity(count);
+                        for index in 0..count {
+                            field_values.push(field_json(field, &geometry.mesh, index, &domain)?);
+                        }
+                        let attribute_name = format!(".bake_{node_id}_{identifier}");
+                        captured_attributes.push((attribute_name.clone(), domain, field_values));
+                        NodeBakeValue::Field { attribute_name }
+                    }
+                };
+                if socket_type == "geometry" && !matches!(baked, NodeBakeValue::Geometry { .. }) {
+                    return Err(evaluation(
+                        "Bake geometry item did not evaluate to geometry",
+                    ));
+                }
+                values.insert(identifier.clone(), baked);
+            }
+            if !captured_attributes.is_empty() {
+                let geometry_identifier = geometry_identifier.ok_or_else(|| {
+                    evaluation("Bake node field items require a geometry bake item")
+                })?;
+                let Some(NodeBakeValue::Geometry { mesh, .. }) =
+                    values.get_mut(&geometry_identifier)
+                else {
+                    return Err(evaluation(
+                        "Bake node geometry item did not evaluate to geometry",
+                    ));
+                };
+                for (name, domain, data) in captured_attributes {
+                    mesh.attributes
+                        .insert(name, json!({"domain":domain,"data":data}));
+                }
+            }
+            self.bake_captures.insert(
+                node_id.to_owned(),
+                NodeBakeFrame {
+                    frame: self.frame,
+                    values,
+                },
+            );
+        }
+        Ok(value)
     }
 
     fn repeat_input_value(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
@@ -3169,6 +3356,202 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
     Ok(result)
 }
 
+impl NodeBakeValue {
+    fn into_eval_value(self) -> EvalValue {
+        match self {
+            Self::Geometry {
+                mesh,
+                instance_paths,
+                ..
+            } => EvalValue::Geometry(GeometryValue {
+                mesh,
+                instance_paths,
+            }),
+            Self::Scalar { value } => EvalValue::Scalar(value),
+            Self::Field { attribute_name } => EvalValue::Field(Field::Attribute(attribute_name)),
+        }
+    }
+}
+
+fn read_bake_value(
+    record: &NodeBakeRecord,
+    frame: f64,
+    socket: &str,
+) -> Result<Option<NodeBakeValue>> {
+    let next = record.frames.partition_point(|baked| baked.frame < frame);
+    if next < record.frames.len() && same_bake_frame(record.frames[next].frame, frame) {
+        return record.frames[next]
+            .values
+            .get(socket)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| evaluation("Bake record is missing a socket value"));
+    }
+    if next == 0 {
+        return record.frames[0]
+            .values
+            .get(socket)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| evaluation("Bake record is missing a socket value"));
+    }
+    if next == record.frames.len() {
+        return record.frames[next - 1]
+            .values
+            .get(socket)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| evaluation("Bake record is missing a socket value"));
+    }
+    let previous = &record.frames[next - 1];
+    let following = &record.frames[next];
+    let first = previous
+        .values
+        .get(socket)
+        .ok_or_else(|| evaluation("Bake record is missing a socket value"))?;
+    let second = following
+        .values
+        .get(socket)
+        .ok_or_else(|| evaluation("Bake record is missing a socket value"))?;
+    let factor = (frame - previous.frame) / (following.frame - previous.frame);
+    Ok(Some(mix_bake_values(first, second, factor)))
+}
+
+fn mix_bake_values(first: &NodeBakeValue, second: &NodeBakeValue, factor: f64) -> NodeBakeValue {
+    match (first, second) {
+        (
+            NodeBakeValue::Geometry {
+                mesh: first_mesh,
+                instance_paths,
+                material_refs,
+            },
+            NodeBakeValue::Geometry {
+                mesh: second_mesh, ..
+            },
+        ) if same_mesh_topology(first_mesh, second_mesh) => {
+            let mut mesh = first_mesh.clone();
+            for (vertex, next) in mesh.vertices.iter_mut().zip(&second_mesh.vertices) {
+                vertex.co = vertex.co.lerp(next.co, factor);
+            }
+            mix_mesh_attributes(&mut mesh, second_mesh, factor);
+            NodeBakeValue::Geometry {
+                mesh,
+                instance_paths: instance_paths.clone(),
+                material_refs: material_refs.clone(),
+            }
+        }
+        (NodeBakeValue::Scalar { value: first }, NodeBakeValue::Scalar { value: second }) => {
+            NodeBakeValue::Scalar {
+                value: mix_json_value(first, second, factor),
+            }
+        }
+        (
+            NodeBakeValue::Field {
+                attribute_name: first,
+            },
+            NodeBakeValue::Field {
+                attribute_name: second,
+            },
+        ) if first == second => NodeBakeValue::Field {
+            attribute_name: first.clone(),
+        },
+        _ => first.clone(),
+    }
+}
+
+fn same_mesh_topology(first: &Mesh, second: &Mesh) -> bool {
+    first
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .eq(second.vertices.iter().map(|vertex| vertex.id))
+        && first.edges == second.edges
+        && first.faces.len() == second.faces.len()
+        && first
+            .faces
+            .iter()
+            .zip(&second.faces)
+            .all(|(first, second)| first.id == second.id && first.vertices == second.vertices)
+}
+
+fn mix_mesh_attributes(first: &mut Mesh, second: &Mesh, factor: f64) {
+    for (name, first_attribute) in &mut first.attributes {
+        // Blender never blends the persistent `id` attribute (mix_geometries.cc, `names.remove("id")`).
+        if name == "id" {
+            continue;
+        }
+        let Some(second_attribute) = second.attributes.get(name) else {
+            continue;
+        };
+        if first_attribute.get("domain") != second_attribute.get("domain")
+            || first_attribute.get("type") != second_attribute.get("type")
+        {
+            continue;
+        }
+        if let (Some(first_data), Some(second_data)) = (
+            first_attribute
+                .get_mut("data")
+                .and_then(Value::as_array_mut),
+            second_attribute.get("data").and_then(Value::as_array),
+        ) {
+            if first_data.len() == second_data.len() {
+                for (first, second) in first_data.iter_mut().zip(second_data) {
+                    *first = mix_json_value(first, second, factor);
+                }
+            }
+            continue;
+        }
+        if !matches!(
+            first_attribute.get("domain").and_then(Value::as_str),
+            Some("point" | "vertices" | "POINT" | "POINTS")
+        ) {
+            continue;
+        }
+        let (Some(first_values), Some(second_values)) = (
+            first_attribute
+                .get_mut("values")
+                .and_then(Value::as_object_mut),
+            second_attribute.get("values").and_then(Value::as_object),
+        ) else {
+            continue;
+        };
+        for (key, value) in first_values {
+            if let Some(next) = second_values.get(key) {
+                *value = mix_json_value(value, next, factor);
+            }
+        }
+    }
+}
+
+fn mix_json_value(first: &Value, second: &Value, factor: f64) -> Value {
+    match (first, second) {
+        (Value::Bool(first), Value::Bool(second)) => {
+            // Blender's bool `mix2`: true once the blend reaches one half (BKE_attribute_math.hh).
+            let blend = (1.0 - factor) * f64::from(u8::from(*first))
+                + factor * f64::from(u8::from(*second));
+            json!(blend >= 0.5)
+        }
+        (Value::Number(first), Value::Number(second)) => {
+            if let (Some(first), Some(second)) = (first.as_i64(), second.as_i64()) {
+                // Blender's int `mix2` rounds the blend, so integers never become fractions.
+                let blend = (1.0 - factor) * first as f64 + factor * second as f64;
+                return json!(blend.round() as i64);
+            }
+            let first = first.as_f64().unwrap_or(0.0);
+            let second = second.as_f64().unwrap_or(0.0);
+            json!(first + (second - first) * factor)
+        }
+        (Value::Array(first), Value::Array(second)) if first.len() == second.len() => Value::Array(
+            first
+                .iter()
+                .zip(second)
+                .map(|(first, second)| mix_json_value(first, second, factor))
+                .collect(),
+        ),
+        _ => first.clone(),
+    }
+}
+
 fn mesh_evaluation_error(error: &MeshError) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, error.to_string())
 }
@@ -3305,4 +3688,167 @@ fn kani_seeded_sample_stays_in_unit_interval() {
         value >= 0.0 && value < 1.0,
         "seeded sample must be in [0, 1)",
     );
+}
+#[cfg(test)]
+mod node_bake_tests {
+    use super::{NodeBakeFrame, NodeBakeRecord, NodeBakeValue, mix_bake_values, read_bake_value};
+    use crate::{
+        error::{ErrorCode, PotError, Result},
+        geom::{Edge, Face, IdCounters, Mesh, Vertex},
+    };
+    use glam::DVec3;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn invalid(message: &str) -> PotError {
+        PotError::new(ErrorCode::InternalError, message)
+    }
+
+    /// A single-triangle mesh with the boundary edges a valid mesh must carry (`face boundary edge is
+    /// missing` otherwise) and `next_id` counters allocated past every element ID.
+    fn triangle(z: f64, vertex_count: u32, winding: [u32; 3]) -> Mesh {
+        let edges = [
+            [winding[0], winding[1]],
+            [winding[1], winding[2]],
+            [winding[2], winding[0]],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, vertices)| Edge {
+            id: u32::try_from(index).unwrap_or(u32::MAX),
+            vertices,
+        })
+        .collect::<Vec<_>>();
+        Mesh {
+            vertices: (0..vertex_count)
+                .map(|id| Vertex {
+                    id,
+                    co: DVec3::new(f64::from(id), 0.0, z),
+                })
+                .collect(),
+            edges,
+            faces: vec![Face {
+                id: 0,
+                vertices: winding.to_vec(),
+                material_index: 0,
+            }],
+            next_id: IdCounters {
+                vertex: vertex_count,
+                edge: 3,
+                face: 1,
+            },
+            ..Mesh::default()
+        }
+    }
+
+    fn geometry(mesh: Mesh) -> NodeBakeValue {
+        NodeBakeValue::Geometry {
+            mesh,
+            instance_paths: Vec::new(),
+            material_refs: Vec::new(),
+        }
+    }
+
+    fn record(frames: Vec<NodeBakeFrame>) -> NodeBakeRecord {
+        NodeBakeRecord {
+            storage: "inline".to_owned(),
+            kind: "node_bake".to_owned(),
+            version: 1,
+            frames,
+        }
+    }
+
+    #[test]
+    fn geometry_cache_interpolates_only_matching_topology() -> Result<()> {
+        let first = geometry(triangle(0.0, 3, [0, 1, 2]));
+        let same_topology = geometry(triangle(2.0, 3, [0, 1, 2]));
+        let NodeBakeValue::Geometry { mesh, .. } = mix_bake_values(&first, &same_topology, 0.5)
+        else {
+            return Err(invalid("geometry cache produced a non-geometry value"));
+        };
+        assert!((mesh.vertices[0].co.z - 1.0).abs() < 1.0e-12);
+
+        let different_count = geometry(triangle(8.0, 4, [0, 1, 2]));
+        assert_eq!(mix_bake_values(&first, &different_count, 0.5), first);
+
+        let different_faces = geometry(triangle(8.0, 3, [0, 2, 1]));
+        assert_eq!(mix_bake_values(&first, &different_faces, 0.5), first);
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_bakes_interpolate_and_clamp_frame_range() -> Result<()> {
+        let frames = [(1.0, 2.0), (3.0, 6.0)]
+            .into_iter()
+            .map(|(frame, value)| NodeBakeFrame {
+                frame,
+                values: BTreeMap::from([(
+                    "Item_0".to_owned(),
+                    NodeBakeValue::Scalar {
+                        value: json!(value),
+                    },
+                )]),
+            })
+            .collect();
+        let record = record(frames);
+        for (frame, expected) in [(0.0, 2.0), (2.0, 4.0), (4.0, 6.0)] {
+            let Some(NodeBakeValue::Scalar { value }) = read_bake_value(&record, frame, "Item_0")?
+            else {
+                return Err(invalid("scalar bake item is missing"));
+            };
+            let number = value
+                .as_f64()
+                .ok_or_else(|| invalid("scalar is not numeric"))?;
+            assert!((number - expected).abs() < 1.0e-12);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_bake_values_and_material_references_roundtrip() -> Result<()> {
+        let mut carrier = triangle(0.0, 3, [0, 1, 2]);
+        carrier.attributes.insert(
+            "attr".to_owned(),
+            json!({"domain": "POINT", "type": "float", "data": [1.0, 2.0, 3.0]}),
+        );
+        let mut values: BTreeMap<String, NodeBakeValue> = [
+            ("float", json!(0.75)),
+            ("integer", json!(7)),
+            ("boolean", json!(true)),
+            ("vector", json!([1.0, 2.0, 3.0])),
+            ("rotation", json!([0.0, 0.0, 0.0, 1.0])),
+            ("color", json!([0.1, 0.2, 0.3, 1.0])),
+            ("string", json!("hello")),
+            ("material", json!("surface")),
+        ]
+        .into_iter()
+        .map(|(socket, value)| (socket.to_owned(), NodeBakeValue::Scalar { value }))
+        .collect();
+        values.insert("carrier".to_owned(), geometry(carrier));
+        values.insert(
+            "field".to_owned(),
+            NodeBakeValue::Field {
+                attribute_name: "attr".to_owned(),
+            },
+        );
+        let record = record(vec![NodeBakeFrame { frame: 1.0, values }]);
+        let encoded = serde_json::to_value(&record).map_err(PotError::internal_json)?;
+        crate::graph::validate_node_bake_resource(&encoded)?;
+        for socket in [
+            "float", "integer", "boolean", "vector", "rotation", "color", "string", "material",
+        ] {
+            let value = read_bake_value(&record, 1.0, socket)?
+                .ok_or_else(|| invalid("bake item is present"))?;
+            assert!(matches!(value, NodeBakeValue::Scalar { .. }));
+        }
+        let field = read_bake_value(&record, 1.0, "field")?
+            .ok_or_else(|| invalid("field item is present"))?;
+        assert_eq!(
+            field,
+            NodeBakeValue::Field {
+                attribute_name: "attr".to_owned(),
+            }
+        );
+        Ok(())
+    }
 }

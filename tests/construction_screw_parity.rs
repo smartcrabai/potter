@@ -13,6 +13,10 @@ use potter_core::{
 };
 use serde_json::{Map, Value, json};
 
+#[path = "common/normal_codes.rs"]
+mod normal_codes;
+use normal_codes::is_auto_code;
+
 const SCREW_FIXTURES: &str = include_str!("fixtures/construction_p/screw/screw.json");
 const POSITION_TOLERANCE: f32 = 1.0e-5;
 
@@ -704,7 +708,7 @@ fn compare_case(case: &Value) {
         for face in mesh.faces.iter().skip(mesh.faces.len() - generated_faces) {
             let row = values[&format!("f{}", face.id)].as_array().unwrap();
             assert!(
-                row.iter().all(Value::is_null),
+                row.iter().all(is_auto_code),
                 "{label} loose-edge corners are Auto codes"
             );
         }

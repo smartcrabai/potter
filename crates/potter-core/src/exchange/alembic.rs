@@ -2767,8 +2767,22 @@ pub(crate) struct MeshCacheSample {
     pub has_multiple_topology_samples: bool,
     /// Named UV parameters in file order, with rows still in Alembic face winding.
     pub uv_layers: Option<Vec<ExchangeUvLayer>>,
-    pub colors: Option<(String, Vec<Vec<f64>>)>,
+    /// The layer of the arbitrary `uv` parameter, the active UV layer, when the cache has one. A read
+    /// without polygons leaves it unwritten, as Blender's UV-only read does (oracle `read_uv_only`).
+    pub uv_primary: Option<String>,
+    pub colors: Vec<CacheColorLayer>,
     pub velocities: Option<(String, Vec<Vec<f64>>)>,
+    /// Per-corner normals in Potter's winding, when the cache stores normals.
+    pub normals: Option<Vec<[f64; 3]>>,
+}
+
+/// One color layer of a cache sample, named by its `GeomParam`'s `sourceName`. Its values are decoded
+/// and placed in corner or point storage exactly as the importer places Alembic colors.
+#[derive(Clone, Debug)]
+pub(crate) struct CacheColorLayer {
+    pub name: String,
+    pub domain: ColorDomain,
+    pub values: Vec<[f64; 4]>,
 }
 
 /// Read a `PolyMesh`'s evaluated attributes and time samples from an Ogawa archive.
@@ -2795,7 +2809,8 @@ pub(crate) fn read_mesh_cache(
     object_path: &str,
     read_uv: bool,
     read_color: bool,
-    read_velocity: bool,
+    read_normals: bool,
+    velocity_name: &str,
 ) -> Result<Vec<MeshCacheSample>> {
     let archive = parse_archive(bytes)?;
     let object = alembic_object_at_path(&archive.objects, object_path)?;
@@ -2840,13 +2855,26 @@ pub(crate) fn read_mesh_cache(
         Vec::new()
     };
     let uv_names = uv_layer_names(&uv);
-    let color = read_color
-        .then(|| property(&geom.children, "color").or_else(|| property(&geom.children, "Cs")))
+    // The exporter stores the active UV layer as the arbitrary parameter named `uv`, which Blender's
+    // UV-only read does not write (its `uvs_param`).
+    let uv_primary = uv
+        .iter()
+        .zip(&uv_names)
+        .find(|(parameter, _)| parameter.name == "uv")
+        .map(|(_, name)| name.clone());
+    let color = if read_color {
+        color_geom_parameters(geom)
+    } else {
+        Vec::new()
+    };
+    let velocity = if velocity_name.is_empty() {
+        None
+    } else {
+        find_named_array_property(&object.properties, velocity_name)
+    };
+    let normals = read_normals
+        .then(|| property(&geom.children, "N"))
         .flatten();
-    let velocity = read_velocity
-        .then(|| property(&geom.children, "velocities").or_else(|| property(&geom.children, "v")))
-        .flatten()
-        .filter(|parameter| matches!(parameter.property_type, 0 | 2));
     let mut sample_count = positions
         .sample_count
         .max(counts.sample_count)
@@ -2855,7 +2883,13 @@ pub(crate) fn read_mesh_cache(
         .into_iter()
         .max_by_key(|parameter| parameter.sample_count)
         .ok_or_else(|| import_error("Alembic PolyMesh has no time-sampled properties"))?;
-    for parameter in uv.iter().copied().chain(color).chain(velocity) {
+    for parameter in uv
+        .iter()
+        .copied()
+        .chain(color.iter().copied())
+        .chain(normals)
+        .chain(velocity)
+    {
         let values = geomparam_values_property(parameter)?;
         sample_count = sample_count.max(values.sample_count);
         if values.sample_count != 1 && values.sample_count != sample_count {
@@ -2931,6 +2965,8 @@ pub(crate) fn read_mesh_cache(
             })
             .transpose()?;
         let colors = color
+            .iter()
+            .copied()
             .map(|parameter| {
                 let values = geomparam_values_property(parameter)?;
                 validate_cache_parameter_samples(values, sample_count)?;
@@ -2948,10 +2984,15 @@ pub(crate) fn read_mesh_cache(
                     extent,
                     sample_slot(values, sample_index),
                 )?;
-                let tuples = potter_scoped_values(&file_faces, &scope, tuples)?;
-                Ok((scope, tuples))
+                let (domain, values) =
+                    canonical_color_values(&file_faces, points.len(), &scope, &tuples)?;
+                Ok(CacheColorLayer {
+                    name: geomparam_source_name(parameter),
+                    domain,
+                    values,
+                })
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
         let velocities = velocity
             .map(|parameter| {
                 let values = geomparam_values_property(parameter)?;
@@ -2977,6 +3018,48 @@ pub(crate) fn read_mesh_cache(
                 Ok((scope, tuples))
             })
             .transpose()?;
+        let cache_normals = normals
+            .map(|parameter| {
+                let values = geomparam_values_property(parameter)?;
+                validate_cache_parameter_samples(values, sample_count)?;
+                let extent = usize::from(values.extent);
+                if extent != 3 {
+                    return Err(unsupported(
+                        "alembic.normal_extent",
+                        format!("Alembic normal extent {extent} is unsupported"),
+                    ));
+                }
+                let (scope, tuples) = geomparam_values(
+                    bytes,
+                    parameter,
+                    &geometry_sample,
+                    extent,
+                    sample_slot(values, sample_index),
+                )?;
+                // Blender reads facevarying normals only when they count one per corner, and vertex or varying normals
+                // only when they count one per point (`process_normals` and `process_loop_normals`,
+                // `abc_reader_mesh.cc`). Uniform and constant normals, empty rows and mismatched counts are ignored.
+                let corner_total: usize = file_faces.iter().map(Vec::len).sum();
+                let fits = match &*scope {
+                    "facevarying" => tuples.len() == corner_total,
+                    "vertex" | "varying" => tuples.len() == points.len(),
+                    _ => false,
+                };
+                if !fits || tuples.is_empty() {
+                    return Ok(None);
+                }
+                let corners = normal_corners(&file_faces, &scope, &tuples)?;
+                reverse_corner_runs(&file_faces, corners).map(|corners| {
+                    Some(
+                        corners
+                            .into_iter()
+                            .map(|normal| potter_vector(normal.to_array()))
+                            .collect::<Vec<[f64; 3]>>(),
+                    )
+                })
+            })
+            .transpose()?
+            .flatten();
         let sample_time = sample_seconds(
             time_property,
             sample_slot(time_property, sample_index),
@@ -2988,8 +3071,10 @@ pub(crate) fn read_mesh_cache(
             positions: points,
             faces: reversed_faces(&file_faces),
             uv_layers,
+            uv_primary: uv_primary.clone(),
             colors,
             velocities,
+            normals: cache_normals,
         });
     }
     Ok(result)
@@ -3218,6 +3303,19 @@ fn validate_cache_parameter_samples(property: &ParsedProperty, sample_count: usi
         ));
     }
     Ok(())
+}
+
+fn find_named_array_property<'a>(
+    properties: &'a [ParsedProperty],
+    name: &str,
+) -> Option<&'a ParsedProperty> {
+    properties.iter().find_map(|property| {
+        if property.name == name && property.property_type == 2 {
+            Some(property)
+        } else {
+            find_named_array_property(&property.children, name)
+        }
+    })
 }
 
 /// Per-corner normals from an Alembic normal parameter, in `faces` order.
@@ -4101,7 +4199,11 @@ fn decompose_matrix(matrix: DMat4) -> (DVec3, DQuat, DVec3) {
     )
 }
 
+/// Alembic transforms are float32 on disk. A valid TRS matrix reads back within about 6e-8 relative
+/// (Blender's own readback of `animated.abc`), so eight float32 epsilons separate that noise from
+/// real shear, which is far larger.
 fn matrix_to_transform(matrix_values: [f64; 16]) -> Result<Transform> {
+    let tolerance = 8.0 * f64::from(f32::EPSILON);
     if matrix_values.iter().any(|value| !value.is_finite()) {
         return Err(import_error("Alembic Xform matrix is not finite"));
     }
@@ -4122,7 +4224,7 @@ fn matrix_to_transform(matrix_values: [f64; 16]) -> Result<Transform> {
     if matrix_values
         .iter()
         .zip(reconstructed)
-        .any(|(original, value)| (*original - value).abs() > 1.0e-8 * (1.0 + original.abs()))
+        .any(|(original, value)| (*original - value).abs() > tolerance * (1.0 + original.abs()))
     {
         return Err(unsupported(
             "transform.matrix_shear",
@@ -4854,6 +4956,7 @@ mod tests {
             true,
             false,
             false,
+            "",
         )?;
         assert!(
             samples.len() > 1,
@@ -4886,7 +4989,8 @@ mod tests {
             assert!(property.constant);
             assert_eq!(sample_storage_count(property), 1);
         }
-        let static_samples = read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false)?;
+        let static_samples =
+            read_mesh_cache(&static_bytes, "/Plane/Plane", true, false, false, "")?;
         assert_eq!(static_samples.len(), 1);
         assert!(
             static_samples

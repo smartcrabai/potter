@@ -89,6 +89,36 @@ pub struct EvaluationContext {
     pub purpose: EvaluationPurpose,
 }
 
+/// Runtime state retained while evaluating successive frames, including the Alembic archive selected by a `CacheFile`.
+/// Create one per render/bake frame sequence; ordinary single-frame evaluation uses a fresh session.
+#[derive(Debug, Default)]
+pub struct EvaluationSession {
+    pub(crate) cache_file_archives: BTreeMap<Id, SelectedCacheFileArchive>,
+}
+impl EvaluationSession {
+    fn cache_file_archive_identity(&self) -> Value {
+        Value::Object(
+            self.cache_file_archives
+                .iter()
+                .map(|(resource_id, archive)| {
+                    (
+                        resource_id.to_string(),
+                        json!({"frame":archive.frame,"hash":archive.hash.as_ref(),"source":archive.source_identity.as_ref()}),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SelectedCacheFileArchive {
+    pub(crate) frame: i32,
+    pub(crate) source_identity: Arc<str>,
+    pub(crate) bytes: Arc<Vec<u8>>,
+    pub(crate) hash: Arc<str>,
+}
+
 /// Borrowed project resources for one modifier evaluation.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ModifierEvaluationContext<'a> {
@@ -274,6 +304,12 @@ pub struct Snapshot {
     /// Member material slots and UV/color layer bindings for evaluated collection instances.
     #[serde(skip)]
     pub slot_bindings: BTreeMap<Id, Vec<SlotBinding>>,
+    /// Bake-node values captured by an explicit bake action, keyed by object, modifier and node.
+    #[serde(skip)]
+    pub(crate) node_bake_captures: BTreeMap<(Id, Id, String), crate::graph::NodeBakeFrame>,
+    /// Material references of captured Bake geometry, keyed like `node_bake_captures`.
+    #[serde(skip)]
+    pub(crate) node_bake_material_refs: BTreeMap<(Id, Id, String), Vec<Id>>,
     /// World-space Grease Pencil strokes held at the selected frame.
     #[serde(skip)]
     pub strokes: BTreeMap<Id, Vec<EvaluatedStroke>>,
@@ -374,11 +410,25 @@ impl Snapshot {
         project_root: Option<&Path>,
         cache_directory: Option<&Path>,
     ) -> Result<Self> {
+        let mut session = EvaluationSession::default();
+        Self::evaluate_with_cache_session(doc, context, project_root, cache_directory, &mut session)
+    }
+
+    /// Evaluate one frame with an explicit session shared across successive frame evaluations.
+    pub fn evaluate_with_cache_session(
+        doc: &SceneDoc,
+        context: &EvaluationContext,
+        project_root: Option<&Path>,
+        cache_directory: Option<&Path>,
+        session: &mut EvaluationSession,
+    ) -> Result<Self> {
         Self::evaluate_internal(
             doc,
             context,
             project_root,
             cache_directory,
+            session,
+            None,
             None,
             None,
             None,
@@ -402,14 +452,45 @@ impl Snapshot {
                 ));
             }
         }
+        let mut session = EvaluationSession::default();
         Self::evaluate_internal(
             doc,
             context,
             project_root,
             cache_directory,
+            &mut session,
             Some(node_ids),
             None,
             None,
+            None,
+        )
+    }
+
+    /// Evaluate the document and capture the Bake node selected by an explicit bake action.
+    pub(crate) fn evaluate_with_node_bake_capture(
+        doc: &SceneDoc,
+        context: &EvaluationContext,
+        project_root: Option<&Path>,
+        cache_directory: Option<&Path>,
+        session: &mut EvaluationSession,
+        object_id: &Id,
+        modifier_id: &Id,
+        bake_node_id: &str,
+    ) -> Result<Self> {
+        Self::evaluate_internal(
+            doc,
+            context,
+            project_root,
+            cache_directory,
+            session,
+            None,
+            None,
+            None,
+            Some(&(
+                object_id.clone(),
+                modifier_id.clone(),
+                bake_node_id.to_owned(),
+            )),
         )
     }
 
@@ -444,11 +525,13 @@ impl Snapshot {
                 json!({"node_id":prefix_node_id}),
             )
         })?;
+        let mut session = EvaluationSession::default();
         Self::evaluate_internal(
             doc,
             context,
             project_root,
             cache_directory,
+            &mut session,
             Some(node_ids),
             Some(ModifierPrefix {
                 node_id: prefix_node_id,
@@ -456,6 +539,7 @@ impl Snapshot {
                 keep,
             }),
             Some(driver_values),
+            None,
         )
     }
 
@@ -465,6 +549,7 @@ impl Snapshot {
         context: &EvaluationContext,
         project_root: Option<&Path>,
         cache_directory: Option<&Path>,
+        session: &mut EvaluationSession,
         target_id: &Id,
         modifier_id: &Id,
         driver_values: &BTreeMap<(Id, String, u32), f64>,
@@ -537,6 +622,8 @@ impl Snapshot {
             Some(&world_matrix_ids),
             None,
             Some(driver_values),
+            session,
+            None,
         )
     }
 
@@ -567,6 +654,7 @@ impl Snapshot {
             None,
         )?;
         let mut node_errors = BTreeMap::new();
+        let mut session = EvaluationSession::default();
         loop {
             let evaluation = Self::evaluate_gated(
                 doc,
@@ -579,6 +667,8 @@ impl Snapshot {
                 &mesh_dependencies,
                 None,
                 None,
+                None,
+                &mut session,
                 None,
             );
             match evaluation {
@@ -598,6 +688,7 @@ impl Snapshot {
                         "frame": snapshot.frame,
                         "adaptive_render": context.adaptive_render,
                         "simulation_cache_key": snapshot.simulation_cache_key,
+                        "cache_file_archives": session.cache_file_archive_identity(),
                     });
                     snapshot.evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
                     for node_id in node_errors.keys() {
@@ -686,9 +777,11 @@ impl Snapshot {
         context: &EvaluationContext,
         project_root: Option<&Path>,
         cache_directory: Option<&Path>,
+        session: &mut EvaluationSession,
         selected_nodes: Option<&BTreeSet<Id>>,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+        bake_capture: Option<&(Id, Id, String)>,
     ) -> Result<Self> {
         source.validate()?;
         let modifier_context = ModifierEvaluationContext {
@@ -781,6 +874,8 @@ impl Snapshot {
             world_matrix_ids,
             modifier_prefix,
             driver_values,
+            session,
+            bake_capture,
         )
     }
 
@@ -798,6 +893,8 @@ impl Snapshot {
         world_matrix_ids: Option<&BTreeSet<Id>>,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+        session: &mut EvaluationSession,
+        bake_capture: Option<&(Id, Id, String)>,
     ) -> Result<Self> {
         // Settings that an accepted lossy import reported are not evaluated: evaluate a copy without them,
         // and carry one warning per value.
@@ -818,6 +915,8 @@ impl Snapshot {
             world_matrix_ids,
             modifier_prefix,
             driver_values,
+            session,
+            bake_capture,
         )?;
         snapshot.warnings.splice(0..0, accepted_warnings);
         Ok(snapshot)
@@ -835,6 +934,8 @@ impl Snapshot {
         world_matrix_ids: Option<&BTreeSet<Id>>,
         modifier_prefix: Option<ModifierPrefix<'_>>,
         driver_values: Option<&BTreeMap<(Id, String, u32), f64>>,
+        session: &mut EvaluationSession,
+        bake_capture: Option<&(Id, Id, String)>,
     ) -> Result<Self> {
         let gate = ModifierGate {
             context: modifier_context,
@@ -890,6 +991,7 @@ impl Snapshot {
             modifier_context.project_root,
             scene.fps,
             scene.fps_base,
+            session,
         )?;
         let adaptive_render = context
             .adaptive_render
@@ -1036,6 +1138,7 @@ impl Snapshot {
                             modifier_context.project_root,
                             scene.fps,
                             scene.fps_base,
+                            session,
                         )?;
                     (evaluated.world, evaluated.pose)
                 } else {
@@ -1050,6 +1153,7 @@ impl Snapshot {
                             modifier_context.project_root,
                             scene.fps,
                             scene.fps_base,
+                            session,
                         )?,
                         None,
                     )
@@ -1071,23 +1175,6 @@ impl Snapshot {
                 }
             }
         }
-        let mut evaluation_key = json!({
-            "engine": EVALUATION_ENGINE,
-            "build_identity": crate::BUILD_IDENTITY,
-            "simulation_engine": crate::sim::SOLVER_VERSION,
-            "scene_hash": scene_hash,
-            "scene_id": scene_id,
-            "view_layer": view_layer,
-            "purpose": context.purpose,
-            "frame": frame,
-            "adaptive_render": context.adaptive_render,
-            "simulation_cache_key": simulation_cache_key,
-        });
-        if let Some(prefix) = modifier_prefix {
-            evaluation_key["modifier_prefix"] =
-                json!({"node_id":prefix.node_id,"keep":prefix.keep});
-        }
-        let evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
         let mut volume_data = if mesh_evaluation_order.is_empty() {
             BTreeMap::new()
         } else {
@@ -1101,6 +1188,8 @@ impl Snapshot {
         let mut instance_paths = BTreeMap::new();
         let mut slot_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
+        let mut node_bake_captures = BTreeMap::new();
+        let mut node_bake_material_refs = BTreeMap::new();
         let mut modifier_warnings = Vec::new();
         for id in &mesh_evaluation_order {
             let node = doc.nodes.get(id).ok_or_else(|| {
@@ -1217,6 +1306,14 @@ impl Snapshot {
                         );
                     }
                     attach_vertex_group_weights(&mut rigged_source, data_block);
+                    let evaluation_modifiers = prepare_node_bake_modifiers(
+                        doc,
+                        id,
+                        &node.modifiers,
+                        modifier_context,
+                        bake_capture,
+                        frame,
+                    )?;
                     // Shape keys are applied above before modifiers, so adaptive derivatives use the same
                     // evaluated coordinates as the render mesh.
                     let mut stack_context = gate.context;
@@ -1227,7 +1324,7 @@ impl Snapshot {
                     let (evaluated, mesh_normals) =
                         crate::geom::modifiers::evaluate_modifiers_with_scene_context_and_normals(
                             rigged_source,
-                            &node.modifiers,
+                            &evaluation_modifiers,
                             &doc.node_groups,
                             frame,
                             node.name.as_str(),
@@ -1256,6 +1353,7 @@ impl Snapshot {
                                         scene.fps_base,
                                         &meshes,
                                         multi_input,
+                                        session,
                                     ),
                                     "lattice" => apply_lattice_modifier(
                                         mesh, modifier, id, data_block, doc, &matrices,
@@ -1321,6 +1419,21 @@ impl Snapshot {
                                     "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
                                         mesh,
                                         modifier,
+                                        id,
+                                        doc,
+                                        modifier_context.project_root,
+                                        frame,
+                                        scene.fps,
+                                        scene.fps_base,
+                                        session,
+                                    )
+                                    .map(|warnings| modifier_warnings.extend(warnings)),
+                                    "mesh_cache" => apply_mesh_cache_modifier(
+                                        mesh,
+                                        node_data.and_then(|data| {
+                                            data.mesh.as_ref().filter(|_| data.data_type == "mesh")
+                                        }),
+                                        modifier,
                                         doc,
                                         modifier_context.project_root,
                                         frame,
@@ -1328,15 +1441,6 @@ impl Snapshot {
                                         scene.fps_base,
                                     )
                                     .map(|warnings| modifier_warnings.extend(warnings)),
-                                    "mesh_cache" => apply_mesh_cache_modifier(
-                                        mesh,
-                                        modifier,
-                                        doc,
-                                        modifier_context.project_root,
-                                        frame,
-                                        scene.fps,
-                                        scene.fps_base,
-                                    ),
                                     "cloth" | "soft_body" | "collision" | "dynamic_paint"
                                     | "fluid" | "particle_system" => apply_stack_physics_modifier(
                                         mesh,
@@ -1394,6 +1498,14 @@ impl Snapshot {
                             },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;
+                    key_node_bake_outputs(
+                        id,
+                        &node.materials.iter().flatten().cloned().collect::<Vec<_>>(),
+                        evaluated.bake_captures,
+                        evaluated.bake_material_refs,
+                        &mut node_bake_captures,
+                        &mut node_bake_material_refs,
+                    );
                     modifier_warnings.extend(
                         evaluated
                             .warnings
@@ -1548,6 +1660,14 @@ impl Snapshot {
                         }
                     };
                     attach_vertex_group_weights(&mut source_mesh, data_block);
+                    let evaluation_modifiers = prepare_node_bake_modifiers(
+                        doc,
+                        id,
+                        &node.modifiers,
+                        modifier_context,
+                        bake_capture,
+                        frame,
+                    )?;
                     let mut stack_context = gate.context;
                     stack_context.material_slot_count = Some(crate::model::material_slot_count(
                         node.materials.len(),
@@ -1556,7 +1676,7 @@ impl Snapshot {
                     let (evaluated, evaluated_normals) =
                         crate::geom::modifiers::evaluate_modifiers_with_scene_context_and_normals(
                             source_mesh,
-                            &node.modifiers,
+                            &evaluation_modifiers,
                             &doc.node_groups,
                             frame,
                             node.name.as_str(),
@@ -1585,6 +1705,7 @@ impl Snapshot {
                                         scene.fps_base,
                                         &meshes,
                                         multi_input,
+                                        session,
                                     ),
                                     "lattice" => apply_lattice_modifier(
                                         mesh, modifier, id, data_block, doc, &matrices,
@@ -1650,6 +1771,21 @@ impl Snapshot {
                                     "mesh_sequence_cache" => apply_mesh_sequence_cache_modifier(
                                         mesh,
                                         modifier,
+                                        id,
+                                        doc,
+                                        modifier_context.project_root,
+                                        frame,
+                                        scene.fps,
+                                        scene.fps_base,
+                                        session,
+                                    )
+                                    .map(|warnings| modifier_warnings.extend(warnings)),
+                                    "mesh_cache" => apply_mesh_cache_modifier(
+                                        mesh,
+                                        node_data.and_then(|data| {
+                                            data.mesh.as_ref().filter(|_| data.data_type == "mesh")
+                                        }),
+                                        modifier,
                                         doc,
                                         modifier_context.project_root,
                                         frame,
@@ -1657,15 +1793,6 @@ impl Snapshot {
                                         scene.fps_base,
                                     )
                                     .map(|warnings| modifier_warnings.extend(warnings)),
-                                    "mesh_cache" => apply_mesh_cache_modifier(
-                                        mesh,
-                                        modifier,
-                                        doc,
-                                        modifier_context.project_root,
-                                        frame,
-                                        scene.fps,
-                                        scene.fps_base,
-                                    ),
                                     "cloth" | "soft_body" | "collision" | "dynamic_paint"
                                     | "fluid" | "particle_system" => apply_stack_physics_modifier(
                                         mesh,
@@ -1723,6 +1850,14 @@ impl Snapshot {
                             },
                         )
                         .map_err(|error| attach_node_owner(error, id))?;
+                    key_node_bake_outputs(
+                        id,
+                        &node.materials.iter().flatten().cloned().collect::<Vec<_>>(),
+                        evaluated.bake_captures,
+                        evaluated.bake_material_refs,
+                        &mut node_bake_captures,
+                        &mut node_bake_material_refs,
+                    );
                     modifier_warnings.extend(
                         evaluated
                             .warnings
@@ -2004,6 +2139,7 @@ impl Snapshot {
                 scene.fps,
                 scene.fps_base,
                 &meshes,
+                session,
             )?;
             for (id, evaluated_node) in &mut nodes {
                 let matrix = matrices.get(id).copied().ok_or_else(|| {
@@ -2044,6 +2180,7 @@ impl Snapshot {
                                 scene.fps,
                                 scene.fps_base,
                                 &meshes,
+                                session,
                             )?;
                         (evaluated.world, evaluated.pose)
                     } else {
@@ -2059,6 +2196,7 @@ impl Snapshot {
                                 scene.fps,
                                 scene.fps_base,
                                 &meshes,
+                                session,
                             )?,
                             None,
                         )
@@ -2147,6 +2285,24 @@ impl Snapshot {
                     .filter_map(|id| matrices.get(id).copied().map(|matrix| (id.clone(), matrix)))
                     .collect()
             });
+        let mut evaluation_key = json!({
+            "engine": EVALUATION_ENGINE,
+            "build_identity": crate::BUILD_IDENTITY,
+            "simulation_engine": crate::sim::SOLVER_VERSION,
+            "scene_hash": scene_hash,
+            "scene_id": scene_id,
+            "view_layer": view_layer,
+            "purpose": context.purpose,
+            "frame": frame,
+            "adaptive_render": context.adaptive_render,
+            "simulation_cache_key": simulation_cache_key,
+            "cache_file_archives": session.cache_file_archive_identity(),
+        });
+        if let Some(prefix) = modifier_prefix {
+            evaluation_key["modifier_prefix"] =
+                json!({"node_id":prefix.node_id,"keep":prefix.keep});
+        }
+        let evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
         Ok(Self {
             scene_id,
             view_layer,
@@ -2159,6 +2315,8 @@ impl Snapshot {
             transform_world_matrices,
             instance_paths,
             slot_bindings,
+            node_bake_captures,
+            node_bake_material_refs,
             meshes,
             adaptive_normals,
             generated_vertices,
@@ -2405,6 +2563,292 @@ impl ModifierGate<'_> {
     }
 }
 
+/// Keys one evaluated object's bake captures and material refs by object, modifier and bake node. Each captured
+/// frame also takes the object's materials.
+fn key_node_bake_outputs(
+    object_id: &Id,
+    materials: &[Id],
+    captures: BTreeMap<(Id, String), crate::graph::NodeBakeFrame>,
+    material_refs: BTreeMap<(Id, String), Vec<Id>>,
+    node_bake_captures: &mut BTreeMap<(Id, Id, String), crate::graph::NodeBakeFrame>,
+    node_bake_material_refs: &mut BTreeMap<(Id, Id, String), Vec<Id>>,
+) {
+    node_bake_captures.extend(captures.into_iter().map(|((modifier_id, node_id), frame)| {
+        (
+            (object_id.clone(), modifier_id, node_id),
+            bake_frame_with_material_refs(frame, materials),
+        )
+    }));
+    node_bake_material_refs.extend(
+        material_refs
+            .into_iter()
+            .map(|((modifier_id, node_id), refs)| {
+                ((object_id.clone(), modifier_id, node_id), refs)
+            }),
+    );
+}
+
+fn bake_frame_with_material_refs(
+    mut frame: crate::graph::NodeBakeFrame,
+    material_refs: &[Id],
+) -> crate::graph::NodeBakeFrame {
+    if material_refs.is_empty() {
+        return frame;
+    }
+    for value in frame.values.values_mut() {
+        if let crate::graph::NodeBakeValue::Geometry {
+            material_refs: baked_materials,
+            ..
+        } = value
+        {
+            baked_materials.extend_from_slice(material_refs);
+        }
+    }
+    frame
+}
+
+fn prepare_node_bake_modifiers<'a>(
+    doc: &SceneDoc,
+    object_id: &Id,
+    modifiers: &'a [Modifier],
+    modifier_context: ModifierEvaluationContext<'_>,
+    capture_bake: Option<&(Id, Id, String)>,
+    frame: f64,
+) -> Result<Cow<'a, [Modifier]>> {
+    let mut resolved = None;
+    for (index, modifier) in modifiers.iter().enumerate() {
+        if modifier.modifier_type != "nodes" {
+            continue;
+        }
+        let requested_node = capture_bake
+            .filter(|(owner, modifier_id, _)| owner == object_id && modifier_id == &modifier.id)
+            .map(|(_, _, node_id)| node_id.as_str());
+        let configs = match modifier.params.get("bakes") {
+            None => None,
+            Some(value) => Some(value.as_object().ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "node-bake settings must be an object",
+                )
+            })?),
+        }
+        .filter(|configs| !configs.is_empty());
+        if requested_node.is_none() && configs.is_none() {
+            continue;
+        }
+        let resolved_modifiers = resolved.get_or_insert_with(|| modifiers.to_vec());
+        let resolved_modifier = &mut resolved_modifiers[index];
+        if let Some(node_id) = requested_node {
+            resolved_modifier
+                .runtime
+                .capture_node_bakes
+                .insert(node_id.to_owned());
+        }
+        let Some(configs) = configs else {
+            continue;
+        };
+        for (node_id, config) in configs {
+            if requested_node == Some(node_id.as_str()) {
+                continue;
+            }
+            Id::new(node_id.clone()).map_err(|_| {
+                PotError::new(ErrorCode::SceneInvalid, "node-bake node ID is invalid")
+            })?;
+            crate::graph::validate_node_bake_config(config)?;
+            // A settings-only entry carries no baked data; its bake node evaluates live.
+            let Some(storage) = config.get("storage").and_then(Value::as_str) else {
+                continue;
+            };
+            // Blender loads baked data by where it is stored, not by the current bake target
+            // (`try_find_baked_data`, MOD_nodes.cc): a target change keeps the stored bake.
+            let record = match storage {
+                "packed" => {
+                    let (resource_id, resource) =
+                        crate::graph::packed_node_bake_resource(&doc.resources, config)?;
+                    let invalid = || {
+                        PotError::with_details(
+                            ErrorCode::SceneInvalid,
+                            "packed node-bake resource is invalid",
+                            json!({"resource_id":resource_id}),
+                        )
+                    };
+                    // Frames are read by index from the stored array, and only the frames this
+                    // evaluation needs are decoded.
+                    let stored = resource
+                        .get("frames")
+                        .and_then(Value::as_array)
+                        .ok_or_else(invalid)?;
+                    let numbers = stored
+                        .iter()
+                        .map(|entry| {
+                            entry
+                                .get("frame")
+                                .and_then(Value::as_f64)
+                                .filter(|number| number.is_finite())
+                                .ok_or_else(invalid)
+                        })
+                        .collect::<Result<Vec<f64>>>()?;
+                    if numbers.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err(invalid());
+                    }
+                    let window = crate::graph::bake_frame_window(&numbers, frame, |index| {
+                        serde_json::from_value::<crate::graph::NodeBakeFrame>(stored[index].clone())
+                            .map(Some)
+                            .map_err(|error| {
+                                PotError::with_details(
+                                    ErrorCode::SceneInvalid,
+                                    "packed node-bake frame is invalid",
+                                    json!({"resource_id":resource_id,"cause":error.to_string()}),
+                                )
+                            })
+                    })?;
+                    let record = crate::graph::NodeBakeRecord {
+                        storage: "inline".to_owned(),
+                        kind: "node_bake".to_owned(),
+                        version: 1,
+                        frames: window,
+                    };
+                    crate::graph::validate_node_bake_record(&record)?;
+                    Some(record)
+                }
+                "disk" => {
+                    let frame_entries =
+                        config
+                            .get("frames")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::SceneInvalid,
+                                    "disk node-bake frame manifest is missing",
+                                )
+                            })?;
+                    if frame_entries.is_empty()
+                        || frame_entries.len() > crate::graph::MAX_NODE_BAKE_FRAME_COUNT
+                    {
+                        return Err(PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "disk node-bake frame manifest has an invalid number of frames",
+                        ));
+                    }
+                    let Some(project_root) = modifier_context.project_root else {
+                        continue;
+                    };
+                    // An empty directory names no location, so the payload is missing and the
+                    // bake node evaluates live.
+                    let Some(bake_directory) = crate::graph::node_bake_directory(modifier, config)
+                    else {
+                        continue;
+                    };
+                    let mut numbers = Vec::with_capacity(frame_entries.len());
+                    let mut digests = Vec::with_capacity(frame_entries.len());
+                    for entry in frame_entries {
+                        let number = entry
+                            .get("frame")
+                            .and_then(Value::as_f64)
+                            .filter(|number| number.is_finite())
+                            .ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::SceneInvalid,
+                                    "disk node-bake frame is invalid",
+                                )
+                            })?;
+                        if numbers.last().is_some_and(|previous| number <= *previous) {
+                            return Err(PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "disk node-bake frames are not strictly increasing",
+                            ));
+                        }
+                        numbers.push(number);
+                        digests.push(entry.get("digest").and_then(Value::as_str).ok_or_else(
+                            || {
+                                PotError::new(
+                                    ErrorCode::SceneInvalid,
+                                    "disk node-bake digest is missing",
+                                )
+                            },
+                        )?);
+                    }
+                    let mut retained_bytes = 0_usize;
+                    let window = crate::graph::bake_frame_window(&numbers, frame, |index| {
+                        let remaining =
+                            crate::graph::MAX_NODE_BAKE_PACKED_BYTES.saturating_sub(retained_bytes);
+                        let read_limit =
+                            remaining / (crate::graph::NODE_BAKE_JSON_MEMORY_MULTIPLIER + 1);
+                        let digest = digests[index];
+                        let Some(bytes) = crate::graph::read_node_bake_payload_limited(
+                            project_root,
+                            &bake_directory,
+                            object_id,
+                            &modifier.id,
+                            node_id,
+                            digest,
+                            read_limit,
+                        )?
+                        else {
+                            // A missing frame is skipped: Blender interpolates it from the cached
+                            // frames around it (MOD_nodes.cc read_interpolated).
+                            return Ok(None);
+                        };
+                        let stored = serde_json::from_slice::<crate::graph::NodeBakeFrame>(&bytes)
+                            .map_err(|error| {
+                                PotError::with_details(
+                                    ErrorCode::SceneInvalid,
+                                    "disk node-bake payload is invalid",
+                                    json!({"cause":error.to_string(),"digest":digest}),
+                                )
+                            })?;
+                        if !crate::graph::same_bake_frame(stored.frame, numbers[index]) {
+                            return Err(PotError::new(
+                                ErrorCode::SceneInvalid,
+                                "disk node-bake frame does not match its manifest",
+                            ));
+                        }
+                        crate::graph::validate_node_bake_frame(&stored)?;
+                        let frame_bytes = crate::graph::node_bake_frame_memory_bytes(&stored);
+                        let peak_bytes = retained_bytes
+                            .saturating_add(frame_bytes)
+                            .saturating_add(bytes.len());
+                        if peak_bytes > crate::graph::MAX_NODE_BAKE_PACKED_BYTES {
+                            return Err(PotError::new(
+                                ErrorCode::LimitExceeded,
+                                "loaded node-bake frames exceed the 2 GiB decoded memory limit",
+                            ));
+                        }
+                        retained_bytes = retained_bytes.saturating_add(frame_bytes);
+                        Ok(Some(stored))
+                    })?;
+                    if window.is_empty() {
+                        // No cached frame at all: Blender passes the live geometry through.
+                        None
+                    } else {
+                        let record = crate::graph::NodeBakeRecord {
+                            storage: "inline".to_owned(),
+                            kind: "node_bake".to_owned(),
+                            version: 1,
+                            frames: window,
+                        };
+                        crate::graph::validate_node_bake_record(&record)?;
+                        Some(record)
+                    }
+                }
+                _ => {
+                    return Err(PotError::new(
+                        ErrorCode::SceneInvalid,
+                        "node-bake storage must be packed or disk",
+                    ));
+                }
+            };
+            if let Some(record) = record {
+                resolved_modifier
+                    .runtime
+                    .node_bakes
+                    .insert(node_id.clone(), record);
+            }
+        }
+    }
+    Ok(resolved.map_or(Cow::Borrowed(modifiers), Cow::Owned))
+}
+
 /// Read and verify a cache resource from the scene's asset registry.
 ///
 /// # Errors
@@ -2422,94 +2866,7 @@ pub(crate) fn read_cache_resource(
             json!({"resource_id":resource_id}),
         )
     })?;
-    let expected_hash = resource
-        .get("hash")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                "Alembic cache resource has no expected content hash",
-                json!({"resource_id":resource_id}),
-            )
-        })?;
-    let bytes = if resource.get("packed").and_then(serde_json::Value::as_bool) == Some(true) {
-        let values = resource
-            .get("bytes")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "packed Alembic cache resource has no byte payload",
-                    json!({"resource_id":resource_id}),
-                )
-            })?;
-        values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                value
-                    .as_u64()
-                    .and_then(|byte| u8::try_from(byte).ok())
-                    .ok_or_else(|| {
-                        PotError::with_details(
-                            ErrorCode::SceneInvalid,
-                            "packed Alembic cache byte is outside 0..255",
-                            json!({"resource_id":resource_id,"index":index}),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        let uri = resource
-            .get("uri")
-            .or_else(|| resource.get("path"))
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    "Alembic cache resource has no file URI",
-                    json!({"resource_id":resource_id}),
-                )
-            })?;
-        let path_text = uri.strip_prefix("file://").unwrap_or(uri);
-        let path = Path::new(path_text);
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else if let Some(root) = project_root {
-            root.join(path)
-        } else {
-            return Err(PotError::with_details(
-                ErrorCode::DependencyMissing,
-                "relative Alembic cache resource cannot be resolved without a project root",
-                json!({"resource_id":resource_id,"uri":uri}),
-            ));
-        };
-        fs::read(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                PotError::with_details(
-                    ErrorCode::DependencyMissing,
-                    format!("Alembic cache file is missing: {}", path.display()),
-                    json!({"resource_id":resource_id,"uri":uri}),
-                )
-            } else {
-                PotError::io(&error)
-            }
-        })?
-    };
-    let actual_hash = hash::sha256(&bytes);
-    if actual_hash != expected_hash {
-        return Err(PotError::with_details(
-            ErrorCode::AssetChanged,
-            format!("Alembic cache resource `{resource_id}` changed after registration"),
-            json!({
-                "resource_id":resource_id,
-                "uri":resource.get("uri").and_then(serde_json::Value::as_str),
-                "expected_hash":expected_hash,
-                "actual_hash":actual_hash,
-            }),
-        ));
-    }
-    Ok((bytes, actual_hash))
+    crate::cache_sequence::read_cache_resource_record(resource, resource_id.as_str(), project_root)
 }
 
 pub(crate) fn load_vdb_volume_data(
@@ -3562,13 +3919,17 @@ pub(crate) fn apply_scene_deform_modifier(
 
 fn apply_mesh_cache_modifier(
     mesh: &mut Mesh,
+    source_mesh: Option<&Mesh>,
     modifier: &Modifier,
     doc: &SceneDoc,
     project_root: Option<&Path>,
     frame: f64,
     fps: u32,
     fps_base: f64,
-) -> Result<()> {
+) -> Result<Vec<PotError>> {
+    if crate::geom::modifiers::attributes::mesh_cache_is_disabled(modifier) {
+        return Ok(Vec::new());
+    }
     let resource_text = modifier
         .params
         .get("resource")
@@ -3587,32 +3948,64 @@ fn apply_mesh_cache_modifier(
             json!({"modifier_id":modifier.id,"resource":resource_text}),
         )
     })?;
+    // A registered resource with an empty URI is Blender's empty filepath, so the modifier is a no-op.
+    if doc.resources.get(&resource_id).is_some_and(|resource| {
+        resource
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|uri| uri.trim().is_empty())
+    }) {
+        return Ok(Vec::new());
+    }
     let (bytes, _) = read_cache_resource(doc, project_root, &resource_id)?;
+    crate::cache_sequence::reject_usd_cache(&bytes, resource_id.as_str())?;
     crate::geom::modifiers::attributes::evaluate_mesh_cache(
-        mesh, modifier, frame, fps, fps_base, &bytes,
+        mesh,
+        source_mesh,
+        modifier,
+        frame,
+        fps,
+        fps_base,
+        &bytes,
     )
 }
 
 fn apply_mesh_sequence_cache_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
+    subject_id: &Id,
     doc: &SceneDoc,
     project_root: Option<&Path>,
     frame: f64,
     fps: u32,
     fps_base: f64,
+    session: &mut EvaluationSession,
 ) -> Result<Vec<PotError>> {
-    let resource_text = modifier
-        .params
-        .get("resource")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            PotError::with_details(
+    // Blender's MeshSequenceCache is disabled without an object path or a cache resource.
+    match modifier.params.get("object_path") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(object_path)) if object_path.is_empty() => return Ok(Vec::new()),
+        Some(Value::String(_)) => {}
+        Some(_) => {
+            return Err(PotError::with_details(
+                ErrorCode::InvalidArgument,
+                "Mesh Sequence Cache object_path must be a string",
+                json!({"modifier_id":modifier.id,"parameter":"object_path"}),
+            ));
+        }
+    }
+    let resource_text = match modifier.params.get("resource") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(resource)) if resource.is_empty() => return Ok(Vec::new()),
+        Some(Value::String(resource)) => resource.as_str(),
+        Some(_) => {
+            return Err(PotError::with_details(
                 ErrorCode::InvalidArgument,
                 "Mesh Sequence Cache resource must be a resource ID",
                 json!({"modifier_id":modifier.id,"parameter":"resource"}),
-            )
-        })?;
+            ));
+        }
+    };
     let resource_id = Id::new(resource_text).map_err(|error| {
         PotError::with_details(
             ErrorCode::InvalidArgument,
@@ -3620,14 +4013,57 @@ fn apply_mesh_sequence_cache_modifier(
             json!({"modifier_id":modifier.id,"resource":resource_text}),
         )
     })?;
-    let (bytes, actual_hash) = read_cache_resource(doc, project_root, &resource_id)?;
-    let is_sequence = doc
-        .resources
-        .get(&resource_id)
-        .and_then(|resource| resource.get("cache_file"))
-        .and_then(|settings| settings.get("is_sequence"))
+    let sequence = modifier
+        .params
+        .get("is_sequence")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let (bytes, actual_hash) = if sequence {
+        let resource = doc.resources.get(&resource_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::DependencyMissing,
+                format!("Alembic cache resource `{resource_id}` is not registered"),
+                json!({"resource_id":resource_id}),
+            )
+        })?;
+        let requested_frame = match modifier.params.get("override_frame") {
+            None | Some(Value::Null) => frame,
+            Some(value) => value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::InvalidArgument,
+                        "Mesh Sequence Cache override_frame must be finite or null",
+                        json!({"modifier_id":modifier.id,"parameter":"override_frame"}),
+                    )
+                })?,
+        };
+        match select_cache_sequence_archive(
+            &resource_id,
+            resource,
+            project_root,
+            requested_frame,
+            session,
+        )? {
+            CacheSequenceRead::Available(bytes, digest) => (bytes, digest),
+            CacheSequenceRead::Missing { frame, reason } => {
+                if let Some(selected) = session.cache_file_archives.get(&resource_id) {
+                    (Arc::clone(&selected.bytes), Arc::clone(&selected.hash))
+                } else {
+                    return Ok(vec![PotError::with_details(
+                        ErrorCode::DependencyMissing,
+                        "Alembic sequence frame is unavailable; Mesh Sequence Cache was skipped",
+                        json!({"modifier_id":modifier.id,"node_id":subject_id,"resource_id":resource_id,"frame":frame,"reason":reason}),
+                    )]);
+                }
+            }
+        }
+    } else {
+        let (bytes, digest) = read_cache_resource(doc, project_root, &resource_id)?;
+        (Arc::new(bytes), Arc::from(digest))
+    };
+    crate::cache_sequence::reject_usd_cache(&bytes, resource_id.as_str())?;
     crate::geom::mesh_cache::evaluate(
         mesh,
         modifier,
@@ -3636,8 +4072,317 @@ fn apply_mesh_sequence_cache_modifier(
         fps_base,
         &actual_hash,
         &bytes,
-        is_sequence,
+        sequence,
     )
+}
+
+pub(crate) enum CacheSequenceRead {
+    Available(Arc<Vec<u8>>, Arc<str>),
+    Missing { frame: i32, reason: &'static str },
+}
+
+/// Reuses a reader for the same selected source, otherwise attempts the requested frame.
+pub(crate) fn select_cache_sequence_archive(
+    resource_id: &Id,
+    resource: &Value,
+    project_root: Option<&Path>,
+    requested_frame: f64,
+    session: &mut EvaluationSession,
+) -> Result<CacheSequenceRead> {
+    let frame = num_traits::ToPrimitive::to_i32(&requested_frame.trunc()).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "Mesh Sequence Cache frame is outside int32 sequence range",
+            json!({"frame":requested_frame}),
+        )
+    })?;
+    let source_identity = cache_sequence_source_identity(resource, frame);
+    if let Some(source_identity) = &source_identity
+        && let Some(selected) = session.cache_file_archives.get(resource_id)
+        && selected.frame == frame
+        && selected.source_identity.as_ref() == source_identity
+    {
+        return Ok(CacheSequenceRead::Available(
+            Arc::clone(&selected.bytes),
+            Arc::clone(&selected.hash),
+        ));
+    }
+    match read_cache_sequence_resource(resource, project_root, requested_frame)? {
+        CacheSequenceRead::Available(bytes, hash) => {
+            let source_identity = source_identity.ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "available cache sequence frame has no source identity",
+                )
+            })?;
+            let selected = SelectedCacheFileArchive {
+                frame,
+                source_identity: Arc::from(source_identity),
+                bytes,
+                hash,
+            };
+            session
+                .cache_file_archives
+                .insert(resource_id.clone(), selected);
+            let selected = session
+                .cache_file_archives
+                .get(resource_id)
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "selected cache archive disappeared",
+                    )
+                })?;
+            Ok(CacheSequenceRead::Available(
+                Arc::clone(&selected.bytes),
+                Arc::clone(&selected.hash),
+            ))
+        }
+        missing @ CacheSequenceRead::Missing { .. } => Ok(missing),
+    }
+}
+
+fn cache_sequence_source_identity(resource: &Value, frame: i32) -> Option<String> {
+    let frame_record = resource.get("sequence_frames")?.get(frame.to_string())?;
+    let identity = json!({
+        "resource_uri": resource.get("uri")?,
+        "resource_kind": resource.get("kind")?,
+        "resource_packed": resource.get("packed")?,
+        "sequence_start": resource.get("sequence_start"),
+        "sequence_end": resource.get("sequence_end"),
+        "frame": frame,
+        "frame_uri": frame_record.get("uri")?,
+        "frame_kind": frame_record.get("kind")?,
+        "frame_packed": frame_record.get("packed")?,
+        "frame_hash": frame_record.get("hash")?,
+    });
+    Some(crate::hash::sha256(
+        &crate::hash::canonicalize(&identity).ok()?,
+    ))
+}
+
+pub(crate) fn read_cache_sequence_resource(
+    resource: &Value,
+    project_root: Option<&Path>,
+    requested_frame: f64,
+) -> Result<CacheSequenceRead> {
+    let frame = num_traits::ToPrimitive::to_i32(&requested_frame.trunc()).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::InvalidArgument,
+            "Mesh Sequence Cache frame is outside int32 sequence range",
+            json!({"frame":requested_frame}),
+        )
+    })?;
+    let uri = resource
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.trim().is_empty())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic sequence resource has no URI",
+                json!({"frame":frame}),
+            )
+        })?;
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic sequence resource has no kind",
+                json!({"frame":frame}),
+            )
+        })?;
+    if !matches!(kind, "alembic" | "alembic_cache") {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Mesh Sequence Cache resource is not Alembic",
+            json!({"kind":kind,"frame":frame}),
+        ));
+    }
+    let packed_sequence = resource
+        .get("packed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic sequence resource has no packed state",
+                json!({"frame":frame}),
+            )
+        })?;
+    let frame_records = match resource.get("sequence_frames") {
+        Some(Value::Object(records)) => records,
+        None | Some(Value::Null) if !packed_sequence => {
+            return Ok(CacheSequenceRead::Missing {
+                frame,
+                reason: "sequence manifest does not contain file frames",
+            });
+        }
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "Alembic sequence has invalid frame records",
+                json!({"frame":frame}),
+            ));
+        }
+    };
+    if packed_sequence {
+        let start = resource
+            .get("sequence_start")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        let end = resource
+            .get("sequence_end")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "packed Alembic sequence has no inclusive int32 frame range",
+                json!({"frame":frame}),
+            ));
+        };
+        if end < start {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "packed Alembic sequence frame range is not ascending",
+                json!({"start":start,"end":end}),
+            ));
+        }
+        if frame < start || frame > end {
+            return Ok(CacheSequenceRead::Missing {
+                frame,
+                reason: "frame is outside the packed source range",
+            });
+        }
+    }
+    let Some(frame_record) = frame_records.get(&frame.to_string()) else {
+        // A frame inside the packed range with no record is a gap in the source: Blender cannot open that frame, and
+        // the scene still evaluates without it.
+        return Ok(CacheSequenceRead::Missing {
+            frame,
+            reason: if packed_sequence {
+                "frame is missing from the packed source sequence"
+            } else {
+                "frame is outside the registered source sequence"
+            },
+        });
+    };
+    let frame_kind = frame_record
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty());
+    let Some(frame_uri) = frame_record
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.trim().is_empty())
+    else {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Alembic sequence frame is not a standard resource record",
+            json!({"frame":frame,"kind":frame_kind,"packed":frame_record.get("packed")}),
+        ));
+    };
+    let packed_frame = frame_record.get("packed").and_then(Value::as_bool);
+    if frame_kind != Some(kind) || packed_frame != Some(packed_sequence) {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Alembic sequence frame is not a standard resource record",
+            json!({"frame":frame,"kind":frame_kind,"uri":frame_uri,"packed":packed_frame}),
+        ));
+    }
+    if !packed_sequence {
+        let frame_path_text = frame_uri.strip_prefix("file://").unwrap_or(frame_uri);
+        let frame_path = Path::new(frame_path_text);
+        let asset_prefix = Path::new("assets/sha256");
+        let is_content_addressed = frame_path.starts_with(asset_prefix)
+            || project_root.is_some_and(|root| {
+                frame_path
+                    .strip_prefix(root)
+                    .is_ok_and(|relative| relative.starts_with(asset_prefix))
+            });
+        if !is_content_addressed {
+            let sequence_path_text = uri.strip_prefix("file://").unwrap_or(uri);
+            let sequence_path = Path::new(sequence_path_text);
+            let sequence_path = if sequence_path.is_absolute() {
+                sequence_path.to_path_buf()
+            } else if let Some(root) = project_root {
+                root.join(sequence_path)
+            } else {
+                return Err(PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "relative Alembic cache sequence cannot be resolved without a project root",
+                    json!({"uri":uri,"frame":frame}),
+                ));
+            };
+            let Some(expected_path) =
+                crate::cache_sequence::cache_sequence_frame_path(&sequence_path, frame)?
+            else {
+                return Ok(CacheSequenceRead::Missing {
+                    frame,
+                    reason: "linked source sequence frame is missing",
+                });
+            };
+            let frame_path = if frame_path.is_absolute() {
+                frame_path.to_path_buf()
+            } else if let Some(root) = project_root {
+                root.join(frame_path)
+            } else {
+                return Err(PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "relative Alembic cache frame cannot be resolved without a project root",
+                    json!({"uri":frame_uri,"frame":frame}),
+                ));
+            };
+            let actual_path = match fs::canonicalize(&frame_path) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "registered Alembic sequence frame URI does not name its source frame",
+                        json!({"uri":uri,"frame_uri":frame_uri,"frame":frame}),
+                    ));
+                }
+                Err(error) => return Err(PotError::io(&error)),
+            };
+            if actual_path != expected_path {
+                return Err(PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "registered Alembic sequence frame URI does not match its source pattern",
+                    json!({
+                        "uri":uri,
+                        "frame_uri":frame_uri,
+                        "expected_path":expected_path,
+                        "actual_path":actual_path,
+                        "frame":frame,
+                    }),
+                ));
+            }
+        }
+    }
+    match crate::cache_sequence::read_cache_resource_record(
+        frame_record,
+        &format!("{uri}:{frame}"),
+        project_root,
+    ) {
+        Ok((bytes, digest)) => Ok(CacheSequenceRead::Available(
+            Arc::new(bytes),
+            Arc::from(digest),
+        )),
+        Err(error)
+            if !packed_sequence
+                && error.code == ErrorCode::DependencyMissing
+                && error.message.starts_with("Alembic cache file is missing:") =>
+        {
+            Ok(CacheSequenceRead::Missing {
+                frame,
+                reason: "linked source sequence frame is missing",
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 const MAX_RENDERED_PARTICLES: usize = 100_000;
@@ -7974,5 +8719,13 @@ mod tests {
         assert_eq!(legacy.material_slot(Some(&data), 0), Some(&object_override));
         assert_eq!(legacy.material_slot(Some(&data), 1), None);
         assert_eq!(legacy.material_slot(Some(&data), 2), Some(&data_last));
+    }
+
+    #[test]
+    fn bake_is_not_an_evaluation_purpose() {
+        let bake = json!({"purpose": "bake"});
+        assert!(serde_json::from_value::<crate::eval::EvaluationContext>(bake).is_err());
+        let preview = json!({"purpose": "preview"});
+        assert!(serde_json::from_value::<crate::eval::EvaluationContext>(preview).is_ok());
     }
 }

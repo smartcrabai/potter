@@ -7,11 +7,17 @@
     "mesh_sequence_cache.frame_offset": {
       "reason": "Blender's MeshSequenceCacheModifier does not expose frame_offset as an RNA property, so the table default cannot be sampled at runtime."
     },
+    "mesh_sequence_cache.is_sequence": {
+      "reason": "Blender's MeshSequenceCacheModifier does not expose is_sequence as an RNA property; it is a CacheFile setting that Potter mirrors onto the modifier, so the table default cannot be sampled at runtime."
+    },
     "mesh_sequence_cache.override_frame": {
       "reason": "Blender's MeshSequenceCacheModifier does not expose override_frame as an RNA property, so the table default cannot be sampled at runtime."
     },
-    "mesh_sequence_cache.scale": {
-      "reason": "Blender's MeshSequenceCacheModifier does not expose scale as an RNA property, so the table default cannot be sampled at runtime."
+    "mesh_sequence_cache.velocity_name": {
+      "reason": "Blender's MeshSequenceCacheModifier does not expose velocity_name as an RNA property; it is a CacheFile setting that Potter mirrors onto the modifier, so the table default cannot be sampled at runtime."
+    },
+    "mesh_sequence_cache.velocity_unit": {
+      "reason": "Blender's MeshSequenceCacheModifier does not expose velocity_unit as an RNA property; it is a CacheFile setting that Potter mirrors onto the modifier, so the table default cannot be sampled at runtime."
     },
     "nodes.inputs": {
       "reason": "Blender's NodesModifier does not expose an inputs RNA attribute on the modifier instance, so the table default cannot be sampled there."
@@ -325,6 +331,11 @@
       "use_pin_to_last": false
     },
     "hook": {
+      "center": [
+        0.0,
+        0.0,
+        0.0
+      ],
       "falloff_curve": [
         [
           0.0,
@@ -336,21 +347,15 @@
         ]
       ],
       "falloff_curve_settings": {
-        "use_clip": true,
         "clip_bounds": [
           0.0,
           0.0,
           1.0,
           1.0
         ],
-        "extend": "EXTRAPOLATED"
+        "extend": "EXTRAPOLATED",
+        "use_clip": true
       },
-      "vertex_indices": [],
-      "center": [
-        0.0,
-        0.0,
-        0.0
-      ],
       "falloff_radius": 0.0,
       "falloff_type": "SMOOTH",
       "invert_vertex_group": false,
@@ -382,7 +387,8 @@
       "use_apply_on_spline": false,
       "use_falloff_uniform": false,
       "use_pin_to_last": false,
-      "vertex_group": ""
+      "vertex_group": "",
+      "vertex_indices": []
     },
     "laplacian_deform": {
       "invert_vertex_group": false,
@@ -954,6 +960,16 @@
           1.0
         ]
       ],
+      "map_curve_settings": {
+        "clip_bounds": [
+          0.0,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "extend": "EXTRAPOLATED",
+        "use_clip": true
+      },
       "mask_constant": 1.0,
       "mask_tex_map_bone": "",
       "mask_tex_map_object": null,
@@ -1014,6 +1030,16 @@
           1.0
         ]
       ],
+      "map_curve_settings": {
+        "clip_bounds": [
+          0.0,
+          0.0,
+          1.0,
+          1.0
+        ],
+        "extend": "EXTRAPOLATED",
+        "use_clip": true
+      },
       "mask_constant": 1.0,
       "mask_tex_map_bone": "",
       "mask_tex_map_object": null,
@@ -1072,6 +1098,8 @@
       "voxel_size": 0.10000000149011612
     },
     "warp": {
+      "bone_from": "",
+      "bone_to": "",
       "falloff_curve": [
         [
           0.0,
@@ -1083,17 +1111,15 @@
         ]
       ],
       "falloff_curve_settings": {
-        "use_clip": true,
         "clip_bounds": [
           0.0,
           0.0,
           1.0,
           1.0
         ],
-        "extend": "EXTRAPOLATED"
+        "extend": "EXTRAPOLATED",
+        "use_clip": true
       },
-      "bone_from": "",
-      "bone_to": "",
       "falloff_radius": 1.0,
       "falloff_type": "SMOOTH",
       "invert_vertex_group": false,

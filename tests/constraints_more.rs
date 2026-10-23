@@ -2,7 +2,7 @@ use std::{error::Error, fs, io, path::Path, process::Command};
 
 use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
-    eval::{EvaluationContext, Snapshot},
+    eval::{EvaluationContext, EvaluationPurpose, EvaluationSession, Snapshot},
     model::{Id, ReconstructedPoint, SceneDoc, TrackingMarker},
     ops,
     tracking::{CameraModel, CameraObservation},
@@ -85,6 +85,35 @@ fn max_matrix_error(left: DMat4, right: DMat4) -> f64 {
         .zip(right.to_cols_array())
         .map(|(left, right)| (left - right).abs())
         .fold(0.0_f64, f64::max)
+}
+
+fn assert_mesh_positions_match(mesh: &potter_core::geom::Mesh, expected: &Value) -> TestResult {
+    let expected: Vec<[f64; 3]> = serde_json::from_value(expected.clone())?;
+    assert_eq!(mesh.vertices.len(), expected.len());
+    let mut actual = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co.to_array())
+        .collect::<Vec<_>>();
+    for expected in expected {
+        let Some(index) = actual.iter().position(|point| {
+            point
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-5)
+        }) else {
+            return Err(io::Error::other(format!(
+                "cache mesh vertex {expected:?} was not present in {actual:?}"
+            ))
+            .into());
+        };
+        actual.swap_remove(index);
+    }
+    assert!(
+        actual.is_empty(),
+        "unexpected cache mesh vertices: {actual:?}"
+    );
+    Ok(())
 }
 fn object_reprojection_errors(
     doc: &SceneDoc,
@@ -2160,6 +2189,349 @@ with open(output_path, "w", encoding="utf-8") as output:
             "Pose-bone Transform Cache frame {frame} maximum component error: {maximum_error:.6e}"
         );
     }
+    Ok(())
+}
+#[test]
+fn blender_transform_cache_sequence_gap_reuses_the_selected_archive() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        return Err(
+            io::Error::other("Blender is required for the Transform Cache sequence probe").into(),
+        );
+    };
+    let directory = tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    let output_path = root.join("sequence_matrices.json");
+    let script = r#"
+import bpy, json, os, sys
+root = sys.argv[sys.argv.index("--") + 1]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+scene.render.fps = 1
+def new_source():
+    mesh = bpy.data.meshes.new("Mesh")
+    mesh.from_pydata([(-1,-1,0),(1,-1,0),(1,1,0),(-1,1,0)], [], [(0,1,2,3)])
+    obj = bpy.data.objects.new("Animated", mesh); scene.collection.objects.link(obj)
+    return obj, mesh
+for frame, x in ((1,10.0),(2,20.0)):
+    scene.frame_set(frame); obj, mesh = new_source()
+    obj.location.x = x; obj.select_set(True); bpy.context.view_layer.objects.active = obj
+    bpy.ops.wm.alembic_export(filepath=os.path.join(root,f"seq.{frame:04d}.abc"),
+        start=frame,end=frame,selected=True,flatten=False,uvs=False,normals=False,as_background_job=False)
+    bpy.data.objects.remove(obj,do_unlink=True); bpy.data.meshes.remove(mesh)
+scene.frame_set(3); obj, mesh = new_source()
+basis = obj.shape_key_add(name="Basis")
+lift = obj.shape_key_add(name="Lift")
+lift.data[0].co.z = 2.0
+lift.value = 0.0; lift.keyframe_insert(data_path="value",frame=3)
+lift.value = 1.0; lift.keyframe_insert(data_path="value",frame=4)
+obj.location.x = 30.0; obj.keyframe_insert(data_path="location",frame=3)
+obj.location.x = 40.0; obj.keyframe_insert(data_path="location",frame=4)
+obj.select_set(True); bpy.context.view_layer.objects.active = obj
+bpy.ops.wm.alembic_export(filepath=os.path.join(root,"seq.0004.abc"),
+    start=3,end=4,selected=True,flatten=False,uvs=False,normals=False,as_background_job=False)
+bpy.data.objects.remove(obj,do_unlink=True); bpy.data.meshes.remove(mesh)
+scene.render.fps = 24
+first_path = os.path.join(root,"seq.0001.abc")
+bpy.ops.wm.alembic_import(filepath=first_path,set_frame_range=False,always_add_cache_reader=True,as_background_job=False)
+cache = bpy.data.cache_files[-1]
+object_path = cache.object_paths[0].path
+cache.filepath = first_path; cache.is_sequence = True
+for obj in list(bpy.data.objects):
+    if obj.type == "MESH": bpy.data.objects.remove(obj,do_unlink=True)
+def new_owner(name):
+    obj = bpy.data.objects.new(name,None); scene.collection.objects.link(obj)
+    obj.location=(3.0,5.0,7.0); obj.rotation_euler=(0.2,-0.3,0.4); obj.scale=(1.5,2.0,0.75)
+    return obj
+def matrix(obj):
+    value=obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).matrix_world
+    return [float(value[r][c]) for c in range(4) for r in range(4)]
+def positions(obj):
+    evaluated=obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    mesh=evaluated.to_mesh()
+    try: return [[float(v.co[i]) for i in range(3)] for v in mesh.vertices]
+    finally: evaluated.to_mesh_clear()
+owner = new_owner("SequenceOwner")
+constraint = owner.constraints.new("TRANSFORM_CACHE")
+constraint.cache_file=cache; constraint.object_path=object_path
+receiver_mesh=bpy.data.meshes.new("ReceiverMesh")
+receiver_mesh.from_pydata([(-1,-1,0),(1,-1,0),(1,1,0),(-1,1,0)], [], [(0,1,2,3)])
+receiver=bpy.data.objects.new("Receiver",receiver_mesh); scene.collection.objects.link(receiver)
+modifier=receiver.modifiers.new("Sequence Cache","MESH_SEQUENCE_CACHE")
+modifier.cache_file=cache; modifier.object_path=object_path; modifier.read_data={"VERT","POLY"}
+sequence={}
+for frame in (4,3):
+    scene.frame_set(frame); bpy.context.view_layer.update()
+    sequence[str(frame)]={"matrix":matrix(owner),"vertices":positions(receiver)}
+assert sequence["4"]["matrix"] != sequence["3"]["matrix"]
+assert sequence["4"]["vertices"] != sequence["3"]["vertices"]
+cache.filepath = os.path.join(root,"seq.0002.abc")
+from_two = {}
+for frame in (2,3):
+    scene.frame_set(frame); bpy.context.view_layer.update()
+    from_two[str(frame)]={"matrix":matrix(owner),"vertices":positions(receiver)}
+cache.filepath = os.path.join(root,"seq.0004.abc")
+missing_cache_path=os.path.join(root,"seq.0003.abc")
+bpy.ops.cachefile.open(filepath=missing_cache_path)
+missing_cache=bpy.data.cache_files[-1]; missing_cache.is_sequence=True
+fresh_owner=new_owner("FreshOwner")
+fresh_constraint=fresh_owner.constraints.new("TRANSFORM_CACHE")
+fresh_constraint.cache_file=missing_cache; fresh_constraint.object_path=object_path
+fresh_mesh=bpy.data.meshes.new("FreshMesh")
+fresh_mesh.from_pydata([(-1,-1,0),(1,-1,0),(1,1,0),(-1,1,0)], [], [(0,1,2,3)])
+fresh_receiver=bpy.data.objects.new("FreshReceiver",fresh_mesh); scene.collection.objects.link(fresh_receiver)
+fresh_modifier=fresh_receiver.modifiers.new("Missing Cache","MESH_SEQUENCE_CACHE")
+fresh_modifier.cache_file=missing_cache; fresh_modifier.object_path=object_path; fresh_modifier.read_data={"VERT","POLY"}
+scene.frame_set(3); bpy.context.view_layer.update()
+fresh_missing={"matrix":matrix(fresh_owner),"vertices":positions(fresh_receiver)}
+with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f:
+    json.dump({"sequence":sequence,"from_two":from_two,"fresh_missing":fresh_missing},f)
+"#;
+    let script_path = root.join("make_transform_sequence.py");
+    fs::write(&script_path, script)?;
+    let blender_output = Command::new(&blender)
+        .args(["--background", "--factory-startup", "--python"])
+        .arg(&script_path)
+        .args(["--", root.to_str().ok_or("probe path is not UTF-8")?])
+        .output()?;
+    assert!(
+        blender_output.status.success(),
+        "Blender sequence probe failed: {}",
+        String::from_utf8_lossy(&blender_output.stderr)
+    );
+    let pattern = root.join("seq.####.abc");
+    let (_directory, project_path) = project(&json!([
+        {"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,4.0]},"projection":"orthographic","ortho_scale":3.0},
+        {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
+        {"op":"node.create","id":"owner","kind":"empty","transform":{"translation":[3.0,5.0,7.0],"rotation_deg":[11.459_156,-17.188_734,22.918_312],"scale":[1.5,2.0,0.75]}},
+        {"op":"node.create","id":"receiver","kind":"plane","params":{"size":2.0}},
+        {"op":"resource.pack","id":"cache","uri":pattern,"kind":"alembic","sequence":{"start":1,"end":2}},
+        {"op":"constraint.create","target":{"id":"owner"},"id":"cache","type":"transform_cache","params":{"resource":"cache","object_path":"/Animated/Mesh","frame_offset":0.0,"scale":1.0,"override_frame":null}},
+        {"op":"modifier.create","target":{"id":"receiver"},"id":"sequence","type":"mesh_sequence_cache","params":{"resource":"cache","object_path":"/Animated/Mesh","is_sequence":true,"read_data":["VERT","POLY"]}}
+    ]))?;
+    let frame4 = fs::read(root.join("seq.0004.abc"))?;
+    let digest = potter_core::hash::sha256(&frame4);
+    let mut document: Value = serde_json::from_slice(&fs::read(project_path.join("scene.json"))?)?;
+    document["resources"]["cache"]["sequence_end"] = json!(4);
+    document["resources"]["cache"]["sequence_frames"]["4"] = json!({
+        "uri":root.join("seq.0004.abc"),"kind":"alembic","hash":digest,"packed":true,
+        "bytes":serde_json::to_value(frame4)?
+    });
+    document["scenes"]["scene_main"]["render"]["resolution_x"] = json!(64);
+    document["scenes"]["scene_main"]["render"]["resolution_y"] = json!(64);
+    document["scenes"]["scene_main"]["render"]["resolution_percentage"] = json!(100);
+    document["scenes"]["scene_main"]["render"]["samples"] = json!(1);
+    fs::write(
+        project_path.join("scene.json"),
+        serde_json::to_vec_pretty(&document)?,
+    )?;
+    let document: SceneDoc = serde_json::from_slice(&fs::read(project_path.join("scene.json"))?)?;
+    let oracle: Value = serde_json::from_slice(&fs::read(output_path)?)?;
+    let assert_frame = |snapshot: &Snapshot, frame: i32| -> TestResult {
+        let oracle_frame = &oracle["sequence"][frame.to_string()];
+        let actual = snapshot.nodes[&Id::new("owner")?].world_matrix;
+        assert!(
+            max_matrix_error(
+                DMat4::from_cols_array(&actual),
+                blender_matrix(&oracle_frame["matrix"])?
+            ) < 1.0e-5,
+            "Transform Cache differs at frame {frame}"
+        );
+        let mesh = snapshot
+            .meshes
+            .get(&Id::new("receiver")?)
+            .ok_or_else(|| io::Error::other("Mesh Sequence Cache receiver mesh is missing"))?;
+        assert_mesh_positions_match(mesh, &oracle_frame["vertices"])?;
+        Ok(())
+    };
+    let mut session = EvaluationSession::default();
+    let fresh_frame4 = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(4.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut session,
+    )?;
+    let warm_frame4 = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(4.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut session,
+    )?;
+    assert_eq!(
+        fresh_frame4.evaluation_hash, warm_frame4.evaluation_hash,
+        "same-frame reevaluation with the retained reader must keep its key stable"
+    );
+    assert_frame(&fresh_frame4, 4)?;
+    assert_frame(&warm_frame4, 4)?;
+    let warm_frame3 = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(3.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut session,
+    )?;
+    assert_frame(&warm_frame3, 3)?;
+
+    let mut mesh_only_document = document.clone();
+    mesh_only_document
+        .nodes
+        .get_mut(&Id::new("owner")?)
+        .ok_or_else(|| io::Error::other("Transform Cache owner is missing"))?
+        .constraints
+        .clear();
+    let mut mesh_only_session = EvaluationSession::default();
+    let fresh_mesh_only = Snapshot::evaluate_with_cache_session(
+        &mesh_only_document,
+        &EvaluationContext {
+            frame: Some(4.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut mesh_only_session,
+    )?;
+    let warm_mesh_only = Snapshot::evaluate_with_cache_session(
+        &mesh_only_document,
+        &EvaluationContext {
+            frame: Some(4.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut mesh_only_session,
+    )?;
+    assert_eq!(
+        fresh_mesh_only.evaluation_hash, warm_mesh_only.evaluation_hash,
+        "Mesh Sequence Cache source selection must be included after modifier evaluation"
+    );
+    assert_mesh_positions_match(
+        warm_mesh_only
+            .meshes
+            .get(&Id::new("receiver")?)
+            .ok_or_else(|| io::Error::other("Mesh Sequence Cache receiver mesh is missing"))?,
+        &oracle["sequence"]["4"]["vertices"],
+    )?;
+    let retained_missing = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(3.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut session,
+    )?;
+    let mut fresh_session = EvaluationSession::default();
+    let fresh_missing = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(3.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut fresh_session,
+    )?;
+    assert_ne!(
+        retained_missing.evaluation_hash, fresh_missing.evaluation_hash,
+        "the selected CacheFile archive participates in the evaluation key"
+    );
+    let actual = fresh_missing.nodes[&Id::new("owner")?].world_matrix;
+    assert!(
+        max_matrix_error(
+            DMat4::from_cols_array(&actual),
+            blender_matrix(&oracle["fresh_missing"]["matrix"])?
+        ) < 1.0e-5,
+        "without a selected CacheFile archive, Transform Cache must preserve the owner's base matrix"
+    );
+    let mesh = fresh_missing
+        .meshes
+        .get(&Id::new("receiver")?)
+        .ok_or_else(|| io::Error::other("fresh missing-frame receiver mesh is missing"))?;
+    assert_mesh_positions_match(mesh, &oracle["fresh_missing"]["vertices"])?;
+
+    let mut from_two_session = EvaluationSession::default();
+    let _ = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(2.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut from_two_session,
+    )?;
+    let from_two_missing = Snapshot::evaluate_with_cache_session(
+        &document,
+        &EvaluationContext {
+            frame: Some(3.0),
+            purpose: EvaluationPurpose::Render,
+            ..EvaluationContext::default()
+        },
+        Some(&project_path),
+        Some(&project_path.join(".potter/cache")),
+        &mut from_two_session,
+    )?;
+    let from_two_oracle = &oracle["from_two"]["3"];
+    assert!(
+        max_matrix_error(
+            DMat4::from_cols_array(&from_two_missing.nodes[&Id::new("owner")?].world_matrix),
+            blender_matrix(&from_two_oracle["matrix"])?
+        ) < 1.0e-5,
+        "a gap after frame 2 must sample the retained frame-2 archive"
+    );
+    assert_ne!(
+        retained_missing.evaluation_hash, from_two_missing.evaluation_hash,
+        "different retained archives at frame 3 must produce distinct evaluation keys"
+    );
+
+    let render_output = project_path.join("render-cache-sequence");
+    let render = pot()
+        .arg("render")
+        .arg(&project_path)
+        .args([
+            "--frames",
+            "2:3",
+            "--camera",
+            "camera_main",
+            "--engine",
+            "realtime",
+            "--format",
+            "png",
+            "--out",
+        ])
+        .arg(&render_output)
+        .arg("--json")
+        .output()?;
+    assert!(
+        render.status.success(),
+        "sequence CLI render failed: {}",
+        String::from_utf8_lossy(&render.stdout)
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(render_output.join("render.manifest.json"))?)?;
+    assert_eq!(
+        manifest["frames"][1]["evaluation_hash"],
+        from_two_missing.evaluation_hash
+    );
     Ok(())
 }
 #[test]

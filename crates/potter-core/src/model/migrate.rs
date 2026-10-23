@@ -202,7 +202,7 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 8, converting superseded modifier binds on
+/// Upgrades a scene document in place through schema version 9, converting superseded modifier binds on
 /// the way. `root` is the project directory that holds the document's image blobs and linked sources,
 /// which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
@@ -229,6 +229,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(7) {
         upgrade_v7(value);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(8) {
+        upgrade_v8(value);
     }
     Ok(warnings)
 }
@@ -644,6 +647,52 @@ fn upgrade_node_ray_visibility(node: &mut Value) {
     node["ray_visibility"] = Value::Object(flags);
 }
 
+/// Upgrades a schema-version-8 scene document to version 9. `Mesh Sequence Cache`'s `CacheFile` fields moved from the
+/// referenced resource's `cache_file` record into the modifier params: `is_sequence`, `velocity_name` and
+/// `velocity_unit` are copied from it when the params do not already set them. The `scale` param is removed, since
+/// Blender applies `CacheFile.scale` only through a Transform Cache constraint.
+fn upgrade_v8(value: &mut Value) {
+    let cache_files: std::collections::BTreeMap<String, Map<String, Value>> = value
+        .get("resources")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, resource)| {
+            Some((id.clone(), resource.get("cache_file")?.as_object()?.clone()))
+        })
+        .collect();
+    if let Some(nodes) = value.get_mut("nodes").and_then(Value::as_object_mut) {
+        for node in nodes.values_mut() {
+            let Some(modifiers) = node.get_mut("modifiers").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for modifier in modifiers {
+                if modifier.get("type").and_then(Value::as_str) != Some("mesh_sequence_cache") {
+                    continue;
+                }
+                let Some(params) = modifier.get_mut("params").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                params.remove("scale");
+                let Some(cache_file) = params
+                    .get("resource")
+                    .and_then(Value::as_str)
+                    .and_then(|id| cache_files.get(id))
+                else {
+                    continue;
+                };
+                for key in ["is_sequence", "velocity_name", "velocity_unit"] {
+                    if let Some(setting) = cache_file.get(key)
+                        && !params.contains_key(key)
+                    {
+                        params.insert(key.to_owned(), setting.clone());
+                    }
+                }
+            }
+        }
+    }
+    value["schema_version"] = json!(9);
+}
 fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Some(curve) = color.get_mut("curve") else {
         return Ok(());
@@ -1733,7 +1782,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1755,7 +1804,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -1775,7 +1824,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -1799,14 +1848,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_seven_scenes_advance_to_eight_and_keep_their_other_fields() {
+    fn current_schema_nine_scenes_pass_through_untouched() {
         let mut scene = json!({
-            "schema_version": 7,
+            "schema_version": 9,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -1829,7 +1878,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -1852,6 +1901,36 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Schema 7 kept a Mesh Sequence Cache's `CacheFile` fields on the resource and an unused `scale` param on the
+    /// modifier. The upgrade copies the fields into the params (an explicit param wins), drops `scale`, and leaves
+    /// other modifier types alone.
+    #[test]
+    fn schema_seven_sequence_caches_take_their_cache_file_fields() {
+        let mut scene = json!({
+            "schema_version": 7,
+            "resources": {
+                "cache": {"cache_file": {"is_sequence": true, "velocity_name": ".vel", "velocity_unit": "FRAME", "scale": 2.0}},
+                "other": {"uri": "a.abc"}
+            },
+            "nodes": {"body": {"modifiers": [
+                {"type": "mesh_sequence_cache", "params": {"resource": "cache", "object_path": "/a", "scale": 2.0, "velocity_unit": "SECOND"}},
+                {"type": "mesh_sequence_cache", "params": {"resource": "other", "object_path": "/b", "scale": 1.0}},
+                {"type": "mesh_cache", "params": {"resource": "cache", "scale": 1.0}}
+            ]}}
+        });
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(9));
+        let modifiers = &scene["nodes"]["body"]["modifiers"];
+        let first = &modifiers[0]["params"];
+        assert_eq!(first["is_sequence"], json!(true));
+        assert_eq!(first["velocity_name"], json!(".vel"));
+        assert_eq!(first["velocity_unit"], json!("SECOND"));
+        assert!(first.get("scale").is_none());
+        assert!(modifiers[1]["params"].get("is_sequence").is_none());
+        assert!(modifiers[1]["params"].get("scale").is_none());
+        assert_eq!(modifiers[2]["params"]["scale"], json!(1.0));
     }
 
     /// A project saved at schema 3 labelled its EXR straight, but Blender and the loader read an EXR as premultiplied.
@@ -1890,7 +1969,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 8);
+        assert_eq!(parsed.doc.schema_version, 9);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -1936,7 +2015,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(8));
+        assert_eq!(scene["schema_version"], json!(9));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -1979,7 +2058,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(8);
+        expected["schema_version"] = json!(9);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -2017,7 +2096,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 8);
+        assert_eq!(migrated.schema_version, 9);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -2231,7 +2310,7 @@ mod tests {
         assert_eq!(attributes["custom_normal"]["type"], json!("normal_code"));
         assert_eq!(
             attributes["custom_normal"]["values"][face.as_str()],
-            json!([null, null, null])
+            json!([[0, 0], [0, 0], [0, 0]])
         );
         let kept: Vec<&str> = attributes["blender_attributes"]
             .as_array()
@@ -2287,8 +2366,8 @@ mod tests {
             .as_array()
             .ok_or("migrated custom normal row is missing")?;
         assert_eq!(corners[0], json!([16000, 0]));
-        assert_eq!(corners[1], Value::Null);
-        assert_eq!(corners[2], Value::Null);
+        assert_eq!(corners[1], json!([0, 0]));
+        assert_eq!(corners[2], json!([0, 0]));
         assert!(
             !attributes
                 .get("blender_attributes")
@@ -2328,7 +2407,7 @@ mod tests {
         );
         assert_eq!(
             migrated.attributes["custom_normal"]["values"][face.as_str()],
-            json!(["explicit_zero", null, null])
+            json!(["explicit_zero", [0, 0], [0, 0]])
         );
         Ok(())
     }
@@ -2521,7 +2600,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 8);
+        assert_eq!(record.snapshot.schema_version, 9);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -2588,7 +2667,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 8);
+        assert_eq!(record.snapshot.schema_version, 9);
         let history_mesh = record
             .snapshot
             .data_blocks

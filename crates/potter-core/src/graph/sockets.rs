@@ -68,6 +68,7 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "GeometryNodeSimulationInput"
             | "GeometryNodeSimulationOutput"
             | "GeometryNodeRepeatOutput"
+            | "GeometryNodeBake"
             | "CompositorNodeRLayers"
             | "CompositorNodeExposure"
             | "CompositorNodeComposite"
@@ -80,6 +81,19 @@ type SocketPair = (SocketList, SocketList);
 
 pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair> {
     let node = group.nodes.get(node_id)?;
+    if node.node_type == "GeometryNodeBake" {
+        let items = node.properties.get("bake_items")?.as_array()?;
+        let bake_sockets = items
+            .iter()
+            .map(|item| {
+                Some((
+                    bake_item_identifier(item)?,
+                    bake_item_socket_type(item.get("socket_type")?.as_str()?)?.to_owned(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some((bake_sockets.clone(), bake_sockets));
+    }
     let sockets = match node.node_type.as_str() {
         "NodeGroupInput" => (
             Vec::new(),
@@ -434,6 +448,28 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         _ => return None,
     };
     Some(sockets)
+}
+
+/// The socket identifier of a Bake item: its `id`, falling back to `identifier` and then `name`.
+pub(super) fn bake_item_identifier(item: &serde_json::Value) -> Option<String> {
+    item.get("id")
+        .or_else(|| item.get("identifier"))
+        .or_else(|| item.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+fn bake_item_socket_type(value: &str) -> Option<&'static str> {
+    match value {
+        "geometry" | "GEOMETRY" | "NodeSocketGeometry" => Some("geometry"),
+        "float" | "FLOAT" | "NodeSocketFloat" => Some("float"),
+        "integer" | "INT" | "INTEGER" | "NodeSocketInt" => Some("integer"),
+        "boolean" | "BOOL" | "BOOLEAN" | "NodeSocketBool" => Some("boolean"),
+        "vector" | "VECTOR" | "FLOAT_VECTOR" | "NodeSocketVector" => Some("vector"),
+        "rotation" | "ROTATION" | "NodeSocketRotation" => Some("rotation"),
+        "color" | "COLOR" | "RGBA" | "NodeSocketColor" => Some("color"),
+        "string" | "STRING" | "NodeSocketString" => Some("string"),
+        _ => None,
+    }
 }
 
 fn sockets(items: &[Socket]) -> Vec<(String, String)> {

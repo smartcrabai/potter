@@ -51,13 +51,24 @@ EXCEPTIONS = {
         "Blender's MeshSequenceCacheModifier does not expose frame_offset as an RNA "
         "property, so the table default cannot be sampled at runtime."
     ),
-    "mesh_sequence_cache.scale": (
-        "Blender's MeshSequenceCacheModifier does not expose scale as an RNA "
-        "property, so the table default cannot be sampled at runtime."
+    "mesh_sequence_cache.is_sequence": (
+        "Blender's MeshSequenceCacheModifier does not expose is_sequence as an RNA property; "
+        "it is a CacheFile setting that Potter mirrors onto the modifier, so the table default "
+        "cannot be sampled at runtime."
     ),
     "mesh_sequence_cache.override_frame": (
         "Blender's MeshSequenceCacheModifier does not expose override_frame as an RNA "
         "property, so the table default cannot be sampled at runtime."
+    ),
+    "mesh_sequence_cache.velocity_name": (
+        "Blender's MeshSequenceCacheModifier does not expose velocity_name as an RNA property; "
+        "it is a CacheFile setting that Potter mirrors onto the modifier, so the table default "
+        "cannot be sampled at runtime."
+    ),
+    "mesh_sequence_cache.velocity_unit": (
+        "Blender's MeshSequenceCacheModifier does not expose velocity_unit as an RNA property; "
+        "it is a CacheFile setting that Potter mirrors onto the modifier, so the table default "
+        "cannot be sampled at runtime."
     ),
     "nodes.inputs": (
         "Blender's NodesModifier does not expose an inputs RNA attribute on the "
@@ -141,15 +152,39 @@ def new_modifier(owner, key, identifier):
     return mod
 
 
+# Table curve-settings properties -> Blender's CurveMapping RNA property on the same modifier.
+CURVE_SETTINGS_PROPERTIES = {
+    "falloff_curve_settings": "falloff_curve",
+    "map_curve_settings": "map_curve",
+}
+
+
+def curve_settings_json(mapping):
+    return {
+        "use_clip": bool(mapping.use_clip),
+        "clip_bounds": [
+            float(mapping.clip_min_x),
+            float(mapping.clip_min_y),
+            float(mapping.clip_max_x),
+            float(mapping.clip_max_y),
+        ],
+        "extend": mapping.extend,
+    }
+
+
 def record_properties(key, mod, properties):
     values = {}
     for prop in properties:
+        attribute = CURVE_SETTINGS_PROPERTIES.get(prop, prop)
         try:
-            value = getattr(mod, prop)
+            value = getattr(mod, attribute)
         except AttributeError:
             print(f"SKIP {key}.{prop}: not exposed on Blender modifier, not compared")
             continue
-        values[prop] = to_json_value(value)
+        if prop in CURVE_SETTINGS_PROPERTIES:
+            values[prop] = curve_settings_json(value)
+        else:
+            values[prop] = to_json_value(value)
     return values
 
 

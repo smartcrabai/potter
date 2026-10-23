@@ -236,6 +236,25 @@ pub struct BakeArgs {
         help = "Target Object or modifier ID, depending on the bake kind."
     )]
     pub target: Option<String>,
+    #[arg(long, help = "Modifier ID for a node bake.")]
+    pub modifier: Option<String>,
+    #[arg(long, help = "Bake node ID for a node bake.")]
+    pub node: Option<String>,
+    #[arg(long, value_enum, help = "Node bake mode: still or animation.")]
+    pub mode: Option<NodeBakeMode>,
+    #[arg(long, help = "Pack a node bake cache into the project.")]
+    pub pack: bool,
+    #[arg(long, help = "Unpack a packed node bake cache to disk.")]
+    pub unpack: bool,
+    #[arg(
+        long,
+        value_enum,
+        requires = "unpack",
+        help = "Unpack method: use-local, write-local, use-original, or write-original."
+    )]
+    pub unpack_method: Option<NodeBakeUnpackMethod>,
+    #[arg(long, help = "Delete a node bake and resume live evaluation.")]
+    pub delete: bool,
     #[arg(
         long,
         help = "Frame range as start:end[:step] (Ocean uses modifier frame_start/end)."
@@ -243,10 +262,9 @@ pub struct BakeArgs {
     pub frames: Option<String>,
     #[arg(
         long,
-        required = true,
-        help = "Output directory for baked data or the bake report."
+        help = "Output directory for baked data or the bake report. Required for Ocean, animation, geometry, and simulation bakes."
     )]
-    pub out: PathBuf,
+    pub out: Option<PathBuf>,
     #[arg(long, help = "Replace existing output files.")]
     pub overwrite: bool,
     #[command(flatten)]
@@ -360,6 +378,24 @@ pub enum BakeKind {
     Geometry,
     Animation,
     Ocean,
+    #[value(name = "node-bake")]
+    NodeBake,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NodeBakeMode {
+    Still,
+    Animation,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NodeBakeUnpackMethod {
+    #[value(name = "use-local")]
+    UseLocal,
+    #[value(name = "write-local")]
+    WriteLocal,
+    #[value(name = "use-original")]
+    UseOriginal,
+    #[value(name = "write-original")]
+    WriteOriginal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

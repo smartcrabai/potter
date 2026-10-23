@@ -14,6 +14,9 @@ const SCENE_UPDATE_FIELDS: &[&str] = &[
     "frame_current",
     "frame_start",
     "frame_end",
+    "use_custom_simulation_range",
+    "simulation_frame_start",
+    "simulation_frame_end",
     "fps",
     "fps_base",
     "camera",
@@ -128,6 +131,9 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         frame_current: 1.0,
         frame_start: 1,
         frame_end: 250,
+        use_custom_simulation_range: false,
+        simulation_frame_start: 1,
+        simulation_frame_end: 250,
         fps: 24,
         fps_base: 1.0,
         camera: None,
@@ -277,6 +283,26 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         .get("frame_end")
         .map(|value| read_i32(engine, value, "set/frame_end"))
         .transpose()?;
+    let use_custom_simulation_range = set
+        .get("use_custom_simulation_range")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "set/use_custom_simulation_range must be a boolean",
+                    &operation_pointer(engine.operation_index, "set/use_custom_simulation_range"),
+                )
+            })
+        })
+        .transpose()?;
+    let simulation_frame_start = set
+        .get("simulation_frame_start")
+        .map(|value| read_i32(engine, value, "set/simulation_frame_start"))
+        .transpose()?;
+    let simulation_frame_end = set
+        .get("simulation_frame_end")
+        .map(|value| read_i32(engine, value, "set/simulation_frame_end"))
+        .transpose()?;
     let fps = set
         .get("fps")
         .map(|value| read_fps(engine, value))
@@ -400,6 +426,16 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             &operation_pointer(engine.operation_index, "set/frame_start"),
         ));
     }
+    let next_simulation_start =
+        simulation_frame_start.unwrap_or(current_scene.simulation_frame_start);
+    let next_simulation_end = simulation_frame_end.unwrap_or(current_scene.simulation_frame_end);
+    if next_simulation_start > next_simulation_end {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "simulation_frame_start must not exceed simulation_frame_end",
+            &operation_pointer(engine.operation_index, "set/simulation_frame_start"),
+        ));
+    }
     let scene = engine.doc.scenes.get_mut(&scene_id).ok_or_else(|| {
         crate::error::PotError::new(
             ErrorCode::InternalError,
@@ -429,6 +465,24 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         && scene.frame_end != value
     {
         scene.frame_end = value;
+        changed = true;
+    }
+    if let Some(value) = use_custom_simulation_range
+        && scene.use_custom_simulation_range != value
+    {
+        scene.use_custom_simulation_range = value;
+        changed = true;
+    }
+    if let Some(value) = simulation_frame_start
+        && scene.simulation_frame_start != value
+    {
+        scene.simulation_frame_start = value;
+        changed = true;
+    }
+    if let Some(value) = simulation_frame_end
+        && scene.simulation_frame_end != value
+    {
+        scene.simulation_frame_end = value;
         changed = true;
     }
     if let Some(value) = fps

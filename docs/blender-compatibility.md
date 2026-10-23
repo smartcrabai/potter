@@ -112,6 +112,17 @@ Blender itself has version compatibility limitations. Treat round trips on the b
 - Distinguish retention targets defined in the format catalog from standard conversions such as evaluation and triangulation. List losses of retention targets in `losses` with `feature_id`, `data_id`, `reason`, and a proposed solution. Reject by default; perform an explicitly specified conversion only when `--allow-lossy` is provided. The entire creation graph in .blend is a retention target.
 - Do not turn failures caused by missing runtimes, assets, or extensions into successes with `--allow-lossy`.
 
+### Geometry Nodes Bakes
+
+Each bake node of a Geometry Nodes modifier's node group maps to one entry of the modifier's Blender `bakes` collection, matched by the `potter.id` custom property of the node. Blender creates the entry when the node group is assigned and removes it with the node. Potter writes and reads these settings on the entry: `bake_mode`, `bake_target`, `use_custom_path`, `directory`, `use_custom_simulation_frame_range`, `frame_start`, and `frame_end`. The scene's `use_custom_simulation_range`, `simulation_frame_start`, and `simulation_frame_end` round-trip as scene properties.
+
+- Layout divergence: Potter stores a bake payload at `<bake directory>/<object id>/<modifier id>/<node id>/sha256-<digest>.json`. Blender stores bakes under `<directory>/meta/` and `<directory>/blobs/` (`source/blender/blenkernel/intern/bake_items_paths.cc`, v5.2.2). Potter does not read or write Blender bake blobs or meta files. Blender re-evaluates the bake live from the node tree, so a .blend exported with Potter-written payloads reports `blender.modifier.nodes_bake_payload` for each payload entry.
+- Export loss `blender.modifier.nodes_bake_unmapped`: a `bakes` entry whose key names no `GeometryNodeBake` node of the modifier's node group. Its settings are not written.
+- Import loss `blender.modifier.nodes_bake_data_blocks`: a Blender bake carries data-blocks (`NodesModifierBake.data_blocks`). Potter does not remap data-block references, so they are not kept.
+- Import loss `blender.modifier.nodes_bake_unmapped`: a Blender bake whose node has no `potter.id`. Its settings are not kept.
+- Import loss `blender.modifier.nodes_bake_packed`: every Blender bake whose effective target is PACKED (its own `bake_target`, or the modifier's when it is INHERIT). Blender 5.2.2 exposes no RNA property for packed bake data (`NodesModifierBake` has no `packed`, `bake_size`, or baked-state property; the pack, unpack, and delete operators poll only for an editable active object, `object_bake_simulation.cc:1204-1281`), so the payload cannot be detected from Python. The loss is conservative: a PACKED bake that holds no payload is reported too. Potter does not read the packed payload, so the bake is re-evaluated live.
+- Directory semantics: the stored `directory` is written as given. A Blender relative path (`//`) resolves against the saved .blend, not against the Potter project root.
+
 ## 4. Import and Export Verification Fixtures
 
 Prepare "create," "edit," "evaluate," and "round trip" fixtures for each feature category. The first release MUST NOT be considered complete until all of the following pass.
