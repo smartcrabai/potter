@@ -126,7 +126,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 8,
+            schema_version: 9,
             scene_id,
             revision: 0,
             active_scene,
@@ -154,7 +154,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 8 {
+        if self.schema_version != 9 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),

@@ -18,6 +18,10 @@ use potter_core::{
 )]
 mod exchange_normals;
 
+#[path = "common/normal_codes.rs"]
+mod normal_codes;
+use normal_codes::is_auto_code;
+
 fn apply(doc: &SceneDoc, operations: &Value) -> potter_core::error::Result<SceneDoc> {
     let batch = json!({
         "schema_version": 1,
@@ -198,7 +202,8 @@ fn instanced_custom_normals_rotate_with_the_instance_transform() {
     .unwrap();
     let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
     let mesh = &snapshot.meshes[&"instance".parse::<Id>().unwrap()];
-    // The stored custom normals are Blender code pairs: `null` is Auto, so only a non-null entry is authored.
+    // The stored custom normals are Blender code pairs: Auto is `[0, 0]` (or the legacy `null`), so a face is
+    // authored when one of its corners is not Auto.
     let codes = mesh.attributes["custom_normal"]["values"]
         .as_object()
         .unwrap();
@@ -208,7 +213,7 @@ fn instanced_custom_normals_rotate_with_the_instance_transform() {
     for face in &mesh.faces {
         let count = face.vertices.len();
         let row = codes[&format!("f{}", face.id)].as_array().unwrap();
-        if row.iter().any(|code| !code.is_null()) {
+        if row.iter().any(|code| !is_auto_code(code)) {
             authored_faces.push((face.id, corner_base));
         }
         corner_base += count;
