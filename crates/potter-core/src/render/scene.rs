@@ -21,16 +21,22 @@ use crate::{
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
         SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace,
-        evaluate_surface_with_workspace, fill_color_layers, heaviest, record_unevaluated_inputs,
+        evaluate_surface_with_workspace, fill_color_layers, heaviest, make_orthonormals,
+        record_unevaluated_inputs,
     },
 };
 
 use super::world_probe::WorldProbe;
 use super::{
     bvh::{Bvh, BvhHit, WalkRay},
+    eevee_ltc::Emitter,
+    eevee_transmission::{
+        self, GlassClosures, GlassLight, Thickness, irradiance_probe_radiance, probe_radiance,
+    },
     light_model::{
-        area_irradiance_per_radiance, area_radiance, area_shape, area_visibility_samples,
-        point_intensity, spot_attenuation,
+        AreaShape, area_irradiance_per_radiance, area_radiance, area_shape,
+        area_visibility_samples, emitter_radiance, local_light_influence, point_intensity,
+        spot_cone, sun_disc_radius,
     },
     path::{hit_params, object_for_index},
     principled_bsdf::{
@@ -38,7 +44,7 @@ use super::{
     },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, Triangle, ViewBasis,
-        blend_color, blend_corner_normals, blend_uv,
+        ambient_visibility, blend_color, blend_corner_normals, blend_uv,
     },
     studio,
     wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
@@ -68,6 +74,9 @@ pub(super) struct ObjectRecord {
     /// Joined color registry indices, matching `color_layers`.
     #[serde(skip)]
     pub color_layer_indices: Vec<usize>,
+    /// EEVEE's default refraction thickness of the object (`transmission_thickness`). Not part of the output.
+    #[serde(skip)]
+    pub thickness: f64,
     /// Inverse of the evaluated world matrix; `None` when it is not finite, and the point then stays unchanged.
     #[serde(skip)]
     pub world_to_local: Option<DMat4>,
@@ -161,6 +170,10 @@ impl Geometry {
         }
         all
     }
+    /// The shared realtime BVH contains every geometry triangle; callers apply their own ray-kind filter.
+    pub(super) fn realtime_bvh(&self) -> Option<&Bvh> {
+        self.shadows.as_ref().map(|shadows| &shadows.bvh)
+    }
 }
 
 /// Shadow acceleration for the realtime Beauty engine; built once per geometry and shared by the per-pixel shading of
@@ -193,6 +206,7 @@ struct PointShadowMap {
 struct ShadowScene<'a> {
     bvh: &'a Bvh,
     triangles: &'a [Triangle],
+    prepared_materials: &'a [PreparedMaterial],
     point_maps: &'a BTreeMap<Id, PointShadowMap>,
     occluders: Option<&'a ShadowOccluders<'a>>,
 }
@@ -202,12 +216,9 @@ type ShadowContext<'a> = Option<ShadowScene<'a>>;
 /// Tolerance of shadow rays along their own surface and at a hit (the epsilon of the realtime shadow code).
 const SHADOW_EPSILON: f64 = 1.0e-5;
 
-/// Whether a surface casts a transparent shadow. EEVEE's pass needs the material compiled as transparent, a static
-/// property of its graph (`PreparedMaterial::is_transparent`: `GPU_MATFLAG_TRANSPARENT`), and transparent shadows on
-/// (`eevee_shader.cc` `transparent_shadows`, `eevee_material.cc` `has_transparent_shadows`). A material whose graph is
-/// opaque, such as a plain Principled, casts an ordinary shadow whatever its render method.
+/// Whether a surface casts a transparent shadow. Volume-only geometry has no surface to occlude a light.
 fn casts_transparent_shadow(material: &Material, prepared: &PreparedMaterial) -> bool {
-    material.use_transparent_shadow && prepared.is_transparent()
+    prepared.is_volume_only() || (material.use_transparent_shadow && prepared.is_transparent())
 }
 
 /// EEVEE's transparent shadow pass for one hit (`eevee_surf_shadow.bsl.hh`): a fragment is kept with probability
@@ -293,8 +304,13 @@ impl<'a> ShadowOccluders<'a> {
                     "triangle references an unmapped material",
                 )
             })?;
-        let prepared = self.geometry.prepared.get(triangle.material_index);
-        if !prepared.is_some_and(|prepared| casts_transparent_shadow(material, prepared)) {
+        let Some(prepared) = self.geometry.prepared.get(triangle.material_index) else {
+            return Ok(None);
+        };
+        if prepared.is_volume_only() {
+            return Ok(Some(1.0));
+        }
+        if !casts_transparent_shadow(material, prepared) {
             return Ok(None);
         }
         let shading = hit_params(
@@ -601,6 +617,7 @@ pub(super) fn extract_geometry(
             .iter()
             .map(|&index| &color_store.layers[index])
             .collect();
+        let thickness = mesh.map_or(0.0, |mesh| transmission_thickness(mesh, matrix));
         // Blender's texture space is computed on the undeformed mesh (`BKE_mesh_eval_geometry` calls
         // `BKE_mesh_texspace_calc` on the original), and modifiers copy it to their result. The data block's mesh is
         // that original, so modifiers that rebuild or shrink the evaluated mesh do not move the texture space.
@@ -625,6 +642,7 @@ pub(super) fn extract_geometry(
                 .map(|layer| layer.name.clone())
                 .collect(),
             color_layer_indices: carried,
+            thickness,
             material_colors: MaterialColors::default(),
             world_to_local: object_inverse(matrix),
         });
@@ -871,8 +889,8 @@ pub(super) fn extract_geometry(
                             params,
                         }];
                         shade(
-                            doc, snapshot, center, center, normal, normal, &closures, mode, None,
-                            None,
+                            doc, snapshot, center, center, normal, normal, normal, &closures, mode,
+                            None, thickness, None,
                         )
                     };
                     let triangle = Triangle {
@@ -1448,7 +1466,11 @@ impl PointShadowMap {
         let pixel_y = (0.5 - y * 0.5) * f64::from(SHADOW_MAP_SIZE) - 0.5;
         let center_x = pixel_x.round() as i32;
         let center_y = pixel_y.round() as i32;
-        let bias = (depth * 0.001).max(1.0e-4);
+        // One texel's world size at this depth: a face spans `2 · depth` across (its 90° field of view). A receiver on a
+        // curved surface sees its neighbouring texels at a depth one texel's slope away, so a bias below a texel
+        // self-shadows the lit side. `tests/fixtures/native_oracle/point_shadow_bias.py` measures it against exact rays:
+        // 90 of 250 lit sphere points are dark at 0.001 · depth, none at one texel, and the plane's shadow is unchanged.
+        let bias = 2.0 * depth / f64::from(SHADOW_MAP_SIZE);
         let mut visible = 0.0;
         for offset in PCF_OFFSETS {
             let sample_x = center_x + offset[0];
@@ -1917,6 +1939,15 @@ impl SurfaceShader for SceneShader<'_> {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
+        if matches!(self.mode, Mode::Beauty)
+            && prepared.is_some_and(PreparedMaterial::is_volume_only)
+        {
+            return Ok(SurfaceSample {
+                color: [0.0; 4],
+                has_surface: false,
+                transparent_tint: [1.0; 3],
+            });
+        }
         let graph_shading = if triangle.lit_per_pixel {
             material
                 .zip(prepared)
@@ -1991,9 +2022,12 @@ impl SurfaceShader for SceneShader<'_> {
         let shadow = self.geometry.shadows.as_ref().map(|shadows| ShadowScene {
             bvh: &shadows.bvh,
             triangles: self.geometry.triangles.as_slice(),
+            prepared_materials: &self.geometry.prepared,
             point_maps: &shadows.point_maps,
             occluders: shadows.transparent_casters.then_some(&occluders),
         });
+        let thickness = object_for_index(&self.geometry.objects, triangle.object_index)
+            .map_or(0.0, |object| object.thickness);
         let color = shade(
             self.doc,
             self.snapshot,
@@ -2001,14 +2035,17 @@ impl SurfaceShader for SceneShader<'_> {
             hit.shadow_point,
             hit.normal,
             hit.geometric,
+            hit.view,
             closures,
             self.mode,
             shadow,
+            thickness,
             self.world_probe()?,
         );
         occluders.finish()?;
         Ok(SurfaceSample {
             color,
+            has_surface: true,
             transparent_tint: beauty_tint(material, surface_tint(closures)),
         })
     }
@@ -2104,6 +2141,26 @@ impl SceneShader<'_> {
         evaluate_surface_with_workspace(material, prepared, &context, &mut workspace)
     }
 }
+/// EEVEE's default refraction thickness of an object: the smallest dimension of its bounds, in world units. EEVEE takes
+/// the bounds' size along each axis times the object's scale along it, then the minimum (`eevee_shader.cc`,
+/// `nodetree_thickness`, `ws_dimensions`). It is a sphere model's diameter (`eevee_thickness_lib.bsl.hh`).
+fn transmission_thickness(mesh: &crate::geom::Mesh, matrix: DMat4) -> f64 {
+    let Some(first) = mesh.vertices.first() else {
+        return 0.0;
+    };
+    let (mut min, mut max) = (first.co, first.co);
+    for vertex in &mesh.vertices {
+        min = min.min(vertex.co);
+        max = max.max(vertex.co);
+    }
+    let scale = DVec3::new(
+        matrix.x_axis.truncate().length(),
+        matrix.y_axis.truncate().length(),
+        matrix.z_axis.truncate().length(),
+    );
+    ((max - min) * scale).min_element().max(0.0)
+}
+
 /// Face-corner index of each triangle vertex; the UV and shading-normal lookups share it.
 fn triangle_corners(face: &crate::geom::Face, triangle: &[u32; 3]) -> [Option<usize>; 3] {
     triangle.map(|vertex_id| {
@@ -2388,6 +2445,9 @@ fn opaque_share(closures: &[ShaderClosure]) -> f64 {
 /// (`eevee_nodetree_lib.bsl.hh`, `closure_eval(ClosureTransparency)`), and Cycles sums the closures' transparent weights
 /// the same way. So a mix of closures passes `sum w (1 - alpha) tint`, and the tint is that over the pass chance.
 fn surface_tint(closures: &[ShaderClosure]) -> [f64; 3] {
+    if closures.is_empty() {
+        return [1.0; 3];
+    }
     weighted_tint(
         closures.iter().map(|closure| {
             (
@@ -2437,9 +2497,11 @@ fn shade(
     shadow_point: DVec3,
     normal: DVec3,
     geometric: DVec3,
+    view: DVec3,
     closures: &[ShaderClosure],
     mode: Mode,
     shadow: ShadowContext<'_>,
+    object_thickness: f64,
     world: Option<&WorldProbe>,
 ) -> [f64; 4] {
     let opaque = opaque_share(closures);
@@ -2449,18 +2511,39 @@ fn shade(
         return [albedo.x, albedo.y, albedo.z, opaque];
     }
     let scene = doc.scenes.get(&snapshot.scene_id);
-    // The camera is the view for the lobes and the environment; without one, the normal.
-    let view = scene
-        .and_then(|scene| scene.camera.as_ref())
-        .and_then(|camera_id| snapshot.nodes.get(camera_id))
-        .map(|camera| {
-            (DMat4::from_cols_array(&camera.world_matrix).transform_point3(DVec3::ZERO) - point)
-                .normalize_or_zero()
-        })
-        .filter(|direction| direction.length_squared() > f64::EPSILON)
-        .unwrap_or(normal);
+    // The view is the camera ray's reverse. An orthographic camera's rays are parallel, which is EEVEE's view too
+    // (`world_incident_vector`); a perspective ray points at the camera. Without one, the normal.
+    let view = view.try_normalize().unwrap_or(normal);
+    // EEVEE's `eevee.light_threshold` sets each local light's influence radius; Blender's default is 0.01.
+    let light_threshold = scene.map_or(0.01, |scene| scene.render.eevee_light_threshold);
+    let receiver = Receiver {
+        point,
+        shadow_point,
+        geometric,
+        view,
+    };
     // The diffuse environment depends on the normal alone, so every closure shares it.
-    let diffuse_environment = world.map(|world| prefiltered_world(world, normal, 1.0));
+    // The diffuse environment depends on the normal alone, so every closure shares it.
+    let diffuse_environment =
+        world.map(|world| prefiltered_world(world, normal, 1.0, irradiance_probe_radiance));
+    // Ambient occlusion attenuates the environment (indirect) light only, as EEVEE's horizon scan does; EEVEE's direct
+    // light is never occluded by it. The hemisphere is the one the raster's occlusion pass casts (`ambient_visibility`).
+    let ambient = shadow.map_or(1.0, |scene| {
+        let facing = if geometric.dot(view) < 0.0 {
+            -geometric
+        } else {
+            geometric
+        };
+        ambient_visibility(
+            scene.bvh,
+            scene.triangles,
+            scene.prepared_materials,
+            point,
+            facing,
+            normal,
+            1.0,
+        )
+    });
     // A closure's reflective share is its weight times its alpha. The raster composite multiplies a straight colour
     // by the opaque share (`render/raster.rs`, `composite_sample`), so the premultiplied sums are divided by it below.
     let mut reflected = DVec3::ZERO;
@@ -2476,19 +2559,37 @@ fn shade(
         // The lobes' layers are set up once here for the camera view, shared by every light below.
         let shading = principled_layers(&lobe, normal, view);
         let albedo = base_albedo(params);
+        let metallic = params.metallic.clamp(0.0, 1.0);
+        let roughness = params.roughness.clamp(0.0, 1.0);
+        // The dielectric layer and the diffuse base share what the transmission closures leave (EEVEE's `weight`).
+        let dielectric = (1.0 - metallic) * (1.0 - params.transmission.clamp(0.0, 1.0));
+        // The coat attenuates every layer below it, including the environment terms.
+        let lower = shading.lower();
+        // The Material Output's linked Thickness socket decides the thickness when present (EEVEE's
+        // `nodetree_thickness`), and the object's bounds otherwise.
+        let thickness = Thickness::new(
+            params.thickness.unwrap_or(object_thickness),
+            params.thickness_slab,
+        );
         let mut lobes = DVec3::ZERO;
         if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
-            let metallic = params.metallic.clamp(0.0, 1.0);
-            let roughness = params.roughness.clamp(0.0, 1.0);
-            // The coat attenuates every layer below it, including the environment terms.
-            let lower = shading.lower();
-            lobes += albedo * diffuse_environment * (1.0 - metallic) * lower;
+            let mut environment = albedo * diffuse_environment * dielectric * lower;
             let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
-            let specular_environment = prefiltered_world(world, reflection, roughness);
+            let specular_environment =
+                prefiltered_world(world, reflection, roughness, probe_radiance);
             let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
-            let f0 = albedo * metallic + DVec3::splat(specular_f0 * (1.0 - metallic));
-            lobes += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
+            let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
+            environment += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
+            lobes += environment * ambient;
+            // Refraction takes no occlusion: EEVEE's deferred combine multiplies no visibility into the transmission
+            // closure's probe read (`eevee_deferred_combine.bsl.hh`), so the glass environment is not attenuated.
+            if let Some(glass) =
+                eevee_transmission::glass_closures(params, normal, view, lower, thickness)
+            {
+                lobes += glass_environment(world, &glass);
+            }
         }
+        let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
         for (id, light_node) in &doc.nodes {
             let Some(light) = light_node
                 .data
@@ -2503,6 +2604,8 @@ fn shade(
             };
             let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
             let point_shadow = shadow.and_then(|scene| scene.point_maps.get(id));
+            let influence = light_influence_at(light, matrix, point, light_threshold);
+            let ray_visibility = light_node.resolved_ray_visibility();
             lobes += light_contribution(
                 light,
                 matrix,
@@ -2514,8 +2617,20 @@ fn shade(
                 &shading,
                 shadow,
                 point_shadow,
-                light_node.resolved_ray_visibility(),
-            );
+                ray_visibility,
+            ) * influence;
+            if let Some(glass) = &glass {
+                lobes += glass_direct_contribution(
+                    light,
+                    matrix,
+                    receiver,
+                    glass,
+                    thickness,
+                    ray_visibility,
+                    shadow,
+                    point_shadow,
+                ) * influence;
+            }
         }
         // Reflectance weights every reflective closure (ambient, direct, environment); Emission has none.
         reflected += lobes * (share * params.reflectance.clamp(0.0, 1.0));
@@ -2537,9 +2652,33 @@ fn shade(
     [result.x, result.y, result.z, opaque]
 }
 
+/// The environment's share of the glass closures: the reflection at its mirror direction and the transmission at the
+/// probe direction, each blurred with its roughness as EEVEE's light probe is (`eevee_transmission`).
+fn glass_environment(world: &WorldProbe, closures: &GlassClosures) -> DVec3 {
+    let reflected = prefiltered_world(
+        world,
+        closures.reflection_direction,
+        closures.reflection_roughness,
+        probe_radiance,
+    );
+    let transmitted = prefiltered_world(
+        world,
+        closures.transmission_direction,
+        closures.transmission_roughness,
+        probe_radiance,
+    );
+    reflected * closures.reflection + transmitted * closures.transmission
+}
+
 /// The world's filtered radiance along `axis` for `roughness`: five taps spread over a lobe of that roughness, read from
-/// the render's world probe. The taps used to evaluate the World node graph, once per tap per shaded sample.
-fn prefiltered_world(world: &WorldProbe, axis: DVec3, roughness: f64) -> DVec3 {
+/// the render's world probe. Each tap's texel is `stored` (the capture format of the probe it is read from) before the
+/// blur: a diffuse read stores irradiance and a glossy or glass read stores radiance (`eevee_transmission`).
+fn prefiltered_world(
+    world: &WorldProbe,
+    axis: DVec3,
+    roughness: f64,
+    stored: impl Fn(DVec3) -> DVec3,
+) -> DVec3 {
     const FILTER_OFFSETS: [[f64; 2]; 5] =
         [[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
     let axis = axis.normalize_or_zero();
@@ -2557,7 +2696,7 @@ fn prefiltered_world(world: &WorldProbe, axis: DVec3, roughness: f64) -> DVec3 {
     for offset in FILTER_OFFSETS {
         let direction = (axis + tangent * (spread * offset[0]) + bitangent * (spread * offset[1]))
             .normalize_or_zero();
-        irradiance += world.radiance(direction);
+        irradiance += stored(world.radiance(direction));
     }
     irradiance / 5.0
 }
@@ -2585,15 +2724,18 @@ fn light_contribution(
     match light.light_type {
         crate::model::LightType::Sun => {
             let toward_light = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
-            punctual_radiance(params, shading, toward_light, color, energy, lobes)
-                * visibility_for_light(
-                    shadow,
-                    point_shadow,
-                    shadow_point,
-                    geometric,
-                    toward_light,
-                    f64::INFINITY,
-                )
+            // The disc's visibility is already inside `sun_lighting`, one ray per disc sample, so the sun is not shadowed again.
+            sun_lighting(
+                params,
+                shading,
+                shadow,
+                shadow_point,
+                geometric,
+                toward_light,
+                color,
+                light,
+                lobes,
+            )
         }
         crate::model::LightType::Point => {
             let delta = position - point;
@@ -2605,6 +2747,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 point_intensity(energy) / distance_squared,
+                LightFactors::of(light),
                 lobes,
             ) * visibility_for_light(
                 shadow,
@@ -2613,15 +2756,14 @@ fn light_contribution(
                 geometric,
                 toward_light,
                 distance_squared.sqrt(),
+                0.0,
             )
         }
         crate::model::LightType::Spot => {
             let delta = position - point;
             let distance_squared = delta.length_squared().max(1.0e-6);
             let toward_light = delta.normalize_or_zero();
-            let direction = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();
-            let cosine = direction.dot(-toward_light).clamp(-1.0, 1.0);
-            let falloff = spot_attenuation(cosine, light.spot_size, light.spot_blend);
+            let falloff = spot_cone(&matrix, toward_light, light.spot_size, light.spot_blend);
             if falloff <= 0.0 {
                 return DVec3::ZERO;
             }
@@ -2631,6 +2773,7 @@ fn light_contribution(
                 toward_light,
                 color,
                 (point_intensity(energy) / distance_squared) * falloff,
+                LightFactors::of(light),
                 lobes,
             ) * visibility_for_light(
                 shadow,
@@ -2639,6 +2782,7 @@ fn light_contribution(
                 geometric,
                 toward_light,
                 distance_squared.sqrt(),
+                0.0,
             )
         }
         crate::model::LightType::Area => {
@@ -2647,45 +2791,111 @@ fn light_contribution(
                 return DVec3::ZERO;
             }
             let light_direction = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();
-            let irradiance =
-                area_irradiance_per_radiance(&shape, position, light_direction, point, normal)
-                    * area_radiance(energy, shape.area);
-            if irradiance <= 0.0 {
-                return DVec3::ZERO;
-            }
-            let (samples, count) =
-                area_visibility_samples(&shape, position, light_direction, point, normal);
-            let mut total_weight = 0.0;
-            let mut visible_weight = 0.0;
-            for sample in &samples[..count] {
-                total_weight += sample.weight;
-                let visibility = visibility_for_light(
-                    shadow,
-                    point_shadow,
-                    shadow_point,
-                    geometric,
-                    sample.direction,
-                    sample.distance,
-                );
-                visible_weight += sample.weight * visibility;
-            }
-            if total_weight <= 0.0 || visible_weight <= 0.0 {
-                return DVec3::ZERO;
-            }
-            // Integrated Lambert irradiance is exact for rectangles and the visibility weight
-            // scales it. The specular, sheen and coat lobes are evaluated towards the emitter centre.
+            let radiance = area_radiance(energy, shape.area);
+            // The lit hemisphere is the receiver's normal side; the transmitted share is the reverse side, where the
+            // emitter's outline clips the same way (`area_irradiance_per_radiance` and `area_visibility_samples`).
+            let front = area_side_weight(
+                shadow,
+                point_shadow,
+                shadow_point,
+                geometric,
+                &shape,
+                position,
+                light_direction,
+                point,
+                normal,
+            ) * radiance;
+            // Integrated Lambert irradiance is exact for rectangles, and the visibility weight scales it. The specular,
+            // sheen and coat lobes are evaluated towards the emitter centre on the lit side.
             let toward_centre = (position - point).normalize_or_zero();
-            reflected_lobes_coefficient(
-                &without_subsurface(params),
+            let params = without_subsurface(params);
+            let factors = LightFactors::of(light);
+            let diffuse = reflected_lobes_coefficient(
+                &params,
                 shading,
                 toward_centre,
-                lobes.mask(),
-            ) * color
-                * (irradiance * visible_weight / total_weight)
+                lobes.mask() & RayKind::Diffuse.bit(),
+            );
+            let specular = reflected_lobes_coefficient(
+                &params,
+                shading,
+                toward_centre,
+                lobes.mask() & RayKind::Glossy.bit(),
+            );
+            (diffuse * factors.diffuse + specular * factors.specular) * front * color
         }
     }
 }
 
+/// The weight of an area light over the hemisphere on `side` of a receiver: the Lambert irradiance of the emitter's
+/// outline clipped to that hemisphere, per unit radiance, times the share of its outline samples that reach the receiver.
+/// `geometric` is the geometric normal on the same side, which offsets the shadow rays to it.
+fn area_side_weight(
+    shadow: ShadowContext<'_>,
+    point_shadow: Option<&PointShadowMap>,
+    shadow_point: DVec3,
+    geometric: DVec3,
+    shape: &AreaShape,
+    position: DVec3,
+    light_direction: DVec3,
+    point: DVec3,
+    side: DVec3,
+) -> f64 {
+    let irradiance = area_irradiance_per_radiance(shape, position, light_direction, point, side);
+    if irradiance <= 0.0 {
+        return 0.0;
+    }
+    irradiance
+        * area_visible_fraction(
+            shadow,
+            point_shadow,
+            shadow_point,
+            geometric,
+            shape,
+            position,
+            light_direction,
+            point,
+            side,
+        )
+}
+
+/// The share of an area light's outline samples that reach the receiver, over the hemisphere on `side`: the sample
+/// weights of `area_visibility_samples`, times their visibility, over their total weight.
+fn area_visible_fraction(
+    shadow: ShadowContext<'_>,
+    point_shadow: Option<&PointShadowMap>,
+    shadow_point: DVec3,
+    geometric: DVec3,
+    shape: &AreaShape,
+    position: DVec3,
+    light_direction: DVec3,
+    point: DVec3,
+    side: DVec3,
+) -> f64 {
+    let (samples, count) = area_visibility_samples(shape, position, light_direction, point, side);
+    let mut total_weight = 0.0;
+    let mut visible_weight = 0.0;
+    for sample in &samples[..count] {
+        total_weight += sample.weight;
+        let visibility = visibility_for_light(
+            shadow,
+            point_shadow,
+            shadow_point,
+            geometric,
+            sample.direction,
+            sample.distance,
+            0.0,
+        );
+        visible_weight += sample.weight * visibility;
+    }
+    if total_weight <= 0.0 || visible_weight <= 0.0 {
+        return 0.0;
+    }
+    visible_weight / total_weight
+}
+
+/// The visibility of a light from `point`: its depth map for a point or spot light, else the scene's rays. `sun_radius` is a
+/// sun's disc radius (`sun_disc_radius`) and is read only at an infinite distance, where the light is a sun.
 fn visibility_for_light(
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
@@ -2693,9 +2903,10 @@ fn visibility_for_light(
     normal: DVec3,
     direction: DVec3,
     distance: f64,
+    sun_radius: f64,
 ) -> f64 {
     let Some(shadow_map) = point_shadow else {
-        return shadow_visibility(shadow, point, normal, direction, distance);
+        return shadow_visibility(shadow, point, normal, direction, distance, sun_radius);
     };
     let opaque = shadow_map.visibility(point);
     match shadow {
@@ -2737,6 +2948,7 @@ fn shadow_visibility(
     normal: DVec3,
     direction: DVec3,
     distance: f64,
+    sun_radius: f64,
 ) -> f64 {
     const PCF_OFFSETS: [[f64; 2]; 9] = [
         [-1.0, -1.0],
@@ -2756,24 +2968,19 @@ fn shadow_visibility(
     if direction == DVec3::ZERO {
         return 0.0;
     }
-    let epsilon = SHADOW_EPSILON;
     let normal = normal.normalize_or_zero();
+    if !distance.is_finite() {
+        return sun_disc_visibility(shadow, point, normal, direction, sun_radius);
+    }
+    let epsilon = SHADOW_EPSILON;
     let tangent = if normal.z.abs() < 0.999 {
         normal.cross(DVec3::Z).normalize_or_zero()
     } else {
         normal.cross(DVec3::Y).normalize_or_zero()
     };
     let bitangent = normal.cross(tangent).normalize_or_zero();
-    let angular_radius = if distance.is_finite() {
-        (0.02 / distance.max(0.02)).min(0.02)
-    } else {
-        0.003
-    };
-    let maximum_distance = if distance.is_finite() {
-        (distance - epsilon).max(0.0)
-    } else {
-        f64::INFINITY
-    };
+    let angular_radius = (0.02 / distance.max(0.02)).min(0.02);
+    let maximum_distance = (distance - epsilon).max(0.0);
     if maximum_distance <= epsilon {
         return 1.0;
     }
@@ -2789,24 +2996,518 @@ fn shadow_visibility(
     visible / 9.0
 }
 
+/// The directions of a sun's disc: `SUN_DISC_SAMPLES` unit vectors uniform over the disc of tangent radius `radius` about
+/// `direction`, in a Vogel spiral.
+fn sun_disc_directions(direction: DVec3, radius: f64) -> impl Iterator<Item = DVec3> {
+    let (tangent, bitangent) = make_orthonormals(direction);
+    let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+    (0..SUN_DISC_SAMPLES).map(move |index| {
+        let offset = ((index as f64 + 0.5) / SUN_DISC_SAMPLES as f64).sqrt() * radius;
+        let angle = index as f64 * golden_angle;
+        (direction + tangent * (offset * angle.cos()) + bitangent * (offset * angle.sin()))
+            .normalize_or_zero()
+    })
+}
+
+/// A sun's visibility at a receiver: the mean over rays from the receiver to the sun's disc, each blocked by an opaque
+/// occluder (`ray_transmittance`).
+fn sun_disc_visibility(
+    shadow: ShadowScene<'_>,
+    point: DVec3,
+    normal: DVec3,
+    direction: DVec3,
+    radius: f64,
+) -> f64 {
+    let total: f64 = sun_disc_directions(direction, radius)
+        .map(|sample| {
+            let origin = shadow_origin(point, normal, sample);
+            ray_transmittance(shadow, origin, sample, f64::INFINITY, true)
+        })
+        .sum();
+    total / SUN_DISC_SAMPLES as f64
+}
+
+/// The receiver of direct light at a shading point: the point and its shadow origin, the geometric normal, and the view.
+#[derive(Clone, Copy)]
+struct Receiver {
+    point: DVec3,
+    shadow_point: DVec3,
+    geometric: DVec3,
+    view: DVec3,
+}
+
+/// The smallest radius of a light's shape (`shape_parameters_set`: `max(0.001, radius)`).
+const MIN_SHAPE_RADIUS: f64 = 0.001;
+/// The samples of a sun's disc: a Vogel spiral that integrates the disc's shadow as EEVEE's soft shadow cone does
+/// (`shadow_ray_generate_directional`). Sixteen match EEVEE's penumbra to within its noise, where nine taps do not.
+const SUN_DISC_SAMPLES: usize = 16;
+
+/// A light as EEVEE's light pass sees it from one point: its emitter, the direction and distance to its centre, the
+/// radiance of its colour and power, and the attenuation the lobes share (`light_attenuation_surface`: the influence
+/// radius, a spot's cone and an area light's emitting side).
+struct DirectEmitter {
+    emitter: Emitter,
+    /// The unit direction from the point to the emitter's centre (a sun's direction).
+    direction: DVec3,
+    /// The vector from the point to the emitter's centre, whose length is the distance (a sun's is its direction).
+    to_centre: DVec3,
+    /// The emitter's distance, one for a sun.
+    distance: f64,
+    /// The distance a shadow ray reaches the light across, infinite for a sun.
+    shadow_distance: f64,
+    /// The light's colour times its radiance per unit of closure colour.
+    radiance: DVec3,
+    /// The attenuation shared by the lobes.
+    attenuation: f64,
+    /// The emitter's centre and emitting axis, for an area light's outline samples.
+    centre: DVec3,
+    axis: DVec3,
+    /// The area light's shape, or `None` for a point, spot or sun light.
+    area: Option<AreaShape>,
+    sun: bool,
+    /// A sun's disc radius in tangent units (`sun_disc_radius`), zero for the other lights.
+    sun_radius: f64,
+}
+
+/// EEVEE's influence of a light at `point` (`light_attenuation_surface`), applied to every closure of the light. A sun
+/// has none; a local light fades to zero at its influence radius (`local_light_influence`).
+fn light_influence_at(
+    light: &crate::model::LightData,
+    matrix: DMat4,
+    point: DVec3,
+    threshold: f64,
+) -> f64 {
+    if matches!(light.light_type, crate::model::LightType::Sun) {
+        return 1.0;
+    }
+    let distance_squared = (matrix.transform_point3(DVec3::ZERO) - point)
+        .length_squared()
+        .max(1.0e-6);
+    local_light_influence(light, distance_squared, threshold)
+}
+
+/// A light as EEVEE's light pass sees it from `point`, or `None` for an area light with no area. The lobes' shared
+/// attenuation is the cone of a spot and the emitting side of an area light; the influence is `light_influence_at`'s.
+fn direct_emitter(
+    light: &crate::model::LightData,
+    matrix: DMat4,
+    point: DVec3,
+) -> Option<DirectEmitter> {
+    let color = DVec3::from_array(light.color).max(DVec3::ZERO);
+    let energy = light.energy.max(0.0);
+    let position = matrix.transform_point3(DVec3::ZERO);
+    let axis = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
+    match light.light_type {
+        crate::model::LightType::Sun => {
+            let radius = sun_disc_radius(light.sun_angle);
+            // `shape_radiance_get` for a sun: `(1 + 1 / r²) / π` per unit of irradiance.
+            let inv_sin_squared = 1.0 + 1.0 / (radius * radius);
+            Some(DirectEmitter {
+                emitter: Emitter::Disk { radius },
+                direction: axis,
+                to_centre: axis,
+                distance: 1.0,
+                shadow_distance: f64::INFINITY,
+                radiance: color * (energy * inv_sin_squared / std::f64::consts::PI),
+                attenuation: 1.0,
+                centre: point + axis,
+                axis,
+                area: None,
+                sun: true,
+                sun_radius: radius,
+            })
+        }
+        crate::model::LightType::Point | crate::model::LightType::Spot => {
+            let radius = light.radius.max(MIN_SHAPE_RADIUS);
+            let to_centre = position - point;
+            let distance_squared = to_centre.length_squared().max(1.0e-6);
+            let distance = distance_squared.sqrt();
+            let direction = to_centre / distance;
+            let emitter = if light.soft_falloff {
+                Emitter::Disk { radius }
+            } else {
+                Emitter::Sphere { radius }
+            };
+            let attenuation = if matches!(light.light_type, crate::model::LightType::Spot) {
+                spot_cone(&matrix, direction, light.spot_size, light.spot_blend)
+            } else {
+                1.0
+            };
+            Some(DirectEmitter {
+                emitter,
+                direction,
+                to_centre,
+                distance,
+                shadow_distance: distance,
+                radiance: color * emitter_radiance(energy, radius),
+                attenuation,
+                centre: position,
+                axis,
+                area: None,
+                sun: false,
+                sun_radius: 0.0,
+            })
+        }
+        crate::model::LightType::Area => {
+            let shape = area_shape(light, &matrix);
+            if shape.area <= 0.0 {
+                return None;
+            }
+            let to_centre = position - point;
+            let distance_squared = to_centre.length_squared().max(1.0e-6);
+            let distance = distance_squared.sqrt();
+            let direction = to_centre / distance;
+            // `light_attenuation_common`: an area light emits along its own axis, so its lit side is where `L · axis > 0`.
+            let emitting_side = if direction.dot(axis) > 0.0 { 1.0 } else { 0.0 };
+            Some(DirectEmitter {
+                emitter: Emitter::Area {
+                    axis_u: shape.axis_u,
+                    axis_v: shape.axis_v,
+                    half_u: shape.half_u,
+                    half_v: shape.half_v,
+                    ellipse: shape.ellipse,
+                },
+                direction,
+                to_centre,
+                distance,
+                shadow_distance: distance,
+                radiance: color * area_radiance(energy, shape.area),
+                attenuation: emitting_side,
+                centre: position,
+                axis,
+                area: Some(shape),
+                sun: false,
+                sun_radius: 0.0,
+            })
+        }
+    }
+}
+
+/// EEVEE's `light_attenuation_facing`: fades an emitter that is near or below the horizon of `ng`. A transmission reads
+/// its lobe's normal reversed, so the light behind the surface is lit.
+fn facing_attenuation(
+    shape_radius: f64,
+    direction: DVec3,
+    distance: f64,
+    ng: DVec3,
+    is_transmission: bool,
+) -> f64 {
+    let sin_solid_angle = shape_radius / distance;
+    let sin_light_angle = direction.dot(if is_transmission { -ng } else { ng });
+    let horizon = sin_solid_angle
+        + if is_transmission {
+            -sin_light_angle
+        } else {
+            sin_light_angle
+        };
+    ((horizon + 0.1) * 10.0).clamp(0.0, 1.0)
+}
+
+/// The origin of a transmission's shadow ray, as EEVEE's `shadow_eval` moves it for `is_transmission`: a receiver that
+/// faces away from its light is moved through the object by its thickness toward the light (at most up to a punctual
+/// light), and biased along `reflect(Ng, L)`. A receiver that faces the light is biased along `Ng`.
+fn transmission_origin(
+    point: DVec3,
+    geometric: DVec3,
+    direction: DVec3,
+    distance: f64,
+    thickness: Thickness,
+) -> DVec3 {
+    if geometric.dot(direction) > 0.0 {
+        return shadow_origin(point, geometric, direction);
+    }
+    let reach = if distance.is_finite() {
+        thickness.value().min(distance - 0.01)
+    } else {
+        thickness.value()
+    };
+    let moved = point + direction * reach.abs();
+    shadow_origin(
+        moved,
+        eevee_transmission::reflect(geometric, direction),
+        direction,
+    )
+}
+
+/// The transmittance of a shadow ray from `origin` along `direction` up to `distance`, through every occluder: a
+/// transmission's shadow is traced against the scene, because the light's depth map holds the view from the light and
+/// the transmission starts behind the surface. `1` without shadows.
+fn transmittance_toward(
+    shadow: ShadowContext<'_>,
+    origin: DVec3,
+    direction: DVec3,
+    distance: f64,
+) -> f64 {
+    let Some(shadow) = shadow else {
+        return 1.0;
+    };
+    let direction = direction.normalize_or_zero();
+    if direction == DVec3::ZERO {
+        return 0.0;
+    }
+    let maximum = if distance.is_finite() {
+        (distance - SHADOW_EPSILON).max(0.0)
+    } else {
+        f64::INFINITY
+    };
+    if maximum <= SHADOW_EPSILON {
+        return 1.0;
+    }
+    ray_transmittance(shadow, origin, direction, maximum, true)
+}
+
+/// The visibility of a light for a transmission: one ray from the amended origin to a point light's centre, or the mean
+/// over a sun's disc.
+fn transmitted_visibility(shadow: ShadowContext<'_>, origin: DVec3, direct: &DirectEmitter) -> f64 {
+    if direct.sun {
+        let total: f64 = sun_disc_directions(direct.direction, direct.sun_radius)
+            .map(|sample| transmittance_toward(shadow, origin, sample, f64::INFINITY))
+            .sum();
+        return total / SUN_DISC_SAMPLES as f64;
+    }
+    let to_centre = direct.centre - origin;
+    transmittance_toward(shadow, origin, to_centre, to_centre.length())
+}
+
+/// The share of an area light's outline samples that reach a transmission's amended origin, over the hemisphere on
+/// `side` (the lobe's own side), as `area_visible_fraction` gives it for the reflection.
+fn area_transmitted_fraction(
+    shadow: ShadowContext<'_>,
+    origin: DVec3,
+    shape: &AreaShape,
+    emitter: (DVec3, DVec3),
+    side: DVec3,
+) -> f64 {
+    let (centre, axis) = emitter;
+    let (samples, count) = area_visibility_samples(shape, centre, axis, origin, side);
+    let mut total_weight = 0.0;
+    let mut visible_weight = 0.0;
+    for sample in &samples[..count] {
+        total_weight += sample.weight;
+        visible_weight +=
+            sample.weight * transmittance_toward(shadow, origin, sample.direction, sample.distance);
+    }
+    if total_weight <= 0.0 || visible_weight <= 0.0 {
+        return 0.0;
+    }
+    visible_weight / total_weight
+}
+
+/// EEVEE's direct light through the glass closures (`light_eval_single`, with `eevee_light_eval.bsl.hh`'s attenuation):
+/// each closure's colour, times the light's colour and radiance, its attenuation, its visibility, and the LTC form
+/// factor of the emitter through the closure's inverse matrix. The reflection is shadowed from the shading point; the
+/// transmission from the point moved through the object by its thickness (`transmission_origin`).
+fn glass_direct_contribution(
+    light: &crate::model::LightData,
+    matrix: DMat4,
+    receiver: Receiver,
+    glass: &GlassLight,
+    thickness: Thickness,
+    ray_visibility: RayVisibility,
+    shadow: ShadowContext<'_>,
+    point_shadow: Option<&PointShadowMap>,
+) -> DVec3 {
+    let Some(direct) = direct_emitter(light, matrix, receiver.point) else {
+        return DVec3::ZERO;
+    };
+    let factors = LightFactors::of(light);
+    let mut result = DVec3::ZERO;
+
+    // The reflection, lit from the normal's side.
+    let facing = facing_attenuation(
+        direct.emitter.shape_radius(),
+        direct.direction,
+        direct.distance,
+        glass.oriented_normal,
+        false,
+    );
+    if ray_visibility.allows(RayKind::Glossy) && facing > 0.0 {
+        let visibility = match direct.area {
+            Some(shape) => area_visible_fraction(
+                shadow,
+                point_shadow,
+                receiver.shadow_point,
+                receiver.geometric,
+                &shape,
+                direct.centre,
+                -direct.axis,
+                receiver.point,
+                glass.oriented_normal,
+            ),
+            None => visibility_for_light(
+                shadow,
+                point_shadow,
+                receiver.shadow_point,
+                receiver.geometric,
+                direct.direction,
+                direct.shadow_distance,
+                direct.sun_radius,
+            ),
+        };
+        let form = direct.emitter.form_factor(
+            glass.oriented_normal,
+            receiver.view,
+            glass.reflection_matrix,
+            direct.to_centre,
+        );
+        result += glass.reflection
+            * direct.radiance
+            * (direct.attenuation * facing * visibility * form * factors.specular);
+    }
+
+    // The transmission, lit from the reverse side, where the lobe's normal points.
+    let facing = facing_attenuation(
+        direct.emitter.shape_radius(),
+        direct.direction,
+        direct.distance,
+        glass.transmission_normal,
+        true,
+    );
+    if facing > 0.0 {
+        let origin = transmission_origin(
+            receiver.point,
+            receiver.geometric,
+            direct.direction,
+            direct.shadow_distance,
+            thickness,
+        );
+        let visibility = match direct.area {
+            Some(shape) => area_transmitted_fraction(
+                shadow,
+                origin,
+                &shape,
+                (direct.centre, -direct.axis),
+                -glass.oriented_normal,
+            ),
+            None => transmitted_visibility(shadow, origin, &direct),
+        };
+        let form = direct.emitter.form_factor(
+            glass.transmission_normal,
+            receiver.view,
+            glass.transmission_matrix,
+            direct.to_centre,
+        );
+        result += glass.transmission
+            * direct.radiance
+            * (direct.attenuation * facing * visibility * form * factors.transmission);
+    }
+    result
+}
+
+/// A sun's direct light, integrated over the sun's disc as EEVEE's sun is. The diffuse class is flat over the disc, so its
+/// centre value times the disc's mean visibility is its integral. The specular class is resolved over the disc: each sample
+/// of the disc (`sun_disc_directions`), weighted by its visibility, is one direction of the integral, so a glossy highlight
+/// takes the disc's shape as EEVEE's LTC integral does.
+fn sun_lighting(
+    params: &BsdfParams,
+    shading: &Layers,
+    shadow: ShadowContext<'_>,
+    shadow_point: DVec3,
+    geometric: DVec3,
+    toward_light: DVec3,
+    color: DVec3,
+    light: &crate::model::LightData,
+    lobes: RayVisibility,
+) -> DVec3 {
+    let params = without_subsurface(params);
+    let energy = light.energy.max(0.0);
+    let factors = LightFactors::of(light);
+    let radius = sun_disc_radius(light.sun_angle);
+    let weight = energy / SUN_DISC_SAMPLES as f64;
+    let mut mean_visibility = 0.0;
+    let mut specular = DVec3::ZERO;
+    for sample in sun_disc_directions(toward_light, radius) {
+        let visibility = match shadow {
+            Some(shadow) => ray_transmittance(
+                shadow,
+                shadow_origin(shadow_point, geometric, sample),
+                sample,
+                f64::INFINITY,
+                true,
+            ),
+            None => 1.0,
+        };
+        mean_visibility += visibility / SUN_DISC_SAMPLES as f64;
+        let cosine = shading.normal.dot(sample);
+        if cosine > 0.0 {
+            let lobe = reflected_lobes_coefficient(
+                &params,
+                shading,
+                sample,
+                lobes.mask() & RayKind::Glossy.bit(),
+            );
+            specular += lobe * (weight * cosine * visibility);
+        }
+    }
+    let cosine = shading.normal.dot(toward_light);
+    let diffuse = if cosine > 0.0 {
+        reflected_lobes_coefficient(
+            &params,
+            shading,
+            toward_light,
+            lobes.mask() & RayKind::Diffuse.bit(),
+        ) * (energy * cosine * mean_visibility)
+    } else {
+        DVec3::ZERO
+    };
+    (diffuse * factors.diffuse + specular * factors.specular) * color
+}
+
 /// Radiance a point, spot or sun light reflects toward the view of `shading`: the Principled
 /// diffuse, specular, sheen and coat lobes along `light`, times the light colour and `intensity`
-/// weighted by the receiver cosine.
+/// weighted by the receiver cosine. The glass lobes are `glass_direct_contribution`'s.
 fn punctual_radiance(
     params: &BsdfParams,
     shading: &Layers,
     light: DVec3,
     color: DVec3,
     intensity: f64,
+    factors: LightFactors,
     lobes: RayVisibility,
 ) -> DVec3 {
-    let normal_light_cosine = shading.normal.dot(light).max(0.0);
+    let normal_light_cosine = shading.normal.dot(light).abs();
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    reflected_lobes_coefficient(&without_subsurface(params), shading, light, lobes.mask())
+    // The reflective lobes sit above the surface.
+    if shading.normal.dot(light) <= 0.0 {
+        return DVec3::ZERO;
+    }
+    let params = without_subsurface(params);
+    let diffuse = reflected_lobes_coefficient(
+        &params,
+        shading,
+        light,
+        lobes.mask() & RayKind::Diffuse.bit(),
+    );
+    let specular = reflected_lobes_coefficient(
+        &params,
+        shading,
+        light,
+        lobes.mask() & RayKind::Glossy.bit(),
+    );
+    (diffuse * factors.diffuse + specular * factors.specular)
         * color
         * (intensity * normal_light_cosine)
+}
+
+/// The light's closure multipliers, which EEVEE applies per closure class (`eevee_light.cc`, `power[LIGHT_DIFFUSE]`,
+/// `power[LIGHT_SPECULAR]`, `power[LIGHT_TRANSMISSION]`). The path tracer does not apply them, as Cycles does not.
+#[derive(Clone, Copy)]
+struct LightFactors {
+    diffuse: f64,
+    specular: f64,
+    transmission: f64,
+}
+
+impl LightFactors {
+    fn of(light: &crate::model::LightData) -> Self {
+        Self {
+            diffuse: light.diffuse_factor.max(0.0),
+            specular: light.specular_factor.max(0.0),
+            transmission: light.transmission_factor.max(0.0),
+        }
+    }
 }
 
 #[cfg(test)]

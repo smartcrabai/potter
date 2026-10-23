@@ -45,7 +45,7 @@ pub use scene::{
     PixelFilterType, PlaneHomography, PlaneTrack, PrimitiveDescriptor, Profile, RayKind,
     RayVisibility, ReconstructedPoint, Reconstruction, RenderSettings, RigidBody, RigidBodyShape,
     RigidBodyType, RigidBodyWorld, Scene, SceneDoc, SolvedCamera, SurfaceData, SurfacePoint,
-    TextObjectData, TextureCoordinateMapping, TextureRef, TimelineMarker, TrackAxis,
+    TextObjectData, TextureCoordinateMapping, TextureRef, ThicknessMode, TimelineMarker, TrackAxis,
     TrackingMarker, TrackingObject, TrackingObjectPose, TrackingTrack, UnitSettings, UpAxis,
     ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling, World,
 };

@@ -11,7 +11,8 @@ ratio, so the tolerance is the sum of three terms, per light and per occluder st
    weighted by the lit radiance of each floor point for the point light.
 3. Potter's edge placement: the largest change of the exact ratio when the occluder's shadow edges move by the bound on
    Potter's placement error, measured in the occluder plane where the occluder is defined:
-   - Sun: the PCF jitter is 0.003 rad at the floor's distance from the occluder (1 unit), so the edge moves 0.003.
+   - Sun: Potter's sun disc is 16 Vogel rays over `tan(angle / 2)`, the default angle's 0.00459 at the floor's distance
+     from the occluder (1 unit), so the edge moves by that radius.
    - Point, transparent occluder: none. Potter traces that occluder with an exact ray to the light
      (`point_light_transparency`), and the depth map leaves it out, so no texel places its edge.
    - Point, opaque occluder: the depth map has 64 texels per 90-degree face at the occluder plane, and its 3 by 3 PCF
@@ -46,7 +47,8 @@ PATCH = [0.25 + 0.5 * index / 8 for index in range(9)]
 RESOLUTION = 64
 SUBSAMPLES = 6
 POINT_LIGHT = (-4.0, 0.0, 2.5)
-SUN_BOUND = 0.003
+# `sun_disc_radius` of the default Blender sun angle, 0.526 degrees: tan(angle / 2) = 0.00459 (`light_model.rs`).
+SUN_BOUND = math.tan(math.radians(0.526) / 2.0)
 POINT_DEPTH_TO_OCCLUDER = POINT_LIGHT[2] - 1.0
 # The 3 by 3 PCF's edge spread plus rounding, in depth-map texels.
 POINT_EDGE_TEXELS = 1.5

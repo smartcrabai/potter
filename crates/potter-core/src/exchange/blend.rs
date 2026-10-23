@@ -3330,6 +3330,11 @@ fn build_imported_graph(
                 .get("cryptomatte_accurate")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            eevee_light_threshold: number_field(&render, "eevee_light_threshold", 0.01),
+            eevee_use_volumetric_shadows: render
+                .get("eevee_use_volumetric_shadows")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             motion_blur: render
                 .get("motion_blur")
                 .and_then(Value::as_bool)
@@ -3639,6 +3644,16 @@ fn build_imported_graph(
                             spread
                         }
                     },
+                    sun_angle: number_field(item, "sun_angle", 0.526_f64.to_radians()),
+                    use_custom_distance: item
+                        .get("use_custom_distance")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    cutoff_distance: number_field(item, "cutoff_distance", 40.0),
+                    diffuse_factor: number_field(item, "diffuse_factor", 1.0),
+                    specular_factor: number_field(item, "specular_factor", 1.0),
+                    transmission_factor: number_field(item, "transmission_factor", 1.0),
+                    volume_factor: number_field(item, "volume_factor", 1.0),
                 }),
                 grease_pencil: None,
                 ..DataBlock::default()
@@ -3695,6 +3710,10 @@ fn build_imported_graph(
                 emission_strength: number_field(item, "emission_strength", 0.0),
                 transmission: number_field(item, "transmission", 0.0),
                 ior: number_field(item, "ior", 1.5),
+                thickness_mode: match item.get("thickness_mode").and_then(Value::as_str) {
+                    Some("slab") => crate::model::ThicknessMode::Slab,
+                    _ => crate::model::ThicknessMode::Sphere,
+                },
                 double_sided: item
                     .get("double_sided")
                     .and_then(Value::as_bool)
@@ -9856,11 +9875,31 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 .and_then(|tree| tree.get("nodes"))
                 .and_then(Value::as_array)
                 .is_some_and(|nodes| {
+                    // The node kinds `shader/world.rs` evaluates, so a world built from them renders natively.
                     nodes.iter().any(|node| {
-                        !matches!(
-                            node.get("type").and_then(Value::as_str),
-                            Some("ShaderNodeBackground" | "ShaderNodeOutputWorld")
-                        )
+                        let properties = node.get("properties");
+                        match node.get("type").and_then(Value::as_str) {
+                            Some("ShaderNodeMix") => !crate::shader::world_mix_supported(
+                                properties
+                                    .and_then(|properties| properties.get("data_type"))
+                                    .and_then(Value::as_str),
+                                properties
+                                    .and_then(|properties| properties.get("blend_type"))
+                                    .and_then(Value::as_str),
+                            ),
+                            Some(
+                                "ShaderNodeBackground"
+                                | "ShaderNodeOutputWorld"
+                                | "ShaderNodeEmission"
+                                | "ShaderNodeTexSky"
+                                | "ShaderNodeTexEnvironment"
+                                | "ShaderNodeTexCoord"
+                                | "ShaderNodeMixRGB"
+                                | "ShaderNodeMixShader"
+                                | "ShaderNodeAddShader",
+                            ) => false,
+                            _ => true,
+                        }
                     })
                 });
             if has_unmapped_nodes {
