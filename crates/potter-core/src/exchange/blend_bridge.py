@@ -1790,6 +1790,13 @@ def _vertex_groups_dump(obj):
     return result
 
 
+def _active_vertex_group_index(obj):
+    if not len(obj.vertex_groups):
+        return None
+    index = int(obj.vertex_groups.active_index)
+    return index if 0 <= index < len(obj.vertex_groups) else None
+
+
 def _rotation_quaternion(source):
     """A bone's or object's rotation as a Quaternion, read from the field its rotation mode uses."""
     mode = source.rotation_mode
@@ -1799,7 +1806,6 @@ def _rotation_quaternion(source):
         angle, *axis = source.rotation_axis_angle
         return Quaternion(axis, angle)
     return source.rotation_euler.to_quaternion()
-
 
 def _pose_dump(obj):
     result = []
@@ -2035,6 +2041,7 @@ def object_dump(obj):
             "material_links": material_links, "modifiers": modifiers,
             "constraints": constraints, "drivers": drivers, "nla_tracks": nla_tracks,
             "action": action, "action_slot": action_slot, "pose": _pose_dump(obj),
+            "active_vertex_group_index": _active_vertex_group_index(obj),
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
             "volume_bounds": volume_bounds,
@@ -3680,9 +3687,12 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
         modifier.filepath = _relative_blend_path(filepath, target)
     elif kind == "uv_project":
         projectors = params.get("projectors", [])
-        if projectors:
-            modifier.projector_count = len(projectors)
-        for index, reference in enumerate(projectors):
+        # `projector_count` is the slot count; empty slots stay empty (rna_modifier.cc projectors_num).
+        count = int(params.get("projector_count", 1))
+        modifier.projector_count = count
+        for index, reference in enumerate(projectors[:count]):
+            if reference is None:
+                continue
             candidate = id_lookup.get(reference) if isinstance(reference, str) else None
             if candidate is None:
                 raise ValueError("UV Project projector references missing object %s" % reference)
@@ -5194,6 +5204,15 @@ def _restore_vertex_groups(obj, groups):
                 raise ValueError("cannot restore weight for vertex group %s" % group.name) from error
     if group_ids:
         obj["potter.vertex_group_ids_json"] = json.dumps(group_ids, sort_keys=True)
+
+
+def _restore_active_vertex_group(obj, item):
+    index = item.get("active_vertex_group_index")
+    if index is None:
+        return
+    if not isinstance(index, int) or not 0 <= index < len(obj.vertex_groups):
+        raise ValueError("object %s has an out-of-range active vertex group" % obj.name)
+    obj.vertex_groups.active_index = index
 
 def _restore_grease_pencil(data, raw, materials):
     for layer_raw in raw.get("layers", []):
@@ -7940,6 +7959,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             if not groups:
                 groups = source_object.get("vertex_groups", [])
             _restore_vertex_groups(obj, groups)
+            _restore_active_vertex_group(obj, item)
             mesh_source = compatibility_block(doc, "meshes", "Mesh", data_id)
             if data_id not in shape_key_meshes:
                 model_shape_keys = _shape_keys_from_model(doc, data_id)

@@ -38,11 +38,11 @@ use super::subsurface_walk::{
     walk_radius, walk_uses_van_de_hulst,
 };
 use super::{
+    bvh::{Bvh, BvhHit, WalkRay},
     eevee_volume_resolve::{
         FroxelTextureLayout, LinearSampleWeights, VolumeDepthMapping, VolumeProjection,
         linear_sample_weights, resolve_z_with_end_of_slice_bias, screen_uv_to_resolve_uv,
     },
-    bvh::{Bvh, BvhHit, WalkRay},
     light_model::{
         AreaShape, Spread, area_radiance, area_shape, emitter_radiance, influence_fade,
         inside_emitter, local_light_influence_radius_squared, point_intensity, spot_attenuation,
@@ -1716,7 +1716,6 @@ fn scene_has_world_volume(doc: &SceneDoc, scene_id: &str) -> bool {
     })
 }
 
-
 pub(super) struct RealtimeVolumeTransport<'a> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
@@ -1752,7 +1751,6 @@ struct RealtimeVolumeResolveCache {
     depth_start: f64,
     columns: BTreeMap<usize, Vec<DVec3>>,
 }
-
 
 pub(super) struct RealtimeVolumePass<'pass, 'scene> {
     transport: &'pass RealtimeVolumeTransport<'scene>,
@@ -1861,7 +1859,6 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
     }
 }
 
-
 impl RealtimeVolumeSample<'_, '_> {
     pub(super) fn integrate_segment(
         &mut self,
@@ -1881,7 +1878,9 @@ impl RealtimeVolumeSample<'_, '_> {
         if !self.initialize_froxel_resolve()? {
             return Ok(DVec3::ONE);
         }
-        let event_depth = self.camera.depth_of(self.origin + self.direction * end_distance);
+        let event_depth = self
+            .camera
+            .depth_of(self.origin + self.direction * end_distance);
         let (x_weights, y_weights, z_weights, grid_width) = {
             let cache = self
                 .scratch
@@ -1889,9 +1888,7 @@ impl RealtimeVolumeSample<'_, '_> {
                 .as_ref()
                 .expect("initialized froxel resolve cache");
             let coord_z = resolve_z_with_end_of_slice_bias(
-                cache
-                    .depth_mapping
-                    .view_z_to_volume_z(-event_depth as f32),
+                cache.depth_mapping.view_z_to_volume_z(-event_depth as f32),
                 cache.slice_count,
             );
             let screen_uv = [
@@ -1957,7 +1954,9 @@ impl RealtimeVolumeSample<'_, '_> {
             .doc
             .scenes
             .get(&self.transport.snapshot.scene_id)
-            .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
+            .ok_or_else(|| {
+                PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist")
+            })?;
         let settings = &scene.render;
         let mut depth_start = if settings.eevee_use_volume_custom_range {
             settings.eevee_volumetric_start
@@ -1969,10 +1968,7 @@ impl RealtimeVolumeSample<'_, '_> {
         } else {
             self.camera.far
         };
-        if !scene_has_world_volume(
-            self.transport.doc,
-            &self.transport.snapshot.scene_id,
-        ) {
+        if !scene_has_world_volume(self.transport.doc, &self.transport.snapshot.scene_id) {
             if let Some((object_depth_min, object_depth_max)) =
                 realtime_volume_depth_bounds(self.geometry, &self.transport.volumes, self.camera)
             {
@@ -2084,9 +2080,8 @@ impl RealtimeVolumeSample<'_, '_> {
 
         for history_index in 0..history_samples {
             let [jitter_x, jitter_y] = eevee_volume_jitter(history_index);
-            let pixel_x =
-                (f64::from(cell_x) + 0.5) * f64::from(tile_size)
-                    - jitter_x * f64::from(tile_size) * 0.5;
+            let pixel_x = (f64::from(cell_x) + 0.5) * f64::from(tile_size)
+                - jitter_x * f64::from(tile_size) * 0.5;
             let pixel_y = (f64::from(cell_y_from_top) + 0.5) * f64::from(tile_size)
                 + jitter_y * f64::from(tile_size) * 0.5;
             let raster_x = pixel_x.floor().clamp(0.0, f64::from(width - 1)) as u32;
@@ -2119,8 +2114,12 @@ impl RealtimeVolumeSample<'_, '_> {
             )?;
             self.origin = origin;
             self.direction = direction;
-            self.near_distance = self.camera.ray_distance_for_depth(direction, self.camera.near);
-            self.far_distance = self.camera.ray_distance_for_depth(direction, self.camera.far);
+            self.near_distance = self
+                .camera
+                .ray_distance_for_depth(direction, self.camera.near);
+            self.far_distance = self
+                .camera
+                .ray_distance_for_depth(direction, self.camera.far);
             self.footprint = footprint;
             self.rng = Pcg32::for_sample(self.seed, raster_x, raster_y, history_index);
             self.ambient = None;
@@ -2132,13 +2131,11 @@ impl RealtimeVolumeSample<'_, '_> {
                 let slice_start_depth = if slice == 0 {
                     depth_start
                 } else {
-                    -f64::from(
-                        depth_mapping
-                            .volume_z_to_view_z(slice as f32 / slice_count as f32),
-                    )
+                    -f64::from(depth_mapping.volume_z_to_view_z(slice as f32 / slice_count as f32))
                 };
-                let start_distance =
-                    self.camera.ray_distance_for_depth(direction, slice_start_depth);
+                let start_distance = self
+                    .camera
+                    .ray_distance_for_depth(direction, slice_start_depth);
                 let end_distance = self.camera.ray_distance_for_depth(direction, slice_depth);
                 let (_, transmittance) =
                     self.integrate_segment_with_sources(start_distance, end_distance, false)?;
@@ -2290,7 +2287,11 @@ mod volume_jitter_tests {
     #[test]
     fn volume_projection_jitter_matches_blender_halton_sequence() {
         let first = eevee_volume_jitter(0);
-        assert!(first.into_iter().all(|coordinate| coordinate.abs() <= f64::EPSILON));
+        assert!(
+            first
+                .into_iter()
+                .all(|coordinate| coordinate.abs() <= f64::EPSILON)
+        );
 
         let second = eevee_volume_jitter(1);
         assert!((second[0] + 0.5).abs() < 1.0e-15);

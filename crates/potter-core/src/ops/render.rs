@@ -222,20 +222,14 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
         .transpose()?;
     let eevee_volumetric_tile_size =
         optional_u32(engine, set, "eevee_volumetric_tile_size", 1, 16)?;
-    if eevee_volumetric_tile_size
-        .is_some_and(|value| !matches!(value, 1 | 2 | 4 | 8 | 16))
-    {
+    if eevee_volumetric_tile_size.is_some_and(|value| !matches!(value, 1 | 2 | 4 | 8 | 16)) {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             "eevee_volumetric_tile_size must be 1, 2, 4, 8, or 16",
-            &operation_pointer(
-                engine.operation_index,
-                "set/eevee_volumetric_tile_size",
-            ),
+            &operation_pointer(engine.operation_index, "set/eevee_volumetric_tile_size"),
         ));
     }
-    let eevee_volumetric_samples =
-        optional_u32(engine, set, "eevee_volumetric_samples", 1, 256)?;
+    let eevee_volumetric_samples = optional_u32(engine, set, "eevee_volumetric_samples", 1, 256)?;
     let eevee_volumetric_sample_distribution = optional_f64(
         engine,
         set,
@@ -250,16 +244,12 @@ pub(super) fn apply(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> 
                 engine.error(
                     ErrorCode::InvalidOperation,
                     "eevee_use_volume_custom_range must be a boolean",
-                    &operation_pointer(
-                        engine.operation_index,
-                        "set/eevee_use_volume_custom_range",
-                    ),
+                    &operation_pointer(engine.operation_index, "set/eevee_use_volume_custom_range"),
                 )
             })
         })
         .transpose()?;
-    let eevee_volumetric_start =
-        optional_positive_f64(engine, set, "eevee_volumetric_start")?;
+    let eevee_volumetric_start = optional_positive_f64(engine, set, "eevee_volumetric_start")?;
     let eevee_volumetric_end = optional_positive_f64(engine, set, "eevee_volumetric_end")?;
     let shutter = set
         .get("shutter")

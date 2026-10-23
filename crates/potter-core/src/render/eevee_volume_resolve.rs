@@ -31,9 +31,8 @@ impl VolumeDepthMapping {
         match projection {
             VolumeProjection::Perspective => {
                 let distribution = 4.0 * (1.0 - volumetric_sample_distribution).max(1e-2);
-                let depth_near =
-                    (volume_far - volume_near * (1.0 / distribution).exp2())
-                        / (volume_far - volume_near);
+                let depth_near = (volume_far - volume_near * (1.0 / distribution).exp2())
+                    / (volume_far - volume_near);
                 let depth_far = (1.0 - depth_near) / volume_near;
                 Self {
                     projection,
@@ -158,8 +157,7 @@ mod tests {
 
     #[test]
     fn orthographic_depth_mapping_round_trips() {
-        let mapping =
-            VolumeDepthMapping::new(VolumeProjection::Orthographic, -0.25, -42.0, 0.5);
+        let mapping = VolumeDepthMapping::new(VolumeProjection::Orthographic, -0.25, -42.0, 0.5);
         for z in [0.0, 0.2, 0.5, 1.0] {
             assert_close(mapping.view_z_to_volume_z(mapping.volume_z_to_view_z(z)), z);
         }

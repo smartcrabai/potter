@@ -4000,8 +4000,6 @@ mod visibility_tests {
                     None,
                     None,
                     None,
-                    None,
-                    None,
                 )
                 .expect("composite resolves");
                 assert_eq!(actual, expected, "pixel ({x}, {y})");
@@ -4042,7 +4040,7 @@ mod composite_layer_tests {
     /// Background (0.5,0.5,0.5), alpha 0.6: colour += (0.5,0.5,0.5) * (0.1,0.1,0) * 0.6 = (0.03,0.03,0).
     /// So the colour sums to (0.53,0.03,0) and the alpha is 1 - (0.25 * 1.4/3) * (1 - 0.6).
     #[test]
-    fn coloured_layers_over_a_partly_transparent_background() {
+    fn coloured_layers_over_a_partly_transparent_background() -> super::Result<()> {
         let layers = [
             Layer {
                 rgb: [1.0, 0.0, 0.0],
@@ -4056,14 +4054,15 @@ mod composite_layer_tests {
             },
         ];
         let alpha = 1.0 - (0.25 * 1.4 / 3.0) * (1.0 - 0.6);
-        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 0.6]);
+        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 0.6])?;
         assert_close(actual, [0.53 / alpha, 0.03 / alpha, 0.0, alpha]);
+        Ok(())
     }
 
     /// Two panes that tint different channels over a transparent film. Each mean is 1/3, so the alpha is
     /// 1 - (1/3) * (1/3) = 8/9. A product of the colour vectors would give zero transmittance and alpha 1.
     #[test]
-    fn overlapping_panes_multiply_their_alpha_means() {
+    fn overlapping_panes_multiply_their_alpha_means() -> super::Result<()> {
         let layers = [
             Layer {
                 rgb: [0.0; 3],
@@ -4076,27 +4075,30 @@ mod composite_layer_tests {
                 tint: [0.0, 1.0, 0.0],
             },
         ];
-        let actual = composite_layers(layers, [0.0; 4]);
+        let actual = composite_layers(layers, [0.0; 4])?;
         assert_close(actual, [0.0, 0.0, 0.0, 8.0 / 9.0]);
+        Ok(())
     }
 
     /// A white layer is the scalar composite: colour (0.8,0.2,0.4) at opacity 0.25 over an opaque background of
     /// (0.5,0.5,0.5). The colour is 0.25 * (0.8,0.2,0.4) + 0.75 * (0.5,0.5,0.5) = (0.575,0.425,0.475), alpha 1.
     #[test]
-    fn white_layer_is_the_scalar_composite() {
+    fn white_layer_is_the_scalar_composite() -> super::Result<()> {
         let layers = [Layer {
             rgb: [0.8, 0.2, 0.4],
             opacity: 0.25,
             tint: [1.0; 3],
         }];
-        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 1.0]);
+        let actual = composite_layers(layers, [0.5, 0.5, 0.5, 1.0])?;
         assert_close(actual, [0.575, 0.425, 0.475, 1.0]);
+        Ok(())
     }
 
     /// No layer over a fully transparent background is that background, as the film has nothing to show.
     #[test]
-    fn empty_stack_over_transparent_background_is_the_background() {
-        let actual = composite_layers(std::iter::empty(), [0.3, 0.4, 0.5, 0.0]);
+    fn empty_stack_over_transparent_background_is_the_background() -> super::Result<()> {
+        let actual = composite_layers(std::iter::empty(), [0.3, 0.4, 0.5, 0.0])?;
         assert_close(actual, [0.3, 0.4, 0.5, 0.0]);
+        Ok(())
     }
 }
