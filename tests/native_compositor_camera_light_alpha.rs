@@ -19,7 +19,8 @@ mod process;
 use std::{fs, path::Path};
 
 use native_oracle::{TestResult, apply_operations, import_blend, pot, read_scene};
-use potter_core::image::{ImageColorspace, decode_pixels};
+use potter_core::image::decode_pixels;
+use potter_core::model::ImageColorspace;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 

@@ -11,12 +11,13 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{error::Error, fs, path::Path};
+use std::{fs, path::Path};
 
 use native_oracle::{
     TestResult, import_blend, pot, read_scene, run_blender_arguments, write_script,
 };
-use potter_core::image::{ImageColorspace, decode_pixels};
+use potter_core::image::decode_pixels;
+use potter_core::model::ImageColorspace;
 use serde_json::Value;
 use tempfile::tempdir;
 
