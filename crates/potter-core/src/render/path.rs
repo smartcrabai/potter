@@ -1194,6 +1194,7 @@ fn render_rows(
                                 (left_origin, left_direction),
                             )?,
                             job.environment,
+                            job.film_transparent,
                             &mut left_rng,
                             &mut evaluator_workspace,
                         )?,
@@ -1217,6 +1218,7 @@ fn render_rows(
                                 (right_origin, right_direction),
                             )?,
                             job.environment,
+                            job.film_transparent,
                             &mut right_rng,
                             &mut evaluator_workspace,
                         )?,
@@ -1248,6 +1250,7 @@ fn render_rows(
                                 (origin, direction),
                             )?,
                             job.environment,
+                            job.film_transparent,
                             &mut rng,
                             &mut evaluator_workspace,
                         )?,
@@ -1270,10 +1273,11 @@ fn render_rows(
                 finite_f32(color.z),
                 finite_f32(alpha),
             ];
+            let display_rgb = display_rgb_from_associated([color.x, color.y, color.z], alpha);
             rgba[index * 4..index * 4 + 4].copy_from_slice(&[
-                to_srgb_byte(color.x),
-                to_srgb_byte(color.y),
-                to_srgb_byte(color.z),
+                to_srgb_byte(display_rgb[0]),
+                to_srgb_byte(display_rgb[1]),
+                to_srgb_byte(display_rgb[2]),
                 (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
             ]);
         }
@@ -1392,7 +1396,8 @@ pub(super) fn render(
     let mut output = RasterOutput {
         rgba: allocate(rgba_len, 0_u8, "RGBA image")?,
         linear_rgba: allocate(pixel_count, [0.0_f32; 4], "linear RGBA image")?,
-        linear_rgba_associated: false,
+        // Path RGB is associated surface radiance plus alpha-independent visible-light radiance.
+        linear_rgba_associated: true,
         ids: allocate(pixel_count, 0_u32, "object ID buffer")?,
         depths: allocate(pixel_count, 0.0_f32, "depth buffer")?,
         elements: allocate(pixel_count, 0_u32, "element ID buffer")?,
@@ -4073,6 +4078,7 @@ fn trace_path(
     mut direction: DVec3,
     footprint: CameraFootprint,
     environment: DVec3,
+    film_transparent: bool,
     rng: &mut Pcg32,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, f64)> {
@@ -4611,9 +4617,12 @@ fn trace_path(
                     power_heuristic(phase_pdf, volume_sampling_pdf(direction, importance))
                 }
             };
-            let environment =
-                world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
-            radiance += throughput * environment * environment_weight;
+            // The transparent film leaves camera-background world radiance to the external compositor.
+            if !film_transparent || !matches!(previous, Scatter::Camera) {
+                let environment =
+                    world_radiance(doc, &snapshot.scene_id, images, direction, environment)?;
+                radiance += throughput * environment * environment_weight;
+            }
             escaped = true;
             break;
         };
@@ -4980,14 +4989,8 @@ fn write_center_passes(
     Ok(())
 }
 
-/// Composites `source` over `destination`, decoding and encoding each buffer's association mode.
-fn overlay_over_rgba(
-    source: [f32; 4],
-    source_associated: bool,
-    destination: [f32; 4],
-    destination_associated: bool,
-    film_transparent: bool,
-) -> [f64; 4] {
+/// Source and destination RGB are associated radiance, including additive camera-visible emission.
+fn overlay_over_rgba(source: [f32; 4], destination: [f32; 4], film_transparent: bool) -> [f64; 4] {
     let source_alpha = f64::from(source[3]).clamp(0.0, 1.0);
     let destination_alpha = f64::from(destination[3]).clamp(0.0, 1.0);
     let inverse_source_alpha = 1.0 - source_alpha;
@@ -4997,85 +5000,259 @@ fn overlay_over_rgba(
         1.0
     };
     let rgb: [f64; 3] = std::array::from_fn(|channel| {
-        let source_rgb = f64::from(source[channel]);
-        let destination_rgb = f64::from(destination[channel]);
-        let source_associated_rgb = if source_associated {
-            source_rgb
-        } else {
-            source_rgb * source_alpha
-        };
-        let destination_associated_rgb = if destination_associated {
-            destination_rgb
-        } else {
-            destination_rgb * destination_alpha
-        };
-        let associated_rgb =
-            source_associated_rgb + destination_associated_rgb * inverse_source_alpha;
-        if destination_associated {
-            associated_rgb
-        } else if alpha > 0.0 {
-            associated_rgb / alpha
-        } else {
-            // Straight path RGB can carry physical radiance even when its coverage alpha is zero.
-            associated_rgb + destination_rgb
-        }
+        f64::from(source[channel]) + f64::from(destination[channel]) * inverse_source_alpha
     });
     [rgb[0], rgb[1], rgb[2], alpha]
 }
 
+/// Converts associated render RGB to straight bytes; alpha-zero additive radiance stays observable.
+fn display_rgb_from_associated(rgb: [f64; 3], alpha: f64) -> [f64; 3] {
+    if alpha > 0.0 {
+        rgb.map(|channel| channel / alpha)
+    } else {
+        rgb
+    }
+}
+
 #[cfg(test)]
 mod overlay_tests {
-    use super::overlay_over_rgba;
+    use std::collections::BTreeMap;
+
+    use super::{
+        AreaShape, Bounces, Camera, CameraFootprint, DMat4, DVec3, EvaluatorWorkspace, Geometry,
+        Pcg32, PointLight, RasterOutput, RayKind, SceneRefs, TraceGeometry,
+        display_rgb_from_associated, overlay_over_rgba, overlay_rasterized_lines, to_srgb_byte,
+        trace_path,
+    };
+    use crate::{
+        eval::{EvaluationContext, Snapshot},
+        model::{LightType, SceneDoc},
+        render::{
+            bvh::Bvh,
+            raster::{Line, Projection, StereoMode},
+        },
+    };
 
     #[test]
-    fn associated_line_over_opaque_black_keeps_its_full_coverage_contribution() {
+    fn associated_line_over_opaque_destination_keeps_full_coverage_contribution() {
         assert_eq!(
-            overlay_over_rgba(
-                [0.5, 0.0, 0.0, 0.5],
-                true,
-                [0.0, 0.0, 0.0, 1.0],
-                false,
-                true
-            ),
-            [0.5, 0.0, 0.0, 1.0]
+            overlay_over_rgba([0.5, 0.0, 0.0, 0.5], [0.0, 0.0, 1.0, 1.0], true),
+            [0.5, 0.0, 0.5, 1.0]
         );
     }
 
     #[test]
-    fn associated_line_over_transparent_destination_ignores_hidden_rgb() {
+    fn associated_line_over_fractional_destination_preserves_associated_energy() {
         assert_eq!(
-            overlay_over_rgba(
-                [0.5, 0.0, 0.0, 0.5],
-                true,
-                [9.0, 8.0, 7.0, 0.0],
-                false,
-                true
-            ),
-            [1.0, 0.0, 0.0, 0.5]
+            overlay_over_rgba([0.5, 0.0, 0.0, 0.5], [0.0, 0.0, 0.25, 0.25], true),
+            [0.5, 0.0, 0.125, 0.625]
         );
     }
 
     #[test]
-    fn associated_line_over_fractional_destination_returns_straight_rgb() {
-        let result = overlay_over_rgba(
-            [0.5, 0.0, 0.0, 0.5],
-            true,
-            [0.0, 0.0, 1.0, 0.25],
-            false,
-            true,
+    fn associated_line_over_transparent_destination_keeps_additive_radiance() {
+        assert_eq!(
+            overlay_over_rgba([0.5, 0.0, 0.0, 0.5], [0.0, 0.0, 1.25, 0.0], true),
+            [0.5, 0.0, 0.625, 0.5]
         );
-        assert!((result[0] - 0.8).abs() < 1.0e-12);
-        assert_eq!(result[1], 0.0);
-        assert!((result[2] - 0.4).abs() < 1.0e-12);
-        assert_eq!(result[3], 0.625);
     }
 
     #[test]
-    fn zero_alpha_preserves_straight_path_radiance() {
+    fn zero_alpha_associated_buffer_keeps_additive_radiance() {
         assert_eq!(
-            overlay_over_rgba([0.0; 4], true, [1.25, 0.5, 0.25, 0.0], false, true),
+            overlay_over_rgba([0.0; 4], [1.25, 0.5, 0.25, 0.0], true),
             [1.25, 0.5, 0.25, 0.0]
         );
+    }
+
+    #[test]
+    fn physical_light_survives_fractional_stroke_in_producer_overlay_and_byte_encoding()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let doc = SceneDoc::default();
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let camera = Camera {
+            position: DVec3::ZERO,
+            target: -DVec3::Z,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 10.0,
+            projection: Projection::Orthographic { height: 2.0 },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.0,
+        };
+        let geometry = Geometry {
+            triangles: Vec::new(),
+            lines: vec![Line {
+                start: DVec3::new(0.0, 0.0, -1.0),
+                end: DVec3::new(0.0, 0.0, -1.0),
+                radius_start: 0.1,
+                radius_end: 0.1,
+                color: [0.0, 0.0, 0.0, 0.5],
+                object_index: 1,
+                element_index: 1,
+                ray_mask: RayKind::Camera.bit(),
+            }],
+            wire_edges: Vec::new(),
+            wire_points: Vec::new(),
+            materials: Vec::new(),
+            prepared: Vec::new(),
+            objects: Vec::new(),
+            elements: Vec::new(),
+            bounds: None,
+            warnings: Vec::new(),
+            shader_warnings: std::cell::RefCell::new(Vec::new()),
+            shadows: None,
+        };
+        let trace_geometry = TraceGeometry::of(&geometry);
+        let bvh = Bvh::build(&geometry.triangles)?;
+        let images = BTreeMap::new();
+        let light = PointLight {
+            position: DVec3::new(0.0, 0.0, -3.0),
+            direction: DVec3::Z,
+            world_transform: DMat4::IDENTITY,
+            kind: LightType::Area,
+            color: DVec3::X,
+            energy: 1.0,
+            radius: 0.0,
+            soft_falloff: false,
+            spot_size: 1.0,
+            spot_blend: 0.0,
+            area: Some(AreaShape {
+                axis_u: DVec3::X,
+                axis_v: DVec3::Y,
+                half_u: 0.5,
+                half_v: 0.5,
+                ellipse: false,
+                area: 1.0,
+            }),
+            spread: None,
+            use_mis: true,
+            volume_factor: 0.0,
+            volume_radius_squared: 0.0,
+            ray_mask: RayKind::Camera.bit(),
+            camera_shape_eligible: true,
+        };
+        let lights = [light];
+        let scene = SceneRefs {
+            doc: &doc,
+            snapshot: &snapshot,
+            geometry: &trace_geometry,
+            bvh: &bvh,
+            lights: &lights,
+            volumes: &[],
+            images: &images,
+            importance: None,
+        };
+        let world_only_scene = SceneRefs {
+            lights: &[],
+            ..scene
+        };
+        let transparent_environment = DVec3::new(0.0, 8.0, 0.0);
+        let mut environment_rng = Pcg32::for_sample(7, 0, 0, 1);
+        let mut environment_workspace = EvaluatorWorkspace::default();
+        let (transparent_world, transparent_alpha) = trace_path(
+            world_only_scene,
+            Bounces {
+                surface: 0,
+                volume: 0,
+                transparent: 2,
+            },
+            DVec3::ZERO,
+            -DVec3::Z,
+            CameraFootprint::default(),
+            transparent_environment,
+            true,
+            &mut environment_rng,
+            &mut environment_workspace,
+        )?;
+        assert_eq!(transparent_world, DVec3::ZERO);
+        assert_eq!(transparent_alpha, 0.0);
+        let mut opaque_environment_rng = Pcg32::for_sample(7, 0, 0, 2);
+        let mut opaque_environment_workspace = EvaluatorWorkspace::default();
+        let (opaque_world, _) = trace_path(
+            world_only_scene,
+            Bounces {
+                surface: 0,
+                volume: 0,
+                transparent: 2,
+            },
+            DVec3::ZERO,
+            -DVec3::Z,
+            CameraFootprint::default(),
+            transparent_environment,
+            false,
+            &mut opaque_environment_rng,
+            &mut opaque_environment_workspace,
+        )?;
+        assert_eq!(opaque_world, transparent_environment);
+        assert_eq!(
+            overlay_over_rgba(
+                [0.0; 4],
+                [
+                    opaque_world.x as f32,
+                    opaque_world.y as f32,
+                    opaque_world.z as f32,
+                    0.0,
+                ],
+                false
+            ),
+            [0.0, 8.0, 0.0, 1.0]
+        );
+        let mut rng = Pcg32::for_sample(7, 0, 0, 0);
+        let mut workspace = EvaluatorWorkspace::default();
+        let (radiance, alpha) = trace_path(
+            scene,
+            Bounces {
+                surface: 0,
+                volume: 0,
+                transparent: 2,
+            },
+            DVec3::ZERO,
+            -DVec3::Z,
+            CameraFootprint::default(),
+            DVec3::new(0.0, 8.0, 0.0),
+            true,
+            &mut rng,
+            &mut workspace,
+        )?;
+        assert_eq!(alpha, 0.0);
+        assert!(radiance.x > 0.0);
+        assert_eq!(radiance.y, 0.0);
+        assert_eq!(radiance.z, 0.0);
+
+        let mut output = RasterOutput {
+            rgba: vec![0; 4],
+            linear_rgba: vec![[radiance.x as f32, radiance.y as f32, radiance.z as f32, 0.0]],
+            linear_rgba_associated: true,
+            ids: vec![0],
+            depths: vec![0.0],
+            elements: vec![0],
+            normals: vec![[0.0; 3]],
+            albedo: vec![[0.0; 4]],
+            emission: vec![[0.0; 4]],
+            ambient_occlusion: vec![1.0],
+        };
+        overlay_rasterized_lines(&geometry, &camera, 1, 1, 0, true, &mut output)?;
+
+        let pixel = output.linear_rgba[0];
+        assert!((f64::from(pixel[0]) - radiance.x * 0.5).abs() < 1.0e-6);
+        assert_eq!(pixel[1], 0.0);
+        assert_eq!(pixel[2], 0.0);
+        assert_eq!(pixel[3], 0.5);
+        assert_eq!(output.ids[0], 1);
+        let display_rgb = display_rgb_from_associated(
+            [
+                f64::from(pixel[0]),
+                f64::from(pixel[1]),
+                f64::from(pixel[2]),
+            ],
+            f64::from(pixel[3]),
+        );
+        assert_eq!(output.rgba[0], to_srgb_byte(display_rgb[0]));
+        assert_eq!(&output.rgba[1..], &[0, 0, 128]);
+        Ok(())
     }
 }
 
@@ -5131,13 +5308,7 @@ fn overlay_rasterized_lines(
             continue;
         };
         let source_alpha = f64::from(source[3]).clamp(0.0, 1.0);
-        let color = overlay_over_rgba(
-            source,
-            overlay.linear_rgba_associated,
-            destination,
-            output.linear_rgba_associated,
-            film_transparent,
-        );
+        let color = overlay_over_rgba(source, destination, film_transparent);
         let alpha = color[3];
         if let Some(pixel) = output.linear_rgba.get_mut(index) {
             *pixel = color.map(finite_f32);
@@ -5194,10 +5365,11 @@ fn overlay_rasterized_lines(
             .rgba
             .get_mut(byte_index..byte_index.saturating_add(4))
         {
+            let display_rgb = display_rgb_from_associated([color[0], color[1], color[2]], alpha);
             bytes.copy_from_slice(&[
-                to_srgb_byte(color[0]),
-                to_srgb_byte(color[1]),
-                to_srgb_byte(color[2]),
+                to_srgb_byte(display_rgb[0]),
+                to_srgb_byte(display_rgb[1]),
+                to_srgb_byte(display_rgb[2]),
                 (alpha * 255.0).round() as u8,
             ]);
         }
