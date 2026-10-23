@@ -9,7 +9,7 @@ use std::{error::Error, fs, io::Cursor};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-use super::{Image, evaluate_graph};
+use super::Image;
 use crate::{
     error::{ErrorCode, Result},
     graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
