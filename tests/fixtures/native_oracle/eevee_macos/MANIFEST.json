@@ -12,7 +12,7 @@
     "eevee_light_shapes.py": "0e5e23a4b0462837586bcebfb101a35620a988dfc9d3c419736cd7c29ee3a5a7",
     "eevee_light_shapes_extra.py": "004fab26c13bde0bc034bcf3c3dadcba4c8841e3dbe7a705f65e10567e94d712",
     "eevee_light_shape_occlusion.py": "a491ea92be2a92bece562bed980c471baf8f5f8488249115d3e84c4b2b9bbafa",
-    "eevee_mesh_volume_gradient.py": "30297f8cc45b9e14900a8fdf778f044821217e1261d2f8096e261363a2561876",
+    "eevee_mesh_volume_gradient.py": "0cd713ccef61705dfed92be7953c94be4734d4d4dcdfd18a6f8c7995cbdd49e2",
     "eevee_volume_factor.py": "cd0688243e558f12fe3985de348ccceba096f562e81ef6d7d67511d8704787d2",
     "eevee_volume_shadowed.py": "3b422aa762119de096acef4765f3c9bd30fd5c3f80762e3b1b3631ead89037d9",
     "eevee_world_background.py": "3dfbc770812ece43429906a7d0425c9e32ef12d101701af8ab56b04f3591e29b",
@@ -54,6 +54,7 @@
     "absorber_zero.f32le": 49152,
     "point_occluded.f32le": 49152,
     "mesh_volume_gradient.f32le": 49152,
+    "mesh_volume_gradient_perspective.f32le": 49152,
     "area_point.f32le": 49152,
     "sun.f32le": 49152,
     "spot.f32le": 49152

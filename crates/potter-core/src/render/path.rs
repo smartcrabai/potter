@@ -2547,44 +2547,17 @@ impl RealtimeVolumeSample<'_, '_> {
         Ok(extinction)
     }
 
-    /// Builds one native render sample's EEVEE froxel column from center-sampled extinction.
+    /// Builds one native render sample's prefix transmittance from its jittered froxel column.
     fn build_froxel_column(&mut self, column_index: usize) -> Result<()> {
-        let (layout, width, height, slice_count, depth_start, depth_mapping) = {
+        let (slice_count, depth_start, depth_mapping) = {
             let cache = self.resolve_cache()?;
-            (
-                cache.layout,
-                cache.width,
-                cache.height,
-                cache.slice_count,
-                cache.depth_start,
-                cache.depth_mapping,
-            )
+            (cache.slice_count, cache.depth_start, cache.depth_mapping)
         };
-        let dimensions = layout.dimensions;
-        let cell_x = column_index as u32 % dimensions[0];
-        let cell_y = column_index as u32 / dimensions[0];
-        let cell_center = layout.cell_center_in_pixels(cell_x, cell_y);
-        let raster_x = cell_center[0].floor().clamp(0.0, f64::from(width - 1)) as u32;
-        let raster_y = cell_center[1].floor().clamp(0.0, f64::from(height - 1)) as u32;
-        let sample_x = cell_center[0] - f64::from(raster_x);
-        let sample_y = cell_center[1] - f64::from(raster_y);
-        let Some((_, integration_direction)) = ray_for_sample_in_frame(
-            &self.frame,
-            &self.camera,
-            width,
-            height,
-            raster_x,
-            raster_y,
-            sample_x,
-            sample_y,
-        )?
-        else {
-            return Err(PotError::new(
-                ErrorCode::InternalError,
-                "realtime froxel column has no camera ray",
-            ));
+        let Some(integration_direction) = self.accumulate_froxel_extinction(column_index)? else {
+            self.scratch.froxel_prefix.clear();
+            self.scratch.froxel_prefix.resize(slice_count, DVec3::ONE);
+            return Ok(());
         };
-        self.accumulate_froxel_extinction(column_index)?;
         let mut cumulative_optical_depth = DVec3::ZERO;
         let mut previous_distance = self
             .camera
@@ -2610,7 +2583,7 @@ impl RealtimeVolumeSample<'_, '_> {
     }
 
     /// Samples occupied mesh and voxel froxel centers for this EEVEE image-render AA sample.
-    fn accumulate_froxel_extinction(&mut self, column_index: usize) -> Result<()> {
+    fn accumulate_froxel_extinction(&mut self, column_index: usize) -> Result<Option<DVec3>> {
         let (layout, tile_size, slice_count, depth_mapping, width, height) = {
             let cache = self.resolve_cache()?;
             (
@@ -2652,7 +2625,7 @@ impl RealtimeVolumeSample<'_, '_> {
             sample_y,
         )?
         else {
-            return Ok(());
+            return Ok(None);
         };
         let mut footprint = camera_footprint(
             &self.frame,
@@ -2745,7 +2718,7 @@ impl RealtimeVolumeSample<'_, '_> {
         self.far_distance = saved.3;
         self.footprint = saved.4;
         self.mesh_prepared = false;
-        Ok(())
+        Ok(Some(direction))
     }
 
     fn integrate_segment_with_sources(

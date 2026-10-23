@@ -12,8 +12,8 @@
 //!   verify that all-zero and transmission-only factors cull the shape while a volume-only factor keeps it visible;
 //! - a hard point light whose physical sphere front is in front of an opaque plane, while EEVEE's center-plane emitter
 //!   lies behind it, pinning the camera-shape depth test.
-//! - a hard point light behind a mesh-volume absorption gradient that is zero at the camera-entry face, pinning material
-//!   evaluation at occupied froxel centers and the AA-filtered emitter edge.
+//! - orthographic and wide-FOV perspective point lights behind a mesh-volume absorption gradient that is zero at camera
+//!   entry, pinning per-froxel material evaluation and jittered perspective prefix steps at the AA-filtered edge.
 //!
 //! The test imports each saved `.blend`, renders it with `pot render --engine realtime`, and compares window means with
 //! committed macOS EEVEE pixel captures. The sun, spot, and opaque-surface tolerances are 0.01; the existing absorber
@@ -72,6 +72,9 @@ const MESH_VOLUME_SCRIPT: &str =
     include_str!("fixtures/native_oracle/eevee_mesh_volume_gradient.py");
 const EEVEE_MESH_VOLUME_GRADIENT: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/mesh_volume_gradient.f32le");
+const EEVEE_MESH_VOLUME_PERSPECTIVE: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/mesh_volume_gradient_perspective.f32le");
+const MESH_VOLUME_PERSPECTIVE_COLUMN: usize = 18;
 
 /// Linear tolerance on a window mean against EEVEE, for the sun and the spot.
 const EMITTER_TOLERANCE: f64 = 0.01;
@@ -386,6 +389,79 @@ fn realtime_point_shape_evaluates_heterogeneous_mesh_volume_per_froxel_sample() 
     assert!(
         (actual_edge - expected_edge).abs() <= ABSORBER_TOLERANCE,
         "AA-filtered point-shape edge through heterogeneous volume: Potter {actual_edge} differs from EEVEE {expected_edge}"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_perspective_mesh_volume_uses_the_sample_jittered_column_ray() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(
+        root.path(),
+        "eevee_mesh_volume_gradient.py",
+        MESH_VOLUME_SCRIPT,
+    )?;
+    let blend = root.path().join("mesh_volume_gradient_perspective.blend");
+    let capture = root.path().join("mesh_volume_gradient_perspective.f32le");
+    run_blender_arguments(
+        &blender,
+        &script,
+        None,
+        &[
+            blend.as_path(),
+            capture.as_path(),
+            Path::new("PERSP"),
+            Path::new("16"),
+            Path::new("-4.0"),
+        ],
+    )?;
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "mesh_volume_gradient_perspective",
+        &blend,
+        "mesh_volume_gradient_perspective",
+        16,
+    )?;
+    let actual_center = window_mean(
+        &project,
+        "mesh_volume_gradient_perspective",
+        MESH_VOLUME_PERSPECTIVE_COLUMN,
+        RESOLUTION as usize / 2,
+        WINDOW,
+    )?;
+    let expected_center = oracle_window_mean(
+        EEVEE_MESH_VOLUME_PERSPECTIVE,
+        MESH_VOLUME_PERSPECTIVE_COLUMN,
+        RESOLUTION as usize / 2,
+        WINDOW,
+    );
+    assert!(
+        (actual_center - expected_center).abs() <= ABSORBER_TOLERANCE,
+        "perspective froxel attenuation at the point-shape center: Potter {actual_center} differs from EEVEE {expected_center}"
+    );
+
+    let edge_column = MESH_VOLUME_PERSPECTIVE_COLUMN + 3;
+    let actual_edge = window_mean(
+        &project,
+        "mesh_volume_gradient_perspective",
+        edge_column,
+        RESOLUTION as usize / 2,
+        0,
+    )?;
+    let expected_edge = oracle_window_mean(
+        EEVEE_MESH_VOLUME_PERSPECTIVE,
+        edge_column,
+        RESOLUTION as usize / 2,
+        0,
+    );
+    assert!(
+        (actual_edge - expected_edge).abs() <= ABSORBER_TOLERANCE,
+        "wide-FOV AA edge through coarse perspective froxels: Potter {actual_edge} differs from EEVEE {expected_edge}"
     );
     Ok(())
 }
