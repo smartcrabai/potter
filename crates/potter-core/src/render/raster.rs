@@ -3999,6 +3999,25 @@ mod smooth_shading_tests {
     }
 
     #[test]
+    fn beauty_retains_interior_samples_with_small_barycentric_weights() {
+        let center = DVec3::new(1.0 / 64.0, -1.0 / 64.0, 0.0);
+        let mut triangle = translucent(triangle(None));
+        triangle.positions = [
+            center + DVec3::new(-1.0, -0.5, 0.0),
+            center + DVec3::new(1.0, -0.5, 0.0),
+            center + DVec3::new(0.0, 1.0e12 - 0.5, 0.0),
+        ];
+
+        let actual = render_beauty(&[triangle]).linear_rgba[CENTER].map(f64::from);
+        for (channel, expected) in actual.iter().zip([0.125, 0.25, 0.375, 0.5]) {
+            assert!(
+                (*channel - expected).abs() < 1.0e-6,
+                "expected a covered interior sample, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
     fn distinct_transparent_surfaces_still_compose_as_separate_beauty_layers() {
         let mut front = translucent(triangle(None));
         let mut back = translucent(triangle(None));
