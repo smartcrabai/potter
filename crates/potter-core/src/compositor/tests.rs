@@ -58,6 +58,158 @@ fn run_node(
     )
 }
 
+fn run_associated_graph(graph: NodeGroup, base: &Image) -> Result<Image> {
+    let mut doc = SceneDoc::default();
+    let graph_id = Id::from_static("associated_graph");
+    doc.node_groups.insert(graph_id.clone(), graph);
+    let scene_id = doc.active_scene.clone();
+    let scene = doc.scenes.get_mut(&scene_id).unwrap();
+    scene.use_compositing = true;
+    scene.compositor = Some(graph_id);
+    let scene = doc.scenes.get(&scene_id).unwrap();
+    super::apply_associated_image(base.clone(), &doc, scene, 1.0)
+}
+
+fn alpha_over_graph() -> NodeGroup {
+    let mut graph = NodeGroup::new("associated alpha over", GraphKind::Compositor);
+    let layers_id = Id::from_static("layers");
+    let alpha_over_id = Id::from_static("alpha_over");
+    let output_id = Id::from_static("output");
+    graph
+        .nodes
+        .insert(layers_id.clone(), GraphNode::new("CompositorNodeRLayers"));
+    graph.nodes.insert(
+        alpha_over_id.clone(),
+        test_node(
+            "CompositorNodeAlphaOver",
+            json!({"background": [0.1, 0.25, 0.5]}),
+        ),
+    );
+    graph
+        .nodes
+        .insert(output_id.clone(), GraphNode::new("CompositorNodeComposite"));
+    graph.links.extend([
+        GraphLink {
+            from_node: layers_id,
+            from_socket: "Image".to_owned(),
+            to_node: alpha_over_id.clone(),
+            to_socket: "Image".to_owned(),
+        },
+        GraphLink {
+            from_node: alpha_over_id,
+            from_socket: "Image".to_owned(),
+            to_node: output_id,
+            to_socket: "Image".to_owned(),
+        },
+    ]);
+    graph
+}
+
+#[test]
+fn associated_alpha_over_keeps_zero_alpha_radiance_over_opaque_background() -> Result<()> {
+    let input = Image::new(1, 1, vec![[2.0, 0.5, 0.25, 0.0]])?;
+    let output = run_associated_graph(alpha_over_graph(), &input)?;
+    assert_pixel(output.pixels[0], [2.1, 0.75, 0.75, 1.0]);
+    Ok(())
+}
+
+#[test]
+fn associated_mix_rgb_keeps_additive_radiance_when_output_alpha_changes() -> Result<()> {
+    let mut graph = NodeGroup::new("associated mix", GraphKind::Compositor);
+    let layers_id = Id::from_static("layers");
+    let mix_id = Id::from_static("mix");
+    let output_id = Id::from_static("output");
+    graph
+        .nodes
+        .insert(layers_id.clone(), GraphNode::new("CompositorNodeRLayers"));
+    graph.nodes.insert(
+        mix_id.clone(),
+        test_node(
+            "CompositorNodeMixRGB",
+            json!({"blend_type": "add", "factor": 0.5, "color2": [0.0, 0.0, 0.0]}),
+        ),
+    );
+    graph
+        .nodes
+        .insert(output_id.clone(), GraphNode::new("CompositorNodeComposite"));
+    graph.links.extend([
+        GraphLink {
+            from_node: layers_id,
+            from_socket: "Image".to_owned(),
+            to_node: mix_id.clone(),
+            to_socket: "Image1".to_owned(),
+        },
+        GraphLink {
+            from_node: mix_id,
+            from_socket: "Image".to_owned(),
+            to_node: output_id,
+            to_socket: "Image".to_owned(),
+        },
+    ]);
+    let input = Image::new(1, 1, vec![[2.0, 0.0, 0.0, 0.0]])?;
+    let output = run_associated_graph(graph, &input)?;
+    assert_pixel(output.pixels[0], [2.0, 0.0, 0.0, 0.5]);
+    Ok(())
+}
+
+#[test]
+fn associated_blur_and_defocus_filter_zero_alpha_radiance_without_reassociation() -> Result<()> {
+    let input = Image::new(
+        3,
+        1,
+        vec![
+            [0.4, 0.2, 0.1, 1.0],
+            [4.0, 2.0, 1.0, 0.0],
+            [0.4, 0.2, 0.1, 1.0],
+        ],
+    )?;
+    let expected = super::gaussian_blur(&input, 1)?;
+    for node_type in [
+        "CompositorNodeBlur",
+        "Blur",
+        "CompositorNodeDefocus",
+        "Defocus",
+    ] {
+        let output = run_associated_graph(
+            graph_with_node(test_node(node_type, json!({"radius": 1})), "Image"),
+            &input,
+        )?;
+        assert_eq!(output, expected, "{node_type}");
+    }
+    Ok(())
+}
+
+#[test]
+fn associated_gamma_uses_native_zero_alpha_fallback() -> Result<()> {
+    let input = Image::new(1, 1, vec![[0.25, 1.0, 4.0, 0.0]])?;
+    let output = run_associated_graph(
+        graph_with_node(
+            test_node("CompositorNodeGamma", json!({"gamma": 2.0})),
+            "Image",
+        ),
+        &input,
+    )?;
+    assert_pixel(output.pixels[0], [0.5, 1.0, 2.0, 0.0]);
+    Ok(())
+}
+
+#[test]
+fn associated_curves_transform_premultiplied_channels_as_native() -> Result<()> {
+    let input = Image::new(1, 1, vec![[0.25, 0.125, 0.375, 0.5]])?;
+    let output = run_associated_graph(
+        graph_with_node(
+            test_node(
+                "CompositorNodeCurves",
+                json!({"curve": [[0.0, 0.2], [1.0, 1.0]]}),
+            ),
+            "Image",
+        ),
+        &input,
+    )?;
+    assert_pixel(output.pixels[0], [0.4, 0.3, 0.5, 0.5]);
+    Ok(())
+}
+
 fn assert_pixel(actual: [f32; 4], expected: [f32; 4]) {
     for (actual, expected) in actual.into_iter().zip(expected) {
         assert!(

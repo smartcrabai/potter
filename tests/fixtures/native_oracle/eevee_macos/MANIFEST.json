@@ -1,8 +1,8 @@
 {
-  "blender": "Blender 5.2.2 LTS / build date: 2026-09-15 / build time: 01:49:19 / build commit date: 2026-09-14",
+  "blender": "Blender 5.2.2 LTS / build date: 2026-09-15 / build time: 01:49:19 / build commit date: 2026-09-14 / build hash: d13f752e3b9c / branch: blender-v5.2-release",
   "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
   "machine": "arm64",
-  "generated_by": "Blender 5.2.2 EEVEE renders on macOS; EXR captures are exported with export_eevee_fixture.py, eevee_light_shape_transparency.py writes transparent-film shape captures, eevee_light_shape_fractional_base.py writes the base-only EXR, eevee_vse_light_shape_scene_strip.py and eevee_vse_light_shape_crossfade.py write saved VSE consumer EXRs, and eevee_light_shape_boundaries.py writes RGB f32le captures from Blender image.pixels. Script hashes identify rendering/export sources.",
+  "generated_by": "Blender 5.2.2 EEVEE renders on macOS; EXR captures are exported with export_eevee_fixture.py, eevee_light_shape_transparency.py writes transparent-film shape captures, eevee_light_shape_fractional_base.py writes the base-only EXR, eevee_vse_light_shape_scene_strip.py and eevee_vse_light_shape_crossfade.py write saved VSE consumer EXRs, eevee_light_shape_boundaries.py writes RGB f32le captures from Blender image.pixels, and compositor_camera_light_alpha.py writes camera-light AlphaOver and Blur File Output EXR consumers with their source .blend inputs. Script hashes identify rendering/export sources.",
   "scripts": {
     "eevee_glass_direct.py": "380387923d1ea62355a282fcb30b464a30bb364d28cf3e1c9ea66571739941ef",
     "eevee_glass_transmission.py": "2559aa78052fd60d474fcf28d7d29555b6f1eb884f43c227874c4ea44c9eaf9b",
@@ -20,7 +20,8 @@
     "eevee_vse_light_shape_crossfade.py": "6cd0d56b9efe333f0a23631a537ccb1cdc987612e1eac9a7ed0f904c7519cf20",
     "eevee_vse_light_shape_scene_strip.py": "01cbe0f49a10ac9d1627c32e7c3db678c26b219e9d5178305fbedb419724a069",
     "eevee_world_background.py": "3dfbc770812ece43429906a7d0425c9e32ef12d101701af8ab56b04f3591e29b",
-    "export_eevee_fixture.py": "214d2ab63f343f7e59af8eaa7752217f7b26b574696e9c21b0518279ddd55606"
+    "export_eevee_fixture.py": "214d2ab63f343f7e59af8eaa7752217f7b26b574696e9c21b0518279ddd55606",
+    "compositor_camera_light_alpha.py": "74d4a6984b1e0150ece8453e779e01b86142e59d5a5423fbba3ba7f02c746076"
   },
   "fixtures": {
     "direct_influence_area.f32le": 196608,
@@ -62,6 +63,10 @@
     "vse_light_shape_crossfade.exr": 67283,
     "vse_light_shape_scene_strip_alpha_over.exr": 67285,
     "vse_light_shape_scene_strip_replace.exr": 67283,
+    "compositor_alpha_over_camera_light.exr": 67351,
+    "compositor_alpha_over_scene.blend": 87655,
+    "compositor_blur_hdr_saved.exr": 67320,
+    "compositor_blur_hdr_scene.blend": 88712,
     "mesh_volume_gradient.f32le": 49152,
     "mesh_volume_gradient_perspective.f32le": 49152,
     "mesh_volume_gradient_odd_perspective.f32le": 78780,

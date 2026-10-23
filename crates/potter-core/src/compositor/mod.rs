@@ -47,20 +47,14 @@ pub(crate) fn apply(
             ));
         }
         let associated = output.linear_rgba_associated;
-        let mut base = Image {
+        let base = Image {
             width,
             height,
             pixels: output.linear_rgba.clone(),
         };
-        if associated {
-            unassociate_pixels(&mut base.pixels);
-        }
         let composite =
             evaluate_graph_with_association(graph, &base, Some(output), doc, frame, associated)?;
         output.linear_rgba = composite.pixels;
-        if associated {
-            associate_pixels(&mut output.linear_rgba);
-        }
     }
     encode_display(
         &mut output.rgba,
@@ -92,7 +86,7 @@ pub(crate) fn apply_associated_image(
 }
 
 fn apply_image_with_association(
-    mut image: Image,
+    image: Image,
     doc: &SceneDoc,
     scene: &Scene,
     frame: f64,
@@ -117,15 +111,7 @@ fn apply_image_with_association(
             "scene compositor reference must identify a compositor node group",
         ));
     }
-    if associated_alpha {
-        unassociate_pixels(&mut image.pixels);
-    }
-    let mut composite =
-        evaluate_graph_with_association(graph, &image, None, doc, frame, associated_alpha)?;
-    if associated_alpha {
-        associate_pixels(&mut composite.pixels);
-    }
-    Ok(composite)
+    evaluate_graph_with_association(graph, &image, None, doc, frame, associated_alpha)
 }
 
 enum NodeOutput {
@@ -178,7 +164,13 @@ fn evaluate_graph_with_association(
                                 "compositor render-layer node disappeared",
                             )
                         })?;
-                        render_layer(source_node, &link.from_socket, base, passes)?
+                        render_layer(
+                            source_node,
+                            &link.from_socket,
+                            base,
+                            passes,
+                            associated_alpha,
+                        )?
                     }
                 };
                 inputs.insert(link.to_socket.clone(), image);
@@ -206,7 +198,9 @@ fn evaluate_graph_with_association(
                     image
                 }
                 "CompositorNodeMixRGB" | "MixRGB" => mix_images(node, &inputs, base)?,
-                "CompositorNodeAlphaOver" | "AlphaOver" => alpha_over(node, &inputs, base)?,
+                "CompositorNodeAlphaOver" | "AlphaOver" => {
+                    alpha_over(node, &inputs, base, associated_alpha)?
+                }
                 "CompositorNodeBlur" | "Blur" => {
                     let radius = property_u32(node, &["size_x", "radius"], 1)?.min(256);
                     gaussian_blur(&image, radius)?
@@ -233,7 +227,12 @@ fn evaluate_graph_with_association(
                             "compositor gamma must be positive and finite",
                         ));
                     }
-                    map_rgb(&image, |value| value.max(0.0).powf(1.0 / gamma))
+                    let transform = |value: f32| value.max(0.0).powf(1.0 / gamma);
+                    if associated_alpha {
+                        map_gamma_rgb(&image, transform)
+                    } else {
+                        map_rgb(&image, transform)
+                    }
                 }
                 "CompositorNodeInvert" | "Invert" => {
                     let factor = scalar_default_value(node, &["Fac"], &["factor", "fac"], 1.0)?
@@ -331,6 +330,7 @@ fn render_layer(
     socket: &str,
     base: &Image,
     passes: Option<&RasterOutput>,
+    associated_alpha: bool,
 ) -> Result<Image> {
     let requested = node
         .inputs
@@ -396,11 +396,43 @@ fn render_layer(
         }
         "DiffCol" | "Albedo" | "albedo" => {
             let passes = passes.ok_or_else(|| unsupported_pass("albedo"))?;
-            Image::new(base.width, base.height, passes.albedo.clone())
+            let pixels = passes
+                .albedo
+                .iter()
+                .map(|pixel| {
+                    if associated_alpha {
+                        [
+                            pixel[0] * pixel[3],
+                            pixel[1] * pixel[3],
+                            pixel[2] * pixel[3],
+                            pixel[3],
+                        ]
+                    } else {
+                        *pixel
+                    }
+                })
+                .collect();
+            Image::new(base.width, base.height, pixels)
         }
         "Emit" | "Emission" | "emission" => {
             let passes = passes.ok_or_else(|| unsupported_pass("emission"))?;
-            Image::new(base.width, base.height, passes.emission.clone())
+            let pixels = passes
+                .emission
+                .iter()
+                .map(|pixel| {
+                    if associated_alpha {
+                        [
+                            pixel[0] * pixel[3],
+                            pixel[1] * pixel[3],
+                            pixel[2] * pixel[3],
+                            pixel[3],
+                        ]
+                    } else {
+                        *pixel
+                    }
+                })
+                .collect();
+            Image::new(base.width, base.height, pixels)
         }
         "ao" | "AO" => {
             let passes = passes.ok_or_else(|| unsupported_pass("ao"))?;
@@ -491,7 +523,12 @@ fn mix_images(node: &GraphNode, inputs: &BTreeMap<String, Image>, base: &Image) 
     Image::new(first.width, first.height, pixels)
 }
 
-fn alpha_over(node: &GraphNode, inputs: &BTreeMap<String, Image>, base: &Image) -> Result<Image> {
+fn alpha_over(
+    node: &GraphNode,
+    inputs: &BTreeMap<String, Image>,
+    base: &Image,
+    associated_alpha: bool,
+) -> Result<Image> {
     let foreground = match inputs.get("Image").or_else(|| inputs.get("Foreground")) {
         Some(image) => image.clone(),
         None => color_image(node, "foreground", base, [0.0; 3])?,
@@ -509,10 +546,11 @@ fn alpha_over(node: &GraphNode, inputs: &BTreeMap<String, Image>, base: &Image) 
         .zip(&background.pixels)
         .map(|(front, back)| {
             let alpha = front[3].clamp(0.0, 1.0) * factor;
+            let foreground_factor = if associated_alpha { factor } else { alpha };
             [
-                front[0] * alpha + back[0] * (1.0 - alpha),
-                front[1] * alpha + back[1] * (1.0 - alpha),
-                front[2] * alpha + back[2] * (1.0 - alpha),
+                front[0] * foreground_factor + back[0] * (1.0 - alpha),
+                front[1] * foreground_factor + back[1] * (1.0 - alpha),
+                front[2] * foreground_factor + back[2] * (1.0 - alpha),
                 alpha + back[3] * (1.0 - alpha),
             ]
         })
@@ -1070,15 +1108,14 @@ fn write_file_output(node: &GraphNode, image: &Image, associated_alpha: bool) ->
             image.height as usize,
             |x, y| {
                 let pixel = image.pixels[y * image.width as usize + x];
-                let associated = |channel| {
-                    if associated_alpha && pixel[3] <= 0.0 {
-                        // Additive camera-shape radiance may remain at zero film alpha.
-                        pixel[channel]
+                let channel = |index| {
+                    if associated_alpha {
+                        pixel[index]
                     } else {
-                        pixel[channel] * pixel[3]
+                        pixel[index] * pixel[3]
                     }
                 };
-                (associated(0), associated(1), associated(2), pixel[3])
+                (channel(0), channel(1), channel(2), pixel[3])
             },
         )
         .map_err(|error| {
@@ -1091,8 +1128,13 @@ fn write_file_output(node: &GraphNode, image: &Image, associated_alpha: bool) ->
     }
     let mut data = Vec::with_capacity(image.pixels.len() * 4);
     for pixel in &image.pixels {
-        for channel in pixel {
-            data.push((channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+        for channel in 0..4 {
+            let value = if associated_alpha && channel < 3 && pixel[3] > 0.0 {
+                pixel[channel] / pixel[3]
+            } else {
+                pixel[channel]
+            };
+            data.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
         }
     }
     let file = fs::File::create(path).map_err(|error| PotError::io(&error))?;
@@ -1155,28 +1197,6 @@ pub(crate) fn encode_associated_image_display(
     let mut bytes = vec![0; length];
     encode_display(&mut bytes, &image.pixels, settings, true)?;
     Ok(bytes)
-}
-
-fn unassociate_pixels(pixels: &mut [[f32; 4]]) {
-    for pixel in pixels {
-        let alpha = pixel[3];
-        if alpha > 0.0 {
-            for channel in &mut pixel[..3] {
-                *channel /= alpha;
-            }
-        }
-    }
-}
-
-fn associate_pixels(pixels: &mut [[f32; 4]]) {
-    for pixel in pixels {
-        let alpha = pixel[3];
-        if alpha > 0.0 {
-            for channel in &mut pixel[..3] {
-                *channel *= alpha;
-            }
-        }
-    }
 }
 
 fn encode_display(
@@ -1259,6 +1279,25 @@ fn map_rgb(image: &Image, mut transform: impl FnMut(f32) -> f32) -> Image {
                     transform(pixel[0]),
                     transform(pixel[1]),
                     transform(pixel[2]),
+                    pixel[3],
+                ]
+            })
+            .collect(),
+    }
+}
+fn map_gamma_rgb(image: &Image, mut transform: impl FnMut(f32) -> f32) -> Image {
+    Image {
+        width: image.width,
+        height: image.height,
+        pixels: image
+            .pixels
+            .iter()
+            .map(|pixel| {
+                let alpha = if pixel[3] > 0.0 { pixel[3] } else { 1.0 };
+                [
+                    transform(pixel[0] / alpha) * alpha,
+                    transform(pixel[1] / alpha) * alpha,
+                    transform(pixel[2] / alpha) * alpha,
                     pixel[3],
                 ]
             })

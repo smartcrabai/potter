@@ -2401,6 +2401,7 @@ pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
     frame: CameraFrame,
     width: u32,
     height: u32,
+    y: u32,
     layout_x: u32,
     layout_width: u32,
     packed_x_offset: u32,
@@ -4979,6 +4980,105 @@ fn write_center_passes(
     Ok(())
 }
 
+/// Composites `source` over `destination`, decoding and encoding each buffer's association mode.
+fn overlay_over_rgba(
+    source: [f32; 4],
+    source_associated: bool,
+    destination: [f32; 4],
+    destination_associated: bool,
+    film_transparent: bool,
+) -> [f64; 4] {
+    let source_alpha = f64::from(source[3]).clamp(0.0, 1.0);
+    let destination_alpha = f64::from(destination[3]).clamp(0.0, 1.0);
+    let inverse_source_alpha = 1.0 - source_alpha;
+    let alpha = if film_transparent {
+        source_alpha + destination_alpha * inverse_source_alpha
+    } else {
+        1.0
+    };
+    let rgb: [f64; 3] = std::array::from_fn(|channel| {
+        let source_rgb = f64::from(source[channel]);
+        let destination_rgb = f64::from(destination[channel]);
+        let source_associated_rgb = if source_associated {
+            source_rgb
+        } else {
+            source_rgb * source_alpha
+        };
+        let destination_associated_rgb = if destination_associated {
+            destination_rgb
+        } else {
+            destination_rgb * destination_alpha
+        };
+        let associated_rgb =
+            source_associated_rgb + destination_associated_rgb * inverse_source_alpha;
+        if destination_associated {
+            associated_rgb
+        } else if alpha > 0.0 {
+            associated_rgb / alpha
+        } else {
+            // Straight path RGB can carry physical radiance even when its coverage alpha is zero.
+            associated_rgb + destination_rgb
+        }
+    });
+    [rgb[0], rgb[1], rgb[2], alpha]
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::overlay_over_rgba;
+
+    #[test]
+    fn associated_line_over_opaque_black_keeps_its_full_coverage_contribution() {
+        assert_eq!(
+            overlay_over_rgba(
+                [0.5, 0.0, 0.0, 0.5],
+                true,
+                [0.0, 0.0, 0.0, 1.0],
+                false,
+                true
+            ),
+            [0.5, 0.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn associated_line_over_transparent_destination_ignores_hidden_rgb() {
+        assert_eq!(
+            overlay_over_rgba(
+                [0.5, 0.0, 0.0, 0.5],
+                true,
+                [9.0, 8.0, 7.0, 0.0],
+                false,
+                true
+            ),
+            [1.0, 0.0, 0.0, 0.5]
+        );
+    }
+
+    #[test]
+    fn associated_line_over_fractional_destination_returns_straight_rgb() {
+        let result = overlay_over_rgba(
+            [0.5, 0.0, 0.0, 0.5],
+            true,
+            [0.0, 0.0, 1.0, 0.25],
+            false,
+            true,
+        );
+        assert!((result[0] - 0.8).abs() < 1.0e-12);
+        assert_eq!(result[1], 0.0);
+        assert!((result[2] - 0.4).abs() < 1.0e-12);
+        assert_eq!(result[3], 0.625);
+    }
+
+    #[test]
+    fn zero_alpha_preserves_straight_path_radiance() {
+        assert_eq!(
+            overlay_over_rgba([0.0; 4], true, [1.25, 0.5, 0.25, 0.0], false, true),
+            [1.25, 0.5, 0.25, 0.0]
+        );
+    }
+}
+
 fn overlay_rasterized_lines(
     geometry: &Geometry,
     camera: &Camera,
@@ -5031,25 +5131,16 @@ fn overlay_rasterized_lines(
             continue;
         };
         let source_alpha = f64::from(source[3]).clamp(0.0, 1.0);
-        let destination_alpha = f64::from(destination[3]).clamp(0.0, 1.0);
-        let inverse_alpha = 1.0 - source_alpha;
-        let color = [
-            f64::from(source[0]) * source_alpha + f64::from(destination[0]) * inverse_alpha,
-            f64::from(source[1]) * source_alpha + f64::from(destination[1]) * inverse_alpha,
-            f64::from(source[2]) * source_alpha + f64::from(destination[2]) * inverse_alpha,
-        ];
-        let alpha = if film_transparent {
-            source_alpha + destination_alpha * inverse_alpha
-        } else {
-            1.0
-        };
+        let color = overlay_over_rgba(
+            source,
+            overlay.linear_rgba_associated,
+            destination,
+            output.linear_rgba_associated,
+            film_transparent,
+        );
+        let alpha = color[3];
         if let Some(pixel) = output.linear_rgba.get_mut(index) {
-            *pixel = [
-                finite_f32(color[0]),
-                finite_f32(color[1]),
-                finite_f32(color[2]),
-                finite_f32(alpha),
-            ];
+            *pixel = color.map(finite_f32);
         }
         if let Some(value) = output.ids.get_mut(index) {
             *value = object_index;
@@ -5068,7 +5159,29 @@ fn overlay_rasterized_lines(
             *normal = value;
         }
         if let Some(albedo) = output.albedo.get_mut(index) {
-            *albedo = [source[0], source[1], source[2], source_alpha as f32];
+            let straight = if overlay.linear_rgba_associated {
+                if source_alpha > 0.0 {
+                    [
+                        f64::from(source[0]) / source_alpha,
+                        f64::from(source[1]) / source_alpha,
+                        f64::from(source[2]) / source_alpha,
+                    ]
+                } else {
+                    [0.0; 3]
+                }
+            } else {
+                [
+                    f64::from(source[0]),
+                    f64::from(source[1]),
+                    f64::from(source[2]),
+                ]
+            };
+            *albedo = [
+                finite_f32(straight[0]),
+                finite_f32(straight[1]),
+                finite_f32(straight[2]),
+                source_alpha as f32,
+            ];
         }
         if let Some(emission) = output.emission.get_mut(index) {
             *emission = [0.0; 4];

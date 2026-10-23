@@ -453,11 +453,11 @@ pub fn apply_blend_effect(
     second: &RgbaFrame,
     factor: f64,
 ) -> Result<RgbaFrame> {
-    let blend_type = match effect {
-        EffectType::Add => StripBlendType::Add,
-        EffectType::Subtract => StripBlendType::Subtract,
-        EffectType::Multiply => StripBlendType::Multiply,
-        EffectType::AlphaOver => StripBlendType::AlphaOver,
+    let effect = match effect {
+        EffectType::Add | EffectType::Subtract | EffectType::Multiply => effect,
+        EffectType::AlphaOver => {
+            return blend_frames(first, second, StripBlendType::AlphaOver, factor);
+        }
         EffectType::Transform | EffectType::Speed | EffectType::Glow | EffectType::GaussianBlur => {
             return Err(PotError::new(
                 ErrorCode::InvalidArgument,
@@ -465,7 +465,49 @@ pub fn apply_blend_effect(
             ));
         }
     };
-    blend_frames(first, second, blend_type, factor)
+    validate_frames(first, second)?;
+    if !factor.is_finite() || !(0.0..=1.0).contains(&factor) {
+        return Err(PotError::new(
+            ErrorCode::InvalidArgument,
+            "blend opacity must be in [0, 1]",
+        ));
+    }
+    let factor = factor as f32;
+    let pixels = first
+        .pixels
+        .iter()
+        .zip(&second.pixels)
+        .map(|(src1, src2)| match effect {
+            EffectType::Add | EffectType::Subtract => {
+                if factor == 0.0 {
+                    // Blender's wrapper returns input 1 before applying the non-identity formula.
+                    *src1
+                } else {
+                    let f = (1.0 - src1[3] * (1.0 - factor)) * src2[3];
+                    let rgb: [f32; 3] = std::array::from_fn(|channel| {
+                        if effect == EffectType::Add {
+                            src1[channel] + f * src2[channel]
+                        } else {
+                            (src1[channel] - f * src2[channel]).max(0.0)
+                        }
+                    });
+                    [rgb[0], rgb[1], rgb[2], src1[3]]
+                }
+            }
+            EffectType::Multiply => [
+                src1[0] + factor * src1[0] * (src2[0] - 1.0),
+                src1[1] + factor * src1[1] * (src2[1] - 1.0),
+                src1[2] + factor * src1[2] * (src2[2] - 1.0),
+                src1[3] + factor * src1[3] * (src2[3] - 1.0),
+            ],
+            EffectType::AlphaOver
+            | EffectType::Transform
+            | EffectType::Speed
+            | EffectType::Glow
+            | EffectType::GaussianBlur => unreachable!(),
+        })
+        .collect();
+    RgbaFrame::new(first.width, first.height, pixels)
 }
 
 pub fn apply_effect(effect: EffectType, frame: RgbaFrame) -> Result<RgbaFrame> {
@@ -1276,6 +1318,30 @@ mod tests {
         assert_pixel_close(subtracted.pixels[0], [0.3, 0.45, 0.55, 1.0]);
         let multiplied = apply_blend_effect(EffectType::Multiply, &first, &second, 0.5).unwrap();
         assert_pixel_close(multiplied.pixels[0], [0.24, 0.39, 0.6, 1.0]);
+    }
+
+    #[test]
+    fn add_sub_effect_zero_factor_preserves_input_one_radiance() {
+        let first = RgbaFrame::new(1, 1, vec![[1.25, -0.5, 2.0, 0.0]]).unwrap();
+        let second = RgbaFrame::new(1, 1, vec![[0.4, 0.2, 0.3, 0.5]]).unwrap();
+
+        for effect in [EffectType::Add, EffectType::Subtract] {
+            let output = apply_blend_effect(effect, &first, &second, 0.0).unwrap();
+            assert_eq!(output.pixels, first.pixels);
+        }
+    }
+
+    #[test]
+    fn blend_effects_keep_native_partial_alpha_at_full_factor() {
+        let first = RgbaFrame::new(1, 1, vec![[0.2, 0.4, 0.6, 0.25]]).unwrap();
+        let second = RgbaFrame::new(1, 1, vec![[0.8, 0.4, 0.2, 0.5]]).unwrap();
+
+        let added = apply_blend_effect(EffectType::Add, &first, &second, 1.0).unwrap();
+        assert_pixel_close(added.pixels[0], [0.6, 0.6, 0.7, 0.25]);
+        let subtracted = apply_blend_effect(EffectType::Subtract, &first, &second, 1.0).unwrap();
+        assert_pixel_close(subtracted.pixels[0], [0.0, 0.2, 0.5, 0.25]);
+        let multiplied = apply_blend_effect(EffectType::Multiply, &first, &second, 1.0).unwrap();
+        assert_pixel_close(multiplied.pixels[0], [0.16, 0.16, 0.12, 0.125]);
     }
 
     #[test]
