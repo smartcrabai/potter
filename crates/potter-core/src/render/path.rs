@@ -681,7 +681,7 @@ fn camera_footprint(
     sample_y: f64,
     (origin, direction): (DVec3, DVec3),
 ) -> Result<CameraFootprint> {
-    let (view_start, view_end) = if frame.stereo_mode == StereoMode::SideBySide {
+    let (view_start, view_end) = if frame.is_side_by_side() {
         let split = width / 2;
         if x < split {
             (0, split)

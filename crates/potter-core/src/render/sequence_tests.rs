@@ -570,14 +570,14 @@ fn potter_exr_writer_preserves_associated_alpha_and_alpha_zero_radiance()
     assert_eq!((width, height), (2, 1));
     for (channel, expected) in associated[0].into_iter().enumerate() {
         assert!(
-            (stored[0][channel] - expected).abs() < 1.0e-6,
+            (stored[0][channel] - f64::from(expected)).abs() < 1.0e-6,
             "stored channel {channel} is {}, expected {expected}",
             stored[0][channel]
         );
     }
     for (channel, expected) in associated[1].into_iter().enumerate() {
         assert!(
-            (stored[1][channel] - expected).abs() < 1.0e-6,
+            (stored[1][channel] - f64::from(expected)).abs() < 1.0e-6,
             "alpha-zero stored channel {channel} is {}, expected {expected}",
             stored[1][channel]
         );

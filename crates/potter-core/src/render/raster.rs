@@ -488,6 +488,11 @@ pub(crate) struct CameraFrame {
     /// Whether a point's depth is its distance from the camera (a panorama) rather than its view-axis distance.
     depth_is_distance: bool,
 }
+impl CameraFrame {
+    pub(super) fn is_side_by_side(&self) -> bool {
+        self.stereo_mode == StereoMode::SideBySide
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct CameraFrustum {
