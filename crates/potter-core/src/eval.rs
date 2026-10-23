@@ -648,6 +648,7 @@ impl Snapshot {
                         "purpose": snapshot.purpose,
                         "frame": snapshot.frame,
                         "adaptive_render": context.adaptive_render,
+                        "simulation_cache_key": snapshot.simulation_cache_key,
                         "cache_file_archives": session.cache_file_archive_identity(),
                     });
                     snapshot.evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
@@ -2220,6 +2221,7 @@ impl Snapshot {
             "purpose": context.purpose,
             "frame": frame,
             "adaptive_render": context.adaptive_render,
+            "simulation_cache_key": simulation_cache_key,
             "cache_file_archives": session.cache_file_archive_identity(),
         });
         if let Some(prefix) = modifier_prefix {

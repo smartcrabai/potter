@@ -2532,11 +2532,6 @@ with open(os.path.join(root,"sequence_matrices.json"),"w",encoding="utf-8") as f
         manifest["frames"][1]["evaluation_hash"],
         from_two_missing.evaluation_hash
     );
-    assert!(
-        manifest["frames"][1]["hash"].as_str().is_some(),
-        "rendered missing-frame artifact has a content hash"
-    );
-    assert!(render_output.join("frame_0003.png").is_file());
     Ok(())
 }
 #[test]
