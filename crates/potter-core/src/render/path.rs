@@ -41,7 +41,8 @@ use super::{
     bvh::{Bvh, BvhHit, WalkRay},
     eevee_volume_resolve::{
         FroxelTextureLayout, LinearSampleWeights, VolumeDepthMapping, VolumeProjection,
-        linear_sample_weights, resolve_z_with_end_of_slice_bias, screen_uv_to_resolve_uv,
+        linear_sample_weights, occupancy_boundary_index, resolve_z_with_end_of_slice_bias,
+        screen_uv_to_resolve_uv,
     },
     light_model::{
         AreaShape, Spread, area_radiance, area_shape, emitter_radiance, influence_fade,
@@ -90,6 +91,8 @@ struct PointLight {
     volume_radius_squared: f64,
     /// Blender's object ray mask of the light; a ray kind not in it passes the light by.
     ray_mask: u8,
+    /// Whether EEVEE's local-light culler includes this camera-visible shape. The factors affect culling, not shape radiance.
+    camera_shape_eligible: bool,
 }
 
 impl PointLight {
@@ -168,8 +171,10 @@ struct VolumeInstance<'a> {
     lobes: Vec<ScatterLobe>,
     emission: DVec3,
     scattering: bool,
-    /// Channel-mean σt per unit grid density (absolute, as `BsdfParams`'s coefficients).
+    /// Channel-mean σt per unit grid density used by the existing voxel path transport.
     extinction_scale: f64,
+    /// Per-channel σt per unit grid density for the EEVEE froxel resolve.
+    extinction_rgb_scale: DVec3,
     /// Blender's `cycles.volume_sampling` of the volume's material.
     sampling: crate::model::VolumeSampling,
     /// Blender's `cycles.volume_interpolation` of the volume's material.
@@ -1534,19 +1539,15 @@ impl RealtimeCameraLightContext<'_> {
         }
     }
 
-    pub(super) fn local_events(
-        &self,
+    pub(super) fn local_events<'a>(
+        &'a self,
+        camera: &'a Camera,
         origin: DVec3,
         direction: DVec3,
         far_distance: f64,
-    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
+    ) -> impl Iterator<Item = CameraLightEvent> + 'a {
         self.lights().iter().filter_map(move |light| {
-            if !light.intersects(RayKind::Camera) {
-                return None;
-            }
-            let (distance, radiance, _) =
-                light_hit(light, origin, direction, origin, far_distance)?;
-            Some(CameraLightEvent { distance, radiance })
+            camera_light_shape_hit(light, camera, origin, direction, far_distance)
         })
     }
 
@@ -1620,6 +1621,230 @@ fn camera_sun_discs(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<SunDisc> {
             })
         })
         .collect()
+}
+/// The camera-visible local-light shape from EEVEE's `shape_display_light_position_get` and
+/// `shape_display_light_radiance_get`. This intentionally does not apply Cycles' physical spread
+/// eligibility or EEVEE's diffuse/specular/transmission/volume power factors.
+fn camera_light_shape_hit(
+    light: &PointLight,
+    camera: &Camera,
+    origin: DVec3,
+    direction: DVec3,
+    limit: f64,
+) -> Option<CameraLightEvent> {
+    if !light.camera_shape_eligible || light.ray_mask & RayKind::Camera.bit() == 0 {
+        return None;
+    }
+
+    if let Some(shape) = light.area {
+        let cos_light = -light.direction.dot(direction);
+        if shape.area <= 0.0 || cos_light <= 0.0 {
+            return None;
+        }
+        let (distance, point) = ray_plane_intersection(
+            origin,
+            direction,
+            light.position,
+            light.direction,
+            cos_light,
+            limit,
+        )?;
+        if !inside_emitter(&shape, light.position, point) {
+            return None;
+        }
+        return Some(CameraLightEvent {
+            distance,
+            radiance: light.color * area_radiance(light.energy, shape.area),
+        });
+    }
+
+    if !matches!(light.kind, LightType::Point | LightType::Spot) {
+        return None;
+    }
+    let emitter_radius = light.radius.max(0.001);
+    let camera_to_light = light.position - camera.position;
+    let camera_distance = camera_to_light.length();
+    let plane_normal = if camera_distance > 1.0e-8 {
+        camera_to_light / camera_distance
+    } else {
+        (camera.target - camera.position).normalize_or_zero()
+    };
+    let display_radius = if light.soft_falloff {
+        emitter_radius
+    } else if camera_distance > emitter_radius {
+        light_sphere_disk_radius(emitter_radius, camera_distance)
+    } else {
+        camera.far
+    };
+    let cos_light = -plane_normal.dot(direction);
+    let (distance, point) = ray_plane_intersection(
+        origin,
+        direction,
+        light.position,
+        plane_normal,
+        cos_light,
+        limit,
+    )?;
+    if (point - light.position).length_squared() > display_radius * display_radius {
+        return None;
+    }
+    let spot = light_attenuation(light, -direction);
+    Some(CameraLightEvent {
+        distance,
+        radiance: light.color * (emitter_radiance(light.energy, emitter_radius) * spot),
+    })
+}
+
+/// Apparent disk radius of a sphere at `distance`, from `eevee_light_lib.bsl.hh`.
+fn light_sphere_disk_radius(radius: f64, distance: f64) -> f64 {
+    let ratio = radius / distance;
+    radius / (1.0 - ratio * ratio).max(1.0e-8).sqrt()
+}
+
+#[cfg(test)]
+mod camera_light_shape_tests {
+    use std::error::Error;
+
+    use glam::DVec3;
+
+    use super::{PointLight, camera_light_shape_hit, light_hit};
+    use crate::{
+        model::{LightType, RayKind},
+        render::{
+            light_model::{AreaShape, Spread, area_radiance},
+            raster::{Camera, Projection, StereoMode},
+        },
+    };
+
+    fn make_camera(position: DVec3, target: DVec3) -> Camera {
+        Camera {
+            position,
+            target,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Orthographic { height: 8.0 },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.0,
+        }
+    }
+
+    fn local_light(kind: LightType, position: DVec3, direction: DVec3, radius: f64) -> PointLight {
+        PointLight {
+            position,
+            direction,
+            kind,
+            color: DVec3::ONE,
+            energy: 1.0,
+            radius,
+            soft_falloff: false,
+            spot_size: 1.0,
+            spot_blend: 0.0,
+            area: None,
+            spread: None,
+            use_mis: true,
+            volume_factor: 0.0,
+            volume_radius_squared: 0.0,
+            ray_mask: RayKind::Camera.bit(),
+            camera_shape_eligible: true,
+        }
+    }
+
+    #[test]
+    fn hard_point_display_uses_center_plane_and_inside_far_disk() -> Result<(), Box<dyn Error>> {
+        let camera = make_camera(DVec3::new(0.0, 0.0, 10.0), DVec3::ZERO);
+        let point = local_light(LightType::Point, DVec3::ZERO, DVec3::Z, 1.0);
+        let origin = DVec3::new(0.0, 0.0, 10.0);
+        let direction = -DVec3::Z;
+        let shape = camera_light_shape_hit(&point, &camera, origin, direction, camera.far)
+            .ok_or("point camera shape was not hit")?;
+        let physical = light_hit(&point, origin, direction, origin, camera.far)
+            .ok_or("physical point sphere was not hit")?;
+        assert!((shape.distance - 10.0).abs() < 1.0e-12);
+        assert!((physical.0 - 9.0).abs() < 1.0e-12);
+
+        let hard_edge = camera_light_shape_hit(
+            &point,
+            &camera,
+            DVec3::new(1.003, 0.0, 10.0),
+            direction,
+            camera.far,
+        );
+        assert!(
+            hard_edge.is_some(),
+            "the hard sphere's apparent radius expands in projection"
+        );
+        let spot = local_light(LightType::Spot, DVec3::ZERO, DVec3::Z, 1.0);
+        let spot_shape = camera_light_shape_hit(&spot, &camera, origin, direction, camera.far)
+            .ok_or("spot camera disk was not hit")?;
+        assert!((spot_shape.distance - 10.0).abs() < 1.0e-12);
+
+        let inside_camera = make_camera(DVec3::new(0.0, 0.0, 0.5), DVec3::ZERO);
+        let off_axis_origin = DVec3::new(5.0, 0.0, 0.5);
+        let inside_shape = camera_light_shape_hit(
+            &point,
+            &inside_camera,
+            off_axis_origin,
+            -DVec3::Z,
+            inside_camera.far,
+        )
+        .ok_or("inside-sphere camera disk was not hit")?;
+        assert!((inside_shape.distance - 0.5).abs() < 1.0e-12);
+        assert!(inside_shape.radiance.x > 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn area_camera_shape_is_invariant_to_physical_spread() -> Result<(), Box<dyn Error>> {
+        let shape = AreaShape::new(DVec3::X, DVec3::Y, 1.0, 1.0, false);
+        let spread = Spread::new(0.0).ok_or("zero spread should be representable")?;
+        let area = PointLight {
+            position: DVec3::ZERO,
+            direction: DVec3::Z,
+            kind: LightType::Area,
+            color: DVec3::ONE,
+            energy: 4.0,
+            radius: 0.0,
+            soft_falloff: false,
+            spot_size: 1.0,
+            spot_blend: 0.0,
+            area: Some(shape),
+            spread: Some(spread),
+            use_mis: true,
+            volume_factor: 0.0,
+            volume_radius_squared: 0.0,
+            ray_mask: RayKind::Camera.bit(),
+            camera_shape_eligible: true,
+        };
+        let camera = make_camera(DVec3::new(0.0, 0.0, 10.0), DVec3::ZERO);
+        let origin = camera.position;
+        let direction = -DVec3::Z;
+        let zero_spread_event =
+            camera_light_shape_hit(&area, &camera, origin, direction, camera.far)
+                .ok_or("area camera shape was suppressed by zero physical spread")?;
+
+        let nonzero_spread = Spread::new(1.0).ok_or("nonzero spread should be representable")?;
+        let nonzero_area = PointLight {
+            spread: Some(nonzero_spread),
+            ..area
+        };
+        let nonzero_spread_event =
+            camera_light_shape_hit(&nonzero_area, &camera, origin, direction, camera.far)
+                .ok_or("area camera shape was suppressed by nonzero physical spread")?;
+        let expected = area_radiance(area.energy, shape.area);
+        for channel in 0..3 {
+            assert!((zero_spread_event.radiance[channel] - expected).abs() < 1.0e-12);
+            assert!(
+                (zero_spread_event.radiance[channel] - nonzero_spread_event.radiance[channel])
+                    .abs()
+                    < 1.0e-12
+            );
+        }
+        assert!((zero_spread_event.distance - nonzero_spread_event.distance).abs() < 1.0e-12);
+        Ok(())
+    }
 }
 fn geometry_has_volume_material(geometry: &Geometry) -> bool {
     geometry.triangles.iter().any(|triangle| {
@@ -1736,7 +1961,8 @@ pub(super) struct RealtimeVolumeScratch {
     hit_media: Vec<MeshMedium>,
     boundaries: Vec<(f64, MeshMedium)>,
     evaluator_workspace: EvaluatorWorkspace,
-    froxel_optical_depth: Vec<DVec3>,
+    froxel_extinction: Vec<DVec3>,
+    froxel_boundaries: Vec<(usize, MeshMedium)>,
     froxel_resolve: Option<RealtimeVolumeResolveCache>,
 }
 
@@ -1785,7 +2011,6 @@ pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
     y: u32,
     sample_x: f64,
     sample_y: f64,
-    seed: u32,
     origin: DVec3,
     direction: DVec3,
     pub(super) far_distance: f64,
@@ -1842,7 +2067,6 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
             y: sample.y,
             sample_x: sample.sample_x,
             sample_y: sample.sample_y,
-            seed: self.seed,
             origin: sample.ray.0,
             direction: sample.ray.1,
             far_distance: sample
@@ -1873,6 +2097,24 @@ impl RealtimeVolumeSample<'_, '_> {
         self.resolve_froxel_transmittance_to(end_distance)
     }
 
+    fn resolve_cache(&self) -> Result<&RealtimeVolumeResolveCache> {
+        self.scratch.froxel_resolve.as_ref().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "realtime volume froxel cache is unavailable",
+            )
+        })
+    }
+
+    fn resolve_cache_mut(&mut self) -> Result<&mut RealtimeVolumeResolveCache> {
+        self.scratch.froxel_resolve.as_mut().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "realtime volume froxel cache is unavailable",
+            )
+        })
+    }
+
     /// Resolves the cumulative froxel transmittance with EEVEE's XY/Z texture filtering.
     fn resolve_froxel_transmittance_to(&mut self, end_distance: f64) -> Result<DVec3> {
         if !self.initialize_froxel_resolve()? {
@@ -1882,11 +2124,7 @@ impl RealtimeVolumeSample<'_, '_> {
             .camera
             .depth_of(self.origin + self.direction * end_distance);
         let (x_weights, y_weights, z_weights, grid_width) = {
-            let cache = self
-                .scratch
-                .froxel_resolve
-                .as_ref()
-                .expect("initialized froxel resolve cache");
+            let cache = self.resolve_cache()?;
             let coord_z = resolve_z_with_end_of_slice_bias(
                 cache.depth_mapping.view_z_to_volume_z(-event_depth as f32),
                 cache.slice_count,
@@ -1910,34 +2148,24 @@ impl RealtimeVolumeSample<'_, '_> {
         for x in [x_weights.lower_index, x_weights.upper_index] {
             for y in [y_weights.lower_index, y_weights.upper_index] {
                 let column = y * grid_width + x;
-                let column_is_missing = !self
-                    .scratch
-                    .froxel_resolve
-                    .as_ref()
-                    .expect("initialized froxel resolve cache")
-                    .columns
-                    .contains_key(&column);
-                if column_is_missing {
+                if !self.resolve_cache()?.columns.contains_key(&column) {
                     let prefix = self.build_froxel_column(column)?;
-                    let _ = self
-                        .scratch
-                        .froxel_resolve
-                        .as_mut()
-                        .expect("initialized froxel resolve cache")
-                        .columns
-                        .insert(column, prefix);
+                    let _previous = self.resolve_cache_mut()?.columns.insert(column, prefix);
                 }
             }
         }
 
-        let cache = self.scratch.froxel_resolve.as_ref().unwrap();
+        let cache = self.resolve_cache()?;
         let mut transmittance = DVec3::ZERO;
         for (x, x_weight) in axis_weights(x_weights) {
             for (y, y_weight) in axis_weights(y_weights) {
-                let column = cache
-                    .columns
-                    .get(&(y * cache.layout.dimensions[0] as usize + x))
-                    .expect("queried froxel column was prepared");
+                let index = y * cache.layout.dimensions[0] as usize + x;
+                let column = cache.columns.get(&index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "realtime volume froxel column was not prepared",
+                    )
+                })?;
                 let z_value = axis_sample(column, z_weights);
                 transmittance += z_value * (x_weight * y_weight);
             }
@@ -1968,13 +2196,12 @@ impl RealtimeVolumeSample<'_, '_> {
         } else {
             self.camera.far
         };
-        if !scene_has_world_volume(self.transport.doc, &self.transport.snapshot.scene_id) {
-            if let Some((object_depth_min, object_depth_max)) =
+        if !scene_has_world_volume(self.transport.doc, &self.transport.snapshot.scene_id)
+            && let Some((object_depth_min, object_depth_max)) =
                 realtime_volume_depth_bounds(self.geometry, &self.transport.volumes, self.camera)
-            {
-                depth_start = depth_start.max(object_depth_min);
-                depth_end = depth_end.min(object_depth_max);
-            }
+        {
+            depth_start = depth_start.max(object_depth_min);
+            depth_end = depth_end.min(object_depth_max);
         }
         depth_start = depth_start.max(self.camera.near - 1.0e-4);
         depth_end = depth_end.min(self.camera.far + 1.0e-4);
@@ -2015,58 +2242,134 @@ impl RealtimeVolumeSample<'_, '_> {
         Ok(true)
     }
 
-    /// Builds one EEVEE froxel column by averaging per-cell extinction over the native Halton
-    /// projection jitters before integrating prefix transmittance.
+    /// Prepares the shared mesh-boundary transport once for this jittered froxel-column ray.
+    fn prepare_froxel_mesh_boundaries(&mut self) -> Result<()> {
+        if !self.transport.has_mesh_volumes || self.mesh_prepared {
+            return Ok(());
+        }
+        let trace_geometry = TraceGeometry::of(self.geometry);
+        let bvh = self.transport.bvh.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "realtime mesh volume tracing requires the geometry BVH",
+            )
+        })?;
+        let scene = SceneRefs {
+            doc: self.transport.doc,
+            snapshot: self.transport.snapshot,
+            geometry: &trace_geometry,
+            bvh,
+            lights: &self.transport.lights,
+            volumes: &self.transport.volumes,
+            images: self.transport.images,
+            importance: None,
+        };
+        let query = RealtimeMeshQuery {
+            transport: self.transport,
+            geometry: &trace_geometry,
+            bvh,
+            scene,
+        };
+        prepare_realtime_mesh_sample(
+            query,
+            RealtimeVolumeRay {
+                origin: self.origin,
+                direction: self.direction,
+                start_distance: 0.0,
+                max_distance: self.far_distance,
+                footprint: self.footprint,
+            },
+            self.scratch,
+        )?;
+        self.mesh_prepared = true;
+        Ok(())
+    }
+
+    /// Builds one EEVEE froxel column from history-averaged center-sampled extinction.
     fn build_froxel_column(&mut self, column_index: usize) -> Result<Vec<DVec3>> {
-        let slice_count = self
-            .scratch
-            .froxel_resolve
-            .as_ref()
-            .expect("froxel resolve cache is initialized")
-            .slice_count;
+        let (layout, width, height, slice_count, history_samples, depth_start, depth_mapping) = {
+            let cache = self.resolve_cache()?;
+            (
+                cache.layout,
+                cache.width,
+                cache.height,
+                cache.slice_count,
+                cache.history_samples,
+                cache.depth_start,
+                cache.depth_mapping,
+            )
+        };
+        let dimensions = layout.dimensions;
+        let cell_x = column_index as u32 % dimensions[0];
+        let cell_y = column_index as u32 / dimensions[0];
+        let cell_center = layout.cell_center_in_pixels(cell_x, cell_y);
+        let raster_x = cell_center[0].floor().clamp(0.0, f64::from(width - 1)) as u32;
+        let raster_y = cell_center[1].floor().clamp(0.0, f64::from(height - 1)) as u32;
+        let sample_x = cell_center[0] - f64::from(raster_x);
+        let sample_y = cell_center[1] - f64::from(raster_y);
+        let Some((_, integration_direction)) = ray_for_sample_in_frame(
+            &self.frame,
+            &self.camera,
+            width,
+            height,
+            raster_x,
+            raster_y,
+            sample_x,
+            sample_y,
+        )?
+        else {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "realtime froxel column has no camera ray",
+            ));
+        };
         self.accumulate_froxel_extinction(column_index)?;
-        let inverse_history_samples = 1.0
-            / f64::from(
-                self.scratch
-                    .froxel_resolve
-                    .as_ref()
-                    .expect("froxel resolve cache is initialized")
-                    .history_samples,
-            );
+        let inverse_history_samples = 1.0 / f64::from(history_samples);
         let mut cumulative_optical_depth = DVec3::ZERO;
+        let mut previous_distance = self
+            .camera
+            .ray_distance_for_depth(integration_direction, depth_start);
         let mut prefix = Vec::with_capacity(slice_count);
-        for slice_optical_depth in &self.scratch.froxel_optical_depth {
-            cumulative_optical_depth += *slice_optical_depth * inverse_history_samples;
+        for slice in 0..slice_count {
+            let normalized_z = (slice + 1) as f32 / slice_count as f32;
+            let slice_depth = -f64::from(depth_mapping.volume_z_to_view_z(normalized_z));
+            let end_distance = self
+                .camera
+                .ray_distance_for_depth(integration_direction, slice_depth);
+            let step_length = (end_distance - previous_distance).abs();
+            let mean_extinction = self.scratch.froxel_extinction[slice] * inverse_history_samples;
+            cumulative_optical_depth += mean_extinction * step_length;
             prefix.push(DVec3::new(
                 (-cumulative_optical_depth.x).exp(),
                 (-cumulative_optical_depth.y).exp(),
                 (-cumulative_optical_depth.z).exp(),
             ));
+            previous_distance = end_distance;
         }
         Ok(prefix)
     }
 
-    /// Accumulates each froxel's extinction over EEVEE's native Halton projection jitters.
+    /// Samples occupied mesh and voxel froxel centers over EEVEE's jittered render history.
     fn accumulate_froxel_extinction(&mut self, column_index: usize) -> Result<()> {
-        let cache = self
-            .scratch
-            .froxel_resolve
-            .as_ref()
-            .expect("froxel resolve cache is initialized");
-        let dimensions = cache.layout.dimensions;
-        let tile_size = cache.tile_size;
-        let slice_count = cache.slice_count;
-        let history_samples = cache.history_samples;
-        let depth_start = cache.depth_start;
-        let depth_mapping = cache.depth_mapping;
-        let width = cache.width;
-        let height = cache.height;
+        let (layout, tile_size, slice_count, history_samples, depth_mapping, width, height) = {
+            let cache = self.resolve_cache()?;
+            (
+                cache.layout,
+                cache.tile_size,
+                cache.slice_count,
+                cache.history_samples,
+                cache.depth_mapping,
+                cache.width,
+                cache.height,
+            )
+        };
+        let dimensions = layout.dimensions;
         let cell_x = column_index as u32 % dimensions[0];
         let cell_y = column_index as u32 / dimensions[0];
-        let cell_y_from_top = dimensions[1] - 1 - cell_y;
-        self.scratch.froxel_optical_depth.clear();
+        let cell_center = layout.cell_center_in_pixels(cell_x, cell_y);
+        self.scratch.froxel_extinction.clear();
         self.scratch
-            .froxel_optical_depth
+            .froxel_extinction
             .resize(slice_count, DVec3::ZERO);
         let saved = (
             self.origin,
@@ -2074,16 +2377,15 @@ impl RealtimeVolumeSample<'_, '_> {
             self.near_distance,
             self.far_distance,
             self.footprint,
-            self.rng.clone(),
-            self.ambient,
         );
 
         for history_index in 0..history_samples {
             let [jitter_x, jitter_y] = eevee_volume_jitter(history_index);
-            let pixel_x = (f64::from(cell_x) + 0.5) * f64::from(tile_size)
-                - jitter_x * f64::from(tile_size) * 0.5;
-            let pixel_y = (f64::from(cell_y_from_top) + 0.5) * f64::from(tile_size)
-                + jitter_y * f64::from(tile_size) * 0.5;
+            let jitter_z =
+                eevee_volume_froxel_jitter(cell_x, cell_y, eevee_volume_w(history_index));
+            let jitter_offset = layout.jitter_in_pixels([jitter_x, jitter_y]);
+            let pixel_x = cell_center[0] - jitter_offset[0];
+            let pixel_y = cell_center[1] + jitter_offset[1];
             let raster_x = pixel_x.floor().clamp(0.0, f64::from(width - 1)) as u32;
             let raster_y = pixel_y.floor().clamp(0.0, f64::from(height - 1)) as u32;
             let sample_x = pixel_x - f64::from(raster_x);
@@ -2101,7 +2403,7 @@ impl RealtimeVolumeSample<'_, '_> {
             else {
                 continue;
             };
-            let footprint = camera_footprint(
+            let mut footprint = camera_footprint(
                 &self.frame,
                 &self.camera,
                 width,
@@ -2112,6 +2414,8 @@ impl RealtimeVolumeSample<'_, '_> {
                 sample_y,
                 (origin, direction),
             )?;
+            footprint.dp *= f64::from(tile_size);
+            footprint.dd *= f64::from(tile_size);
             self.origin = origin;
             self.direction = direction;
             self.near_distance = self
@@ -2121,26 +2425,54 @@ impl RealtimeVolumeSample<'_, '_> {
                 .camera
                 .ray_distance_for_depth(direction, self.camera.far);
             self.footprint = footprint;
-            self.rng = Pcg32::for_sample(self.seed, raster_x, raster_y, history_index);
-            self.ambient = None;
             self.mesh_prepared = false;
+            self.prepare_froxel_mesh_boundaries()?;
 
+            self.scratch.froxel_boundary_bins.clear();
+            if self.transport.has_mesh_volumes {
+                for (distance, medium) in &self.scratch.boundaries {
+                    let point = origin + direction * *distance;
+                    let view_z = -self.camera.depth_of(point) as f32;
+                    let volume_z = depth_mapping.view_z_to_volume_z(view_z);
+                    let boundary = occupancy_boundary_index(volume_z, jitter_z, slice_count);
+                    self.scratch.froxel_boundary_bins.push((boundary, *medium));
+                }
+                self.scratch.media.clone_from(&self.scratch.initial_media);
+            } else {
+                self.scratch.media.clear();
+            }
+
+            let mut boundary_index = 0;
             for slice in 0..slice_count {
-                let z_end = (slice + 1) as f32 / slice_count as f32;
-                let slice_depth = -f64::from(depth_mapping.volume_z_to_view_z(z_end));
-                let slice_start_depth = if slice == 0 {
-                    depth_start
-                } else {
-                    -f64::from(depth_mapping.volume_z_to_view_z(slice as f32 / slice_count as f32))
-                };
-                let start_distance = self
-                    .camera
-                    .ray_distance_for_depth(direction, slice_start_depth);
-                let end_distance = self.camera.ray_distance_for_depth(direction, slice_depth);
-                let (_, transmittance) =
-                    self.integrate_segment_with_sources(start_distance, end_distance, false)?;
-                self.scratch.froxel_optical_depth[slice] +=
-                    transmittance_optical_depth(transmittance);
+                while boundary_index < self.scratch.froxel_boundary_bins.len()
+                    && self.scratch.froxel_boundary_bins[boundary_index].0 <= slice
+                {
+                    let medium = self.scratch.froxel_boundary_bins[boundary_index].1;
+                    toggle_mesh_medium(&mut self.scratch.media, &medium);
+                    boundary_index += 1;
+                }
+                let mesh_extinction = stack_medium(&self.scratch.media)
+                    .map_or(DVec3::ZERO, |medium| medium_extinction(&medium));
+                let normalized_z = (slice as f32 + 0.5 - jitter_z) / slice_count as f32;
+                let view_z = depth_mapping.volume_z_to_view_z(normalized_z);
+                let depth = -f64::from(view_z);
+                let distance = self.camera.ray_distance_for_depth(direction, depth);
+                let point = origin + direction * distance;
+                let mut extinction = mesh_extinction;
+                for volume in self
+                    .transport
+                    .volumes
+                    .iter()
+                    .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
+                {
+                    if !volume_contains_point(volume, point) {
+                        continue;
+                    }
+                    let density = volume_density_at(volume, point)?;
+                    extinction +=
+                        volume.extinction_rgb_scale * (density * self.transport.meters_per_unit);
+                }
+                self.scratch.froxel_extinction[slice] += extinction;
             }
         }
 
@@ -2149,8 +2481,6 @@ impl RealtimeVolumeSample<'_, '_> {
         self.near_distance = saved.2;
         self.far_distance = saved.3;
         self.footprint = saved.4;
-        self.rng = saved.5;
-        self.ambient = saved.6;
         self.mesh_prepared = false;
         Ok(())
     }
@@ -2244,24 +2574,27 @@ fn axis_sample(values: &[DVec3], weights: LinearSampleWeights) -> DVec3 {
     values[lower_index] * lower_weight + values[upper_index] * upper_weight
 }
 
-fn transmittance_optical_depth(transmittance: DVec3) -> DVec3 {
-    DVec3::new(
-        -transmittance.x.max(f64::MIN_POSITIVE).ln(),
-        -transmittance.y.max(f64::MIN_POSITIVE).ln(),
-        -transmittance.z.max(f64::MIN_POSITIVE).ln(),
-    )
-}
-
-/// EEVEE's volume projection jitter, from `eevee_sampling.cc:231-241` and
-/// `eevee_volume.cc:413-421`.
+/// EEVEE's render-history projection jitter, from `eevee_sampling.cc:231-241` and
+/// `eevee_volume.cc:413-421`. The shader inputs are floats, so wrap after conversion to f32.
 fn eevee_volume_jitter(sample_index: u32) -> [f64; 2] {
     let index = sample_index + 1;
-    let volume_u = fract(halton(index, 2) + 0.5);
-    let volume_v = fract(halton(index, 3) + 2.0 / 3.0);
+    let volume_u = fract_f32(halton(index, 2) as f32 + 0.5);
+    let volume_v = fract_f32(halton(index, 3) as f32 + 2.0 / 3.0);
     [
-        fract(volume_u + 0.5) * 2.0 - 1.0,
-        fract(volume_v + 0.5) * 2.0 - 1.0,
+        f64::from(fract_f32(volume_u + 0.5) * 2.0 - 1.0),
+        f64::from(fract_f32(volume_v + 0.5) * 2.0 - 1.0),
     ]
+}
+
+/// EEVEE's volume-W Halton dimension (`eevee_sampling.cc:231-241`).
+fn eevee_volume_w(sample_index: u32) -> f32 {
+    fract_f32(halton(sample_index + 1, 5) as f32 + 0.8)
+}
+
+/// The per-column Z jitter from `eevee_volume_lib.bsl.hh:25-29` and `eevee_sampling_lib.bsl.hh:59-63`.
+fn eevee_volume_froxel_jitter(x: u32, y: u32, offset: f32) -> f32 {
+    let pixel_noise = fract_f32(0.067_110_56 * x as f32 + 0.005_837_15 * y as f32);
+    fract_f32(offset + 52.982_918_9 * pixel_noise)
 }
 
 fn halton(mut index: u32, base: u32) -> f64 {
@@ -2276,13 +2609,13 @@ fn halton(mut index: u32, base: u32) -> f64 {
     value
 }
 
-fn fract(value: f64) -> f64 {
+fn fract_f32(value: f32) -> f32 {
     value - value.floor()
 }
 
 #[cfg(test)]
 mod volume_jitter_tests {
-    use super::eevee_volume_jitter;
+    use super::{eevee_volume_froxel_jitter, eevee_volume_jitter, eevee_volume_w};
 
     #[test]
     fn volume_projection_jitter_matches_blender_halton_sequence() {
@@ -2290,12 +2623,14 @@ mod volume_jitter_tests {
         assert!(
             first
                 .into_iter()
-                .all(|coordinate| coordinate.abs() <= f64::EPSILON)
+                .all(|coordinate| coordinate.abs() <= 1.0e-6)
         );
 
         let second = eevee_volume_jitter(1);
-        assert!((second[0] + 0.5).abs() < 1.0e-15);
-        assert!((second[1] - 2.0 / 3.0).abs() < 1.0e-15);
+        assert!((second[0] + 0.5).abs() < 1.0e-6);
+        assert!((second[1] - 2.0 / 3.0).abs() < 1.0e-6);
+        assert!(eevee_volume_w(0).abs() < 1.0e-6);
+        assert!((eevee_volume_froxel_jitter(0, 0, eevee_volume_w(1)) - 0.2).abs() < 1.0e-6);
     }
 }
 
@@ -5321,11 +5656,29 @@ fn nearest_light_hit(
     nearest
 }
 
+/// Intersects a ray with a plane and returns the distance and world-space hit point.
+/// One-light plane crossing shared by path-tracer emitters and EEVEE's camera-shape display.
+fn ray_plane_intersection(
+    origin: DVec3,
+    direction: DVec3,
+    center: DVec3,
+    normal: DVec3,
+    cos_light: f64,
+    limit: f64,
+) -> Option<(f64, DVec3)> {
+    if cos_light.abs() <= f64::MIN_POSITIVE {
+        return None;
+    }
+    let distance = (origin - center).dot(normal) / cos_light;
+    if !(distance > RAY_EPSILON && distance < limit) {
+        return None;
+    }
+    Some((distance, origin + direction * distance))
+}
+
 /// Intersects a ray with a hittable light, as Cycles' `area_light_intersect`, `point_light_intersect`
-/// and `spot_light_intersect`. Returns the distance, the emitter radiance, and the solid-angle
-/// density that `sample_light` gives this direction from `receiver`. Area lights and the disk of a
-/// soft-falloff point or spot light are one-sided (they emit towards the receiver); a sphere emits
-/// from every side.
+/// and `spot_light_intersect`. Returns distance, emitter radiance, and solid-angle density from `receiver`.
+/// Area and soft-falloff disks are one-sided; a hard-falloff sphere emits from every side.
 fn light_hit(
     light: &PointLight,
     origin: DVec3,
@@ -5338,11 +5691,14 @@ fn light_hit(
         if cos_light <= 0.0 {
             return None;
         }
-        let distance = (origin - light.position).dot(light.direction) / cos_light;
-        if !(distance > RAY_EPSILON && distance < limit) {
-            return None;
-        }
-        let hit = origin + direction * distance;
+        let (distance, hit) = ray_plane_intersection(
+            origin,
+            direction,
+            light.position,
+            light.direction,
+            cos_light,
+            limit,
+        )?;
         if !inside_emitter(&shape, light.position, hit) {
             return None;
         }
@@ -5385,12 +5741,9 @@ fn light_hit(
         if cos_light <= 0.0 {
             return None;
         }
-        let distance = (origin - light.position).dot(normal) / cos_light;
-        if !(distance > RAY_EPSILON && distance < limit) {
-            return None;
-        }
-        let hit = origin + direction * distance - light.position;
-        if hit.length_squared() > radius_squared {
+        let (distance, hit) =
+            ray_plane_intersection(origin, direction, light.position, normal, cos_light, limit)?;
+        if (hit - light.position).length_squared() > radius_squared {
             return None;
         }
         let radiance = light.color * (emitted * light_attenuation(light, -direction));
@@ -5910,19 +6263,37 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 .and_then(|data_id| doc.data_blocks.get(data_id))?
                 .light
                 .as_ref()?;
-            let evaluated = snapshot.nodes.get(node_id)?;
-            let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+            let color = DVec3::from_array(data.color).max(DVec3::ZERO);
+            let energy = data.energy.max(0.0);
+            let area = (data.light_type == LightType::Area).then(|| area_shape(data, &matrix));
+            let camera_shape_eligible = if data.light_type == LightType::Sun {
+                true
+            } else {
+                let area_shape_has_power_area =
+                    area.is_none_or(|shape| 4.0 * shape.half_u * shape.half_v >= 1.0e-5);
+                let local_influence_radius_squared = local_light_influence_radius_squared(
+                    data,
+                    data.diffuse_factor.max(data.specular_factor),
+                    threshold,
+                )
+                .max(local_light_influence_radius_squared(
+                    data,
+                    data.volume_factor,
+                    threshold,
+                ));
+                area_shape_has_power_area && local_influence_radius_squared > 0.0
+            };
             Some(PointLight {
                 position: matrix.transform_point3(DVec3::ZERO),
                 direction: matrix.transform_vector3(-DVec3::Z).normalize_or_zero(),
                 kind: data.light_type,
-                color: DVec3::from_array(data.color).max(DVec3::ZERO),
-                energy: data.energy.max(0.0),
+                color,
+                energy,
                 radius: data.radius.max(0.0),
                 soft_falloff: data.soft_falloff,
                 spot_size: data.spot_size,
                 spot_blend: data.spot_blend,
-                area: (data.light_type == LightType::Area).then(|| area_shape(data, &matrix)),
+                area,
                 spread: Spread::new(data.spread),
                 use_mis: data.use_multiple_importance_sampling,
                 volume_factor: data.volume_factor.max(0.0),
@@ -5932,6 +6303,7 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                     local_light_influence_radius_squared(data, data.volume_factor, threshold)
                 },
                 ray_mask: node.resolved_ray_visibility().mask(),
+                camera_shape_eligible,
             })
         })
         .collect()
@@ -6139,8 +6511,7 @@ fn collect_volumes<'a>(
         };
         // Voxel transport is scalar: extinction is the channel mean of σt per unit grid density, and
         // the albedo is the per-channel σs / σt. That is exact for grey media only.
-        let extinction: [f64; 3] = std::array::from_fn(|index| scatter[index] + absorption[index]);
-        let extinction_scale = extinction.iter().sum::<f64>() / 3.0;
+        let extinction_rgb_scale = DVec3::from_array(extinction);
         let albedo = DVec3::from_array(std::array::from_fn(|index| {
             if extinction[index] > 0.0 {
                 scatter[index] / extinction[index]
@@ -6218,6 +6589,7 @@ fn collect_volumes<'a>(
             emission,
             scattering,
             extinction_scale,
+            extinction_rgb_scale,
             sampling: params.map_or(crate::model::VolumeSampling::default(), |params| {
                 params.volume_sampling
             }),
@@ -6878,6 +7250,16 @@ fn trace_volume_segment(
     })
 }
 
+fn volume_contains_point(instance: &VolumeInstance<'_>, world_position: DVec3) -> bool {
+    let local = instance.world_to_local.transform_point3(world_position);
+    local.x >= instance.bounds_min.x
+        && local.y >= instance.bounds_min.y
+        && local.z >= instance.bounds_min.z
+        && local.x <= instance.bounds_max.x
+        && local.y <= instance.bounds_max.y
+        && local.z <= instance.bounds_max.z
+}
+
 fn volume_density_at(instance: &VolumeInstance<'_>, world_position: DVec3) -> Result<f64> {
     let local_position = instance.world_to_local.transform_point3(world_position);
     let density = instance_density(instance, local_position);
@@ -7274,6 +7656,7 @@ mod volume_extinction_tests {
             emission: DVec3::ZERO,
             scattering: false,
             extinction_scale: 1.0,
+            extinction_rgb_scale: DVec3::ONE,
             sampling: crate::model::VolumeSampling::MultipleImportance,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: None,
@@ -7324,7 +7707,7 @@ mod volume_extinction_tests {
             emission: DVec3::ZERO,
             scattering: false,
             extinction_scale: 1.0,
-            sampling: crate::model::VolumeSampling::MultipleImportance,
+            extinction_rgb_scale: DVec3::ONE,
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: None,
             ray_mask,
@@ -7440,6 +7823,7 @@ mod volume_extinction_tests {
             volume_factor: 1.0,
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
+            camera_shape_eligible: true,
             spread: None,
             spot_size: 0.0,
             spot_blend: 0.0,
@@ -7485,6 +7869,7 @@ mod volume_extinction_tests {
             volume_factor: 1.0,
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
+            camera_shape_eligible: true,
             spread: None,
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
@@ -7517,6 +7902,7 @@ mod volume_extinction_tests {
             volume_factor: 1.0,
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
+            camera_shape_eligible: true,
             spread: None,
             spot_size: std::f64::consts::FRAC_PI_4,
             spot_blend: 0.15,
@@ -7688,6 +8074,7 @@ mod sampling_tests {
                 volume_factor: 1.0,
                 volume_radius_squared: f64::INFINITY,
                 ray_mask: crate::model::RayVisibility::default().mask(),
+                camera_shape_eligible: true,
                 spread: None,
             };
         let above = DVec3::new(0.2, -0.1, 3.0);
@@ -7794,6 +8181,7 @@ mod sampling_tests {
                     area: Some(shape),
                     spread: Some(spread),
                     ray_mask: crate::model::RayVisibility::default().mask(),
+                    camera_shape_eligible: true,
                     use_mis: true,
                     volume_factor: 1.0,
                     volume_radius_squared: f64::INFINITY,
@@ -7875,6 +8263,7 @@ mod sampling_tests {
             area: Some(shape),
             spread: Spread::new(0.0),
             ray_mask: crate::model::RayVisibility::default().mask(),
+            camera_shape_eligible: true,
             use_mis: true,
             volume_factor: 1.0,
             volume_radius_squared: f64::INFINITY,
@@ -7916,6 +8305,7 @@ mod sampling_tests {
                 volume_factor: 1.0,
                 volume_radius_squared: f64::INFINITY,
                 ray_mask: crate::model::RayVisibility::default().mask(),
+                camera_shape_eligible: true,
                 spread: None,
             }
         };
@@ -7989,6 +8379,7 @@ mod sampling_tests {
             volume_factor: 1.0,
             volume_radius_squared: f64::INFINITY,
             ray_mask: crate::model::RayVisibility::default().mask(),
+            camera_shape_eligible: true,
             spread: None,
         };
         let receiver = DVec3::ZERO;

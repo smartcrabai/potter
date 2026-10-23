@@ -1,14 +1,17 @@
-//! Sun discs, spot emitters, and a light seen through absorbing volume, in the realtime Beauty image, checked against
-//! committed Blender 5.2.2 EEVEE captures.
+//! Sun, point, and spot emitters, and an area light through absorbing volume, in the realtime Beauty image, checked
+//! against committed Blender 5.2.2 EEVEE captures.
 //!
-//! `fixtures/native_oracle/eevee_light_shapes_extra.py` saves three scenes on a black world:
+//! `fixtures/native_oracle/eevee_light_shapes_extra.py` saves three base scenes and three local-light cull variants;
+//! `eevee_light_shape_occlusion.py` saves a point-shape scene behind an opaque surface:
 //!
 //! - a sun of angle 8° seen by a perspective camera that looks straight at it, whose disc EEVEE draws at
 //!   `energy · (1 + 1 / r²) / π` with `r = tan(angle / 2)`;
 //! - a spot light facing an orthographic camera, next to the area and point lights, whose disc EEVEE draws at the
 //!   sphere emitter radiance `P / (4 π² r²)` on axis;
-//! - the area light behind a slab of absorbing volume, where EEVEE attenuates the light shape by the transmittance in
-//!   front of it; the default tile-size-8 and tile-size-1 EEVEE captures exercise different froxel layouts.
+//! - the area light behind a slab of absorbing volume, with tile-size-8 and tile-size-1 captures; local cull variants
+//!   verify that all-zero and transmission-only factors cull the shape while a volume-only factor keeps it visible;
+//! - a hard point light whose physical sphere front is in front of an opaque plane, while EEVEE's center-plane emitter
+//!   lies behind it, pinning the camera-shape depth test.
 //!
 //! The test imports each saved `.blend`, renders it with `pot render --engine realtime`, and compares window means with
 //! committed macOS EEVEE pixel captures. The sun and spot tolerances are 0.01; the existing absorber tolerance remains
@@ -51,6 +54,18 @@ const EEVEE_SPOT: &[u8] = include_bytes!("fixtures/native_oracle/eevee_macos/spo
 const EEVEE_ABSORBER: &[u8] = include_bytes!("fixtures/native_oracle/eevee_macos/absorber.f32le");
 const EEVEE_ABSORBER_TILE1: &[u8] =
     include_bytes!("fixtures/native_oracle/eevee_macos/absorber_tile1.f32le");
+
+const EEVEE_ABSORBER_ZERO: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/absorber_zero.f32le");
+const EEVEE_ABSORBER_VOLUME_ONLY: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/absorber_volume_only.f32le");
+const EEVEE_ABSORBER_TRANSMISSION_ONLY: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/absorber_transmission_only.f32le");
+
+const OCCLUSION_SCRIPT: &str =
+    include_str!("fixtures/native_oracle/eevee_light_shape_occlusion.py");
+const EEVEE_POINT_OCCLUDED: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/point_occluded.f32le");
 
 /// Linear tolerance on a window mean against EEVEE, for the sun and the spot.
 const EMITTER_TOLERANCE: f64 = 0.01;
@@ -160,6 +175,9 @@ fn realtime_sun_spot_and_absorber_match_eevee() -> TestResult {
     let sun_blend = root.path().join("sun.blend");
     let spot_blend = root.path().join("spot.blend");
     let absorber_blend = root.path().join("absorber.blend");
+    let absorber_zero_blend = root.path().join("absorber_zero.blend");
+    let absorber_volume_blend = root.path().join("absorber_volume.blend");
+    let absorber_transmission_blend = root.path().join("absorber_transmission.blend");
     run_blender_arguments(
         &blender,
         &script,
@@ -168,6 +186,12 @@ fn realtime_sun_spot_and_absorber_match_eevee() -> TestResult {
             sun_blend.as_path(),
             spot_blend.as_path(),
             absorber_blend.as_path(),
+            absorber_zero_blend.as_path(),
+            absorber_volume_blend.as_path(),
+            absorber_transmission_blend.as_path(),
+            Path::new("-"),
+            Path::new("-"),
+            Path::new("-"),
             Path::new("-"),
             Path::new("-"),
             Path::new("-"),
@@ -244,6 +268,73 @@ fn realtime_sun_spot_and_absorber_match_eevee() -> TestResult {
     assert!(
         (through_tile1 - expected_through_tile1).abs() <= ABSORBER_TOLERANCE,
         "area light through the absorber at tile size 1: Potter {through_tile1} differs from EEVEE {expected_through_tile1}"
+    );
+    // EEVEE's local-light cull list uses diffuse/specular and volume power, not transmission.
+    for (name, blend, capture, tolerance) in [
+        (
+            "absorber_zero",
+            &absorber_zero_blend,
+            EEVEE_ABSORBER_ZERO,
+            EMITTER_TOLERANCE,
+        ),
+        (
+            "absorber_volume",
+            &absorber_volume_blend,
+            EEVEE_ABSORBER_VOLUME_ONLY,
+            ABSORBER_TOLERANCE,
+        ),
+        (
+            "absorber_transmission",
+            &absorber_transmission_blend,
+            EEVEE_ABSORBER_TRANSMISSION_ONLY,
+            EMITTER_TOLERANCE,
+        ),
+    ] {
+        let project = render_realtime(&blender, root.path(), name, blend, name, 8)?;
+        let actual = window_mean(&project, name, 20, centre, WINDOW)?;
+        let expected = oracle_window_mean(capture, 20, centre, WINDOW);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{name}: Potter {actual} differs from EEVEE {expected}"
+        );
+        if name == "absorber_volume" {
+            assert!(
+                (actual - through).abs() <= EMITTER_TOLERANCE,
+                "camera-shape radiance changed when only the volume cull factor remained: {actual} vs {through}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn realtime_point_shape_uses_center_plane_depth_for_surface_occlusion() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(
+        root.path(),
+        "eevee_light_shape_occlusion.py",
+        OCCLUSION_SCRIPT,
+    )?;
+    let blend = root.path().join("point_occluded.blend");
+    run_blender_arguments(&blender, &script, None, &[blend.as_path(), Path::new("-")])?;
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "point_occluded",
+        &blend,
+        "point_occluded",
+        8,
+    )?;
+    let centre = RESOLUTION as usize / 2;
+    let actual = window_mean(&project, "point_occluded", centre, centre, WINDOW)?;
+    let expected = oracle_window_mean(EEVEE_POINT_OCCLUDED, centre, centre, WINDOW);
+    assert!(
+        (actual - expected).abs() <= EMITTER_TOLERANCE,
+        "camera-visible point shape at the light center plane: Potter {actual} differs from EEVEE {expected}"
     );
     Ok(())
 }

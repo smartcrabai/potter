@@ -1232,16 +1232,16 @@ fn default_eevee_volumetric_tile_size() -> u32 {
     8
 }
 
-fn is_default_eevee_volumetric_tile_size(value: &u32) -> bool {
-    *value == 8
+fn is_default_eevee_volumetric_tile_size<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64((*value).into(), 8.0)
 }
 
 fn default_eevee_volumetric_samples() -> u32 {
     64
 }
 
-fn is_default_eevee_volumetric_samples(value: &u32) -> bool {
-    *value == 64
+fn is_default_eevee_volumetric_samples<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64((*value).into(), 64.0)
 }
 
 fn default_eevee_volumetric_sample_distribution() -> f64 {
@@ -1249,24 +1249,24 @@ fn default_eevee_volumetric_sample_distribution() -> f64 {
 }
 
 // Blender stores these RNA factors and distances as floats.
-fn is_default_eevee_volumetric_sample_distribution(value: &f64) -> bool {
-    (*value as f32) == 0.8_f32
+fn is_default_eevee_volumetric_sample_distribution<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64(f64::from((*value).into() as f32), f64::from(0.8_f32))
 }
 
 fn default_eevee_volumetric_start() -> f64 {
     0.1
 }
 
-fn is_default_eevee_volumetric_start(value: &f64) -> bool {
-    (*value as f32) == 0.1_f32
+fn is_default_eevee_volumetric_start<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64(f64::from((*value).into() as f32), f64::from(0.1_f32))
 }
 
 fn default_eevee_volumetric_end() -> f64 {
     100.0
 }
 
-fn is_default_eevee_volumetric_end(value: &f64) -> bool {
-    (*value as f32) == 100.0_f32
+fn is_default_eevee_volumetric_end<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64(f64::from((*value).into() as f32), f64::from(100.0_f32))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

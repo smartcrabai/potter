@@ -80,6 +80,8 @@ impl VolumeDepthMapping {
 pub(super) struct FroxelTextureLayout {
     pub(super) dimensions: [u32; 2],
     pub(super) coord_scale: [f32; 2],
+    extent: [u32; 2],
+    tile_size: u32,
 }
 
 impl FroxelTextureLayout {
@@ -95,7 +97,27 @@ impl FroxelTextureLayout {
         Self {
             dimensions,
             coord_scale,
+            extent: [width, height],
+            tile_size,
         }
+    }
+
+    /// Returns the pixel-space center of a bottom-up froxel, including Blender's padded top extent.
+    ///
+    /// `VolumeModule::set_view` expands the view window from the unchanged left/bottom edges
+    /// (`eevee_volume.cc:390-397`), so rows beyond the actual height are above the image.
+    pub(super) fn cell_center_in_pixels(self, x: u32, y: u32) -> [f64; 2] {
+        [
+            (f64::from(x) + 0.5) * f64::from(self.tile_size),
+            f64::from(self.extent[1]) - (f64::from(y) + 0.5) * f64::from(self.tile_size),
+        ]
+    }
+    /// Converts native NDC jitter (`±1 / tex_size`) to raster pixels.
+    pub(super) fn jitter_in_pixels(self, jitter: [f64; 2]) -> [f64; 2] {
+        [
+            jitter[0] * f64::from(self.extent[0]) / (2.0 * f64::from(self.dimensions[0])),
+            jitter[1] * f64::from(self.extent[1]) / (2.0 * f64::from(self.dimensions[1])),
+        ]
     }
 }
 
@@ -112,6 +134,16 @@ pub(super) fn screen_uv_to_resolve_uv(screen_uv: [f32; 2], coord_scale: [f32; 2]
 pub(super) fn resolve_z_with_end_of_slice_bias(z: f32, texture_depth: usize) -> f32 {
     assert!(texture_depth > 0, "froxel texture depth must be nonzero");
     z - 1.0 / texture_depth as f32
+}
+
+/// `occupancy::bit_index_from_depth` rounds a surface crossing to the center of a froxel bit
+/// (`eevee_occupancy_lib.bsl.hh:15-20`), after the surface W jitter (`eevee_surf_occupancy.bsl.hh:70-76`).
+pub(super) fn occupancy_boundary_index(volume_z: f32, jitter: f32, depth_slices: usize) -> usize {
+    assert!(depth_slices > 0, "froxel texture depth must be nonzero");
+    let index = (volume_z * depth_slices as f32 + jitter + 0.5)
+        .trunc()
+        .clamp(0.0, depth_slices as f32);
+    index as usize
 }
 
 /// The two texel indices and upper-texel blend weight for normalized linear texture sampling.
@@ -148,7 +180,8 @@ pub(super) fn linear_sample_weights(
 mod tests {
     use super::{
         FroxelTextureLayout, LinearSampleWeights, VolumeDepthMapping, VolumeProjection,
-        linear_sample_weights, resolve_z_with_end_of_slice_bias, screen_uv_to_resolve_uv,
+        linear_sample_weights, occupancy_boundary_index, resolve_z_with_end_of_slice_bias,
+        screen_uv_to_resolve_uv,
     };
 
     fn assert_close(actual: f32, expected: f32) {
@@ -181,6 +214,16 @@ mod tests {
             screen_uv_to_resolve_uv([1.0, 1.0], layout.coord_scale),
             layout.coord_scale,
         );
+
+        let bottom_cell = layout.cell_center_in_pixels(0, 0);
+        assert!((bottom_cell[0] - 8.0).abs() < f64::EPSILON);
+        assert!((bottom_cell[1] - 45.0).abs() < f64::EPSILON);
+        let padded_top_right = layout.cell_center_in_pixels(6, 3);
+        assert!((padded_top_right[0] - 104.0).abs() < f64::EPSILON);
+        assert!((padded_top_right[1] + 3.0).abs() < f64::EPSILON);
+        let jitter_offset = layout.jitter_in_pixels([1.0, 1.0]);
+        assert!((jitter_offset[0] - 101.0 / 14.0).abs() < 1.0e-6);
+        assert!((jitter_offset[1] - 53.0 / 8.0).abs() < 1.0e-6);
     }
 
     #[test]
@@ -227,6 +270,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn occupancy_boundaries_round_to_the_native_froxel_bit_centers() {
+        assert_eq!(occupancy_boundary_index(0.0, 0.0, 64), 0);
+        assert_eq!(occupancy_boundary_index(0.5, 0.0, 64), 32);
+        assert_eq!(occupancy_boundary_index(0.5, 0.75, 64), 33);
+        assert_eq!(occupancy_boundary_index(-1.0, 0.0, 64), 0);
+        assert_eq!(occupancy_boundary_index(2.0, 0.0, 64), 64);
+    }
     #[test]
     fn resolve_bias_moves_to_previous_slice_endpoint() {
         assert_close(resolve_z_with_end_of_slice_bias(0.5, 4), 0.5 - 1.0 / 4.0);

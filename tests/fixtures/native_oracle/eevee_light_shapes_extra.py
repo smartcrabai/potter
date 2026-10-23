@@ -1,22 +1,23 @@
 """EEVEE oracle for the realtime light shapes beyond the area and point lights (Blender 5.2.2).
 
-Three scenes, each on a black world, rendered by EEVEE and saved as `.blend` for Potter to import:
+Three base scenes on a black world, plus three area-light culling variants, rendered by EEVEE and saved as `.blend` for
+Potter to import:
 
-- Sun: a perspective camera at the origin looks up +Z, and a sun with `visible_camera` on shines down -Z, so its
-  disc sits at the image centre. The disc has the sun's angular diameter (`SUN_ANGLE`), which EEVEE takes as
-  `shape_radius = tan(angle / 2)` (`eevee_light.cc`). Its radiance is `energy · (1 + 1 / r²) / π`
-  (`shape_display_light_radiance_get`).
-- Spot and absorber: the orthographic top view of `eevee_light_shapes.py` with a spot light that faces the camera at
-  (0, 2.5) m, and an absorbing slab, 2 m thick, over the area light. EEVEE multiplies each light shape by the
-  transmittance in front of it (`eevee_light_shape_display.bsl.hh`), so the area light is dimmed by the slab. The
-  spot's radiance on axis is the sphere-light formula `P / (4 π² r²)`.
+- Sun: a perspective camera at the origin looks up +Z, and a sun with `visible_camera` on shines down -Z. EEVEE draws
+  its disc with radiance `energy · (1 + 1 / r²) / π`, `r = tan(angle / 2)` (`eevee_light.cc`).
+- Spot and absorber: an orthographic top view with a spot light at (0, 2.5) m, and a 2 m absorbing slab over an area
+  light. EEVEE multiplies the area shape by volume transmittance (`eevee_light_shape_display.bsl.hh`); the spot's
+  on-axis radiance is `P / (4 π² r²)`.
+- The absorber is also rendered at froxel tile size 1 (default 8) and with zero, volume-only, and transmission-only
+  light factors, to pin the local-light cull-list rule: surface diffuse/specular or volume power keeps a local light in
+  the camera-shape list; transmission power alone does not (`eevee_light.cc`, `shape_parameters_set`).
 
-Rows are reported top-down, as Potter's images are indexed. Passing `-` for each render output saves the three `.blend`
-files without rendering; tests use the committed macOS f32le captures. The absorber has a second render at froxel tile
-size 1, in addition to the default tile size 8.
+Rows are reported top-down, as Potter's images are indexed. Passing `-` for each render output saves the six `.blend`
+files without rendering; tests use the committed macOS f32le captures.
 
-Arguments after `--`: sun_blend, spot_blend, absorber_blend, json_out, sun_exr, spot_exr, absorber_exr,
-absorber_tile1_exr.
+Arguments after `--`: sun_blend, spot_blend, absorber_blend, absorber_zero_blend, absorber_volume_blend,
+absorber_transmission_blend, json_out, sun_exr, spot_exr, absorber_exr, absorber_tile1_exr, absorber_zero_exr,
+absorber_volume_exr, absorber_transmission_exr.
 """
 
 import json
@@ -48,9 +49,22 @@ SPOT_ENERGY = 5.0
 SLAB_DENSITY = 0.5
 SLAB_THICKNESS = 2.0
 
-sun_blend, spot_blend, absorber_blend, json_out, sun_exr, spot_exr, absorber_exr, absorber_tile1_exr = sys.argv[
-    sys.argv.index("--") + 1 :
-][:8]
+(
+    sun_blend,
+    spot_blend,
+    absorber_blend,
+    absorber_zero_blend,
+    absorber_volume_blend,
+    absorber_transmission_blend,
+    json_out,
+    sun_exr,
+    spot_exr,
+    absorber_exr,
+    absorber_tile1_exr,
+    absorber_zero_exr,
+    absorber_volume_exr,
+    absorber_transmission_exr,
+) = sys.argv[sys.argv.index("--") + 1 :][:14]
 render_eevee = all(path != "-" for path in (sun_exr, spot_exr, absorber_exr))
 
 
@@ -197,8 +211,36 @@ volume.inputs["Anisotropy"].default_value = 0.0
 tree.links.new(volume.outputs["Volume"], output.inputs["Volume"])
 slab.data.materials.append(material)
 bpy.ops.wm.save_as_mainfile(filepath=absorber_blend)
+base_factors = (
+    area.diffuse_factor,
+    area.specular_factor,
+    area.transmission_factor,
+    area.volume_factor,
+)
+
+area.diffuse_factor = 0.0
+area.specular_factor = 0.0
+area.transmission_factor = 0.0
+area.volume_factor = 0.0
+bpy.ops.wm.save_as_mainfile(filepath=absorber_zero_blend)
+area.volume_factor = 1.0
+bpy.ops.wm.save_as_mainfile(filepath=absorber_volume_blend)
+area.volume_factor = 0.0
+area.transmission_factor = 1.0
+bpy.ops.wm.save_as_mainfile(filepath=absorber_transmission_blend)
+area.diffuse_factor, area.specular_factor, area.transmission_factor, area.volume_factor = base_factors
+
 if not render_eevee:
-    print("SAVED", sun_blend, spot_blend, absorber_blend, "(EEVEE renders skipped)")
+    print(
+        "SAVED",
+        sun_blend,
+        spot_blend,
+        absorber_blend,
+        absorber_zero_blend,
+        absorber_volume_blend,
+        absorber_transmission_blend,
+        "(EEVEE renders skipped)",
+    )
     sys.exit(0)
 
 absorber_pixels = render_and_read(scene, absorber_exr)
@@ -213,6 +255,30 @@ if absorber_tile1_exr != "-":
     absorber_tile1_pixels = render_and_read(scene, absorber_tile1_exr)
     result["absorber_tile1_mean_red"] = window_mean(
         absorber_tile1_pixels, area_column, RESOLUTION // 2
+    )
+
+scene.eevee.volumetric_tile_size = "8"
+area.diffuse_factor = 0.0
+area.specular_factor = 0.0
+area.transmission_factor = 0.0
+area.volume_factor = 0.0
+if absorber_zero_exr != "-":
+    absorber_zero_pixels = render_and_read(scene, absorber_zero_exr)
+    result["absorber_zero_factors_mean_red"] = window_mean(
+        absorber_zero_pixels, area_column, RESOLUTION // 2
+    )
+area.volume_factor = 1.0
+if absorber_volume_exr != "-":
+    absorber_volume_pixels = render_and_read(scene, absorber_volume_exr)
+    result["absorber_volume_only_mean_red"] = window_mean(
+        absorber_volume_pixels, area_column, RESOLUTION // 2
+    )
+area.volume_factor = 0.0
+area.transmission_factor = 1.0
+if absorber_transmission_exr != "-":
+    absorber_transmission_pixels = render_and_read(scene, absorber_transmission_exr)
+    result["absorber_transmission_only_mean_red"] = window_mean(
+        absorber_transmission_pixels, area_column, RESOLUTION // 2
     )
 with open(json_out, "w") as handle:
     json.dump(result, handle, indent=2)

@@ -2400,7 +2400,7 @@ fn composite_sample(
         let far_distance = camera.ray_distance_for_depth(ray.direction, camera.far);
         let layers = &hits[..hit_count];
         let mut light_radiance = DVec3::ZERO;
-        for event in camera_lights.local_events(ray.origin, ray.direction, far_distance) {
+        for event in camera_lights.local_events(camera, ray.origin, ray.direction, far_distance) {
             light_radiance += camera_light_event_radiance(
                 triangles,
                 layers,
