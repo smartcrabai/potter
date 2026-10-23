@@ -1,8 +1,17 @@
+mod bake;
 mod evaluator;
 mod model;
 mod sockets;
 
-pub use evaluator::{GraphEvaluation, evaluate, evaluate_at_frame};
+pub(crate) use bake::{
+    MAX_NODE_BAKE_FRAME_COUNT, MAX_NODE_BAKE_PACKED_BYTES, NODE_BAKE_JSON_MEMORY_MULTIPLIER,
+    bake_frame_window, node_bake_directory, node_bake_frame_memory_bytes,
+    packed_node_bake_resource, read_node_bake_payload_limited, same_bake_frame,
+    uses_custom_node_bake_path, validate_node_bake_config, validate_node_bake_frame,
+    validate_node_bake_record, validate_node_bake_resource, validate_node_bake_settings,
+};
+pub use bake::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord, NodeBakeValue};
+pub use evaluator::{GraphEvaluation, evaluate, evaluate_at_frame, evaluate_at_frame_with_bakes};
 pub use model::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup};
 pub use sockets::validate_link;
 

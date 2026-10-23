@@ -263,6 +263,9 @@ fn complete_scene_schema(root: &mut Value) {
         "frame_current",
         "frame_start",
         "frame_end",
+        "use_custom_simulation_range",
+        "simulation_frame_start",
+        "simulation_frame_end",
         "fps",
         "fps_base",
         "camera",
@@ -294,6 +297,9 @@ fn complete_scene_schema(root: &mut Value) {
     ] {
         defs["light"]["properties"][factor] = json!({"type":"number","minimum":0});
     }
+    scene["properties"]["use_custom_simulation_range"] = json!({"type":"boolean"});
+    scene["properties"]["simulation_frame_start"] = json!({"type":"integer"});
+    scene["properties"]["simulation_frame_end"] = json!({"type":"integer"});
     let render = &mut defs["render_settings"];
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
     render["properties"]["eevee_use_volumetric_shadows"] =
