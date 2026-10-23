@@ -1879,29 +1879,188 @@ pub fn import_blend(file: &Path, blender: Option<&Path>) -> Result<ImportedGraph
                 return Err(PotError::io(&error));
             }
         };
-        let mut native_bindings =
-            super::blend_dna::read_modifier_bindings(&original).map_err(|error| {
-                PotError::with_details(
-                    ErrorCode::ImportFailed,
-                    format!("could not read native Blender modifier bind data: {error}"),
-                    json!({"file": file.display().to_string()}),
-                )
-            })?;
-        let mut native_multires = super::blend_dna::read_multires_displacements(&original)
-            .map_err(|error| {
-                PotError::with_details(
-                    ErrorCode::ImportFailed,
-                    format!("could not read native Blender multires data: {error}"),
-                    json!({"file": file.display().to_string()}),
-                )
-            })?;
+        let native_metadata = super::blend_dna::read_native_metadata(&original).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                format!("could not read native Blender modifier, multires, and Bake metadata: {error}"),
+                json!({"file": file.display().to_string()}),
+            )
+        })?;
+        let mut native_bindings = native_metadata.modifier_bindings;
+        let mut native_multires = native_metadata.multires_displacements;
         load_external_multires(&raw, &mut native_multires, file)?;
         attach_native_multires(&mut raw, &mut native_multires)?;
         attach_native_target_vertices(&mut raw, &mut native_bindings)?;
+        attach_native_packed_bake_states(&mut raw, file, &native_metadata.node_bakes)?;
         build_imported_graph(&raw, file, original, &native_bindings)
     })();
     cleanup(&[script, output]);
     operation
+}
+
+fn attach_native_packed_bake_states(
+    raw: &mut Value,
+    main_file: &Path,
+    main_states: &super::blend_dna::NativeBakeStates,
+) -> Result<()> {
+    let main_source = fs::canonicalize(main_file).map_err(|error| {
+        PotError::with_details(
+            ErrorCode::ImportFailed,
+            "could not resolve the Blender source file for packed Bake metadata",
+            json!({"file":main_file.display().to_string(),"cause":error.to_string()}),
+        )
+    })?;
+    let Some(objects) = raw.get("objects").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let mut states_by_source = BTreeMap::from([(main_source.clone(), main_states.clone())]);
+    let mut library_sources = BTreeSet::new();
+    for modifier in objects
+        .iter()
+        .filter_map(|object| object.get("modifiers").and_then(Value::as_array))
+        .flatten()
+    {
+        let Some(bake_losses) = modifier.get("bake_losses") else {
+            continue;
+        };
+        bake_losses
+            .get("bake_ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_intermediate("node-bake IDs are missing from bake metadata"))?;
+        let source_file = bake_losses
+            .get("source_file")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_intermediate("Bake source-file identity is missing"))?;
+        let source = fs::canonicalize(source_file).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                "could not resolve Blender library source for packed Bake metadata",
+                json!({"file":source_file,"cause":error.to_string()}),
+            )
+        })?;
+        if source != main_source {
+            library_sources.insert(source);
+        }
+    }
+    for source in library_sources {
+        let bytes = fs::read(&source).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                "could not read Blender library for packed Bake metadata",
+                json!({"file":source.display().to_string(),"cause":error.to_string()}),
+            )
+        })?;
+        let states = super::blend_dna::read_node_bake_states(&bytes).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                format!("could not read Blender library Bake metadata: {error}"),
+                json!({"file":source.display().to_string()}),
+            )
+        })?;
+        states_by_source.insert(source, states);
+    }
+
+    let Some(objects) = raw.get_mut("objects").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for modifier in objects
+        .iter_mut()
+        .filter_map(|object| object.get_mut("modifiers").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let modifier_name = modifier
+            .get("blender_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid_intermediate("Blender modifier name is missing"))?;
+        let Some(bake_losses) = modifier
+            .get_mut("bake_losses")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let bake_ids = bake_losses
+            .get("bake_ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_intermediate("node-bake IDs are missing from bake metadata"))?;
+        let source_file = bake_losses
+            .get("source_file")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_intermediate("Bake source-file identity is missing"))?;
+        let source = fs::canonicalize(source_file).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::ImportFailed,
+                "could not resolve Blender source for packed Bake metadata",
+                json!({"file":source_file,"cause":error.to_string()}),
+            )
+        })?;
+        let states = states_by_source
+            .get(&source)
+            .ok_or_else(|| invalid_intermediate("Bake source state was not indexed"))?;
+        let owner_name = bake_losses
+            .get("owner_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_intermediate("Bake owner identity is missing"))?;
+        let mut reported_ids = BTreeSet::new();
+        let mut packed_payloads = Vec::new();
+        let mut packed_unmapped_ids = Vec::new();
+        for entry in bake_ids {
+            let bake_id = entry
+                .get("bake_id")
+                .and_then(Value::as_i64)
+                .and_then(|id| i32::try_from(id).ok())
+                .ok_or_else(|| invalid_intermediate("Bake ID is invalid"))?;
+            if !reported_ids.insert(bake_id) {
+                return Err(invalid_intermediate("duplicate Bake ID in bridge metadata"));
+            }
+            let node_name = match entry.get("node_name") {
+                Some(Value::String(name)) => Some(name.as_str()),
+                Some(Value::Null) => None,
+                _ => return Err(invalid_intermediate("Bake node name is invalid")),
+            };
+            let matches_bake = |(object, blender_modifier, id): &(String, String, i32)| {
+                object.as_str() == owner_name
+                    && blender_modifier.as_str() == modifier_name
+                    && *id == bake_id
+            };
+            if !states.bake_ids.iter().any(matches_bake) {
+                return Err(PotError::with_details(
+                    ErrorCode::ImportFailed,
+                    "Blender Bake IDs differ between RNA and serialized SDNA",
+                    json!({"file":source.display().to_string(),"object":owner_name,
+                        "modifier":modifier_name,"node":node_name,"bake_id":bake_id}),
+                ));
+            }
+            if states.packed.iter().any(matches_bake) {
+                if let Some(node_name) = node_name {
+                    packed_payloads.push(node_name.to_owned());
+                } else {
+                    packed_unmapped_ids.push(bake_id);
+                }
+            }
+        }
+        let source_id_count = states
+            .bake_ids
+            .iter()
+            .filter(|key| key.0.as_str() == owner_name && key.1.as_str() == modifier_name)
+            .count();
+        let source_ids_reported = states
+            .bake_ids
+            .iter()
+            .filter(|key| key.0.as_str() == owner_name && key.1.as_str() == modifier_name)
+            .all(|key| reported_ids.contains(&key.2));
+        if source_id_count != reported_ids.len() || !source_ids_reported {
+            return Err(PotError::with_details(
+                ErrorCode::ImportFailed,
+                "Blender Bake ID list is incomplete between RNA and serialized SDNA",
+                json!({"file":source.display().to_string(),"object":owner_name,
+                    "modifier":modifier_name}),
+            ));
+        }
+        bake_losses.insert("packed_payloads".to_owned(), json!(packed_payloads));
+        bake_losses.insert("packed_unmapped_ids".to_owned(), json!(packed_unmapped_ids));
+    }
+    Ok(())
 }
 
 fn attach_native_target_vertices(
@@ -3082,6 +3241,16 @@ fn build_imported_graph(
             .map_err(|_| invalid_intermediate("scene frame_start is out of range"))?;
         let frame_end = i32::try_from(integer_field(item, "frame_end", 250))
             .map_err(|_| invalid_intermediate("scene frame_end is out of range"))?;
+        let use_custom_simulation_range = item
+            .get("use_custom_simulation_range")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let simulation_frame_start =
+            i32::try_from(integer_field(item, "simulation_frame_start", 1)).map_err(|_| {
+                invalid_intermediate("scene simulation_frame_start is out of range")
+            })?;
+        let simulation_frame_end = i32::try_from(integer_field(item, "simulation_frame_end", 250))
+            .map_err(|_| invalid_intermediate("scene simulation_frame_end is out of range"))?;
         let fps = u32::try_from(integer_field(item, "fps", 24))
             .map_err(|_| invalid_intermediate("scene fps is out of range"))?;
         let render = item.get("render").cloned().unwrap_or(Value::Null);
@@ -3204,6 +3373,9 @@ fn build_imported_graph(
             frame_current: number_field(item, "frame_current", 1.0),
             frame_start,
             frame_end,
+            use_custom_simulation_range,
+            simulation_frame_start,
+            simulation_frame_end,
             fps,
             fps_base: number_field(item, "fps_base", 1.0),
             camera: None,
@@ -4089,6 +4261,9 @@ fn build_imported_graph(
                         invalid_intermediate("modifier references an unknown node group")
                     })?;
                     params.insert("node_group".to_owned(), json!(group_id.as_str()));
+                    if let Some(group) = doc.node_groups.get(group_id) {
+                        rekey_nodes_bakes(&mut params, group);
+                    }
                 }
                 if crate::params::type_spec(crate::params::ParameterFamily::Modifier, &model_type)
                     .is_some()
@@ -9370,6 +9545,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             if !known_modifier(kind) {
                 losses.push(loss(format!("blender.modifier.{}", kind.to_lowercase()), modifier.get("name").and_then(Value::as_str), "modifier properties are preserved, but this modifier is not editable/evaluated by potter"));
             }
+            losses.extend(nodes_bake_import_losses(modifier));
             if kind == "VOLUME_DISPLACE"
                 && modifier
                     .get("properties")
@@ -9605,6 +9781,92 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             "blender.orphan_datablock",
             None,
             "orphan IDs outside the editable mesh/material/camera/light/action/world registries remain preserve-only",
+        ));
+    }
+    losses
+}
+
+/// Re-keys a modifier's bake settings from Blender bake node names, which is how the bridge keys them, to the
+/// imported node IDs. Names are unique within a node tree, so each entry maps to one node. An entry whose name
+/// names no node of the group is dropped; the bridge reports such a bake as unmapped.
+fn rekey_nodes_bakes(params: &mut Map<String, Value>, group: &NodeGroup) {
+    let Some(bakes) = params.get("bakes").and_then(Value::as_object) else {
+        return;
+    };
+    let rekeyed = bakes
+        .iter()
+        .filter_map(|(name, settings)| {
+            let (node_id, _) = group.nodes.iter().find(|(_, node)| node.name == *name)?;
+            Some((node_id.as_str().to_owned(), settings.clone()))
+        })
+        .collect::<Map<String, Value>>();
+    params.insert("bakes".to_owned(), Value::Object(rekeyed));
+}
+
+/// Facts from Blender's modifier and validated SDNA metadata for Bake nodes. Data-block references are not remapped by
+/// Potter; packed state is matched by source library, object, modifier, and the nested node ID.
+fn nodes_bake_import_losses(modifier: &Value) -> Vec<Loss> {
+    let name = modifier.get("name").and_then(Value::as_str);
+    let mut losses = Vec::new();
+    let Some(bake_losses) = modifier.get("bake_losses") else {
+        return losses;
+    };
+    for bake in bake_losses
+        .get("packed_payloads")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        losses.push(loss(
+            "blender.modifier.nodes_bake_packed",
+            name,
+            &format!(
+                "Blender bake {bake} has packed data that Potter cannot read because Blender exposes no RNA for it; the bake is re-evaluated live"
+            ),
+        ));
+    }
+    for bake_id in bake_losses
+        .get("packed_unmapped_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+    {
+        losses.push(loss(
+            "blender.modifier.nodes_bake_packed",
+            name,
+            &format!(
+                "Blender bake ID {bake_id} has packed data that Potter cannot read because Blender exposes no RNA for it; the bake is re-evaluated live"
+            ),
+        ));
+    }
+    for bake in bake_losses
+        .get("data_blocks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        losses.push(loss(
+            "blender.modifier.nodes_bake_data_blocks",
+            name,
+            &format!(
+                "Blender bake {bake} references data-blocks that Potter does not remap, so they are not kept"
+            ),
+        ));
+    }
+    for bake in bake_losses
+        .get("unmapped")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        losses.push(loss(
+            "blender.modifier.nodes_bake_unmapped",
+            name,
+            &format!("Blender bake {bake} has no bake node, so its settings are not kept"),
         ));
     }
     losses
@@ -10243,6 +10505,9 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                     "modifier kind is not supported by the adapter",
                 ));
             }
+            if modifier.modifier_type == "nodes" {
+                losses.extend(nodes_bake_export_losses(doc, modifier));
+            }
         }
         losses.extend(potter_physics_export_losses(node));
     }
@@ -10455,6 +10720,48 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             loss.feature_id != "blender.material.displacement_method"
                 || imported_both_loss_applies(doc, loss.data_id.as_deref())
         }));
+    }
+    losses
+}
+
+/// Node-bake entries Blender can receive are settings only. A payload (packed or disk) stays in Potter's store, and
+/// an entry whose key names no bake node of the modifier's node group has no Blender bake to receive it.
+fn nodes_bake_export_losses(doc: &SceneDoc, modifier: &Modifier) -> Vec<Loss> {
+    let Some(bakes) = modifier.params.get("bakes").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let group = modifier
+        .params
+        .get("node_group")
+        .and_then(Value::as_str)
+        .and_then(|group_id| Id::new(group_id.to_owned()).ok())
+        .and_then(|group_id| doc.node_groups.get(&group_id));
+    let mut losses = Vec::new();
+    for (node_id, entry) in bakes {
+        if let Some(storage) = entry.get("storage").and_then(Value::as_str) {
+            losses.push(loss(
+                "blender.modifier.nodes_bake_payload",
+                Some(modifier.id.as_str()),
+                &format!(
+                    "the {storage} payload of bake node {node_id} is not written to Blender: Potter writes no Blender bake blobs, so Blender re-evaluates the bake live"
+                ),
+            ));
+        }
+        let is_bake_node = group.is_some_and(|group| {
+            Id::new(node_id.clone())
+                .ok()
+                .and_then(|id| group.nodes.get(&id))
+                .is_some_and(|node| node.node_type == "GeometryNodeBake")
+        });
+        if !is_bake_node {
+            losses.push(loss(
+                "blender.modifier.nodes_bake_unmapped",
+                Some(modifier.id.as_str()),
+                &format!(
+                    "bake entry {node_id} names no GeometryNodeBake node of the modifier's node group, so its settings are not written to Blender"
+                ),
+            ));
+        }
     }
     losses
 }
@@ -18531,6 +18838,139 @@ print("UNSUPPORTED_POSE " + json.dumps({
             });
         }
         Ok(group)
+    }
+
+    /// A cube with one Geometry Nodes modifier whose group holds two bake nodes and a transform node.
+    fn nodes_bake_modifier(bakes: Value) -> Result<SceneDoc> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let mut group = NodeGroup::new("Geometry", GraphKind::Geometry);
+        for bake in ["bake_main", "bake_disk"] {
+            group
+                .nodes
+                .insert(Id::new(bake)?, GraphNode::new("GeometryNodeBake"));
+        }
+        group.nodes.insert(
+            Id::new("transform")?,
+            GraphNode::new("GeometryNodeTransform"),
+        );
+        doc.node_groups.insert(Id::new("group_geo")?, group);
+        let mut cube = test_node("Cube", "mesh_cube", None, None)?;
+        cube.modifiers.push(Modifier {
+            id: Id::new("geo")?,
+            modifier_type: "nodes".to_owned(),
+            name: "Geo".to_owned(),
+            enabled: true,
+            show_viewport: true,
+            show_render: true,
+            params: Map::from_iter([
+                ("node_group".to_owned(), json!("group_geo")),
+                ("bakes".to_owned(), bakes),
+            ]),
+            baked_ocean_cache: None,
+            binding_data: None,
+            runtime: crate::model::ModifierRuntime::default(),
+        });
+        doc.nodes.insert(Id::new("cube")?, cube);
+        Ok(doc)
+    }
+
+    #[test]
+    fn export_losses_report_nodes_bake_payloads_and_unmapped_entries() -> Result<()> {
+        let doc = nodes_bake_modifier(json!({
+            "bake_main": {"bake_mode": "STILL", "bake_target": "DISK", "directory": "//bakes"},
+            "bake_disk": {"storage": "disk"},
+            "transform": {"bake_mode": "STILL"},
+            "ghost": {"frame_start": 1}
+        }))?;
+        let losses = export_losses(&doc);
+        let bake_losses = losses
+            .iter()
+            .filter(|loss| loss.feature_id.starts_with("blender.modifier.nodes_bake"))
+            .map(|loss| (loss.feature_id.as_str(), loss.data_id.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bake_losses,
+            [
+                ("blender.modifier.nodes_bake_payload", Some("geo")),
+                ("blender.modifier.nodes_bake_unmapped", Some("geo")),
+                ("blender.modifier.nodes_bake_unmapped", Some("geo")),
+            ]
+        );
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.modifier.nodes_bake_payload"
+                && loss.reason.contains("disk payload of bake node bake_disk")
+        }));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.modifier.nodes_bake_unmapped"
+                && loss.reason.contains("bake entry transform ")
+        }));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.modifier.nodes_bake_unmapped"
+                && loss.reason.contains("bake entry ghost ")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn import_losses_report_nodes_bake_packed_data_blocks_and_unmapped_bakes() {
+        let raw = json!({"objects": [{
+            "name": "Cube",
+            "type": "MESH",
+            "modifiers": [{
+                "name": "Geo",
+                "type": "NODES",
+                "properties": {"node_group": "Geometry", "bakes": {
+                    "bake_main": {"bake_mode": "STILL"},
+                    "bake_disk": {"bake_target": "DISK"},
+                    "bake_empty_packed": {"bake_target": "PACKED"},
+                    "bake 42": {"bake_target": "DISK"}
+                }},
+                "bake_losses": {
+                    "packed_payloads": ["bake_main", "bake_disk", "bake 42"],
+                    "packed_unmapped_ids": [42],
+                    "data_blocks": ["bake_main"],
+                    "unmapped": ["Bake.001"]
+                }
+            }, {
+                "name": "Plain",
+                "type": "NODES",
+                "properties": {}
+            }]
+        }]});
+        let bake_losses = import_losses(&raw)
+            .into_iter()
+            .filter(|loss| loss.feature_id.starts_with("blender.modifier.nodes_bake"))
+            .map(|loss| (loss.feature_id, loss.data_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bake_losses,
+            [
+                (
+                    "blender.modifier.nodes_bake_packed".to_owned(),
+                    Some("Geo".to_owned())
+                ),
+                (
+                    "blender.modifier.nodes_bake_packed".to_owned(),
+                    Some("Geo".to_owned())
+                ),
+                (
+                    "blender.modifier.nodes_bake_packed".to_owned(),
+                    Some("Geo".to_owned())
+                ),
+                (
+                    "blender.modifier.nodes_bake_packed".to_owned(),
+                    Some("Geo".to_owned())
+                ),
+                (
+                    "blender.modifier.nodes_bake_data_blocks".to_owned(),
+                    Some("Geo".to_owned())
+                ),
+                (
+                    "blender.modifier.nodes_bake_unmapped".to_owned(),
+                    Some("Geo".to_owned())
+                ),
+            ]
+        );
     }
 
     #[test]
