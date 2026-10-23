@@ -20,7 +20,7 @@
     "eevee_vse_light_shape_crossfade.py": "6cd0d56b9efe333f0a23631a537ccb1cdc987612e1eac9a7ed0f904c7519cf20",
     "eevee_vse_light_shape_scene_strip.py": "01cbe0f49a10ac9d1627c32e7c3db678c26b219e9d5178305fbedb419724a069",
     "eevee_world_background.py": "3dfbc770812ece43429906a7d0425c9e32ef12d101701af8ab56b04f3591e29b",
-    "gamma_cross_native.py": "1c488c3588df2a157436e2486f0ced7c1d0bd36490dada47c0c631ea28a8ae2e",
+    "gamma_cross_native.py": "3b4ac7b61b5c5fb91d5f8edcaebe998753d504caf8889f1dc5749396d4f2e51f",
     "export_eevee_fixture.py": "214d2ab63f343f7e59af8eaa7752217f7b26b574696e9c21b0518279ddd55606",
     "compositor_camera_light_alpha.py": "74d4a6984b1e0150ece8453e779e01b86142e59d5a5423fbba3ba7f02c746076"
   },
@@ -64,7 +64,7 @@
     "vse_light_shape_crossfade.exr": 67283,
     "vse_light_shape_scene_strip_alpha_over.exr": 67285,
     "vse_light_shape_scene_strip_replace.exr": 67283,
-    "gamma_cross_native.blend": 86114,
+    "gamma_cross_native.blend": 86056,
     "gamma_cross_native.exr": 67292,
     "compositor_alpha_over_camera_light.exr": 67351,
     "compositor_alpha_over_scene.blend": 87655,
@@ -81,7 +81,7 @@
     "spot.f32le": 49152,
     "spot_ortho_offcenter.f32le": 49152,
     "spot_perspective_ray.f32le": 49152,
-    "spot_scaled_offaxis.f32le": 49152,
+    "spot_scaled_offaxis.f32le": 49152
   },
   "mirrors": {
     "eevee_glass_transmission_deviation.py": "transmission bound (clear 0.00134, tinted 0.00113, rough 0.00169)",

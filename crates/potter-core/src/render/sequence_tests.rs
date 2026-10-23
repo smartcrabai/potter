@@ -477,6 +477,7 @@ fn side_by_side_realtime_volume_odd_seam_matches_each_eye() -> Result<(), Box<dy
 #[test]
 fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
+    // GammaCross is covered by the saved Blender consumer in tests/native_vse_gamma_cross.rs.
     for (transition, expected) in [(TransitionType::Cross, [0.5, 0.0, 0.5, 1.0])] {
         let mut transition_strip = strip("transition", StripType::Transition, 3);
         transition_strip.length = 2.0;
@@ -504,6 +505,7 @@ fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<
     assert_pixel(wipe.pixels[0], [0.0, 0.0, 1.0, 1.0]);
     assert_pixel(wipe.pixels[1], [1.0, 0.0, 0.0, 1.0]);
 
+    // Glow is non-identity and has separate focused coverage.
     let effects = [
         (EffectType::Add, [0.3, 0.6, 0.9, 1.0], true),
         (EffectType::Subtract, [0.1, 0.2, 0.3, 1.0], true),
@@ -511,7 +513,6 @@ fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<
         (EffectType::AlphaOver, [0.1, 0.2, 0.3, 1.0], true),
         (EffectType::Transform, [0.2, 0.4, 0.6, 1.0], false),
         (EffectType::Speed, [0.2, 0.4, 0.6, 1.0], false),
-        (EffectType::Glow, [0.2, 0.4, 0.6, 1.0], false),
         (EffectType::GaussianBlur, [0.2, 0.4, 0.6, 1.0], false),
     ];
     for (effect, expected, two_inputs) in effects {

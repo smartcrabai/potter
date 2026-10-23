@@ -49,6 +49,11 @@ strips.new_effect(
     input2=white,
 )
 
+# The previous capture was frame 1 because this producer never selected `frame`.
+# Replacing it corrects producer provenance; it is not a numerical reference adjustment.
+scene.frame_set(frame)
+if scene.frame_current != frame:
+    raise RuntimeError(f"expected frame {frame}, selected {scene.frame_current}")
 bpy.ops.wm.save_as_mainfile(filepath=blend_out)
 print("SAVED", blend_out)
 bpy.ops.render.render(write_still=False, scene=scene.name)

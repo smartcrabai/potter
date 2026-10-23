@@ -5230,22 +5230,30 @@ mod overlay_tests {
         assert_eq!(radiance.y, 0.0);
         assert_eq!(radiance.z, 0.0);
 
+        // In a 1×1 image the optical center lies at the pixel corner, outside the minimum 0.5-pixel stroke radius.
+        // A 2×2 frame puts it at pixel (0, 0)'s center, giving that pixel full stroke coverage.
         let mut output = RasterOutput {
-            rgba: vec![0; 4],
-            linear_rgba: vec![[radiance.x as f32, radiance.y as f32, radiance.z as f32, 0.0]],
+            rgba: vec![0; 16],
+            linear_rgba: vec![[radiance.x as f32, radiance.y as f32, radiance.z as f32, 0.0]; 4],
             linear_rgba_associated: true,
-            ids: vec![0],
-            depths: vec![0.0],
-            elements: vec![0],
-            normals: vec![[0.0; 3]],
-            albedo: vec![[0.0; 4]],
-            emission: vec![[0.0; 4]],
-            ambient_occlusion: vec![1.0],
+            ids: vec![0; 4],
+            depths: vec![0.0; 4],
+            elements: vec![0; 4],
+            normals: vec![[0.0; 3]; 4],
+            albedo: vec![[0.0; 4]; 4],
+            emission: vec![[0.0; 4]; 4],
+            ambient_occlusion: vec![1.0; 4],
         };
-        overlay_rasterized_lines(&geometry, &camera, 1, 1, 0, true, &mut output)?;
+        overlay_rasterized_lines(&geometry, &camera, 2, 2, 0, true, &mut output)?;
 
         let pixel = output.linear_rgba[0];
-        assert!((f64::from(pixel[0]) - radiance.x * 0.5).abs() < 1.0e-6);
+        let expected_red = radiance.x * 0.5;
+        let actual_red = f64::from(pixel[0]);
+        assert!(
+            (actual_red - expected_red).abs() < 1.0e-6,
+            "full-coverage 0.5-alpha stroke should halve associated red radiance: actual={actual_red}, expected={expected_red}, difference={}",
+            (actual_red - expected_red).abs()
+        );
         assert_eq!(pixel[1], 0.0);
         assert_eq!(pixel[2], 0.0);
         assert_eq!(pixel[3], 0.5);
