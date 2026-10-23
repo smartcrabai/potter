@@ -3794,7 +3794,6 @@ mod visibility_tests {
         hit_opacity, intersect_triangle, nearest_visible_hit, prepare_triangles,
         ray_for_pixel_in_frame,
     };
-    use crate::error::Result;
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
     use crate::render::bvh::Bvh;
@@ -3906,7 +3905,7 @@ mod visibility_tests {
         ray: Ray,
         frame: &CameraFrame,
         background: [f64; 4],
-    ) -> Result<[f64; 4]> {
+    ) -> super::Result<[f64; 4]> {
         let mut layers: Vec<(usize, Hit)> = Vec::new();
         for (index, triangle) in triangles.iter().enumerate() {
             let Some(hit) = intersect_triangle(triangle, ray, frame) else {

@@ -247,6 +247,25 @@ fn realtime_volumetric_shadow_setting_changes_render() -> TestResult {
         .zip(&potter_shadowed)
         .map(|(unshadowed, shadowed)| unshadowed - shadowed)
         .collect();
+    let center = (SIZE as usize / 2) * SIZE as usize + SIZE as usize / 2;
+    let native_base_center = eevee_unshadowed[center];
+    let potter_base_center = potter_unshadowed[center];
+    assert!(
+        native_base_center > 0.0 && potter_base_center > 0.0,
+        "the center volume sample is not lit"
+    );
+    // The light-to-center path stays within the 2 m cube, plus a 1 mm allowance for film jitter.
+    let minimum_shadow_transmittance = (-0.5_f64 * 2.001).exp();
+    let native_shadow_ratio = eevee_shadowed[center] / native_base_center;
+    let potter_shadow_ratio = potter_shadowed[center] / potter_base_center;
+    assert!(
+        (minimum_shadow_transmittance..=1.0).contains(&native_shadow_ratio),
+        "EEVEE's center shadow ratio exceeds the homogeneous optical-depth bound: {native_shadow_ratio}"
+    );
+    assert!(
+        (minimum_shadow_transmittance..=1.0).contains(&potter_shadow_ratio),
+        "Potter's center shadow ratio exceeds the homogeneous optical-depth bound: {potter_shadow_ratio}"
+    );
     let native_shadow_effect = native_delta
         .iter()
         .fold(0.0_f64, |maximum, value| maximum.max(*value));
