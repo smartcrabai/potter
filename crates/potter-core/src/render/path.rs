@@ -3254,6 +3254,11 @@ fn write_center_passes(
     output: &mut RasterOutput,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<()> {
+    let has_volume_only = geometry
+        .prepared
+        .iter()
+        .any(PreparedMaterial::is_volume_only);
+
     // The camera's frame is built once for the pass, as the render builds each eye's frame once.
     let frame = camera_frame(camera, width, height)?;
     for y in 0..height {
@@ -3339,6 +3344,7 @@ fn write_center_passes(
                 surface.geometric_normal,
                 surface.normal,
                 1.0,
+                has_volume_only,
             ));
             output.albedo[index] = surface.closures.albedo.map(finite_f32);
             // The emission pass is the beauty's emission term: the coat attenuates it per channel.
