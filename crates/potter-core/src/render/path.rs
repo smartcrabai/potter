@@ -2428,14 +2428,14 @@ impl RealtimeVolumeSample<'_, '_> {
             self.mesh_prepared = false;
             self.prepare_froxel_mesh_boundaries()?;
 
-            self.scratch.froxel_boundary_bins.clear();
+            self.scratch.froxel_boundaries.clear();
             if self.transport.has_mesh_volumes {
                 for (distance, medium) in &self.scratch.boundaries {
                     let point = origin + direction * *distance;
                     let view_z = -self.camera.depth_of(point) as f32;
                     let volume_z = depth_mapping.view_z_to_volume_z(view_z);
                     let boundary = occupancy_boundary_index(volume_z, jitter_z, slice_count);
-                    self.scratch.froxel_boundary_bins.push((boundary, *medium));
+                    self.scratch.froxel_boundaries.push((boundary, *medium));
                 }
                 self.scratch.media.clone_from(&self.scratch.initial_media);
             } else {
@@ -2444,10 +2444,10 @@ impl RealtimeVolumeSample<'_, '_> {
 
             let mut boundary_index = 0;
             for slice in 0..slice_count {
-                while boundary_index < self.scratch.froxel_boundary_bins.len()
-                    && self.scratch.froxel_boundary_bins[boundary_index].0 <= slice
+                while boundary_index < self.scratch.froxel_boundaries.len()
+                    && self.scratch.froxel_boundaries[boundary_index].0 <= slice
                 {
-                    let medium = self.scratch.froxel_boundary_bins[boundary_index].1;
+                    let medium = self.scratch.froxel_boundaries[boundary_index].1;
                     toggle_mesh_medium(&mut self.scratch.media, &medium);
                     boundary_index += 1;
                 }
@@ -6263,6 +6263,8 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
                 .and_then(|data_id| doc.data_blocks.get(data_id))?
                 .light
                 .as_ref()?;
+            let evaluated = snapshot.nodes.get(node_id)?;
+            let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
             let color = DVec3::from_array(data.color).max(DVec3::ZERO);
             let energy = data.energy.max(0.0);
             let area = (data.light_type == LightType::Area).then(|| area_shape(data, &matrix));
@@ -6509,6 +6511,8 @@ fn collect_volumes<'a>(
             Some(_) => ([0.0; 3], [1.0; 3]),
             None => ([0.5; 3], [0.5; 3]),
         };
+        let extinction: [f64; 3] = std::array::from_fn(|index| scatter[index] + absorption[index]);
+        let extinction_scale = extinction.iter().sum::<f64>() / 3.0;
         // Voxel transport is scalar: extinction is the channel mean of σt per unit grid density, and
         // the albedo is the per-channel σs / σt. That is exact for grey media only.
         let extinction_rgb_scale = DVec3::from_array(extinction);
@@ -7708,6 +7712,7 @@ mod volume_extinction_tests {
             scattering: false,
             extinction_scale: 1.0,
             extinction_rgb_scale: DVec3::ONE,
+            sampling: crate::model::VolumeSampling::default(),
             interpolation: crate::model::VolumeInterpolation::Linear,
             index_from_local: None,
             ray_mask,
