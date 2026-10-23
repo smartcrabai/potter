@@ -94,7 +94,7 @@ fn render_scene_strip(
     Ok(fs::read(output_dir.join(format!("frame_{frame:04}.exr")))?)
 }
 
-fn assert_replace_inputs(label: &str, pixels: &[[f64; 4]]) {
+fn assert_replace_inputs(label: &str, pixels: &[[f64; 4]]) -> TestResult {
     let alpha_zero_shape = pixels
         .iter()
         .filter(|pixel| pixel[3].abs() <= ALPHA_TOLERANCE)
@@ -103,7 +103,7 @@ fn assert_replace_inputs(label: &str, pixels: &[[f64; 4]]) {
             let energy_b = b[0].max(b[1]).max(b[2]);
             energy_a.total_cmp(&energy_b)
         })
-        .expect("Replace output contains an alpha-zero pixel");
+        .ok_or_else(|| format!("{label} contains no alpha-zero pixel"))?;
     assert!(
         alpha_zero_shape[0]
             .max(alpha_zero_shape[1])
@@ -121,6 +121,7 @@ fn assert_replace_inputs(label: &str, pixels: &[[f64; 4]]) {
         }),
         "{label} has no half-alpha base-only control pixel"
     );
+    Ok(())
 }
 
 fn assert_matches_native(label: &str, actual: &[[f64; 4]], expected: &[[f64; 4]]) {
@@ -176,10 +177,10 @@ fn scene_strip_light_shape_matches_blender_vse_replace_alpha_over_and_crossfade_
 
     let blender_replace = decode_exr(BLENDER_REPLACE_EXR, "Blender Replace oracle")?;
     let blender_alpha_over = decode_exr(BLENDER_ALPHA_OVER_EXR, "Blender AlphaOver oracle")?;
-    assert_replace_inputs("Blender Replace oracle", &blender_replace);
+    assert_replace_inputs("Blender Replace oracle", &blender_replace)?;
     let potter_replace_bytes = render_scene_strip(&project, &replace_id, 1, root, "replace")?;
     let potter_replace = decode_exr(&potter_replace_bytes, "Potter Replace output")?;
-    assert_replace_inputs("Potter Replace output", &potter_replace);
+    assert_replace_inputs("Potter Replace output", &potter_replace)?;
     assert_matches_native("Scene-strip Replace", &potter_replace, &blender_replace);
 
     let potter_alpha_over_bytes =
