@@ -9,7 +9,7 @@ use potter_core::{
     model::SceneDoc,
     ops::apply_batch,
     render::render_sequence,
-    sequencer::{AudioTrack, Strip, StripType, TransitionType, mix_audio},
+    sequencer::{AudioTrack, SequencerColorSpace, Strip, StripType, TransitionType, mix_audio},
 };
 use serde_json::{Value, json};
 
@@ -324,28 +324,34 @@ fn sequencer_render_writes_crossfade_frame_and_frame_aligned_audio() {
     };
     fs::write(&source_audio_path, encode_wav(&source_audio).unwrap()).unwrap();
 
+    let red_path = directory.path().join("red.exr");
+    exr::prelude::write_rgba_file(&red_path, 1, 1, |_, _| (1.0, 0.0, 0.0, 1.0)).unwrap();
+    let blue_path = directory.path().join("blue.exr");
+    exr::prelude::write_rgba_file(&blue_path, 1, 1, |_, _| (0.0, 0.0, 1.0, 1.0)).unwrap();
+
     let mut document = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
     let scene = document.scenes.get_mut(&document.active_scene).unwrap();
     scene.fps = 24;
     scene.fps_base = 1.0;
     scene.render.use_sequencer = true;
+    scene.sequencer.colorspace = SequencerColorSpace::Linear;
     scene.sequencer.strips = vec![
         Strip {
             id: "red".to_owned(),
-            kind: StripType::Color,
+            kind: StripType::Image,
             channel: 1,
             frame_start: 1.0,
             length: 2.0,
-            color: [1.0, 0.0, 0.0, 1.0],
+            source: Some(red_path.display().to_string()),
             ..Strip::default()
         },
         Strip {
             id: "blue".to_owned(),
-            kind: StripType::Color,
+            kind: StripType::Image,
             channel: 2,
             frame_start: 1.0,
             length: 2.0,
-            color: [0.0, 0.0, 1.0, 1.0],
+            source: Some(blue_path.display().to_string()),
             ..Strip::default()
         },
         Strip {

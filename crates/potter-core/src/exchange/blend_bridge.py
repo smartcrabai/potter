@@ -2848,10 +2848,22 @@ def _node_groups_dump():
             for group in groups]
 
 
+def _color_gamma_to_scene_linear(value):
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _scene_linear_to_color_gamma(value):
+    if value <= 0.0031308:
+        return 12.92 * value
+    return 1.055 * value ** (1.0 / 2.4) - 0.055
+
+
 def _sequencer_dump(scene):
     editor = getattr(scene, "sequence_editor", None)
     if editor is None:
-        return {"channels": 32, "strips": []}
+        return {"channels": 32, "colorspace": scene.sequencer_colorspace_settings.name, "strips": []}
     sequences = getattr(editor, "strips", None) or getattr(editor, "sequences", ())
     result = []
     for strip in sequences:
@@ -2892,6 +2904,8 @@ def _sequencer_dump(scene):
             color.append(1.0)
         elif len(color) != 4:
             color = [0.0, 0.0, 0.0, 1.0]
+        if source_type in ("color", "text"):
+            color[:3] = [_color_gamma_to_scene_linear(value) for value in color[:3]]
         retiming = []
         for key in getattr(strip, "retiming_keys", ()):
             retiming.append({"frame": float(getattr(key, "timeline_frame", 0.0)),
@@ -2906,6 +2920,8 @@ def _sequencer_dump(scene):
             "length": float(getattr(strip, "frame_final_duration", 1.0)),
             "blend_type": str(getattr(strip, "blend_type", "REPLACE")).lower(),
             "opacity": float(getattr(strip, "blend_alpha", 1.0)),
+            "color_multiply": float(getattr(strip, "color_multiply", 1.0)),
+            "multiply_alpha": bool(getattr(strip, "multiply_alpha", False)),
             "mute": bool(getattr(strip, "mute", False)),
             "retiming_keys": retiming,
             "modifiers": [],
@@ -2923,7 +2939,7 @@ def _sequencer_dump(scene):
     channels = getattr(editor, "channels", 32)
     if not isinstance(channels, int):
         channels = len(channels)
-    return {"channels": int(channels), "strips": result}
+    return {"channels": int(channels), "colorspace": scene.sequencer_colorspace_settings.name, "strips": result}
 
 
 def potter_audio_codec(value):
@@ -7209,7 +7225,16 @@ def _restore_rigid_body_world(scene, source):
     world.point_cache.frame_end = int(source.get("frame_end", scene.frame_end))
 
 def _restore_sequencer(scene, sequencer, scene_map, doc, target):
-    strips = sequencer.get("strips", []) if sequencer else []
+    sequencer = sequencer or {}
+    colorspaces = {
+        "srgb": "sRGB",
+        "linear": "Linear Rec.709",
+    }
+    colorspace = sequencer.get("colorspace", "srgb")
+    if colorspace not in colorspaces:
+        raise ValueError("unsupported sequencer colorspace: %s" % colorspace)
+    scene.sequencer_colorspace_settings.name = colorspaces[colorspace]
+    strips = sequencer.get("strips", [])
     if not strips:
         return
     editor = scene.sequence_editor_create()
@@ -7291,6 +7316,8 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                 strip.frame_offset_end = float(source.get("frame_offset_end", 0.0))
                 strip.blend_type = source.get("blend_type", "replace").upper()
                 strip.blend_alpha = float(source.get("opacity", 1.0))
+                strip.color_multiply = float(source.get("color_multiply", 1.0))
+                strip.multiply_alpha = bool(source.get("multiply_alpha", False))
                 strip.mute = bool(source.get("mute", False))
                 if hasattr(strip, "volume"):
                     strip.volume = float(source.get("sound_volume", 1.0))
@@ -7299,9 +7326,11 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                 if hasattr(strip, "pitch"):
                     strip.pitch = float(source.get("sound_pitch", 1.0))
                 if hasattr(strip, "color"):
-                    color = source.get("color", (0.0, 0.0, 0.0, 1.0))
+                    color = list(source.get("color", (0.0, 0.0, 0.0, 1.0)))
                     if kind == "color" and len(color) == 4:
                         color = color[:3]
+                    if kind in ("color", "text"):
+                        color[:3] = [_scene_linear_to_color_gamma(value) for value in color[:3]]
                     strip.color = color
                 if hasattr(strip, "text"):
                     strip.text = source.get("text") or ""

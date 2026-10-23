@@ -38,8 +38,9 @@ use crate::{
         VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
     },
     sequencer::{
-        EffectType as SequenceEffectType, RetimingKey, Strip as SequenceStrip, StripBlendType,
-        StripModifier, StripType as SequenceStripType, TransitionType as SequenceTransitionType,
+        EffectType as SequenceEffectType, RetimingKey, SequencerColorSpace, Strip as SequenceStrip,
+        StripBlendType, StripModifier, StripType as SequenceStripType,
+        TransitionType as SequenceTransitionType,
     },
     store::Project,
 };
@@ -5814,6 +5815,21 @@ fn parse_sequencer(
     let Some(raw) = scene.get("sequencer").filter(|value| !value.is_null()) else {
         return Ok(crate::sequencer::Sequencer::default());
     };
+    let colorspace_name = match raw.get("colorspace") {
+        None | Some(Value::Null) => "sRGB",
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| invalid_intermediate("sequencer colorspace must be a string"))?,
+    };
+    let colorspace = match colorspace_name {
+        "sRGB" => SequencerColorSpace::Srgb,
+        "Linear Rec.709" => SequencerColorSpace::Linear,
+        _ => {
+            return Err(invalid_intermediate(&format!(
+                "unsupported sequencer colorspace `{colorspace_name}`"
+            )));
+        }
+    };
     let raw_strips = optional_array(raw, "strips")?;
     let mut strip_ids = BTreeMap::new();
     let mut strip_names = BTreeMap::new();
@@ -5949,6 +5965,11 @@ fn parse_sequencer(
                 length: number_field(strip, "length", 1.0),
                 blend_type,
                 opacity: number_field(strip, "opacity", 1.0),
+                color_multiply: number_field(strip, "color_multiply", 1.0),
+                multiply_alpha: strip
+                    .get("multiply_alpha")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 mute: strip.get("mute").and_then(Value::as_bool).unwrap_or(false),
                 retiming_keys,
                 modifiers,
@@ -5967,6 +5988,7 @@ fn parse_sequencer(
     Ok(crate::sequencer::Sequencer {
         channels: u32::try_from(integer_field(raw, "channels", 32))
             .map_err(|_| invalid_intermediate("sequencer channel count is out of range"))?,
+        colorspace,
         strips,
     })
 }

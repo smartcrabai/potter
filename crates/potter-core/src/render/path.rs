@@ -51,8 +51,9 @@ use super::{
     },
     pixel_filter::PixelFilter,
     raster::{
-        Camera, CameraFrame, CameraFrustum, Mode, RasterOutput, StereoMode, Triangle,
-        blend_corner_normals, camera_eye, camera_frame, camera_frustum, rasterize_with_lines,
+        Camera, CameraFrame, CameraFrustum, CameraLightProjectedQuad, CameraLightRasterQuad, Mode,
+        RasterOutput, StereoMode, Triangle, blend_corner_normals, camera_eye, camera_frame,
+        camera_frustum, camera_light_display_quad, project_camera_light_quad, rasterize_with_lines,
         ray_for_sample_in_frame, smooth_shadow_origin,
     },
     scene::{
@@ -1554,14 +1555,148 @@ struct CameraLightPrepared {
 pub(super) struct RealtimeCameraLightContext<'a> {
     lights: RealtimeCameraLights<'a>,
     cameras: [Camera; 2],
+    frames: [CameraFrame; 2],
+    view_widths: [u32; 2],
+    height: u32,
     culling: Vec<CameraLightCull>,
     suns: Vec<SunDisc>,
 }
 
-#[derive(Clone, Copy)]
 struct CameraLightCull {
     area_display: Option<AreaShape>,
     visible: [bool; 2],
+    point_display: [Option<NativeCameraLightDisplay>; 2],
+}
+
+struct NativeCameraLightDisplay {
+    center: DVec3,
+    plane_normal: DVec3,
+    positions: [DVec3; 4],
+    quad: Option<CameraLightProjectedQuad>,
+}
+
+pub(super) struct CameraLightRasterSamples {
+    rasters: Vec<Option<CameraLightRasterQuad>>,
+    projected: Option<Vec<Option<CameraLightProjectedQuad>>>,
+    sample_count: usize,
+    first_eye: usize,
+    eye_count: usize,
+    light_count: usize,
+}
+
+impl CameraLightRasterSamples {
+    fn shape_for(
+        &self,
+        sample_index: usize,
+        eye: usize,
+        light_index: usize,
+    ) -> Option<(&CameraLightRasterQuad, Option<&CameraLightProjectedQuad>)> {
+        if sample_index >= self.sample_count
+            || eye < self.first_eye
+            || eye >= self.first_eye + self.eye_count
+            || light_index >= self.light_count
+        {
+            return None;
+        }
+        let eye_index = eye - self.first_eye;
+        let index = (sample_index * self.eye_count + eye_index) * self.light_count + light_index;
+        let raster = self.rasters.get(index)?.as_ref()?;
+        let projected = self
+            .projected
+            .as_ref()
+            .and_then(|projected| projected.get(index))
+            .and_then(Option::as_ref);
+        Some((raster, projected))
+    }
+}
+
+pub(super) struct RealtimeCameraLightSample<'context, 'lights, 'samples> {
+    view: RealtimeCameraLightView<'context, 'lights>,
+    raster_samples: Option<&'samples CameraLightRasterSamples>,
+    sample_index: usize,
+    jitter_x: f64,
+    jitter_y: f64,
+    pixel_x: u32,
+    pixel_y: u32,
+}
+impl RealtimeCameraLightContext<'_> {
+    fn local_events(
+        &self,
+        eye: usize,
+        origin: DVec3,
+        direction: DVec3,
+        far_distance: f64,
+        raster_samples: Option<&CameraLightRasterSamples>,
+        sample_index: usize,
+        jitter_x: f64,
+        jitter_y: f64,
+        pixel_x: u32,
+        pixel_y: u32,
+    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
+        self.lights()
+            .iter()
+            .zip(&self.culling)
+            .enumerate()
+            .filter_map(move |(light_index, (light, culling))| {
+                if !culling.visible[eye] {
+                    return None;
+                }
+                if let Some(area_display) = culling.area_display {
+                    return camera_light_shape_hit_projected(
+                        light,
+                        Some(area_display),
+                        None,
+                        None,
+                        None,
+                        origin,
+                        direction,
+                        far_distance,
+                        (pixel_x, pixel_y),
+                    );
+                }
+                let display = culling.point_display[eye].as_ref()?;
+                if let Some(samples) = raster_samples {
+                    let (raster, projected) = samples.shape_for(sample_index, eye, light_index)?;
+                    let quad = projected.or(display.quad.as_ref())?;
+                    return camera_light_shape_hit_projected(
+                        light,
+                        None,
+                        Some(display),
+                        Some(quad),
+                        Some(raster),
+                        origin,
+                        direction,
+                        far_distance,
+                        (pixel_x, pixel_y),
+                    );
+                }
+
+                let projected = match self.frames[eye].lens_sample(jitter_x, jitter_y) {
+                    Some(lens_sample) if !lens_sample.is_zero() => Some(project_camera_light_quad(
+                        self.cameras[eye].position,
+                        &self.frames[eye],
+                        self.view_widths[eye],
+                        self.height,
+                        &display.positions,
+                        Some(lens_sample),
+                    )?),
+                    _ => None,
+                };
+                let quad = projected.as_ref().or(display.quad.as_ref())?;
+                let raster = quad.rasterize(jitter_x, jitter_y);
+                camera_light_shape_hit_projected(
+                    light,
+                    None,
+                    Some(display),
+                    Some(quad),
+                    Some(&raster),
+                    origin,
+                    direction,
+                    far_distance,
+                    (pixel_x, pixel_y),
+                )
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1591,30 +1726,6 @@ impl<'lights> RealtimeCameraLightContext<'lights> {
         }
     }
 
-    fn local_events(
-        &self,
-        eye: usize,
-        origin: DVec3,
-        direction: DVec3,
-        far_distance: f64,
-    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
-        self.lights()
-            .iter()
-            .zip(&self.culling)
-            .filter_map(move |(light, culling)| {
-                culling.visible[eye].then(|| {
-                    camera_light_shape_hit_with_area(
-                        light,
-                        culling.area_display,
-                        &self.cameras[eye],
-                        origin,
-                        direction,
-                        far_distance,
-                    )
-                })?
-            })
-    }
-
     pub(super) fn sun_radiance(&self, direction: DVec3) -> DVec3 {
         self.suns
             .iter()
@@ -1631,18 +1742,135 @@ impl RealtimeCameraLightView<'_, '_> {
         }
     }
 
+    pub(super) fn prepare_raster_samples(
+        &self,
+        sample_offsets: impl ExactSizeIterator<Item = (f64, f64)>,
+        both_eyes: bool,
+    ) -> Result<CameraLightRasterSamples> {
+        let first_eye = if both_eyes { 0 } else { self.eye };
+        let eye_count = if both_eyes { 2 } else { 1 };
+        let sample_count = sample_offsets.len();
+        let light_count = self.context.culling.len();
+        let shape_count = sample_count
+            .checked_mul(eye_count)
+            .and_then(|count| count.checked_mul(light_count))
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "camera light sample cache exceeds platform limits",
+                )
+            })?;
+        let mut rasters = Vec::new();
+        rasters.try_reserve_exact(shape_count).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "cannot allocate camera light sample cache",
+            )
+        })?;
+        rasters.resize_with(shape_count, || None);
+        let has_aperture = (first_eye..first_eye + eye_count)
+            .any(|eye| self.context.frames[eye].lens_sample(0.5, 0.5).is_some());
+        let mut projected = if has_aperture {
+            let mut projected = Vec::new();
+            projected.try_reserve_exact(shape_count).map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "cannot allocate camera light sample cache",
+                )
+            })?;
+            projected.resize_with(shape_count, || None);
+            Some(projected)
+        } else {
+            None
+        };
+        for (sample_index, (jitter_x, jitter_y)) in sample_offsets.enumerate() {
+            for eye_offset in 0..eye_count {
+                let eye = first_eye + eye_offset;
+                let frame = &self.context.frames[eye];
+                let lens_sample = frame.lens_sample(jitter_x, jitter_y);
+                for (light_index, culling) in self.context.culling.iter().enumerate() {
+                    let Some(display) = culling.point_display[eye].as_ref() else {
+                        continue;
+                    };
+                    let index = (sample_index * eye_count + eye_offset) * light_count + light_index;
+                    if let Some(lens_sample) = lens_sample.filter(|sample| !sample.is_zero()) {
+                        let Some(quad) = project_camera_light_quad(
+                            self.context.cameras[eye].position,
+                            frame,
+                            self.context.view_widths[eye],
+                            self.context.height,
+                            &display.positions,
+                            Some(lens_sample),
+                        ) else {
+                            continue;
+                        };
+                        rasters[index] = Some(quad.rasterize(jitter_x, jitter_y));
+                        if let Some(projected) = &mut projected {
+                            projected[index] = Some(quad);
+                        }
+                    } else {
+                        let Some(quad) = display.quad.as_ref() else {
+                            continue;
+                        };
+                        rasters[index] = Some(quad.rasterize(jitter_x, jitter_y));
+                    }
+                }
+            }
+        }
+        Ok(CameraLightRasterSamples {
+            rasters,
+            projected,
+            sample_count,
+            first_eye,
+            eye_count,
+            light_count,
+        })
+    }
+
+    pub(super) fn at_pixel<'samples>(
+        self,
+        raster_samples: Option<&'samples CameraLightRasterSamples>,
+        sample_index: usize,
+        jitter_x: f64,
+        jitter_y: f64,
+        pixel_x: u32,
+        pixel_y: u32,
+    ) -> RealtimeCameraLightSample<'_, '_, 'samples> {
+        RealtimeCameraLightSample {
+            view: self,
+            raster_samples,
+            sample_index,
+            jitter_x,
+            jitter_y,
+            pixel_x,
+            pixel_y,
+        }
+    }
+}
+
+impl RealtimeCameraLightSample<'_, '_, '_> {
     pub(super) fn local_events(
         &self,
         origin: DVec3,
         direction: DVec3,
         far_distance: f64,
     ) -> impl Iterator<Item = CameraLightEvent> + '_ {
-        self.context
-            .local_events(self.eye, origin, direction, far_distance)
+        self.view.context.local_events(
+            self.view.eye,
+            origin,
+            direction,
+            far_distance,
+            self.raster_samples,
+            self.sample_index,
+            self.jitter_x,
+            self.jitter_y,
+            self.pixel_x,
+            self.pixel_y,
+        )
     }
 
     pub(super) fn sun_radiance(&self, direction: DVec3) -> DVec3 {
-        self.context.sun_radiance(direction)
+        self.view.context.sun_radiance(direction)
     }
 }
 
@@ -1672,13 +1900,26 @@ pub(super) fn prepare_realtime_camera_light_context<'a>(
         RealtimeCameraLightInput::Owned(_, prepared) => prepared,
     };
     let cameras = camera_light_cameras(camera);
+    let view_widths = if camera.stereo_mode == StereoMode::SideBySide {
+        [width / 2, width - width / 2]
+    } else {
+        [width, width]
+    };
+    let frame_width = if camera.stereo_mode == StereoMode::SideBySide {
+        width / 2
+    } else {
+        width
+    };
+    let frames = [
+        camera_frame(&cameras[0], frame_width, height)?,
+        camera_frame(&cameras[1], frame_width, height)?,
+    ];
     let frusta = camera_light_frusta(camera, &cameras, width, height)?;
     let culling = light_slice
         .iter()
         .zip(prepared.iter().copied())
-        .map(|(light, prepared)| CameraLightCull {
-            area_display: prepared.area_display,
-            visible: [
+        .map(|(light, prepared)| {
+            let visible = [
                 camera_light_visible_in_view(
                     light,
                     prepared.influence_radius_max,
@@ -1689,7 +1930,27 @@ pub(super) fn prepare_realtime_camera_light_context<'a>(
                     prepared.influence_radius_max,
                     frusta[1].as_ref(),
                 ),
-            ],
+            ];
+            let point_display = std::array::from_fn(|eye| {
+                (visible[eye]
+                    && prepared.area_display.is_none()
+                    && matches!(light.kind, LightType::Point | LightType::Spot))
+                .then(|| {
+                    native_camera_light_display(
+                        light,
+                        &cameras[eye],
+                        &frames[eye],
+                        view_widths[eye],
+                        height,
+                    )
+                })
+                .flatten()
+            });
+            CameraLightCull {
+                area_display: prepared.area_display,
+                visible,
+                point_display,
+            }
         })
         .collect();
     let lights = match light_input {
@@ -1699,6 +1960,9 @@ pub(super) fn prepare_realtime_camera_light_context<'a>(
     Ok(RealtimeCameraLightContext {
         lights,
         cameras,
+        frames,
+        view_widths,
+        height,
         culling,
         suns: camera_sun_discs(doc, snapshot),
     })
@@ -1872,6 +2136,7 @@ fn camera_light_shape_hit(
     camera_light_shape_hit_with_area(light, area_display, camera, origin, direction, limit)
 }
 
+#[cfg(test)]
 fn camera_light_display_area(shape: AreaShape) -> AreaShape {
     AreaShape::new(
         shape.axis_u,
@@ -1882,6 +2147,102 @@ fn camera_light_display_area(shape: AreaShape) -> AreaShape {
     )
 }
 
+fn native_camera_light_display(
+    light: &PointLight,
+    camera: &Camera,
+    frame: &CameraFrame,
+    width: u32,
+    height: u32,
+) -> Option<NativeCameraLightDisplay> {
+    let (center, plane_normal, positions, quad) = camera_light_display_quad(
+        camera.position,
+        frame,
+        light.position,
+        light.radius,
+        light.soft_falloff,
+        width,
+        height,
+    )?;
+    Some(NativeCameraLightDisplay {
+        center,
+        plane_normal,
+        positions,
+        quad,
+    })
+}
+
+fn camera_light_shape_hit_projected(
+    light: &PointLight,
+    area_display: Option<AreaShape>,
+    point_display: Option<&NativeCameraLightDisplay>,
+    projected_quad: Option<&CameraLightProjectedQuad>,
+    raster_quad: Option<&CameraLightRasterQuad>,
+    origin: DVec3,
+    direction: DVec3,
+    limit: f64,
+    pixel: (u32, u32),
+) -> Option<CameraLightEvent> {
+    if !light.camera_shape_eligible || light.ray_mask & RayKind::Camera.bit() == 0 {
+        return None;
+    }
+
+    if let Some(display_shape) = area_display {
+        let cos_light = -light.direction.dot(direction);
+        if display_shape.area <= 0.0 || cos_light <= 0.0 {
+            return None;
+        }
+        let (distance, point) = ray_plane_intersection(
+            origin,
+            direction,
+            light.position,
+            light.direction,
+            cos_light,
+            limit,
+        )?;
+        if !inside_emitter(&display_shape, light.position, point) {
+            return None;
+        }
+        return Some(CameraLightEvent {
+            distance,
+            radiance: light.color * area_radiance(light.energy, display_shape.area),
+        });
+    }
+
+    if !matches!(light.kind, LightType::Point | LightType::Spot) {
+        return None;
+    }
+    let display = point_display?;
+    let cos_light = -display.plane_normal.dot(direction);
+    let (distance, _) = ray_plane_intersection(
+        origin,
+        direction,
+        display.center,
+        display.plane_normal,
+        cos_light,
+        limit,
+    )?;
+    let projected_quad = projected_quad?;
+    let raster_quad = raster_quad?;
+    if !projected_quad.contains_pixel(raster_quad, pixel.0, pixel.1) {
+        return None;
+    }
+    let spot = if light.kind == LightType::Spot {
+        spot_cone(
+            &light.world_transform,
+            direction,
+            light.spot_size,
+            light.spot_blend,
+        )
+    } else {
+        1.0
+    };
+    Some(CameraLightEvent {
+        distance,
+        radiance: light.color * (emitter_radiance(light.energy, light.radius.max(0.001)) * spot),
+    })
+}
+
+#[cfg(test)]
 fn camera_light_shape_hit_with_area(
     light: &PointLight,
     area_display: Option<AreaShape>,
@@ -1963,6 +2324,7 @@ fn camera_light_shape_hit_with_area(
 }
 
 /// Apparent disk radius of a sphere at `distance`, from `eevee_light_lib.bsl.hh`.
+#[cfg(test)]
 fn light_sphere_disk_radius(radius: f64, distance: f64) -> f64 {
     let ratio = radius / distance;
     radius / (1.0 - ratio * ratio).max(1.0e-8).sqrt()

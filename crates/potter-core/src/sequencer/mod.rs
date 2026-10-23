@@ -3,12 +3,32 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ErrorCode, PotError, Result},
     media::AudioBuffer,
+    model::ImageColorspace,
 };
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SequencerColorSpace {
+    #[default]
+    Srgb,
+    Linear,
+}
+
+impl SequencerColorSpace {
+    pub(crate) const fn image_colorspace(self) -> ImageColorspace {
+        match self {
+            Self::Srgb => ImageColorspace::Srgb,
+            Self::Linear => ImageColorspace::Linear,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Sequencer {
     pub channels: u32,
+    /// Blender VSE working space used for strip effects and layer blending.
+    pub colorspace: SequencerColorSpace,
     pub strips: Vec<Strip>,
 }
 
@@ -16,6 +36,7 @@ impl Default for Sequencer {
     fn default() -> Self {
         Self {
             channels: 32,
+            colorspace: SequencerColorSpace::Srgb,
             strips: Vec::new(),
         }
     }
@@ -35,6 +56,10 @@ pub struct Strip {
     pub length: f64,
     pub blend_type: StripBlendType,
     pub opacity: f64,
+    /// Blender's Replace preprocessing color multiplier, before blend opacity.
+    pub color_multiply: f64,
+    /// Blender's SEQ_MULTIPLY_ALPHA flag for Replace strip preprocessing.
+    pub multiply_alpha: bool,
     pub mute: bool,
     pub retiming_keys: Vec<RetimingKey>,
     pub modifiers: Vec<StripModifier>,
@@ -42,6 +67,7 @@ pub struct Strip {
     pub sound_pan: f64,
     pub sound_pitch: f64,
     pub source: Option<String>,
+    /// Scene-linear RGBA; Blender's COLOR_GAMMA Color/Text properties are decoded on import.
     pub color: [f32; 4],
     pub text: Option<String>,
     pub transition: Option<TransitionType>,
@@ -62,6 +88,8 @@ impl Default for Strip {
             length: 1.0,
             blend_type: StripBlendType::Replace,
             opacity: 1.0,
+            color_multiply: 1.0,
+            multiply_alpha: false,
             mute: false,
             retiming_keys: Vec::new(),
             modifiers: Vec::new(),
@@ -92,6 +120,8 @@ impl Strip {
             || self.frame_offset_start + self.frame_offset_end >= self.length
             || !self.opacity.is_finite()
             || !(0.0..=1.0).contains(&self.opacity)
+            || !self.color_multiply.is_finite()
+            || !(0.0..=20.0).contains(&self.color_multiply)
             || !self.sound_volume.is_finite()
             || self.sound_volume < 0.0
             || !self.sound_pan.is_finite()

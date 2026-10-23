@@ -8,9 +8,9 @@ use tempfile::tempdir;
 use super::{frame_output_names, render_camera_frame, render_vse_frame};
 use crate::{
     eval::{EvaluationContext, EvaluationPurpose, EvaluationSession},
-    model::{Id, Scene, SceneDoc},
+    model::{Id, ImageColorspace, Scene, SceneDoc},
     ops::apply_batch,
-    sequencer::{EffectType, Strip, StripType, TransitionType},
+    sequencer::{EffectType, RgbaFrame, SequencerColorSpace, Strip, StripType, TransitionType},
 };
 
 fn camera_volume_doc(grid: &Value, render_samples: u32) -> Result<SceneDoc, Box<dyn Error>> {
@@ -110,8 +110,10 @@ fn strip(id: &str, kind: StripType, channel: u32) -> Strip {
 fn scene_with_strips(strips: Vec<Strip>) -> (SceneDoc, Scene) {
     let mut doc = SceneDoc::default();
     let scene_id = doc.active_scene.clone();
-    doc.scenes.get_mut(&scene_id).unwrap().sequencer.strips = strips;
-    let scene = doc.scenes.get(&scene_id).unwrap().clone();
+    let scene = doc.scenes.get_mut(&scene_id).unwrap();
+    scene.sequencer.colorspace = SequencerColorSpace::Linear;
+    scene.sequencer.strips = strips;
+    let scene = scene.clone();
     (doc, scene)
 }
 
@@ -150,10 +152,151 @@ fn color_strip(id: &str, channel: u32, color: [f32; 4]) -> Strip {
     }
 }
 
+fn float_image_strip(
+    root: &Path,
+    id: &str,
+    channel: u32,
+    color: [f32; 4],
+) -> Result<Strip, Box<dyn Error>> {
+    let source = format!("{id}.exr");
+    super::write_exr(&root.join(&source), &[color], 1, 1)?;
+    Ok(Strip {
+        source: Some(source),
+        ..strip(id, StripType::Image, channel)
+    })
+}
+
 fn assert_pixel(actual: [f32; 4], expected: [f32; 4]) {
     for (actual, expected) in actual.into_iter().zip(expected) {
         assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
     }
+}
+
+#[test]
+fn sequencer_srgb_roundtrip_and_byte_transitions_preserve_storage_semantics()
+-> Result<(), Box<dyn Error>> {
+    let input = RgbaFrame::new(
+        2,
+        1,
+        vec![[0.2, 0.1, 0.05, 0.5], [0.25, 0.125, 0.0625, 0.0]],
+    )?;
+    let working = super::scene_to_sequencer(input.clone(), ImageColorspace::Srgb)?;
+    let restored = super::sequencer_to_scene(working, ImageColorspace::Srgb)?;
+    for (actual, expected) in restored
+        .pixels
+        .iter()
+        .flatten()
+        .zip(input.pixels.iter().flatten())
+    {
+        assert!((actual - expected).abs() < 1.0e-6);
+    }
+
+    let black = super::SequencerFrame::from_straight_scene_linear(
+        RgbaFrame::new(1, 1, vec![[0.0, 0.0, 0.0, 1.0]])?,
+        ImageColorspace::Srgb,
+    )?;
+    let white = super::SequencerFrame::from_straight_scene_linear(
+        RgbaFrame::new(1, 1, vec![[1.0, 1.0, 1.0, 1.0]])?,
+        ImageColorspace::Srgb,
+    )?;
+    let (
+        super::SequencerFrame::Byte { pixels: black, .. },
+        super::SequencerFrame::Byte { pixels: white, .. },
+    ) = (black, white)
+    else {
+        unreachable!()
+    };
+    let output = super::byte_gamma_cross(1, 1, &black, &white, 0.5)?;
+    let output = output.into_scene_linear(SequencerColorSpace::Srgb)?;
+    for channel in 0..3 {
+        assert!((output.pixels[0][channel] - 0.0512698814).abs() < 1.0e-6);
+    }
+    assert_eq!(output.pixels[0][3], 1.0);
+
+    let cross = super::byte_crossfade(1, 1, &[[255, 0, 0, 0]], &[[0, 0, 0, 255]], 0.5)?;
+    let super::SequencerFrame::Byte { pixels, .. } = cross else {
+        unreachable!()
+    };
+    assert_eq!(pixels[0], [127, 0, 0, 127]);
+    Ok(())
+}
+
+#[test]
+fn color_gamma_strip_values_round_trip_through_byte_and_sequencer_spaces()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let color = [
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(0.1))?,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(0.2))?,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(0.3))?,
+        1.0,
+    ];
+    let (doc, mut scene) = scene_with_strips(vec![color_strip(
+        "gamma_color",
+        1,
+        [color[0], color[1], color[2], color[3]],
+    )]);
+    scene.sequencer.colorspace = SequencerColorSpace::Srgb;
+    let output = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
+    let expected = [
+        crate::color::srgb_to_linear(26.0 / 255.0),
+        crate::color::srgb_to_linear(51.0 / 255.0),
+        crate::color::srgb_to_linear(77.0 / 255.0),
+        1.0,
+    ];
+    for (actual, expected) in output.pixels[0].into_iter().zip(expected) {
+        assert!((f64::from(actual) - expected).abs() < 1.0e-6);
+    }
+    Ok(())
+}
+
+#[test]
+fn float_exr_image_replace_preserves_alpha_zero_radiance_and_fractional_base()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let source = directory.path().join("float_scene_strip.exr");
+    let expected = [[0.375, 0.25, 0.125, 0.0], [0.375, 0.3, 0.225, 0.5]];
+    super::write_exr(&source, &expected, 2, 1)?;
+    let (doc, mut scene) = scene_with_strips(vec![Strip {
+        source: Some(source.to_string_lossy().into_owned()),
+        ..strip("float_image", StripType::Image, 1)
+    }]);
+    scene.sequencer.colorspace = SequencerColorSpace::Srgb;
+    let output = render(&doc, &scene, directory.path(), 1.0, 2, 1)?;
+    for (actual, expected) in output
+        .pixels
+        .iter()
+        .flatten()
+        .zip(expected.into_iter().flatten())
+    {
+        assert!((actual - expected).abs() < 1.0e-6);
+    }
+    Ok(())
+}
+
+#[test]
+fn byte_replace_applies_opacity_and_multiply_alpha_independently() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let (doc, mut scene) = scene_with_strips(vec![color_strip("white", 1, [1.0, 1.0, 1.0, 1.0])]);
+    scene.sequencer.colorspace = SequencerColorSpace::Srgb;
+    scene.sequencer.strips[0].opacity = 0.5;
+    let output = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
+    let byte_color = super::finite_f64_to_f32(crate::color::srgb_to_linear(127.0 / 255.0))?;
+    assert_pixel(output.pixels[0], [byte_color, byte_color, byte_color, 1.0]);
+
+    scene.sequencer.strips[0].multiply_alpha = true;
+    let output = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
+    let alpha = f32::from(127_u8) / 255.0;
+    assert_pixel(
+        output.pixels[0],
+        [
+            byte_color * alpha,
+            byte_color * alpha,
+            byte_color * alpha,
+            alpha,
+        ],
+    );
+    Ok(())
 }
 
 fn write_red_png(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -182,9 +325,6 @@ fn frame_filenames_use_frame_values_and_disambiguate_repeats() {
 fn color_text_image_image_sequence_and_meta_strips_render_numeric_pixels()
 -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    let (doc, scene) = scene_with_strips(vec![color_strip("fill", 1, [0.25, 0.5, 0.75, 1.0])]);
-    let color = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
-    assert_pixel(color.pixels[0], [0.25, 0.5, 0.75, 1.0]);
 
     let (doc, scene) = scene_with_strips(vec![Strip {
         text: Some("A".to_owned()),
@@ -192,7 +332,14 @@ fn color_text_image_image_sequence_and_meta_strips_render_numeric_pixels()
         ..strip("title", StripType::Text, 1)
     }]);
     let text = render(&doc, &scene, directory.path(), 1.0, 5, 7)?;
-    assert_pixel(text.pixels[1], [0.6, 0.3, 0.15, 0.75]);
+    let byte_alpha = f32::from(191_u8) / 255.0;
+    let text_pixel = [
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(231.0 / 255.0))? * byte_alpha,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(170.0 / 255.0))? * byte_alpha,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(124.0 / 255.0))? * byte_alpha,
+        byte_alpha,
+    ];
+    assert_pixel(text.pixels[1], text_pixel);
     assert_pixel(text.pixels[0], [0.0, 0.0, 0.0, 0.0]);
 
     write_red_png(&directory.path().join("still.png"))?;
@@ -485,8 +632,8 @@ fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<
     transition_strip.transition = Some(TransitionType::Cross);
     transition_strip.inputs = vec!["red".to_owned(), "blue".to_owned()];
     let (doc, scene) = scene_with_strips(vec![
-        color_strip("red", 1, [1.0, 0.0, 0.0, 1.0]),
-        color_strip("blue", 2, [0.0, 0.0, 1.0, 1.0]),
+        float_image_strip(directory.path(), "red", 1, [1.0, 0.0, 0.0, 1.0])?,
+        float_image_strip(directory.path(), "blue", 2, [0.0, 0.0, 1.0, 1.0])?,
         transition_strip,
     ]);
     let output = render(&doc, &scene, directory.path(), 2.0, 1, 1)?;
@@ -523,9 +670,19 @@ fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<
         } else {
             vec!["first".to_owned()]
         };
-        let mut strips = vec![color_strip("first", 1, [0.2, 0.4, 0.6, 1.0])];
+        let mut strips = vec![float_image_strip(
+            directory.path(),
+            "first",
+            1,
+            [0.2, 0.4, 0.6, 1.0],
+        )?];
         if two_inputs {
-            strips.push(color_strip("second", 2, [0.1, 0.2, 0.3, 1.0]));
+            strips.push(float_image_strip(
+                directory.path(),
+                "second",
+                2,
+                [0.1, 0.2, 0.3, 1.0],
+            )?);
         }
         strips.push(effect_strip);
         let (doc, scene) = scene_with_strips(strips);

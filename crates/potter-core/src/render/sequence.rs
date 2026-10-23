@@ -11,12 +11,12 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{EvaluationContext, EvaluationPurpose, EvaluationSession, Snapshot},
     hash,
-    image::{ImageData, ImageInterpolation, sample, storage},
+    image::{ImageData, ImageInterpolation, Precision, sample, storage},
     media::{AudioBuffer, decode_wav, encode_flac, encode_wav},
-    model::{Id, Scene, SceneDoc},
+    model::{Id, ImageColorspace, Scene, SceneDoc},
     sequencer::{
-        AudioTrack, EffectType, RgbaFrame, Strip, StripType, apply_blend_effect, apply_effect,
-        apply_modifiers, blend_frames, mix_audio, transition,
+        AudioTrack, EffectType, RgbaFrame, SequencerColorSpace, Strip, StripBlendType, StripType,
+        apply_blend_effect, apply_effect, apply_modifiers, blend_frames, mix_audio, transition,
     },
 };
 
@@ -546,6 +546,700 @@ fn associate_straight_frame(mut frame: RgbaFrame) -> Result<RgbaFrame> {
     RgbaFrame::new(frame.width, frame.height, frame.pixels)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FramePrecision {
+    Byte(ImageColorspace),
+    Float,
+}
+
+impl FramePrecision {
+    fn from_image(precision: Precision, colorspace: ImageColorspace) -> Self {
+        match precision {
+            Precision::Byte => Self::Byte(colorspace),
+            Precision::Short | Precision::Half | Precision::Float => Self::Float,
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        if matches!((self, other), (Self::Byte(_), Self::Byte(_))) {
+            Self::Byte(ImageColorspace::Srgb)
+        } else {
+            Self::Float
+        }
+    }
+
+    const fn is_byte(self) -> bool {
+        matches!(self, Self::Byte(_))
+    }
+}
+
+enum SequencerFrame {
+    /// Straight RGBA8 in the byte buffer's native color space.
+    Byte {
+        width: u32,
+        height: u32,
+        colorspace: ImageColorspace,
+        pixels: Vec<[u8; 4]>,
+    },
+    /// Associated RGB in the scene's declared VSE working space.
+    Float(RgbaFrame),
+}
+
+impl SequencerFrame {
+    fn from_straight_scene_linear(frame: RgbaFrame, colorspace: ImageColorspace) -> Result<Self> {
+        let mut pixels = Vec::with_capacity(frame.pixels.len());
+        for mut pixel in frame.pixels {
+            for channel in &mut pixel[..3] {
+                *channel = scene_to_color_space(*channel, colorspace)?;
+            }
+            pixels.push(pixel.map(byte_channel));
+        }
+        Ok(Self::Byte {
+            width: frame.width,
+            height: frame.height,
+            colorspace,
+            pixels,
+        })
+    }
+
+    fn from_associated_float(frame: RgbaFrame, colorspace: ImageColorspace) -> Self {
+        let mut pixels = Vec::with_capacity(frame.pixels.len());
+        for pixel in frame.pixels {
+            let alpha = pixel[3];
+            let straight: [f32; 3] = std::array::from_fn(|channel| {
+                if alpha == 0.0 {
+                    0.0
+                } else {
+                    pixel[channel] / alpha
+                }
+            });
+            pixels.push([
+                byte_channel(straight[0]),
+                byte_channel(straight[1]),
+                byte_channel(straight[2]),
+                byte_channel(alpha),
+            ]);
+        }
+        Self::Byte {
+            width: frame.width,
+            height: frame.height,
+            colorspace,
+            pixels,
+        }
+    }
+
+    fn from_scene_linear(frame: RgbaFrame, colorspace: SequencerColorSpace) -> Result<Self> {
+        Ok(Self::Float(scene_to_sequencer(
+            frame,
+            colorspace.image_colorspace(),
+        )?))
+    }
+
+    fn precision(&self) -> FramePrecision {
+        match self {
+            Self::Byte { colorspace, .. } => FramePrecision::Byte(*colorspace),
+            Self::Float(_) => FramePrecision::Float,
+        }
+    }
+
+    fn into_working(self, working: SequencerColorSpace) -> Result<RgbaFrame> {
+        match self {
+            Self::Float(frame) => Ok(frame),
+            Self::Byte {
+                width,
+                height,
+                colorspace,
+                pixels,
+            } => {
+                let working_colorspace = working.image_colorspace();
+                let mut associated = Vec::with_capacity(pixels.len());
+                for pixel in pixels {
+                    let alpha = byte_float(pixel[3]);
+                    let mut output = [0.0; 4];
+                    output[3] = alpha;
+                    for channel in 0..3 {
+                        let scene = color_space_to_scene(byte_float(pixel[channel]), colorspace)?;
+                        output[channel] = scene_to_color_space(scene, working_colorspace)? * alpha;
+                    }
+                    associated.push(output);
+                }
+                RgbaFrame::new(width, height, associated)
+            }
+        }
+    }
+
+    fn into_scene_linear(self, working: SequencerColorSpace) -> Result<RgbaFrame> {
+        match self {
+            Self::Float(frame) => sequencer_to_scene(frame, working.image_colorspace()),
+            Self::Byte {
+                width,
+                height,
+                colorspace,
+                pixels,
+            } => {
+                let mut associated = Vec::with_capacity(pixels.len());
+                for pixel in pixels {
+                    let alpha = byte_float(pixel[3]);
+                    let mut output = [0.0; 4];
+                    output[3] = alpha;
+                    for channel in 0..3 {
+                        output[channel] =
+                            color_space_to_scene(byte_float(pixel[channel]), colorspace)? * alpha;
+                    }
+                    associated.push(output);
+                }
+                RgbaFrame::new(width, height, associated)
+            }
+        }
+    }
+}
+
+fn scene_to_color_space(value: f32, colorspace: ImageColorspace) -> Result<f32> {
+    if colorspace == ImageColorspace::Srgb {
+        finite_f64_to_f32(crate::color::linear_to_srgb_unclamped(f64::from(value)))
+    } else {
+        Ok(value)
+    }
+}
+
+fn color_space_to_scene(value: f32, colorspace: ImageColorspace) -> Result<f32> {
+    if colorspace == ImageColorspace::Srgb {
+        finite_f64_to_f32(crate::color::srgb_to_linear(f64::from(value)))
+    } else {
+        Ok(value)
+    }
+}
+
+fn scene_to_sequencer(mut frame: RgbaFrame, colorspace: ImageColorspace) -> Result<RgbaFrame> {
+    if colorspace == ImageColorspace::Srgb {
+        for pixel in &mut frame.pixels {
+            let alpha = pixel[3];
+            for channel in &mut pixel[..3] {
+                let straight = if alpha == 0.0 {
+                    *channel
+                } else {
+                    *channel / alpha
+                };
+                let encoded = scene_to_color_space(straight, colorspace)?;
+                *channel = if alpha == 0.0 {
+                    encoded
+                } else {
+                    encoded * alpha
+                };
+            }
+        }
+    }
+    RgbaFrame::new(frame.width, frame.height, frame.pixels)
+}
+
+fn sequencer_to_scene(mut frame: RgbaFrame, colorspace: ImageColorspace) -> Result<RgbaFrame> {
+    if colorspace == ImageColorspace::Srgb {
+        for pixel in &mut frame.pixels {
+            let alpha = pixel[3];
+            for channel in &mut pixel[..3] {
+                let straight = if alpha == 0.0 {
+                    *channel
+                } else {
+                    *channel / alpha
+                };
+                let linear = color_space_to_scene(straight, colorspace)?;
+                *channel = if alpha == 0.0 { linear } else { linear * alpha };
+            }
+        }
+    }
+    RgbaFrame::new(frame.width, frame.height, frame.pixels)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the component is clamped and scaled to an 8-bit channel before conversion"
+)]
+fn byte_channel(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+fn byte_float(value: u8) -> f32 {
+    f32::from(value) / 255.0
+}
+
+fn byte_to_associated(width: u32, height: u32, pixels: &[[u8; 4]]) -> Result<RgbaFrame> {
+    let associated = pixels
+        .iter()
+        .map(|pixel| {
+            let alpha = byte_float(pixel[3]);
+            [
+                byte_float(pixel[0]) * alpha,
+                byte_float(pixel[1]) * alpha,
+                byte_float(pixel[2]) * alpha,
+                alpha,
+            ]
+        })
+        .collect();
+    RgbaFrame::new(width, height, associated)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "the validated transition factor is in [0, 1] and byte values scale exactly"
+)]
+fn byte_cross_factor(factor: f64) -> u32 {
+    (256.0_f32 * factor as f32) as u32
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "weighted channel values are bounded to the byte range"
+)]
+fn byte_cross_channel(first: u8, second: u8, second_weight: u32) -> u8 {
+    let value = ((256 - second_weight) * u32::from(first) + second_weight * u32::from(second)) >> 8;
+    value as u8
+}
+
+fn byte_crossfade(
+    width: u32,
+    height: u32,
+    first: &[[u8; 4]],
+    second: &[[u8; 4]],
+    factor: f64,
+) -> Result<SequencerFrame> {
+    if first.len() != second.len() {
+        return Err(PotError::new(
+            ErrorCode::InvalidArgument,
+            "frames must have matching nonzero dimensions",
+        ));
+    }
+    let weight = byte_cross_factor(factor);
+    let pixels = first
+        .iter()
+        .zip(second)
+        .map(|(first, second)| {
+            [
+                byte_cross_channel(first[0], second[0], weight),
+                byte_cross_channel(first[1], second[1], weight),
+                byte_cross_channel(first[2], second[2], weight),
+                byte_cross_channel(first[3], second[3], weight),
+            ]
+        })
+        .collect();
+    Ok(SequencerFrame::Byte {
+        width,
+        height,
+        colorspace: ImageColorspace::Srgb,
+        pixels,
+    })
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the validated factor and bounded frame width keep the wipe cut within the image"
+)]
+fn byte_wipe(
+    width: u32,
+    height: u32,
+    first: &[[u8; 4]],
+    second: &[[u8; 4]],
+    factor: f64,
+) -> Result<SequencerFrame> {
+    if first.len() != second.len() {
+        return Err(PotError::new(
+            ErrorCode::InvalidArgument,
+            "frames must have matching nonzero dimensions",
+        ));
+    }
+    let cut = (f64::from(width) * factor).round() as usize;
+    let width = usize::try_from(width).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "render width exceeds platform range",
+        )
+    })?;
+    let pixels = first
+        .iter()
+        .zip(second)
+        .enumerate()
+        .map(
+            |(index, (first, second))| {
+                if index % width < cut { *second } else { *first }
+            },
+        )
+        .collect();
+    Ok(SequencerFrame::Byte {
+        width: u32::try_from(width).map_err(|_| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "render width exceeds platform range",
+            )
+        })?,
+        height,
+        colorspace: ImageColorspace::Srgb,
+        pixels,
+    })
+}
+
+fn byte_gamma_cross(
+    width: u32,
+    height: u32,
+    first: &[[u8; 4]],
+    second: &[[u8; 4]],
+    factor: f64,
+) -> Result<SequencerFrame> {
+    let first = byte_to_associated(width, height, first)?;
+    let second = byte_to_associated(width, height, second)?;
+    let output = transition(&first, &second, factor, TransitionType::GammaCross)?;
+    Ok(SequencerFrame::from_associated_float(
+        output,
+        ImageColorspace::Srgb,
+    ))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "validated VSE opacity and color multipliers keep byte factors bounded"
+)]
+fn byte_effect_factor(factor: f64) -> i32 {
+    (256.0_f32 * factor as f32) as i32
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "native Add/Subtract result channels are clamped to 0..=255"
+)]
+fn byte_add_sub_channel(first: u8, second: u8, second_alpha: u8, factor: i32, add: bool) -> u8 {
+    let scaled = factor * i32::from(second_alpha);
+    let delta = (scaled * i32::from(second)) >> 16;
+    if add {
+        (i32::from(first) + delta).min(255) as u8
+    } else {
+        (i32::from(first) - delta).max(0) as u8
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "native Multiply result channels are bounded to 0..=255"
+)]
+fn byte_multiply_channel(first: u8, second: u8, factor: i32) -> u8 {
+    let first = i32::from(first);
+    let second = i32::from(second);
+    (first + ((factor * first * (second - 255)) >> 16)).clamp(0, 255) as u8
+}
+
+fn byte_blend_effect(
+    effect: EffectType,
+    first: &[u8; 4],
+    second: &[u8; 4],
+    factor: f64,
+) -> [u8; 4] {
+    let factor = byte_effect_factor(factor);
+    match effect {
+        EffectType::Add | EffectType::Subtract => [
+            byte_add_sub_channel(
+                first[0],
+                second[0],
+                second[3],
+                factor,
+                effect == EffectType::Add,
+            ),
+            byte_add_sub_channel(
+                first[1],
+                second[1],
+                second[3],
+                factor,
+                effect == EffectType::Add,
+            ),
+            byte_add_sub_channel(
+                first[2],
+                second[2],
+                second[3],
+                factor,
+                effect == EffectType::Add,
+            ),
+            first[3],
+        ],
+        EffectType::Multiply => [
+            byte_multiply_channel(first[0], second[0], factor),
+            byte_multiply_channel(first[1], second[1], factor),
+            byte_multiply_channel(first[2], second[2], factor),
+            byte_multiply_channel(first[3], second[3], factor),
+        ],
+        _ => unreachable!("only byte Add/Subtract/Multiply use this kernel"),
+    }
+}
+
+fn byte_effect_frame(
+    effect: EffectType,
+    first: SequencerFrame,
+    second: SequencerFrame,
+    factor: f64,
+) -> Result<SequencerFrame> {
+    match (first, second) {
+        (
+            SequencerFrame::Byte {
+                width,
+                height,
+                pixels: first,
+                ..
+            },
+            SequencerFrame::Byte { pixels: second, .. },
+        ) if matches!(
+            effect,
+            EffectType::Add | EffectType::Subtract | EffectType::Multiply
+        ) =>
+        {
+            if first.len() != second.len() {
+                return Err(PotError::new(
+                    ErrorCode::InvalidArgument,
+                    "frames must have matching nonzero dimensions",
+                ));
+            }
+            Ok(SequencerFrame::Byte {
+                width,
+                height,
+                colorspace: ImageColorspace::Srgb,
+                pixels: first
+                    .iter()
+                    .zip(&second)
+                    .map(|(first, second)| byte_blend_effect(effect, first, second, factor))
+                    .collect(),
+            })
+        }
+        (first, second) => {
+            let (
+                SequencerFrame::Byte {
+                    width,
+                    height,
+                    pixels: first_pixels,
+                    ..
+                },
+                SequencerFrame::Byte {
+                    pixels: second_pixels,
+                    ..
+                },
+            ) = (first, second)
+            else {
+                return Err(PotError::new(
+                    ErrorCode::InvalidArgument,
+                    "byte effect inputs must both have byte storage",
+                ));
+            };
+            let first = byte_to_associated(width, height, &first_pixels)?;
+            let second = byte_to_associated(width, height, &second_pixels)?;
+            let output = apply_blend_effect(EffectType::AlphaOver, &first, &second, factor)?;
+            Ok(SequencerFrame::from_associated_float(
+                output,
+                ImageColorspace::Srgb,
+            ))
+        }
+    }
+}
+
+fn divide_round_i(numerator: i32, denominator: i32) -> i32 {
+    let half = denominator / 2;
+    if numerator < 0 {
+        -((-numerator + half) / denominator)
+    } else {
+        (numerator + half) / denominator
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "VSE opacity is validated in [0, 1] and byte alpha stays in 0..=255"
+)]
+fn byte_alpha_with_opacity(alpha: u8, opacity: f64) -> u8 {
+    (f32::from(alpha) * opacity as f32) as u8
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "strip blend mode channel arithmetic is clamped to 0..=255"
+)]
+fn byte_strip_blend_pixel(
+    destination: &[u8; 4],
+    source: &[u8; 4],
+    blend_type: StripBlendType,
+    opacity: f64,
+) -> [u8; 4] {
+    let alpha = byte_alpha_with_opacity(source[3], opacity);
+    match blend_type {
+        StripBlendType::Add | StripBlendType::Subtract => {
+            let add = blend_type == StripBlendType::Add;
+            let channel = |index| {
+                let numerator = i32::from(destination[index]) * 255
+                    + if add {
+                        i32::from(source[index]) * i32::from(alpha)
+                    } else {
+                        -i32::from(source[index]) * i32::from(alpha)
+                    };
+                divide_round_i(numerator, 255).clamp(0, 255) as u8
+            };
+            [channel(0), channel(1), channel(2), destination[3]]
+        }
+        StripBlendType::Multiply if alpha != 0 => {
+            let channel = |index| {
+                let inverse = 255 - i32::from(alpha);
+                let destination = i32::from(destination[index]);
+                let source = i32::from(source[index]);
+                let numerator =
+                    inverse * destination * 255 + i32::from(alpha) * destination * source;
+                divide_round_i(numerator, 255 * 255).clamp(0, 255) as u8
+            };
+            [channel(0), channel(1), channel(2), destination[3]]
+        }
+        StripBlendType::Multiply | StripBlendType::AlphaOver | StripBlendType::Replace => {
+            *destination
+        }
+    }
+}
+
+fn multiply_sequencer_frame(
+    frame: SequencerFrame,
+    multiplier: f64,
+    multiply_alpha: bool,
+) -> Result<SequencerFrame> {
+    match frame {
+        SequencerFrame::Byte {
+            width,
+            height,
+            colorspace,
+            mut pixels,
+        } => {
+            let multiplier = byte_effect_factor(multiplier);
+            for pixel in &mut pixels {
+                for channel in &mut pixel[..3] {
+                    *channel = ((multiplier * i32::from(*channel)) >> 8).clamp(0, 255) as u8;
+                }
+                if multiply_alpha {
+                    pixel[3] = ((multiplier * i32::from(pixel[3])) >> 8).clamp(0, 255) as u8;
+                }
+            }
+            Ok(SequencerFrame::Byte {
+                width,
+                height,
+                colorspace,
+                pixels,
+            })
+        }
+        SequencerFrame::Float(mut frame) => {
+            let multiplier = finite_f64_to_f32(multiplier)?;
+            for pixel in &mut frame.pixels {
+                for channel in &mut pixel[..3] {
+                    *channel *= multiplier;
+                }
+                if multiply_alpha {
+                    pixel[3] *= multiplier;
+                }
+            }
+            Ok(SequencerFrame::Float(RgbaFrame::new(
+                frame.width,
+                frame.height,
+                frame.pixels,
+            )?))
+        }
+    }
+}
+
+fn preprocess_strip_frame(
+    frame: SequencerFrame,
+    strip: &Strip,
+    working: SequencerColorSpace,
+) -> Result<SequencerFrame> {
+    let multiplier = strip.color_multiply
+        * if strip.blend_type == StripBlendType::Replace {
+            strip.opacity
+        } else {
+            1.0
+        };
+    if multiplier == 1.0 {
+        return Ok(frame);
+    }
+    let needs_promote = match &frame {
+        SequencerFrame::Byte { colorspace, .. } => *colorspace != working.image_colorspace(),
+        SequencerFrame::Float(_) => false,
+    };
+    if needs_promote {
+        return multiply_sequencer_frame(
+            SequencerFrame::Float(frame.into_working(working)?),
+            multiplier,
+            strip.multiply_alpha,
+        );
+    }
+    multiply_sequencer_frame(frame, multiplier, strip.multiply_alpha)
+}
+
+fn blend_sequence_frames(
+    destination: SequencerFrame,
+    source: SequencerFrame,
+    blend_type: StripBlendType,
+    opacity: f64,
+    working: SequencerColorSpace,
+) -> Result<SequencerFrame> {
+    if blend_type == StripBlendType::Replace {
+        return Ok(source);
+    }
+    let precision = destination.precision().combine(source.precision());
+    if precision.is_byte() {
+        let (
+            SequencerFrame::Byte {
+                width,
+                height,
+                pixels: destination_pixels,
+                ..
+            },
+            SequencerFrame::Byte {
+                pixels: source_pixels,
+                ..
+            },
+        ) = (destination, source)
+        else {
+            return Err(PotError::new(
+                ErrorCode::InternalError,
+                "byte sequencer composite has a non-byte input",
+            ));
+        };
+        if destination_pixels.len() != source_pixels.len() {
+            return Err(PotError::new(
+                ErrorCode::InvalidArgument,
+                "frames must have matching nonzero dimensions",
+            ));
+        }
+        if matches!(
+            blend_type,
+            StripBlendType::Add | StripBlendType::Subtract | StripBlendType::Multiply
+        ) {
+            return Ok(SequencerFrame::Byte {
+                width,
+                height,
+                colorspace: ImageColorspace::Srgb,
+                pixels: destination_pixels
+                    .iter()
+                    .zip(&source_pixels)
+                    .map(|(destination, source)| {
+                        byte_strip_blend_pixel(destination, source, blend_type, opacity)
+                    })
+                    .collect(),
+            });
+        }
+        let destination = byte_to_associated(width, height, &destination_pixels)?;
+        let source = byte_to_associated(width, height, &source_pixels)?;
+        let output = blend_frames(&destination, &source, blend_type, opacity)?;
+        return Ok(SequencerFrame::from_associated_float(
+            output,
+            ImageColorspace::Srgb,
+        ));
+    }
+    let destination = destination.into_working(working)?;
+    let source = source.into_working(working)?;
+    Ok(SequencerFrame::Float(blend_frames(
+        &destination,
+        &source,
+        blend_type,
+        opacity,
+    )?))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "VSE output depends on resolved scene, render, and output settings"
@@ -580,12 +1274,13 @@ fn render_vse_frame(
     let count = width_usize
         .checked_mul(height_usize)
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "render dimensions overflow"))?;
-    let background = if film_transparent {
-        [0.0, 0.0, 0.0, 0.0]
-    } else {
-        [0.0, 0.0, 0.0, 1.0]
+    let background_alpha = if film_transparent { 0 } else { 255 };
+    let mut composite = SequencerFrame::Byte {
+        width,
+        height,
+        colorspace: ImageColorspace::Srgb,
+        pixels: vec![[0, 0, 0, background_alpha]; count],
     };
-    let mut composite = RgbaFrame::new(width, height, vec![background; count])?;
     let mut nested_ids = BTreeSet::new();
     for strip in &scene.sequencer.strips {
         if strip.kind == StripType::Meta {
@@ -633,9 +1328,16 @@ fn render_vse_frame(
             &mut visiting,
             warnings,
         )? {
-            composite = blend_frames(&composite, &layer, strip.blend_type, strip.opacity)?;
+            composite = blend_sequence_frames(
+                composite,
+                layer,
+                strip.blend_type,
+                strip.opacity,
+                scene.sequencer.colorspace,
+            )?;
         }
     }
+    let composite = composite.into_scene_linear(scene.sequencer.colorspace)?;
     let input = CompositorImage::new(width, height, composite.pixels)?;
     let output = compositor::apply_associated_image(input, doc, scene, frame)?;
     RgbaFrame::new(output.width, output.height, output.pixels)
@@ -662,7 +1364,7 @@ fn render_strip_frame(
     allow_outside_range: bool,
     visiting: &mut BTreeSet<String>,
     warnings: &mut Vec<Value>,
-) -> Result<Option<RgbaFrame>> {
+) -> Result<Option<SequencerFrame>> {
     if strip.mute || (!allow_outside_range && !strip.contains_frame(frame)) {
         return Ok(None);
     }
@@ -691,13 +1393,18 @@ fn render_strip_frame(
         warnings,
     );
     visiting.remove(&strip.id);
-    let mut frame = result?;
-    if let Some(image) = &frame
-        && !strip.modifiers.is_empty()
-    {
-        frame = Some(apply_modifiers(image, &strip.modifiers)?);
+    let Some(frame) = result? else {
+        return Ok(None);
+    };
+    let frame = preprocess_strip_frame(frame, strip, scene.sequencer.colorspace)?;
+    if strip.modifiers.is_empty() {
+        return Ok(Some(frame));
     }
-    Ok(frame)
+    let frame = frame.into_working(scene.sequencer.colorspace)?;
+    Ok(Some(SequencerFrame::Float(apply_modifiers(
+        &frame,
+        &strip.modifiers,
+    )?)))
 }
 
 #[expect(
@@ -720,7 +1427,7 @@ fn render_strip_content(
     film_transparent: bool,
     visiting: &mut BTreeSet<String>,
     warnings: &mut Vec<Value>,
-) -> Result<Option<RgbaFrame>> {
+) -> Result<Option<SequencerFrame>> {
     let result = match strip.kind {
         StripType::Image | StripType::ImageSequence => {
             let source = strip.source.as_deref().ok_or_else(|| {
@@ -737,6 +1444,7 @@ fn render_strip_content(
                 strip.source_frame(frame),
                 width,
                 height,
+                scene.sequencer.colorspace,
             )?)
         }
         StripType::Movie => {
@@ -799,11 +1507,15 @@ fn render_strip_content(
             push_new_warnings(warnings, strip_warnings);
             let associated_alpha = raster.linear_rgba_associated;
             let pixels = RgbaFrame::new(width, height, raster.linear_rgba)?;
-            Some(if associated_alpha {
+            let pixels = if associated_alpha {
                 pixels
             } else {
                 associate_straight_frame(pixels)?
-            })
+            };
+            Some(SequencerFrame::from_scene_linear(
+                pixels,
+                scene.sequencer.colorspace,
+            )?)
         }
         StripType::Color => {
             let width_usize = usize::try_from(width).map_err(|_| {
@@ -821,8 +1533,15 @@ fn render_strip_content(
             let count = width_usize.checked_mul(height_usize).ok_or_else(|| {
                 PotError::new(ErrorCode::LimitExceeded, "render dimensions overflow")
             })?;
-            let pixels = RgbaFrame::new(width, height, vec![strip.color; count])?;
-            Some(associate_straight_frame(pixels)?)
+            let pixels = RgbaFrame::new(
+                width,
+                height,
+                vec![[strip.color[0], strip.color[1], strip.color[2], 1.0]; count],
+            )?;
+            Some(SequencerFrame::from_straight_scene_linear(
+                pixels,
+                ImageColorspace::Srgb,
+            )?)
         }
         StripType::Text => {
             let text = strip.text.as_deref().ok_or_else(|| {
@@ -832,12 +1551,11 @@ fn render_strip_content(
                     json!({"strip_id":strip.id}),
                 )
             })?;
-            Some(associate_straight_frame(render_text_frame(
-                text,
-                strip.color,
-                width,
-                height,
-            )?)?)
+            let pixels = render_text_frame(text, strip.color, width, height)?;
+            Some(SequencerFrame::from_straight_scene_linear(
+                pixels,
+                ImageColorspace::Srgb,
+            )?)
         }
         StripType::Meta => Some(compose_meta_frame(
             doc,
@@ -913,7 +1631,37 @@ fn render_strip_content(
                 warnings,
             )?;
             let factor = ((frame - strip.frame_start) / strip.length).clamp(0.0, 1.0);
-            Some(transition(&first, &second, factor, transition_kind)?)
+            let precision = first.precision().combine(second.precision());
+            let output = if precision.is_byte() {
+                match (first, second) {
+                    (
+                        SequencerFrame::Byte {
+                            width,
+                            height,
+                            pixels: first,
+                            ..
+                        },
+                        SequencerFrame::Byte { pixels: second, .. },
+                    ) => match transition_kind {
+                        TransitionType::Cross => {
+                            byte_crossfade(width, height, &first, &second, factor)
+                        }
+                        TransitionType::GammaCross => {
+                            byte_gamma_cross(width, height, &first, &second, factor)
+                        }
+                        TransitionType::Wipe => byte_wipe(width, height, &first, &second, factor),
+                    },
+                    _ => Err(PotError::new(
+                        ErrorCode::InternalError,
+                        "byte transition has a non-byte input",
+                    )),
+                }
+            } else {
+                let first = first.into_working(scene.sequencer.colorspace)?;
+                let second = second.into_working(scene.sequencer.colorspace)?;
+                transition(&first, &second, factor, transition_kind).map(SequencerFrame::Float)
+            };
+            Some(output?)
         }
         StripType::Effect => {
             let effect = strip.effect.ok_or_else(|| {
@@ -983,9 +1731,36 @@ fn render_strip_content(
                     visiting,
                     warnings,
                 )?;
-                Some(apply_blend_effect(effect, &first, &second, 1.0)?)
+                let precision = first.precision().combine(second.precision());
+                if precision.is_byte() {
+                    Some(byte_effect_frame(effect, first, second, 1.0)?)
+                } else {
+                    let first = first.into_working(scene.sequencer.colorspace)?;
+                    let second = second.into_working(scene.sequencer.colorspace)?;
+                    let output = apply_blend_effect(effect, &first, &second, 1.0)?;
+                    Some(SequencerFrame::Float(output))
+                }
+            } else if effect == EffectType::Speed {
+                Some(first)
             } else {
-                Some(apply_effect(effect, first)?)
+                match first {
+                    SequencerFrame::Byte {
+                        width,
+                        height,
+                        colorspace: _,
+                        pixels,
+                    } => {
+                        let associated = byte_to_associated(width, height, &pixels)?;
+                        let output = apply_effect(effect, associated)?;
+                        Some(SequencerFrame::from_associated_float(
+                            output,
+                            ImageColorspace::Srgb,
+                        ))
+                    }
+                    SequencerFrame::Float(frame) => {
+                        Some(SequencerFrame::Float(apply_effect(effect, frame)?))
+                    }
+                }
             }
         }
     };
@@ -1012,7 +1787,7 @@ fn render_strip_input(
     film_transparent: bool,
     visiting: &mut BTreeSet<String>,
     warnings: &mut Vec<Value>,
-) -> Result<RgbaFrame> {
+) -> Result<SequencerFrame> {
     let strip = scene
         .sequencer
         .strips
@@ -1072,7 +1847,7 @@ fn compose_meta_frame(
     film_transparent: bool,
     visiting: &mut BTreeSet<String>,
     warnings: &mut Vec<Value>,
-) -> Result<RgbaFrame> {
+) -> Result<SequencerFrame> {
     let width_usize = usize::try_from(width).map_err(|_| {
         PotError::new(
             ErrorCode::LimitExceeded,
@@ -1088,7 +1863,12 @@ fn compose_meta_frame(
     let count = width_usize
         .checked_mul(height_usize)
         .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "render dimensions overflow"))?;
-    let mut composite = RgbaFrame::new(width, height, vec![[0.0; 4]; count])?;
+    let mut composite = SequencerFrame::Byte {
+        width,
+        height,
+        colorspace: ImageColorspace::Srgb,
+        pixels: vec![[0, 0, 0, 0]; count],
+    };
     let mut children = Vec::with_capacity(meta.inputs.len());
     for input_id in &meta.inputs {
         let child = scene
@@ -1125,7 +1905,13 @@ fn compose_meta_frame(
             visiting,
             warnings,
         )? {
-            composite = blend_frames(&composite, &layer, child.blend_type, child.opacity)?;
+            composite = blend_sequence_frames(
+                composite,
+                layer,
+                child.blend_type,
+                child.opacity,
+                scene.sequencer.colorspace,
+            )?;
         }
     }
     Ok(composite)
@@ -1138,22 +1924,34 @@ fn load_strip_image(
     source_frame: f64,
     width: u32,
     height: u32,
-) -> Result<RgbaFrame> {
+    working: SequencerColorSpace,
+) -> Result<SequencerFrame> {
     if let Ok(image_id) = Id::new(source.to_owned())
         && let Some(image) = doc.images.get(&image_id)
     {
         let data = storage::load_image_data(image, root, ImageInterpolation::Linear)?;
-        return resize_image_data(&data, width, height);
+        let precision = FramePrecision::from_image(data.storage.precision, image.colorspace);
+        return match precision {
+            FramePrecision::Byte(colorspace) => SequencerFrame::from_straight_scene_linear(
+                resize_image_straight(&data, width, height)?,
+                colorspace,
+            ),
+            FramePrecision::Float => {
+                SequencerFrame::from_scene_linear(resize_image_data(&data, width, height)?, working)
+            }
+        };
     }
     let path = resolve_image_sequence_path(root, source, source_frame)?;
     let bytes = fs::read(&path).map_err(|error| PotError::io(&error))?;
     let (colorspace, image_width, image_height, pixels) =
         storage::decode_pixels_with_default_colorspace(&bytes, None)?;
+    let precision = storage::source_precision(&bytes);
     let data = ImageData {
         colour: crate::image::ColourCache::default(),
         storage: crate::image::ImageStorage {
             straight_alpha: storage::default_alpha_mode(&bytes)
                 == crate::model::ImageAlphaMode::Straight,
+            precision,
             ..crate::image::ImageStorage::default()
         },
         width: image_width,
@@ -1164,7 +1962,30 @@ fn load_strip_image(
         tiles: std::collections::BTreeMap::new(),
         interpolation: ImageInterpolation::Linear,
     };
-    resize_image_data(&data, width, height)
+    match FramePrecision::from_image(precision, colorspace) {
+        FramePrecision::Byte(colorspace) => SequencerFrame::from_straight_scene_linear(
+            resize_image_straight(&data, width, height)?,
+            colorspace,
+        ),
+        FramePrecision::Float => {
+            SequencerFrame::from_scene_linear(resize_image_data(&data, width, height)?, working)
+        }
+    }
+}
+
+fn resize_image_straight(data: &ImageData, width: u32, height: u32) -> Result<RgbaFrame> {
+    let mut frame = resample_image(data, width, height, false)?;
+    if !data.storage.straight_alpha && !data.storage.ignore_alpha && !data.storage.data {
+        for pixel in &mut frame.pixels {
+            let alpha = pixel[3];
+            if alpha != 0.0 {
+                for channel in &mut pixel[..3] {
+                    *channel /= alpha;
+                }
+            }
+        }
+    }
+    RgbaFrame::new(frame.width, frame.height, frame.pixels)
 }
 
 fn resize_image_data(data: &ImageData, width: u32, height: u32) -> Result<RgbaFrame> {

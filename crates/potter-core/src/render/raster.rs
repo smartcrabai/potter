@@ -1,6 +1,6 @@
 use std::f64::consts::TAU;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use serde::{Deserialize, Serialize};
 
 use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, WireSegment};
@@ -488,9 +488,29 @@ pub(crate) struct CameraFrame {
     /// Whether a point's depth is its distance from the camera (a panorama) rather than its view-axis distance.
     depth_is_distance: bool,
 }
+#[derive(Clone, Copy)]
+pub(super) struct CameraLensSample {
+    aperture: glam::DVec2,
+    focus_distance: f64,
+}
+impl CameraLensSample {
+    pub(super) fn is_zero(self) -> bool {
+        self.aperture == glam::DVec2::ZERO
+    }
+}
 impl CameraFrame {
     pub(super) fn is_side_by_side(&self) -> bool {
         self.stereo_mode == StereoMode::SideBySide
+    }
+    pub(super) fn lens_sample(&self, sample_x: f64, sample_y: f64) -> Option<CameraLensSample> {
+        let dof = self
+            .depth_of_field
+            .filter(|dof| dof.aperture_radius > 0.0)?;
+        Some(CameraLensSample {
+            aperture: concentric_disk(sample_x, sample_y, dof.aperture_blades)
+                * dof.aperture_radius,
+            focus_distance: dof.focus_distance,
+        })
     }
 }
 
@@ -579,6 +599,616 @@ enum ProjectionFrame {
         sensor_width_mm: f64,
         sensor_height_mm: f64,
     },
+}
+// EEVEE's projected shape quad interpolates local coordinates on the 8-bit subpixel raster grid.
+const CAMERA_LIGHT_SUBPIXEL_SCALE: f32 = 256.0;
+const CAMERA_LIGHT_QUAD_UV: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]];
+const CAMERA_LIGHT_QUAD_TRIANGLES: [[usize; 3]; 2] = [[0, 1, 2], [1, 3, 2]];
+// Near/far clipping can add one vertex per plane to each source triangle.
+const CAMERA_LIGHT_CLIPPED_TRIANGLE_VERTICES: usize = 5;
+const CAMERA_LIGHT_MAX_TRIANGLES: usize = 6;
+const CAMERA_LIGHT_MAX_VERTICES: usize = CAMERA_LIGHT_MAX_TRIANGLES * 3;
+
+#[derive(Clone, Copy, Default)]
+struct CameraLightClipVertex {
+    clip: [f32; 2],
+    w: f32,
+    depth: f32,
+    local: [f32; 2],
+}
+
+#[derive(Clone, Copy, Default)]
+struct CameraLightProjectedVertex {
+    screen: [f32; 2],
+    inverse_w: f32,
+    local: [f32; 2],
+}
+
+pub(super) struct CameraLightProjectedQuad {
+    vertices: [CameraLightProjectedVertex; CAMERA_LIGHT_MAX_VERTICES],
+    triangle_count: usize,
+}
+
+pub(super) struct CameraLightRasterQuad {
+    screen: [[i64; 2]; CAMERA_LIGHT_MAX_VERTICES],
+    triangle_count: usize,
+}
+
+impl CameraLightProjectedQuad {
+    pub(super) fn rasterize(&self, jitter_x: f64, jitter_y: f64) -> CameraLightRasterQuad {
+        let vertex_count = self.triangle_count * 3;
+        let jitter_x = 0.5 - jitter_x as f32;
+        let jitter_y = 0.5 - jitter_y as f32;
+        CameraLightRasterQuad {
+            screen: std::array::from_fn(|index| {
+                if index < vertex_count {
+                    [
+                        snap_camera_light_coordinate(self.vertices[index].screen[0] + jitter_x),
+                        snap_camera_light_coordinate(self.vertices[index].screen[1] + jitter_y),
+                    ]
+                } else {
+                    [0; 2]
+                }
+            }),
+            triangle_count: self.triangle_count,
+        }
+    }
+
+    pub(super) fn contains_pixel(&self, raster: &CameraLightRasterQuad, x: u32, y: u32) -> bool {
+        raster.contains_pixel(x, y, &self.vertices)
+    }
+}
+
+impl CameraLightRasterQuad {
+    fn contains_pixel(
+        &self,
+        x: u32,
+        y: u32,
+        vertices: &[CameraLightProjectedVertex; CAMERA_LIGHT_MAX_VERTICES],
+    ) -> bool {
+        let pixel = [i64::from(x) * 256 + 128, i64::from(y) * 256 + 128];
+        (0..self.triangle_count).any(|triangle| {
+            self.local_position(pixel, triangle, vertices)
+                .is_some_and(|local| local[0] * local[0] + local[1] * local[1] <= 1.0)
+        })
+    }
+
+    fn local_position(
+        &self,
+        pixel: [i64; 2],
+        triangle: usize,
+        vertices: &[CameraLightProjectedVertex; CAMERA_LIGHT_MAX_VERTICES],
+    ) -> Option<[f32; 2]> {
+        let first = triangle * 3;
+        let second = first + 1;
+        let third = first + 2;
+        let edge_a = [
+            self.screen[second][0] - self.screen[first][0],
+            self.screen[second][1] - self.screen[first][1],
+        ];
+        let edge_b = [
+            self.screen[third][0] - self.screen[first][0],
+            self.screen[third][1] - self.screen[first][1],
+        ];
+        let point = [
+            pixel[0] - self.screen[first][0],
+            pixel[1] - self.screen[first][1],
+        ];
+        let cross = |left: [i64; 2], right: [i64; 2]| {
+            i128::from(left[0]) * i128::from(right[1]) - i128::from(left[1]) * i128::from(right[0])
+        };
+        let determinant = cross(edge_a, edge_b);
+        if determinant == 0 {
+            return None;
+        }
+        let numerator_second = cross(point, edge_b);
+        let numerator_third = cross(edge_a, point);
+        let numerator_first = determinant - numerator_second - numerator_third;
+        let orientation = determinant.signum();
+        if [numerator_first, numerator_second, numerator_third]
+            .into_iter()
+            .any(|weight| weight * orientation < 0)
+        {
+            return None;
+        }
+
+        for (numerator, (start, end)) in [
+            (numerator_first, (second, third)),
+            (numerator_second, (third, first)),
+            (numerator_third, (first, second)),
+        ] {
+            if numerator == 0 {
+                let mut dx = self.screen[end][0] - self.screen[start][0];
+                let mut dy = self.screen[end][1] - self.screen[start][1];
+                if orientation < 0 {
+                    dx = -dx;
+                    dy = -dy;
+                }
+                if !(dy < 0 || (dy == 0 && dx < 0)) {
+                    return None;
+                }
+            }
+        }
+
+        let denominator = determinant.abs() as f32;
+        let weight_second = (numerator_second * orientation) as f32 / denominator;
+        let weight_third = (numerator_third * orientation) as f32 / denominator;
+        let weight_first = 1.0 - weight_second - weight_third;
+        let perspective_weights = [
+            weight_first * vertices[first].inverse_w,
+            weight_second * vertices[second].inverse_w,
+            weight_third * vertices[third].inverse_w,
+        ];
+        let weight_sum = perspective_weights[0] + perspective_weights[1] + perspective_weights[2];
+        if !weight_sum.is_finite() || weight_sum <= f32::MIN_POSITIVE {
+            return None;
+        }
+        Some([
+            (perspective_weights[0] * vertices[first].local[0]
+                + perspective_weights[1] * vertices[second].local[0]
+                + perspective_weights[2] * vertices[third].local[0])
+                / weight_sum,
+            (perspective_weights[0] * vertices[first].local[1]
+                + perspective_weights[1] * vertices[second].local[1]
+                + perspective_weights[2] * vertices[third].local[1])
+                / weight_sum,
+        ])
+    }
+}
+
+fn interpolate_camera_light_vertex(
+    first: CameraLightClipVertex,
+    second: CameraLightClipVertex,
+    t: f32,
+    clipped_depth: f32,
+) -> CameraLightClipVertex {
+    let interpolate = |a: f32, b: f32| a + (b - a) * t;
+    CameraLightClipVertex {
+        clip: [
+            interpolate(first.clip[0], second.clip[0]),
+            interpolate(first.clip[1], second.clip[1]),
+        ],
+        w: interpolate(first.w, second.w),
+        depth: clipped_depth,
+        local: [
+            interpolate(first.local[0], second.local[0]),
+            interpolate(first.local[1], second.local[1]),
+        ],
+    }
+}
+
+fn clip_camera_light_polygon(
+    input: [CameraLightClipVertex; CAMERA_LIGHT_CLIPPED_TRIANGLE_VERTICES],
+    input_count: usize,
+    depth: f32,
+    keep_greater: bool,
+) -> (
+    [CameraLightClipVertex; CAMERA_LIGHT_CLIPPED_TRIANGLE_VERTICES],
+    usize,
+) {
+    let mut output = [CameraLightClipVertex::default(); CAMERA_LIGHT_CLIPPED_TRIANGLE_VERTICES];
+    if input_count == 0 {
+        return (output, 0);
+    }
+    let inside = |vertex: CameraLightClipVertex| {
+        if keep_greater {
+            vertex.depth >= depth
+        } else {
+            vertex.depth <= depth
+        }
+    };
+    let mut output_count = 0;
+    let mut previous = input[input_count - 1];
+    let mut previous_inside = inside(previous);
+    for current in input.into_iter().take(input_count) {
+        let current_inside = inside(current);
+        if current_inside {
+            if !previous_inside && current.depth != depth {
+                let t = (depth - previous.depth) / (current.depth - previous.depth);
+                output[output_count] = interpolate_camera_light_vertex(previous, current, t, depth);
+                output_count += 1;
+            }
+            output[output_count] = current;
+            output_count += 1;
+        } else if previous_inside && previous.depth != depth {
+            let t = (depth - previous.depth) / (current.depth - previous.depth);
+            output[output_count] = interpolate_camera_light_vertex(previous, current, t, depth);
+            output_count += 1;
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    (output, output_count)
+}
+
+fn snap_camera_light_coordinate(value: f32) -> i64 {
+    (value * CAMERA_LIGHT_SUBPIXEL_SCALE).round() as i64
+}
+
+fn camera_light_clip_vertices(
+    camera_position: DVec3,
+    frame: &CameraFrame,
+    positions: &[DVec3; 4],
+    lens_sample: Option<CameraLensSample>,
+) -> Option<[CameraLightClipVertex; 4]> {
+    let camera_position = Vec3::new(
+        camera_position.x as f32,
+        camera_position.y as f32,
+        camera_position.z as f32,
+    );
+    let forward = Vec3::new(
+        frame.forward.x as f32,
+        frame.forward.y as f32,
+        frame.forward.z as f32,
+    );
+    let right = Vec3::new(
+        frame.right.x as f32,
+        frame.right.y as f32,
+        frame.right.z as f32,
+    );
+    let up = Vec3::new(frame.up.x as f32, frame.up.y as f32, frame.up.z as f32);
+    let shift = [frame.shift[0] as f32, frame.shift[1] as f32];
+    let mut vertices = [CameraLightClipVertex::default(); 4];
+
+    for (index, position) in positions.iter().enumerate() {
+        let point = Vec3::new(position.x as f32, position.y as f32, position.z as f32);
+        let offset = point - camera_position;
+        let depth = offset.dot(forward);
+        let (clip, w) = match frame.projection {
+            ProjectionFrame::Orthographic {
+                half_width,
+                half_height,
+            } => {
+                let lens_correction = lens_sample.map_or(glam::DVec2::ZERO, |sample| {
+                    sample.aperture * (1.0 - f64::from(depth) / sample.focus_distance)
+                });
+                (
+                    [
+                        offset.dot(right) / half_width as f32
+                            - 2.0 * shift[0]
+                            - lens_correction.x as f32 / half_width as f32,
+                        offset.dot(up) / half_height as f32
+                            - 2.0 * shift[1]
+                            - lens_correction.y as f32 / half_height as f32,
+                    ],
+                    1.0,
+                )
+            }
+            ProjectionFrame::Perspective {
+                horizontal_scale,
+                vertical_scale,
+            } => {
+                let horizontal_scale = horizontal_scale as f32;
+                let vertical_scale = vertical_scale as f32;
+                let lens_correction = lens_sample.map_or(glam::DVec2::ZERO, |sample| {
+                    sample.aperture * (f64::from(depth) / sample.focus_distance - 1.0)
+                });
+                (
+                    [
+                        offset.dot(right) / horizontal_scale - 2.0 * shift[0] * depth
+                            + lens_correction.x as f32 / horizontal_scale,
+                        offset.dot(up) / vertical_scale - 2.0 * shift[1] * depth
+                            + lens_correction.y as f32 / vertical_scale,
+                    ],
+                    depth,
+                )
+            }
+            ProjectionFrame::Equirectangular { .. }
+            | ProjectionFrame::FisheyeEquidistant { .. }
+            | ProjectionFrame::FisheyeEquisolid { .. } => return None,
+        };
+        if !depth.is_finite() || clip.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        vertices[index] = CameraLightClipVertex {
+            clip,
+            w,
+            depth,
+            local: CAMERA_LIGHT_QUAD_UV[index],
+        };
+    }
+    Some(vertices)
+}
+
+pub(super) fn project_camera_light_quad(
+    camera_position: DVec3,
+    frame: &CameraFrame,
+    width: u32,
+    height: u32,
+    positions: &[DVec3; 4],
+    lens_sample: Option<CameraLensSample>,
+) -> Option<CameraLightProjectedQuad> {
+    let clip_vertices = camera_light_clip_vertices(camera_position, frame, positions, lens_sample)?;
+    let near = frame.near as f32;
+    let far = frame.far as f32;
+    if !near.is_finite() || !far.is_finite() || near <= 0.0 || far <= near {
+        return None;
+    }
+    let mut vertices = [CameraLightProjectedVertex::default(); CAMERA_LIGHT_MAX_VERTICES];
+    let mut triangle_count = 0;
+    for triangle in CAMERA_LIGHT_QUAD_TRIANGLES {
+        let mut polygon =
+            [CameraLightClipVertex::default(); CAMERA_LIGHT_CLIPPED_TRIANGLE_VERTICES];
+        for (slot, vertex_index) in triangle.into_iter().enumerate() {
+            polygon[slot] = clip_vertices[vertex_index];
+        }
+        let (polygon, count) = clip_camera_light_polygon(polygon, 3, near, true);
+        let (polygon, count) = clip_camera_light_polygon(polygon, count, far, false);
+        for fan in 1..count.saturating_sub(1) {
+            if triangle_count == CAMERA_LIGHT_MAX_TRIANGLES {
+                return None;
+            }
+            let output = &mut vertices[triangle_count * 3..triangle_count * 3 + 3];
+            for (slot, vertex) in [polygon[0], polygon[fan], polygon[fan + 1]]
+                .into_iter()
+                .enumerate()
+            {
+                let inverse_w = 1.0 / vertex.w;
+                let ndc = [vertex.clip[0] / vertex.w, vertex.clip[1] / vertex.w];
+                let screen = [
+                    (ndc[0] + 1.0) * 0.5 * width as f32,
+                    (1.0 - ndc[1]) * 0.5 * height as f32,
+                ];
+                if !inverse_w.is_finite() || screen.iter().any(|value| !value.is_finite()) {
+                    return None;
+                }
+                output[slot] = CameraLightProjectedVertex {
+                    screen,
+                    inverse_w,
+                    local: vertex.local,
+                };
+            }
+            triangle_count += 1;
+        }
+    }
+
+    (triangle_count > 0).then_some(CameraLightProjectedQuad {
+        vertices,
+        triangle_count,
+    })
+}
+
+pub(super) fn camera_light_display_quad(
+    camera_position: DVec3,
+    frame: &CameraFrame,
+    light_position: DVec3,
+    light_radius: f64,
+    soft_falloff: bool,
+    width: u32,
+    height: u32,
+) -> Option<(DVec3, DVec3, [DVec3; 4], Option<CameraLightProjectedQuad>)> {
+    let to_light = Vec3::new(
+        light_position.x as f32,
+        light_position.y as f32,
+        light_position.z as f32,
+    ) - Vec3::new(
+        camera_position.x as f32,
+        camera_position.y as f32,
+        camera_position.z as f32,
+    );
+    let distance = to_light.length();
+    let (plane_normal, right, up) = if distance > 1.0e-8 {
+        let normal = to_light / distance;
+        let up_vector = if normal.z.abs() < 0.999_99 {
+            Vec3::Z
+        } else {
+            Vec3::X
+        };
+        let right = up_vector.cross(normal).normalize();
+        (normal, right, normal.cross(right))
+    } else {
+        (
+            Vec3::new(
+                frame.forward.x as f32,
+                frame.forward.y as f32,
+                frame.forward.z as f32,
+            ),
+            Vec3::new(
+                frame.right.x as f32,
+                frame.right.y as f32,
+                frame.right.z as f32,
+            ),
+            Vec3::new(frame.up.x as f32, frame.up.y as f32, frame.up.z as f32),
+        )
+    };
+
+    let mut radius = (light_radius as f32).max(0.001);
+    if !soft_falloff {
+        if distance > radius {
+            let ratio = radius / distance;
+            radius *= (1.0 / (1.0 - ratio * ratio).max(1.0e-8).sqrt()) as f32;
+        } else {
+            radius = frame.far as f32;
+        }
+    }
+    if !radius.is_finite() {
+        return None;
+    }
+
+    let center = Vec3::new(
+        light_position.x as f32,
+        light_position.y as f32,
+        light_position.z as f32,
+    );
+    let positions = CAMERA_LIGHT_QUAD_UV.map(|coordinate| {
+        let point = center + (right * coordinate[0] + up * coordinate[1]) * radius;
+        DVec3::new(f64::from(point.x), f64::from(point.y), f64::from(point.z))
+    });
+    let center = DVec3::new(
+        f64::from(center.x),
+        f64::from(center.y),
+        f64::from(center.z),
+    );
+    let plane_normal = DVec3::new(
+        f64::from(plane_normal.x),
+        f64::from(plane_normal.y),
+        f64::from(plane_normal.z),
+    );
+    let quad = project_camera_light_quad(camera_position, frame, width, height, &positions, None);
+    Some((center, plane_normal, positions, quad))
+}
+#[cfg(test)]
+mod camera_light_raster_tests {
+    use std::error::Error;
+
+    use glam::DVec3;
+
+    use super::{
+        Camera, CameraFrame, CameraLightProjectedQuad, CameraLightProjectedVertex, DepthOfField,
+        Projection, StereoMode, camera_frame, camera_light_display_quad, camera_light_eye_index,
+        project_camera_light_quad, ray_for_subpixel_in_frame,
+    };
+
+    fn camera(depth_of_field: Option<DepthOfField>) -> Camera {
+        Camera {
+            position: DVec3::ZERO,
+            target: -DVec3::Z,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Perspective {
+                lens_mm: 50.0,
+                sensor_width_mm: 36.0,
+            },
+            shift: [0.0; 2],
+            depth_of_field,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.0,
+        }
+    }
+
+    fn projected_center_x(quad: &CameraLightProjectedQuad) -> f32 {
+        let count = quad.triangle_count * 3;
+        quad.vertices[..count]
+            .iter()
+            .map(|vertex| vertex.screen[0])
+            .sum::<f32>()
+            / count as f32
+    }
+
+    fn projected_quad_positions(center: DVec3, radius: f64) -> [DVec3; 4] {
+        [
+            center + DVec3::new(-radius, -radius, 0.0),
+            center + DVec3::new(radius, -radius, 0.0),
+            center + DVec3::new(-radius, radius, 0.0),
+            center + DVec3::new(radius, radius, 0.0),
+        ]
+    }
+
+    #[test]
+    fn film_sample_translation_uses_pixel_corner_offsets() {
+        let quad = CameraLightProjectedQuad {
+            vertices: std::array::from_fn(|index| CameraLightProjectedVertex {
+                screen: [1.25 + index as f32, 2.75 + index as f32],
+                inverse_w: 1.0,
+                local: [0.0; 2],
+            }),
+            triangle_count: 2,
+        };
+        let centered = quad.rasterize(0.5, 0.5);
+        let shifted = quad.rasterize(0.25, 0.75);
+        assert_eq!(centered.screen[0], [320, 704]);
+        assert_eq!(shifted.screen[0], [384, 640]);
+    }
+
+    #[test]
+    fn sample_routing_keeps_the_anaglyph_eye() {
+        assert_eq!(camera_light_eye_index(StereoMode::Anaglyph, 0, 100, 1), 1);
+        assert_eq!(
+            camera_light_eye_index(StereoMode::SideBySide, 49, 100, 0),
+            0
+        );
+        assert_eq!(
+            camera_light_eye_index(StereoMode::SideBySide, 50, 100, 0),
+            1
+        );
+    }
+
+    #[test]
+    fn hard_falloff_expands_the_sphere_but_soft_falloff_keeps_its_disk()
+    -> Result<(), Box<dyn Error>> {
+        let camera = camera(None);
+        let frame = camera_frame(&camera, 100, 100)?;
+        let light = DVec3::new(0.0, 0.0, -10.0);
+        let (_, _, soft, _) =
+            camera_light_display_quad(camera.position, &frame, light, 1.0, true, 100, 100)
+                .ok_or("soft-falloff display quad was unavailable")?;
+        let (_, _, hard, _) =
+            camera_light_display_quad(camera.position, &frame, light, 1.0, false, 100, 100)
+                .ok_or("hard-falloff display quad was unavailable")?;
+        let center = DVec3::new(0.0, 0.0, -10.0);
+        let radius = |positions: [DVec3; 4]| (positions[0] - center).length() / 2.0_f64.sqrt();
+        let soft_radius = radius(soft);
+        let hard_radius = radius(hard);
+        assert!((soft_radius - 1.0).abs() < 1.0e-6);
+        assert!(hard_radius > soft_radius);
+        Ok(())
+    }
+
+    #[test]
+    fn camera_inside_off_axis_light_keeps_the_near_clipped_disk() -> Result<(), Box<dyn Error>> {
+        let camera = camera(None);
+        let frame = camera_frame(&camera, 100, 100)?;
+        let (_, _, _, projected) = camera_light_display_quad(
+            camera.position,
+            &frame,
+            DVec3::new(0.5, 0.0, -1.0),
+            2.0,
+            false,
+            100,
+            100,
+        )
+        .ok_or("inside light display geometry was unavailable")?;
+        let projected = projected.ok_or("inside light's visible quad was clipped away")?;
+        let raster = projected.rasterize(0.5, 0.5);
+        assert!(projected.contains_pixel(&raster, 50, 49));
+        Ok(())
+    }
+
+    #[test]
+    fn projected_dof_coverage_matches_the_aperture_ray() -> Result<(), Box<dyn Error>> {
+        let camera = camera(Some(DepthOfField {
+            focus_distance: 5.0,
+            aperture_radius: 0.5,
+            aperture_blades: 0,
+        }));
+        let frame: CameraFrame = camera_frame(&camera, 100, 100)?;
+        let positions = projected_quad_positions(DVec3::new(0.0, 0.0, -2.0), 0.02);
+        let pinhole =
+            project_camera_light_quad(camera.position, &frame, 100, 100, &positions, None)
+                .ok_or("pinhole quad projection was unavailable")?;
+        let lens_sample = frame
+            .lens_sample(0.75, 0.5)
+            .ok_or("depth-of-field lens sample was unavailable")?;
+        let aperture = project_camera_light_quad(
+            camera.position,
+            &frame,
+            100,
+            100,
+            &positions,
+            Some(lens_sample),
+        )
+        .ok_or("aperture quad projection was unavailable")?;
+        assert!(projected_center_x(&aperture) < projected_center_x(&pinhole) - 5.0);
+
+        let raster = aperture.rasterize(0.75, 0.5);
+        let inside_ray =
+            ray_for_subpixel_in_frame(&frame, camera.position, 100, 100, 39, 49, 0.75, 0.5)?
+                .ok_or("inside aperture sample had no ray")?;
+        let inside_distance = (-2.0 - inside_ray.origin.z) / inside_ray.direction.z;
+        let inside_hit = inside_ray.origin + inside_ray.direction * inside_distance;
+        assert!(inside_hit.x * inside_hit.x + inside_hit.y * inside_hit.y < 0.02_f64.powi(2));
+        assert!(aperture.contains_pixel(&raster, 39, 49));
+
+        let outside_ray =
+            ray_for_subpixel_in_frame(&frame, camera.position, 100, 100, 50, 49, 0.75, 0.5)?
+                .ok_or("outside aperture sample had no ray")?;
+        let outside_distance = (-2.0 - outside_ray.origin.z) / outside_ray.direction.z;
+        let outside_hit = outside_ray.origin + outside_ray.direction * outside_distance;
+        assert!(outside_hit.x * outside_hit.x + outside_hit.y * outside_hit.y > 0.02_f64.powi(2));
+        assert!(!aperture.contains_pixel(&raster, 50, 49));
+        Ok(())
+    }
 }
 
 struct PreparedTriangle {
@@ -887,6 +1517,15 @@ fn rasterize_with_samples_for_eye(
             FilmFilter::new(radius, width, height, eye_split)
         })
         .transpose()?;
+    // Film jitter is shared across pixels; other sample patterns vary per pixel.
+    let camera_light_raster_samples = match (film.as_ref(), camera_lights) {
+        (Some(film), Some(lights)) => Some(lights.prepare_raster_samples(
+            (0..samples).map(|sample_index| film.jitter(film_sample_offset(sample_index))),
+            camera.stereo_mode == StereoMode::SideBySide,
+        )?),
+        _ => None,
+    };
+
     let mut candidates = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -959,8 +1598,8 @@ fn rasterize_with_samples_for_eye(
                     // jittered over its pixel, the first included, as EEVEE jitters every sample (`pixel_jitter_get`).
                     let (sample_x, filter_y, sample_y) = if let Some(film) = film.as_ref() {
                         let (sample_x, filter_y) = film.jitter(film_sample_offset(sample_index));
-                        // Camera jitter moves screen rows opposite to the row-down film filter.
-                        (sample_x, filter_y, 1.0 - filter_y)
+                        // EEVEE applies the same pixel jitter to the projection and film sample table.
+                        (sample_x, filter_y, filter_y)
                     } else {
                         let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
                         (sample_x, sample_y, sample_y)
@@ -1030,11 +1669,22 @@ fn rasterize_with_samples_for_eye(
                             })
                             .transpose()?;
                         let camera_light_view = camera_lights.map(|lights| {
-                            if camera.stereo_mode == StereoMode::SideBySide && x >= width / 2 {
-                                lights.for_eye(1)
-                            } else {
-                                lights
-                            }
+                            let eye =
+                                camera_light_eye_index(camera.stereo_mode, x, width, view_index);
+                            let pixel_x =
+                                if camera.stereo_mode == StereoMode::SideBySide && x >= width / 2 {
+                                    x - width / 2
+                                } else {
+                                    x
+                                };
+                            lights.for_eye(eye).at_pixel(
+                                camera_light_raster_samples.as_ref(),
+                                sample_index as usize,
+                                sample_x,
+                                sample_y,
+                                pixel_x,
+                                y,
+                            )
                         });
                         let color = composite_sample_with_association(
                             &prepared,
@@ -1713,6 +2363,13 @@ fn checked_pixel_count(width: u32, height: u32) -> Result<usize> {
 fn pixel_in_bounds(width: u32, height: u32, x: u32, y: u32) -> bool {
     width != 0 && height != 0 && x < width && y < height
 }
+fn camera_light_eye_index(stereo_mode: StereoMode, x: u32, width: u32, view_index: usize) -> usize {
+    if stereo_mode == StereoMode::SideBySide {
+        if x >= width / 2 { 1 } else { 0 }
+    } else {
+        view_index
+    }
+}
 
 /// The camera's `forward`, `right`, and `up` directions in world space, from its position, target
 /// and up hint.
@@ -2166,14 +2823,11 @@ fn ray_for_subpixel_in_frame(
     }) else {
         return Ok(None);
     };
-    if let Some(dof) = frame.depth_of_field
-        && dof.aperture_radius > 0.0
-    {
-        let plane_distance = dof.focus_distance / ray.direction.dot(frame.forward).max(1.0e-6);
+    if let Some(lens_sample) = frame.lens_sample(sample_x, sample_y) {
+        let plane_distance =
+            lens_sample.focus_distance / ray.direction.dot(frame.forward).max(1.0e-6);
         let focus_point = ray.origin + ray.direction * plane_distance;
-        let aperture =
-            concentric_disk(sample_x, sample_y, dof.aperture_blades) * dof.aperture_radius;
-        ray.origin += frame.right * aperture.x + frame.up * aperture.y;
+        ray.origin += frame.right * lens_sample.aperture.x + frame.up * lens_sample.aperture.y;
         ray.direction = safe_normalize(focus_point - ray.origin)
             .ok_or_else(|| PotError::invalid_argument("depth-of-field ray is out of range"))?;
     }
@@ -2245,7 +2899,7 @@ impl FilmFilter {
     /// units: the raster position is `(0.5 - j_x, 0.5 + j_y)`.
     fn jitter(&self, offset: (f64, f64)) -> (f64, f64) {
         if self.radius >= std::f64::consts::FRAC_1_SQRT_2 {
-            return ((1.0 - offset.0).fract(), offset.1);
+            return (1.0 - offset.0, offset.1);
         }
         let scale = 0.5 * self.radius * offset.0.sqrt();
         let theta = std::f64::consts::TAU * offset.1;
@@ -2544,7 +3198,7 @@ fn composite_sample_with_association(
     world: Option<WorldRadiance<'_>>,
     shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
-    camera_lights: Option<super::path::RealtimeCameraLightView<'_, '_>>,
+    camera_lights: Option<super::path::RealtimeCameraLightSample<'_, '_, '_>>,
     mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
 ) -> Result<CompositeColor> {
     const MAX_ALPHA_LAYERS: usize = 16;
@@ -3020,7 +3674,7 @@ fn triangle_owns_edge(
         return dy < 0.0;
     }
     if dx.abs() > f64::MIN_POSITIVE {
-        return dx > 0.0;
+        return dx < 0.0;
     }
 
     // A projected point edge has no top-left direction; use a stable ray-space tie-break instead.
@@ -4017,6 +4671,53 @@ mod smooth_shading_tests {
                     "reverse_second_winding={reverse_second_winding}, got {actual:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn opaque_quad_matches_native_top_left_boundary_ownership() {
+        let probes = [
+            ("bottom", 10, 10, 0.0, 0.25, 1.0),
+            ("top", 20, 20, 0.0, -0.25, 0.0),
+            ("left", 40, 40, 0.25, 0.0, 1.0),
+            ("right", 50, 50, -0.25, 0.0, 0.0),
+        ];
+        let mut triangles = Vec::with_capacity(probes.len() * 2);
+        for (_, x, y, offset_x, offset_y, _) in probes {
+            let world_x = -1.0 + (f64::from(x) + 0.5) * 2.0 / f64::from(SIZE);
+            let world_y = 1.0 - (f64::from(y) + 0.5) * 2.0 / f64::from(SIZE);
+            let center = DVec3::new(world_x + offset_x, world_y + offset_y, 0.0);
+            let a = center + DVec3::new(-0.25, -0.25, 0.0);
+            let b = center + DVec3::new(0.25, -0.25, 0.0);
+            let c = center + DVec3::new(0.25, 0.25, 0.0);
+            let d = center + DVec3::new(-0.25, 0.25, 0.0);
+            let mut first = triangle(None);
+            first.positions = [a, b, c];
+            let mut second = triangle(None);
+            second.positions = [a, c, d];
+            triangles.extend([first, second]);
+        }
+
+        let output = rasterize_with_samples(
+            &triangles,
+            &camera(),
+            SIZE,
+            SIZE,
+            Mode::Beauty,
+            [0, 0, 0, 0],
+            None,
+            1,
+            0,
+            0.0,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .expect("opaque boundary probes rasterize");
+        for (edge, x, y, _, _, expected_alpha) in probes {
+            let actual = f64::from(output.linear_rgba[y as usize * SIZE as usize + x as usize][3]);
+            assert_eq!(actual, expected_alpha, "{edge} edge");
         }
     }
 

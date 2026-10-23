@@ -233,7 +233,7 @@ fn image_storage(image: &Image, bytes: &[u8]) -> ImageStorage {
 /// The precision a stored image is quantised to, which sets the precision of Blender's premultiply at load: a 16-bit
 /// PNG or any 16-bit decoder output is 16-bit; an EXR whose colour channels are all half is half; an EXR with float
 /// channels, Radiance HDR, float decoder output, and Potter's stored pixel format are float; other encodings are 8-bit.
-fn source_precision(bytes: &[u8]) -> Precision {
+pub(crate) fn source_precision(bytes: &[u8]) -> Precision {
     if bytes.first() == Some(&b'{') {
         return Precision::Float;
     }
