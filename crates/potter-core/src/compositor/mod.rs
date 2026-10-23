@@ -65,16 +65,6 @@ pub(crate) fn apply(
     Ok(())
 }
 
-/// Applies the selected scene compositor to an already-linear image without display encoding.
-pub(crate) fn apply_image(
-    image: Image,
-    doc: &SceneDoc,
-    scene: &Scene,
-    frame: f64,
-) -> Result<Image> {
-    apply_image_with_association(image, doc, scene, frame, false)
-}
-
 /// Applies the scene compositor to associated float RGBA, preserving additive RGB at alpha zero.
 pub(crate) fn apply_associated_image(
     image: Image,
@@ -117,16 +107,6 @@ fn apply_image_with_association(
 enum NodeOutput {
     Image(Image),
     RenderLayers,
-}
-
-fn evaluate_graph(
-    graph: &NodeGroup,
-    base: &Image,
-    passes: Option<&RasterOutput>,
-    doc: &SceneDoc,
-    frame: f64,
-) -> Result<Image> {
-    evaluate_graph_with_association(graph, base, passes, doc, frame, false)
 }
 
 fn evaluate_graph_with_association(
@@ -1168,19 +1148,6 @@ pub(crate) fn encode_display_output(
         settings,
         output.linear_rgba_associated,
     )
-}
-
-/// Applies scene color management and returns the image's display-encoded RGBA8 pixels.
-pub(crate) fn encode_image_display(image: &Image, settings: &ColorManagement) -> Result<Vec<u8>> {
-    let length = image.pixels.len().checked_mul(4).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "display image dimensions exceed platform limits",
-        )
-    })?;
-    let mut bytes = vec![0; length];
-    encode_display(&mut bytes, &image.pixels, settings, false)?;
-    Ok(bytes)
 }
 
 /// Applies scene color management to associated float RGBA and returns display-encoded pixels.

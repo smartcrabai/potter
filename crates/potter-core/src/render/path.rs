@@ -1591,13 +1591,13 @@ impl<'lights> RealtimeCameraLightContext<'lights> {
         }
     }
 
-    fn local_events<'a>(
-        &'a self,
+    fn local_events(
+        &self,
         eye: usize,
         origin: DVec3,
         direction: DVec3,
         far_distance: f64,
-    ) -> impl Iterator<Item = CameraLightEvent> + 'a {
+    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
         self.lights()
             .iter()
             .zip(&self.culling)
@@ -1631,12 +1631,12 @@ impl RealtimeCameraLightView<'_, '_> {
         }
     }
 
-    pub(super) fn local_events<'a>(
-        &'a self,
+    pub(super) fn local_events(
+        &self,
         origin: DVec3,
         direction: DVec3,
         far_distance: f64,
-    ) -> impl Iterator<Item = CameraLightEvent> + 'a {
+    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
         self.context
             .local_events(self.eye, origin, direction, far_distance)
     }
@@ -1679,8 +1679,16 @@ pub(super) fn prepare_realtime_camera_light_context<'a>(
         .map(|(light, prepared)| CameraLightCull {
             area_display: prepared.area_display,
             visible: [
-                camera_light_visible_in_view(light, prepared.influence_radius_max, frusta[0]),
-                camera_light_visible_in_view(light, prepared.influence_radius_max, frusta[1]),
+                camera_light_visible_in_view(
+                    light,
+                    prepared.influence_radius_max,
+                    frusta[0].as_ref(),
+                ),
+                camera_light_visible_in_view(
+                    light,
+                    prepared.influence_radius_max,
+                    frusta[1].as_ref(),
+                ),
             ],
         })
         .collect();
@@ -1730,7 +1738,7 @@ fn camera_light_frusta(
 fn camera_light_visible_in_view(
     light: &PointLight,
     influence_radius_max: f64,
-    frustum: Option<CameraFrustum>,
+    frustum: Option<&CameraFrustum>,
 ) -> bool {
     if !light.camera_shape_eligible
         || light.ray_mask & RayKind::Camera.bit() == 0

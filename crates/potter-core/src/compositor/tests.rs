@@ -49,13 +49,47 @@ fn run_node(
     passes: Option<&RasterOutput>,
     doc: &SceneDoc,
 ) -> Result<Image> {
-    evaluate_graph(
-        &graph_with_node(node, output_socket),
-        base,
-        passes,
-        doc,
-        1.0,
-    )
+    let graph_id = Id::from_static("test_compositor");
+    let mut doc = doc.clone();
+    doc.node_groups
+        .insert(graph_id.clone(), graph_with_node(node, output_socket));
+    let scene_id = doc.active_scene.clone();
+    let scene = doc.scenes.get_mut(&scene_id).unwrap();
+    scene.use_compositing = true;
+    scene.compositor = Some(graph_id);
+    let scene = doc.scenes.get(&scene_id).unwrap();
+
+    let pixel_count = base.pixels.len();
+    let mut output = RasterOutput {
+        rgba: vec![0; pixel_count * 4],
+        linear_rgba: base.pixels.clone(),
+        linear_rgba_associated: false,
+        ids: passes.map_or_else(|| vec![0; pixel_count], |passes| passes.ids.clone()),
+        depths: passes.map_or_else(|| vec![0.0; pixel_count], |passes| passes.depths.clone()),
+        elements: passes.map_or_else(|| vec![0; pixel_count], |passes| passes.elements.clone()),
+        normals: passes.map_or_else(
+            || vec![[0.0; 3]; pixel_count],
+            |passes| passes.normals.clone(),
+        ),
+        albedo: passes.map_or_else(
+            || vec![[0.0; 4]; pixel_count],
+            |passes| passes.albedo.clone(),
+        ),
+        emission: passes.map_or_else(
+            || vec![[0.0; 4]; pixel_count],
+            |passes| passes.emission.clone(),
+        ),
+        ambient_occlusion: passes.map_or_else(
+            || vec![0.0; pixel_count],
+            |passes| passes.ambient_occlusion.clone(),
+        ),
+    };
+    super::apply(&mut output, &doc, scene, base.width, base.height, 1.0)?;
+    Ok(Image {
+        width: base.width,
+        height: base.height,
+        pixels: output.linear_rgba,
+    })
 }
 
 fn run_associated_graph(graph: NodeGroup, base: &Image) -> Result<Image> {

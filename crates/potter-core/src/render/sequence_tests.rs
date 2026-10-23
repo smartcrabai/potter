@@ -13,7 +13,7 @@ use crate::{
     sequencer::{EffectType, Strip, StripType, TransitionType},
 };
 
-fn camera_volume_doc(grid: Value, render_samples: u32) -> Result<SceneDoc, Box<dyn Error>> {
+fn camera_volume_doc(grid: &Value, render_samples: u32) -> Result<SceneDoc, Box<dyn Error>> {
     const EYE_OFFSET: f64 = 0.2;
     let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
     let outcome = apply_batch(
@@ -270,13 +270,14 @@ fn scene_strips_match_their_source_camera_render() -> Result<(), Box<dyn Error>>
 
 #[test]
 fn nested_realtime_volume_uses_outer_sequence_sample_count() -> Result<(), Box<dyn Error>> {
+    const OUTER_SEQUENCE_SAMPLES: u32 = 4;
     let grid = json!({
         "dims": [5, 5, 3],
         "voxel_size": 1.0,
         "origin": [-2.0, -2.0, 1.0],
         "values": vec![1.0; 75]
     });
-    let mut doc = camera_volume_doc(grid, 1)?;
+    let mut doc = camera_volume_doc(&grid, 1)?;
     let scene_id = doc.active_scene.clone();
     let mut scene = doc.scenes.get(&scene_id).unwrap().clone();
     scene.sequencer.strips = vec![Strip {
@@ -285,7 +286,6 @@ fn nested_realtime_volume_uses_outer_sequence_sample_count() -> Result<(), Box<d
     }];
     doc.scenes.insert(scene_id.clone(), scene.clone());
 
-    const OUTER_SEQUENCE_SAMPLES: u32 = 4;
     assert_eq!(doc.scenes.get(&scene_id).unwrap().render.samples, 1);
     let directory = tempdir()?;
     let cache_directory = directory.path().join(".potter/cache");
@@ -327,7 +327,7 @@ fn anaglyph_realtime_volume_resolves_each_eye_column_independently() -> Result<(
         "origin": [-1.5, -1.5, 1.0],
         "values": values
     });
-    let doc = camera_volume_doc(grid, SAMPLES)?;
+    let doc = camera_volume_doc(&grid, SAMPLES)?;
     let directory = tempdir()?;
     let anaglyph = render_realtime_pixel(&doc, directory.path(), "camera_stereo", SAMPLES)?;
     let left = render_realtime_pixel(&doc, directory.path(), "camera_left", SAMPLES)?;
@@ -374,7 +374,7 @@ fn side_by_side_realtime_volume_odd_seam_matches_each_eye() -> Result<(), Box<dy
         "origin": [-1.5, -1.5, 1.0],
         "values": values
     });
-    let mut doc = camera_volume_doc(grid, SAMPLES)?;
+    let mut doc = camera_volume_doc(&grid, SAMPLES)?;
     let scene_id = doc.active_scene.clone();
     doc.scenes
         .get_mut(&scene_id)

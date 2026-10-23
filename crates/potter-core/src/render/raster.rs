@@ -494,7 +494,6 @@ impl CameraFrame {
     }
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct CameraFrustum {
     corners: [DVec3; 8],
     planes: [FrustumPlane; 6],
@@ -513,13 +512,13 @@ impl FrustumPlane {
 }
 
 impl CameraFrustum {
-    pub(crate) fn intersects_sphere(self, center: DVec3, radius: f64) -> bool {
+    pub(crate) fn intersects_sphere(&self, center: DVec3, radius: f64) -> bool {
         self.planes
             .iter()
             .all(|plane| plane.distance(center) >= -radius)
     }
 
-    pub(crate) fn intersects_pyramid(self, corners: [DVec3; 5]) -> bool {
+    pub(crate) fn intersects_pyramid(&self, corners: [DVec3; 5]) -> bool {
         if self
             .planes
             .iter()
@@ -2530,37 +2529,6 @@ fn is_white(tint: [f64; 3]) -> bool {
     tint.iter().all(|&channel| (channel - 1.0).abs() <= 1.0e-12)
 }
 
-fn composite_sample(
-    triangles: &[PreparedTriangle],
-    visibility: &super::bvh::Bvh,
-    candidates: &mut Vec<usize>,
-    ray: Ray,
-    frame: &CameraFrame,
-    camera: &Camera,
-    background: [f64; 4],
-    world: Option<WorldRadiance<'_>>,
-    shader: Option<&dyn SurfaceShader>,
-    cached_hit: Option<VisibleHit>,
-    camera_lights: Option<super::path::RealtimeCameraLightView<'_, '_>>,
-    volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
-) -> Result<[f64; 4]> {
-    composite_sample_with_association(
-        triangles,
-        visibility,
-        candidates,
-        ray,
-        frame,
-        camera,
-        background,
-        world,
-        shader,
-        cached_hit,
-        camera_lights,
-        volume_sample,
-    )
-    .map(|color| color.straight)
-}
-
 fn composite_sample_with_association(
     triangles: &[PreparedTriangle],
     visibility: &super::bvh::Bvh,
@@ -2791,7 +2759,7 @@ fn associated_rgba(color: [f64; 4]) -> [f64; 4] {
     ]
 }
 
-/// One surface of a pixel's stack, for `composite_layers`.
+/// One surface of a pixel's stack, for `composite_layers_with_association`.
 #[derive(Clone, Copy)]
 struct Layer {
     rgb: [f64; 3],
@@ -2810,14 +2778,6 @@ struct Layer {
 /// `average(transmittance)` per surface). Overlapping coloured layers therefore multiply their means, not the mean of
 /// their products. The film alpha is `1 - alpha_transmittance * (1 - background alpha)`. With white tints this is the
 /// scalar composite of the layers. Returns straight display colour and associated Combined RGB.
-fn composite_layers_with_background(
-    layers: impl IntoIterator<Item = Layer>,
-    background_alpha: f64,
-    background_rgb: impl FnOnce() -> Result<[f64; 3]>,
-) -> Result<[f64; 4]> {
-    composite_layers_with_association(layers, background_alpha, background_rgb)
-        .map(|color| color.straight)
-}
 
 fn composite_layers_with_association(
     layers: impl IntoIterator<Item = Layer>,
@@ -4244,9 +4204,9 @@ mod visibility_tests {
 
     use super::{
         AlphaMode, Camera, CameraFrame, Hit, Layer, Mode, PreparedTriangle, Projection, Ray,
-        StereoMode, Triangle, camera_frame, composite_layers_with_background, composite_sample,
-        hit_opacity, intersect_triangle, nearest_visible_hit, prepare_triangles,
-        ray_for_pixel_in_frame,
+        StereoMode, Triangle, camera_frame, composite_layers_with_association,
+        composite_sample_with_association, hit_opacity, intersect_triangle, nearest_visible_hit,
+        prepare_triangles, ray_for_pixel_in_frame,
     };
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
@@ -4353,7 +4313,7 @@ mod visibility_tests {
 
     /// The composite before candidate culling: every prepared triangle in index order, inserted
     /// by depth (equal depths keep index order), the 16 nearest layers kept, then the same
-    /// accumulation as `composite_sample`. Shading is the triangle colour, as with no shader.
+    /// accumulation as `composite_sample_with_association`. Shading is the triangle colour, as with no shader.
     fn scan_composite(
         triangles: &[PreparedTriangle],
         ray: Ray,
@@ -4375,7 +4335,7 @@ mod visibility_tests {
             layers.insert(at, (index, hit));
             layers.truncate(16);
         }
-        composite_layers_with_background(
+        composite_layers_with_association(
             layers.iter().map(|(index, _)| {
                 let triangle = &triangles[*index];
                 let color = triangle.source.color;
@@ -4388,6 +4348,7 @@ mod visibility_tests {
             background[3],
             || Ok([background[0], background[1], background[2]]),
         )
+        .map(|color| color.straight)
     }
 
     #[test]
@@ -4442,7 +4403,7 @@ mod visibility_tests {
                     .expect("the perspective test view has a ray");
                 let expected = scan_composite(&prepared, ray, &frame, BACKGROUND)
                     .expect("reference composite resolves");
-                let actual = composite_sample(
+                let actual = composite_sample_with_association(
                     &prepared,
                     &visibility,
                     &mut candidates,
@@ -4457,7 +4418,7 @@ mod visibility_tests {
                     None,
                 )
                 .expect("composite resolves");
-                assert_eq!(actual, expected, "pixel ({x}, {y})");
+                assert_eq!(actual.straight, expected, "pixel ({x}, {y})");
             }
         }
     }
@@ -4465,15 +4426,16 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod composite_layer_tests {
-    use super::{Layer, composite_layers_with_background};
+    use super::{Layer, composite_layers_with_association};
 
     fn composite_layers(
         layers: impl IntoIterator<Item = Layer>,
         background: [f64; 4],
     ) -> super::Result<[f64; 4]> {
-        composite_layers_with_background(layers, background[3], || {
+        composite_layers_with_association(layers, background[3], || {
             Ok([background[0], background[1], background[2]])
         })
+        .map(|color| color.straight)
     }
 
     fn assert_close(actual: [f64; 4], expected: [f64; 4]) {
