@@ -752,6 +752,20 @@ fn evaluate_surface_inner_into(
     } else {
         None
     };
+    // The Thickness socket, when linked, is the refraction thickness of the whole material (EEVEE's `nodetree_thickness`);
+    // unlinked, the object's bounds decide it. The mode is the material's.
+    let thickness = if group
+        .links
+        .iter()
+        .any(|link| link.to_node == *output && link.to_socket == "Thickness")
+    {
+        match evaluator.input(output, "Thickness", ValueKind::Scalar)? {
+            Value::Scalar(thickness) => Some(thickness.max(0.0)),
+            _ => return Err(eval_error("material thickness is not a scalar")),
+        }
+    } else {
+        None
+    };
     let displacement_height = if has_displacement {
         let normal = hit_ctx.normal;
         match evaluator.input(output, "Displacement", ValueKind::Vector)? {

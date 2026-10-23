@@ -1,5 +1,5 @@
 {
-  "blender": "Blender 5.2.2 LTS (hash d13f752e3b9c, built 2026-09-15 01:49:19)",
+  "blender": "Blender 5.2.2 LTS / build date: 2026-09-15 / build time: 01:49:19 / build commit date: 2026-09-14",
   "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
   "machine": "arm64",
   "generated_by": "EEVEE renders from the light-shape, world-background, and B oracle scripts on macOS; each EXR exported with export_eevee_fixture.py. Script hashes identify the rendering and export sources.",

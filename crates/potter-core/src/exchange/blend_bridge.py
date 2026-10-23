@@ -2497,7 +2497,6 @@ def _eevee_volumetric_end(scene):
     eevee = getattr(scene, "eevee", None)
     return float(getattr(eevee, "volumetric_end", 100.0)) if eevee is not None else 100.0
 
-
 def _cryptomatte_accurate(scene):
     return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
