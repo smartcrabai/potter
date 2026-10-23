@@ -169,6 +169,122 @@
         "radius": 1.5
       },
       "expectation": "inert"
+    },
+    {
+      "id": "particle_instance_no_parents_keeps_mesh",
+      "primitive": "box",
+      "modifier": "particle_instance",
+      "setup": "particle_instance_emitter",
+      "baseline_params": {
+        "object": "emitter",
+        "use_normal": true
+      },
+      "case_params": {
+        "object": "emitter",
+        "use_normal": false
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "particle_instance_axis_x",
+      "primitive": "plane",
+      "modifier": "particle_instance",
+      "setup": "particle_instance_emitter",
+      "baseline_params": {
+        "object": "emitter"
+      },
+      "case_params": {
+        "object": "emitter",
+        "axis": "X"
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "particle_instance_amount_half",
+      "primitive": "box",
+      "modifier": "particle_instance",
+      "setup": "particle_instance_emitter",
+      "baseline_params": {
+        "object": "emitter"
+      },
+      "case_params": {
+        "object": "emitter",
+        "particle_amount": 0.5,
+        "particle_offset": 0.0
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "particle_instance_position_without_path_inert",
+      "primitive": "box",
+      "modifier": "particle_instance",
+      "setup": "particle_instance_emitter",
+      "baseline_params": {
+        "object": "emitter"
+      },
+      "case_params": {
+        "object": "emitter",
+        "position": 0.5
+      },
+      "expectation": "inert"
+    },
+    {
+      "id": "particle_instance_use_size",
+      "primitive": "box",
+      "modifier": "particle_instance",
+      "setup": "particle_instance_emitter",
+      "baseline_params": {
+        "object": "emitter"
+      },
+      "case_params": {
+        "object": "emitter",
+        "use_size": true
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "explode_use_edge_cut",
+      "primitive": "box",
+      "modifier": "explode",
+      "setup": "particle_emitter",
+      "baseline_params": {},
+      "case_params": {
+        "use_edge_cut": true
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "explode_show_alive_off",
+      "primitive": "box",
+      "modifier": "explode",
+      "setup": "particle_emitter",
+      "baseline_params": {},
+      "case_params": {
+        "show_alive": false
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "explode_use_size",
+      "primitive": "box",
+      "modifier": "explode",
+      "setup": "particle_emitter",
+      "baseline_params": {},
+      "case_params": {
+        "use_size": true
+      },
+      "expectation": "equal_active"
+    },
+    {
+      "id": "explode_protect_without_group_inert",
+      "primitive": "box",
+      "modifier": "explode",
+      "setup": "particle_emitter",
+      "baseline_params": {},
+      "case_params": {
+        "protect": 0.5
+      },
+      "expectation": "inert"
     }
   ]
 }

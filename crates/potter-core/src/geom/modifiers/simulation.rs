@@ -1,527 +1,18 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
-use glam::{DMat3, DMat4, DQuat, DVec3, IVec3};
+use glam::{DMat4, DVec3, IVec3};
 use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{
-        Edge, Face, Mesh, Vertex, edge_key,
         vdb::{VdbGrid, VdbValue, VdbVolume},
         volume::{VolumeData, VolumeGeneratedSource, VolumeGrid, VolumeSource},
     },
-    sim::ParticleState,
 };
-
-/// Instantiates the current mesh at each visible particle position in the target object's space.
-pub fn particle_instance(
-    mesh: &Mesh,
-    particles: &[ParticleState],
-    source_world: DMat4,
-    _target_world: DMat4,
-    params: &Map<String, Value>,
-    _frame: f64,
-    fps: f64,
-) -> Result<Mesh> {
-    if !fps.is_finite() || fps <= 0.0 {
-        return Err(invalid(
-            "particle instance frame rate must be finite and positive",
-        ));
-    }
-    let space = string_param("particle_instance", params, "space")?;
-    if !matches!(space, "WORLD" | "LOCAL") {
-        return Err(unsupported(
-            "modifier.particle_instance.space",
-            "unsupported particle instance space",
-        ));
-    }
-    let inverse_source = if space == "LOCAL" {
-        Some(invert(source_world)?)
-    } else {
-        None
-    };
-    let show_alive = bool_param("particle_instance", params, "show_alive")?;
-    let show_dead = bool_param("particle_instance", params, "show_dead")?;
-    let show_unborn = bool_param("particle_instance", params, "show_unborn")?;
-    let use_children = bool_param("particle_instance", params, "use_children")?;
-    let use_normal = bool_param("particle_instance", params, "use_normal")?;
-    let use_size = bool_param("particle_instance", params, "use_size")?;
-    if bool_param("particle_instance", params, "use_path")? {
-        return Err(unsupported(
-            "modifier.particle_instance.use_path",
-            "Blender sampled paths require particle cache trajectories, which are not represented by the current particle states",
-        ));
-    }
-    let axis = string_param("particle_instance", params, "axis")?;
-    let axis_index = match axis {
-        "X" => 0,
-        "Y" => 1,
-        "Z" => 2,
-        _ => return Err(invalid("axis must be X, Y, or Z")),
-    };
-    let track_axis = if params.contains_key("track_axis") {
-        string_param("particle_instance", params, "track_axis")?
-    } else {
-        // `track_axis` has no schema default; it follows `axis`.
-        axis
-    };
-    let track_index = match track_axis {
-        "X" | "POS_X" | "NEG_X" => 0,
-        "Y" | "POS_Y" | "NEG_Y" => 1,
-        "Z" | "POS_Z" | "NEG_Z" => 2,
-        _ => return Err(invalid("track_axis must be X, Y, or Z")),
-    };
-    let orient_point = |point: DVec3| {
-        let source = point.to_array();
-        let mut destination = [0.0; 3];
-        for offset in 0..3 {
-            destination[(axis_index + offset) % 3] = source[(track_index + offset) % 3];
-        }
-        DVec3::from_array(destination)
-    };
-    let axis_matrix = DMat4::from_mat3(DMat3::from_cols(
-        orient_point(DVec3::X),
-        orient_point(DVec3::Y),
-        orient_point(DVec3::Z),
-    ));
-    let mut transforms = Vec::new();
-    for particle in particles {
-        if particle.is_child {
-            if !use_children {
-                continue;
-            }
-        } else if !use_normal {
-            continue;
-        }
-        let visible = match particle.life_state {
-            crate::sim::ParticleLifeState::Alive => show_alive,
-            crate::sim::ParticleLifeState::Dead => show_dead,
-            crate::sim::ParticleLifeState::Unborn => show_unborn,
-        };
-        if !visible {
-            continue;
-        }
-        let (world_translation, particle_rotation) =
-            if particle.life_state == crate::sim::ParticleLifeState::Unborn {
-                (
-                    DVec3::from_array(particle.birth_position),
-                    DQuat::from_array(particle.birth_rotation),
-                )
-            } else {
-                (
-                    DVec3::from_array(particle.position),
-                    DQuat::from_array(particle.rotation),
-                )
-            };
-        if !particle_rotation.is_finite() || particle_rotation.length_squared() <= 1.0e-20 {
-            return Err(invalid(
-                "particle instance rotation must be finite and nonzero",
-            ));
-        }
-        let orientation = particle_rotation.normalize();
-        let rotation = orientation;
-        let scale = if use_size { particle.size } else { 1.0 };
-        let instance_matrix =
-            DMat4::from_scale_rotation_translation(DVec3::splat(scale), rotation, DVec3::ZERO)
-                * axis_matrix;
-        let (matrix, translation) = if space == "LOCAL" {
-            let inverse_source = inverse_source
-                .ok_or_else(|| invalid("local particle-instance transform is unavailable"))?;
-            let transformed = inverse_source * instance_matrix;
-            (
-                DMat4::from_mat3(DMat3::from_cols(
-                    transformed.x_axis.truncate(),
-                    transformed.y_axis.truncate(),
-                    transformed.z_axis.truncate(),
-                )),
-                inverse_source.transform_point3(world_translation),
-            )
-        } else {
-            (instance_matrix, world_translation)
-        };
-        transforms.push((matrix, translation));
-    }
-    append_instances(mesh, &transforms)
-}
-
-/// Splits source faces into disconnected particle-driven fragments.
-pub fn explode(
-    mesh: &Mesh,
-    particles: &[ParticleState],
-    target_world: DMat4,
-    params: &Map<String, Value>,
-    _frame: f64,
-    _lifetime: f64,
-) -> Result<Mesh> {
-    let show_alive = bool_param("explode", params, "show_alive")?;
-    let show_dead = bool_param("explode", params, "show_dead")?;
-    let show_unborn = bool_param("explode", params, "show_unborn")?;
-    let use_edge_cut = bool_param("explode", params, "use_edge_cut")?;
-    let use_size = bool_param("explode", params, "use_size")?;
-    let protect = number_param("explode", params, "protect")?;
-    if !(0.0..=1.0).contains(&protect) {
-        return Err(invalid("protect must be in [0, 1]"));
-    }
-    let alive = particles
-        .iter()
-        .filter(|particle| match particle.life_state {
-            crate::sim::ParticleLifeState::Alive => show_alive,
-            crate::sim::ParticleLifeState::Dead => show_dead,
-            crate::sim::ParticleLifeState::Unborn => show_unborn,
-        })
-        .collect::<Vec<_>>();
-    if alive.is_empty() {
-        return Ok(Mesh::default());
-    }
-    let inverse_world = invert(target_world)?;
-    let positions = mesh
-        .vertices
-        .iter()
-        .enumerate()
-        .map(|(index, vertex)| (vertex.id, (index, vertex.co)))
-        .collect::<BTreeMap<_, _>>();
-    let local_particles = alive
-        .iter()
-        .map(|particle| {
-            (
-                inverse_world.transform_point3(DVec3::from_array(particle.birth_position)),
-                particle.size,
-            )
-        })
-        .collect::<Vec<_>>();
-    let face_particles = mesh
-        .faces
-        .iter()
-        .map(|face| {
-            let points = face
-                .vertices
-                .iter()
-                .map(|id| {
-                    positions
-                        .get(id)
-                        .map(|(_, point)| *point)
-                        .ok_or_else(|| invalid("explode face references a missing vertex"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let center = points.iter().copied().sum::<DVec3>() / points.len() as f64;
-            Ok(nearest_particle(center, &local_particles))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut vertex_particles = vec![alive.len(); mesh.vertices.len()];
-    for (face, particle_index) in mesh.faces.iter().zip(&face_particles) {
-        for vertex_id in &face.vertices {
-            let vertex_index = positions
-                .get(vertex_id)
-                .map(|(index, _)| *index)
-                .ok_or_else(|| invalid("explode face references a missing vertex"))?;
-            vertex_particles[vertex_index] = *particle_index;
-        }
-    }
-    let mut geometry_points = mesh
-        .vertices
-        .iter()
-        .map(|vertex| vertex.co)
-        .collect::<Vec<_>>();
-    let mut split_edges = BTreeMap::<(usize, usize), usize>::new();
-    if use_edge_cut {
-        for face in &mesh.faces {
-            let vertex_indices = face
-                .vertices
-                .iter()
-                .map(|vertex_id| {
-                    positions
-                        .get(vertex_id)
-                        .map(|(index, _)| *index)
-                        .ok_or_else(|| invalid("explode face references a missing vertex"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for index in 0..vertex_indices.len() {
-                let first = vertex_indices[index];
-                let second = vertex_indices[(index + 1) % vertex_indices.len()];
-                if vertex_particles[first] != vertex_particles[second] {
-                    add_split_edge(&mut split_edges, &mut geometry_points, first, second);
-                }
-            }
-            if vertex_indices.len() == 4
-                && (0..4).all(|index| {
-                    vertex_particles[vertex_indices[index]]
-                        != vertex_particles[vertex_indices[(index + 1) % 4]]
-                })
-            {
-                add_split_edge(
-                    &mut split_edges,
-                    &mut geometry_points,
-                    vertex_indices[0],
-                    vertex_indices[2],
-                );
-            }
-        }
-    }
-
-    let mut output = Mesh::default();
-    let mut output_vertices = BTreeMap::<(usize, usize), u32>::new();
-    let mut output_edges = BTreeSet::new();
-    for (face_index, face) in mesh.faces.iter().enumerate() {
-        let source_indices = face
-            .vertices
-            .iter()
-            .map(|vertex_id| {
-                positions
-                    .get(vertex_id)
-                    .map(|(index, _)| *index)
-                    .ok_or_else(|| invalid("explode face references a missing vertex"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let face_particle = face_particles[face_index];
-        let fragments = if use_edge_cut {
-            edge_cut_fragments(
-                &source_indices,
-                &vertex_particles,
-                &split_edges,
-                face_particle,
-            )?
-        } else {
-            vec![(source_indices, face_particle)]
-        };
-        let protection = (1.0 - protect) * vertex_group_weight(mesh, face, params);
-        for (fragment, fragment_particle) in fragments {
-            let particle = alive[fragment_particle];
-            let current_position = DVec3::from_array(particle.position);
-            let birth_position = DVec3::from_array(particle.birth_position);
-            let current_rotation = DQuat::from_array(particle.rotation);
-            let birth_rotation = DQuat::from_array(particle.birth_rotation);
-            if !current_rotation.is_finite()
-                || !birth_rotation.is_finite()
-                || current_rotation.length_squared() <= 1.0e-20
-                || birth_rotation.length_squared() <= 1.0e-20
-            {
-                return Err(invalid(
-                    "explode particle rotations must be finite and nonzero",
-                ));
-            }
-            let rotation_delta =
-                current_rotation.normalize() * birth_rotation.normalize().inverse();
-            let size = if use_size { particle.size } else { 1.0 };
-            let mut expanded = Vec::with_capacity(fragment.len() * 2);
-            for (first, second) in fragment
-                .iter()
-                .copied()
-                .zip(fragment.iter().copied().cycle().skip(1))
-                .take(fragment.len())
-            {
-                expanded.push(first);
-                if let Some(midpoint) = split_edges.get(&edge_key(first, second)) {
-                    expanded.push(*midpoint);
-                }
-            }
-            let mut vertex_ids = Vec::with_capacity(expanded.len());
-            for point_index in expanded {
-                let key = (point_index, fragment_particle);
-                let id = if let Some(id) = output_vertices.get(&key) {
-                    *id
-                } else {
-                    let id = take_id(&mut output.next_id.vertex)?;
-                    let source_world = target_world.transform_point3(geometry_points[point_index]);
-                    let relative = source_world - birth_position;
-                    let world_point =
-                        current_position + rotation_delta * relative * (size * protection);
-                    let position = inverse_world.transform_point3(world_point);
-                    output.vertices.push(Vertex { id, co: position });
-                    output_vertices.insert(key, id);
-                    id
-                };
-                vertex_ids.push(id);
-            }
-            for (first, second) in super::cyclic_pairs(&vertex_ids) {
-                let key = edge_key(*first, *second);
-                if output_edges.insert(key) {
-                    let id = take_id(&mut output.next_id.edge)?;
-                    output.edges.push(Edge {
-                        id,
-                        vertices: [*first, *second],
-                    });
-                }
-            }
-            let id = take_id(&mut output.next_id.face)?;
-            output.faces.push(Face {
-                id,
-                vertices: vertex_ids,
-                material_index: face.material_index,
-            });
-        }
-    }
-
-    output
-        .validate()
-        .map_err(|error| invalid(&format!("explode produced invalid geometry: {error}")))?;
-    Ok(output)
-}
-fn add_split_edge(
-    split_edges: &mut BTreeMap<(usize, usize), usize>,
-    points: &mut Vec<DVec3>,
-    first: usize,
-    second: usize,
-) {
-    split_edges
-        .entry(edge_key(first, second))
-        .or_insert_with(|| {
-            let midpoint = (points[first] + points[second]) * 0.5;
-            let index = points.len();
-            points.push(midpoint);
-            index
-        });
-}
-
-fn edge_cut_fragments(
-    vertices: &[usize],
-    vertex_particles: &[usize],
-    split_edges: &BTreeMap<(usize, usize), usize>,
-    face_particle: usize,
-) -> Result<Vec<(Vec<usize>, usize)>> {
-    match vertices.len() {
-        3 => triangle_cut_fragments(vertices, vertex_particles, split_edges),
-        4 => quad_cut_fragments(vertices, vertex_particles, split_edges, face_particle),
-        count if count > 4 => {
-            let has_cut = (1..count - 1).any(|index| {
-                let triangle = [vertices[0], vertices[index], vertices[index + 1]];
-                [
-                    (triangle[0], triangle[1]),
-                    (triangle[1], triangle[2]),
-                    (triangle[2], triangle[0]),
-                ]
-                .into_iter()
-                .any(|(first, second)| split_edges.contains_key(&edge_key(first, second)))
-            });
-            if !has_cut {
-                return Ok(vec![(vertices.to_vec(), face_particle)]);
-            }
-            let mut fragments = Vec::new();
-            for index in 1..count - 1 {
-                fragments.extend(triangle_cut_fragments(
-                    &[vertices[0], vertices[index], vertices[index + 1]],
-                    vertex_particles,
-                    split_edges,
-                )?);
-            }
-            Ok(fragments)
-        }
-        _ => Err(invalid(
-            "explode faces must contain at least three vertices",
-        )),
-    }
-}
-
-fn triangle_cut_fragments(
-    vertices: &[usize],
-    vertex_particles: &[usize],
-    split_edges: &BTreeMap<(usize, usize), usize>,
-) -> Result<Vec<(Vec<usize>, usize)>> {
-    let [first, second, third] = vertices else {
-        return Err(invalid(
-            "explode triangle must contain exactly three vertices",
-        ));
-    };
-    let edge = |a: usize, b: usize| {
-        split_edges
-            .get(&edge_key(a, b))
-            .copied()
-            .ok_or_else(|| invalid("explode triangle cut edge is missing its midpoint"))
-    };
-    let mask = usize::from(split_edges.contains_key(&edge_key(*first, *second)))
-        | (usize::from(split_edges.contains_key(&edge_key(*second, *third))) << 1)
-        | (usize::from(split_edges.contains_key(&edge_key(*third, *first))) << 2);
-    let ordered = match mask {
-        0 | 5 | 7 => [*first, *second, *third],
-        3 => [*second, *third, *first],
-        6 => [*third, *first, *second],
-        _ => {
-            return Err(invalid(
-                "explode triangle has an impossible edge-cut pattern",
-            ));
-        }
-    };
-    let [a, b, c] = ordered;
-    let owner_a = vertex_particles[a];
-    let owner_b = vertex_particles[b];
-    let owner_c = vertex_particles[c];
-    match mask {
-        0 => Ok(vec![(vec![a, b, c], owner_a)]),
-        3 | 5 | 6 => Ok(vec![
-            (vec![a, edge(a, b)?, edge(a, c)?], owner_a),
-            (vec![edge(a, b)?, b, c, edge(a, c)?], owner_b),
-        ]),
-        7 => Ok(vec![
-            (vec![a, edge(a, b)?, edge(b, c)?, edge(a, c)?], owner_a),
-            (vec![edge(a, b)?, b, edge(b, c)?], owner_b),
-            (vec![edge(a, c)?, edge(b, c)?, c], owner_c),
-        ]),
-        _ => Err(invalid(
-            "explode triangle has an unsupported edge-cut pattern",
-        )),
-    }
-}
-
-fn quad_cut_fragments(
-    vertices: &[usize],
-    vertex_particles: &[usize],
-    split_edges: &BTreeMap<(usize, usize), usize>,
-    face_particle: usize,
-) -> Result<Vec<(Vec<usize>, usize)>> {
-    let [first, second, third, fourth] = vertices else {
-        return Err(invalid("explode quad must contain exactly four vertices"));
-    };
-    let original = [*first, *second, *third, *fourth];
-    let mut mask = 0;
-    for index in 0..4 {
-        if split_edges.contains_key(&edge_key(original[index], original[(index + 1) % 4])) {
-            mask |= 1 << index;
-        }
-    }
-    if mask == 0 {
-        return Ok(vec![(vertices.to_vec(), face_particle)]);
-    }
-    let order = match mask {
-        3 | 10 | 11 | 15 => [0, 1, 2, 3],
-        5..=7 => [1, 2, 3, 0],
-        9 | 13 => [3, 0, 1, 2],
-        12 | 14 => [2, 3, 0, 1],
-        _ => return Err(invalid("explode quad has an impossible edge-cut pattern")),
-    };
-    let [a, b, c, d] = order.map(|index| original[index]);
-    let owner = |vertex: usize| vertex_particles[vertex];
-    let edge = |first: usize, second: usize| {
-        split_edges
-            .get(&edge_key(first, second))
-            .copied()
-            .ok_or_else(|| invalid("explode quad cut edge is missing its midpoint"))
-    };
-    match mask {
-        3 | 6 | 9 | 12 => Ok(vec![
-            (vec![a, edge(a, b)?, edge(b, c)?, c], owner(a)),
-            (vec![edge(a, b)?, b, edge(b, c)?], owner(b)),
-            (vec![a, c, d], owner(a)),
-        ]),
-        5 | 10 => Ok(vec![
-            (vec![a, b, edge(b, c)?, edge(a, d)?], owner(a)),
-            (vec![edge(a, d)?, edge(b, c)?, c, d], owner(c)),
-        ]),
-        15 => Ok(vec![
-            (vec![a, edge(a, b)?, edge(a, c)?, edge(a, d)?], owner(a)),
-            (vec![edge(a, b)?, b, edge(b, c)?, edge(a, c)?], owner(b)),
-            (vec![edge(a, c)?, edge(b, c)?, c, edge(c, d)?], owner(c)),
-            (vec![edge(a, d)?, edge(a, c)?, edge(c, d)?, d], owner(d)),
-        ]),
-        7 | 11 | 13 | 14 => Ok(vec![
-            (vec![a, edge(a, b)?, edge(b, c)?, edge(a, d)?], owner(a)),
-            (vec![edge(a, b)?, b, edge(b, c)?], owner(b)),
-            (vec![edge(a, d)?, edge(b, c)?, c, d], owner(d)),
-        ]),
-        _ => Err(invalid("explode quad has an unsupported edge-cut pattern")),
-    }
-}
 
 /// Resamples inline or VDB scalar volume grids using mapped texture color as a displacement vector.
 pub(crate) fn displace_volume(
@@ -955,75 +446,6 @@ fn dilate_face_edge(seeds: Vec<IVec3>, rounds: i32) -> Result<HashSet<IVec3>> {
     Ok(domain)
 }
 
-fn append_instances(mesh: &Mesh, transforms: &[(DMat4, DVec3)]) -> Result<Mesh> {
-    if transforms.is_empty() {
-        return Ok(Mesh::default());
-    }
-    let vertex_count = mesh
-        .vertices
-        .len()
-        .checked_mul(transforms.len())
-        .ok_or_else(|| invalid("particle instance vertex count overflows"))?;
-    let edge_count = mesh
-        .edges
-        .len()
-        .checked_mul(transforms.len())
-        .ok_or_else(|| invalid("particle instance edge count overflows"))?;
-    let face_count = mesh
-        .faces
-        .len()
-        .checked_mul(transforms.len())
-        .ok_or_else(|| invalid("particle instance face count overflows"))?;
-    let mut output = Mesh::default();
-    output.vertices.reserve(vertex_count);
-    output.edges.reserve(edge_count);
-    output.faces.reserve(face_count);
-    for (matrix, translation) in transforms {
-        let mut remap = BTreeMap::new();
-        for vertex in &mesh.vertices {
-            let id = take_id(&mut output.next_id.vertex)?;
-            let position = matrix.transform_point3(vertex.co) + *translation;
-            output.vertices.push(Vertex { id, co: position });
-            remap.insert(vertex.id, id);
-        }
-        for edge in &mesh.edges {
-            let id = take_id(&mut output.next_id.edge)?;
-            let vertices = [
-                *remap
-                    .get(&edge.vertices[0])
-                    .ok_or_else(|| invalid("particle instance edge references a missing vertex"))?,
-                *remap
-                    .get(&edge.vertices[1])
-                    .ok_or_else(|| invalid("particle instance edge references a missing vertex"))?,
-            ];
-            output.edges.push(Edge { id, vertices });
-        }
-        for face in &mesh.faces {
-            let id = take_id(&mut output.next_id.face)?;
-            let vertices = face
-                .vertices
-                .iter()
-                .map(|vertex_id| {
-                    remap.get(vertex_id).copied().ok_or_else(|| {
-                        invalid("particle instance face references a missing vertex")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            output.faces.push(Face {
-                id,
-                vertices,
-                material_index: face.material_index,
-            });
-        }
-    }
-    output.validate().map_err(|error| {
-        invalid(&format!(
-            "particle instancing produced invalid geometry: {error}"
-        ))
-    })?;
-    Ok(output)
-}
-
 /// `OpenVDB`'s `Mat4 * Mat4` (`openvdb/math/Mat4.h`, `operator*=`) on the memory of two float
 /// matrices: `result(i, j) = a(i, 0) b(0, j) + a(i, 1) b(1, j) + a(i, 2) b(2, j) + a(i, 3) b(3, j)`,
 /// summed left to right in `float`. Blender's `float[4][4]` has the same memory layout.
@@ -1065,64 +487,6 @@ fn sample_volume_grid(samples: &[f32], dims: [usize; 3], coordinate: DVec3) -> f
     )
 }
 
-fn vertex_group_weight(mesh: &Mesh, face: &Face, params: &Map<String, Value>) -> f64 {
-    let Some(group_name) = params.get("vertex_group").and_then(Value::as_str) else {
-        return 1.0;
-    };
-    let Some(group) = mesh
-        .attributes
-        .get("vertex_groups")
-        .and_then(|groups| groups.get(group_name))
-        .and_then(Value::as_object)
-    else {
-        return 0.0;
-    };
-    let mut total = 0.0;
-    let mut count = 0.0;
-    for id in &face.vertices {
-        total += group
-            .get(&format!("v{id}"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0);
-        count += 1.0;
-    }
-    if count == 0.0 { 0.0 } else { total / count }
-}
-
-fn take_id(next: &mut u32) -> Result<u32> {
-    let id = *next;
-    *next = next.checked_add(1).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::LimitExceeded,
-            "modifier output exhausted mesh element IDs",
-        )
-    })?;
-    Ok(id)
-}
-fn nearest_particle(point: DVec3, particles: &[(DVec3, f64)]) -> usize {
-    let point = point.as_vec3();
-    let mut nearest = 0;
-    let mut nearest_distance = f32::INFINITY;
-    for (index, (position, _)) in particles.iter().enumerate() {
-        let distance = position.as_vec3().distance_squared(point);
-        if index == 0 || distance < nearest_distance {
-            nearest = index;
-            nearest_distance = distance;
-        }
-    }
-    nearest
-}
-
-fn invert(matrix: DMat4) -> Result<DMat4> {
-    if !matrix.is_finite() || matrix.determinant().abs() <= 1.0e-15 {
-        return Err(invalid(
-            "particle object transform must be finite and invertible",
-        ));
-    }
-    Ok(matrix.inverse())
-}
-
 /// The Blender default for `name` on modifier type `kind`, from `param_table.json`.
 fn schema_default(kind: &str, name: &str) -> Result<&'static Value> {
     crate::params::default_value(crate::params::ParameterFamily::Modifier, kind, name).ok_or_else(
@@ -1137,7 +501,7 @@ fn schema_default(kind: &str, name: &str) -> Result<&'static Value> {
 }
 
 /// The modifier's own `name` value, else the table default for modifier type `kind`.
-fn value_or_default<'a>(
+pub(super) fn value_or_default<'a>(
     kind: &str,
     params: &'a Map<String, Value>,
     name: &str,
@@ -1148,13 +512,13 @@ fn value_or_default<'a>(
     }
 }
 
-fn bool_param(kind: &str, params: &Map<String, Value>, name: &str) -> Result<bool> {
+pub(super) fn bool_param(kind: &str, params: &Map<String, Value>, name: &str) -> Result<bool> {
     value_or_default(kind, params, name)?
         .as_bool()
         .ok_or_else(|| invalid(&format!("{name} must be a boolean")))
 }
 
-fn number_param(kind: &str, params: &Map<String, Value>, name: &str) -> Result<f64> {
+pub(super) fn number_param(kind: &str, params: &Map<String, Value>, name: &str) -> Result<f64> {
     value_or_default(kind, params, name)?
         .as_f64()
         .filter(|number| number.is_finite())
@@ -1180,7 +544,11 @@ fn vector_param(kind: &str, params: &Map<String, Value>, name: &str) -> Result<[
     Ok(result)
 }
 
-fn string_param<'a>(kind: &str, params: &'a Map<String, Value>, name: &str) -> Result<&'a str> {
+pub(super) fn string_param<'a>(
+    kind: &str,
+    params: &'a Map<String, Value>,
+    name: &str,
+) -> Result<&'a str> {
     let value = value_or_default(kind, params, name)?
         .as_str()
         .ok_or_else(|| invalid(&format!("{name} must be a string")))?;
@@ -1191,14 +559,13 @@ fn string_param<'a>(kind: &str, params: &'a Map<String, Value>, name: &str) -> R
     }
 }
 
-fn invalid(message: &str) -> PotError {
+pub(super) fn invalid(message: &str) -> PotError {
     PotError::new(ErrorCode::InvalidArgument, message)
 }
 
 fn limit(message: &str) -> PotError {
     PotError::new(ErrorCode::LimitExceeded, message)
 }
-
 fn unsupported(feature_id: &str, reason: &str) -> PotError {
     PotError::with_details(
         ErrorCode::UnsupportedFeature,
@@ -1212,118 +579,8 @@ mod tests {
     use glam::{DMat4, DVec3};
     use serde_json::{Map, json};
 
-    use super::{displace_volume, particle_instance};
-    use crate::{
-        geom::{
-            primitive,
-            volume::{VolumeData, VolumeGrid},
-        },
-        sim::ParticleState,
-    };
-
-    #[test]
-    fn instances_duplicate_mesh_apply_normal_orientation_and_translate_to_particle_coordinates()
-    -> crate::error::Result<()> {
-        let mesh = primitive("plane", &json!({}))
-            .map_err(|error| crate::error::PotError::invalid_argument(error.to_string()))?;
-        let particles = vec![ParticleState {
-            position: [2.0, 0.0, 0.0],
-            rotation: [
-                0.0,
-                -std::f64::consts::FRAC_1_SQRT_2,
-                0.0,
-                std::f64::consts::FRAC_1_SQRT_2,
-            ],
-            velocity: [0.0, 0.0, 0.0],
-            birth_frame: 1.0,
-            ..ParticleState::default()
-        }];
-        let result = particle_instance(
-            &mesh,
-            &particles,
-            DMat4::IDENTITY,
-            DMat4::IDENTITY,
-            &Map::new(),
-            1.0,
-            20.0,
-        )?;
-        assert_eq!(result.vertices.len(), mesh.vertices.len());
-        assert_eq!(result.faces.len(), mesh.faces.len());
-        // Blender's plane vertices (`plane_size_2`: (-1,-1), (1,-1), (-1,1), (1,1)), rotated by the
-        // test's quaternion: local (x, y, 0) lands at world (2, y, x).
-        let expected = [
-            DVec3::new(2.0, -1.0, -1.0),
-            DVec3::new(2.0, -1.0, 1.0),
-            DVec3::new(2.0, 1.0, -1.0),
-            DVec3::new(2.0, 1.0, 1.0),
-        ];
-        for (vertex, expected) in result.vertices.iter().zip(expected) {
-            assert!(
-                vertex.co.distance(expected) <= 1.0e-12,
-                "instance vertex {}: actual={}, expected={expected}",
-                vertex.id,
-                vertex.co,
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn particle_instance_selects_parent_particles_and_orients_their_axis()
-    -> crate::error::Result<()> {
-        let mesh = primitive("plane", &json!({}))
-            .map_err(|error| crate::error::PotError::invalid_argument(error.to_string()))?;
-        let particle = ParticleState {
-            position: [0.0; 3],
-            rotation: [
-                0.0,
-                -std::f64::consts::FRAC_1_SQRT_2,
-                0.0,
-                std::f64::consts::FRAC_1_SQRT_2,
-            ],
-            velocity: [0.0, 0.0, 0.0],
-            birth_frame: 1.0,
-            ..ParticleState::default()
-        };
-        let result = particle_instance(
-            &mesh,
-            std::slice::from_ref(&particle),
-            DMat4::IDENTITY,
-            DMat4::IDENTITY,
-            &Map::from_iter([
-                ("use_normal".to_owned(), json!(true)),
-                ("axis".to_owned(), json!("X")),
-            ]),
-            1.0,
-            24.0,
-        )?;
-        let bounds = result.bounds().ok_or_else(|| {
-            crate::error::PotError::new(
-                crate::error::ErrorCode::EvaluationFailed,
-                "oriented particle instance has no bounds",
-            )
-        })?;
-        assert!(bounds.min.x.abs() <= 1.0e-12);
-        assert!(bounds.max.x.abs() <= 1.0e-12);
-        assert!((bounds.min.y + 1.0).abs() <= 1.0e-12);
-        assert!((bounds.max.y - 1.0).abs() <= 1.0e-12);
-        assert!((bounds.min.z + 1.0).abs() <= 1.0e-12);
-        assert!((bounds.max.z - 1.0).abs() <= 1.0e-12);
-        let no_parents = particle_instance(
-            &mesh,
-            std::slice::from_ref(&particle),
-            DMat4::IDENTITY,
-            DMat4::IDENTITY,
-            &Map::from_iter([("use_normal".to_owned(), json!(false))]),
-            1.0,
-            24.0,
-        )?;
-        assert!(
-            no_parents.vertices.is_empty(),
-            "particles without parents must produce no vertices"
-        );
-        Ok(())
-    }
+    use super::displace_volume;
+    use crate::geom::volume::{VolumeData, VolumeGrid};
 
     #[test]
     fn volume_displace_resamples_with_shared_texture() -> crate::error::Result<()> {

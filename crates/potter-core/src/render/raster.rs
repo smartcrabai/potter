@@ -840,6 +840,11 @@ fn rasterize_with_samples_for_eye(
         None
     };
 
+    let has_volume_only = ao_bvh.is_some()
+        && prepared_materials
+            .iter()
+            .any(crate::shader::PreparedMaterial::is_volume_only);
+
     let background_linear = background_to_linear_f64(background);
     let mut rgba = allocate_filled(rgba_len, 0_u8, "RGBA image")?;
     let (pixels, _) = rgba.as_chunks_mut::<4>();
@@ -929,6 +934,7 @@ fn rasterize_with_samples_for_eye(
                         geometric,
                         shading,
                         1.0,
+                        has_volume_only,
                     );
                     ambient_occlusion[pixel_index] =
                         linear_color_to_f32([visibility, visibility, visibility, 1.0])[0];
@@ -1910,6 +1916,7 @@ pub(crate) fn ambient_visibility(
     geometric: DVec3,
     shading: DVec3,
     distance: f64,
+    has_volume_only: bool,
 ) -> f64 {
     const SAMPLE_COUNT: u32 = 12;
     let normal = shading.normalize_or_zero();
@@ -1940,29 +1947,36 @@ pub(crate) fn ambient_visibility(
         } else {
             direction
         };
-        let mut occluded = false;
-        bvh.walk_hits(
-            triangles,
-            super::bvh::WalkRay {
-                origin,
-                direction,
-                epsilon: 1.0e-5,
-                remaining: distance,
-                kind: Some(RayKind::Shadow),
-            },
-            |hit, _| {
-                let triangle = &triangles[hit.triangle_index];
-                if prepared_materials
-                    .get(triangle.material_index)
-                    .is_some_and(crate::shader::PreparedMaterial::is_volume_only)
-                {
-                    true
-                } else {
-                    occluded = true;
-                    false
-                }
-            },
-        );
+        let occluded = if has_volume_only {
+            let mut occluded = false;
+            bvh.walk_hits(
+                triangles,
+                super::bvh::WalkRay {
+                    origin,
+                    direction,
+                    epsilon: 1.0e-5,
+                    remaining: distance,
+                    kind: Some(RayKind::Shadow),
+                },
+                |hit, _| {
+                    let triangle = &triangles[hit.triangle_index];
+                    if prepared_materials
+                        .get(triangle.material_index)
+                        .is_some_and(crate::shader::PreparedMaterial::is_volume_only)
+                    {
+                        true
+                    } else {
+                        occluded = true;
+                        false
+                    }
+                },
+            );
+            occluded
+        } else {
+            bvh.any_hit_where(triangles, origin, direction, 1.0e-5, distance, &|mask| {
+                mask & RayKind::Shadow.bit() != 0
+            })
+        };
         if !occluded {
             visible += 1;
         }
@@ -3661,7 +3675,9 @@ mod smooth_shading_tests {
         SurfaceShader, Triangle, rasterize_with_samples,
     };
     use crate::error::Result;
-    use crate::model::RayVisibility;
+    use crate::graph::{GraphKind, GraphLink, GraphNode, NodeGroup};
+    use crate::model::{Id, Material, RayKind, RayVisibility, Registry};
+    use crate::shader::PreparedMaterial;
 
     const SIZE: u32 = 64;
     /// Pixel (32, 32) has its centre at world (1/64, -1/64, 0) for this camera.
@@ -3952,8 +3968,113 @@ mod smooth_shading_tests {
             DVec3::Z,
             DVec3::new(0.866, 0.0, 0.5),
             1.0,
+            false,
         );
         assert!((visibility - 1.0).abs() < 1e-12, "visibility {visibility}");
+    }
+
+    fn horizontal_triangle(z: f64) -> Triangle {
+        let mut plane = triangle(None);
+        plane.positions = plane.positions.map(|point| point + DVec3::Z * z);
+        plane
+    }
+
+    fn ao_visibility(
+        triangles: &[Triangle],
+        materials: &[PreparedMaterial],
+        distance: f64,
+        has_volume_only: bool,
+    ) -> f64 {
+        let bvh = crate::render::bvh::Bvh::build(triangles).expect("AO BVH builds");
+        super::ambient_visibility(
+            &bvh,
+            triangles,
+            materials,
+            DVec3::ZERO,
+            DVec3::Z,
+            DVec3::Z,
+            distance,
+            has_volume_only,
+        )
+    }
+
+    fn volume_only_material() -> PreparedMaterial {
+        let mut graph = NodeGroup::new("AO volume", GraphKind::Shader);
+        let output = Id::new("output").expect("valid output id");
+        let volume = Id::new("volume").expect("valid volume id");
+        graph
+            .nodes
+            .insert(output.clone(), GraphNode::new("ShaderNodeOutputMaterial"));
+        graph
+            .nodes
+            .insert(volume.clone(), GraphNode::new("ShaderNodeVolumePrincipled"));
+        graph.links.push(GraphLink {
+            from_node: volume,
+            from_socket: "Volume".to_owned(),
+            to_node: output,
+            to_socket: "Volume".to_owned(),
+        });
+        let graph_id = Id::new("ao_volume").expect("valid graph id");
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        PreparedMaterial::new(
+            &Material {
+                node_tree: Some(graph_id),
+                ..Material::default()
+            },
+            &groups,
+        )
+    }
+
+    #[test]
+    fn ambient_visibility_uses_any_hit_without_changing_surface_boundaries() {
+        assert_eq!(ao_visibility(&[], &[], 1.0, false), 1.0);
+
+        let opaque = horizontal_triangle(0.001);
+        assert_eq!(
+            ao_visibility(std::slice::from_ref(&opaque), &[], 1.0, false),
+            0.0
+        );
+
+        let mut filtered = horizontal_triangle(0.001);
+        filtered.ray_mask &= !RayKind::Shadow.bit();
+        assert_eq!(
+            ao_visibility(std::slice::from_ref(&filtered), &[], 1.0, false),
+            1.0
+        );
+
+        let mut transparent = horizontal_triangle(0.001);
+        transparent.alpha_mode = AlphaMode::Blend;
+        transparent.color[3] = 0.0;
+        assert_eq!(
+            ao_visibility(std::slice::from_ref(&transparent), &[], 1.0, false),
+            0.0
+        );
+
+        let distant = horizontal_triangle(1.0);
+        assert_eq!(
+            ao_visibility(std::slice::from_ref(&distant), &[], 1.0, false),
+            1.0
+        );
+        assert_eq!(
+            ao_visibility(std::slice::from_ref(&distant), &[], 1.1, false),
+            11.0 / 12.0
+        );
+    }
+
+    #[test]
+    fn ambient_visibility_passes_through_volume_only_shells() {
+        let materials = [volume_only_material(), PreparedMaterial::default()];
+        let mut shell = horizontal_triangle(0.001);
+        shell.material_index = 0;
+        assert_eq!(
+            ao_visibility(std::slice::from_ref(&shell), &materials[..1], 1.0, true,),
+            1.0
+        );
+
+        let mut blocker = horizontal_triangle(0.002);
+        blocker.material_index = 1;
+        assert_eq!(ao_visibility(&[shell, blocker], &materials, 1.0, true), 0.0);
     }
 
     #[test]

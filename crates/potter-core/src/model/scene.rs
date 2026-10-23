@@ -104,6 +104,7 @@ impl SceneDoc {
                 simulation_frame_end: 250,
                 fps: 24,
                 fps_base: 1.0,
+                use_gravity: true,
                 sequencer: Sequencer::default(),
                 camera: None,
                 world: None,
@@ -640,6 +641,8 @@ pub struct Scene {
     pub simulation_frame_end: i32,
     pub fps: u32,
     pub fps_base: f64,
+    #[serde(default = "default_true")]
+    pub use_gravity: bool,
     pub camera: Option<Id>,
     pub world: Option<Id>,
     /// Active Movie Clip used by constraints with `use_active_clip`.
@@ -2149,6 +2152,38 @@ pub enum MaterialLink {
     Object,
 }
 
+/// Blender `Object.track_axis` (`trackflag`): the axis Particle Instance orients along. Blender
+/// initializes new objects to `POS_Y`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackAxis {
+    #[serde(rename = "POS_X")]
+    PosX,
+    #[default]
+    #[serde(rename = "POS_Y")]
+    PosY,
+    #[serde(rename = "POS_Z")]
+    PosZ,
+    #[serde(rename = "NEG_X")]
+    NegX,
+    #[serde(rename = "NEG_Y")]
+    NegY,
+    #[serde(rename = "NEG_Z")]
+    NegZ,
+}
+
+/// Blender `Object.up_axis` (`upflag`). Blender initializes new objects to `Z`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpAxis {
+    X,
+    Y,
+    #[default]
+    Z,
+}
+
+fn is_default_axis<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
 /// A Cycles ray class that Blender's object visibility gates (`PATH_RAY_*` in Cycles' kernel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RayKind {
@@ -2357,6 +2392,12 @@ pub struct Node {
     pub parent_type: ParentType,
     #[serde(default)]
     pub parent_bone: Option<Id>,
+    /// Blender `Object.track_axis`; omitted from serialized documents at the default `POS_Y`.
+    #[serde(default, skip_serializing_if = "is_default_axis")]
+    pub track_axis: TrackAxis,
+    /// Blender `Object.up_axis`; omitted from serialized documents at the default `Z`.
+    #[serde(default, skip_serializing_if = "is_default_axis")]
+    pub up_axis: UpAxis,
     #[serde(default)]
     pub pose: BTreeMap<Id, PoseBone>,
     #[serde(default)]
@@ -2396,6 +2437,8 @@ impl Default for Node {
             force_field: None,
             parent_type: ParentType::default(),
             parent_bone: None,
+            track_axis: TrackAxis::default(),
+            up_axis: UpAxis::default(),
             pose: BTreeMap::new(),
             constraints: Vec::new(),
             drivers: Vec::new(),

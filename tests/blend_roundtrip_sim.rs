@@ -508,9 +508,13 @@ for object_name, modifier_name in [('ParticleInstance','ParticleInstanceSettings
 scene.frame_set(1)
 bpy.context.view_layer.update()
 geometry_after = {name:geometry(bpy.data.objects[name]) for name in expected['geometry']}
+fluid_particle_types = sorted(system.settings.type for obj in bpy.data.objects
+                              for system in obj.particle_systems
+                              if system.settings.type in ('FLIP', 'SPRAY', 'FOAM', 'BUBBLE', 'TRACER'))
 with open(output, 'w', encoding='utf-8') as handle:
     json.dump({'settings':checks, 'modifiers':mods, 'geometry':geometry_after,
-               'frame_start':scene.frame_start, 'frame_end':scene.frame_end}, handle)
+               'frame_start':scene.frame_start, 'frame_end':scene.frame_end,
+               'fluid_particle_types':fluid_particle_types}, handle)
 ";
 
 const REOPEN_DYNAMIC_PAINT_ROLES: &str = r"
@@ -804,6 +808,16 @@ fn assert_imported_physics(expected: &Value, mappings: &Map<String, Value>, scen
             );
         }
     }
+    // The domain's Liquid particle system imports with Blender's FLIP type.
+    let flip_systems = scene["nodes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|node| node["properties"]["physics_particle_systems"].as_object())
+        .flat_map(|systems| systems.values())
+        .filter(|system| system["type"] == "FLIP")
+        .count();
+    assert_eq!(flip_systems, 1, "imported FLIP particle system count");
 }
 
 fn assert_catalog_parity() {
@@ -953,6 +967,11 @@ fn assert_export_and_reopen(
         run_guarded,
     )?;
     let after: Value = serde_json::from_slice(&fs::read(reopened_path)?)?;
+    assert_eq!(
+        after["fluid_particle_types"],
+        json!(["FLIP"]),
+        "the exported FLIP particle system must reopen as one FLIP system"
+    );
     assert_eq!(after["frame_start"], expected["frame_start"]);
     assert_eq!(after["frame_end"], expected["frame_end"]);
     Ok(after)

@@ -183,6 +183,7 @@ pub(super) struct RealtimeShadows {
     point_maps: BTreeMap<Id, PointShadowMap>,
     /// Whether some triangle can cast a transparent shadow, so shadow rays must evaluate the occluders they hit.
     transparent_casters: bool,
+    has_volume_only: bool,
 }
 
 const SHADOW_MAP_SIZE: u32 = 64;
@@ -207,6 +208,7 @@ struct ShadowScene<'a> {
     bvh: &'a Bvh,
     triangles: &'a [Triangle],
     prepared_materials: &'a [PreparedMaterial],
+    has_volume_only: bool,
     point_maps: &'a BTreeMap<Id, PointShadowMap>,
     occluders: Option<&'a ShadowOccluders<'a>>,
 }
@@ -1334,6 +1336,10 @@ pub(super) fn extract_geometry(
             bvh,
             point_maps: shadow_maps,
             transparent_casters,
+            has_volume_only: geometry
+                .prepared
+                .iter()
+                .any(PreparedMaterial::is_volume_only),
         });
     }
     Ok(geometry)
@@ -2022,6 +2028,7 @@ impl SurfaceShader for SceneShader<'_> {
             bvh: &shadows.bvh,
             triangles: self.geometry.triangles.as_slice(),
             prepared_materials: &self.geometry.prepared,
+            has_volume_only: shadows.has_volume_only,
             point_maps: &shadows.point_maps,
             occluders: shadows.transparent_casters.then_some(&occluders),
         });
@@ -2541,6 +2548,7 @@ fn shade(
             facing,
             normal,
             1.0,
+            scene.has_volume_only,
         )
     });
     // A closure's reflective share is its weight times its alpha. The raster composite multiplies a straight colour

@@ -155,6 +155,7 @@ pub(super) fn evaluate(
     if !world.enabled {
         return Ok(None);
     }
+    let gravity = super::effective_scene_gravity(scene);
 
     let members = scene_members(doc, scene_id)?;
     let body_ids: Vec<Id> = members
@@ -226,6 +227,7 @@ pub(super) fn evaluate(
         &mut bodies,
         &forces,
         world,
+        gravity,
         scene.fps,
         scene.fps_base,
         frame,
@@ -700,6 +702,7 @@ fn simulate(
     bodies: &mut [Body],
     forces: &[Force],
     world: &crate::model::RigidBodyWorld,
+    gravity: DVec3,
     fps: u32,
     fps_base: f64,
     frame: f64,
@@ -727,10 +730,10 @@ fn simulate(
         remainder = 0.0;
     }
     for _ in 0..full_steps {
-        step(bodies, forces, world, fixed_dt)?;
+        step(bodies, forces, world, gravity, fixed_dt)?;
     }
     if remainder > 0.0 {
-        step(bodies, forces, world, remainder)?;
+        step(bodies, forces, world, gravity, remainder)?;
     }
     Ok(())
 }
@@ -739,9 +742,9 @@ fn step(
     bodies: &mut [Body],
     forces: &[Force],
     world: &crate::model::RigidBodyWorld,
+    gravity: DVec3,
     dt: f64,
 ) -> Result<()> {
-    let gravity = DVec3::from_array(world.gravity);
     for body in bodies.iter_mut().filter(|body| body.dynamic) {
         let mut acceleration = gravity;
         for force in forces {
