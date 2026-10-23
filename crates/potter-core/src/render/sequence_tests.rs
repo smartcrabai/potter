@@ -209,7 +209,7 @@ fn sequencer_srgb_roundtrip_and_byte_transitions_preserve_storage_semantics()
     let output = super::byte_gamma_cross(1, 1, &black, &white, 0.5)?;
     let output = output.into_scene_linear(SequencerColorSpace::Srgb)?;
     for channel in 0..3 {
-        assert!((output.pixels[0][channel] - 0.0512698814).abs() < 1.0e-6);
+        assert!((output.pixels[0][channel] - 0.051_269_881_4).abs() < 1.0e-6);
     }
     assert_eq!(output.pixels[0][3], 1.0);
 

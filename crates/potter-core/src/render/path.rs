@@ -1620,19 +1620,19 @@ pub(super) struct RealtimeCameraLightSample<'context, 'lights, 'samples> {
     pixel_y: u32,
 }
 impl RealtimeCameraLightContext<'_> {
-    fn local_events(
-        &self,
+    fn local_events<'a>(
+        &'a self,
         eye: usize,
         origin: DVec3,
         direction: DVec3,
         far_distance: f64,
-        raster_samples: Option<&CameraLightRasterSamples>,
+        raster_samples: Option<&'a CameraLightRasterSamples>,
         sample_index: usize,
         jitter_x: f64,
         jitter_y: f64,
         pixel_x: u32,
         pixel_y: u32,
-    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
+    ) -> impl Iterator<Item = CameraLightEvent> + 'a {
         self.lights()
             .iter()
             .zip(&self.culling)
@@ -1734,7 +1734,7 @@ impl<'lights> RealtimeCameraLightContext<'lights> {
     }
 }
 
-impl RealtimeCameraLightView<'_, '_> {
+impl<'context, 'lights> RealtimeCameraLightView<'context, 'lights> {
     pub(super) fn for_eye(self, eye: usize) -> Self {
         Self {
             eye: eye.min(1),
@@ -1835,7 +1835,7 @@ impl RealtimeCameraLightView<'_, '_> {
         jitter_y: f64,
         pixel_x: u32,
         pixel_y: u32,
-    ) -> RealtimeCameraLightSample<'_, '_, 'samples> {
+    ) -> RealtimeCameraLightSample<'context, 'lights, 'samples> {
         RealtimeCameraLightSample {
             view: self,
             raster_samples,
@@ -1848,13 +1848,13 @@ impl RealtimeCameraLightView<'_, '_> {
     }
 }
 
-impl RealtimeCameraLightSample<'_, '_, '_> {
-    pub(super) fn local_events(
-        &self,
+impl<'context, 'lights, 'samples> RealtimeCameraLightSample<'context, 'lights, 'samples> {
+    pub(super) fn local_events<'sample>(
+        &'sample self,
         origin: DVec3,
         direction: DVec3,
         far_distance: f64,
-    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
+    ) -> impl Iterator<Item = CameraLightEvent> + 'sample {
         self.view.context.local_events(
             self.view.eye,
             origin,
@@ -2136,7 +2136,6 @@ fn camera_light_shape_hit(
     camera_light_shape_hit_with_area(light, area_display, camera, origin, direction, limit)
 }
 
-#[cfg(test)]
 fn camera_light_display_area(shape: AreaShape) -> AreaShape {
     AreaShape::new(
         shape.axis_u,

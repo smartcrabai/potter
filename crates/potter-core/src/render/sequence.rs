@@ -16,7 +16,8 @@ use crate::{
     model::{Id, ImageColorspace, Scene, SceneDoc},
     sequencer::{
         AudioTrack, EffectType, RgbaFrame, SequencerColorSpace, Strip, StripBlendType, StripType,
-        apply_blend_effect, apply_effect, apply_modifiers, blend_frames, mix_audio, transition,
+        TransitionType, apply_blend_effect, apply_effect, apply_modifiers, blend_frames, mix_audio,
+        transition,
     },
 };
 
