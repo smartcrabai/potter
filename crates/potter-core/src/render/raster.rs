@@ -2952,13 +2952,15 @@ fn intersect_triangle(triangle: &PreparedTriangle, ray: Ray, frame: &CameraFrame
     {
         return None;
     }
-    if barycentric.iter().enumerate().any(|(index, weight)| {
-        weight.abs() <= BARYCENTRIC_EPSILON
-            && !triangle_owns_edge(triangle, index, ray, frame, determinant)
-    }) {
-        return None;
+    // Barycentric epsilon narrows candidates; the edge determinant, not this tolerance, decides ownership.
+    for (opposite_vertex, weight) in barycentric.iter().enumerate() {
+        if weight.abs() <= BARYCENTRIC_EPSILON
+            && ray_is_on_triangle_edge(triangle, opposite_vertex, ray)
+            && !triangle_owns_edge(triangle, opposite_vertex, ray, frame, determinant)
+        {
+            return None;
+        }
     }
-
     // A panorama's depth is the hit's distance: a view-axis depth is negative behind the camera, where it still has pixels.
     let depth = if frame.depth_is_distance {
         distance
@@ -2974,6 +2976,26 @@ fn intersect_triangle(triangle: &PreparedTriangle, ray: Ray, frame: &CameraFrame
         barycentric: barycentric.map(|weight| weight.clamp(0.0, 1.0)),
         direction: ray.direction,
     })
+}
+
+fn ray_is_on_triangle_edge(triangle: &PreparedTriangle, opposite_vertex: usize, ray: Ray) -> bool {
+    let (start, end) = match opposite_vertex {
+        0 => (1, 2),
+        1 => (2, 0),
+        _ => (0, 1),
+    };
+    let start = triangle.source.positions[start] - ray.origin;
+    let end = triangle.source.positions[end] - ray.origin;
+    let direction = ray.direction;
+    // Scale the edge-plane determinant's rounding bound to its own products, not the triangle's barycentric area.
+    let determinant = direction.dot(start.cross(end));
+    let error_scale = direction.x.abs()
+        * (start.y.abs() * end.z.abs() + start.z.abs() * end.y.abs())
+        + direction.y.abs() * (start.z.abs() * end.x.abs() + start.x.abs() * end.z.abs())
+        + direction.z.abs() * (start.x.abs() * end.y.abs() + start.y.abs() * end.x.abs());
+    determinant.is_finite()
+        && error_scale.is_finite()
+        && determinant.abs() <= 16.0 * f64::EPSILON * error_scale
 }
 
 fn triangle_owns_edge(
