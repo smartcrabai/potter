@@ -957,9 +957,17 @@ fn rasterize_with_samples_for_eye(
                 for sample_index in 0..samples {
                     // Without a film the pixel keeps its own pattern, whose first sample is the centre. A film sample is
                     // jittered over its pixel, the first included, as EEVEE jitters every sample (`pixel_jitter_get`).
-                    let (sample_x, sample_y) = match film.as_ref() {
-                        Some(film) => film.jitter(film_sample_offset(sample_index)),
-                        None => sample_offset(seed, x, y, sample_index),
+                    let (sample_x, filter_y, sample_y) = match film.as_ref() {
+                        Some(film) => {
+                            let (sample_x, filter_y) =
+                                film.jitter(film_sample_offset(sample_index));
+                            // Camera jitter moves screen rows opposite to the row-down film filter.
+                            (sample_x, filter_y, 1.0 - filter_y)
+                        }
+                        None => {
+                            let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
+                            (sample_x, sample_y, sample_y)
+                        }
                     };
                     let (sample_ray, sample_hit) = if sample_index == 0 && film.is_none() {
                         (center_ray, center_hit)
@@ -1079,7 +1087,7 @@ fn rasterize_with_samples_for_eye(
                         }
                     }
                     if let Some(film) = film.as_mut() {
-                        film.splat(x, y, sample_x, sample_y, sample_index, sample_linear);
+                        film.splat(x, y, sample_x, filter_y, sample_index, sample_linear);
                     }
                 }
                 if display_average_needed {
@@ -2933,6 +2941,7 @@ fn intersect_triangle(triangle: &PreparedTriangle, ray: Ray, frame: &CameraFrame
     let barycentric_2 = ray.direction.dot(q_vector) * inverse_determinant;
     let distance = triangle.edge2.dot(q_vector) * inverse_determinant;
     let barycentric_0 = 1.0 - barycentric_1 - barycentric_2;
+    let barycentric = [barycentric_0, barycentric_1, barycentric_2];
     if !barycentric_0.is_finite()
         || !barycentric_1.is_finite()
         || !barycentric_2.is_finite()
@@ -2945,6 +2954,12 @@ fn intersect_triangle(triangle: &PreparedTriangle, ray: Ray, frame: &CameraFrame
         || barycentric_1 > 1.0 + BARYCENTRIC_EPSILON
         || barycentric_2 > 1.0 + BARYCENTRIC_EPSILON
     {
+        return None;
+    }
+    if barycentric.iter().enumerate().any(|(index, weight)| {
+        weight.abs() <= BARYCENTRIC_EPSILON
+            && !triangle_owns_edge(triangle, index, ray, frame, determinant)
+    }) {
         return None;
     }
 
@@ -2960,13 +2975,81 @@ fn intersect_triangle(triangle: &PreparedTriangle, ray: Ray, frame: &CameraFrame
     Some(Hit {
         depth,
         distance,
-        barycentric: [
-            barycentric_0.clamp(0.0, 1.0),
-            barycentric_1.clamp(0.0, 1.0),
-            barycentric_2.clamp(0.0, 1.0),
-        ],
+        barycentric: barycentric.map(|weight| weight.clamp(0.0, 1.0)),
         direction: ray.direction,
     })
+}
+
+fn triangle_owns_edge(
+    triangle: &PreparedTriangle,
+    opposite_vertex: usize,
+    ray: Ray,
+    frame: &CameraFrame,
+    determinant: f64,
+) -> bool {
+    let (start, end) = match opposite_vertex {
+        0 => (1, 2),
+        1 => (2, 0),
+        _ => (0, 1),
+    };
+    let mut edge = triangle.source.positions[end] - triangle.source.positions[start];
+    // Normalize the edge direction to screen-space clockwise winding before applying top-left.
+    if determinant > 0.0 {
+        edge = -edge;
+    }
+    let (dx, dy) = projected_edge_direction(edge, ray, frame);
+    if dy.abs() > f64::MIN_POSITIVE {
+        return dy < 0.0;
+    }
+    if dx.abs() > f64::MIN_POSITIVE {
+        return dx > 0.0;
+    }
+
+    // A projected point edge has no top-left direction; use a stable ray-space tie-break instead.
+    if edge.x.abs() > f64::MIN_POSITIVE {
+        return edge.x > 0.0;
+    }
+    if edge.y.abs() > f64::MIN_POSITIVE {
+        return edge.y > 0.0;
+    }
+    edge.z > 0.0
+}
+
+fn projected_edge_direction(edge: DVec3, ray: Ray, frame: &CameraFrame) -> (f64, f64) {
+    let direction = ray.direction;
+    match frame.projection {
+        ProjectionFrame::Orthographic { .. } => (edge.dot(frame.right), -edge.dot(frame.up)),
+        ProjectionFrame::Perspective { .. } => {
+            let forward = direction.dot(frame.forward);
+            let right = direction.dot(frame.right);
+            let up = direction.dot(frame.up);
+            let edge_forward = edge.dot(frame.forward);
+            let projected = (
+                edge.dot(frame.right) * forward - right * edge_forward,
+                -(edge.dot(frame.up) * forward - up * edge_forward),
+            );
+            if forward.abs() > f64::MIN_POSITIVE {
+                projected
+            } else {
+                ray_space_edge_direction(edge, ray, frame)
+            }
+        }
+        ProjectionFrame::Equirectangular { .. }
+        | ProjectionFrame::FisheyeEquidistant { .. }
+        | ProjectionFrame::FisheyeEquisolid { .. } => ray_space_edge_direction(edge, ray, frame),
+    }
+}
+
+fn ray_space_edge_direction(edge: DVec3, ray: Ray, frame: &CameraFrame) -> (f64, f64) {
+    let direction = ray.direction;
+    let tangent = edge - direction * direction.dot(edge);
+    let mut up = frame.up - direction * direction.dot(frame.up);
+    if up.length_squared() <= f64::MIN_POSITIVE {
+        up = frame.right - direction * direction.dot(frame.right);
+    }
+    let up = safe_normalize(up).unwrap_or(frame.up);
+    let right = safe_normalize(direction.cross(up)).unwrap_or(frame.right);
+    (tangent.dot(right), -tangent.dot(up))
 }
 
 fn is_wire_edge(
@@ -3862,6 +3945,79 @@ mod smooth_shading_tests {
             None,
         )
         .expect("triangle rasterizes")
+    }
+
+    fn translucent(mut triangle: Triangle) -> Triangle {
+        triangle.alpha_mode = AlphaMode::Blend;
+        triangle.color = [0.25, 0.5, 0.75, 0.5];
+        triangle
+    }
+
+    fn render_beauty(triangles: &[Triangle]) -> RasterOutput {
+        rasterize_with_samples(
+            triangles,
+            &camera(),
+            SIZE,
+            SIZE,
+            Mode::Beauty,
+            [0, 0, 0, 0],
+            None,
+            1,
+            0,
+            1.5,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .expect("Beauty triangles rasterize")
+    }
+
+    #[test]
+    fn transparent_quad_shared_diagonal_has_one_beauty_owner_for_either_winding() {
+        let center = DVec3::new(1.0 / 64.0, -1.0 / 64.0, 0.0);
+        let a = center + DVec3::new(-1.0, -1.0, 0.0);
+        let b = center + DVec3::new(1.0, -1.0, 0.0);
+        let c = center + DVec3::new(1.0, 1.0, 0.0);
+        let d = center + DVec3::new(-1.0, 1.0, 0.0);
+
+        for reverse_second_winding in [false, true] {
+            let mut first = translucent(triangle(None));
+            first.positions = [a, b, c];
+            first.double_sided = true;
+            let mut second = translucent(triangle(None));
+            second.positions = [a, c, d];
+            second.double_sided = true;
+            if reverse_second_winding {
+                second.positions.swap(1, 2);
+            }
+
+            let actual = render_beauty(&[first, second]).linear_rgba[CENTER].map(f64::from);
+            for (channel, expected) in actual.iter().zip([0.125, 0.25, 0.375, 0.5]) {
+                assert!(
+                    (*channel - expected).abs() < 1.0e-6,
+                    "reverse_second_winding={reverse_second_winding}, got {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_transparent_surfaces_still_compose_as_separate_beauty_layers() {
+        let mut front = translucent(triangle(None));
+        let mut back = translucent(triangle(None));
+        front.double_sided = true;
+        back.double_sided = true;
+        back.object_index = 2;
+        back.positions = back.positions.map(|position| position - DVec3::Z);
+
+        let actual = render_beauty(&[front, back]).linear_rgba[CENTER].map(f64::from);
+        for (channel, expected) in actual.iter().zip([0.1875, 0.375, 0.5625, 0.75]) {
+            assert!(
+                (*channel - expected).abs() < 1.0e-6,
+                "expected two transparent layers, got {actual:?}"
+            );
+        }
     }
 
     struct FrontShader {

@@ -931,13 +931,22 @@ fn boolean_cases() -> Vec<Value> {
     ]
 }
 
-fn expected_modifier_value(value: &Value, mappings: &serde_json::Map<String, Value>) -> Value {
+fn expected_modifier_value(
+    value: &Value,
+    mappings: &serde_json::Map<String, Value>,
+    collection_records: &[Value],
+) -> Value {
     if let Some(reference) = value.as_str() {
         if let Some(name) = reference.strip_prefix("@object:") {
             return mappings[&format!("Object:{name}")].clone();
         }
         if let Some(name) = reference.strip_prefix("@collection:") {
-            return mappings[&format!("Collection:{name}")].clone();
+            let collection = collection_records
+                .iter()
+                .find(|item| item["name"].as_str() == Some(name))
+                .unwrap();
+            let bridge_id = collection["bridge_id"].as_str().unwrap();
+            return mappings[&format!("Collection:{bridge_id}")].clone();
         }
         if let Some(name) = reference.strip_prefix("@group:") {
             return mappings[&format!("NodeGroup:{name}")].clone();
@@ -1325,6 +1334,7 @@ fn assert_skin_branch_round_trip(
     root: &Path,
     owner_id: &str,
     mappings: &serde_json::Map<String, Value>,
+    collection_records: &[Value],
     before_geometry: &Value,
 ) -> Result<(), Box<dyn Error>> {
     let scene: potter_core::model::SceneDoc =
@@ -1335,7 +1345,7 @@ fn assert_skin_branch_round_trip(
     for (key, value) in case["expected"].as_object().unwrap() {
         assert_json_value(
             &modifier.params[key],
-            &expected_modifier_value(value, mappings),
+            &expected_modifier_value(value, mappings, collection_records),
             &format!("{}.params.{key}", case["name"]),
         );
     }
@@ -1490,6 +1500,11 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
         blender.to_str().unwrap(),
     ])?;
     let mappings = imported["result"]["id_mappings"].as_object().unwrap();
+    let imported_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let collection_records =
+        imported_scene["compatibility"]["blender_adapter"]["intermediate"]["collections"]
+            .as_array()
+            .unwrap();
     let owner_id = mappings[&format!("Object:{case_name}")].as_str().unwrap();
     let losses = imported["result"]["losses"].as_array().unwrap();
     assert!(
@@ -1506,6 +1521,7 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
             root,
             owner_id,
             mappings,
+            collection_records,
             &before[case_name],
         )?;
         return Ok(());
@@ -1520,7 +1536,7 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
         for (key, value) in case["expected"].as_object().unwrap() {
             assert_json_value(
                 &modifier.params[key],
-                &expected_modifier_value(value, mappings),
+                &expected_modifier_value(value, mappings, collection_records),
                 &format!("{case_name}.params.{key}"),
             );
         }
@@ -1585,7 +1601,7 @@ fn modifier_round_trip(case_name: &str) -> Result<(), Box<dyn Error>> {
     for (key, value) in case["expected"].as_object().unwrap() {
         assert_json_value(
             &modifier["params"][key],
-            &expected_modifier_value(value, mappings),
+            &expected_modifier_value(value, mappings, collection_records),
             &format!("{case_name}.params.{key}"),
         );
     }

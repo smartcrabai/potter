@@ -2916,7 +2916,7 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
     let object = raw
         .as_object()
         .ok_or_else(|| invalid_intermediate("top-level value is not an object"))?;
-    if object.get("bridge_version").and_then(Value::as_u64) != Some(1) {
+    if object.get("bridge_version").and_then(Value::as_u64) != Some(2) {
         return Err(invalid_intermediate("unsupported bridge_version"));
     }
     let version = object
@@ -3161,15 +3161,8 @@ fn build_imported_graph(
     let mut collection_ids = BTreeMap::new();
     for item in collections {
         let name = string_field(item, "name")?;
-        let id = mapped_id(
-            item,
-            "potter_id",
-            "collection",
-            name,
-            &mut collection_ids,
-            &mut mappings,
-            "Collection",
-        )?;
+        let bridge_id = string_field(item, "bridge_id")?;
+        let id = mapped_collection_id(item, name, bridge_id, &mut collection_ids, &mut mappings)?;
         doc.collections.insert(
             id.clone(),
             Collection {
@@ -3191,11 +3184,10 @@ fn build_imported_graph(
             &mut mappings,
             "Scene",
         )?;
-        let root_name = string_field(item, "root_collection")?;
-        let root = collection_ids
-            .get(root_name)
-            .cloned()
-            .ok_or_else(|| invalid_intermediate("scene references an unknown root collection"))?;
+        let root_bridge_id = string_field(item, "root_collection")?;
+        let root = collection_ids.get(root_bridge_id).cloned().ok_or_else(|| {
+            invalid_intermediate("scene references an unknown collection bridge ID")
+        })?;
         let mut view_layers = Registry::new();
         let mut view_layer_ids = BTreeMap::new();
         if let Some(raw_layers) = item.get("view_layers").and_then(Value::as_array) {
@@ -3210,14 +3202,23 @@ fn build_imported_graph(
                     &mut mappings,
                     &format!("ViewLayer:{id}"),
                 )?;
-                let excluded_collections = view_layer
+                let mut excluded_collections = Vec::new();
+                for reference in view_layer
                     .get("excluded_collections")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                    .filter_map(Value::as_str)
-                    .filter_map(|collection_name| collection_ids.get(collection_name).cloned())
-                    .collect();
+                {
+                    let bridge_id = reference.as_str().ok_or_else(|| {
+                        invalid_intermediate("view-layer collection reference is not a string")
+                    })?;
+                    let id = collection_ids.get(bridge_id).cloned().ok_or_else(|| {
+                        invalid_intermediate(
+                            "view layer references an unknown collection bridge ID",
+                        )
+                    })?;
+                    excluded_collections.push(id);
+                }
                 view_layers.insert(
                     layer_id,
                     ViewLayer {
@@ -4170,11 +4171,11 @@ fn build_imported_graph(
             .cloned()
             .ok_or_else(|| invalid_intermediate("object ID mapping is missing"))?;
         let object_type = item.get("type").and_then(Value::as_str).unwrap_or("EMPTY");
-        let instance_collection_name = item
+        let instance_collection_bridge_id = item
             .get("instance_collection")
             .and_then(Value::as_str)
-            .filter(|name| !name.is_empty());
-        let kind = if instance_collection_name.is_some() {
+            .filter(|bridge_id| !bridge_id.is_empty());
+        let kind = if instance_collection_bridge_id.is_some() {
             "collection_instance"
         } else {
             match object_type {
@@ -4219,9 +4220,11 @@ fn build_imported_graph(
             // Blender source values exactly, instead of recomputing them from the quaternion.
             metadata.insert("source_rotation".to_owned(), json!(rotation));
         }
-        if let Some(instance_name) = instance_collection_name {
-            let collection_id = collection_ids.get(instance_name).ok_or_else(|| {
-                invalid_intermediate("collection instance references an unknown collection")
+        if let Some(bridge_id) = instance_collection_bridge_id {
+            let collection_id = collection_ids.get(bridge_id).ok_or_else(|| {
+                invalid_intermediate(
+                    "collection instance references an unknown collection bridge ID",
+                )
             })?;
             properties.insert("instance_collection".to_owned(), json!(collection_id));
         }
@@ -4375,16 +4378,19 @@ fn build_imported_graph(
                 if modifier_type == "BOOLEAN"
                     && params.get("operand_type").and_then(Value::as_str) == Some("COLLECTION")
                 {
-                    let collection_name = params
+                    let bridge_id = params
                         .get("collection")
-                        .and_then(|value| value.get("name").and_then(Value::as_str))
+                        .and_then(|value| value.get("bridge_id"))
+                        .and_then(Value::as_str)
                         .ok_or_else(|| {
                             invalid_intermediate(
-                                "Boolean modifier references an invalid collection",
+                                "Boolean modifier references an invalid collection bridge ID",
                             )
                         })?;
-                    let collection_id = collection_ids.get(collection_name).ok_or_else(|| {
-                        invalid_intermediate("Boolean modifier references an unknown collection")
+                    let collection_id = collection_ids.get(bridge_id).ok_or_else(|| {
+                        invalid_intermediate(
+                            "Boolean modifier references an unknown collection bridge ID",
+                        )
                     })?;
                     params.insert("collection".to_owned(), json!(collection_id.as_str()));
                     params.remove("object");
@@ -4892,27 +4898,37 @@ fn build_imported_graph(
         }
     }
     for item in collections {
-        let name = string_field(item, "name")?;
-        if let Some(collection_id) = collection_ids.get(name).cloned()
-            && let Some(collection) = doc.collections.get_mut(&collection_id)
-        {
-            collection.children = item
-                .get("children")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .filter_map(|child| collection_ids.get(child).cloned())
-                .collect();
-            collection.objects = item
-                .get("objects")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .filter_map(|object| object_ids.get(object).cloned())
-                .collect();
-        }
+        let bridge_id = string_field(item, "bridge_id")?;
+        let collection_id = collection_ids.get(bridge_id).cloned().ok_or_else(|| {
+            invalid_intermediate("collection record references an unknown collection bridge ID")
+        })?;
+        let collection = doc.collections.get_mut(&collection_id).ok_or_else(|| {
+            invalid_intermediate("collection bridge ID has no imported collection")
+        })?;
+        collection.children = item
+            .get("children")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|reference| {
+                let bridge_id = reference.as_str().ok_or_else(|| {
+                    invalid_intermediate("collection child reference is not a string")
+                })?;
+                collection_ids.get(bridge_id).cloned().ok_or_else(|| {
+                    invalid_intermediate(
+                        "collection child references an unknown collection bridge ID",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        collection.objects = item
+            .get("objects")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(|object| object_ids.get(object).cloned())
+            .collect();
     }
     for item in scenes {
         let name = string_field(item, "name")?;
@@ -6449,8 +6465,12 @@ fn register_blend_libraries(
             continue;
         };
         for item in optional_array(raw, key)? {
-            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-            let Some(id) = ids.get(name) else {
+            let reference = if registry == "collections" {
+                string_field(item, "bridge_id")?
+            } else {
+                item.get("name").and_then(Value::as_str).unwrap_or_default()
+            };
+            let Some(id) = ids.get(reference) else {
                 continue;
             };
             register_blend_linked_item(item, registry, id, &library_ids, doc)?;
@@ -7238,6 +7258,41 @@ fn matrix_column_major(value: Option<&Value>) -> Option<[f64; 16]> {
         }
     }
     Some(result)
+}
+
+fn mapped_collection_id(
+    item: &Value,
+    name: &str,
+    bridge_id: &str,
+    collection_ids: &mut BTreeMap<String, Id>,
+    mappings: &mut BTreeMap<String, String>,
+) -> Result<Id> {
+    if bridge_id.is_empty() || collection_ids.contains_key(bridge_id) {
+        return Err(invalid_intermediate(
+            "collection bridge ID is empty or duplicated",
+        ));
+    }
+    let used: BTreeSet<String> = collection_ids
+        .values()
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let id_name = if bridge_id.starts_with("scene-root:") {
+        bridge_id
+    } else {
+        name
+    };
+    let candidate = item
+        .get("potter_id")
+        .and_then(Value::as_str)
+        .filter(|id| crate::model::is_valid_id(id) && !used.contains(*id))
+        .map_or_else(
+            || unique_id(id_name, "collection", &mut used.into_iter().collect()),
+            str::to_owned,
+        );
+    let id = Id::new(candidate)?;
+    collection_ids.insert(bridge_id.to_owned(), id.clone());
+    mappings.insert(format!("Collection:{bridge_id}"), id.as_str().to_owned());
+    Ok(id)
 }
 
 fn mapped_id(
@@ -9435,13 +9490,13 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             "Blender's USD cache file is not supported; the cache resource is kept but its Mesh Cache and Mesh Sequence Cache modifiers fail at evaluation",
         ));
     }
-    // The importer maps a Blender Collection pointer to a Potter collection only when the raw `collections` array names it.
-    let collection_names: BTreeSet<&str> = raw
+    // Physics pointers resolve only to collections explicitly imported by their bridge identity.
+    let collection_bridge_ids: BTreeSet<&str> = raw
         .get("collections")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .filter_map(|item| item.get("bridge_id").and_then(Value::as_str))
         .collect();
     // Particle texture slots (`psys_get_texture`) that Potter cannot apply are reported. Potter applies
     // the time, life, density, and size channels with GLOBAL or OBJECT coordinates; a texture without a
@@ -9801,7 +9856,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     modifier.get("name").and_then(Value::as_str),
                     kind,
                     settings,
-                    &collection_names,
+                    &collection_bridge_ids,
                 ));
             }
         }
@@ -10151,15 +10206,14 @@ fn blender_physics_system(modifier_type: &str, settings: &Value) -> Option<&'sta
     }
 }
 
-/// Name of the Blender Collection that a physics value points at. The bridge dumps an ID pointer as `{"id_type", "name"}`.
-fn collection_pointer_name(value: &Value) -> Option<&str> {
+/// The bridge identity of a Blender Collection pointer.
+fn collection_pointer_bridge_id(value: &Value) -> Option<&str> {
     (value.get("id_type").and_then(Value::as_str) == Some("Collection"))
-        .then(|| value.get("name").and_then(Value::as_str))
+        .then(|| value.get("bridge_id").and_then(Value::as_str))
         .flatten()
 }
 
-/// Maps the Blender Collection pointers of a physics block, and of the nested blocks and surfaces it holds, to Potter collection
-/// ids. A pointer that the property consumes, and whose collection was imported, becomes that id. Every other pointer is cleared;
+/// Maps imported Blender Collection references in a physics block to Potter collection IDs. Every other pointer is cleared;
 /// `collect_physics_import_losses` reports it.
 fn resolve_physics_collection_references(
     system: &str,
@@ -10182,10 +10236,10 @@ fn resolve_physics_collection_references(
             }
             continue;
         }
-        let Some(name) = collection_pointer_name(value).map(str::to_owned) else {
+        let Some(bridge_id) = collection_pointer_bridge_id(value).map(str::to_owned) else {
             continue;
         };
-        *value = match collection_ids.get(&name) {
+        *value = match collection_ids.get(&bridge_id) {
             Some(id) if honoured.contains(&key.as_str()) => json!(id.as_str()),
             _ => Value::Null,
         };
@@ -10194,7 +10248,7 @@ fn resolve_physics_collection_references(
 
 /// Blender physics settings that Potter keeps but does not evaluate. `settings` is the bridge dump of one modifier's physics
 /// block, scoped by `blender_physics_system`. Each property that the block holds away from its Blender default, and that Potter
-/// does not evaluate, is a loss. `collections` names the imported collections.
+/// does not evaluate, is a loss. `collections` contains imported bridge identities.
 fn physics_import_losses(
     modifier_name: Option<&str>,
     modifier_type: &str,
@@ -10251,14 +10305,14 @@ fn collect_physics_import_losses(
             continue;
         }
         let consumed = honoured.contains(&key.as_str());
-        if let Some(name) = collection_pointer_name(value) {
+        if let Some(bridge_id) = collection_pointer_bridge_id(value) {
             // A consumed pointer to an imported collection is mapped on import; every other pointer is cleared there.
-            if !(consumed && collections.contains(name)) {
+            if !(consumed && collections.contains(bridge_id)) {
                 losses.push(loss(
                     format!("blender.physics.{system}.{key}"),
                     owner,
                     &format!(
-                        "Blender's {key} points at collection `{name}`, which Potter cannot apply to this {system} property; the reference is cleared on import, so Potter applies the setting without it"
+                        "Blender's {key} points at collection bridge ID `{bridge_id}`, which Potter cannot apply to this {system} property; the reference is cleared on import, so Potter applies the setting without it"
                     ),
                 ));
             }
@@ -11861,7 +11915,7 @@ mod tests {
     #[test]
     fn intermediate_rejects_missing_required_graph_arrays() {
         let error = validate_intermediate(
-            &json!({"bridge_version": 1, "blender_version": "5.2.2", "scenes": []}),
+            &json!({"bridge_version": 2, "blender_version": "5.2.2", "scenes": []}),
         );
         assert!(matches!(
             error,
@@ -12170,10 +12224,10 @@ mod tests {
     #[test]
     fn import_projection_preserves_shared_mesh_parent_material_and_animation() -> Result<()> {
         let raw: Value = serde_json::from_str(r#"{
-            "bridge_version": 1, "blender_version": "5.2.2", "file_version": [5, 2, 2],
+            "bridge_version": 2, "blender_version": "5.2.2", "file_version": [5, 2, 2],
             "active_scene": "Scene",
             "scenes": [{
-                "name": "Scene", "potter_id": "scene_test", "root_collection": "Collection",
+                "name": "Scene", "potter_id": "scene_test", "root_collection": "collection:Collection",
                 "frame_current": 12.5, "frame_start": 1, "frame_end": 50, "fps": 24, "fps_base": 1.0,
                 "camera": null, "world": {"name": "World", "potter_id": "world_test",
                     "color": [0.1,0.2,0.3], "strength": 0.6,
@@ -12188,6 +12242,7 @@ mod tests {
             }],
             "collections": [{
                 "name": "Collection", "potter_id": "collection_root", "children": [],
+                "bridge_id": "collection:Collection",
                 "objects": ["Child", "Parent"]
             }],
             "objects": [
@@ -12342,12 +12397,85 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_scene_roots_keep_identity_and_share_regular_child_collections() -> Result<()> {
+        let raw = json!({
+            "bridge_version":2,"blender_version":"5.2.2","file_version":[5,2,2],
+            "active_scene":"Source",
+            "scenes":[
+                {"name":"Source","root_collection":"scene-root:Source","frame_start":1,
+                    "frame_end":1,"fps":24,"fps_base":1.0,"camera":null,"world":null,
+                    "render":{},"view_layers":[{"name":"View Layer","excluded_collections":[]}],
+                    "sequencer":{"channels":1,"strips":[]}},
+                {"name":"Consumer","root_collection":"scene-root:Consumer","frame_start":1,
+                    "frame_end":1,"fps":24,"fps_base":1.0,"camera":null,"world":null,
+                    "render":{},"view_layers":[{"name":"View Layer","excluded_collections":[]}],
+                    "sequencer":{"channels":1,"strips":[]}}
+            ],
+            "collections":[
+                {"name":"Scene Collection","bridge_id":"scene-root:Source",
+                    "children":["collection:Shared"],"objects":[]},
+                {"name":"Scene Collection","bridge_id":"scene-root:Consumer",
+                    "children":["collection:Shared"],"objects":[]},
+                {"name":"Shared","potter_id":"collection_shared",
+                    "bridge_id":"collection:Shared","children":[],"objects":["SharedObject"]}
+            ],
+            "objects":[{"name":"SharedObject","potter_id":"node_shared","type":"EMPTY",
+                "parent":null,"location":[0,0,0],"rotation_mode":"XYZ","rotation_euler":[0,0,0],
+                "rotation_quaternion":[1,0,0,0],"scale":[1,1,1],"materials":[],"material_links":[],
+                "constraints":[],"modifiers":[],"drivers":[],"nla_tracks":[],"custom_properties":{},
+                "rna_properties":{}}],
+            "meshes":[],"materials":[],"cameras":[],"lights":[],
+            "armatures":[],"grease_pencils":[],"actions":[],"images":[],"texts":[],
+            "node_groups":[],"other_datablocks":[],"unused_datablocks":[]
+        });
+        let imported = build_imported_graph(
+            &raw,
+            Path::new("multi_scene.blend"),
+            b"ORIGINAL".to_vec(),
+            &BTreeMap::new(),
+        )?;
+        let source = imported
+            .doc
+            .scenes
+            .values()
+            .find(|scene| scene.name == "Source")
+            .ok_or_else(|| invalid_intermediate("source scene is missing"))?;
+        let consumer = imported
+            .doc
+            .scenes
+            .values()
+            .find(|scene| scene.name == "Consumer")
+            .ok_or_else(|| invalid_intermediate("consumer scene is missing"))?;
+        assert_ne!(source.root_collection, consumer.root_collection);
+        assert_eq!(imported.doc.collections.len(), 3);
+        let source_root = &imported.doc.collections[&source.root_collection];
+        let consumer_root = &imported.doc.collections[&consumer.root_collection];
+        assert_eq!(source_root.name, "Scene Collection");
+        assert_eq!(consumer_root.name, "Scene Collection");
+        let shared = Id::new("collection_shared")?;
+        assert_eq!(
+            source_root.children.as_slice(),
+            std::slice::from_ref(&shared)
+        );
+        assert_eq!(
+            consumer_root.children.as_slice(),
+            std::slice::from_ref(&shared)
+        );
+        let shared_node = Id::new("node_shared")?;
+        assert_eq!(
+            imported.doc.collections[&shared].objects.as_slice(),
+            std::slice::from_ref(&shared_node)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn advanced_blender_projection_maps_rig_animation_physics_nodes_and_grease_pencil() -> Result<()>
     {
         let raw = json!({
-            "bridge_version":1,"blender_version":"5.2.2","file_version":[5,2,2],"active_scene":"Scene",
+            "bridge_version":2,"blender_version":"5.2.2","file_version":[5,2,2],"active_scene":"Scene",
             "scenes":[{
-                "name":"Scene","potter_id":"scene_main","root_collection":"Collection",
+                "name":"Scene","potter_id":"scene_main","root_collection":"collection:Collection",
                 "frame_current":1.0,"frame_start":1,"frame_end":250,"fps":24,"fps_base":1.0,
                 "camera":null,"world":null,"unit":{"system":"METRIC","scale_length":1.0},
                 "display_shading":{"type":"SOLID","light":"STUDIO","studio_light":"Default","color_type":"MATERIAL","use_world_space_lighting":false,"show_specular_highlight":true,"show_cavity":false,"show_shadows":false,"show_object_outline":false,"show_backface_culling":false,"show_xray":false,"xray_alpha":0.5,"use_dof":false,"camera_dof":false,"background_type":"THEME"},
@@ -12357,6 +12485,7 @@ mod tests {
                     "substeps":4,"solver_iterations":10,"frame_start":1,"frame_end":250,"seed":3}
             }],
             "collections":[{"name":"Collection","potter_id":"collection_root","children":[],
+                "bridge_id":"collection:Collection",
                 "objects":["Rig","Skinned","Cube","Pencil"]}],
             "objects":[
                 {"name":"Rig","potter_id":"node_rig","type":"ARMATURE","data_name":"Armature",
@@ -20040,9 +20169,11 @@ mod volume_and_physics_loss_tests {
 
     #[test]
     fn collection_pointer_maps_to_potter_collection_when_consumed_and_imported() -> Result<()> {
-        let collection_ids = BTreeMap::from([("Col".to_owned(), Id::new("collection_col")?)]);
-        let mut settings =
-            json!({"collision_settings": {"collection": {"id_type": "Collection", "name": "Col"}}});
+        let collection_ids =
+            BTreeMap::from([("collection:Col".to_owned(), Id::new("collection_col")?)]);
+        let mut settings = json!({"collision_settings": {"collection": {
+            "id_type": "Collection", "name": "Col", "bridge_id": "collection:Col"
+        }}});
         let block = settings
             .as_object_mut()
             .ok_or_else(|| PotError::invalid_argument("test settings must be an object"))?;
@@ -20056,7 +20187,9 @@ mod volume_and_physics_loss_tests {
 
     #[test]
     fn collection_pointer_to_an_unimported_collection_is_cleared_and_reported() -> Result<()> {
-        let mut settings = json!({"collision_settings": {"collection": {"id_type": "Collection", "name": "Missing"}}});
+        let mut settings = json!({"collision_settings": {"collection": {
+            "id_type": "Collection", "name": "Missing", "bridge_id": "collection:Missing"
+        }}});
         let block = settings
             .as_object_mut()
             .ok_or_else(|| PotError::invalid_argument("test settings must be an object"))?;
@@ -20064,7 +20197,9 @@ mod volume_and_physics_loss_tests {
         assert_eq!(settings["collision_settings"]["collection"], Value::Null);
         let raw = json!({"objects": [{"name": "Cloth", "type": "MESH", "modifiers": [{
             "name": "Cloth", "type": "CLOTH",
-            "physics_settings": {"collision_settings": {"collection": {"id_type": "Collection", "name": "Missing"}}}
+            "physics_settings": {"collision_settings": {"collection": {
+                "id_type": "Collection", "name": "Missing", "bridge_id": "collection:Missing"
+            }}}
         }]}]});
         assert_eq!(
             features(&raw),
@@ -20075,9 +20210,11 @@ mod volume_and_physics_loss_tests {
 
     #[test]
     fn collection_pointer_to_an_imported_collection_is_not_reported() {
-        let raw = json!({"collections": [{"name": "Col"}], "objects": [{"name": "Cloth", "type": "MESH", "modifiers": [{
+        let raw = json!({"collections": [{"name": "Col", "bridge_id": "collection:Col"}], "objects": [{"name": "Cloth", "type": "MESH", "modifiers": [{
             "name": "Cloth", "type": "CLOTH",
-            "physics_settings": {"collision_settings": {"collection": {"id_type": "Collection", "name": "Col"}}}
+            "physics_settings": {"collision_settings": {"collection": {
+                "id_type": "Collection", "name": "Col", "bridge_id": "collection:Col"
+            }}}
         }]}]});
         assert_eq!(features(&raw), Vec::<String>::new());
     }
@@ -20087,7 +20224,7 @@ mod volume_and_physics_loss_tests {
         let raw = json!({"objects": [{"name": "Canvas", "type": "MESH", "modifiers": [{
             "name": "Paint", "type": "DYNAMIC_PAINT",
             "physics_settings": {"role": "canvas", "canvas_surfaces": [
-                {"brush_collection": {"id_type": "Collection", "name": "Brushes"}}
+                {"brush_collection": {"id_type": "Collection", "name": "Brushes", "bridge_id": "collection:Brushes"}}
             ]}
         }]}]});
         assert_eq!(

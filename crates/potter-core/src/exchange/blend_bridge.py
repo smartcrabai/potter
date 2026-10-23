@@ -243,6 +243,13 @@ def potter_modifier_type(blender_type):
 
 
 
+def _collection_bridge_id(collection):
+    for scene in bpy.data.scenes:
+        if scene.collection.as_pointer() == collection.as_pointer():
+            return "scene-root:" + scene.name_full
+    return "collection:" + collection.name_full
+
+
 def plain(value, depth=0):
     if depth > 8:
         return repr(value)
@@ -250,8 +257,11 @@ def plain(value, depth=0):
         return value
     if isinstance(value, (set, frozenset)):
         return [plain(item, depth + 1) for item in sorted(value)]
-    if isinstance(value, (bpy.types.ID,)):
-        return {"id_type": value.bl_rna.identifier, "name": value.name_full}
+    if isinstance(value, bpy.types.ID):
+        result = {"id_type": value.bl_rna.identifier, "name": value.name_full}
+        if isinstance(value, bpy.types.Collection):
+            result["bridge_id"] = _collection_bridge_id(value)
+        return result
     if isinstance(value, Matrix):
         return matrix_rows(value)
     if all(hasattr(value, axis) for axis in ("r", "g", "b")):
@@ -297,7 +307,7 @@ def matrix_rows(matrix):
 def custom_props(block):
     try:
         return {str(key): plain(block[key]) for key in block.keys()
-                if key != "potter.object_solver_inverses_json"}
+                if key not in ("potter.object_solver_inverses_json", "potter.root_collection")}
     except Exception:
         return {}
 
@@ -323,7 +333,7 @@ def rna_props(block, omit=()):
     result = {}
     for prop, key, val in _walk_rna_properties(block, omit=omit):
         if isinstance(val, bpy.types.ID):
-            result[key] = {"id_type": val.bl_rna.identifier, "name": val.name_full}
+            result[key] = plain(val)
         elif hasattr(val, "bl_rna"):
             result[key] = {"rna_type": val.bl_rna.identifier}
         else:
@@ -2461,7 +2471,7 @@ def object_dump(obj):
             "data_name": data.name_full if data else None, "parent": obj.parent.name_full if obj.parent else None,
             "parent_type": obj.parent_type, "parent_bone": obj.parent_bone,
             "track_axis": obj.track_axis, "up_axis": obj.up_axis,
-            "instance_collection": obj.instance_collection.name_full
+            "instance_collection": _collection_bridge_id(obj.instance_collection)
             if getattr(obj, "instance_collection", None) else None,
             "matrix_parent_inverse": matrix_rows(obj.matrix_parent_inverse),
             "location": plain(obj.location),
@@ -2594,9 +2604,10 @@ def dump_fcurve(curve):
 
 
 def collection_dump(collection):
-    return {"name": collection.get("potter.name", collection.name_full),
+    return {"bridge_id": _collection_bridge_id(collection),
+            "name": collection.get("potter.name", collection.name_full),
             "potter_id": collection.get("potter.id"), "library": library_reference(collection),
-            "children": [child.name_full for child in collection.children],
+            "children": [_collection_bridge_id(child) for child in collection.children],
             "objects": [obj.name_full for obj in collection.objects],
             "custom_properties": custom_props(collection), "hide_viewport": bool(collection.hide_viewport),
             "hide_render": bool(collection.hide_render), "fake_user": bool(collection.use_fake_user)}
@@ -2905,7 +2916,7 @@ def _sequencer_dump(scene):
             "color": color,
             "text": getattr(strip, "text", None),
             "transition": transition,
-            "inputs": [getattr(strip, name).name_full for name in ("input_1", "input_2")
+            "inputs": [getattr(strip, name).name for name in ("input_1", "input_2")
                        if getattr(strip, name, None) is not None],
             "effect": effect,
         })
@@ -2974,7 +2985,7 @@ def dump_scene(scene):
         excluded = []
         def walk(layer_collection):
             if layer_collection.exclude:
-                excluded.append(layer_collection.collection.name_full)
+                excluded.append(_collection_bridge_id(layer_collection.collection))
             for child in layer_collection.children:
                 walk(child)
         walk(view_layer.layer_collection)
@@ -3073,7 +3084,7 @@ def dump_scene(scene):
                 if any(modifier.type in ("MESH_TO_VOLUME", "VOLUME_DISPLACE", "VOLUME_TO_MESH")
                        for modifier in obj.modifiers)],
             "sequencer": _sequencer_dump(scene),
-            "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
+            "root_collection": _collection_bridge_id(scene.collection),
             "world": world_info, "custom_properties": custom_props(scene),
             "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings", "use_gravity"))}
 
@@ -3231,7 +3242,7 @@ def dump_all():
         bpy.context.view_layer.update()
     except Exception:
         pass
-    data = {"bridge_version": 1, "blender_version": "%d.%d.%d" % bpy.app.version,
+    data = {"bridge_version": 2, "blender_version": "%d.%d.%d" % bpy.app.version,
             "file_version": list(getattr(bpy.app, "version_file", bpy.app.version)),
             "active_scene": bpy.context.scene.name_full,
             "scenes": [dump_scene(item) for item in bpy.data.scenes],
@@ -5320,13 +5331,20 @@ def compatibility_block(doc, collection_name, entity_kind, identifier):
         candidates = intermediate.get(collection_name, [])
     for item in candidates:
         name = item.get("name")
-        mapped = item.get("potter_id") or mappings.get(entity_kind + ":" + name)
+        mapping_name = (item.get("bridge_id")
+                        if collection_name == "collections" else name)
+        mapped = item.get("potter_id")
+        if mapped is None and isinstance(mapping_name, str):
+            mapped = mappings.get(entity_kind + ":" + mapping_name)
         if mapped == identifier:
             return item
     return {}
 
 
 def compatibility_name(doc, entity_kind, identifier, fallback):
+    if entity_kind == "Collection":
+        source = compatibility_block(doc, "collections", entity_kind, identifier)
+        return source.get("name") or fallback
     compatibility = doc.get("compatibility", {}).get("blender_adapter", {})
     for key, value in compatibility.get("id_mappings", {}).items():
         if key.startswith(entity_kind + ":") and value == identifier:
@@ -8122,7 +8140,6 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene["potter.scene_hash"] = scene_hash
         source = compatibility_block(doc, "scenes", "Scene", scene_id)
         set_props(scene, source.get("custom_properties", {}))
-        scene["potter.root_collection"] = collections_raw[item["root_collection"]]["name"]
         set_scene_frame(scene, item["frame_current"])
         scene.frame_start = item["frame_start"]
         scene.use_gravity = bool(item.get("use_gravity", True))
@@ -8598,16 +8615,14 @@ def export_doc(doc, target, pack, scene_hash, context):
             obj.data = obj_data
         else:
             obj = bpy.data.objects.new(item["name"], obj_data)
-        instance_name = source_object.get("instance_collection")
+        instance_reference = source_object.get("instance_collection")
         instance_id = item.get("properties", {}).get("instance_collection")
+        if instance_reference and not instance_id:
+            raise ValueError("collection instance has no imported collection bridge ID")
         instance = collection_map.get(instance_id) if instance_id else None
-        if instance is None and instance_name:
-            instance = next((candidate for candidate in collection_map.values()
-                             if candidate.name_full == instance_name), None)
-        if instance_id or instance_name:
-            if instance is None:
-                raise ValueError("collection instance references missing collection %s"
-                                 % (instance_id or instance_name))
+        if instance_id and instance is None:
+            raise ValueError("collection instance references missing collection ID %s" % instance_id)
+        if instance is not None:
             obj.instance_type = "COLLECTION"
             obj.instance_collection = instance
         set_id(obj, node_id)
