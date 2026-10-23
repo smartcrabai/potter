@@ -263,6 +263,9 @@ fn complete_scene_schema(root: &mut Value) {
         "frame_current",
         "frame_start",
         "frame_end",
+        "use_custom_simulation_range",
+        "simulation_frame_start",
+        "simulation_frame_end",
         "fps",
         "fps_base",
         "camera",
@@ -282,6 +285,9 @@ fn complete_scene_schema(root: &mut Value) {
     scene["properties"]["compositor"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
     scene["properties"]["color_management"] = json!({"$ref":"#/$defs/color_management"});
     scene["properties"]["sequencer"] = json!({"$ref":"#/$defs/sequencer"});
+    scene["properties"]["use_custom_simulation_range"] = json!({"type":"boolean"});
+    scene["properties"]["simulation_frame_start"] = json!({"type":"integer"});
+    scene["properties"]["simulation_frame_end"] = json!({"type":"integer"});
     let render = &mut defs["render_settings"];
     render["required"] = json!([
         "resolution_x",

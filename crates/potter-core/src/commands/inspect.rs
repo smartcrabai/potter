@@ -384,6 +384,14 @@ fn node_item(
         .map(|(child_id, _)| child_id.to_string())
         .collect::<Vec<_>>();
     let animated_transform = animated_transform(node, doc, snapshot.frame)?;
+    let evaluated_material_refs = snapshot
+        .node_bake_material_refs
+        .iter()
+        .filter(|((object_id, _, _), _)| object_id == id)
+        .map(|((_, modifier_id, node_id), materials)| {
+            json!({"modifier":modifier_id,"node":node_id,"materials":materials})
+        })
+        .collect::<Vec<_>>();
     let evaluated_geometry = snapshot.meshes.get(id).map_or(Value::Null, |mesh| {
         let vertex_indices: HashMap<_, _> = mesh
             .vertices
@@ -443,7 +451,7 @@ fn node_item(
     let materials = (0..snapshot.slot_count(id, node, data_block))
         .map(|slot| snapshot.slot_material(id, node, data_block, slot))
         .collect::<Vec<_>>();
-    Ok(json!({
+    let mut item = json!({
         "type": "node",
         "id": id,
         "name": node.name,
@@ -494,7 +502,11 @@ fn node_item(
         "bounds": evaluated.bounds,
         "dimensions": evaluated.dimensions,
         "evaluated_geometry": evaluated_geometry,
-    }))
+    });
+    if !evaluated_material_refs.is_empty() {
+        item["evaluated_material_refs"] = json!(evaluated_material_refs);
+    }
+    Ok(item)
 }
 
 fn modifier_item(modifier: &Modifier) -> Result<Value> {
