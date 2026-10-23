@@ -797,20 +797,27 @@ fn clip_camera_light_polygon(
             vertex.depth <= depth
         }
     };
+    let strictly_inside = |vertex: CameraLightClipVertex| {
+        if keep_greater {
+            vertex.depth > depth
+        } else {
+            vertex.depth < depth
+        }
+    };
     let mut output_count = 0;
     let mut previous = input[input_count - 1];
     let mut previous_inside = inside(previous);
     for current in input.into_iter().take(input_count) {
         let current_inside = inside(current);
         if current_inside {
-            if !previous_inside && current.depth != depth {
+            if !previous_inside && strictly_inside(current) {
                 let t = (depth - previous.depth) / (current.depth - previous.depth);
                 output[output_count] = interpolate_camera_light_vertex(previous, current, t, depth);
                 output_count += 1;
             }
             output[output_count] = current;
             output_count += 1;
-        } else if previous_inside && previous.depth != depth {
+        } else if previous_inside && strictly_inside(previous) {
             let t = (depth - previous.depth) / (current.depth - previous.depth);
             output[output_count] = interpolate_camera_light_vertex(previous, current, t, depth);
             output_count += 1;
@@ -946,8 +953,8 @@ pub(super) fn project_camera_light_quad(
                 let inverse_w = 1.0 / vertex.w;
                 let ndc = [vertex.clip[0] / vertex.w, vertex.clip[1] / vertex.w];
                 let screen = [
-                    (ndc[0] + 1.0) * 0.5 * width as f32,
-                    (1.0 - ndc[1]) * 0.5 * height as f32,
+                    ndc[0].midpoint(1.0) * width as f32,
+                    (-ndc[1]).midpoint(1.0) * height as f32,
                 ];
                 if !inverse_w.is_finite() || screen.iter().any(|value| !value.is_finite()) {
                     return None;
@@ -1016,7 +1023,7 @@ pub(super) fn camera_light_display_quad(
     if !soft_falloff {
         if distance > radius {
             let ratio = radius / distance;
-            radius *= (1.0 / (1.0 - ratio * ratio).max(1.0e-8).sqrt()) as f32;
+            radius *= 1.0 / (1.0 - ratio * ratio).max(1.0e-8).sqrt();
         } else {
             radius = frame.far as f32;
         }
@@ -1078,12 +1085,12 @@ mod camera_light_raster_tests {
     }
 
     fn projected_center_x(quad: &CameraLightProjectedQuad) -> f32 {
-        let count = quad.triangle_count * 3;
-        quad.vertices[..count]
+        assert_eq!(quad.triangle_count, 2);
+        quad.vertices[..6]
             .iter()
             .map(|vertex| vertex.screen[0])
             .sum::<f32>()
-            / count as f32
+            / 6.0
     }
 
     fn projected_quad_positions(center: DVec3, radius: f64) -> [DVec3; 4] {
@@ -1097,9 +1104,13 @@ mod camera_light_raster_tests {
 
     #[test]
     fn film_sample_translation_uses_pixel_corner_offsets() {
+        let offsets = [
+            0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+            15.0, 16.0, 17.0,
+        ];
         let quad = CameraLightProjectedQuad {
             vertices: std::array::from_fn(|index| CameraLightProjectedVertex {
-                screen: [1.25 + index as f32, 2.75 + index as f32],
+                screen: [1.25 + offsets[index], 2.75 + offsets[index]],
                 inverse_w: 1.0,
                 local: [0.0; 2],
             }),
@@ -1329,6 +1340,23 @@ fn sample_background(
     }
 }
 
+struct RasterSamplesRequest<'scene, 'context, 'lights, 'volume, 'volume_scene, 'borrow> {
+    triangles: &'scene [Triangle],
+    camera: &'scene Camera,
+    width: u32,
+    height: u32,
+    mode: Mode,
+    background: [u8; 4],
+    world: Option<WorldRadiance<'scene>>,
+    samples: u32,
+    seed: u32,
+    filter_size: f64,
+    shader: Option<&'scene dyn SurfaceShader>,
+    prepared_materials: &'scene [crate::shader::PreparedMaterial],
+    camera_lights: Option<super::path::RealtimeCameraLightView<'context, 'lights>>,
+    view_index: usize,
+    volume_pass: Option<&'borrow mut super::path::RealtimeVolumePass<'volume, 'volume_scene>>,
+}
 #[expect(
     clippy::too_many_arguments,
     reason = "raster configuration is explicit at this low-level boundary"
@@ -1349,7 +1377,7 @@ pub(super) fn rasterize_with_samples(
     camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
-    rasterize_with_samples_for_eye(
+    rasterize_with_samples_for_eye(RasterSamplesRequest {
         triangles,
         camera,
         width,
@@ -1362,33 +1390,32 @@ pub(super) fn rasterize_with_samples(
         filter_size,
         shader,
         prepared_materials,
-        camera_lights.map(|lights| lights.view(0)),
-        0,
+        camera_lights: camera_lights.map(|lights| lights.view(0)),
+        view_index: 0,
         volume_pass,
-    )
+    })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "raster configuration is explicit at this low-level boundary"
-)]
 fn rasterize_with_samples_for_eye(
-    triangles: &[Triangle],
-    camera: &Camera,
-    width: u32,
-    height: u32,
-    mode: Mode,
-    background: [u8; 4],
-    world: Option<WorldRadiance<'_>>,
-    samples: u32,
-    seed: u32,
-    filter_size: f64,
-    shader: Option<&dyn SurfaceShader>,
-    prepared_materials: &[crate::shader::PreparedMaterial],
-    camera_lights: Option<super::path::RealtimeCameraLightView<'_, '_>>,
-    view_index: usize,
-    volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
+    request: RasterSamplesRequest<'_, '_, '_, '_, '_, '_>,
 ) -> Result<RasterOutput> {
+    let RasterSamplesRequest {
+        triangles,
+        camera,
+        width,
+        height,
+        mode,
+        background,
+        world,
+        samples,
+        seed,
+        filter_size,
+        shader,
+        prepared_materials,
+        camera_lights,
+        view_index,
+        volume_pass,
+    } = request;
     if samples == 0 {
         return Err(PotError::invalid_argument(
             "sample count must be greater than zero",
@@ -1398,9 +1425,9 @@ fn rasterize_with_samples_for_eye(
     if camera.stereo_mode == StereoMode::Anaglyph {
         let left_camera = camera_eye(camera, -1.0);
         let right_camera = camera_eye(camera, 1.0);
-        let mut left_output = rasterize_with_samples_for_eye(
+        let mut left_output = rasterize_with_samples_for_eye(RasterSamplesRequest {
             triangles,
-            &left_camera,
+            camera: &left_camera,
             width,
             height,
             mode,
@@ -1411,13 +1438,13 @@ fn rasterize_with_samples_for_eye(
             filter_size,
             shader,
             prepared_materials,
-            camera_lights.map(|lights| lights.for_eye(0)),
-            0,
-            volume_pass.as_deref_mut(),
-        )?;
-        let right_output = rasterize_with_samples_for_eye(
+            camera_lights: camera_lights.map(|lights| lights.for_eye(0)),
+            view_index: 0,
+            volume_pass: volume_pass.as_deref_mut(),
+        })?;
+        let right_output = rasterize_with_samples_for_eye(RasterSamplesRequest {
             triangles,
-            &right_camera,
+            camera: &right_camera,
             width,
             height,
             mode,
@@ -1428,10 +1455,10 @@ fn rasterize_with_samples_for_eye(
             filter_size,
             shader,
             prepared_materials,
-            camera_lights.map(|lights| lights.for_eye(1)),
-            1,
-            volume_pass.as_deref_mut(),
-        )?;
+            camera_lights: camera_lights.map(|lights| lights.for_eye(1)),
+            view_index: 1,
+            volume_pass: volume_pass.as_deref_mut(),
+        })?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
         let (right_pixels, _) = right_output.rgba.as_chunks::<4>();
         for (left, right) in left_pixels.iter_mut().zip(right_pixels) {
@@ -1679,7 +1706,7 @@ fn rasterize_with_samples_for_eye(
                                 };
                             lights.for_eye(eye).at_pixel(
                                 camera_light_raster_samples.as_ref(),
-                                sample_index as usize,
+                                sample_index,
                                 sample_x,
                                 sample_y,
                                 pixel_x,
@@ -2365,7 +2392,7 @@ fn pixel_in_bounds(width: u32, height: u32, x: u32, y: u32) -> bool {
 }
 fn camera_light_eye_index(stereo_mode: StereoMode, x: u32, width: u32, view_index: usize) -> usize {
     if stereo_mode == StereoMode::SideBySide {
-        if x >= width / 2 { 1 } else { 0 }
+        usize::from(x >= width / 2)
     } else {
         view_index
     }

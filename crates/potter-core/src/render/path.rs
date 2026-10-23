@@ -1587,10 +1587,11 @@ pub(super) struct CameraLightRasterSamples {
 impl CameraLightRasterSamples {
     fn shape_for(
         &self,
-        sample_index: usize,
+        sample_index: u32,
         eye: usize,
         light_index: usize,
     ) -> Option<(&CameraLightRasterQuad, Option<&CameraLightProjectedQuad>)> {
+        let sample_index = usize::try_from(sample_index).ok()?;
         if sample_index >= self.sample_count
             || eye < self.first_eye
             || eye >= self.first_eye + self.eye_count
@@ -1613,7 +1614,7 @@ impl CameraLightRasterSamples {
 pub(super) struct RealtimeCameraLightSample<'context, 'lights, 'samples> {
     view: RealtimeCameraLightView<'context, 'lights>,
     raster_samples: Option<&'samples CameraLightRasterSamples>,
-    sample_index: usize,
+    sample_index: u32,
     jitter_x: f64,
     jitter_y: f64,
     pixel_x: u32,
@@ -1627,7 +1628,7 @@ impl RealtimeCameraLightContext<'_> {
         direction: DVec3,
         far_distance: f64,
         raster_samples: Option<&'a CameraLightRasterSamples>,
-        sample_index: usize,
+        sample_index: u32,
         jitter_x: f64,
         jitter_y: f64,
         pixel_x: u32,
@@ -1830,7 +1831,7 @@ impl<'context, 'lights> RealtimeCameraLightView<'context, 'lights> {
     pub(super) fn at_pixel<'samples>(
         self,
         raster_samples: Option<&'samples CameraLightRasterSamples>,
-        sample_index: usize,
+        sample_index: u32,
         jitter_x: f64,
         jitter_y: f64,
         pixel_x: u32,
@@ -1848,13 +1849,13 @@ impl<'context, 'lights> RealtimeCameraLightView<'context, 'lights> {
     }
 }
 
-impl<'context, 'lights, 'samples> RealtimeCameraLightSample<'context, 'lights, 'samples> {
-    pub(super) fn local_events<'sample>(
-        &'sample self,
+impl RealtimeCameraLightSample<'_, '_, '_> {
+    pub(super) fn local_events(
+        &self,
         origin: DVec3,
         direction: DVec3,
         far_distance: f64,
-    ) -> impl Iterator<Item = CameraLightEvent> + 'sample {
+    ) -> impl Iterator<Item = CameraLightEvent> + '_ {
         self.view.context.local_events(
             self.view.eye,
             origin,

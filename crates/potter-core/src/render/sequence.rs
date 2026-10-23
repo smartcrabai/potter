@@ -593,7 +593,12 @@ impl SequencerFrame {
             for channel in &mut pixel[..3] {
                 *channel = scene_to_color_space(*channel, colorspace)?;
             }
-            pixels.push(pixel.map(byte_channel));
+            pixels.push([
+                byte_channel(pixel[0])?,
+                byte_channel(pixel[1])?,
+                byte_channel(pixel[2])?,
+                byte_channel(pixel[3])?,
+            ]);
         }
         Ok(Self::Byte {
             width: frame.width,
@@ -603,7 +608,7 @@ impl SequencerFrame {
         })
     }
 
-    fn from_associated_float(frame: RgbaFrame, colorspace: ImageColorspace) -> Self {
+    fn from_associated_float(frame: RgbaFrame, colorspace: ImageColorspace) -> Result<Self> {
         let mut pixels = Vec::with_capacity(frame.pixels.len());
         for pixel in frame.pixels {
             let alpha = pixel[3];
@@ -615,18 +620,18 @@ impl SequencerFrame {
                 }
             });
             pixels.push([
-                byte_channel(straight[0]),
-                byte_channel(straight[1]),
-                byte_channel(straight[2]),
-                byte_channel(alpha),
+                byte_channel(straight[0])?,
+                byte_channel(straight[1])?,
+                byte_channel(straight[2])?,
+                byte_channel(alpha)?,
             ]);
         }
-        Self::Byte {
+        Ok(Self::Byte {
             width: frame.width,
             height: frame.height,
             colorspace,
             pixels,
-        }
+        })
     }
 
     fn from_scene_linear(frame: RgbaFrame, colorspace: SequencerColorSpace) -> Result<Self> {
@@ -751,12 +756,14 @@ fn sequencer_to_scene(mut frame: RgbaFrame, colorspace: ImageColorspace) -> Resu
     RgbaFrame::new(frame.width, frame.height, frame.pixels)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the component is clamped and scaled to an 8-bit channel before conversion"
-)]
-fn byte_channel(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+fn byte_channel(value: f32) -> Result<u8> {
+    let scaled = value.clamp(0.0, 1.0) * 255.0 + 0.5;
+    num_traits::ToPrimitive::to_u8(&scaled).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "VSE byte channel is not representable",
+        )
+    })
 }
 
 fn byte_float(value: u8) -> f32 {
@@ -779,22 +786,23 @@ fn byte_to_associated(width: u32, height: u32, pixels: &[[u8; 4]]) -> Result<Rgb
     RgbaFrame::new(width, height, associated)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "the validated transition factor is in [0, 1] and byte values scale exactly"
-)]
-fn byte_cross_factor(factor: f64) -> u32 {
-    (256.0_f32 * factor as f32) as u32
+fn byte_cross_factor(factor: f64) -> Result<u32> {
+    let factor = num_traits::ToPrimitive::to_f32(&factor).ok_or_else(|| {
+        PotError::invalid_argument("VSE byte transition factor is not representable")
+    })?;
+    num_traits::ToPrimitive::to_u32(&(256.0_f32 * factor)).ok_or_else(|| {
+        PotError::invalid_argument("VSE byte transition factor is outside its supported range")
+    })
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "weighted channel values are bounded to the byte range"
-)]
-fn byte_cross_channel(first: u8, second: u8, second_weight: u32) -> u8 {
+fn byte_cross_channel(first: u8, second: u8, second_weight: u32) -> Result<u8> {
     let value = ((256 - second_weight) * u32::from(first) + second_weight * u32::from(second)) >> 8;
-    value as u8
+    u8::try_from(value).map_err(|_| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "native VSE byte transition channel exceeded its range",
+        )
+    })
 }
 
 fn byte_crossfade(
@@ -810,19 +818,19 @@ fn byte_crossfade(
             "frames must have matching nonzero dimensions",
         ));
     }
-    let weight = byte_cross_factor(factor);
+    let weight = byte_cross_factor(factor)?;
     let pixels = first
         .iter()
         .zip(second)
         .map(|(first, second)| {
-            [
-                byte_cross_channel(first[0], second[0], weight),
-                byte_cross_channel(first[1], second[1], weight),
-                byte_cross_channel(first[2], second[2], weight),
-                byte_cross_channel(first[3], second[3], weight),
-            ]
+            Ok([
+                byte_cross_channel(first[0], second[0], weight)?,
+                byte_cross_channel(first[1], second[1], weight)?,
+                byte_cross_channel(first[2], second[2], weight)?,
+                byte_cross_channel(first[3], second[3], weight)?,
+            ])
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(SequencerFrame::Byte {
         width,
         height,
@@ -831,10 +839,6 @@ fn byte_crossfade(
     })
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the validated factor and bounded frame width keep the wipe cut within the image"
-)]
 fn byte_wipe(
     width: u32,
     height: u32,
@@ -848,7 +852,8 @@ fn byte_wipe(
             "frames must have matching nonzero dimensions",
         ));
     }
-    let cut = (f64::from(width) * factor).round() as usize;
+    let cut = num_traits::ToPrimitive::to_usize(&(f64::from(width) * factor).round())
+        .ok_or_else(|| PotError::invalid_argument("VSE wipe cut is outside the platform range"))?;
     let width = usize::try_from(width).map_err(|_| {
         PotError::new(
             ErrorCode::LimitExceeded,
@@ -888,52 +893,58 @@ fn byte_gamma_cross(
     let first = byte_to_associated(width, height, first)?;
     let second = byte_to_associated(width, height, second)?;
     let output = transition(&first, &second, factor, TransitionType::GammaCross)?;
-    Ok(SequencerFrame::from_associated_float(
-        output,
-        ImageColorspace::Srgb,
-    ))
+    SequencerFrame::from_associated_float(output, ImageColorspace::Srgb)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "validated VSE opacity and color multipliers keep byte factors bounded"
-)]
-fn byte_effect_factor(factor: f64) -> i32 {
-    (256.0_f32 * factor as f32) as i32
+fn byte_effect_factor(factor: f64) -> Result<i32> {
+    let factor = num_traits::ToPrimitive::to_f32(&factor)
+        .ok_or_else(|| PotError::invalid_argument("VSE byte effect factor is not representable"))?;
+    num_traits::ToPrimitive::to_i32(&(256.0_f32 * factor)).ok_or_else(|| {
+        PotError::invalid_argument("VSE byte effect factor is outside its supported range")
+    })
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "native Add/Subtract result channels are clamped to 0..=255"
-)]
-fn byte_add_sub_channel(first: u8, second: u8, second_alpha: u8, factor: i32, add: bool) -> u8 {
+fn byte_add_sub_channel(
+    first: u8,
+    second: u8,
+    second_alpha: u8,
+    factor: i32,
+    add: bool,
+) -> Result<u8> {
     let scaled = factor * i32::from(second_alpha);
     let delta = (scaled * i32::from(second)) >> 16;
-    if add {
-        (i32::from(first) + delta).min(255) as u8
+    let value = if add {
+        (i32::from(first) + delta).min(255)
     } else {
-        (i32::from(first) - delta).max(0) as u8
-    }
+        (i32::from(first) - delta).max(0)
+    };
+    u8::try_from(value).map_err(|_| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "native VSE Add/Subtract channel exceeded its range",
+        )
+    })
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "native Multiply result channels are bounded to 0..=255"
-)]
-fn byte_multiply_channel(first: u8, second: u8, factor: i32) -> u8 {
+fn byte_multiply_channel(first: u8, second: u8, factor: i32) -> Result<u8> {
     let first = i32::from(first);
     let second = i32::from(second);
-    (first + ((factor * first * (second - 255)) >> 16)).clamp(0, 255) as u8
+    u8::try_from((first + ((factor * first * (second - 255)) >> 16)).clamp(0, 255)).map_err(|_| {
+        PotError::new(
+            ErrorCode::InternalError,
+            "native VSE Multiply channel exceeded its range",
+        )
+    })
 }
 
 fn byte_blend_effect(
     effect: EffectType,
-    first: &[u8; 4],
-    second: &[u8; 4],
+    first: [u8; 4],
+    second: [u8; 4],
     factor: f64,
-) -> [u8; 4] {
-    let factor = byte_effect_factor(factor);
-    match effect {
+) -> Result<[u8; 4]> {
+    let factor = byte_effect_factor(factor)?;
+    Ok(match effect {
         EffectType::Add | EffectType::Subtract => [
             byte_add_sub_channel(
                 first[0],
@@ -941,31 +952,31 @@ fn byte_blend_effect(
                 second[3],
                 factor,
                 effect == EffectType::Add,
-            ),
+            )?,
             byte_add_sub_channel(
                 first[1],
                 second[1],
                 second[3],
                 factor,
                 effect == EffectType::Add,
-            ),
+            )?,
             byte_add_sub_channel(
                 first[2],
                 second[2],
                 second[3],
                 factor,
                 effect == EffectType::Add,
-            ),
+            )?,
             first[3],
         ],
         EffectType::Multiply => [
-            byte_multiply_channel(first[0], second[0], factor),
-            byte_multiply_channel(first[1], second[1], factor),
-            byte_multiply_channel(first[2], second[2], factor),
-            byte_multiply_channel(first[3], second[3], factor),
+            byte_multiply_channel(first[0], second[0], factor)?,
+            byte_multiply_channel(first[1], second[1], factor)?,
+            byte_multiply_channel(first[2], second[2], factor)?,
+            byte_multiply_channel(first[3], second[3], factor)?,
         ],
         _ => unreachable!("only byte Add/Subtract/Multiply use this kernel"),
-    }
+    })
 }
 
 fn byte_effect_frame(
@@ -1001,8 +1012,8 @@ fn byte_effect_frame(
                 pixels: first
                     .iter()
                     .zip(&second)
-                    .map(|(first, second)| byte_blend_effect(effect, first, second, factor))
-                    .collect(),
+                    .map(|(first, second)| byte_blend_effect(effect, *first, *second, factor))
+                    .collect::<Result<Vec<_>>>()?,
             })
         }
         (first, second) => {
@@ -1027,10 +1038,7 @@ fn byte_effect_frame(
             let first = byte_to_associated(width, height, &first_pixels)?;
             let second = byte_to_associated(width, height, &second_pixels)?;
             let output = apply_blend_effect(EffectType::AlphaOver, &first, &second, factor)?;
-            Ok(SequencerFrame::from_associated_float(
-                output,
-                ImageColorspace::Srgb,
-            ))
+            SequencerFrame::from_associated_float(output, ImageColorspace::Srgb)
         }
     }
 }
@@ -1044,26 +1052,22 @@ fn divide_round_i(numerator: i32, denominator: i32) -> i32 {
     }
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "VSE opacity is validated in [0, 1] and byte alpha stays in 0..=255"
-)]
-fn byte_alpha_with_opacity(alpha: u8, opacity: f64) -> u8 {
-    (f32::from(alpha) * opacity as f32) as u8
+fn byte_alpha_with_opacity(alpha: u8, opacity: f64) -> Result<u8> {
+    let opacity = num_traits::ToPrimitive::to_f32(&opacity)
+        .ok_or_else(|| PotError::invalid_argument("VSE byte opacity is not representable"))?;
+    let scaled = f32::from(alpha) * opacity;
+    num_traits::ToPrimitive::to_u8(&scaled).ok_or_else(|| {
+        PotError::invalid_argument("VSE byte opacity is outside its supported range")
+    })
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "strip blend mode channel arithmetic is clamped to 0..=255"
-)]
 fn byte_strip_blend_pixel(
-    destination: &[u8; 4],
-    source: &[u8; 4],
+    destination: [u8; 4],
+    source: [u8; 4],
     blend_type: StripBlendType,
     opacity: f64,
-) -> [u8; 4] {
-    let alpha = byte_alpha_with_opacity(source[3], opacity);
+) -> Result<[u8; 4]> {
+    let alpha = byte_alpha_with_opacity(source[3], opacity)?;
     match blend_type {
         StripBlendType::Add | StripBlendType::Subtract => {
             let add = blend_type == StripBlendType::Add;
@@ -1074,9 +1078,14 @@ fn byte_strip_blend_pixel(
                     } else {
                         -i32::from(source[index]) * i32::from(alpha)
                     };
-                divide_round_i(numerator, 255).clamp(0, 255) as u8
+                u8::try_from(divide_round_i(numerator, 255).clamp(0, 255)).map_err(|_| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "native VSE strip channel exceeded its range",
+                    )
+                })
             };
-            [channel(0), channel(1), channel(2), destination[3]]
+            Ok([channel(0)?, channel(1)?, channel(2)?, destination[3]])
         }
         StripBlendType::Multiply if alpha != 0 => {
             let channel = |index| {
@@ -1085,12 +1094,17 @@ fn byte_strip_blend_pixel(
                 let source = i32::from(source[index]);
                 let numerator =
                     inverse * destination * 255 + i32::from(alpha) * destination * source;
-                divide_round_i(numerator, 255 * 255).clamp(0, 255) as u8
+                u8::try_from(divide_round_i(numerator, 255 * 255).clamp(0, 255)).map_err(|_| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "native VSE strip channel exceeded its range",
+                    )
+                })
             };
-            [channel(0), channel(1), channel(2), destination[3]]
+            Ok([channel(0)?, channel(1)?, channel(2)?, destination[3]])
         }
         StripBlendType::Multiply | StripBlendType::AlphaOver | StripBlendType::Replace => {
-            *destination
+            Ok(destination)
         }
     }
 }
@@ -1107,13 +1121,27 @@ fn multiply_sequencer_frame(
             colorspace,
             mut pixels,
         } => {
-            let multiplier = byte_effect_factor(multiplier);
+            let multiplier = byte_effect_factor(multiplier)?;
             for pixel in &mut pixels {
                 for channel in &mut pixel[..3] {
-                    *channel = ((multiplier * i32::from(*channel)) >> 8).clamp(0, 255) as u8;
+                    *channel =
+                        u8::try_from(((multiplier * i32::from(*channel)) >> 8).clamp(0, 255))
+                            .map_err(|_| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "native VSE multiplier channel exceeded its range",
+                                )
+                            })?;
                 }
                 if multiply_alpha {
-                    pixel[3] = ((multiplier * i32::from(pixel[3])) >> 8).clamp(0, 255) as u8;
+                    pixel[3] =
+                        u8::try_from(((multiplier * i32::from(pixel[3])) >> 8).clamp(0, 255))
+                            .map_err(|_| {
+                                PotError::new(
+                                    ErrorCode::InternalError,
+                                    "native VSE multiplier channel exceeded its range",
+                                )
+                            })?;
                 }
             }
             Ok(SequencerFrame::Byte {
@@ -1153,7 +1181,7 @@ fn preprocess_strip_frame(
         } else {
             1.0
         };
-    if multiplier == 1.0 {
+    if multiplier.to_bits() == 1.0_f64.to_bits() {
         return Ok(frame);
     }
     let needs_promote = match &frame {
@@ -1218,18 +1246,15 @@ fn blend_sequence_frames(
                     .iter()
                     .zip(&source_pixels)
                     .map(|(destination, source)| {
-                        byte_strip_blend_pixel(destination, source, blend_type, opacity)
+                        byte_strip_blend_pixel(*destination, *source, blend_type, opacity)
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
             });
         }
         let destination = byte_to_associated(width, height, &destination_pixels)?;
         let source = byte_to_associated(width, height, &source_pixels)?;
         let output = blend_frames(&destination, &source, blend_type, opacity)?;
-        return Ok(SequencerFrame::from_associated_float(
-            output,
-            ImageColorspace::Srgb,
-        ));
+        return SequencerFrame::from_associated_float(output, ImageColorspace::Srgb);
     }
     let destination = destination.into_working(working)?;
     let source = source.into_working(working)?;
@@ -1756,7 +1781,7 @@ fn render_strip_content(
                         Some(SequencerFrame::from_associated_float(
                             output,
                             ImageColorspace::Srgb,
-                        ))
+                        )?)
                     }
                     SequencerFrame::Float(frame) => {
                         Some(SequencerFrame::Float(apply_effect(effect, frame)?))

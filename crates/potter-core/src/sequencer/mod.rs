@@ -58,7 +58,7 @@ pub struct Strip {
     pub opacity: f64,
     /// Blender's Replace preprocessing color multiplier, before blend opacity.
     pub color_multiply: f64,
-    /// Blender's SEQ_MULTIPLY_ALPHA flag for Replace strip preprocessing.
+    /// Blender's `SEQ_MULTIPLY_ALPHA` flag for Replace strip preprocessing.
     pub multiply_alpha: bool,
     pub mute: bool,
     pub retiming_keys: Vec<RetimingKey>,
@@ -67,7 +67,7 @@ pub struct Strip {
     pub sound_pan: f64,
     pub sound_pitch: f64,
     pub source: Option<String>,
-    /// Scene-linear RGBA; Blender's COLOR_GAMMA Color/Text properties are decoded on import.
+    /// Scene-linear RGBA; Blender's `COLOR_GAMMA` Color/Text properties are decoded on import.
     pub color: [f32; 4],
     pub text: Option<String>,
     pub transition: Option<TransitionType>,
