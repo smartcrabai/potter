@@ -371,12 +371,14 @@ fn assert_volume_pixels(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn assert_volume_disc(
+// VDB interpolation and sampling give this density field soft support rather than a binary-disc pixel area.
+
+fn assert_volume_shape(
     volume_path: &Path,
     empty_path: &Path,
     center_x: f64,
     center_y: f64,
-    radius: f64,
+    support: Option<(f64, f64)>,
 ) -> Result<(), Box<dyn Error>> {
     let (width, height, volume_pixels) = read_png(volume_path)?;
     let (empty_width, empty_height, empty_pixels) = read_png(empty_path)?;
@@ -399,6 +401,16 @@ fn assert_volume_disc(
                 volume_pixels[offset + channel].abs_diff(empty_pixels[offset + channel]) > 2
             });
             if changed {
+                if let Some((support_x, support_y)) = support {
+                    let pixel_x = f64::from(u32::try_from(x)?) + 0.5;
+                    let pixel_y = f64::from(u32::try_from(y)?) + 0.5;
+                    assert!(
+                        (pixel_x - center_x).abs() <= support_x
+                            && (pixel_y - center_y).abs() <= support_y,
+                        "{} changed pixel ({x}, {y}) lies outside the projected VDB support",
+                        volume_path.display()
+                    );
+                }
                 covered += 1;
                 centroid_x += f64::from(u32::try_from(x)?);
                 centroid_y += f64::from(u32::try_from(y)?);
@@ -426,15 +438,7 @@ fn assert_volume_disc(
         }),
         "volume center pixel matches the empty-scene background"
     );
-    let expected_area = std::f64::consts::PI * radius * radius;
     let covered_f64 = f64::from(u32::try_from(covered)?);
-    let area_error = (covered_f64 - expected_area).abs() / expected_area;
-    assert!(
-        area_error <= 0.2,
-        "{} covered pixels do not approximate a disc of radius {radius:.2}: \
-         area={covered}, expected={expected_area:.1}, relative_error={area_error:.3}",
-        volume_path.display()
-    );
     let centroid_x = centroid_x / covered_f64;
     let centroid_y = centroid_y / covered_f64;
     assert!(
@@ -458,13 +462,38 @@ fn assert_volume_disc(
         volume_path.display()
     );
     eprintln!(
-        "{}: covered={covered}, expected_area={expected_area:.1}, \
-         centroid=({centroid_x:.2},{centroid_y:.2}), center=({center_x:.2},{center_y:.2}), \
-         center_rgb={center_rgb:?}, background_rgb={background_rgb:?}",
+        "{}: covered={covered}, centroid=({centroid_x:.2},{centroid_y:.2}), \
+         center=({center_x:.2},{center_y:.2}), center_rgb={center_rgb:?}, \
+         background_rgb={background_rgb:?}",
         volume_path.display()
     );
     Ok(())
 }
+
+/// Project active VDB bounds through the fixture's orthographic camera. Linear sampling can
+/// contribute one index voxel beyond the active bounds; then the caller supplies only the
+/// remaining sample-space support (the realtime film radius or the path pixel's half-width).
+fn projected_vdb_support(
+    active_min: DVec3,
+    active_max: DVec3,
+    volume_offset: DVec3,
+    camera_center: DVec3,
+    pixels_per_world_unit: f64,
+    sample_support: f64,
+) -> (f64, f64) {
+    let padding = DVec3::ONE;
+    let minimum = active_min + volume_offset - padding;
+    let maximum = active_max + volume_offset + padding;
+    let axis_extent = |axis: usize| {
+        (minimum[axis] - camera_center[axis])
+            .abs()
+            .max((maximum[axis] - camera_center[axis]).abs())
+            * pixels_per_world_unit
+            + sample_support
+    };
+    (axis_extent(0), axis_extent(1))
+}
+
 fn linear_luminance(pixels: &[u8], offset: usize) -> f64 {
     let channel = |index: usize| {
         let encoded = f64::from(pixels[offset + index]) / 255.0;
@@ -802,6 +831,16 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
     )?;
     let item = &inspect["result"]["items"][0];
     let volume_offset = DVec3::new(2.0, 0.0, 1.0);
+    let active_scene = document["active_scene"]
+        .as_str()
+        .ok_or("imported active scene is missing")?;
+    let render_settings = &document["scenes"][active_scene]["render"];
+    let render_samples = render_settings["samples"]
+        .as_u64()
+        .ok_or("imported render sample count is missing")?;
+    let filter_size = render_settings["filter_size"]
+        .as_f64()
+        .ok_or("imported film filter size is missing")?;
     let expected_min = DVec3::from_array(serde_json::from_value(expected_bounds(
         directory.path(),
         "sphere_min",
@@ -824,6 +863,29 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
             1.0e-6,
         );
     }
+    let camera_center = DVec3::new(9.5, 7.5, 0.0);
+    let pixels_per_world_unit = 64.0 / 24.0;
+    let path_support = projected_vdb_support(
+        expected_min,
+        expected_max,
+        volume_offset,
+        camera_center,
+        pixels_per_world_unit,
+        0.5,
+    );
+    let realtime_filter_radius = if render_samples > 1 {
+        filter_size.clamp(0.0, 100.0).max(1.0e-4)
+    } else {
+        0.0
+    };
+    let realtime_support = projected_vdb_support(
+        expected_min,
+        expected_max,
+        volume_offset,
+        camera_center,
+        pixels_per_world_unit,
+        realtime_filter_radius,
+    );
 
     let revision = document["revision"]
         .as_u64()
@@ -884,12 +946,12 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
         "empty-scene beauty preview",
     )?;
     assert_eq!(empty_beauty["ok"], true);
-    assert_volume_disc(
+    assert_volume_shape(
         &beauty_dir.join("front.png"),
         &empty_beauty_dir.join("front.png"),
         31.5,
         31.5,
-        6.0 * 64.0 / 12.1,
+        None,
     )?;
 
     for mode in ["solid", "wire"] {
@@ -955,7 +1017,12 @@ fn imports_vdb_resources_and_renders_real_volume_data() -> Result<(), Box<dyn Er
             .map(|entry| entry.path())
             .find(|path| path.extension().is_some_and(|extension| extension == "png"))
             .ok_or("renderer did not create the empty-scene PNG")?;
-        assert_volume_disc(&image, &empty_image, 31.5, 31.5, 16.0)?;
+        let support = if engine == "realtime" {
+            realtime_support
+        } else {
+            path_support
+        };
+        assert_volume_shape(&image, &empty_image, 31.5, 31.5, Some(support))?;
         if engine == "path" {
             compare_cycles_and_path_volume(
                 &image,
