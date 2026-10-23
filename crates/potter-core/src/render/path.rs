@@ -2516,8 +2516,12 @@ impl RealtimeVolumeSample<'_, '_> {
                 HitContext::new(&self.transport.doc.node_groups).with_images(self.transport.images);
             context.position = point;
             context.object = local_point;
-            context.generated =
-                medium.generated_origin + local_point.component_mul(medium.generated_per_local);
+            context.generated = medium.generated_origin
+                + DVec3::new(
+                    local_point.x * medium.generated_per_local.x,
+                    local_point.y * medium.generated_per_local.y,
+                    local_point.z * medium.generated_per_local.z,
+                );
             context.generated_per_local = medium.generated_per_local;
             context.normal = -self.direction;
             context.view_direction = -self.direction;
@@ -5028,8 +5032,12 @@ fn surface_froxel_media_into(
     media.reserve(volume.len());
     let generated_per_local = triangle.generated.per_local;
     let local_origin = object_space(object, triangle.positions[0]);
-    let generated_origin =
-        triangle.generated.corners[0] - local_origin.component_mul(generated_per_local);
+    let generated_origin = triangle.generated.corners[0]
+        - DVec3::new(
+            local_origin.x * generated_per_local.x,
+            local_origin.y * generated_per_local.y,
+            local_origin.z * generated_per_local.z,
+        );
     for closure in 0..volume.len() {
         media.push(FroxelMeshMedium {
             object_index: triangle.object_index,
