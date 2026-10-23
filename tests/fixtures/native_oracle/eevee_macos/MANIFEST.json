@@ -1,14 +1,51 @@
 {
-  "blender": "Blender 5.2.2 LTS (hash d13f752e3b9c, built 2026-09-15 01:49:19)",
+  "blender": "Blender 5.2.2 LTS / build date: 2026-09-15 / build time: 01:49:19 / build commit date: 2026-09-14",
   "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
   "machine": "arm64",
-  "generated_by": "tests/fixtures/native_oracle/eevee_world_background.py (rendered on macOS), then export_eevee_fixture.py; the scripts above are the versions that rendered them",
+  "generated_by": "tests/fixtures/native_oracle/eevee_* generators (rendered on macOS), then export_eevee_fixture.py; the scripts above are the versions that rendered them",
   "scripts": {
+    "eevee_glass_direct.py": "380387923d1ea62355a282fcb30b464a30bb364d28cf3e1c9ea66571739941ef",
+    "eevee_glass_transmission.py": "2559aa78052fd60d474fcf28d7d29555b6f1eb884f43c227874c4ea44c9eaf9b",
+    "eevee_glass_world.py": "af1cc014121349a5d4ded1e6ee7fb69e0c4f1fa2196996a22700a6c379435288",
+    "eevee_direct_light_cases.py": "0fceceb23e734a3e76d0e02b11ad59e4fecd4ad320031e196aee369ad4a6e007",
+    "eevee_light_factors.py": "c77aeeae6ba8f55d0679f1ba0caf1fd0c78fa9acd05e4539e11c52c9e029d2ff",
+    "eevee_volume_factor.py": "cd0688243e558f12fe3985de348ccceba096f562e81ef6d7d67511d8704787d2",
+    "eevee_volume_shadowed.py": "3b422aa762119de096acef4765f3c9bd30fd5c3f80762e3b1b3631ead89037d9",
     "eevee_world_background.py": "3dfbc770812ece43429906a7d0425c9e32ef12d101701af8ab56b04f3591e29b",
     "export_eevee_fixture.py": "214d2ab63f343f7e59af8eaa7752217f7b26b574696e9c21b0518279ddd55606"
   },
   "fixtures": {
+    "direct_influence_area.f32le": 196608,
+    "direct_influence_custom.f32le": 196608,
+    "direct_influence_point.f32le": 196608,
+    "direct_influence_threshold.f32le": 196608,
+    "direct_spot_plain.f32le": 196608,
+    "direct_spot_scaled.f32le": 196608,
+    "direct_sun_angle.f32le": 196608,
+    "factors_diffuse_base.f32le": 196608,
+    "factors_diffuse_half.f32le": 196608,
+    "factors_glass_base.f32le": 196608,
+    "factors_glass_half.f32le": 196608,
+    "factors_glass_zero.f32le": 196608,
+    "factors_specular_base.f32le": 196608,
+    "factors_specular_half.f32le": 196608,
+    "factors_sun_delta.f32le": 196608,
+    "factors_sun_disc.f32le": 196608,
+    "glass_direct_area_above.f32le": 110592,
+    "glass_direct_area_below.f32le": 110592,
+    "glass_direct_point_above.f32le": 110592,
+    "glass_direct_point_below.f32le": 110592,
+    "glass_transmission.f32le": 110592,
+    "glass_world.f32le": 110592,
+    "volume_volume_base.f32le": 110592,
+    "volume_volume_half.f32le": 110592,
+    "volume_volume_zero.f32le": 110592,
+    "volume_volume_shadowed_base.f32le": 110592,
     "world_background_node_black.f32le": 49152,
     "world_background_node_colour.f32le": 49152
+  },
+  "mirrors": {
+    "eevee_glass_transmission_deviation.py": "transmission bound (clear 0.00134, tinted 0.00113, rough 0.00169)",
+    "eevee_glass_world_mirror.py": "world bound (clear 0.01049, tinted 0.00233, rough 0.00990)"
   }
 }

@@ -1295,6 +1295,16 @@ pub struct RenderSettings {
     /// `rna_scene.cc`). It changes how the cryptomatte pass is generated and is not a pass itself.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cryptomatte_accurate: bool,
+    /// Blender's `eevee.light_threshold` (`DNA_scene_types.h`): the power at which an EEVEE local light's influence ends,
+    /// where `light_influence` reads `eevee_light.cc` `attenuation_radius_get`. Omitted at Blender's default of 0.01.
+    #[serde(
+        default = "default_light_threshold",
+        skip_serializing_if = "is_default_light_threshold"
+    )]
+    pub eevee_light_threshold: f64,
+    /// Blender's `Scene.eevee.use_volumetric_shadows`; disabled by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub eevee_use_volumetric_shadows: bool,
     #[serde(default)]
     pub motion_blur: bool,
     #[serde(default = "default_shutter")]
@@ -1355,6 +1365,8 @@ impl Default for RenderSettings {
             audio_codec: "wav".to_owned(),
             passes: vec!["combined".to_owned()],
             cryptomatte_accurate: false,
+            eevee_light_threshold: default_light_threshold(),
+            eevee_use_volumetric_shadows: false,
             motion_blur: false,
             shutter: default_shutter(),
             motion_blur_samples: default_motion_blur_samples(),
@@ -1592,6 +1604,52 @@ pub struct LightData {
     /// hit is weighted against light sampling. When `false`, the light is only light-sampled.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub use_multiple_importance_sampling: bool,
+    /// Blender's sun `angle` (`light.sun_angle`, `rna_light.cc`): the sun's angular diameter, in radians. EEVEE draws the
+    /// sun's disc from it (`eevee_light.cc`, `shape_radius = tan(angle / 2)`). Omitted at Blender's default.
+    #[serde(
+        default = "default_sun_angle",
+        skip_serializing_if = "is_default_sun_angle"
+    )]
+    pub sun_angle: f64,
+    /// Blender's `use_custom_distance` (`LA_CUSTOM_ATTENUATION`): the light's influence ends at `cutoff_distance` instead of
+    /// where its power falls to the scene's light threshold (`eevee_light.cc`, `attenuation_radius_get`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_custom_distance: bool,
+    /// Blender's `cutoff_distance` (`att_dist`), the influence radius of a light with `use_custom_distance`. Omitted at
+    /// Blender's default of 40 m.
+    #[serde(
+        default = "default_cutoff_distance",
+        skip_serializing_if = "is_default_cutoff_distance"
+    )]
+    pub cutoff_distance: f64,
+    /// Blender's `diffuse_factor` (`Light.diff_fac`, `rna_light.cc`): the multiplier of the light's diffuse closures
+    /// (diffuse, sheen and subsurface). EEVEE applies it (`eevee_light.cc`, `power[LIGHT_DIFFUSE]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub diffuse_factor: f64,
+    /// Blender's `specular_factor` (`Light.spec_fac`): the multiplier of the specular and coat closures, and of the glass
+    /// reflection. EEVEE applies it (`power[LIGHT_SPECULAR]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub specular_factor: f64,
+    /// Blender's `transmission_factor` (`Light.transmission_fac`): the multiplier of the transmission closures. EEVEE
+    /// applies it (`power[LIGHT_TRANSMISSION]`); Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub transmission_factor: f64,
+    /// Blender's `volume_factor` (`Light.volume_fac`): the multiplier of the light's volume scattering (`power[LIGHT_VOLUME]`).
+    /// EEVEE applies it; Cycles does not.
+    #[serde(
+        default = "default_light_factor",
+        skip_serializing_if = "is_default_light_factor"
+    )]
+    pub volume_factor: f64,
 }
 
 impl Default for LightData {
@@ -1609,12 +1667,56 @@ impl Default for LightData {
             area_size_y: 0.25,
             spread: std::f64::consts::PI,
             use_multiple_importance_sampling: true,
+            sun_angle: default_sun_angle(),
+            use_custom_distance: false,
+            cutoff_distance: default_cutoff_distance(),
+            diffuse_factor: default_light_factor(),
+            specular_factor: default_light_factor(),
+            transmission_factor: default_light_factor(),
+            volume_factor: default_light_factor(),
         }
     }
 }
 
 fn white_rgb() -> [f64; 3] {
     [1.0, 1.0, 1.0]
+}
+
+/// Blender's sun angle default, `DNA_light_types.h`: `DEG2RADF(0.526f)`.
+fn default_sun_angle() -> f64 {
+    0.526_f64.to_radians()
+}
+
+fn is_default_sun_angle<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_sun_angle()).abs() < 1.0e-6
+}
+
+/// Blender's light closure multipliers default to one (`DNA_light_types.h`: `diff_fac`, `spec_fac`, `transmission_fac`,
+/// `volume_fac`).
+fn default_light_factor() -> f64 {
+    1.0
+}
+
+fn is_default_light_factor<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - 1.0).abs() < 1.0e-6
+}
+
+/// Blender's light cutoff distance default, `DNA_light_types.h`: 40 m.
+fn default_cutoff_distance() -> f64 {
+    40.0
+}
+
+fn is_default_cutoff_distance<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_cutoff_distance()).abs() < 1.0e-9
+}
+
+/// Blender's `eevee.light_threshold` default, `DNA_scene_types.h`: 0.01.
+fn default_light_threshold() -> f64 {
+    0.01
+}
+
+fn is_default_light_threshold<T: Into<f64> + Copy>(value: &T) -> bool {
+    ((*value).into() - default_light_threshold()).abs() < 1.0e-6
 }
 fn default_volume_color() -> [f64; 3] {
     [0.5; 3]
@@ -2974,6 +3076,26 @@ pub struct ViewportDisplay {
     pub metallic: f64,
 }
 
+/// Blender's `Material.thickness_mode` (`MA_THICKNESS_SPHERE`, `MA_THICKNESS_SLAB`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThicknessMode {
+    #[default]
+    Sphere,
+    Slab,
+}
+
+impl ThicknessMode {
+    /// The name the operation schema and the Blender bridge use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sphere => "sphere",
+            Self::Slab => "slab",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Material {
@@ -2996,6 +3118,10 @@ pub struct Material {
     pub transmission: f64,
     #[serde(default = "default_ior")]
     pub ior: f64,
+    /// Blender's `Material.thickness_mode`: the refraction thickness model EEVEE uses when the Thickness socket is not
+    /// linked (`eevee_thickness_lib.bsl.hh`). Sphere is Blender's default.
+    #[serde(default)]
+    pub thickness_mode: ThicknessMode,
     /// Blender's `use_backface_culling` is off for new materials (`MA_BL_CULL_BACKFACE` unset in `DNA_material_types.h`).
     #[serde(default = "default_true")]
     pub double_sided: bool,
@@ -3053,6 +3179,7 @@ impl Default for Material {
             emission_strength: 0.0,
             transmission: 0.0,
             ior: default_ior(),
+            thickness_mode: ThicknessMode::Sphere,
             double_sided: default_true(),
             use_transparent_shadow: default_true(),
             use_bump_map_correction: default_true(),

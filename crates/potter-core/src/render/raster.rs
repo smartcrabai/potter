@@ -333,10 +333,13 @@ pub(crate) struct SurfaceHit {
     pub(crate) view: DVec3,
 }
 
-/// What a surface shader returns at a hit: its linear RGBA, and the tint of the transparent share it passes.
+/// What the raster hit evaluator returns: its linear RGBA, whether it is a camera surface,
+/// and the tint of the transparent share it passes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SurfaceSample {
     pub(crate) color: [f64; 4],
+    /// Whether this sample is an actual surface rather than a volume-only boundary.
+    pub(crate) has_surface: bool,
     /// The Transparent closure's colour per channel, as `(1 - alpha) * tint` is its transmittance. White for a
     /// surface that passes nothing, and a Blender DITHERED material's channel mean (`scene.rs` `beauty_tint`).
     pub(crate) transparent_tint: [f64; 3],
@@ -347,6 +350,7 @@ impl SurfaceSample {
     pub(crate) fn opaque(color: [f64; 4]) -> Self {
         Self {
             color,
+            has_surface: true,
             transparent_tint: [1.0; 3],
         }
     }
@@ -630,7 +634,7 @@ fn sample_background(
     clippy::too_many_arguments,
     reason = "raster configuration is explicit at this low-level boundary"
 )]
-pub(crate) fn rasterize_with_samples(
+pub(super) fn rasterize_with_samples(
     triangles: &[Triangle],
     camera: &Camera,
     width: u32,
@@ -642,12 +646,15 @@ pub(crate) fn rasterize_with_samples(
     seed: u32,
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
+    prepared_materials: &[crate::shader::PreparedMaterial],
+    volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     if samples == 0 {
         return Err(PotError::invalid_argument(
             "sample count must be greater than zero",
         ));
     }
+    let mut volume_pass = volume_pass;
     if camera.stereo_mode == StereoMode::Anaglyph {
         let left_camera = camera_eye(camera, -1.0);
         let right_camera = camera_eye(camera, 1.0);
@@ -663,6 +670,8 @@ pub(crate) fn rasterize_with_samples(
             seed,
             filter_size,
             shader,
+            prepared_materials,
+            volume_pass.as_deref_mut(),
         )?;
         let right_output = rasterize_with_samples(
             triangles,
@@ -676,6 +685,8 @@ pub(crate) fn rasterize_with_samples(
             seed,
             filter_size,
             shader,
+            prepared_materials,
+            volume_pass.as_deref_mut(),
         )?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
         let (right_pixels, _) = right_output.rgba.as_chunks::<4>();
@@ -803,8 +814,15 @@ pub(crate) fn rasterize_with_samples(
                     }
                     // The hit's distance along its ray places the point; its depth is a view-axis or panorama measure.
                     let point = center_ray.origin + center_ray.direction * hit.distance;
-                    let visibility =
-                        ambient_visibility(bvh, triangles, point, geometric, shading, 1.0);
+                    let visibility = ambient_visibility(
+                        bvh,
+                        triangles,
+                        prepared_materials,
+                        point,
+                        geometric,
+                        shading,
+                        1.0,
+                    );
                     ambient_occlusion[pixel_index] =
                         linear_color_to_f32([visibility, visibility, visibility, 1.0])[0];
                 }
@@ -858,6 +876,23 @@ pub(crate) fn rasterize_with_samples(
                         // The composite walks every surface along the ray, nearest first. A transparent pane that only
                         // tints sits in front of an opaque surface and is not the opacity hit, so the opacity hit alone
                         // cannot decide the colour: an opaque front layer ends the walk inside `composite_layers`.
+                        let mut volume_sample = volume_pass
+                            .as_deref_mut()
+                            .map(|volume_pass| {
+                                volume_pass.begin_sample(super::path::RealtimeVolumeSampleInfo {
+                                    camera,
+                                    frame: &frame,
+                                    width,
+                                    height,
+                                    x,
+                                    y,
+                                    sample_x,
+                                    sample_y,
+                                    ray: (sample_ray.origin, sample_ray.direction),
+                                    sample_index,
+                                })
+                            })
+                            .transpose()?;
                         composite_sample(
                             &prepared,
                             &visibility,
@@ -868,6 +903,7 @@ pub(crate) fn rasterize_with_samples(
                             world,
                             shader,
                             sample_hit,
+                            volume_sample.as_mut(),
                         )?
                     } else {
                         sample_background(background_linear, world, None)?
@@ -879,30 +915,7 @@ pub(crate) fn rasterize_with_samples(
                             average[channel] * previous_weight + sample_color[channel] / count;
                     }
                     if let Some(film) = film.as_mut() {
-                        // EEVEE shades each sample with its pixel's occlusion, then filters the shaded samples.
-                        let ao = ambient_occlusion
-                            .get(pixel_index)
-                            .copied()
-                            .map_or(1.0, f64::from);
-                        let shaded = [
-                            sample_color[0] * ao,
-                            sample_color[1] * ao,
-                            sample_color[2] * ao,
-                            sample_color[3],
-                        ];
-                        film.splat(x, y, sample_x, sample_y, sample_index, shaded);
-                    }
-                }
-                // Solid mirrors Blender Workbench, which shows no ambient occlusion by default.
-                let ao_in_color = !matches!(mode, Mode::Solid);
-                if let Some(ao) = ambient_occlusion
-                    .get(pixel_index)
-                    .copied()
-                    .filter(|_| ao_in_color)
-                {
-                    let ao = f64::from(ao);
-                    for channel in &mut average[..3] {
-                        *channel *= ao;
+                        film.splat(x, y, sample_x, sample_y, sample_index, sample_color);
                     }
                 }
                 let color = color_to_srgba(average);
@@ -958,7 +971,7 @@ pub(crate) fn rasterize_with_samples(
     clippy::too_many_arguments,
     reason = "line rasterization uses the same explicit configuration as triangle rasterization"
 )]
-pub(crate) fn rasterize_with_lines(
+pub(super) fn rasterize_with_lines(
     triangles: &[Triangle],
     lines: &[Line],
     camera: &Camera,
@@ -971,6 +984,8 @@ pub(crate) fn rasterize_with_lines(
     seed: u32,
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
+    prepared_materials: &[crate::shader::PreparedMaterial],
+    volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     let mut output = rasterize_with_samples(
         triangles,
@@ -984,6 +999,8 @@ pub(crate) fn rasterize_with_lines(
         seed,
         filter_size,
         shader,
+        prepared_materials,
+        volume_pass,
     )?;
     if lines.is_empty() {
         return Ok(output);
@@ -1140,6 +1157,8 @@ pub(crate) fn rasterize_wireframe(
         // Wire is never a film Beauty render, so no film filter applies.
         0.0,
         None,
+        &[],
+        None,
     )?;
     let mut output = rasterize_with_lines(
         triangles,
@@ -1153,6 +1172,8 @@ pub(crate) fn rasterize_wireframe(
         1,
         0,
         0.0,
+        None,
+        &[],
         None,
     )?;
     let frame = camera_frame(camera, width, height)?;
@@ -1678,12 +1699,12 @@ fn is_valid_fov(fov: f64) -> bool {
     fov.is_finite() && fov > 0.0 && fov <= crate::model::FISHEYE_FOV_MAX
 }
 
-/// Fraction of the hemisphere above `shading` that is unoccluded at `point`. Occluders are filtered
-/// by shadow visibility, as Cycles' ambient occlusion is, so objects hidden from camera rays still
-/// occlude.
+/// Fraction of the hemisphere above `shading` that is unoccluded at `point`. Shadow-visible surfaces occlude as
+/// Cycles' ambient occlusion does, but a Volume-only material has no surface to block the ray.
 pub(crate) fn ambient_visibility(
     bvh: &super::bvh::Bvh,
     triangles: &[Triangle],
+    prepared_materials: &[crate::shader::PreparedMaterial],
     point: DVec3,
     geometric: DVec3,
     shading: DVec3,
@@ -1718,12 +1739,30 @@ pub(crate) fn ambient_visibility(
         } else {
             direction
         };
-        if bvh
-            .closest_hit_where(triangles, origin, direction, 1.0e-5, distance, &|mask| {
-                mask & RayKind::Shadow.bit() != 0
-            })
-            .is_none()
-        {
+        let mut occluded = false;
+        bvh.walk_hits(
+            triangles,
+            super::bvh::WalkRay {
+                origin,
+                direction,
+                epsilon: 1.0e-5,
+                remaining: distance,
+                kind: Some(RayKind::Shadow),
+            },
+            |hit, _| {
+                let triangle = &triangles[hit.triangle_index];
+                if prepared_materials
+                    .get(triangle.material_index)
+                    .is_some_and(crate::shader::PreparedMaterial::is_volume_only)
+                {
+                    true
+                } else {
+                    occluded = true;
+                    false
+                }
+            },
+        );
+        if !occluded {
             visible += 1;
         }
     }
@@ -2202,7 +2241,7 @@ fn nearest_visible_hit(
         let sample = hit_color(triangle, hit, ray, shader)?;
         // The nearest surface with opacity is the pixel's data-pass hit (ids, depth, normals, albedo, AO). A transparent
         // pane that only tints is not, so it cannot change those passes; the Beauty composite finds it separately.
-        if hit_opacity(&triangle.source, sample.color) > 0.0 {
+        if sample.has_surface && hit_opacity(&triangle.source, sample.color) > 0.0 {
             return Ok(Some(VisibleHit {
                 triangle_index,
                 hit,
@@ -2229,6 +2268,7 @@ fn composite_sample(
     world: Option<WorldRadiance<'_>>,
     shader: Option<&dyn SurfaceShader>,
     cached_hit: Option<VisibleHit>,
+    volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
 ) -> Result<[f64; 4]> {
     const MAX_ALPHA_LAYERS: usize = 16;
     let mut hits: [Option<VisibleHit>; MAX_ALPHA_LAYERS] = [None; MAX_ALPHA_LAYERS];
@@ -2250,11 +2290,15 @@ fn composite_sample(
                 |cached| {
                     Ok(SurfaceSample {
                         color: cached.color,
+                        has_surface: true,
                         transparent_tint: cached.transparent_tint,
                     })
                 },
             )?;
-        if hit_opacity(&triangle.source, sample.color) <= 0.0 && is_white(sample.transparent_tint) {
+        if !sample.has_surface
+            || (hit_opacity(&triangle.source, sample.color) <= 0.0
+                && is_white(sample.transparent_tint))
+        {
             continue;
         }
         let visible_hit = VisibleHit {
@@ -2278,6 +2322,52 @@ fn composite_sample(
         }
         hits[insert_at] = Some(visible_hit);
         hit_count = next_count;
+    }
+    if let Some(volume_sample) = volume_sample {
+        let mut transmittance = DVec3::ONE;
+        let mut alpha_transmittance = 1.0;
+        let mut premultiplied = DVec3::ZERO;
+        let mut start_distance = volume_sample.near_distance;
+        for visible_hit in hits.iter().take(hit_count).flatten() {
+            let (radiance, segment_transmittance) =
+                volume_sample.integrate_segment(start_distance, visible_hit.hit.distance)?;
+            premultiplied += transmittance * radiance;
+            transmittance *= segment_transmittance;
+            alpha_transmittance *= segment_transmittance.element_sum() / 3.0;
+            let triangle = &triangles[visible_hit.triangle_index];
+            let color = visible_hit.color;
+            let opacity = hit_opacity(&triangle.source, color);
+            premultiplied += DVec3::new(color[0], color[1], color[2]) * (transmittance * opacity);
+            let passed = 1.0 - opacity;
+            transmittance *= DVec3::from_array(visible_hit.transparent_tint) * passed;
+            alpha_transmittance *= visible_hit.transparent_tint.iter().sum::<f64>() / 3.0 * passed;
+            start_distance = visible_hit.hit.distance;
+            if transmittance.max_element() <= 1.0e-6 && alpha_transmittance <= 1.0e-6 {
+                break;
+            }
+        }
+        if transmittance.max_element() > 1.0e-6 || alpha_transmittance > 1.0e-6 {
+            let (radiance, segment_transmittance) =
+                volume_sample.integrate_segment(start_distance, volume_sample.far_distance)?;
+            premultiplied += transmittance * radiance;
+            transmittance *= segment_transmittance;
+            alpha_transmittance *= segment_transmittance.element_sum() / 3.0;
+        }
+        let background_alpha = background[3].clamp(0.0, 1.0);
+        let background_rgb = if transmittance == DVec3::ZERO {
+            [0.0; 3]
+        } else {
+            let color = sample_background(background, world, Some(ray.direction))?;
+            [color[0], color[1], color[2]]
+        };
+        premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
+        let alpha = 1.0 - alpha_transmittance * (1.0 - background_alpha);
+        let color = if alpha <= f64::MIN_POSITIVE {
+            premultiplied + DVec3::from_array(background_rgb)
+        } else {
+            premultiplied / alpha
+        };
+        return Ok([color.x, color.y, color.z, alpha]);
     }
     let layers = hits.iter().take(hit_count).flatten().map(|visible_hit| {
         let triangle = &triangles[visible_hit.triangle_index];
@@ -3139,6 +3229,8 @@ mod tests {
             0,
             1.5,
             None,
+            &[],
+            None,
         )?;
         assert!(
             output.ids.contains(&7),
@@ -3176,6 +3268,8 @@ mod tests {
             1,
             0,
             1.5,
+            None,
+            &[],
             None,
         )?;
         let mut drawn = 0_usize;
@@ -3245,6 +3339,8 @@ mod line_tests {
             1,
             0,
             1.5,
+            None,
+            &[],
             None,
         );
         assert!(output.is_ok());
@@ -3376,6 +3472,8 @@ mod smooth_shading_tests {
             0,
             1.5,
             shader,
+            &[],
+            None,
         )
         .expect("triangle rasterizes")
     }
@@ -3579,6 +3677,7 @@ mod smooth_shading_tests {
         let visibility = super::ambient_visibility(
             &bvh,
             std::slice::from_ref(&plane),
+            &[],
             DVec3::ZERO,
             DVec3::Z,
             DVec3::new(0.866, 0.0, 0.5),
@@ -3818,6 +3917,7 @@ mod visibility_tests {
                     ray,
                     &frame,
                     BACKGROUND,
+                    None,
                     None,
                     None,
                     None,

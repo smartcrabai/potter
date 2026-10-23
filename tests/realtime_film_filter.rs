@@ -201,3 +201,82 @@ fn realtime_film_filter_matches_eevee_edge_profiles() -> TestResult {
     assert!(report.is_empty(), "{}", report.join("\n\n"));
     Ok(())
 }
+
+#[test]
+fn realtime_film_filter_does_not_multiply_beauty_ambient_occlusion_again() -> TestResult {
+    let root = tempdir()?;
+    let project = root.path().join("ao_film");
+    let initialized = pot().arg("init").arg(&project).arg("--json").output()?;
+    assert!(
+        initialized.status.success(),
+        "pot init failed: {}",
+        String::from_utf8_lossy(&initialized.stdout)
+    );
+    let applied = apply_operations(
+        &project,
+        root.path(),
+        json!([
+            {"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0},
+            {"op":"material.create","id":"white","base_color":[1.0,1.0,1.0,1.0],"roughness":1.0},
+            {"op":"node.create","id":"floor","kind":"box","params":{"size":4.0},"transform":{"translation":[0.0,0.0,-0.05],"scale":[1.0,1.0,0.025]},"material":"white"},
+            {"op":"node.create","id":"ceiling","kind":"box","params":{"size":4.0},"transform":{"translation":[0.0,0.0,0.3],"scale":[1.0,1.0,0.025]},"material":"white"},
+            {
+                "op":"camera.create","id":"camera_main",
+                "transform":{"translation":[0.0,-0.5,0.15],"rotation":[std::f64::consts::FRAC_PI_8.sin(),0.0,0.0,std::f64::consts::FRAC_PI_8.cos()]},
+                "projection":"orthographic","ortho_scale":2.0
+            },
+            {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}},
+            {"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":64,"resolution_y":64,"samples":1,"seed":0,"max_bounces":0}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+
+    let mut center_red = Vec::new();
+    for (name, samples) in [("single", 1), ("filtered", 8)] {
+        let updated = apply_operations(
+            &project,
+            root.path(),
+            json!([{
+                "op":"render.update","target":{"id":"scene_main"},
+                "set":{"resolution_x":64,"resolution_y":64,"samples":samples,"seed":0,"max_bounces":0}
+            }]),
+        )?;
+        assert_eq!(updated["ok"], true, "{updated}");
+        let frames = root.path().join(format!("frames_{name}"));
+        let rendered = pot()
+            .arg("render")
+            .arg(&project)
+            .args(["--engine", "realtime", "--format", "exr", "--out"])
+            .arg(&frames)
+            .arg("--json")
+            .output()?;
+        assert!(
+            rendered.status.success(),
+            "realtime render failed: {}",
+            String::from_utf8_lossy(&rendered.stdout)
+        );
+        let id = format!("ao_{name}");
+        let loaded = apply_operations(
+            &project,
+            root.path(),
+            json!([{"op":"image.load","id":id,"path":frames.join("frame_0001.exr").to_string_lossy()}]),
+        )?;
+        assert_eq!(loaded["ok"], true, "{loaded}");
+        let scene = read_scene(&project)?;
+        let image: Image = serde_json::from_value(scene["images"][&id].clone())?;
+        let data = load_image_data(&image, &project, ImageInterpolation::Closest)?;
+        center_red.push(sample(&data, [0.5, 0.5], false)[0]);
+    }
+
+    assert!(
+        center_red[0] > 0.0,
+        "the enclosed floor should receive nonzero environment light"
+    );
+    assert!(
+        center_red[1] > center_red[0] * 0.75,
+        "film-filtered Beauty reapplied AO to the already-occluded environment: one sample {}, eight samples {}",
+        center_red[0],
+        center_red[1]
+    );
+    Ok(())
+}

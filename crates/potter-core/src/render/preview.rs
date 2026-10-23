@@ -239,6 +239,7 @@ pub fn render_previews(
                 0,
                 scene.render.filter_size,
                 shader.as_deref(),
+                None,
             )?
         };
         match mode {
@@ -392,6 +393,21 @@ pub(crate) fn render_camera_frame(
             crate::shader::evaluate_world(world, &doc.node_groups, images_ref, direction)
         }
     });
+    let realtime_volume_transport = if engine == "realtime" && matches!(mode, Mode::Beauty) {
+        super::path::prepare_realtime_volume_transport(
+            doc,
+            &snapshot,
+            &geometry,
+            &images,
+            &geometry.shader_warnings,
+        )?
+    } else {
+        None
+    };
+    let mut volume_scratch = super::path::RealtimeVolumeScratch::default();
+    let mut volume_pass = realtime_volume_transport.as_ref().map(|transport| {
+        super::path::RealtimeVolumePass::new(transport, &geometry, &mut volume_scratch, seed)
+    });
     let mut raster = if matches!(mode, Mode::Beauty) && engine == "path" {
         super::path::render(
             doc,
@@ -424,23 +440,10 @@ pub(crate) fn render_camera_frame(
             seed,
             scene.render.filter_size,
             shader.as_deref(),
+            volume_pass.as_mut(),
         )?
     };
     drop(shader);
-    if engine == "realtime" && matches!(mode, Mode::Beauty) {
-        super::path::composite_realtime_volumes(
-            doc,
-            &snapshot,
-            &camera.camera,
-            width,
-            height,
-            seed,
-            film_transparent,
-            &images,
-            &mut raster,
-            &geometry.shader_warnings,
-        )?;
-    }
     crate::compositor::apply(
         &mut raster,
         doc,
@@ -691,6 +694,7 @@ fn rasterize_view(
     seed: u32,
     filter_size: f64,
     shader: Option<&dyn SurfaceShader>,
+    volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     if !matches!(mode, Mode::Wire) {
         return rasterize_with_lines(
@@ -706,6 +710,8 @@ fn rasterize_view(
             seed,
             filter_size,
             shader,
+            geometry.prepared.as_slice(),
+            volume_pass,
         );
     }
     // The overlay's edges and points come from the scene's wire geometry; the lines feed the pick buffers.
