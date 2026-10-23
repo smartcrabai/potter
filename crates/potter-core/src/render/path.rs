@@ -4971,8 +4971,8 @@ fn with_hit_frame<T>(
         back_facing,
         geometric_normal,
         normal,
-        triangle,
         object,
+        triangle,
         material,
         prepared,
         context,
@@ -5200,7 +5200,7 @@ fn shadow_hit_into(
     images: &BTreeMap<String, ImageData>,
     footprint: Option<f64>,
     media: &mut Vec<MeshMedium>,
-    mut froxel_media: Option<&mut Vec<FroxelMeshMedium>>,
+    froxel_media: Option<&mut Vec<FroxelMeshMedium>>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<(DVec3, bool)> {
     with_hit_frame(
@@ -5233,7 +5233,7 @@ fn shadow_hit_into(
             );
             let volume_boundary = frame.prepared.is_volume_only();
             surface_media_into(frame.triangle.object_index, &shading.volume, media);
-            if let Some(froxel_media) = froxel_media.as_deref_mut() {
+            if let Some(froxel_media) = froxel_media {
                 froxel_media.clear();
                 if frame.prepared.has_volume_output()
                     || (frame.material.node_tree.is_none()

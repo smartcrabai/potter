@@ -272,14 +272,6 @@ pub(crate) fn heaviest<T>(items: &[T], weight: impl Fn(&T) -> f64) -> Option<&T>
         .max_by(|first, second| weight(first).total_cmp(&weight(second)))
 }
 
-/// The Vec form of a single node closure, for the surface and volume outputs.
-fn single_closure(params: &BsdfParams) -> Vec<ShaderClosure> {
-    vec![ShaderClosure {
-        weight: 1.0,
-        params: *params,
-    }]
-}
-
 impl BsdfParams {
     pub(crate) fn from_material(material: &Material, normal: DVec3) -> Self {
         let volume = principled_volume_weights(material.volume_color, [0.0; 3]);
