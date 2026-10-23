@@ -285,6 +285,9 @@ fn complete_scene_schema(root: &mut Value) {
     scene["properties"]["compositor"] = json!({"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]});
     scene["properties"]["color_management"] = json!({"$ref":"#/$defs/color_management"});
     scene["properties"]["sequencer"] = json!({"$ref":"#/$defs/sequencer"});
+    scene["properties"]["use_custom_simulation_range"] = json!({"type":"boolean"});
+    scene["properties"]["simulation_frame_start"] = json!({"type":"integer"});
+    scene["properties"]["simulation_frame_end"] = json!({"type":"integer"});
     defs["light"]["properties"]["sun_angle"] =
         json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
     defs["light"]["properties"]["use_custom_distance"] = json!({"type":"boolean"});
@@ -297,9 +300,6 @@ fn complete_scene_schema(root: &mut Value) {
     ] {
         defs["light"]["properties"][factor] = json!({"type":"number","minimum":0});
     }
-    scene["properties"]["use_custom_simulation_range"] = json!({"type":"boolean"});
-    scene["properties"]["simulation_frame_start"] = json!({"type":"integer"});
-    scene["properties"]["simulation_frame_end"] = json!({"type":"integer"});
     let render = &mut defs["render_settings"];
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
     render["properties"]["eevee_use_volumetric_shadows"] =
