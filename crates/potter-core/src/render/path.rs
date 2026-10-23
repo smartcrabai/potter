@@ -2594,7 +2594,7 @@ fn eevee_volume_w(sample_index: u32) -> f32 {
 /// The per-column Z jitter from `eevee_volume_lib.bsl.hh:25-29` and `eevee_sampling_lib.bsl.hh:59-63`.
 fn eevee_volume_froxel_jitter(x: u32, y: u32, offset: f32) -> f32 {
     let pixel_noise = fract_f32(0.067_110_56 * x as f32 + 0.005_837_15 * y as f32);
-    fract_f32(offset + 52.982_918_9 * pixel_noise)
+    fract_f32(offset + 52.982_918 * pixel_noise)
 }
 
 fn halton(mut index: u32, base: u32) -> f64 {
