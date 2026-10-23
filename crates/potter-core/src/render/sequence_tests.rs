@@ -36,18 +36,20 @@ fn camera_volume_doc(grid: &Value, render_samples: u32) -> Result<SceneDoc, Box<
         }),
     )?.doc;
     let emitter_id = Id::new("emitter")?;
-    let data_id = doc.nodes[&emitter_id]
-        .data
-        .as_ref()
-        .expect("fixture emitter has a light data-block")
+    let data_id = doc
+        .nodes
+        .get(&emitter_id)
+        .and_then(|node| node.data.as_ref())
+        .ok_or_else(|| std::io::Error::other("fixture emitter has no light data-block"))?
         .clone();
-    doc.data_blocks
+    let light = doc
+        .data_blocks
         .get_mut(&data_id)
-        .expect("fixture emitter data-block exists")
-        .light
-        .as_mut()
-        .expect("fixture emitter has a typed light payload")
-        .volume_factor = 0.0;
+        .and_then(|block| block.light.as_mut())
+        .ok_or_else(|| {
+            std::io::Error::other("fixture emitter data-block has no typed light payload")
+        })?;
+    light.volume_factor = 0.0;
     Ok(doc)
 }
 
@@ -478,19 +480,17 @@ fn side_by_side_realtime_volume_odd_seam_matches_each_eye() -> Result<(), Box<dy
 fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     // GammaCross is covered by the saved Blender consumer in tests/native_vse_gamma_cross.rs.
-    for (transition, expected) in [(TransitionType::Cross, [0.5, 0.0, 0.5, 1.0])] {
-        let mut transition_strip = strip("transition", StripType::Transition, 3);
-        transition_strip.length = 2.0;
-        transition_strip.transition = Some(transition);
-        transition_strip.inputs = vec!["red".to_owned(), "blue".to_owned()];
-        let (doc, scene) = scene_with_strips(vec![
-            color_strip("red", 1, [1.0, 0.0, 0.0, 1.0]),
-            color_strip("blue", 2, [0.0, 0.0, 1.0, 1.0]),
-            transition_strip,
-        ]);
-        let output = render(&doc, &scene, directory.path(), 2.0, 1, 1)?;
-        assert_pixel(output.pixels[0], expected);
-    }
+    let mut transition_strip = strip("transition", StripType::Transition, 3);
+    transition_strip.length = 2.0;
+    transition_strip.transition = Some(TransitionType::Cross);
+    transition_strip.inputs = vec!["red".to_owned(), "blue".to_owned()];
+    let (doc, scene) = scene_with_strips(vec![
+        color_strip("red", 1, [1.0, 0.0, 0.0, 1.0]),
+        color_strip("blue", 2, [0.0, 0.0, 1.0, 1.0]),
+        transition_strip,
+    ]);
+    let output = render(&doc, &scene, directory.path(), 2.0, 1, 1)?;
+    assert_pixel(output.pixels[0], [0.5, 0.0, 0.5, 1.0]);
 
     let mut wipe_strip = strip("wipe", StripType::Transition, 3);
     wipe_strip.length = 2.0;

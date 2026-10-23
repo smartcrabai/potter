@@ -957,17 +957,13 @@ fn rasterize_with_samples_for_eye(
                 for sample_index in 0..samples {
                     // Without a film the pixel keeps its own pattern, whose first sample is the centre. A film sample is
                     // jittered over its pixel, the first included, as EEVEE jitters every sample (`pixel_jitter_get`).
-                    let (sample_x, filter_y, sample_y) = match film.as_ref() {
-                        Some(film) => {
-                            let (sample_x, filter_y) =
-                                film.jitter(film_sample_offset(sample_index));
-                            // Camera jitter moves screen rows opposite to the row-down film filter.
-                            (sample_x, filter_y, 1.0 - filter_y)
-                        }
-                        None => {
-                            let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
-                            (sample_x, sample_y, sample_y)
-                        }
+                    let (sample_x, filter_y, sample_y) = if let Some(film) = film.as_ref() {
+                        let (sample_x, filter_y) = film.jitter(film_sample_offset(sample_index));
+                        // Camera jitter moves screen rows opposite to the row-down film filter.
+                        (sample_x, filter_y, 1.0 - filter_y)
+                    } else {
+                        let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
+                        (sample_x, sample_y, sample_y)
                     };
                     let (sample_ray, sample_hit) = if sample_index == 0 && film.is_none() {
                         (center_ray, center_hit)

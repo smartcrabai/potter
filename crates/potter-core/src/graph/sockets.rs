@@ -196,12 +196,13 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             sockets(&[("Image", "image"), ("Size", "vector")]),
             sockets(&[("Image", "image")]),
         ),
-        "CompositorNodeOutputFile" => (sockets(&[("Image", "image")]), Vec::new()),
+        "CompositorNodeOutputFile" | "CompositorNodeComposite" => {
+            (sockets(&[("Image", "image")]), Vec::new())
+        }
         "CompositorNodeExposure" => (
             sockets(&[("Image", "image"), ("Exposure", "float")]),
             sockets(&[("Image", "image")]),
         ),
-        "CompositorNodeComposite" => (sockets(&[("Image", "image")]), Vec::new()),
         "CompositorNodeMask" => (Vec::new(), sockets(&[("Mask", "image")])),
         "GeometryNodeTransform" => (
             sockets(&[
