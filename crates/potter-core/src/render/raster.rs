@@ -1351,6 +1351,7 @@ struct RasterSamplesRequest<'scene, 'context, 'lights, 'volume, 'volume_scene, '
     samples: u32,
     seed: u32,
     filter_size: f64,
+    exposure_scale: f32,
     shader: Option<&'scene dyn SurfaceShader>,
     prepared_materials: &'scene [crate::shader::PreparedMaterial],
     camera_lights: Option<super::path::RealtimeCameraLightView<'context, 'lights>>,
@@ -1388,12 +1389,202 @@ pub(super) fn rasterize_with_samples(
         samples,
         seed,
         filter_size,
+        exposure_scale: 1.0,
         shader,
         prepared_materials,
         camera_lights: camera_lights.map(|lights| lights.view(0)),
         view_index: 0,
         volume_pass,
     })
+}
+
+#[derive(Clone, Copy)]
+struct RasterPixelSample {
+    cached: Option<(Option<Ray>, Option<VisibleHit>)>,
+    index: u32,
+    count: u32,
+    x: u32,
+    y: u32,
+    sample_x: f64,
+    sample_y: f64,
+}
+
+struct RasterSampleContext<
+    'scene,
+    'light_context,
+    'lights,
+    'volume_pass,
+    'volume_scene,
+    'pass_borrow,
+    'borrow,
+> {
+    triangles: &'scene [PreparedTriangle],
+    visibility: &'scene super::bvh::Bvh,
+    candidates: &'borrow mut Vec<usize>,
+    frame: &'scene CameraFrame,
+    camera: &'scene Camera,
+    width: u32,
+    height: u32,
+    mode: Mode,
+    background: [f64; 4],
+    world: Option<WorldRadiance<'scene>>,
+    shader: Option<&'scene dyn SurfaceShader>,
+    camera_lights: Option<super::path::RealtimeCameraLightView<'light_context, 'lights>>,
+    camera_light_raster_samples: Option<&'scene super::path::CameraLightRasterSamples>,
+    view_index: usize,
+    volume_pass: &'borrow mut Option<
+        &'pass_borrow mut super::path::RealtimeVolumePass<'volume_pass, 'volume_scene>,
+    >,
+    linear_rgba_associated: bool,
+}
+
+impl<'scene, 'light_context, 'lights, 'volume_pass, 'volume_scene, 'pass_borrow, 'borrow>
+    RasterSampleContext<
+        'scene,
+        'light_context,
+        'lights,
+        'volume_pass,
+        'volume_scene,
+        'pass_borrow,
+        'borrow,
+    >
+{
+    fn shade(&mut self, sample: RasterPixelSample) -> Result<([f64; 4], [f64; 4])> {
+        let (sample_ray, sample_hit) = if let Some(cached) = sample.cached {
+            cached
+        } else {
+            let ray = ray_for_subpixel_in_frame(
+                self.frame,
+                self.camera.position,
+                self.width,
+                self.height,
+                sample.x,
+                sample.y,
+                sample.sample_x,
+                sample.sample_y,
+            )?;
+            let hit = match ray {
+                Some(ray) => nearest_visible_hit(
+                    self.triangles,
+                    self.visibility,
+                    self.candidates,
+                    ray,
+                    self.frame,
+                    self.shader,
+                )?,
+                None => None,
+            };
+            (ray, hit)
+        };
+        if matches!(self.mode, Mode::Wire) {
+            let color = sample_hit.map_or(self.background, |visible_hit| {
+                let triangle = &self.triangles[visible_hit.triangle_index];
+                if is_wire_edge(
+                    triangle,
+                    visible_hit.hit,
+                    self.frame,
+                    self.width,
+                    self.height,
+                ) {
+                    triangle.source.color
+                } else {
+                    self.background
+                }
+            });
+            return Ok((color, color));
+        }
+        let Some(sample_ray) = sample_ray else {
+            let color = sample_background(self.background, self.world, None)?;
+            return Ok((
+                color,
+                if self.linear_rgba_associated {
+                    associated_rgba(color)
+                } else {
+                    color
+                },
+            ));
+        };
+        self.shade_surface(sample, sample_ray, sample_hit)
+    }
+
+    fn shade_surface(
+        &mut self,
+        sample: RasterPixelSample,
+        sample_ray: Ray,
+        sample_hit: Option<VisibleHit>,
+    ) -> Result<([f64; 4], [f64; 4])> {
+        let mut volume_sample = self
+            .volume_pass
+            .as_deref_mut()
+            .map(|volume_pass| {
+                volume_pass.begin_sample(super::path::RealtimeVolumeSampleInfo {
+                    camera: self.camera,
+                    frame: self.frame,
+                    width: self.width,
+                    height: self.height,
+                    x: sample.x,
+                    y: sample.y,
+                    sample_x: sample.sample_x,
+                    sample_y: sample.sample_y,
+                    ray: (sample_ray.origin, sample_ray.direction),
+                    sample_index: sample.index,
+                    sample_count: sample.count,
+                    view_index: if self.camera.stereo_mode == StereoMode::SideBySide
+                        && sample.x >= self.width / 2
+                    {
+                        1
+                    } else {
+                        self.view_index
+                    },
+                })
+            })
+            .transpose()?;
+        let camera_light_view = self.camera_lights.map(|lights| {
+            let eye = camera_light_eye_index(
+                self.camera.stereo_mode,
+                sample.x,
+                self.width,
+                self.view_index,
+            );
+            let pixel_x = if self.camera.stereo_mode == StereoMode::SideBySide
+                && sample.x >= self.width / 2
+            {
+                sample.x - self.width / 2
+            } else {
+                sample.x
+            };
+            lights.for_eye(eye).at_pixel(
+                self.camera_light_raster_samples,
+                sample.index,
+                sample.sample_x,
+                sample.sample_y,
+                pixel_x,
+                sample.y,
+            )
+        });
+        let color = composite_sample_with_association(
+            self.triangles,
+            self.visibility,
+            self.candidates,
+            sample_ray,
+            self.frame,
+            self.camera,
+            self.background,
+            self.world,
+            self.shader,
+            sample_hit,
+            camera_light_view,
+            volume_sample.as_mut(),
+        )?;
+        Ok((
+            color.straight,
+            if self.linear_rgba_associated {
+                color.associated
+            } else {
+                color.straight
+            },
+        ))
+    }
 }
 
 fn rasterize_with_samples_for_eye(
@@ -1410,6 +1601,7 @@ fn rasterize_with_samples_for_eye(
         samples,
         seed,
         filter_size,
+        exposure_scale,
         shader,
         prepared_materials,
         camera_lights,
@@ -1436,6 +1628,7 @@ fn rasterize_with_samples_for_eye(
             samples,
             seed,
             filter_size,
+            exposure_scale,
             shader,
             prepared_materials,
             camera_lights: camera_lights.map(|lights| lights.for_eye(0)),
@@ -1453,6 +1646,7 @@ fn rasterize_with_samples_for_eye(
             samples,
             seed,
             filter_size,
+            exposure_scale,
             shader,
             prepared_materials,
             camera_lights: camera_lights.map(|lights| lights.for_eye(1)),
@@ -1541,7 +1735,7 @@ fn rasterize_with_samples_for_eye(
             // Side-by-side stereo puts the right eye at `width / 2`, as `ray_for_subpixel_in_frame` does.
             let eye_split =
                 (camera.stereo_mode == StereoMode::SideBySide).then_some((width / 2) as usize);
-            FilmFilter::new(radius, width, height, eye_split)
+            FilmFilter::new(radius, width, height, eye_split, exposure_scale)
         })
         .transpose()?;
     // Film jitter is shared across pixels; other sample patterns vary per pixel.
@@ -1556,6 +1750,16 @@ fn rasterize_with_samples_for_eye(
     let mut candidates = Vec::new();
     for y in 0..height {
         for x in 0..width {
+            let pixel_index = usize::try_from(y)
+                .ok()
+                .and_then(|row| row.checked_mul(width_usize))
+                .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "pixel index exceeds platform limits",
+                    )
+                })?;
             let center_ray = ray_for_pixel_in_frame(&frame, camera.position, width, height, x, y)?;
             let center_hit = match center_ray {
                 Some(ray) => nearest_visible_hit(
@@ -1568,16 +1772,6 @@ fn rasterize_with_samples_for_eye(
                 )?,
                 None => None,
             };
-            let pixel_index = usize::try_from(y)
-                .ok()
-                .and_then(|row| row.checked_mul(width_usize))
-                .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
-                .ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::LimitExceeded,
-                        "pixel index exceeds platform limits",
-                    )
-                })?;
             if let Some(visible_hit) = center_hit {
                 let triangle = &prepared[visible_hit.triangle_index];
                 let hit = visible_hit.hit;
@@ -1598,7 +1792,6 @@ fn rasterize_with_samples_for_eye(
                     if shading.dot(geometric) < 0.0 {
                         shading = -shading;
                     }
-                    // The hit's distance along its ray places the point; its depth is a view-axis or panorama measure.
                     let point = center_ray.origin + center_ray.direction * hit.distance;
                     let visibility = ambient_visibility(
                         bvh,
@@ -1614,138 +1807,40 @@ fn rasterize_with_samples_for_eye(
                         linear_color_to_f32([visibility, visibility, visibility, 1.0])[0];
                 }
             }
-
-            if matches!(mode, Mode::Solid | Mode::Beauty | Mode::Wire) {
+            if film.is_none() && matches!(mode, Mode::Solid | Mode::Beauty | Mode::Wire) {
                 let mut average = [0.0_f64; 4];
                 let display_average_needed = film.is_none();
                 let associated_average_needed = linear_rgba_associated && display_average_needed;
                 let mut average_associated = [0.0_f64; 4];
                 for sample_index in 0..samples {
-                    // Without a film the pixel keeps its own pattern, whose first sample is the centre. A film sample is
-                    // jittered over its pixel, the first included, as EEVEE jitters every sample (`pixel_jitter_get`).
-                    let (sample_x, filter_y, sample_y) = if let Some(film) = film.as_ref() {
-                        let (sample_x, filter_y) = film.jitter(film_sample_offset(sample_index));
-                        // EEVEE applies the same pixel jitter to the projection and film sample table.
-                        (sample_x, filter_y, filter_y)
-                    } else {
-                        let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
-                        (sample_x, sample_y, sample_y)
-                    };
-                    let (sample_ray, sample_hit) = if sample_index == 0 && film.is_none() {
-                        (center_ray, center_hit)
-                    } else {
-                        let ray = ray_for_subpixel_in_frame(
-                            &frame,
-                            camera.position,
-                            width,
-                            height,
-                            x,
-                            y,
-                            sample_x,
-                            sample_y,
-                        )?;
-                        let hit = match ray {
-                            Some(ray) => nearest_visible_hit(
-                                &prepared,
-                                &visibility,
-                                &mut candidates,
-                                ray,
-                                &frame,
-                                shader,
-                            )?,
-                            None => None,
-                        };
-                        (ray, hit)
-                    };
-                    let (sample_color, sample_linear) = if matches!(mode, Mode::Wire) {
-                        let color = sample_hit.map_or(background_linear, |visible_hit| {
-                            let triangle = &prepared[visible_hit.triangle_index];
-                            if is_wire_edge(triangle, visible_hit.hit, &frame, width, height) {
-                                triangle.source.color
-                            } else {
-                                background_linear
-                            }
-                        });
-                        (color, color)
-                    } else if let Some(sample_ray) = sample_ray {
-                        // Camera shapes are drawn after the forward blend pass, so their surface depth comes from the
-                        // opaque/DITHERED geometry rather than BLENDED color or tint.
-                        let mut volume_sample = volume_pass
-                            .as_deref_mut()
-                            .map(|volume_pass| {
-                                volume_pass.begin_sample(super::path::RealtimeVolumeSampleInfo {
-                                    camera,
-                                    frame: &frame,
-                                    width,
-                                    height,
-                                    x,
-                                    y,
-                                    sample_x,
-                                    sample_y,
-                                    ray: (sample_ray.origin, sample_ray.direction),
-                                    sample_index,
-                                    sample_count: samples,
-                                    view_index: if camera.stereo_mode == StereoMode::SideBySide
-                                        && x >= width / 2
-                                    {
-                                        1
-                                    } else {
-                                        view_index
-                                    },
-                                })
-                            })
-                            .transpose()?;
-                        let camera_light_view = camera_lights.map(|lights| {
-                            let eye =
-                                camera_light_eye_index(camera.stereo_mode, x, width, view_index);
-                            let pixel_x =
-                                if camera.stereo_mode == StereoMode::SideBySide && x >= width / 2 {
-                                    x - width / 2
-                                } else {
-                                    x
-                                };
-                            lights.for_eye(eye).at_pixel(
-                                camera_light_raster_samples.as_ref(),
-                                sample_index,
-                                sample_x,
-                                sample_y,
-                                pixel_x,
-                                y,
-                            )
-                        });
-                        let color = composite_sample_with_association(
-                            &prepared,
-                            &visibility,
-                            &mut candidates,
-                            sample_ray,
-                            &frame,
-                            camera,
-                            background_linear,
-                            world,
-                            shader,
-                            sample_hit,
-                            camera_light_view,
-                            volume_sample.as_mut(),
-                        )?;
-                        (
-                            color.straight,
-                            if linear_rgba_associated {
-                                color.associated
-                            } else {
-                                color.straight
-                            },
-                        )
-                    } else {
-                        let color = sample_background(background_linear, world, None)?;
-                        (
-                            color,
-                            if linear_rgba_associated {
-                                associated_rgba(color)
-                            } else {
-                                color
-                            },
-                        )
-                    };
+                    let (sample_x, sample_y) = sample_offset(seed, x, y, sample_index);
+                    let (sample_color, sample_linear) = RasterSampleContext {
+                        triangles: &prepared,
+                        visibility: &visibility,
+                        candidates: &mut candidates,
+                        frame: &frame,
+                        camera,
+                        width,
+                        height,
+                        mode,
+                        background: background_linear,
+                        world,
+                        shader,
+                        camera_lights,
+                        camera_light_raster_samples: camera_light_raster_samples.as_ref(),
+                        view_index,
+                        volume_pass: &mut volume_pass,
+                        linear_rgba_associated,
+                    }
+                    .shade(RasterPixelSample {
+                        cached: (sample_index == 0).then_some((center_ray, center_hit)),
+                        index: sample_index,
+                        count: samples,
+                        x,
+                        y,
+                        sample_x,
+                        sample_y,
+                    })?;
                     let count = f64::from(sample_index + 1);
                     let previous_weight = 1.0 - 1.0 / count;
                     for channel in 0..4 {
@@ -1758,9 +1853,6 @@ fn rasterize_with_samples_for_eye(
                                 * previous_weight
                                 + sample_linear[channel] / count;
                         }
-                    }
-                    if let Some(film) = film.as_mut() {
-                        film.splat(x, y, sample_x, filter_y, sample_index, sample_linear);
                     }
                 }
                 if display_average_needed {
@@ -1797,9 +1889,56 @@ fn rasterize_with_samples_for_eye(
         }
     }
 
-    if let Some(film) = &film {
-        for (pixel_index, (colour, weight)) in film.colour.iter().zip(&film.weight).enumerate() {
-            let associated = colour.map(|sum| sum / weight.max(f64::MIN_POSITIVE));
+    if let Some(film) = film.as_mut() {
+        linear_rgba.fill([0.0; 4]);
+        for sample_index in 0..samples {
+            let (sample_x, sample_y) = film.jitter(film_sample_offset(sample_index));
+            for y in 0..height {
+                for x in 0..width {
+                    let pixel_index = usize::try_from(y)
+                        .ok()
+                        .and_then(|row| row.checked_mul(width_usize))
+                        .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
+                        .ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::LimitExceeded,
+                                "pixel index exceeds platform limits",
+                            )
+                        })?;
+                    let (_, sample_linear) = RasterSampleContext {
+                        triangles: &prepared,
+                        visibility: &visibility,
+                        candidates: &mut candidates,
+                        frame: &frame,
+                        camera,
+                        width,
+                        height,
+                        mode,
+                        background: background_linear,
+                        world,
+                        shader,
+                        camera_lights,
+                        camera_light_raster_samples: camera_light_raster_samples.as_ref(),
+                        view_index,
+                        volume_pass: &mut volume_pass,
+                        linear_rgba_associated,
+                    }
+                    .shade(RasterPixelSample {
+                        cached: None,
+                        index: sample_index,
+                        count: samples,
+                        x,
+                        y,
+                        sample_x,
+                        sample_y,
+                    })?;
+                    film.store_sample(pixel_index, sample_linear);
+                }
+            }
+            film.resolve_sample(sample_index, sample_x, sample_y, &mut linear_rgba);
+        }
+        for (pixel_index, associated) in linear_rgba.iter().copied().enumerate() {
+            let associated = associated.map(f64::from);
             let alpha = associated[3];
             let display = if alpha > 0.0 {
                 [
@@ -1812,7 +1951,6 @@ fn rasterize_with_samples_for_eye(
                 associated
             };
             rgba[pixel_index * 4..pixel_index * 4 + 4].copy_from_slice(&color_to_srgba(display));
-            linear_rgba[pixel_index] = linear_color_to_f32(associated);
         }
     }
 
@@ -1834,6 +1972,7 @@ fn rasterize_with_samples_for_eye(
     clippy::too_many_arguments,
     reason = "line rasterization uses the same explicit configuration as triangle rasterization"
 )]
+
 pub(super) fn rasterize_with_lines(
     triangles: &[Triangle],
     lines: &[Line],
@@ -1846,12 +1985,13 @@ pub(super) fn rasterize_with_lines(
     samples: u32,
     seed: u32,
     filter_size: f64,
+    exposure_scale: f32,
     shader: Option<&dyn SurfaceShader>,
     prepared_materials: &[crate::shader::PreparedMaterial],
     camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
-    let mut output = rasterize_with_samples(
+    let mut output = rasterize_with_samples_for_eye(RasterSamplesRequest {
         triangles,
         camera,
         width,
@@ -1862,11 +2002,13 @@ pub(super) fn rasterize_with_lines(
         samples,
         seed,
         filter_size,
+        exposure_scale,
         shader,
         prepared_materials,
-        camera_lights,
+        camera_lights: camera_lights.map(|lights| lights.view(0)),
+        view_index: 0,
         volume_pass,
-    )?;
+    })?;
     if lines.is_empty() {
         return Ok(output);
     }
@@ -2042,6 +2184,7 @@ pub(crate) fn rasterize_wireframe(
         1,
         0,
         0.0,
+        1.0,
         None,
         &[],
         None,
@@ -2902,28 +3045,32 @@ fn sample_offset(seed: u32, x: u32, y: u32, sample_index: u32) -> (f64, f64) {
     (x_offset, y_offset)
 }
 
-/// EEVEE's film reconstruction for realtime Beauty (`eevee_film.cc`): every associated sample is splatted into the output
-/// pixels whose centres lie within `radius` of it, weighted by `film_filter_weight`; `colour` and `weight` are per output pixel.
+/// EEVEE's combined-film resolve uses one RGBA16F input frame and one RGBA16F history frame;
+/// spatial weights and their history are float32.
+#[derive(Clone, Copy, Default)]
+struct FilmTap {
+    x: i64,
+    y: i64,
+    weight: f32,
+}
+
+const MAX_FILM_TAPS: usize = 16;
+
 struct FilmFilter {
     radius: f64,
     width: usize,
     height: usize,
-    /// The column where the right eye starts, in a side-by-side stereo frame. A sample splats only into its own eye's
-    /// columns, as each eye has its own film in EEVEE (`ShadingView::update_view` per view).
+    exposure_scale: f32,
+    /// One reusable, quantized input frame, as EEVEE's combined render target.
+    sample_color: Vec<[f32; 4]>,
+    /// The accumulation-weight image persists between film samples.
+    history_weight: Vec<f32>,
+    /// The column where the right eye starts; each eye has an independent film.
     eye_split: Option<usize>,
-    /// Weighted associated RGBA sum for each output pixel.
-    colour: Vec<[f64; 4]>,
-    weight: Vec<f64>,
 }
 
 impl FilmFilter {
-    /// The sub-pixel position of a film sample from its offset in the pixel. EEVEE's `pixel_jitter_get` gives the
-    /// offset `j` of its film weights: below `FRAC_1_SQRT_2` px a disk of half the radius, mapped by
-    /// `Sampling::sample_disk` as `sqrt(u)` and `2*pi*v` (`eevee_film.cc`, `eevee_sampling.cc`), otherwise uniform over
-    /// the pixel. The camera's window shifts by `+j` in NDC (`ShadingView::update_view`, `eevee_view.cc`;
-    /// `window_translate_m4`, `math_geom.cc`), and content moves by that shift. So a pixel sees the scene at `-j` in NDC
-    /// x. NDC y points up but rows here point down (`ndc_y = 1 - 2 (y + sy) / h`), so the same shift is `+j` in row
-    /// units: the raster position is `(0.5 - j_x, 0.5 + j_y)`.
+    /// EEVEE's pixel jitter, converted to a position inside the rendered pixel.
     fn jitter(&self, offset: (f64, f64)) -> (f64, f64) {
         if self.radius >= std::f64::consts::FRAC_1_SQRT_2 {
             return (1.0 - offset.0, offset.1);
@@ -2933,7 +3080,13 @@ impl FilmFilter {
         (0.5 - scale * theta.cos(), 0.5 + scale * theta.sin())
     }
 
-    fn new(radius: f64, width: u32, height: u32, eye_split: Option<usize>) -> Result<Self> {
+    fn new(
+        radius: f64,
+        width: u32,
+        height: u32,
+        eye_split: Option<usize>,
+        exposure_scale: f32,
+    ) -> Result<Self> {
         let width = usize::try_from(width).map_err(|_| {
             PotError::new(
                 ErrorCode::LimitExceeded,
@@ -2956,13 +3109,13 @@ impl FilmFilter {
             radius,
             width,
             height,
+            exposure_scale,
+            sample_color: allocate_filled(pixel_count, [0.0_f32; 4], "film input frame")?,
+            history_weight: allocate_filled(pixel_count, 0.0_f32, "film weight history")?,
             eye_split,
-            colour: allocate_filled(pixel_count, [0.0_f64; 4], "film colour")?,
-            weight: allocate_filled(pixel_count, 0.0_f64, "film weight")?,
         })
     }
 
-    /// The output columns a sample in column `x` may reach: its own eye's columns in a side-by-side frame.
     fn eye_columns(&self, x: u32) -> (i64, i64) {
         let width = self.width as i64;
         match self.eye_split {
@@ -2978,66 +3131,164 @@ impl FilmFilter {
         }
     }
 
-    fn accumulate(&mut self, px: usize, py: usize, weight: f64, associated: [f64; 4]) {
-        let index = py * self.width + px;
-        for (sum, value) in self.colour[index].iter_mut().zip(associated) {
-            *sum += weight * value;
-        }
-        self.weight[index] += weight;
+    fn store_sample(&mut self, pixel: usize, color: [f64; 4]) {
+        let mut stored = color.map(|channel| exr::prelude::f16::from_f32(channel as f32).to_f32());
+        stored[3] = exr::prelude::f16::from_f32(1.0_f32 - color[3] as f32).to_f32();
+        self.sample_color[pixel] = stored;
     }
 
-    /// Splats the associated sample of frame `sample_index`, taken at `(sample_x, sample_y)` inside pixel `(x, y)`. Below
-    /// `LARGE_FILTER_RADIUS` it reaches the output pixels whose centres lie within the radius. From there on it reaches
-    /// EEVEE's 16 table taps (`large_filter_taps`), each weighted from its distance to the sample, with no radius test.
-    /// Either way the output stays in the sample's own eye's columns.
-    fn splat(
+    /// Resolves one TAA sample into the float32 weight image and RGBA16F combined history.
+    fn resolve_sample(
         &mut self,
-        x: u32,
-        y: u32,
+        sample_index: u32,
         sample_x: f64,
         sample_y: f64,
-        sample_index: u32,
-        associated: [f64; 4],
+        history: &mut [[f32; 4]],
     ) {
-        let sample = (f64::from(x) + sample_x, f64::from(y) + sample_y);
-        let (lo, hi) = self.eye_columns(x);
-        let height = self.height as i64;
-        if self.radius < LARGE_FILTER_RADIUS {
-            let reach = (self.radius + 0.5).ceil() as i64;
-            let radius_squared = self.radius * self.radius;
-            for dy in -reach..=reach {
-                for dx in -reach..=reach {
-                    let px = i64::from(x) + dx;
-                    let py = i64::from(y) + dy;
-                    if px < lo || px >= hi || py < 0 || py >= height {
-                        continue;
+        let mut taps = [FilmTap::default(); MAX_FILM_TAPS];
+        let mut sample_weight_total = 0.0_f32;
+        let tap_count = if self.radius < LARGE_FILTER_RADIUS {
+            if self.radius < 0.01 {
+                taps[0] = FilmTap {
+                    x: 0,
+                    y: 0,
+                    weight: 1.0,
+                };
+                sample_weight_total = 1.0;
+                1
+            } else {
+                let radius = self.radius as f32;
+                let jitter_x = 0.5 - sample_x as f32;
+                let jitter_y = 0.5 - sample_y as f32;
+                let reach = radius.ceil() as i64;
+                let radius_squared = radius * radius;
+                let mut count = 0;
+                let mut closest = 0;
+                let mut closest_distance = f32::MAX;
+                for y in -reach..=reach {
+                    for x in -reach..=reach {
+                        let distance_x = x as f32 - jitter_x;
+                        let distance_y = y as f32 - jitter_y;
+                        let distance_squared = distance_x * distance_x + distance_y * distance_y;
+                        if distance_squared >= radius_squared {
+                            continue;
+                        }
+                        let weight = film_filter_weight(radius, distance_squared);
+                        sample_weight_total += weight;
+                        taps[count] = FilmTap { x, y, weight };
+                        if distance_squared < closest_distance {
+                            closest = count;
+                            closest_distance = distance_squared;
+                        }
+                        count += 1;
                     }
-                    let centre = (px as f64 + 0.5, py as f64 + 0.5);
-                    let distance_squared =
-                        (centre.0 - sample.0).powi(2) + (centre.1 - sample.1).powi(2);
-                    if distance_squared >= radius_squared {
-                        continue;
-                    }
-                    let weight = film_filter_weight(self.radius, distance_squared);
-                    self.accumulate(px as usize, py as usize, weight, associated);
                 }
+                if closest != 0 {
+                    taps.swap(0, closest);
+                }
+                if count <= 9 { 9 } else { MAX_FILM_TAPS }
             }
         } else {
-            for (tap_x, tap_y) in large_filter_taps(self.radius, sample_index) {
-                // EEVEE's table is in texel space with y up, and rows here point down.
-                let px = i64::from(x) - tap_x;
-                let py = i64::from(y) + tap_y;
-                if px < lo || px >= hi || py < 0 || py >= height {
-                    continue;
+            let jitter_x = 0.5 - sample_x as f32;
+            let jitter_y = 0.5 - sample_y as f32;
+            for (tap, (x, y)) in taps
+                .iter_mut()
+                .zip(large_filter_taps(self.radius, sample_index))
+            {
+                let distance_x = x as f32 - jitter_x;
+                let distance_y = y as f32 - jitter_y;
+                let weight = film_filter_weight(
+                    self.radius as f32,
+                    distance_x * distance_x + distance_y * distance_y,
+                );
+                *tap = FilmTap { x, y, weight };
+                sample_weight_total += weight;
+            }
+            MAX_FILM_TAPS
+        };
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let pixel = y * self.width + x;
+                let (column_start, column_end) = self.eye_columns(x as u32);
+                let mut color_sum = [0.0_f32; 4];
+                let mut color_weight = 0.0_f32;
+                for tap in taps[..tap_count].iter().rev() {
+                    if tap.weight == 0.0 {
+                        continue;
+                    }
+                    let source_x = (x as i64 + tap.x).clamp(column_start, column_end - 1);
+                    let source_y = (y as i64 - tap.y).clamp(0, self.height as i64 - 1);
+                    let source =
+                        self.sample_color[source_y as usize * self.width + source_x as usize];
+                    let color = ycocg_from_sample(source);
+                    let weight = tap.weight * film_luma_weight(color[0], self.exposure_scale);
+                    for channel in 0..4 {
+                        color_sum[channel] += color[channel] * weight;
+                    }
+                    color_weight += weight;
                 }
-                let centre = (px as f64 + 0.5, py as f64 + 0.5);
-                let distance_squared =
-                    (centre.0 - sample.0).powi(2) + (centre.1 - sample.1).powi(2);
-                let weight = film_filter_weight(self.radius, distance_squared);
-                self.accumulate(px as usize, py as usize, weight, associated);
+
+                let previous = history[pixel];
+                let previous_ycocg = ycocg_from_scene_linear(previous);
+                let previous_weight = self.history_weight[pixel];
+                let weight_dst =
+                    film_luma_weight(previous_ycocg[0], self.exposure_scale) * previous_weight;
+                let color_src = color_sum.map(|channel| channel / color_weight);
+                let weight_sum = weight_dst + color_weight;
+                let blended = std::array::from_fn(|channel| {
+                    (previous_ycocg[channel] * weight_dst + color_src[channel] * color_weight)
+                        / weight_sum
+                });
+                let mut color = scene_linear_from_ycocg(blended);
+                if color[3] > 0.995 {
+                    color[3] = 1.0;
+                }
+                if color.iter().any(|channel| channel.is_nan()) {
+                    color = [0.0, 0.0, 0.0, 1.0];
+                }
+                for channel in &mut color {
+                    if !(*channel > 0.0) {
+                        *channel = 0.0;
+                    }
+                }
+                history[pixel] = color.map(store_film_history_f16);
+                self.history_weight[pixel] = previous_weight + sample_weight_total;
             }
         }
     }
+}
+
+fn ycocg_from_scene_linear(color: [f32; 4]) -> [f32; 4] {
+    [
+        color[0] + 2.0 * color[1] + color[2],
+        2.0 * color[0] - 2.0 * color[2],
+        -color[0] + 2.0 * color[1] - color[2],
+        color[3],
+    ]
+}
+fn ycocg_from_sample(color: [f32; 4]) -> [f32; 4] {
+    let mut color = ycocg_from_scene_linear(color);
+    color[3] = (1.0 - color[3]).clamp(0.0, 1.0);
+    color
+}
+
+fn scene_linear_from_ycocg(color: [f32; 4]) -> [f32; 4] {
+    [
+        (color[0] + color[1] - color[2]) * 0.25,
+        (color[0] + color[2]) * 0.25,
+        (color[0] - color[1] - color[2]) * 0.25,
+        color[3],
+    ]
+}
+
+fn film_luma_weight(luma: f32, exposure_scale: f32) -> f32 {
+    1.0 / (4.0 + luma * exposure_scale)
+}
+
+fn store_film_history_f16(value: f32) -> f32 {
+    let patched = f32::from_bits(value.to_bits().wrapping_add(0x1000));
+    exr::prelude::f16::from_f32(patched).to_f32()
 }
 
 /// The film radius of realtime Beauty, or `None` for the one-sample render, where EEVEE's filter is zero and the sample
@@ -3101,8 +3352,8 @@ fn halton_radical_inverse(base: u64, mut index: u64) -> f64 {
 
 /// EEVEE's `film_filter_weight`: a Gaussian fitted to Blackman-Harris, with a standard deviation of 0.284 radii
 /// (`eevee_film_shared.hh`).
-fn film_filter_weight(radius: f64, distance_squared: f64) -> f64 {
-    const SIGMA: f64 = 0.284;
+fn film_filter_weight(radius: f32, distance_squared: f32) -> f32 {
+    const SIGMA: f32 = 0.284;
     let r = distance_squared / (radius * radius);
     (-0.5 / (SIGMA * SIGMA) * r).exp()
 }
@@ -4390,6 +4641,7 @@ mod tests {
             1,
             0,
             1.5,
+            1.0,
             None,
             &[],
             None,
@@ -4431,6 +4683,7 @@ mod tests {
             1,
             0,
             1.5,
+            1.0,
             None,
             &[],
             None,
@@ -4503,6 +4756,7 @@ mod line_tests {
             1,
             0,
             1.5,
+            1.0,
             None,
             &[],
             None,

@@ -5659,6 +5659,7 @@ fn overlay_rasterized_lines(
         seed,
         // One sample per pixel: EEVEE's film filter is off, so the overlay is drawn unfiltered.
         0.0,
+        1.0,
         None,
         geometry.prepared.as_slice(),
         None,
