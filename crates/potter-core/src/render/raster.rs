@@ -675,6 +675,9 @@ pub(super) fn rasterize_with_samples(
             camera_lights,
             volume_pass.as_deref_mut(),
         )?;
+        if let Some(volume_pass) = volume_pass.as_deref_mut() {
+            volume_pass.reset_column_cache();
+        }
         let right_output = rasterize_with_samples(
             triangles,
             &right_camera,
@@ -893,6 +896,7 @@ pub(super) fn rasterize_with_samples(
                                     sample_y,
                                     ray: (sample_ray.origin, sample_ray.direction),
                                     sample_index,
+                                    sample_count: samples,
                                 })
                             })
                             .transpose()?;

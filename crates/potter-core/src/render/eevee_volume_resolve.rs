@@ -112,11 +112,12 @@ impl FroxelTextureLayout {
             f64::from(self.extent[1]) - (f64::from(y) + 0.5) * f64::from(self.tile_size),
         ]
     }
-    /// Converts native NDC jitter (`±1 / tex_size`) to raster pixels.
+    /// Converts native NDC jitter (`±1 / tex_size`) to raster pixels using the padded tile projection.
     pub(super) fn jitter_in_pixels(self, jitter: [f64; 2]) -> [f64; 2] {
+        let pixels_per_ndc_unit = f64::from(self.tile_size) * 0.5;
         [
-            jitter[0] * f64::from(self.extent[0]) / (2.0 * f64::from(self.dimensions[0])),
-            jitter[1] * f64::from(self.extent[1]) / (2.0 * f64::from(self.dimensions[1])),
+            jitter[0] * pixels_per_ndc_unit,
+            jitter[1] * pixels_per_ndc_unit,
         ]
     }
 }
@@ -222,8 +223,16 @@ mod tests {
         assert!((padded_top_right[0] - 104.0).abs() < f64::EPSILON);
         assert!((padded_top_right[1] + 3.0).abs() < f64::EPSILON);
         let jitter_offset = layout.jitter_in_pixels([1.0, 1.0]);
-        assert!((jitter_offset[0] - 101.0 / 14.0).abs() < 1.0e-6);
-        assert!((jitter_offset[1] - 53.0 / 8.0).abs() < 1.0e-6);
+        assert_eq!(jitter_offset, [8.0, 8.0]);
+    }
+
+    #[test]
+    fn native_jitter_uses_padded_projection_for_odd_and_aligned_extents() {
+        let odd_layout = FroxelTextureLayout::new(101, 65, 16);
+        assert_eq!(odd_layout.jitter_in_pixels([1.0, 1.0]), [8.0, 8.0]);
+
+        let aligned_layout = FroxelTextureLayout::new(112, 64, 16);
+        assert_eq!(aligned_layout.jitter_in_pixels([1.0, 1.0]), [8.0, 8.0]);
     }
 
     #[test]

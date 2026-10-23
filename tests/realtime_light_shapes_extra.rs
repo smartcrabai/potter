@@ -2,7 +2,7 @@
 //! against committed Blender 5.2.2 EEVEE captures.
 //!
 //! `fixtures/native_oracle/eevee_light_shapes_extra.py` saves three base scenes and three local-light cull variants;
-//! `eevee_light_shape_occlusion.py` and `eevee_mesh_volume_gradient.py` save the opaque-surface and gradient-volume cases:
+//! `eevee_light_shape_boundaries.py` saves the odd-viewport, scaled-spot, and small-area boundary cases:
 //!
 //! - a sun of angle 8° seen by a perspective camera that looks straight at it, whose disc EEVEE draws at
 //!   `energy · (1 + 1 / r²) / π` with `r = tan(angle / 2)`;
@@ -14,6 +14,8 @@
 //!   lies behind it, pinning the camera-shape depth test.
 //! - orthographic and wide-FOV perspective point lights behind a mesh-volume absorption gradient that is zero at camera
 //!   entry, pinning per-froxel material evaluation and jittered perspective prefix steps at the AA-filtered edge.
+//! - a 101×65 perspective point shape through a heterogeneous mesh volume at tile size 16, plus a scaled off-axis spot
+//!   and a square area light below EEVEE's half-extent cutoff.
 //!
 //! The test imports each saved `.blend`, renders it with `pot render --engine realtime`, and compares window means with
 //! committed macOS EEVEE pixel captures. The sun, spot, and opaque-surface tolerances are 0.01; the existing absorber
@@ -45,6 +47,169 @@ use tempfile::tempdir;
 
 /// The scenes and EEVEE renders (`eevee_light_shapes_extra.py`).
 const SCRIPT: &str = include_str!("fixtures/native_oracle/eevee_light_shapes_extra.py");
+const BOUNDARY_SCRIPT: &str =
+    include_str!("fixtures/native_oracle/eevee_light_shape_boundaries.py");
+const ODD_VIEWPORT_WIDTH: usize = 101;
+const ODD_VIEWPORT_HEIGHT: usize = 65;
+const ODD_VIEWPORT_EDGE_COLUMN: usize = 22;
+const ODD_VIEWPORT_EDGE_ROW: usize = 32;
+const EEVEE_MESH_VOLUME_ODD_PERSPECTIVE: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/mesh_volume_gradient_odd_perspective.f32le");
+const EEVEE_SPOT_SCALED_OFFAXIS: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/spot_scaled_offaxis.f32le");
+const EEVEE_AREA_SMALL_CUTOFF: &[u8] =
+    include_bytes!("fixtures/native_oracle/eevee_macos/area_small_cutoff.f32le");
+
+/// The mean red value of the `(2 * half + 1)` square window centred on `(column, row)` (top-down) in the image `id`.
+fn window_mean(
+    project: &Path,
+    id: &str,
+    column: usize,
+    row: usize,
+    half: usize,
+) -> Result<f64, Box<dyn Error>> {
+    window_mean_at(
+        project,
+        id,
+        column,
+        row,
+        half,
+        RESOLUTION as usize,
+        RESOLUTION as usize,
+    )
+}
+
+fn window_mean_at(
+    project: &Path,
+    id: &str,
+    column: usize,
+    row: usize,
+    half: usize,
+    width: usize,
+    height: usize,
+) -> Result<f64, Box<dyn Error>> {
+    let scene = read_scene(project)?;
+    let image: Image = serde_json::from_value(scene["images"][id].clone())?;
+    let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
+    let width = width as f64;
+    let height = height as f64;
+    let mut total = 0.0;
+    let mut count = 0.0;
+    for r in row - half..=row + half {
+        for c in column - half..=column + half {
+            let uv = [(c as f64 + 0.5) / width, (r as f64 + 0.5) / height];
+            total += sample(&data, uv, false)[0];
+            count += 1.0;
+        }
+    }
+    Ok(total / count)
+}
+
+/// The mean red value of an RGB f32le capture window; fixture rows are bottom-up, unlike Potter's top-down rows.
+fn oracle_window_mean(capture: &[u8], column: usize, row: usize, half: usize) -> f64 {
+    oracle_window_mean_at(
+        capture,
+        column,
+        row,
+        half,
+        RESOLUTION as usize,
+        RESOLUTION as usize,
+    )
+}
+
+fn oracle_window_mean_at(
+    capture: &[u8],
+    column: usize,
+    row: usize,
+    half: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    assert_eq!(capture.len(), width * height * 3 * 4);
+    let mut total = 0.0;
+    for top_down_row in row - half..=row + half {
+        let bottom_up_row = height - 1 - top_down_row;
+        for sample_column in column - half..=column + half {
+            let offset = (bottom_up_row * width + sample_column) * 3 * 4;
+            let red = f32::from_le_bytes([
+                capture[offset],
+                capture[offset + 1],
+                capture[offset + 2],
+                capture[offset + 3],
+            ]);
+            total += f64::from(red);
+        }
+    }
+    total / ((2 * half + 1) * (2 * half + 1)) as f64
+}
+
+/// Imports `blend` into `root/name`, renders it in the realtime engine with `samples` samples, and loads the frame as
+/// the image `id`. Returns the project's directory.
+fn render_realtime(
+    blender: &Path,
+    root: &Path,
+    name: &str,
+    blend: &Path,
+    id: &str,
+    volumetric_tile_size: u32,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    render_realtime_at(
+        blender,
+        root,
+        name,
+        blend,
+        id,
+        RESOLUTION,
+        RESOLUTION,
+        volumetric_tile_size,
+    )
+}
+
+fn render_realtime_at(
+    blender: &Path,
+    root: &Path,
+    name: &str,
+    blend: &Path,
+    id: &str,
+    width: u32,
+    height: u32,
+    volumetric_tile_size: u32,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let (project, _) = import_blend(blender, root, name, blend)?;
+    let scene = read_scene(&project)?;
+    let active = scene["active_scene"]
+        .as_str()
+        .ok_or("active scene is missing")?
+        .to_owned();
+    let applied = apply_operations(
+        &project,
+        root,
+        json!([
+            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": width, "resolution_y": height, "samples": 64, "seed": 0, "eevee_volumetric_tile_size": volumetric_tile_size}}
+        ]),
+    )?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let frames = root.join(format!("frames_{name}"));
+    let rendered = pot()
+        .arg("render")
+        .arg(&project)
+        .args(["--engine", "realtime", "--format", "exr", "--out"])
+        .arg(&frames)
+        .arg("--json")
+        .output()?;
+    assert!(
+        rendered.status.success(),
+        "realtime render failed: {}",
+        String::from_utf8_lossy(&rendered.stdout)
+    );
+    let loaded = apply_operations(
+        &project,
+        root,
+        json!([{"op": "image.load", "id": id, "path": frames.join("frame_0001.exr").to_string_lossy()}]),
+    )?;
+    assert_eq!(loaded["ok"], true, "{loaded}");
+    Ok(project)
+}
 
 /// Render settings shared with `eevee_light_shapes_extra.py`.
 const RESOLUTION: u32 = 64;
@@ -81,97 +246,6 @@ const EMITTER_TOLERANCE: f64 = 0.01;
 
 /// The existing 0.03 linear window-mean tolerance for absorber and heterogeneous mesh-volume EEVEE comparisons.
 const ABSORBER_TOLERANCE: f64 = 0.03;
-
-/// The mean red value of the `(2 * half + 1)` square window centred on `(column, row)` (top-down) in the image `id`.
-fn window_mean(
-    project: &Path,
-    id: &str,
-    column: usize,
-    row: usize,
-    half: usize,
-) -> Result<f64, Box<dyn Error>> {
-    let scene = read_scene(project)?;
-    let image: Image = serde_json::from_value(scene["images"][id].clone())?;
-    let data = load_image_data(&image, project, ImageInterpolation::Closest)?;
-    let texels = f64::from(RESOLUTION);
-    let mut total = 0.0;
-    let mut count = 0.0;
-    for r in row - half..=row + half {
-        for c in column - half..=column + half {
-            let uv = [(c as f64 + 0.5) / texels, (r as f64 + 0.5) / texels];
-            total += sample(&data, uv, false)[0];
-            count += 1.0;
-        }
-    }
-    Ok(total / count)
-}
-
-/// The mean red value of an RGB f32le capture window; fixture rows are bottom-up, unlike Potter's top-down rows.
-fn oracle_window_mean(capture: &[u8], column: usize, row: usize, half: usize) -> f64 {
-    let resolution = RESOLUTION as usize;
-    assert_eq!(capture.len(), resolution * resolution * 3 * 4);
-    let mut total = 0.0;
-    for top_down_row in row - half..=row + half {
-        let bottom_up_row = resolution - 1 - top_down_row;
-        for sample_column in column - half..=column + half {
-            let offset = (bottom_up_row * resolution + sample_column) * 3 * 4;
-            let red = f32::from_le_bytes([
-                capture[offset],
-                capture[offset + 1],
-                capture[offset + 2],
-                capture[offset + 3],
-            ]);
-            total += f64::from(red);
-        }
-    }
-    total / ((2 * half + 1) * (2 * half + 1)) as f64
-}
-
-/// Imports `blend` into `root/name`, renders it in the realtime engine with `samples` samples, and loads the frame as
-/// the image `id`. Returns the project's directory.
-fn render_realtime(
-    blender: &Path,
-    root: &Path,
-    name: &str,
-    blend: &Path,
-    id: &str,
-    volumetric_tile_size: u32,
-) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let (project, _) = import_blend(blender, root, name, blend)?;
-    let scene = read_scene(&project)?;
-    let active = scene["active_scene"]
-        .as_str()
-        .ok_or("active scene is missing")?
-        .to_owned();
-    let applied = apply_operations(
-        &project,
-        root,
-        json!([
-            {"op": "render.update", "target": {"id": active}, "set": {"resolution_x": RESOLUTION, "resolution_y": RESOLUTION, "samples": 64, "seed": 0, "eevee_volumetric_tile_size": volumetric_tile_size}}
-        ]),
-    )?;
-    assert_eq!(applied["ok"], true, "{applied}");
-    let frames = root.join(format!("frames_{name}"));
-    let rendered = pot()
-        .arg("render")
-        .arg(&project)
-        .args(["--engine", "realtime", "--format", "exr", "--out"])
-        .arg(&frames)
-        .arg("--json")
-        .output()?;
-    assert!(
-        rendered.status.success(),
-        "realtime render failed: {}",
-        String::from_utf8_lossy(&rendered.stdout)
-    );
-    let loaded = apply_operations(
-        &project,
-        root,
-        json!([{"op": "image.load", "id": id, "path": frames.join("frame_0001.exr").to_string_lossy()}]),
-    )?;
-    assert_eq!(loaded["ok"], true, "{loaded}");
-    Ok(project)
-}
 
 #[test]
 fn realtime_sun_spot_and_absorber_match_eevee() -> TestResult {
@@ -462,6 +536,110 @@ fn realtime_perspective_mesh_volume_uses_the_sample_jittered_column_ray() -> Tes
     assert!(
         (actual_edge - expected_edge).abs() <= ABSORBER_TOLERANCE,
         "wide-FOV AA edge through coarse perspective froxels: Potter {actual_edge} differs from EEVEE {expected_edge}"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_light_shape_boundaries_match_eevee() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let script = write_script(
+        root.path(),
+        "eevee_light_shape_boundaries.py",
+        BOUNDARY_SCRIPT,
+    )?;
+    let odd_blend = root.path().join("odd_viewport.blend");
+    let spot_blend = root.path().join("scaled_spot.blend");
+    let area_blend = root.path().join("small_area.blend");
+    run_blender_arguments(
+        &blender,
+        &script,
+        None,
+        &[
+            odd_blend.as_path(),
+            spot_blend.as_path(),
+            area_blend.as_path(),
+            Path::new("-"),
+            Path::new("-"),
+            Path::new("-"),
+        ],
+    )?;
+
+    let project = render_realtime_at(
+        &blender,
+        root.path(),
+        "odd_viewport",
+        &odd_blend,
+        "odd_viewport",
+        ODD_VIEWPORT_WIDTH as u32,
+        ODD_VIEWPORT_HEIGHT as u32,
+        16,
+    )?;
+    let odd_edge = window_mean_at(
+        &project,
+        "odd_viewport",
+        ODD_VIEWPORT_EDGE_COLUMN,
+        ODD_VIEWPORT_EDGE_ROW,
+        0,
+        ODD_VIEWPORT_WIDTH,
+        ODD_VIEWPORT_HEIGHT,
+    )?;
+    let expected_odd_edge = oracle_window_mean_at(
+        EEVEE_MESH_VOLUME_ODD_PERSPECTIVE,
+        ODD_VIEWPORT_EDGE_COLUMN,
+        ODD_VIEWPORT_EDGE_ROW,
+        0,
+        ODD_VIEWPORT_WIDTH,
+        ODD_VIEWPORT_HEIGHT,
+    );
+    assert!(
+        expected_odd_edge > 0.0,
+        "the native odd-viewport volume edge must retain the visible point shape"
+    );
+    assert!(
+        (odd_edge - expected_odd_edge).abs() <= ABSORBER_TOLERANCE,
+        "odd-extent perspective AA edge through heterogeneous volume: Potter {odd_edge} differs from EEVEE {expected_odd_edge}"
+    );
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "scaled_spot",
+        &spot_blend,
+        "scaled_spot",
+        8,
+    )?;
+    let spot_center = window_mean(&project, "scaled_spot", 32, 32, 0)?;
+    let expected_spot_center = oracle_window_mean(EEVEE_SPOT_SCALED_OFFAXIS, 32, 32, 0);
+    assert_eq!(
+        expected_spot_center, 0.0,
+        "the native scaled spot is outside its cone at the selected camera"
+    );
+    assert!(
+        (spot_center - expected_spot_center).abs() <= EMITTER_TOLERANCE,
+        "scaled off-axis spot: Potter {spot_center} differs from EEVEE {expected_spot_center}"
+    );
+
+    let project = render_realtime(
+        &blender,
+        root.path(),
+        "small_area",
+        &area_blend,
+        "small_area",
+        8,
+    )?;
+    let area_center = window_mean(&project, "small_area", 32, 32, 0)?;
+    let expected_area_center = oracle_window_mean(EEVEE_AREA_SMALL_CUTOFF, 32, 32, 0);
+    assert_eq!(
+        expected_area_center, 0.0,
+        "the native area light is culled below EEVEE's half-extent product cutoff"
+    );
+    assert!(
+        (area_center - expected_area_center).abs() <= EMITTER_TOLERANCE,
+        "small square area-light cutoff: Potter {area_center} differs from EEVEE {expected_area_center}"
     );
     Ok(())
 }

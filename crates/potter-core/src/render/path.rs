@@ -47,7 +47,7 @@ use super::{
     light_model::{
         AreaShape, Spread, area_radiance, area_shape, emitter_radiance, influence_fade,
         inside_emitter, local_light_influence_radius_squared, point_intensity, spot_attenuation,
-        spread_attenuation, spread_region,
+        spot_cone, spread_attenuation, spread_region,
     },
     pixel_filter::PixelFilter,
     raster::{
@@ -70,6 +70,8 @@ const VOLUME_BOUNDS_MAX: u32 = 1024;
 struct PointLight {
     position: DVec3,
     direction: DVec3,
+    /// The evaluated object transform, including scale used by EEVEE's camera-visible spot cone.
+    world_transform: DMat4,
     kind: LightType,
     color: DVec3,
     energy: f64,
@@ -1688,7 +1690,16 @@ fn camera_light_shape_hit(
     if (point - light.position).length_squared() > display_radius * display_radius {
         return None;
     }
-    let spot = light_attenuation(light, -direction);
+    let spot = if light.kind == LightType::Spot {
+        spot_cone(
+            &light.world_transform,
+            (light.position - camera.position).normalize_or_zero(),
+            light.spot_size,
+            light.spot_blend,
+        )
+    } else {
+        1.0
+    };
     Some(CameraLightEvent {
         distance,
         radiance: light.color * (emitter_radiance(light.energy, emitter_radius) * spot),
@@ -1705,7 +1716,7 @@ fn light_sphere_disk_radius(radius: f64, distance: f64) -> f64 {
 mod camera_light_shape_tests {
     use std::error::Error;
 
-    use glam::DVec3;
+    use glam::{DMat4, DQuat, DVec3};
 
     use super::{PointLight, camera_light_shape_hit, light_hit};
     use crate::{
@@ -1735,6 +1746,10 @@ mod camera_light_shape_tests {
         PointLight {
             position,
             direction,
+            world_transform: DMat4::from_rotation_translation(
+                DQuat::from_rotation_arc(-DVec3::Z, direction.normalize_or_zero()),
+                position,
+            ),
             kind,
             color: DVec3::ONE,
             energy: 1.0,
@@ -1797,12 +1812,34 @@ mod camera_light_shape_tests {
     }
 
     #[test]
+    fn camera_spot_shape_uses_the_light_object_scale() -> Result<(), Box<dyn Error>> {
+        let angle: f64 = 0.4;
+        let position = DVec3::new(10.0 * angle.sin(), 0.0, 10.0 * angle.cos());
+        let camera = make_camera(position, DVec3::ZERO);
+        let origin = position;
+        let direction = -position.normalize();
+        let spot = local_light(LightType::Spot, DVec3::ZERO, DVec3::Z, 1.0);
+        let unscaled = camera_light_shape_hit(&spot, &camera, origin, direction, camera.far)
+            .ok_or("unscaled spot camera disk was not hit")?;
+        let scaled = PointLight {
+            world_transform: spot.world_transform * DMat4::from_scale(DVec3::new(1.0, 1.0, 2.0)),
+            ..spot
+        };
+        let scaled_event = camera_light_shape_hit(&scaled, &camera, origin, direction, camera.far)
+            .ok_or("scaled spot camera disk was not hit")?;
+        assert!(unscaled.radiance.x > 0.0);
+        assert_eq!(scaled_event.radiance, DVec3::ZERO);
+        Ok(())
+    }
+
+    #[test]
     fn area_camera_shape_is_invariant_to_physical_spread() -> Result<(), Box<dyn Error>> {
         let shape = AreaShape::new(DVec3::X, DVec3::Y, 1.0, 1.0, false);
         let spread = Spread::new(0.0).ok_or("zero spread should be representable")?;
         let area = PointLight {
             position: DVec3::ZERO,
             direction: DVec3::Z,
+            world_transform: DMat4::IDENTITY,
             kind: LightType::Area,
             color: DVec3::ONE,
             energy: 4.0,
@@ -2080,6 +2117,12 @@ impl RealtimeVolumeResolveCache {
         let end = start.checked_add(self.slice_count)?;
         self.column_prefix.get(start..end)
     }
+
+    // Preserve the allocated prefix buffers while invalidating eye-specific column keys.
+    fn clear_columns(&mut self) {
+        self.column_slots.fill(FroxelColumnCacheSlot::default());
+        self.column_clock = 0;
+    }
 }
 
 pub(super) struct RealtimeVolumePass<'pass, 'scene> {
@@ -2101,6 +2144,7 @@ pub(super) struct RealtimeVolumeSampleInfo<'a> {
     pub(super) sample_y: f64,
     pub(super) ray: (DVec3, DVec3),
     pub(super) sample_index: u32,
+    pub(super) sample_count: u32,
 }
 
 pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
@@ -2115,6 +2159,7 @@ pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
     y: u32,
     /// Blender's image-render AA sample index, also the per-sample volume projection jitter.
     sample_index: u32,
+    sample_count: u32,
     sample_x: f64,
     sample_y: f64,
     origin: DVec3,
@@ -2140,6 +2185,12 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
             geometry,
             scratch,
             seed,
+        }
+    }
+
+    pub(super) fn reset_column_cache(&mut self) {
+        if let Some(cache) = self.scratch.froxel_resolve.as_mut() {
+            cache.clear_columns();
         }
     }
 
@@ -2172,6 +2223,7 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
             x: sample.x,
             y: sample.y,
             sample_index: sample.sample_index,
+            sample_count: sample.sample_count,
             sample_x: sample.sample_x,
             sample_y: sample.sample_y,
             origin: sample.ray.0,
@@ -2243,8 +2295,8 @@ impl RealtimeVolumeSample<'_, '_> {
                 cache.slice_count,
             );
             let screen_uv = [
-                (f64::from(self.x) + self.sample_x) / f64::from(cache.width),
-                1.0 - (f64::from(self.y) + self.sample_y) / f64::from(cache.height),
+                (f64::from(self.x) + 0.5) / f64::from(cache.width),
+                1.0 - (f64::from(self.y) + 0.5) / f64::from(cache.height),
             ];
             let resolve_uv = screen_uv_to_resolve_uv(
                 [screen_uv[0] as f32, screen_uv[1] as f32],
@@ -2370,7 +2422,7 @@ impl RealtimeVolumeSample<'_, '_> {
             -depth_end as f32,
             settings.eevee_volumetric_sample_distribution as f32,
         );
-        let sample_count = usize::try_from(settings.samples.max(1)).map_err(|_| {
+        let sample_count = usize::try_from(self.sample_count).map_err(|_| {
             PotError::new(
                 ErrorCode::LimitExceeded,
                 "realtime volume sample count exceeds platform limits",
@@ -2926,6 +2978,14 @@ mod volume_jitter_tests {
             cache.column_prefix(second_slot, 3),
             Some(&[super::DVec3::splat(0.25), super::DVec3::splat(0.125)][..])
         );
+        let slots_ptr = cache.column_slots.as_ptr();
+        let prefixes_ptr = cache.column_prefix.as_ptr();
+        cache.clear_columns();
+        assert_eq!(cache.column_slots.as_ptr(), slots_ptr);
+        assert_eq!(cache.column_prefix.as_ptr(), prefixes_ptr);
+        assert!(cache.cached_column_slot(0, 3).is_none());
+        assert!(cache.cached_column_slot(1, 3).is_none());
+        assert_eq!(cache.sample_count, 2);
     }
 }
 
@@ -6633,8 +6693,9 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
             let camera_shape_eligible = if data.light_type == LightType::Sun {
                 true
             } else {
+                // EEVEE's culler compares the product of half-extents (`eevee_light.cc:219-235`).
                 let area_shape_has_power_area =
-                    area.is_none_or(|shape| 4.0 * shape.half_u * shape.half_v >= 1.0e-5);
+                    area.is_none_or(|shape| shape.half_u * shape.half_v >= 1.0e-5);
                 let local_influence_radius_squared = local_light_influence_radius_squared(
                     data,
                     data.diffuse_factor.max(data.specular_factor),
@@ -6650,6 +6711,7 @@ fn collect_lights(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<PointLight> {
             Some(PointLight {
                 position: matrix.transform_point3(DVec3::ZERO),
                 direction: matrix.transform_vector3(-DVec3::Z).normalize_or_zero(),
+                world_transform: matrix,
                 kind: data.light_type,
                 color,
                 energy,
@@ -8215,6 +8277,7 @@ mod volume_extinction_tests {
         let light = PointLight {
             position: DVec3::ZERO,
             direction: DVec3::Z,
+            world_transform: DMat4::IDENTITY,
             kind: LightType::Area,
             color: DVec3::ONE,
             energy: power,
@@ -8261,6 +8324,7 @@ mod volume_extinction_tests {
         let light = PointLight {
             position: DVec3::ZERO,
             direction: DVec3::Z,
+            world_transform: DMat4::IDENTITY,
             kind: LightType::Point,
             color: DVec3::ONE,
             energy: 4.0 * std::f64::consts::PI,
@@ -8294,6 +8358,7 @@ mod volume_extinction_tests {
         let light = PointLight {
             position: DVec3::ZERO,
             direction: DVec3::Z,
+            world_transform: DMat4::IDENTITY,
             kind: LightType::Point,
             color: DVec3::ONE,
             energy: 100.0,
@@ -8463,6 +8528,7 @@ mod sampling_tests {
             |kind: LightType, position: DVec3, radius: f64, soft_falloff: bool| PointLight {
                 position,
                 direction: -DVec3::Z,
+                world_transform: DMat4::IDENTITY,
                 kind,
                 color: DVec3::new(1.0, 0.5, 0.25),
                 energy: 50.0,
@@ -8572,6 +8638,7 @@ mod sampling_tests {
                 let light = PointLight {
                     position: centre,
                     direction: normal,
+                    world_transform: DMat4::IDENTITY,
                     kind: LightType::Area,
                     color: DVec3::ONE,
                     energy: std::f64::consts::PI * shape.area,
@@ -8654,6 +8721,7 @@ mod sampling_tests {
         let light = PointLight {
             position: DVec3::new(0.0, 0.0, 2.0),
             direction: -DVec3::Z,
+            world_transform: DMat4::IDENTITY,
             kind: LightType::Area,
             color: DVec3::ONE,
             energy: std::f64::consts::PI * shape.area,
@@ -8695,6 +8763,7 @@ mod sampling_tests {
                 position: DVec3::new(0.0, 0.0, 2.0),
                 direction: -DVec3::Z,
                 kind,
+                world_transform: DMat4::IDENTITY,
                 color: DVec3::ONE,
                 energy: 10.0,
                 radius,
@@ -8762,6 +8831,7 @@ mod sampling_tests {
             position: DVec3::new(0.0, 0.0, 2.0),
             direction: -DVec3::Z,
             kind: LightType::Area,
+            world_transform: DMat4::IDENTITY,
             color: DVec3::ONE,
             energy: 10.0,
             radius: 0.0,

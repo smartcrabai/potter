@@ -2,7 +2,7 @@
 
 use std::{error::Error, fs, path::Path};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use super::{frame_output_names, render_camera_frame, render_vse_frame};
@@ -12,6 +12,63 @@ use crate::{
     ops::apply_batch,
     sequencer::{EffectType, Strip, StripType, TransitionType},
 };
+
+fn camera_volume_doc(grid: Value, render_samples: u32) -> Result<SceneDoc, Box<dyn Error>> {
+    const EYE_OFFSET: f64 = 0.2;
+    let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+    let outcome = apply_batch(
+        &base,
+        &json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op":"camera.create","id":"camera_main","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2},
+                {"op":"camera.create","id":"camera_stereo","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2,"stereo_mode":"anaglyph","interocular_distance":EYE_OFFSET * 2.0},
+                {"op":"camera.create","id":"camera_left","transform":{"translation":[-EYE_OFFSET,0,4]},"projection":"orthographic","ortho_scale":2},
+                {"op":"camera.create","id":"camera_right","transform":{"translation":[EYE_OFFSET,0,4]},"projection":"orthographic","ortho_scale":2},
+                {"op":"light.create","id":"emitter","light_type":"point","energy":100,"radius":2,"transform":{"translation":[0,0,0]}},
+                {"op":"node.update","target":{"id":"emitter"},"set":{"ray_visibility":{"camera":true}}},
+                {"op":"light.update","target":{"id":"emitter"},"set":{"volume_factor":0}},
+                {"op":"volume.create","id":"fog","grids":[grid]},
+                {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
+                {"op":"render.update","target":{"id":"scene_main"},"set":{"samples":render_samples,"engine":"realtime"}}
+            ]
+        }),
+    )?;
+    Ok(outcome.doc)
+}
+
+fn render_realtime_pixel(
+    doc: &SceneDoc,
+    root: &Path,
+    camera_id: &str,
+    samples: u32,
+) -> Result<[f32; 4], Box<dyn Error>> {
+    let context = EvaluationContext {
+        scene_id: Some(doc.active_scene.clone()),
+        frame: Some(1.0),
+        purpose: EvaluationPurpose::Render,
+        ..EvaluationContext::default()
+    };
+    let cache_directory = root.join(".potter/cache");
+    let mut session = EvaluationSession::default();
+    let (_, raster, _) = render_camera_frame(
+        doc,
+        &context,
+        &mut session,
+        root,
+        &cache_directory,
+        camera_id,
+        1,
+        1,
+        "beauty",
+        "realtime",
+        false,
+        samples,
+        0,
+    )?;
+    Ok(raster.linear_rgba[0])
+}
 
 fn strip(id: &str, kind: StripType, channel: u32) -> Strip {
     Strip {
@@ -196,6 +253,96 @@ fn scene_strips_match_their_source_camera_render() -> Result<(), Box<dyn Error>>
     )?;
     let nested = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
     assert_eq!(nested.pixels, raster.linear_rgba);
+    Ok(())
+}
+
+#[test]
+fn nested_realtime_volume_uses_outer_sequence_sample_count() -> Result<(), Box<dyn Error>> {
+    let grid = json!({
+        "dims": [5, 5, 3],
+        "voxel_size": 1.0,
+        "origin": [-2.0, -2.0, 1.0],
+        "values": vec![1.0; 75]
+    });
+    let mut doc = camera_volume_doc(grid, 1)?;
+    let scene_id = doc.active_scene.clone();
+    let mut scene = doc.scenes.get(&scene_id).unwrap().clone();
+    scene.sequencer.strips = vec![Strip {
+        source: Some(scene_id.as_str().to_owned()),
+        ..strip("nested_volume", StripType::Scene, 1)
+    }];
+    doc.scenes.insert(scene_id.clone(), scene.clone());
+
+    const OUTER_SEQUENCE_SAMPLES: u32 = 4;
+    assert_eq!(doc.scenes.get(&scene_id).unwrap().render.samples, 1);
+    let directory = tempdir()?;
+    let cache_directory = directory.path().join(".potter/cache");
+    let mut session = EvaluationSession::default();
+    let mut warnings = Vec::new();
+    let output = render_vse_frame(
+        &doc,
+        &scene,
+        1.0,
+        1,
+        1,
+        directory.path(),
+        &cache_directory,
+        &mut session,
+        "realtime",
+        OUTER_SEQUENCE_SAMPLES,
+        0,
+        false,
+        &mut warnings,
+    )?;
+    let pixel = output.pixels[0];
+    assert!(pixel.into_iter().all(f32::is_finite), "{pixel:?}");
+    assert!(
+        pixel[..3].iter().any(|channel| *channel > 0.0),
+        "camera-visible emitter through the nested volume rendered black: {pixel:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn anaglyph_realtime_volume_resolves_each_eye_column_independently() -> Result<(), Box<dyn Error>> {
+    const SAMPLES: u32 = 4;
+    let values = (0..3)
+        .flat_map(|_| (0..7).flat_map(|_| (0..7).map(|x| x as f32 * 0.8)))
+        .collect::<Vec<_>>();
+    let grid = json!({
+        "dims": [7, 7, 3],
+        "voxel_size": 0.5,
+        "origin": [-1.5, -1.5, 1.0],
+        "values": values
+    });
+    let doc = camera_volume_doc(grid, SAMPLES)?;
+    let directory = tempdir()?;
+    let anaglyph = render_realtime_pixel(&doc, directory.path(), "camera_stereo", SAMPLES)?;
+    let left = render_realtime_pixel(&doc, directory.path(), "camera_left", SAMPLES)?;
+    let right = render_realtime_pixel(&doc, directory.path(), "camera_right", SAMPLES)?;
+
+    assert!(anaglyph.into_iter().all(f32::is_finite), "{anaglyph:?}");
+    assert!(left.into_iter().all(f32::is_finite), "{left:?}");
+    assert!(right.into_iter().all(f32::is_finite), "{right:?}");
+    assert!(
+        left[0] > right[0],
+        "density increases toward the right eye: {left:?} vs {right:?}"
+    );
+    assert!(
+        right[0] > 0.0,
+        "the right eye must still see the emitter: {right:?}"
+    );
+    for (channel, expected) in [(0, left[0]), (1, right[1]), (2, right[2])] {
+        assert!(
+            (anaglyph[channel] - expected).abs() < 1.0e-5,
+            "anaglyph channel {channel} is {}, expected independent-eye value {expected}; left={left:?}, right={right:?}",
+            anaglyph[channel]
+        );
+    }
+    assert!(
+        anaglyph[0] > anaglyph[1],
+        "the right-eye column was reused from the left eye: {anaglyph:?}"
+    );
     Ok(())
 }
 
