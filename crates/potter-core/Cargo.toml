@@ -17,6 +17,7 @@ glam.workspace = true
 hex.workspace = true
 image.workspace = true
 lz4_flex.workspace = true
+mikktspace.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true
 png.workspace = true

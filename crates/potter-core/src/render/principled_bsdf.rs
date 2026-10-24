@@ -39,7 +39,7 @@ use super::principled_thin_film::{
 };
 use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
 use crate::model::RayKind;
-use crate::shader::{BsdfParams, dielectric_f0, make_orthonormals};
+use crate::shader::{AnisotropyModel, BsdfParams, dielectric_f0, make_orthonormals};
 
 /// Roughness floor shared with the sampler; Cycles treats roughness below ~1e-5 as delta.
 const MIN_ROUGHNESS: f64 = 0.02;
@@ -158,13 +158,19 @@ pub(crate) fn continuous_lobes(
         roughness_squared: 1.0,
     };
     let coat = layers.coat.map_or(absent, |coat| LobeDensity {
-        weight: probabilities.coat * half_vector_pdf(coat.normal, coat.roughness, view, light),
+        weight: probabilities.coat
+            * ndf_half_vector_pdf(
+                coat.normal,
+                isotropic_microfacet(coat.roughness),
+                view,
+                light,
+            ),
         roughness_squared: microfacet_roughness_squared(coat.roughness),
     });
     let specular = LobeDensity {
         weight: probabilities.specular
-            * half_vector_pdf(layers.specular, params.roughness, view, light),
-        roughness_squared: microfacet_roughness_squared(params.roughness),
+            * visible_half_vector_pdf(layers.specular, layers.specular_microfacet, view, light),
+        roughness_squared: layers.specular_microfacet.roughness_squared(),
     };
     let glass = layers.glass.as_ref().map_or(absent, |glass| LobeDensity {
         weight: probabilities.transmission * glass_eval(glass, layers.specular, view, light).1,
@@ -172,7 +178,7 @@ pub(crate) fn continuous_lobes(
         roughness_squared: if glass.singular {
             0.0
         } else {
-            microfacet_roughness_squared(params.roughness)
+            glass.alpha * glass.alpha
         },
     });
     [diffuse, sheen, coat, specular, glass]
@@ -188,17 +194,32 @@ pub(crate) fn continuous_density(params: &BsdfParams, layers: &Layers, light: DV
         .sum()
 }
 
-/// Density in solid angle of the reflection of `view` about the half vector drawn with
-/// `sample_ggx_half`: `D(h)·(n·h) / (4 v·h)` for the half vector of `view` and `light`.
-fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> f64 {
+/// Density of a normal drawn from the isotropic GGX NDF and reflected around the half vector.
+fn ndf_half_vector_pdf(normal: DVec3, microfacet: GgxMicrofacet, view: DVec3, light: DVec3) -> f64 {
     let half = (view + light).normalize_or_zero();
     let n_dot_h = normal.dot(half).max(0.0);
     let v_dot_h = view.dot(half).max(0.0);
     if v_dot_h <= 0.0 {
         return 0.0;
     }
-    let pdf_half = ggx_distribution(ggx_alpha_squared(roughness), n_dot_h) * n_dot_h;
-    pdf_half / (4.0 * v_dot_h).max(1.0e-8)
+    microfacet.distribution(half, normal) * n_dot_h / (4.0 * v_dot_h).max(1.0e-8)
+}
+
+/// Density of a visible-normal GGX sample in solid angle, as Cycles' `bsdf_microfacet_eval` returns it.
+fn visible_half_vector_pdf(
+    normal: DVec3,
+    microfacet: GgxMicrofacet,
+    view: DVec3,
+    light: DVec3,
+) -> f64 {
+    let half = (view + light).normalize_or_zero();
+    let n_dot_v = normal.dot(view).max(0.0);
+    let v_dot_h = view.dot(half);
+    if n_dot_v <= 0.0 || v_dot_h <= 0.0 {
+        return 0.0;
+    }
+    let pdf_half = microfacet.distribution(half, normal) / (1.0 + microfacet.lambda(view, normal));
+    pdf_half / (4.0 * n_dot_v).max(1.0e-8)
 }
 
 /// Diffuse lobe of the Principled BSDF: Cycles' improved energy-preserving Oren-Nayar closure
@@ -391,6 +412,7 @@ pub(crate) fn specular_coefficient(params: &BsdfParams, layers: &Layers, light: 
     specular_lobe(
         params,
         layers.energy_roughness,
+        layers.specular_microfacet,
         layers.specular,
         layers.view,
         light,
@@ -404,6 +426,7 @@ pub(crate) fn specular_coefficient(params: &BsdfParams, layers: &Layers, light: 
 fn specular_lobe(
     params: &BsdfParams,
     energy_roughness: f64,
+    microfacet: GgxMicrofacet,
     normal: DVec3,
     view: DVec3,
     light: DVec3,
@@ -416,10 +439,7 @@ fn specular_lobe(
         return DVec3::ZERO;
     }
     let half = (view + light).normalize_or_zero();
-    let n_dot_h = normal.dot(half).max(0.0);
     let v_dot_h = view.dot(half).max(0.0);
-    let roughness = params.roughness.clamp(MIN_ROUGHNESS, 1.0);
-    let alpha_squared = ggx_alpha_squared(roughness);
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
     let base = base_color(params);
@@ -432,8 +452,8 @@ fn specular_lobe(
     let energy_average = ggx_energy_average(energy_roughness);
     let missing = (1.0 - energy) / energy;
 
-    let common = ggx_distribution(alpha_squared, n_dot_h)
-        * ggx_height_correlated_g2(alpha_squared, n_dot_v, n_dot_l)
+    let common = microfacet.distribution(half, normal)
+        / (1.0 + microfacet.lambda(view, normal) + microfacet.lambda(light, normal))
         / (4.0 * n_dot_v * n_dot_l).max(1.0e-8);
 
     let dielectric_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
@@ -577,6 +597,56 @@ fn coat_layer(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<CoatLay
     })
 }
 
+/// The anisotropic GGX axes and local frame shared by a closure's evaluation, pdf and sampler.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GgxMicrofacet {
+    alpha_x: f64,
+    alpha_y: f64,
+    tangent: DVec3,
+    bitangent: DVec3,
+    anisotropic: bool,
+}
+
+impl GgxMicrofacet {
+    fn local(self, vector: DVec3, normal: DVec3) -> DVec3 {
+        DVec3::new(
+            self.tangent.dot(vector),
+            self.bitangent.dot(vector),
+            normal.dot(vector),
+        )
+    }
+
+    fn distribution(self, half: DVec3, normal: DVec3) -> f64 {
+        if self.anisotropic {
+            ggx_anisotropic_distribution(self.alpha_x, self.alpha_y, self.local(half, normal))
+        } else {
+            ggx_distribution(self.alpha_x * self.alpha_x, normal.dot(half))
+        }
+    }
+
+    fn lambda(self, direction: DVec3, normal: DVec3) -> f64 {
+        if self.anisotropic {
+            ggx_anisotropic_lambda(self.alpha_x, self.alpha_y, self.local(direction, normal))
+        } else {
+            ggx_lambda(self.alpha_x * self.alpha_x, normal.dot(direction))
+        }
+    }
+
+    fn energy_roughness(self) -> f64 {
+        (self.alpha_x * self.alpha_y).sqrt().sqrt()
+    }
+
+    fn blurred(mut self, blur_alpha: f64) -> Self {
+        self.alpha_x = self.alpha_x.max(blur_alpha);
+        self.alpha_y = self.alpha_y.max(blur_alpha);
+        self
+    }
+
+    fn roughness_squared(self) -> f64 {
+        self.alpha_x * self.alpha_y
+    }
+}
+
 /// The layers above the base lobes at one shading point, set up once and shared by every lobe they
 /// attenuate. `lower` is the factor they leave to the diffuse, specular and metallic lobes, the
 /// transmission delta and the emission: the coat's layering and tint, times the sheen's layering,
@@ -593,6 +663,8 @@ pub(crate) struct Layers {
     pub(crate) sheen_normal: DVec3,
     /// The normal of the specular and glass microfacets: the shading normal bent by [`valid_specular_normal`].
     pub(crate) specular: DVec3,
+    /// Principled reflection/metal axes. Cycles 5.2.2 keeps transmission isotropic.
+    pub(crate) specular_microfacet: GgxMicrofacet,
     /// The coat's normal, bent the same way as Cycles' `valid_coat_normal`.
     pub(crate) coat_normal: DVec3,
     pub(crate) view: DVec3,
@@ -619,6 +691,12 @@ pub(crate) fn layers_at(
     bump_correction: bool,
 ) -> Layers {
     let specular = valid_specular_normal(geometric, normal, view, bump_correction);
+    let rotation_normal = match params.anisotropy_model {
+        AnisotropyModel::Principled => normal,
+        AnisotropyModel::Glossy => specular,
+    };
+    let specular_microfacet = ggx_microfacet(params, params.roughness, rotation_normal, specular);
+    let energy_roughness = specular_microfacet.energy_roughness();
     let coat_normal = valid_specular_normal(
         geometric,
         params.coat_normal_or_shading(),
@@ -639,10 +717,11 @@ pub(crate) fn layers_at(
     let lower = coat_lower_factor_of(params, coat.as_ref()) * sheen.layer_weight();
     let glass = glass_lobe(params, specular, view);
     Layers {
-        energy_roughness: params.roughness,
+        energy_roughness,
         normal,
         sheen_normal,
         specular,
+        specular_microfacet,
         coat_normal,
         view,
         coat,
@@ -702,6 +781,20 @@ fn ensure_valid_specular_reflection(geometric: DVec3, incoming: DVec3, normal: D
 }
 
 impl Layers {
+    /// The closure after Cycles' glossy blur: widen cached microfacets and refresh glass singularity, retaining setup energy.
+    pub(crate) fn blurred(&self, blur_alpha: f64) -> Self {
+        let mut layers = *self;
+        layers.specular_microfacet = layers.specular_microfacet.blurred(blur_alpha);
+        if let Some(coat) = &mut layers.coat {
+            coat.roughness = coat.roughness.powi(2).max(blur_alpha).sqrt();
+        }
+        if let Some(glass) = &mut layers.glass {
+            glass.alpha = glass.alpha.max(blur_alpha);
+            glass.singular = glass.alpha * glass.alpha <= GLASS_SINGULAR_ALPHA_SQUARED;
+        }
+        layers
+    }
+
     /// The factor the layers leave to the lobes below them and to the emission.
     pub(crate) fn lower(&self) -> DVec3 {
         self.lower
@@ -925,21 +1018,26 @@ pub(crate) fn reflected_lobes_coefficient(
     light: DVec3,
     ray_mask: u8,
 ) -> DVec3 {
+    let layers = Layers {
+        energy_roughness: params.roughness,
+        ..*layers
+    };
     let diffuse = if ray_mask & RayKind::Diffuse.bit() != 0 {
-        diffuse_coefficient_with_roughness(params, layers, light, 0.0, false)
-            + sheen_coefficient(params, layers, light)
+        diffuse_coefficient_with_roughness(params, &layers, light, 0.0, false)
+            + sheen_coefficient(params, &layers, light)
     } else {
         DVec3::ZERO
     };
     let coat = if ray_mask & RayKind::Glossy.bit() != 0 {
-        coat_coefficient(params, layers, light)
+        coat_coefficient(params, &layers, light)
     } else {
         DVec3::ZERO
     };
     let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
         specular_lobe(
             params,
-            layers.energy_roughness,
+            params.roughness,
+            isotropic_microfacet(params.roughness),
             layers.specular,
             layers.view,
             light,
@@ -1068,6 +1166,82 @@ fn multiscatter_gain(fss: DVec3, energy_average: f64, missing: f64) -> DVec3 {
 fn ggx_alpha_squared(roughness: f64) -> f64 {
     let alpha = roughness.clamp(MIN_ROUGHNESS, 1.0).powi(2);
     alpha * alpha
+}
+
+fn isotropic_microfacet(roughness: f64) -> GgxMicrofacet {
+    let alpha = roughness.clamp(MIN_ROUGHNESS, 1.0).powi(2);
+    GgxMicrofacet {
+        alpha_x: alpha,
+        alpha_y: alpha,
+        tangent: DVec3::ZERO,
+        bitangent: DVec3::ZERO,
+        anisotropic: false,
+    }
+}
+
+fn ggx_microfacet(
+    params: &BsdfParams,
+    roughness: f64,
+    rotation_normal: DVec3,
+    normal: DVec3,
+) -> GgxMicrofacet {
+    let Some(tangent) = params.anisotropic_tangent else {
+        return isotropic_microfacet(roughness);
+    };
+    let alpha = roughness.clamp(MIN_ROUGHNESS, 1.0).powi(2);
+    let (alpha_x, alpha_y) = match params.anisotropy_model {
+        AnisotropyModel::Principled => {
+            let anisotropy = params.anisotropy.clamp(0.0, 1.0);
+            let aspect = (1.0 - 0.9 * anisotropy).sqrt();
+            (alpha / aspect, alpha * aspect)
+        }
+        AnisotropyModel::Glossy => {
+            let anisotropy = params.anisotropy.clamp(-0.99, 0.99);
+            if anisotropy < 0.0 {
+                (alpha / (1.0 + anisotropy), alpha * (1.0 + anisotropy))
+            } else {
+                (alpha * (1.0 - anisotropy), alpha / (1.0 - anisotropy))
+            }
+        }
+    };
+    let alpha_x = alpha_x.clamp(0.0, 1.0);
+    let alpha_y = alpha_y.clamp(0.0, 1.0);
+    let tangent = rotate_around_axis(
+        tangent,
+        rotation_normal,
+        params.anisotropic_rotation * 2.0 * PI,
+    );
+    let bitangent = normal.cross(tangent).normalize_or_zero();
+    if bitangent.length_squared() <= f64::EPSILON {
+        return isotropic_microfacet(roughness);
+    }
+    GgxMicrofacet {
+        alpha_x,
+        alpha_y,
+        tangent: bitangent.cross(normal),
+        bitangent,
+        anisotropic: true,
+    }
+}
+
+fn rotate_around_axis(vector: DVec3, axis: DVec3, angle: f64) -> DVec3 {
+    let (sin, cos) = angle.sin_cos();
+    vector * cos + axis.cross(vector) * sin + axis * (axis.dot(vector) * (1.0 - cos))
+}
+
+fn ggx_anisotropic_distribution(alpha_x: f64, alpha_y: f64, half: DVec3) -> f64 {
+    let scaled = DVec3::new(half.x / alpha_x, half.y / alpha_y, half.z);
+    1.0 / (PI * alpha_x * alpha_y * scaled.length_squared().powi(2)).max(1.0e-12)
+}
+
+fn ggx_anisotropic_lambda(alpha_x: f64, alpha_y: f64, direction: DVec3) -> f64 {
+    let z_squared = direction.z * direction.z;
+    if z_squared <= 1.0e-16 {
+        return f64::INFINITY;
+    }
+    let alpha_squared_tangent_squared =
+        ((alpha_x * direction.x).powi(2) + (alpha_y * direction.y).powi(2)) / z_squared;
+    0.5 * ((1.0 + alpha_squared_tangent_squared).sqrt() - 1.0)
 }
 
 fn ggx_distribution(alpha_squared: f64, n_dot_h: f64) -> f64 {
@@ -1434,10 +1608,20 @@ pub(crate) fn sample_glass(
     }
 }
 
-/// Cycles' `microfacet_ggx_sample_vndf` (Heitz 2018): the half vector visible from the local view `wi`
-/// (`z` up) for the isotropic GGX `alpha`, from the uniform pair `(u, v)`.
+/// Cycles' `microfacet_ggx_sample_vndf` (Heitz 2018): the isotropic half vector visible from local view `wi`.
 pub(super) fn sample_visible_normal(wi: DVec3, alpha: f64, u: f64, v: f64) -> DVec3 {
-    let stretched = DVec3::new(alpha * wi.x, alpha * wi.y, wi.z).normalize_or_zero();
+    sample_visible_normal_anisotropic(wi, alpha, alpha, u, v)
+}
+
+/// Cycles' anisotropic GGX VNDF half vector visible from local view `wi` (`z` up).
+fn sample_visible_normal_anisotropic(
+    wi: DVec3,
+    alpha_x: f64,
+    alpha_y: f64,
+    u: f64,
+    v: f64,
+) -> DVec3 {
+    let stretched = DVec3::new(alpha_x * wi.x, alpha_y * wi.y, wi.z).normalize_or_zero();
     let length_squared = stretched.x * stretched.x + stretched.y * stretched.y;
     let (t1, t2) = if length_squared > 1.0e-7 {
         let t1 = DVec3::new(-stretched.y, stretched.x, 0.0) / length_squared.sqrt();
@@ -1445,19 +1629,69 @@ pub(super) fn sample_visible_normal(wi: DVec3, alpha: f64, u: f64, v: f64) -> DV
     } else {
         (DVec3::X, DVec3::Y)
     };
-    // Section 4.2: the parameterisation of the projected area.
     let (x, disk_y) = concentric_disk(u, v);
     let s = f64::midpoint(1.0, stretched.z);
     let y = (1.0 - s) * (1.0 - x * x).max(0.0).sqrt() + s * disk_y;
-    // Section 4.3: the reprojection onto the hemisphere, then back to the ellipsoid.
     let hemisphere = DVec3::new(x, y, (1.0 - x * x - y * y).max(0.0).sqrt());
     let half = t1 * hemisphere.x + t2 * hemisphere.y + stretched * hemisphere.z;
-    DVec3::new(alpha * half.x, alpha * half.y, half.z.max(0.0)).normalize_or_zero()
+    DVec3::new(alpha_x * half.x, alpha_y * half.y, half.z.max(0.0)).normalize_or_zero()
+}
+
+pub(super) fn sample_specular_ggx_half(
+    microfacet: GgxMicrofacet,
+    normal: DVec3,
+    view: DVec3,
+    u: f64,
+    v: f64,
+) -> DVec3 {
+    let (tangent, bitangent) = if microfacet.anisotropic {
+        (microfacet.tangent, microfacet.bitangent)
+    } else {
+        make_orthonormals(normal)
+    };
+    let local_view = DVec3::new(tangent.dot(view), bitangent.dot(view), normal.dot(view));
+    let local_half =
+        sample_visible_normal_anisotropic(local_view, microfacet.alpha_x, microfacet.alpha_y, u, v);
+    (tangent * local_half.x + bitangent * local_half.y + normal * local_half.z).normalize_or_zero()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Material;
+
+    #[test]
+    fn anisotropic_ggx_axes_and_rotation_follow_the_closure_model() {
+        let mut params = BsdfParams::from_material(&Material::default(), DVec3::Z);
+        params.anisotropy = 0.9;
+        let unlinked = ggx_microfacet(&params, 0.35, DVec3::Z, DVec3::Z);
+        assert!(!unlinked.anisotropic);
+        assert_eq!(unlinked.alpha_x, unlinked.alpha_y);
+
+        params.anisotropic_tangent = Some(DVec3::X);
+        let principled = ggx_microfacet(&params, 0.35, DVec3::Z, DVec3::Z);
+        let alpha = 0.35_f64.powi(2);
+        let aspect = (1.0_f64 - 0.9 * 0.9).sqrt();
+        assert!(principled.anisotropic);
+        assert!((principled.alpha_x - alpha / aspect).abs() < 1.0e-12);
+        assert!((principled.alpha_y - alpha * aspect).abs() < 1.0e-12);
+
+        params.anisotropic_rotation = 0.25;
+        let rotated = ggx_microfacet(&params, 0.35, DVec3::Z, DVec3::Z);
+        assert!((rotated.tangent - DVec3::Y).length() < 1.0e-12);
+
+        params.anisotropy_model = AnisotropyModel::Glossy;
+        params.anisotropy = 0.5;
+        params.anisotropic_rotation = 0.0;
+        let glossy = ggx_microfacet(&params, 0.35, DVec3::Z, DVec3::Z);
+        assert!((glossy.alpha_x - alpha * 0.5).abs() < 1.0e-12);
+        assert!((glossy.alpha_y - alpha / 0.5).abs() < 1.0e-12);
+
+        let view = DVec3::new(0.5, 0.0, 3.0_f64.sqrt() / 2.0);
+        let half = sample_specular_ggx_half(glossy, DVec3::Z, view, 0.2, 0.7);
+        assert!(view.dot(half) > 0.0);
+        assert!(DVec3::Z.dot(half) > 0.0);
+    }
 
     #[test]
     fn layered_diffuse_weight_keeps_what_the_layer_does_not_reflect() {

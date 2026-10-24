@@ -260,6 +260,8 @@ pub(crate) struct Triangle {
     pub(crate) uv: [[f64; 2]; 3],
     /// Corner UVs of every UV layer of the source mesh, in layer order; empty without layers.
     pub(crate) layer_uvs: Vec<[[f64; 2]; 3]>,
+    /// World-space per-corner Mikk tangents for each UV layer; absent when no UV tangent graph is used.
+    pub(crate) layer_tangents: Vec<[DVec3; 3]>,
     /// World-space corner shading normals; `None` for flat faces, which keep their geometric normal.
     pub(crate) normals: Option<[DVec3; 3]>,
     /// Corner colors of every color layer the object carries, in `ObjectRecord::color_layers`
@@ -280,6 +282,7 @@ impl Triangle {
         generated: GeneratedCorners,
         uv: [[f64; 2]; 3],
         layer_uvs: Vec<[[f64; 2]; 3]>,
+        layer_tangents: Vec<[DVec3; 3]>,
         layer_colors: Vec<[[f64; 4]; 3]>,
     ) -> Self {
         Self {
@@ -294,6 +297,7 @@ impl Triangle {
             material_index: self.material_index,
             uv,
             layer_uvs,
+            layer_tangents,
             normals: self.normals,
             layer_colors,
             lit_per_pixel: self.lit_per_pixel,
@@ -311,6 +315,7 @@ impl Triangle {
                 self.positions,
                 self.generated,
                 self.uv,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )
@@ -4897,6 +4902,7 @@ mod smooth_shading_tests {
             material_index: 0,
             uv: [[0.0; 2]; 3],
             layer_uvs: Vec::new(),
+            layer_tangents: Vec::new(),
             normals,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
@@ -5438,6 +5444,7 @@ mod visibility_tests {
             material_index: 0,
             uv: [[0.0; 2]; 3],
             layer_uvs: Vec::new(),
+            layer_tangents: Vec::new(),
             normals: None,
             layer_colors: Vec::new(),
             lit_per_pixel: false,

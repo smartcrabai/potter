@@ -26,8 +26,8 @@ use crate::{
 
 use super::principled_bsdf::{
     GlassSample, Layers, base_color, continuous_density, continuous_lobes, diffuse_coefficient,
-    evaluate_masked, layers_at, lobe_probabilities, sample_glass, sheen_coefficient, specular_eta,
-    subsurface_closure_weight,
+    evaluate_masked, layers_at, lobe_probabilities, sample_glass, sample_specular_ggx_half,
+    sheen_coefficient, specular_eta, subsurface_closure_weight,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -547,22 +547,19 @@ impl Closures {
         }
     }
 
-    /// The closures after Cycles' glossy blur (`bsdf_microfacet_blur`, `kernel/closure/bsdf_microfacet.h`). The blur raises
-    /// only the microfacet alpha: each specular and coat roughness becomes `sqrt(max(roughness², blur_alpha))`, which
-    /// drives the sampling distribution. The closure keeps its setup layers, so its multiscatter energy stays at the
-    /// original roughness (Cycles' `energy_scale` is computed once at setup and the blur does not recompute it).
+    /// The closures after Cycles' glossy blur (`bsdf_microfacet_blur`, `kernel/closure/bsdf_microfacet.h`). It raises each
+    /// cached microfacet alpha independently, while preserving setup-time energy compensation.
     fn blurred(&self, blur_alpha: f64) -> Self {
         let items = self
             .items
             .iter()
             .map(|closure| {
                 let mut params = closure.params;
-                params.roughness = blurred_roughness(params.roughness, blur_alpha);
                 params.coat_roughness = blurred_roughness(params.coat_roughness, blur_alpha);
                 HitClosure {
                     weight: closure.weight,
                     params,
-                    layers: closure.layers,
+                    layers: closure.layers.blurred(blur_alpha),
                 }
             })
             .collect();
@@ -7249,7 +7246,13 @@ fn sample_lobes(
             RayKind::Glossy,
         )
     } else {
-        let half_vector = sample_ggx_half(layers.specular, params.roughness, rng);
+        let half_vector = sample_specular_ggx_half(
+            layers.specular_microfacet,
+            layers.specular,
+            view,
+            rng.next_f64(),
+            rng.next_f64(),
+        );
         (
             reflect(-view, half_vector).normalize_or_zero(),
             RayKind::Glossy,
@@ -9952,10 +9955,10 @@ mod band_tests {
         // A pixel-ordered stream in which each warning recurs in every band, as a shared material does.
         let stream: Vec<Value> = (0..48)
             .map(|index| match index % 4 {
-                0 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.anisotropic",
-                    "material": "a", "input": "Anisotropic", "message": "a"}),
-                1 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.anisotropic",
-                    "material": "b", "input": "Anisotropic", "message": "b"}),
+                0 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.thin_wall",
+                    "material": "a", "input": "Thin Wall", "message": "a"}),
+                1 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.thin_wall",
+                    "material": "b", "input": "Thin Wall", "message": "b"}),
                 2 => json!({"code": "uv.layer_missing", "layer": "UV2",
                     "message": "UV layer `UV2` is not on this mesh; the render layer was used"}),
                 _ => json!({"code": "mesh.color_layer_missing", "layer": "Col",

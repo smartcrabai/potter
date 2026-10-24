@@ -456,6 +456,16 @@ pub(super) fn extract_geometry(
     let mut warnings = Vec::new();
     let shader_warnings: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
     let mut evaluator_workspace = EvaluatorWorkspace::default();
+    let has_uv_map_tangent = doc.node_groups.values().any(|group| {
+        group.nodes.values().any(|node| {
+            node.node_type == "ShaderNodeTangent"
+                && node
+                    .properties
+                    .get("direction_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("UV_MAP")
+        })
+    });
     for (node_id, node) in &doc.nodes {
         if !visible_nodes.contains(node_id)
             || !node.visible
@@ -695,13 +705,28 @@ pub(super) fn extract_geometry(
                     serde_json::json!({ "node_id": node_id }),
                 )
             })?;
-            let face_normals = world_face_normals(
+            let face_normal_data = corner_normals(
                 mesh,
                 matrix,
                 node_id,
                 snapshot.adaptive_normals.get(node_id).map(Vec::as_slice),
+                has_uv_map_tangent,
                 &mut warnings,
             );
+            let mut mikk_tangents = if has_uv_map_tangent && !uv_store.layers.is_empty() {
+                Some(mesh_mikk_tangents(
+                    mesh,
+                    &mesh_triangles,
+                    &vertex_positions,
+                    &uv_store,
+                    face_normal_data.local.as_deref(),
+                    matrix,
+                )?)
+            } else {
+                None
+            }
+            .map(Vec::into_iter);
+            let face_normals = face_normal_data.world;
             let mut triangle_offset = 0_usize;
             let mut corner_base = 0_usize;
             let mesh_edge_pairs: Vec<[u32; 2]> = if matches!(mode, Mode::Wire) {
@@ -865,6 +890,10 @@ pub(super) fn extract_geometry(
                         *triangle,
                         &vertex_slots,
                     );
+                    let layer_tangents = mikk_tangents
+                        .as_mut()
+                        .and_then(Iterator::next)
+                        .unwrap_or_default();
                     let raw_normal =
                         (positions[1] - positions[0]).cross(positions[2] - positions[0]);
                     if raw_normal.length_squared() <= f64::EPSILON || !raw_normal.is_finite() {
@@ -935,6 +964,7 @@ pub(super) fn extract_geometry(
                         material_index,
                         uv,
                         layer_uvs,
+                        layer_tangents,
                         normals: corner_normals,
                         layer_colors,
                         lit_per_pixel,
@@ -1658,6 +1688,7 @@ fn subdivide_displaced(
     let mut uvs = [[0.0; 2]; 6];
     let mut layer_samples = vec![[[0.0; 2]; 6]; triangle.layer_uvs.len()];
     let mut color_samples = vec![[[0.0; 4]; 6]; triangle.layer_colors.len()];
+    let mut tangent_samples = vec![[DVec3::ZERO; 6]; triangle.layer_tangents.len()];
     let mut sample_normals = [normal; 6];
     let world_to_object = object_to_world.inverse();
     let inverse_is_finite = world_to_object
@@ -1699,6 +1730,10 @@ fn subdivide_displaced(
         for (table, corners) in color_samples.iter_mut().zip(&triangle.layer_colors) {
             table[index] = blend_color(corners, weights);
         }
+        for (table, corners) in tangent_samples.iter_mut().zip(&triangle.layer_tangents) {
+            table[index] =
+                corners[0] * weights[0] + corners[1] * weights[1] + corners[2] * weights[2];
+        }
     }
     let indices: [[usize; 3]; 4] = [[0, 1, 2], [1, 3, 4], [2, 4, 5], [1, 4, 2]];
     Ok(indices.map(|corners| {
@@ -1710,6 +1745,10 @@ fn subdivide_displaced(
             },
             corners.map(|vertex| uvs[vertex]),
             layer_samples
+                .iter()
+                .map(|table| corners.map(|vertex| table[vertex]))
+                .collect(),
+            tangent_samples
                 .iter()
                 .map(|table| corners.map(|vertex| table[vertex]))
                 .collect(),
@@ -1754,17 +1793,23 @@ fn collect_collection_nodes(
     }
 }
 
-/// World-space corner normals per face; `None` marks a flat face. A mesh whose corner normals
+struct FaceNormalData {
+    world: Vec<Option<Vec<DVec3>>>,
+    local: Option<Vec<Option<Vec<DVec3>>>>,
+}
+
+/// Corner normals in object and world space; `None` marks a flat face. A mesh whose corner normals
 /// cannot be built keeps flat face normals and records a warning.
-fn world_face_normals(
+fn corner_normals(
     mesh: &crate::geom::Mesh,
     matrix: DMat4,
     node_id: &Id,
     adaptive_normals: Option<&[Option<DVec3>]>,
+    keep_local: bool,
     warnings: &mut Vec<serde_json::Value>,
-) -> Vec<Option<Vec<DVec3>>> {
+) -> FaceNormalData {
     let positions: Vec<DVec3> = mesh.vertices.iter().map(|vertex| vertex.co).collect();
-    let local = match render_corner_normals(mesh, &positions) {
+    let mut local = match render_corner_normals(mesh, &positions) {
         Ok(faces) => faces,
         Err(error) => {
             warnings.push(serde_json::json!({
@@ -1774,10 +1819,13 @@ fn world_face_normals(
                 ),
                 "node_id": node_id,
             }));
-            return vec![None; mesh.faces.len()];
+            let flat_faces = vec![None; mesh.faces.len()];
+            return FaceNormalData {
+                world: flat_faces.clone(),
+                local: keep_local.then_some(flat_faces),
+            };
         }
     };
-    let mut local = local;
     if let Some(normals) = adaptive_normals.filter(|normals| normals.len() == mesh.vertices.len())
         && let Ok(smooth_faces) = smooth_face_flags(mesh)
         && smooth_faces.iter().any(|smooth| *smooth)
@@ -1810,11 +1858,12 @@ fn world_face_normals(
     // Inverse-transpose keeps normals perpendicular to the surface under non-uniform scale.
     let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
     let mut degenerate = false;
-    let faces = local
-        .into_iter()
+    let world = local
+        .iter()
         .map(|face| {
-            let world: Vec<DVec3> = face?
-                .into_iter()
+            let world: Vec<DVec3> = face
+                .as_ref()?
+                .iter()
                 .map(|normal| (normal_matrix * normal).normalize_or_zero())
                 .collect();
             let valid = world
@@ -1831,7 +1880,190 @@ fn world_face_normals(
             "node_id": node_id,
         }));
     }
-    faces
+    FaceNormalData {
+        world,
+        local: keep_local.then_some(local),
+    }
+}
+
+#[cfg(test)]
+fn world_face_normals(
+    mesh: &crate::geom::Mesh,
+    matrix: DMat4,
+    node_id: &Id,
+    adaptive_normals: Option<&[Option<DVec3>]>,
+    warnings: &mut Vec<serde_json::Value>,
+) -> Vec<Option<Vec<DVec3>>> {
+    corner_normals(mesh, matrix, node_id, adaptive_normals, false, warnings).world
+}
+struct MikkGeometry<'a> {
+    positions: &'a [[[f32; 3]; 3]],
+    normals: &'a [[[f32; 3]; 3]],
+    uvs: &'a [[[f32; 2]; 3]],
+    tangents: Vec<[[f32; 3]; 3]>,
+}
+
+impl mikktspace::Geometry for MikkGeometry<'_> {
+    fn num_faces(&self) -> usize {
+        self.positions.len()
+    }
+
+    fn num_vertices_of_face(&self, _face: usize) -> usize {
+        3
+    }
+
+    fn position(&self, face: usize, vert: usize) -> [f32; 3] {
+        self.positions[face][vert]
+    }
+
+    fn normal(&self, face: usize, vert: usize) -> [f32; 3] {
+        self.normals[face][vert]
+    }
+
+    fn tex_coord(&self, face: usize, vert: usize) -> [f32; 2] {
+        self.uvs[face][vert]
+    }
+
+    fn set_tangent_encoded(&mut self, tangent: [f32; 4], face: usize, vert: usize) {
+        self.tangents[face][vert] = [tangent[0], tangent[1], tangent[2]];
+    }
+}
+
+/// Calculates mesh-space Mikk tangents for every UV layer, then applies Cycles' inverse-transpose
+/// object-normal transform to each corner before hits interpolate them.
+fn mesh_mikk_tangents(
+    mesh: &Mesh,
+    triangles: &[[u32; 3]],
+    vertex_positions: &BTreeMap<u32, DVec3>,
+    uv_store: &UvStore,
+    local_face_normals: Option<&[Option<Vec<DVec3>>]>,
+    matrix: DMat4,
+) -> Result<Vec<Vec<[DVec3; 3]>>> {
+    if triangles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut positions = Vec::with_capacity(triangles.len());
+    let mut normals = Vec::with_capacity(triangles.len());
+    let mut uvs_by_layer: Vec<Vec<[[f32; 2]; 3]>> = (0..uv_store.layers.len())
+        .map(|_| Vec::with_capacity(triangles.len()))
+        .collect();
+    let mut triangle_offset = 0_usize;
+    for (face_index, face) in mesh.faces.iter().enumerate() {
+        let triangle_count = face.vertices.len().checked_sub(2).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::SceneInvalid,
+                "mesh face has fewer than three vertices",
+            )
+        })?;
+        let triangle_end = triangle_offset.checked_add(triangle_count).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "triangle offset exceeds the supported index range",
+            )
+        })?;
+        let face_triangles = triangles
+            .get(triangle_offset..triangle_end)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "triangulated face ranges are inconsistent",
+                )
+            })?;
+        for triangle in face_triangles {
+            let corners = triangle_corners(face, triangle);
+            let mut local_positions = [DVec3::ZERO; 3];
+            for (index, vertex_id) in triangle.iter().enumerate() {
+                local_positions[index] =
+                    vertex_positions.get(vertex_id).copied().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "triangle references a missing vertex",
+                        )
+                    })?;
+            }
+            let mikk_positions = local_positions.map(mikk_vec3);
+            let flat_normal = mikk_face_normal(mikk_positions);
+            let mikk_normals = local_face_normals
+                .and_then(|faces| faces.get(face_index))
+                .and_then(Option::as_deref)
+                .and_then(|face_normals| corner_values(face_normals, corners))
+                .map_or([flat_normal; 3], |normals| normals.map(mikk_vec3));
+            positions.push(mikk_positions);
+            normals.push(mikk_normals);
+            for (uvs, layer) in uvs_by_layer.iter_mut().zip(&uv_store.layers) {
+                let values = layer.faces.get(face_index).and_then(Option::as_deref);
+                uvs.push(corners.map(|corner| {
+                    corner
+                        .and_then(|corner| values.and_then(|values| values.get(corner)))
+                        .copied()
+                        .unwrap_or([0.0, 1.0])
+                        .map(|coordinate| coordinate as f32)
+                }));
+            }
+        }
+        triangle_offset = triangle_end;
+    }
+    if triangle_offset != triangles.len() {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "triangulated face ranges are inconsistent",
+        ));
+    }
+
+    let normal_matrix = DMat3::from_mat4(matrix).inverse().transpose();
+    let mut tangents_by_triangle: Vec<Vec<[DVec3; 3]>> = (0..triangles.len())
+        .map(|_| Vec::with_capacity(uv_store.layers.len()))
+        .collect();
+    for uvs in &uvs_by_layer {
+        let mut geometry = MikkGeometry {
+            positions: &positions,
+            normals: &normals,
+            uvs,
+            tangents: vec![[[0.0; 3]; 3]; triangles.len()],
+        };
+        let _ = mikktspace::generate_tangents(&mut geometry);
+        for (target, corners) in tangents_by_triangle.iter_mut().zip(geometry.tangents) {
+            target.push(corners.map(|tangent| {
+                let world = normal_matrix
+                    * DVec3::new(tangent[0] as f64, tangent[1] as f64, tangent[2] as f64);
+                if world.is_finite() {
+                    world
+                } else {
+                    DVec3::ZERO
+                }
+            }));
+        }
+    }
+    Ok(tangents_by_triangle)
+}
+
+fn mikk_vec3(value: DVec3) -> [f32; 3] {
+    [value.x as f32, value.y as f32, value.z as f32]
+}
+/// Cycles' `Mesh::Triangle::compute_normal` for the flat-normal input to `MikkTSpace`.
+fn mikk_face_normal(points: [[f32; 3]; 3]) -> [f32; 3] {
+    let [first, second, third] = points;
+    let edge1 = [
+        second[0] - first[0],
+        second[1] - first[1],
+        second[2] - first[2],
+    ];
+    let edge2 = [
+        third[0] - first[0],
+        third[1] - first[1],
+        third[2] - first[2],
+    ];
+    let normal = [
+        edge1[1] * edge2[2] - edge1[2] * edge2[1],
+        edge1[2] * edge2[0] - edge1[0] * edge2[2],
+        edge1[0] * edge2[1] - edge1[1] * edge2[0],
+    ];
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if length == 0.0 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [normal[0] / length, normal[1] / length, normal[2] / length]
+    }
 }
 
 /// Ray-visibility flags that realtime Beauty does not honour, one warning per flag switched away from
@@ -2389,6 +2621,7 @@ pub(super) fn layered_context<'a>(
             barycentric: pose.barycentric,
             ..uv_layers
         })
+        .with_uv_tangents(&triangle.layer_tangents)
         .with_color_layers(color_maps, color_render)
         .with_warnings(warnings);
     context.uv = uv_override.unwrap_or_else(|| blend_uv(&triangle.uv, pose.barycentric));
@@ -4017,8 +4250,9 @@ mod shading_normal_tests {
             material_index: 0,
             uv: [[0.0; 2]; 3],
             layer_uvs: Vec::new(),
-            normals: Some(normals),
+            layer_tangents: Vec::new(),
             layer_colors: Vec::new(),
+            normals: Some(normals),
             lit_per_pixel: false,
             ray_mask: RayVisibility::default().mask(),
         }

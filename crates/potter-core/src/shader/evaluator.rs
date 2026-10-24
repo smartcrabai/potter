@@ -40,13 +40,10 @@ pub(crate) fn principled_glass_tint(base: [f64; 4]) -> [f64; 3] {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 2] {
-    [
-        (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
-        params
-            .thin_wall
-            .then_some(("shader.principled.thin_wall", "Thin Wall")),
-    ]
+) -> [Option<(&'static str, &'static str)>; 1] {
+    [params
+        .thin_wall
+        .then_some(("shader.principled.thin_wall", "Thin Wall"))]
 }
 
 /// Records `UNSUPPORTED_FEATURE` for each Principled input in `params` that Potter's lobe model
@@ -153,6 +150,13 @@ impl SubsurfaceMethod {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AnisotropyModel {
+    #[default]
+    Principled,
+    Glossy,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
     pub base_color: [f64; 4],
@@ -205,8 +209,11 @@ pub struct BsdfParams {
     pub sheen_tint: [f64; 3],
     pub specular_ior_level: f64,
     pub specular_tint: [f64; 3],
-    pub anisotropic_ior: f64,
+    pub(crate) anisotropy_model: AnisotropyModel,
+    pub anisotropy: f64,
     pub anisotropic_rotation: f64,
+    /// Effective world-space Cycles tangent: a linked node or, for unlinked anisotropy, Geometry Tangent.
+    pub anisotropic_tangent: Option<DVec3>,
     pub thin_film_thickness: f64,
     pub thin_film_ior: f64,
     /// Oren-Nayar roughness of the diffuse lobe (`bsdf_oren_nayar_setup`); Cycles uses the
@@ -302,8 +309,10 @@ impl BsdfParams {
             sheen_tint: [1.0; 3],
             specular_ior_level: DEFAULT_SPECULAR_IOR_LEVEL,
             specular_tint: [1.0; 3],
-            anisotropic_ior: 0.0,
+            anisotropy_model: AnisotropyModel::Principled,
+            anisotropy: 0.0,
             anisotropic_rotation: 0.0,
+            anisotropic_tangent: None,
             thin_film_thickness: 0.0,
             thin_film_ior: 1.33,
             diffuse_roughness: 0.0,
@@ -422,6 +431,8 @@ pub struct HitContext<'a> {
     pub uv: [f64; 2],
     /// The UV layers of the hit triangle; `None` when only `uv` is known.
     pub uv_layers: Option<HitUvLayers<'a>>,
+    /// Per-corner world-space Mikk tangents in UV layer order; absent when mesh tangent data is unavailable.
+    uv_tangents: Option<&'a [[DVec3; 3]]>,
     /// Sink for `uv.layer_missing` warnings; see [`HitContext::with_warnings`].
     pub warnings: Option<&'a RefCell<Vec<JsonValue>>>,
     /// The Generated texture coordinate: the object's texture space applied to its local point (see
@@ -429,6 +440,8 @@ pub struct HitContext<'a> {
     pub generated: DVec3,
     /// How far `generated` moves per unit of object-local movement (`1 / (2 size)` per axis).
     pub generated_per_local: DVec3,
+    /// The Generated/orco values of this hit's triangle, used to transform radial tangent axes.
+    generated_corners: Option<GeneratedCorners>,
     pub position: DVec3,
     pub object: DVec3,
     pub normal: DVec3,
@@ -462,9 +475,11 @@ impl<'a> HitContext<'a> {
             node_groups,
             uv: [0.0; 2],
             uv_layers: None,
+            uv_tangents: None,
             warnings: None,
             generated: DVec3::ZERO,
             generated_per_local: DVec3::ONE,
+            generated_corners: None,
             position: DVec3::ZERO,
             object: DVec3::ZERO,
             normal: DVec3::Z,
@@ -497,12 +512,20 @@ impl<'a> HitContext<'a> {
         self
     }
 
+    /// Attach Mikk tangents for the hit triangle, in the same layer order as its UVs.
+    #[must_use]
+    pub(crate) const fn with_uv_tangents(mut self, tangents: &'a [[DVec3; 3]]) -> Self {
+        self.uv_tangents = Some(tangents);
+        self
+    }
+
     /// Set the Generated coordinate of the object-local point `local` through the object's texture space
     /// (Cycles' `ATTR_STD_GENERATED`), and the Jacobian that moves it with `local` in shifted samples.
     #[must_use]
     pub fn with_generated(mut self, texture_space: TextureSpace, local: DVec3) -> Self {
         self.generated = texture_space.generated(local);
         self.generated_per_local = texture_space.generated_per_local();
+        self.generated_corners = None;
         self
     }
 
@@ -519,6 +542,7 @@ impl<'a> HitContext<'a> {
         let [first, second, third] = generated.corners;
         self.generated = first * barycentric[0] + second * barycentric[1] + third * barycentric[2];
         self.generated_per_local = generated.per_local;
+        self.generated_corners = Some(generated);
         self
     }
 
@@ -1032,6 +1056,7 @@ enum NodeKind {
     CombineXyz,
     TexCoord,
     UvMap,
+    Tangent,
     NormalMap,
     Fresnel,
     LayerWeight,
@@ -1370,6 +1395,25 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .iter()
             .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket))
     }
+    /// The effective lobe tangent: explicit Tangent link, or Cycles' implicit Geometry Tangent.
+    fn anisotropic_tangent(&mut self, id: &Id, active: bool) -> Result<Option<DVec3>> {
+        if !active {
+            return Ok(None);
+        }
+        if !self.is_linked(id, "Tangent") {
+            return self.radial_tangent(id, "Z").map(Some);
+        }
+        let tangent = match self.input(id, "Tangent", ValueKind::Vector)? {
+            Value::Vector(value) => value,
+            Value::Scalar(value) => DVec3::splat(value),
+            Value::Color(value) => DVec3::new(value[0], value[1], value[2]),
+            Value::Shader(_) => return Err(invalid("expected an anisotropy tangent vector")),
+        };
+        if !tangent.is_finite() || tangent.length_squared() <= f64::EPSILON {
+            return Err(unsupported_node(id, "Anisotropic:Tangent"));
+        }
+        Ok(Some(tangent.normalize()))
+    }
 
     fn output(&mut self, node_id: &Id, socket: &str, socket_index: usize) -> Result<Value> {
         let Some((node_key, node)) = self.group.nodes.get_key_value(node_id) else {
@@ -1425,6 +1469,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             "ShaderNodeCombineXYZ" => Ok(NodeKind::CombineXyz),
             "ShaderNodeTexCoord" => Ok(NodeKind::TexCoord),
             "ShaderNodeUVMap" => Ok(NodeKind::UvMap),
+            "ShaderNodeTangent" => Ok(NodeKind::Tangent),
             "ShaderNodeNormalMap" => Ok(NodeKind::NormalMap),
             "ShaderNodeFresnel" => Ok(NodeKind::Fresnel),
             "ShaderNodeLayerWeight" => Ok(NodeKind::LayerWeight),
@@ -1514,6 +1559,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             NodeKind::CombineXyz => self.combine_xyz(node_id, socket),
             NodeKind::TexCoord => self.tex_coord(socket),
             NodeKind::UvMap => self.uv_map(node_id, socket),
+            NodeKind::Tangent => self.tangent(node_id, socket),
             NodeKind::NormalMap => self.normal_map(node_id, socket),
             NodeKind::Fresnel => self.fresnel(node_id, socket),
             NodeKind::LayerWeight => self.layer_weight(node_id, socket),
@@ -1617,9 +1663,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         params.specular_tint = self.color_input(id, &["Specular Tint"], [1.0, 1.0, 1.0, 1.0])?[..3]
             .try_into()
             .map_err(|_| invalid("invalid specular tint"))?;
-        params.anisotropic_ior =
-            self.scalar_input(id, &["Anisotropic IOR Level", "Anisotropic"], 0.0)?;
+        params.anisotropy = self.scalar_input(id, &["Anisotropic"], 0.0)?;
         params.anisotropic_rotation = self.scalar_input(id, &["Anisotropic Rotation"], 0.0)?;
+        params.anisotropic_tangent = self.anisotropic_tangent(id, params.anisotropy >= 1.0e-5)?;
         params.thin_film_thickness = self.scalar_input(id, &["Thin Film Thickness"], 0.0)?;
         params.thin_film_ior = self.scalar_input(id, &["Thin Film IOR"], 1.33)?;
         params.diffuse_roughness = self.scalar_input(id, &["Diffuse Roughness"], 0.0)?;
@@ -1738,6 +1784,26 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let mut params = self.diffuse(id)?;
         params.metallic = 1.0;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.5)?;
+        let anisotropy = self.scalar_input(id, &["Anisotropy"], 0.0)?;
+        if anisotropy.abs() > 1.0e-4 {
+            let distribution = self
+                .node(id)?
+                .properties
+                .get("distribution")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("MULTI_GGX")
+                .to_owned();
+            if !matches!(distribution.as_str(), "GGX" | "MULTI_GGX") {
+                return Err(unsupported_node(
+                    id,
+                    &format!("Glossy:distribution:{distribution}"),
+                ));
+            }
+        }
+        params.anisotropy = anisotropy;
+        params.anisotropy_model = AnisotropyModel::Glossy;
+        params.anisotropic_rotation = self.scalar_input(id, &["Rotation"], 0.0)?;
+        params.anisotropic_tangent = self.anisotropic_tangent(id, anisotropy.abs() > 1.0e-4)?;
         Ok(params)
     }
 
@@ -2454,6 +2520,86 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let uv = storage_to_blender_uv(layer_uv(&self.hit_ctx, layer));
         Ok(Value::Vector(DVec3::new(uv[0], uv[1], 0.0)))
     }
+    /// `ShaderNodeTangent`: Cycles' `svm_node_tangent` (`kernel/svm/tex_coord.h`).
+    fn tangent(&self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Tangent" {
+            return Err(invalid(format!("unknown Tangent output `{socket}`")));
+        }
+        let node = self.node(id)?;
+        // DNA_node_types.h sets direction_type's default storage value to 0: RADIAL.
+        let direction = match node.properties.get("direction_type") {
+            None => "RADIAL",
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| unsupported_node(id, "Tangent:direction_type"))?,
+        };
+        let tangent = match direction {
+            "RADIAL" => {
+                let axis = match node.properties.get("axis") {
+                    None => "Z",
+                    Some(value) => value
+                        .as_str()
+                        .ok_or_else(|| unsupported_node(id, "Tangent:RADIAL:axis"))?,
+                };
+                self.radial_tangent(id, axis)?
+            }
+            "UV_MAP" => {
+                let Some(layers) = self.hit_ctx.uv_layers else {
+                    return Err(unsupported_node(id, "Tangent:UV_MAP:uv_layers"));
+                };
+                let layer_name = match node.properties.get("uv_map") {
+                    Some(value) => value
+                        .as_str()
+                        .ok_or_else(|| unsupported_node(id, "Tangent:UV_MAP:uv_map"))?,
+                    None => "",
+                };
+                let layer = if layer_name.is_empty() {
+                    layers.render
+                } else {
+                    layers.index_of(layer_name).filter(|&index| {
+                        layers
+                            .available_mask
+                            .is_none_or(|mask| index < 8 && mask & (1_u8 << index) != 0)
+                    })
+                }
+                .ok_or_else(|| unsupported_node(id, "Tangent:UV_MAP:uv_map"))?;
+                let tangent_corners = self
+                    .hit_ctx
+                    .uv_tangents
+                    .and_then(|tangents| tangents.get(layer))
+                    .ok_or_else(|| unsupported_node(id, "Tangent:UV_MAP:uv_tangent"))?;
+                let [first, second, third] = *tangent_corners;
+                let [b0, b1, b2] = layers.barycentric;
+                let tangent = first * b0 + second * b1 + third * b2;
+                surface_tangent(tangent, self.hit_ctx.normal)
+                    .ok_or_else(|| unsupported_node(id, "Tangent:UV_MAP:direction"))?
+            }
+            other => return Err(unsupported_node(id, &format!("Tangent:{other}"))),
+        };
+        Ok(Value::Vector(tangent))
+    }
+    /// The implicit `LINK_TANGENT` fallback: `GeometryNode::Tangent` uses RADIAL around Z
+    /// (`shader_graph.cpp:934-940`, `kernel/geom/primitive.h:162-185`).
+    fn radial_tangent(&self, id: &Id, axis: &str) -> Result<DVec3> {
+        let generated = self
+            .hit_ctx
+            .generated_corners
+            .ok_or_else(|| unsupported_node(id, "Tangent:RADIAL:Generated"))?;
+        let point = self.hit_ctx.generated;
+        if !point.is_finite() {
+            return Err(unsupported_node(id, "Tangent:RADIAL:Generated"));
+        }
+        let local_tangent = match axis {
+            "X" => DVec3::new(0.0, -(point.z - 0.5), point.y - 0.5),
+            "Y" => DVec3::new(-(point.z - 0.5), 0.0, point.x - 0.5),
+            "Z" => DVec3::new(-(point.y - 0.5), point.x - 0.5, 0.0),
+            _ => return Err(unsupported_node(id, &format!("Tangent:RADIAL:{axis}"))),
+        };
+        let world_tangent = object_normal_tangent_to_world(local_tangent, generated, &self.hit_ctx)
+            .ok_or_else(|| unsupported_node(id, "Tangent:RADIAL:Generated"))?;
+        surface_tangent(world_tangent, self.hit_ctx.normal)
+            .ok_or_else(|| unsupported_node(id, "Tangent:RADIAL:direction"))
+    }
     fn normal_map(&mut self, id: &Id, socket: &str) -> Result<Value> {
         if socket != "Normal" {
             return Err(invalid(format!("unknown Normal Map output `{socket}`")));
@@ -2947,6 +3093,74 @@ fn layer_frame_with_v_direction(
         fallback.1,
     );
     (tangent, bitangent)
+}
+/// The Cycles tangent node transforms object-space tangents by the inverse transpose. Generated
+/// corner coordinates and the hit triangle recover that transform's projection onto the world
+/// geometric tangent plane without falling back to an arbitrary frame.
+fn object_normal_tangent_to_world(
+    tangent: DVec3,
+    generated: GeneratedCorners,
+    hit_ctx: &HitContext<'_>,
+) -> Option<DVec3> {
+    let layers = hit_ctx.uv_layers?;
+    let [g0, g1, g2] = generated.corners;
+    let scale = generated.per_local;
+    if !tangent.is_finite()
+        || !g0.is_finite()
+        || !g1.is_finite()
+        || !g2.is_finite()
+        || !scale.is_finite()
+        || scale.abs().min_element() <= f64::EPSILON
+    {
+        return None;
+    }
+    let local_edge1 = DVec3::new(
+        (g1.x - g0.x) / scale.x,
+        (g1.y - g0.y) / scale.y,
+        (g1.z - g0.z) / scale.z,
+    );
+    let local_edge2 = DVec3::new(
+        (g2.x - g0.x) / scale.x,
+        (g2.y - g0.y) / scale.y,
+        (g2.z - g0.z) / scale.z,
+    );
+    let local_normal = local_edge1.cross(local_edge2);
+    let local_normal_length_squared = local_normal.length_squared();
+    let [p0, p1, p2] = layers.positions;
+    let world_edge1 = p1 - p0;
+    let world_edge2 = p2 - p0;
+    let (a11, a12, a22) = (
+        world_edge1.dot(world_edge1),
+        world_edge1.dot(world_edge2),
+        world_edge2.dot(world_edge2),
+    );
+    let determinant = a11 * a22 - a12 * a12;
+    if !local_normal_length_squared.is_finite()
+        || local_normal_length_squared <= f64::EPSILON
+        || !determinant.is_finite()
+        || determinant <= f64::EPSILON * a11 * a22
+    {
+        return None;
+    }
+    let tangent = tangent - local_normal * tangent.dot(local_normal) / local_normal_length_squared;
+    let (r1, r2) = (tangent.dot(local_edge1), tangent.dot(local_edge2));
+    let world_tangent = world_edge1 * ((a22 * r1 - a12 * r2) / determinant)
+        + world_edge2 * ((a11 * r2 - a12 * r1) / determinant);
+    world_tangent.is_finite().then_some(world_tangent)
+}
+
+/// Cycles' `cross(N, normalize(cross(T, N)))` tangent projection.
+fn surface_tangent(tangent: DVec3, normal: DVec3) -> Option<DVec3> {
+    if !tangent.is_finite() || !normal.is_finite() || normal.length_squared() <= f64::EPSILON {
+        return None;
+    }
+    let normal = normal.normalize();
+    let crossed = tangent.cross(normal);
+    if !crossed.is_finite() || crossed.length_squared() <= f64::EPSILON {
+        return None;
+    }
+    let tangent = normal.cross(crossed.normalize());
+    (tangent.is_finite() && tangent.length_squared() > f64::EPSILON).then(|| tangent.normalize())
 }
 
 /// Finite-difference step across the surface, in render-UV units.
