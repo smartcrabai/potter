@@ -21,8 +21,9 @@ use crate::{
     },
     hash,
     model::{
-        ArmatureData, CameraData, ConstraintType, DataBlock, Id, Modifier, Node, Scene, SceneDoc,
-        TextureCoordinateMapping, TrackAxis, VertexGroup,
+        ArmatureData, CameraData, ConstraintType, CurveData, CurveFillMode, CurveFillRule,
+        CurveFillSolver, DataBlock, Id, Modifier, Node, Scene, SceneDoc, TextureCoordinateMapping,
+        TrackAxis, VertexGroup,
     },
     params::{self, ParameterFamily},
 };
@@ -41,6 +42,27 @@ pub mod animation;
 mod ik_solver;
 pub mod rig;
 const EVALUATION_ENGINE: &str = "potter-eval-5";
+
+// Blender 5.2.2 DNA_curve_types.h:282-286 defines the defaults; displist.cc:674-704 applies
+// fill_rule only in the CDT branch, while SWEEP_LINE falls back to scan-fill.
+fn ensure_curve_fill_supported(curve: &CurveData, owner_id: &Id) -> Result<()> {
+    if curve.fill_mode != CurveFillMode::None
+        && curve.fill_solver == CurveFillSolver::Cdt
+        && curve.fill_rule == CurveFillRule::Nonzero
+    {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "CDT curve fills with the NONZERO rule are not supported",
+            json!({
+                "feature_id":"curve.fill.multiple_contours",
+                "owner_id":owner_id,
+                "fill_solver":curve.fill_solver,
+                "fill_rule":curve.fill_rule,
+            }),
+        ));
+    }
+    Ok(())
+}
 
 /// A render camera explicitly chosen by a preview view rather than a scene camera node.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -967,6 +989,7 @@ impl Snapshot {
         }
         let mesh_evaluation_order =
             object_mesh_evaluation_order(doc, selected_nodes, gate, mesh_dependencies)?;
+        let taper_profiles = curve_taper_profiles(doc, &mesh_evaluation_order)?;
         let evaluated_node_ids: BTreeSet<Id> = mesh_evaluation_order.iter().cloned().collect();
 
         let computed_driver_values;
@@ -1533,36 +1556,20 @@ impl Snapshot {
                                     json!({ "data": data_id }),
                                 )
                             })?;
-                            if let Some(taper) = curve.taper.as_ref() {
-                                return Err(PotError::with_details(
-                                    ErrorCode::UnsupportedFeature,
-                                    "curve taper-object evaluation is not supported",
-                                    json!({
-                                        "feature_id": "curve.taper_object",
-                                        "data": data_id,
-                                        "taper": taper,
-                                    }),
-                                ));
-                            }
-                            if curve.fill_mode != crate::model::CurveFillMode::None
-                                && curve.splines.len() > 1
-                            {
-                                return Err(PotError::with_details(
-                                    ErrorCode::UnsupportedFeature,
-                                    "multiple 2D fill contours are not supported",
-                                    json!({
-                                        "feature_id": "curve.fill.multiple_contours",
-                                        "data": data_id,
-                                    }),
-                                ));
-                            }
-                            crate::geom::curve::evaluate_curve(curve).map_err(|error| {
-                                PotError::with_details(
-                                    ErrorCode::SceneInvalid,
-                                    format!("curve geometry is invalid: {error}"),
-                                    json!({ "data": data_id }),
-                                )
-                            })?
+                            ensure_curve_fill_supported(curve, id)?;
+                            let taper_profile = curve
+                                .taper
+                                .as_ref()
+                                .and_then(|taper| taper_profiles.get(taper))
+                                .map(Vec::as_slice);
+                            crate::geom::curve::evaluate_curve_with_taper(curve, taper_profile)
+                                .map_err(|error| {
+                                    PotError::with_details(
+                                        ErrorCode::SceneInvalid,
+                                        format!("curve geometry is invalid: {error}"),
+                                        json!({ "data": data_id }),
+                                    )
+                                })?
                         }
                         "surface" => {
                             let surface = data_block.surface.as_ref().ok_or_else(|| {
@@ -3163,6 +3170,137 @@ fn object_mesh_dependencies(
     }
     Ok(dependencies)
 }
+pub(crate) fn curve_taper_profiles(
+    doc: &SceneDoc,
+    roots: &[Id],
+) -> Result<BTreeMap<Id, Vec<[f64; 2]>>> {
+    fn visit(
+        id: &Id,
+        doc: &SceneDoc,
+        active: &mut Vec<Id>,
+        complete: &mut BTreeSet<Id>,
+        order: &mut Vec<Id>,
+        taper_data: &mut BTreeSet<Id>,
+    ) -> Result<()> {
+        if complete.contains(id) {
+            return Ok(());
+        }
+        if let Some(start) = active.iter().position(|active_id| active_id == id) {
+            let mut cycle: Vec<String> = active[start..].iter().map(ToString::to_string).collect();
+            cycle.push(id.to_string());
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "curve taper dependency cycle",
+                json!({"feature_id":"curve.taper_object","cycle":cycle,"dependency":"curve taper"}),
+            ));
+        }
+        let curve = doc
+            .data_blocks
+            .get(id)
+            .filter(|block| block.data_type == "curve")
+            .and_then(|block| block.curve.as_ref())
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "curve taper dependency is not a curve Data-Block",
+                    json!({"data":id}),
+                )
+            })?;
+        ensure_curve_fill_supported(curve, id)?;
+        active.push(id.clone());
+        if let Some(taper) = &curve.taper {
+            let target = doc.data_blocks.get(taper).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::DependencyMissing,
+                    "curve taper references a missing Data-Block",
+                    json!({"feature_id":"curve.taper_object","data":id,"taper":taper}),
+                )
+            })?;
+            // Blender's `displist_calc_taper` returns factor 1 for non-curve objects.
+            if target.data_type == "curve" {
+                if target.curve.is_none() {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "curve taper reference is not a curve Data-Block",
+                        json!({"feature_id":"curve.taper_object","data":id,"taper":taper}),
+                    ));
+                }
+                taper_data.insert(taper.clone());
+                visit(taper, doc, active, complete, order, taper_data)?;
+            } else {
+                taper_data.insert(taper.clone());
+            }
+        }
+        active.truncate(active.len() - 1);
+        complete.insert(id.clone());
+        order.push(id.clone());
+        Ok(())
+    }
+
+    let mut order = Vec::new();
+    let mut active = Vec::new();
+    let mut complete = BTreeSet::new();
+    let mut taper_data = BTreeSet::new();
+    for node_id in roots {
+        let Some(data_id) = doc.nodes.get(node_id).and_then(|node| node.data.as_ref()) else {
+            continue;
+        };
+        if doc
+            .data_blocks
+            .get(data_id)
+            .is_some_and(|block| block.data_type == "curve" && block.curve.is_some())
+        {
+            visit(
+                data_id,
+                doc,
+                &mut active,
+                &mut complete,
+                &mut order,
+                &mut taper_data,
+            )?;
+        }
+    }
+    let mut profiles = BTreeMap::new();
+    for id in &taper_data {
+        if doc
+            .data_blocks
+            .get(id)
+            .is_some_and(|block| block.data_type != "curve")
+        {
+            profiles.insert(id.clone(), Vec::new());
+        }
+    }
+    for id in order {
+        if !taper_data.contains(&id) {
+            continue;
+        }
+        let curve = doc
+            .data_blocks
+            .get(&id)
+            .and_then(|block| block.curve.as_ref())
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "ordered curve taper Data-Block disappeared",
+                )
+            })?;
+        let taper_profile = curve
+            .taper
+            .as_ref()
+            .and_then(|taper| profiles.get(taper))
+            .map(Vec::as_slice);
+        let profile =
+            crate::geom::curve::taper_profile_samples(curve, taper_profile).map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    format!("curve taper profile is invalid: {error}"),
+                    json!({"feature_id":"curve.taper_object","data":id}),
+                )
+            })?;
+        profiles.insert(id, profile);
+    }
+    Ok(profiles)
+}
 
 fn object_mesh_evaluation_order(
     doc: &SceneDoc,
@@ -3453,6 +3591,7 @@ fn operand_object_mesh(
     modifier: &Modifier,
     object_id: &Id,
     data_block: Option<&DataBlock>,
+    doc: &SceneDoc,
 ) -> Result<Mesh> {
     let mut base_mesh = match data_block {
         Some(data) if data.data_type == "mesh" => data.mesh.clone().ok_or_else(|| {
@@ -3463,20 +3602,28 @@ fn operand_object_mesh(
             )
         })?,
         Some(data) if data.data_type == "curve" => {
-            crate::geom::curve::evaluate_curve(data.curve.as_ref().ok_or_else(|| {
+            let curve = data.curve.as_ref().ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::SceneInvalid,
                     "curve modifier operand has no curve payload",
                     json!({"modifier_id":modifier.id,"object":object_id}),
                 )
-            })?)
-            .map_err(|error| {
-                PotError::with_details(
-                    ErrorCode::InvalidArgument,
-                    format!("curve modifier operand is invalid: {error}"),
-                    json!({"modifier_id":modifier.id,"object":object_id}),
-                )
-            })?
+            })?;
+            let taper_profiles = curve_taper_profiles(doc, std::slice::from_ref(object_id))?;
+            let taper_profile = curve
+                .taper
+                .as_ref()
+                .and_then(|taper_id| taper_profiles.get(taper_id))
+                .map(Vec::as_slice);
+            crate::geom::curve::evaluate_curve_with_taper(curve, taper_profile).map_err(
+                |error| {
+                    PotError::with_details(
+                        ErrorCode::InvalidArgument,
+                        format!("curve modifier operand is invalid: {error}"),
+                        json!({"modifier_id":modifier.id,"object":object_id}),
+                    )
+                },
+            )?
         }
         _ => Mesh::default(),
     };
@@ -3590,7 +3737,7 @@ pub(crate) fn resolve_modifier_object_operands(
             } else if let Some(evaluated_mesh) = evaluated_meshes.get(&object_id) {
                 evaluated_mesh.clone()
             } else {
-                operand_object_mesh(modifier, &object_id, data_block)?
+                operand_object_mesh(modifier, &object_id, data_block, doc)?
             };
             let object_world = world_matrices.get(&object_id).copied().ok_or_else(|| {
                 PotError::with_details(
@@ -5302,20 +5449,29 @@ pub(crate) fn apply_scene_operand_modifier(
                     )
                 })?,
                 ("curve", "curve") => {
-                    crate::geom::curve::evaluate_curve(data.curve.as_ref().ok_or_else(|| {
+                    let curve = data.curve.as_ref().ok_or_else(|| {
                         PotError::with_details(
                             ErrorCode::SceneInvalid,
                             "curve modifier operand has no curve payload",
                             json!({"modifier_id":modifier.id,"object":object_id}),
                         )
-                    })?)
-                    .map_err(|error| {
-                        PotError::with_details(
-                            ErrorCode::InvalidArgument,
-                            format!("curve modifier operand is invalid: {error}"),
-                            json!({"modifier_id":modifier.id,"object":object_id}),
-                        )
-                    })?
+                    })?;
+                    let taper_profiles =
+                        curve_taper_profiles(doc, std::slice::from_ref(&object_id))?;
+                    let taper_profile = curve
+                        .taper
+                        .as_ref()
+                        .and_then(|taper_id| taper_profiles.get(taper_id))
+                        .map(Vec::as_slice);
+                    crate::geom::curve::evaluate_curve_with_taper(curve, taper_profile).map_err(
+                        |error| {
+                            PotError::with_details(
+                                ErrorCode::InvalidArgument,
+                                format!("curve modifier operand is invalid: {error}"),
+                                json!({"modifier_id":modifier.id,"object":object_id}),
+                            )
+                        },
+                    )?
                 }
                 _ => {
                     return Err(PotError::with_details(

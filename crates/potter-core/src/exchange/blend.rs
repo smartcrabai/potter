@@ -23,19 +23,19 @@ use crate::{
     graph::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
     model::{
         Action, ActionSlot, ArmatureData, Bone, CameraData, CameraProjection, Collection,
-        Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveHandleType,
-        CurvePoint, CurveSpline, CurveSplineType, DEFAULT_FILTER_WIDTH, DataBlock, Driver,
-        DriverType, DriverVariable, DriverVariableType, Extrapolation, FCurve, ForceField,
-        ForceFieldType, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
-        GreasePencilStroke, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
-        Interpolation, Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty,
-        LibraryStatus, LightData, LightType, Material, MaterialLink, Modifier,
-        ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
-        NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind, RayVisibility,
-        Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene,
-        SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData,
-        TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer, ViewportDisplay,
-        VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
+        Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveFillRule,
+        CurveFillSolver, CurveHandleType, CurvePoint, CurveSpline, CurveSplineType,
+        CurveTaperRadiusMode, DEFAULT_FILTER_WIDTH, DataBlock, Driver, DriverType, DriverVariable,
+        DriverVariableType, Extrapolation, FCurve, ForceField, ForceFieldType, GreasePencilData,
+        GreasePencilFrame, GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image,
+        ImageAlphaMode, ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library,
+        LibraryKind, LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType,
+        Material, MaterialLink, Modifier, ModifierParameterBinding, MovieClip, MovieTracking,
+        NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, PixelFilterType,
+        Profile, RayKind, RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape,
+        RigidBodyType, RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData,
+        SurfacePoint, TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup,
+        ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, SequencerColorSpace, Strip as SequenceStrip,
@@ -6169,6 +6169,30 @@ fn import_armatures(
     Ok((armature_ids, bones_by_data))
 }
 
+fn curve_fill_solver(item: &Value) -> Result<CurveFillSolver> {
+    match item.get("fill_solver") {
+        None => Ok(CurveFillSolver::SweepLine),
+        Some(Value::String(value)) if value == "SWEEP_LINE" => Ok(CurveFillSolver::SweepLine),
+        Some(Value::String(value)) if value == "CDT" => Ok(CurveFillSolver::Cdt),
+        Some(Value::String(value)) => Err(invalid_intermediate(&format!(
+            "curve fill solver `{value}` is unknown"
+        ))),
+        Some(_) => Err(invalid_intermediate("curve fill solver is not a string")),
+    }
+}
+
+fn curve_fill_rule(item: &Value) -> Result<CurveFillRule> {
+    match item.get("fill_rule") {
+        None => Ok(CurveFillRule::EvenOdd),
+        Some(Value::String(value)) if value == "EVEN_ODD" => Ok(CurveFillRule::EvenOdd),
+        Some(Value::String(value)) if value == "NONZERO" => Ok(CurveFillRule::Nonzero),
+        Some(Value::String(value)) => Err(invalid_intermediate(&format!(
+            "curve fill rule `{value}` is unknown"
+        ))),
+        Some(_) => Err(invalid_intermediate("curve fill rule is not a string")),
+    }
+}
+
 fn import_curves(
     items: &[Value],
     doc: &mut SceneDoc,
@@ -6379,6 +6403,24 @@ fn import_curves(
                             })?,
                         extrude: number_field(item, "extrude", 0.0),
                         taper: None,
+                        taper_radius_mode: match item
+                            .get("taper_radius_mode")
+                            .and_then(Value::as_str)
+                            .unwrap_or("OVERRIDE")
+                        {
+                            "OVERRIDE" => CurveTaperRadiusMode::Override,
+                            "MULTIPLY" => CurveTaperRadiusMode::Multiply,
+                            "ADD" => CurveTaperRadiusMode::Add,
+                            mode => {
+                                return Err(invalid_intermediate(&format!(
+                                    "curve taper radius mode `{mode}` is unknown"
+                                )));
+                            }
+                        },
+                        use_map_taper: item
+                            .get("use_map_taper")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                         fill_mode: match item
                             .get("fill_mode")
                             .and_then(Value::as_str)
@@ -6389,6 +6431,8 @@ fn import_curves(
                             "BOTH" => CurveFillMode::Both,
                             _ => CurveFillMode::None,
                         },
+                        fill_solver: curve_fill_solver(item)?,
+                        fill_rule: curve_fill_rule(item)?,
                         twist_mode: item
                             .get("twist_mode")
                             .and_then(Value::as_str)
@@ -6413,6 +6457,34 @@ fn import_curves(
             }
         };
         doc.data_blocks.insert(id, data);
+    }
+    for item in items {
+        let taper_name = match item.get("taper") {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(name)) => name,
+            Some(_) => {
+                return Err(invalid_intermediate(
+                    "curve taper reference is not a string",
+                ));
+            }
+        };
+        let name = string_field(item, "name")?;
+        let data_id = data_ids
+            .get(name)
+            .ok_or_else(|| invalid_intermediate("curve taper owner has no Data-Block ID"))?;
+        let taper_id = data_ids.get(taper_name).cloned().ok_or_else(|| {
+            invalid_intermediate(&format!(
+                "curve `{name}` references unknown taper curve `{taper_name}`"
+            ))
+        })?;
+        let curve = doc
+            .data_blocks
+            .get_mut(data_id)
+            .and_then(|block| block.curve.as_mut())
+            .ok_or_else(|| {
+                invalid_intermediate("taper reference belongs to a non-curve Data-Block")
+            })?;
+        curve.taper = Some(taper_id);
     }
     Ok(data_ids)
 }

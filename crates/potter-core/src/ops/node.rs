@@ -1285,13 +1285,36 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         engine.mark("scenes", &scene_id, ChangeKind::Updated);
     }
     if cascade_data {
-        for data_id in affected_data {
-            let still_used = engine
-                .doc
-                .nodes
-                .values()
-                .any(|node| node.data.as_ref() == Some(&data_id));
-            if !still_used && engine.doc.data_blocks.remove(&data_id).is_some() {
+        // Blender's Curve ID walker includes taperobj in unlink traversal (curve.cc, curve_foreach_id).
+
+        let data_to_delete: BTreeSet<_> = affected_data
+            .into_iter()
+            .filter(|data_id| {
+                !engine
+                    .doc
+                    .nodes
+                    .values()
+                    .any(|node| node.data.as_ref() == Some(data_id))
+            })
+            .collect();
+        let mut cleared_tapers = Vec::new();
+        for (owner_id, block) in &mut engine.doc.data_blocks {
+            if !data_to_delete.contains(owner_id)
+                && let Some(curve) = block.curve.as_mut()
+                && curve
+                    .taper
+                    .as_ref()
+                    .is_some_and(|taper_id| data_to_delete.contains(taper_id))
+            {
+                curve.taper = None;
+                cleared_tapers.push(owner_id.clone());
+            }
+        }
+        for owner_id in cleared_tapers {
+            engine.mark("data_blocks", &owner_id, ChangeKind::Updated);
+        }
+        for data_id in data_to_delete {
+            if engine.doc.data_blocks.remove(&data_id).is_some() {
                 engine.mark("data_blocks", &data_id, ChangeKind::Deleted);
             }
         }

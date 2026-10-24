@@ -12,10 +12,10 @@
 //! FLOAT always remaps by INDEX, from the effective (OBJECT-resolved) slots.
 
 mod blender_map;
-mod cdt;
+pub(super) mod cdt;
 mod classify;
 mod dissolve;
-mod exact;
+pub(super) mod exact;
 mod float;
 mod float_connect;
 mod float_split_net;

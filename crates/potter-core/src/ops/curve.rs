@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
+
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom,
-    model::{CurveData, CurveFillMode, CurvePoint, DataBlock, Id, SurfaceData, TextObjectData},
+    model::{CurveData, CurvePoint, DataBlock, Id, SurfaceData, TextObjectData},
 };
 
 use super::{
@@ -45,12 +47,17 @@ fn create_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "name",
             "data_id",
             "splines",
+            "resolution_u",
             "dimensions",
             "bevel_depth",
             "bevel_resolution",
             "extrude",
             "taper",
+            "taper_radius_mode",
+            "use_map_taper",
             "fill_mode",
+            "fill_solver",
+            "fill_rule",
             "collection",
             "transform",
             "parent",
@@ -70,16 +77,22 @@ fn create_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         operation,
         &[
             "splines",
+            "resolution_u",
             "dimensions",
             "bevel_depth",
             "bevel_resolution",
             "extrude",
             "taper",
+            "taper_radius_mode",
+            "use_map_taper",
             "fill_mode",
+            "fill_solver",
+            "fill_rule",
         ],
         "",
     )?;
     validate_curve(engine, &curve, "")?;
+    validate_curve_taper(engine, &curve, &data_id, "taper")?;
     insert_data_block(
         engine,
         &data_id,
@@ -106,12 +119,17 @@ fn update_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         set,
         &[
             "splines",
+            "resolution_u",
             "dimensions",
             "bevel_depth",
             "bevel_resolution",
             "extrude",
             "taper",
+            "taper_radius_mode",
+            "use_map_taper",
             "fill_mode",
+            "fill_solver",
+            "fill_rule",
         ],
         "set",
     )?;
@@ -126,6 +144,7 @@ fn update_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
     merge_values(&mut updated, set);
     let updated: CurveData = decode_value(engine, updated, "set")?;
     validate_curve(engine, &updated, "set")?;
+    validate_curve_taper(engine, &updated, &data_id, "set/taper")?;
     if updated == curve {
         return Ok(false);
     }
@@ -315,9 +334,14 @@ fn convert_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
         .get(&data_id)
         .and_then(|block| block.curve.as_ref())
         .ok_or_else(|| super::geometry_data::missing_payload(engine, "curve", "target"))?;
-    reject_taper_object(engine, curve, "target")?;
-    reject_multiple_fill_contours(engine, curve, "target")?;
-    let mesh = geom::curve::evaluate_curve(curve).map_err(|error| {
+    let taper_profiles =
+        crate::eval::curve_taper_profiles(engine.doc, std::slice::from_ref(&node_id))?;
+    let taper_profile = curve
+        .taper
+        .as_ref()
+        .and_then(|taper| taper_profiles.get(taper))
+        .map(Vec::as_slice);
+    let mesh = geom::curve::evaluate_curve_with_taper(curve, taper_profile).map_err(|error| {
         engine.error(
             ErrorCode::InvalidOperation,
             format!("curve geometry is invalid: {error}"),
@@ -814,45 +838,8 @@ fn merge_values(destination: &mut Value, source: &Map<String, Value>) {
     }
 }
 
-fn reject_taper_object(engine: &Engine<'_>, curve: &CurveData, pointer: &str) -> Result<()> {
-    let Some(taper) = curve.taper.as_ref() else {
-        return Ok(());
-    };
-    Err(PotError::with_details(
-        ErrorCode::UnsupportedFeature,
-        "curve taper-object evaluation is not supported",
-        json!({
-            "operation_index": engine.operation_index,
-            "pointer": operation_pointer(engine.operation_index, pointer),
-            "feature_id": "curve.taper_object",
-            "taper": taper,
-        }),
-    ))
-}
-
-fn reject_multiple_fill_contours(
-    engine: &Engine<'_>,
-    curve: &CurveData,
-    pointer: &str,
-) -> Result<()> {
-    if curve.fill_mode == CurveFillMode::None || curve.splines.len() <= 1 {
-        return Ok(());
-    }
-    Err(PotError::with_details(
-        ErrorCode::UnsupportedFeature,
-        "multiple 2D fill contours are not supported",
-        json!({
-            "operation_index": engine.operation_index,
-            "pointer": operation_pointer(engine.operation_index, pointer),
-            "feature_id": "curve.fill.multiple_contours",
-        }),
-    ))
-}
-
 fn validate_curve(engine: &Engine<'_>, curve: &CurveData, pointer: &str) -> Result<()> {
-    reject_taper_object(engine, curve, pointer)?;
-    reject_multiple_fill_contours(engine, curve, pointer)?;
-    geom::curve::evaluate_curve(curve)
+    geom::curve::evaluate_curve_with_taper(curve, Some(&[]))
         .map(|_| ())
         .map_err(|error| {
             engine.error(
@@ -861,4 +848,310 @@ fn validate_curve(engine: &Engine<'_>, curve: &CurveData, pointer: &str) -> Resu
                 &operation_pointer(engine.operation_index, pointer),
             )
         })
+}
+
+// Validate only the edited curve's dependency chain; unrelated data must not fail this operation.
+
+fn validate_curve_taper(
+    engine: &Engine<'_>,
+    root_curve: &CurveData,
+    root_id: &Id,
+    pointer: &str,
+) -> Result<()> {
+    fn visit(
+        engine: &Engine<'_>,
+        id: &Id,
+        root_curve: &CurveData,
+        root_id: &Id,
+        pointer: &str,
+        active: &mut Vec<Id>,
+        complete: &mut BTreeSet<Id>,
+    ) -> Result<()> {
+        if let Some(start) = active.iter().position(|active_id| active_id == id) {
+            let mut cycle: Vec<String> = active[start..].iter().map(ToString::to_string).collect();
+            cycle.push(id.to_string());
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("curve taper dependency cycle: {}", cycle.join(" -> ")),
+                &operation_pointer(engine.operation_index, pointer),
+            ));
+        }
+        if complete.contains(id) {
+            return Ok(());
+        }
+        let curve = if id == root_id {
+            root_curve
+        } else {
+            let block = engine.doc.data_blocks.get(id).ok_or_else(|| {
+                engine.error(
+                    ErrorCode::DependencyMissing,
+                    "curve taper references a missing Data-Block",
+                    &operation_pointer(engine.operation_index, pointer),
+                )
+            })?;
+            if block.data_type != "curve" {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "curve taper reference is not a curve Data-Block",
+                    &operation_pointer(engine.operation_index, pointer),
+                ));
+            }
+            block.curve.as_ref().ok_or_else(|| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    "curve taper reference is not a curve Data-Block",
+                    &operation_pointer(engine.operation_index, pointer),
+                )
+            })?
+        };
+
+        active.push(id.clone());
+        if let Some(taper) = &curve.taper {
+            visit(
+                engine, taper, root_curve, root_id, pointer, active, complete,
+            )?;
+        }
+        active.pop();
+        complete.insert(id.clone());
+        Ok(())
+    }
+
+    visit(
+        engine,
+        root_id,
+        root_curve,
+        root_id,
+        pointer,
+        &mut Vec::new(),
+        &mut BTreeSet::new(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "unit tests assert operation contracts")]
+
+    use super::super::apply_batch;
+    use crate::{
+        error::ErrorCode,
+        model::{Id, SceneDoc},
+    };
+    use serde_json::{Value, json};
+
+    fn batch(doc: &SceneDoc, operations: Value) -> Value {
+        let mut batch = json!({
+            "schema_version": 1,
+            "base_revision": doc.revision,
+        });
+        batch["operations"] = operations;
+        batch
+    }
+
+    fn curve_create(id: &str, data_id: &str, taper: Option<&str>) -> Value {
+        let mut operation = json!({
+            "op": "curve.create",
+            "id": id,
+            "data_id": data_id,
+            "splines": [{
+                "type": "poly",
+                "points": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}],
+            }],
+        });
+        if let Some(taper) = taper {
+            operation["taper"] = json!(taper);
+        }
+        operation
+    }
+
+    #[test]
+    fn curve_create_and_update_reject_missing_and_non_curve_tapers() {
+        let base = SceneDoc::new("scene-test".to_owned());
+        let missing = apply_batch(
+            &base,
+            &batch(
+                &base,
+                json!([curve_create("owner", "owner_data", Some("missing"))]),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(missing.code, ErrorCode::DependencyMissing);
+        assert_eq!(missing.details["operation_index"], json!(0));
+        assert_eq!(missing.details["pointer"], json!("/operations/0/taper"));
+
+        // Blender 5.2.2's displist_calc_taper returns 1 for non-curves; reject references before evaluation.
+
+        let created = apply_batch(
+            &base,
+            &batch(
+                &base,
+                json!([
+                    {"op":"node.create","id":"box","kind":"box","params":{"size":1.0}},
+                    curve_create("owner", "owner_data", Some("box_mesh")),
+                ]),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(created.code, ErrorCode::InvalidOperation);
+        assert_eq!(created.details["operation_index"], json!(1));
+
+        let valid = apply_batch(
+            &base,
+            &batch(
+                &base,
+                json!([
+                    {"op":"node.create","id":"box","kind":"box","params":{"size":1.0}},
+                    curve_create("owner", "owner_data", None),
+                ]),
+            ),
+        )
+        .unwrap();
+        let missing_update = apply_batch(
+            &valid.doc,
+            &batch(
+                &valid.doc,
+                json!([{"op":"curve.update","target":{"id":"owner"},"set":{"taper":"missing"}}]),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(missing_update.code, ErrorCode::DependencyMissing);
+        assert_eq!(
+            missing_update.details["pointer"],
+            json!("/operations/0/set/taper")
+        );
+
+        let non_curve_update = apply_batch(
+            &valid.doc,
+            &batch(
+                &valid.doc,
+                json!([{"op":"curve.update","target":{"id":"owner"},"set":{"taper":"box_mesh"}}]),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(non_curve_update.code, ErrorCode::InvalidOperation);
+    }
+
+    #[test]
+    fn curve_create_and_update_reject_taper_cycles_at_operation_time() {
+        let base = SceneDoc::new("scene-test".to_owned());
+        let self_cycle = apply_batch(
+            &base,
+            &batch(
+                &base,
+                json!([curve_create("self", "self_data", Some("self_data"))]),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(self_cycle.code, ErrorCode::InvalidOperation);
+        assert!(self_cycle.message.contains("curve taper dependency cycle"));
+
+        let created = apply_batch(
+            &base,
+            &batch(
+                &base,
+                json!([
+                    curve_create("first", "first_data", None),
+                    curve_create("second", "second_data", None),
+                ]),
+            ),
+        )
+        .unwrap();
+        let cycle = apply_batch(
+            &created.doc,
+            &batch(
+                &created.doc,
+                json!([
+                    {"op":"curve.update","target":{"id":"first"},"set":{"taper":"second_data"}},
+                    {"op":"curve.update","target":{"id":"second"},"set":{"taper":"first_data"}},
+                ]),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(cycle.code, ErrorCode::InvalidOperation);
+        assert_eq!(cycle.details["operation_index"], json!(1));
+        assert!(cycle.message.contains("curve taper dependency cycle"));
+    }
+
+    #[test]
+    fn deleting_taper_data_with_cascade_clears_surviving_curve_reference() {
+        let base = SceneDoc::new("scene-test".to_owned());
+        let created = apply_batch(
+            &base,
+            &batch(
+                &base,
+                json!([
+                    curve_create("profile", "profile_data", None),
+                    curve_create("owner", "owner_data", Some("profile_data")),
+                ]),
+            ),
+        )
+        .unwrap();
+        let deleted = apply_batch(
+            &created.doc,
+            &batch(
+                &created.doc,
+                json!([{"op":"node.delete","target":{"id":"profile"},"cascade_data":true}]),
+            ),
+        )
+        .unwrap();
+        let owner_data = Id::new("owner_data").unwrap();
+        assert!(
+            !deleted
+                .doc
+                .data_blocks
+                .contains_key(&Id::new("profile_data").unwrap())
+        );
+        assert_eq!(
+            deleted.doc.data_blocks[&owner_data]
+                .curve
+                .as_ref()
+                .unwrap()
+                .taper,
+            None
+        );
+        assert_eq!(
+            deleted.changes["data_blocks"]["updated"],
+            json!(["owner_data"])
+        );
+    }
+
+    #[test]
+    fn curve_update_does_not_validate_unrelated_taper_dependencies() {
+        let base = SceneDoc::new("scene-test".to_owned());
+        let created = apply_batch(
+            &base,
+            &batch(
+                &base,
+                json!([
+                    curve_create("unrelated", "unrelated_data", None),
+                    curve_create("target", "target_data", None),
+                ]),
+            ),
+        )
+        .unwrap();
+        let mut doc = created.doc;
+        doc.data_blocks
+            .get_mut(&Id::new("unrelated_data").unwrap())
+            .unwrap()
+            .curve
+            .as_mut()
+            .unwrap()
+            .taper = Some(Id::new("missing").unwrap());
+
+        let updated = apply_batch(
+            &doc,
+            &batch(
+                &doc,
+                json!([{"op":"curve.update","target":{"id":"target"},"set":{"bevel_depth":0.25}}]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            updated.doc.data_blocks[&Id::new("target_data").unwrap()]
+                .curve
+                .as_ref()
+                .unwrap()
+                .bevel_depth,
+            0.25
+        );
+    }
 }

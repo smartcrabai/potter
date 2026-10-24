@@ -1,0 +1,301 @@
+[
+  {
+    "op": "curve.create",
+    "id": "taper_profile",
+    "data_id": "taper_profile_data",
+    "name": "Taper Profile",
+    "dimensions": "two_d",
+    "fill_mode": "none",
+    "splines": [
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.0, 0.25, 0.0] },
+          { "co": [0.5, 0.5, 0.0] },
+          { "co": [1.0, 1.0, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": false,
+        "resolution": 1,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "taper_override",
+    "name": "Taper Override",
+    "dimensions": "three_d",
+    "bevel_depth": 0.2,
+    "bevel_resolution": 2,
+    "taper": "taper_profile_data",
+    "taper_radius_mode": "override",
+    "use_map_taper": false,
+    "splines": [
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.0, 0.0, 0.0], "radius": 0.35 },
+          { "co": [0.5, 0.0, 0.0], "radius": 0.85 },
+          { "co": [4.0, 0.0, 0.0], "radius": 1.4 }
+        ],
+        "order": 2,
+        "cyclic": false,
+        "resolution": 1,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "taper_multiply",
+    "name": "Taper Multiply Mapped",
+    "dimensions": "three_d",
+    "bevel_depth": 0.2,
+    "bevel_resolution": 2,
+    "taper": "taper_profile_data",
+    "taper_radius_mode": "multiply",
+    "use_map_taper": true,
+    "splines": [
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.0, 0.0, 0.0], "radius": 0.35 },
+          { "co": [0.5, 0.0, 0.0], "radius": 0.85 },
+          { "co": [4.0, 0.0, 0.0], "radius": 1.4 }
+        ],
+        "order": 2,
+        "cyclic": false,
+        "resolution": 1,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "taper_add",
+    "name": "Taper Add",
+    "dimensions": "three_d",
+    "bevel_depth": 0.2,
+    "bevel_resolution": 2,
+    "taper": "taper_profile_data",
+    "taper_radius_mode": "add",
+    "use_map_taper": false,
+    "splines": [
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.0, 0.0, 0.0], "radius": 0.35 },
+          { "co": [0.5, 0.0, 0.0], "radius": 0.85 },
+          { "co": [4.0, 0.0, 0.0], "radius": 1.4 }
+        ],
+        "order": 2,
+        "cyclic": false,
+        "resolution": 1,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "taper_2d_contours",
+    "name": "2D Tapered Contours",
+    "dimensions": "two_d",
+    "fill_mode": "none",
+    "bevel_depth": 0.2,
+    "bevel_resolution": 2,
+    "taper": "taper_profile_data",
+    "taper_radius_mode": "override",
+    "use_map_taper": false,
+    "splines": [
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.0, 0.0, 0.0] },
+          { "co": [2.0, 0.0, 0.0] },
+          { "co": [2.0, 2.0, 0.0] },
+          { "co": [0.0, 2.0, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": true,
+        "resolution": 1,
+        "use_endpoint": true
+      },
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.5, 0.5, 0.0] },
+          { "co": [1.5, 0.5, 0.0] },
+          { "co": [1.5, 1.5, 0.0] },
+          { "co": [0.5, 1.5, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": true,
+        "resolution": 1,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "bevelled_taper_source",
+    "data_id": "bevelled_taper_source_data",
+    "name": "Bevelled Taper Source",
+    "dimensions": "two_d",
+    "fill_mode": "none",
+    "bevel_depth": 0.2,
+    "bevel_resolution": 2,
+    "splines": [
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.0, 1.0, 0.0] },
+          { "co": [1.0, 0.0, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": false,
+        "resolution": 1,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "bevelled_taper_host",
+    "name": "Curve Using Bevelled Taper Source",
+    "dimensions": "three_d",
+    "bevel_depth": 0.2,
+    "bevel_resolution": 2,
+    "taper": "bevelled_taper_source_data",
+    "taper_radius_mode": "override",
+    "use_map_taper": false,
+    "splines": [
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.0, 0.0, 0.0] },
+          { "co": [1.0, 0.0, 0.0] },
+          { "co": [4.0, 0.0, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": false,
+        "resolution": 1,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "filled",
+    "name": "Outer, Hole, and Two Islands",
+    "dimensions": "two_d",
+    "resolution_u": 6,
+    "fill_mode": "front",
+    "fill_solver": "sweep_line",
+    "fill_rule": "nonzero",
+    "splines": [
+      {
+        "type": "poly",
+        "points": [
+          { "co": [0.0, 0.0, 0.0] },
+          { "co": [10.0, 0.0, 0.0] },
+          { "co": [10.0, 8.0, 0.0] },
+          { "co": [0.0, 8.0, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": true,
+        "resolution": 1,
+        "use_endpoint": true
+      },
+      {
+        "type": "poly",
+        "points": [
+          { "co": [3.0, 2.0, 0.0] },
+          { "co": [3.0, 6.0, 0.0] },
+          { "co": [7.0, 6.0, 0.0] },
+          { "co": [7.0, 2.0, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": true,
+        "resolution": 1,
+        "use_endpoint": true
+      },
+      {
+        "type": "poly",
+        "points": [
+          { "co": [12.0, 0.0, 0.0] },
+          { "co": [14.0, 0.0, 0.0] },
+          { "co": [14.0, 2.0, 0.0] },
+          { "co": [12.0, 2.0, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": true,
+        "resolution": 1,
+        "use_endpoint": true
+      },
+      {
+        "type": "poly",
+        "points": [
+          { "co": [16.0, 0.0, 0.0] },
+          { "co": [19.0, 0.0, 0.0] },
+          { "co": [19.0, 3.0, 0.0] },
+          { "co": [16.0, 3.0, 0.0] }
+        ],
+        "order": 2,
+        "cyclic": true,
+        "resolution": 1,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "nurbs_endpoint_on",
+    "name": "Open 2D NURBS Bevel Endpoint Enabled",
+    "dimensions": "two_d",
+    "resolution_u": 12,
+    "fill_mode": "none",
+    "bevel_depth": 0.35,
+    "bevel_resolution": 2,
+    "splines": [
+      {
+        "type": "nurbs",
+        "points": [
+          { "co": [0.0, 0.0, 0.0] },
+          { "co": [1.0, 0.0, 0.0] },
+          { "co": [1.0, 2.0, 0.0] },
+          { "co": [3.0, 2.0, 0.0] }
+        ],
+        "order": 3,
+        "cyclic": false,
+        "resolution": 12,
+        "use_endpoint": true
+      }
+    ]
+  },
+  {
+    "op": "curve.create",
+    "id": "nurbs_endpoint_off",
+    "name": "Open 2D NURBS Bevel Endpoint Disabled",
+    "dimensions": "two_d",
+    "resolution_u": 12,
+    "fill_mode": "none",
+    "bevel_depth": 0.35,
+    "bevel_resolution": 2,
+    "splines": [
+      {
+        "type": "nurbs",
+        "points": [
+          { "co": [0.0, 0.0, 0.0] },
+          { "co": [1.0, 0.0, 0.0] },
+          { "co": [1.0, 2.0, 0.0] },
+          { "co": [3.0, 2.0, 0.0] }
+        ],
+        "order": 3,
+        "cyclic": false,
+        "resolution": 12,
+        "use_endpoint": false
+      }
+    ]
+  }
+]
