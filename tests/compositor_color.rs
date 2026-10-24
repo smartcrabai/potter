@@ -93,7 +93,33 @@ fn cli_render_writes_requested_passes_as_multilayer_exr() -> Result<(), Box<dyn 
         "{}",
         String::from_utf8_lossy(&rendered.stdout)
     );
+    let first_hash = serde_json::from_slice::<serde_json::Value>(&rendered.stdout)?["result"]
+        ["frames"][0]["hash"]
+        .as_str()
+        .ok_or("first render hash is missing")?
+        .to_owned();
     let bytes = fs::read(output.join("frame_0001.exr"))?;
+    let second_output = directory.path().join("multilayer-exr-repeat");
+    let rerendered = pot()
+        .arg("render")
+        .arg(&scene)
+        .args(["--format", "exr", "--out"])
+        .arg(&second_output)
+        .arg("--json")
+        .output()?;
+    assert!(
+        rerendered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rerendered.stdout)
+    );
+    let repeated_bytes = fs::read(second_output.join("frame_0001.exr"))?;
+    assert_eq!(bytes, repeated_bytes, "repeated EXR render bytes differ");
+    let repeated_hash = serde_json::from_slice::<serde_json::Value>(&rerendered.stdout)?["result"]
+        ["frames"][0]["hash"]
+        .as_str()
+        .ok_or("repeated render hash is missing")?
+        .to_owned();
+    assert_eq!(first_hash, repeated_hash);
     assert_eq!(bytes.get(0..4), Some(&[0x76, 0x2f, 0x31, 0x01][..]));
     for layer in [
         "Combined",
@@ -111,6 +137,131 @@ fn cli_render_writes_requested_passes_as_multilayer_exr() -> Result<(), Box<dyn 
                 .any(|window| window == layer.as_bytes()),
             "EXR should include the `{layer}` layer",
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_sequence_and_file_output_exrs_have_repeatable_hashes() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let initialized = pot().arg("init").arg(&scene).arg("--json").output()?;
+    assert!(initialized.status.success());
+    apply(
+        &scene,
+        r#"{"schema_version":1,"base_revision":0,"operations":[
+            {"op":"node.create","id":"body","kind":"box","params":{"size":1},"transform":{"translation":[0,0,0.5]}},
+            {"op":"camera.create","id":"camera_main","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":3},
+            {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
+            {"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":64,"resolution_y":64,"samples":1}}
+        ]}"#,
+    )?;
+    let source_output = directory.path().join("source-render");
+    let source_render = pot()
+        .arg("render")
+        .arg(&scene)
+        .args(["--format", "exr", "--out"])
+        .arg(&source_output)
+        .arg("--json")
+        .output()?;
+    assert!(
+        source_render.status.success(),
+        "{}",
+        String::from_utf8_lossy(&source_render.stdout)
+    );
+    let source_exr = source_output.join("frame_0001.exr");
+    let file_output = directory.path().join("file-output.exr");
+    let sequence_operations = serde_json::json!({
+        "schema_version": 1,
+        "base_revision": 1,
+        "operations": [
+            {
+                "op": "sequencer.strip_create",
+                "id": "image_strip",
+                "type": "image",
+                "channel": 1,
+                "frame_start": 1.0,
+                "length": 2.0,
+                "source": source_exr.to_string_lossy()
+            },
+            {
+                "op": "render.update",
+                "target": {"id": "scene_main"},
+                "set": {"use_sequencer": true, "resolution_x": 256, "resolution_y": 256, "samples": 1}
+            },
+            {"op": "graph.create", "id": "graph_exr", "kind": "compositor"},
+            {"op": "compositor.node_add", "graph": "graph_exr", "id": "layers", "type": "CompositorNodeRLayers"},
+            {
+                "op": "compositor.node_add",
+                "graph": "graph_exr",
+                "id": "file",
+                "type": "CompositorNodeOutputFile",
+                "properties": {"path": file_output.to_string_lossy()}
+            },
+            {"op": "compositor.node_add", "graph": "graph_exr", "id": "composite", "type": "CompositorNodeComposite"},
+            {"op": "compositor.link", "graph": "graph_exr", "from_node": "layers", "from_socket": "Image", "to_node": "file", "to_socket": "Image"},
+            {"op": "compositor.link", "graph": "graph_exr", "from_node": "layers", "from_socket": "Image", "to_node": "composite", "to_socket": "Image"},
+            {"op": "compositor.enable", "target": {"id": "scene_main"}, "set": {"enabled": true, "graph": "graph_exr"}}
+        ]
+    });
+    apply(&scene, &sequence_operations.to_string())?;
+    let render = |output: &Path| {
+        pot()
+            .arg("render")
+            .arg(&scene)
+            .args(["--format", "exr", "--frames", "1:2", "--out"])
+            .arg(output)
+            .arg("--json")
+            .output()
+    };
+    let first_output = directory.path().join("sequence-render-a");
+    let first = render(&first_output)?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let first_file_output = fs::read(&file_output)?;
+    let first_envelope: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    let first_frames = first_envelope["result"]["frames"]
+        .as_array()
+        .ok_or("first sequence render has no frame hashes")?;
+
+    let second_output = directory.path().join("sequence-render-b");
+    let second = render(&second_output)?;
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let second_file_output = fs::read(&file_output)?;
+    assert_eq!(first_file_output, second_file_output);
+    let second_envelope: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    let second_frames = second_envelope["result"]["frames"]
+        .as_array()
+        .ok_or("repeated sequence render has no frame hashes")?;
+    assert_eq!(first_frames.len(), 2);
+    assert_eq!(first_frames.len(), second_frames.len());
+    for (first_frame, second_frame) in first_frames.iter().zip(second_frames) {
+        let first_hash = first_frame["hash"]
+            .as_str()
+            .ok_or("first sequence frame hash is missing")?;
+        let second_hash = second_frame["hash"]
+            .as_str()
+            .ok_or("repeated sequence frame hash is missing")?;
+        assert_eq!(first_hash, second_hash);
+        let first_bytes = fs::read(
+            first_frame["path"]
+                .as_str()
+                .ok_or("first sequence frame path is missing")?,
+        )?;
+        let second_bytes = fs::read(
+            second_frame["path"]
+                .as_str()
+                .ok_or("repeated sequence frame path is missing")?,
+        )?;
+        assert_eq!(first_bytes, second_bytes);
+        assert_eq!(potter_core::hash::sha256(&first_bytes), first_hash);
     }
     Ok(())
 }

@@ -2443,7 +2443,7 @@ fn write_exr(path: &Path, rgba: &[[f32; 4]], width: u32, height: u32) -> Result<
             "linear RGBA buffer dimensions do not match EXR output",
         ));
     }
-    exr::prelude::write_rgba_file(path, width_usize, height_usize, |x, y| {
+    crate::image::storage::write_rgba_exr_file(path, width_usize, height_usize, |x, y| {
         let pixel = rgba[y * width_usize + x];
         // The VSE frame is associated; alpha-zero RGB can contain additive camera-shape radiance.
         (pixel[0], pixel[1], pixel[2], pixel[3])
