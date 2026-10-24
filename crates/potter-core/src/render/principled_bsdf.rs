@@ -33,6 +33,10 @@ use super::principled_tables::{
     ggx_glass_energy_average, ggx_glass_inverse_energy, ggx_glass_inverse_energy_average,
     sheen_ltc,
 };
+use super::principled_thin_film::{
+    THICKNESS_CUTOFF, dielectric_fresnel as thin_film_dielectric_fresnel,
+    f82_fresnel as thin_film_f82_fresnel,
+};
 use super::subsurface::{channel_mask, raw_radius, subsurface_evaluated};
 use crate::model::RayKind;
 use crate::shader::{BsdfParams, dielectric_f0, make_orthonormals};
@@ -201,7 +205,7 @@ fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> 
 /// under the dielectric-layering weight, times reflectance, less the share the subsurface closure
 /// takes. The path tracer evaluates its view- and light-dependent BRDF.
 pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
-    diffuse_coefficient_with_roughness(params, layers, light, params.diffuse_roughness)
+    diffuse_coefficient_with_roughness(params, layers, light, params.diffuse_roughness, true)
 }
 
 fn diffuse_coefficient_with_roughness(
@@ -209,6 +213,7 @@ fn diffuse_coefficient_with_roughness(
     layers: &Layers,
     light: DVec3,
     diffuse_roughness: f64,
+    apply_thin_film: bool,
 ) -> DVec3 {
     diffuse_lobe(
         params,
@@ -218,6 +223,7 @@ fn diffuse_coefficient_with_roughness(
         light,
         layers.lower,
         diffuse_roughness,
+        apply_thin_film,
     )
 }
 
@@ -231,22 +237,35 @@ pub(crate) fn without_subsurface(params: &BsdfParams) -> BsdfParams {
 }
 
 /// The Lambert weight of the dielectric-layered diffuse lobe, before the 1/π and the albedo (Cycles' diffuse weight).
+/// Active thin film follows Cycles' fallback to the view-angle Fresnel when the roughness LUT is unavailable.
 fn diffuse_layer_weight(
     params: &BsdfParams,
     energy_roughness: f64,
     normal: DVec3,
     view: DVec3,
+    apply_thin_film: bool,
 ) -> f64 {
     let n_dot_v = normal.dot(view).max(0.0);
     let roughness = energy_roughness.clamp(MIN_ROUGHNESS, 1.0);
     let metallic = params.metallic.clamp(0.0, 1.0);
     let transmission = params.transmission.clamp(0.0, 1.0);
     let dielectric_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
-    match specular_layer(params) {
+    match specular_layer(params, apply_thin_film) {
         Some(layer) => {
-            let z = ((layer.eta - 1.0) / (layer.eta + 1.0)).abs().sqrt();
-            let albedo_remap = ggx_gen_schlick_ior_s(roughness, n_dot_v, z);
-            let albedo = layer.f0_tinted.lerp(DVec3::ONE, albedo_remap);
+            let albedo = if apply_thin_film && params.thin_film_thickness > THICKNESS_CUTOFF {
+                thin_film_dielectric_fresnel(
+                    n_dot_v,
+                    params.thin_film_thickness,
+                    params.thin_film_ior.max(1.0e-5),
+                    layer.eta,
+                    layer.f0_tinted,
+                )
+                .0
+            } else {
+                let z = ((layer.eta - 1.0) / (layer.eta + 1.0)).abs().sqrt();
+                let albedo_remap = ggx_gen_schlick_ior_s(roughness, n_dot_v, z);
+                layer.f0_tinted.lerp(DVec3::ONE, albedo_remap)
+            };
             let energy = ggx_energy(roughness, n_dot_v).max(1.0e-6);
             let darkened = albedo * dielectric_darkening(&layer, roughness, energy);
             layered_diffuse_weight(dielectric_weight, darkened.max_element())
@@ -295,7 +314,7 @@ pub(crate) fn subsurface_closure_weight(
     base_color(params)
         * covered
         * (params.subsurface_weight.clamp(0.0, 1.0)
-            * diffuse_layer_weight(params, energy_roughness, normal, view)
+            * diffuse_layer_weight(params, energy_roughness, normal, view, true)
             * params.reflectance.clamp(0.0, 1.0))
         * lower
 }
@@ -309,12 +328,13 @@ fn diffuse_lobe(
     light: DVec3,
     lower: DVec3,
     diffuse_roughness: f64,
+    apply_thin_film: bool,
 ) -> DVec3 {
     let n_dot_v = normal.dot(view).max(0.0);
     if n_dot_v <= 0.0 {
         return DVec3::ZERO;
     }
-    let weight = diffuse_layer_weight(params, energy_roughness, normal, view);
+    let weight = diffuse_layer_weight(params, energy_roughness, normal, view, apply_thin_film);
     let brdf = oren_nayar_brdf(base_color(params), diffuse_roughness, normal, view, light);
     diffuse_albedo(params)
         * subsurface_share(params)
@@ -375,10 +395,12 @@ pub(crate) fn specular_coefficient(params: &BsdfParams, layers: &Layers, light: 
         layers.view,
         light,
         layers.lower,
+        true,
     )
 }
 
 /// The specular lobe, given the coat's lower-layer factor (set up once by the caller).
+/// `apply_thin_film` is false for EEVEE's realtime lobe path, which ignores these sockets.
 fn specular_lobe(
     params: &BsdfParams,
     energy_roughness: f64,
@@ -386,6 +408,7 @@ fn specular_lobe(
     view: DVec3,
     light: DVec3,
     lower: DVec3,
+    apply_thin_film: bool,
 ) -> DVec3 {
     let n_dot_v = normal.dot(view).max(0.0);
     let n_dot_l = normal.dot(light).max(0.0);
@@ -416,10 +439,21 @@ fn specular_lobe(
     let dielectric_weight = ((1.0 - metallic) * (1.0 - transmission)).max(0.0);
     let mut reflected = DVec3::ZERO;
 
-    if let Some(layer) = specular_layer(params) {
+    if let Some(layer) = specular_layer(params, apply_thin_film) {
         let f0 = layer.f0_tinted;
-        let real_f = fresnel_dielectric(v_dot_h, layer.eta);
-        let fresnel = remapped_fresnel(f0, layer.eta, real_f);
+        let fresnel = if apply_thin_film && params.thin_film_thickness > THICKNESS_CUTOFF {
+            thin_film_dielectric_fresnel(
+                v_dot_h,
+                params.thin_film_thickness,
+                params.thin_film_ior.max(1.0e-5),
+                layer.eta,
+                f0,
+            )
+            .0
+        } else {
+            let real_f = fresnel_dielectric(v_dot_h, layer.eta);
+            remapped_fresnel(f0, layer.eta, real_f)
+        };
         let gain = multiscatter_gain(dielectric_fss(&layer), energy_average, missing);
         reflected += gain * fresnel * dielectric_weight;
     }
@@ -437,7 +471,17 @@ fn specular_lobe(
         } else {
             f82_tint_b(base, tint)
         };
-        let fresnel = f82_fresnel(v_dot_h, base, b);
+        let fresnel = if apply_thin_film && params.thin_film_thickness > THICKNESS_CUTOFF {
+            thin_film_f82_fresnel(
+                v_dot_h,
+                params.thin_film_thickness,
+                params.thin_film_ior.max(1.0e-5),
+                base,
+                b,
+            )
+        } else {
+            f82_fresnel(v_dot_h, base, b)
+        };
         let fss = f82_fss(base, b);
         let gain = multiscatter_gain(fss, energy_average, missing);
         reflected += gain * fresnel * metallic;
@@ -882,7 +926,7 @@ pub(crate) fn reflected_lobes_coefficient(
     ray_mask: u8,
 ) -> DVec3 {
     let diffuse = if ray_mask & RayKind::Diffuse.bit() != 0 {
-        diffuse_coefficient_with_roughness(params, layers, light, 0.0)
+        diffuse_coefficient_with_roughness(params, layers, light, 0.0, false)
             + sheen_coefficient(params, layers, light)
     } else {
         DVec3::ZERO
@@ -893,7 +937,15 @@ pub(crate) fn reflected_lobes_coefficient(
         DVec3::ZERO
     };
     let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
-        specular_coefficient(params, layers, light)
+        specular_lobe(
+            params,
+            layers.energy_roughness,
+            layers.specular,
+            layers.view,
+            light,
+            layers.lower,
+            false,
+        )
     } else {
         DVec3::ZERO
     };
@@ -985,16 +1037,16 @@ pub(super) fn specular_eta(params: &BsdfParams) -> f64 {
     if params.ior < 1.0 { 1.0 / eta } else { eta }
 }
 
-/// Cycles' specular setup: `f0 = F0(ior) * 2 * level`, `eta` from [`specular_eta`]. No specular layer when `eta == 1`.
+/// Cycles' specular setup: `f0 = F0(ior) * 2 * level`, `eta` from [`specular_eta`]. The layer exists when `eta != 1`, or when film is active.
 #[expect(
     clippy::float_cmp,
-    reason = "Cycles compares eta with exactly 1 to drop the specular layer"
+    reason = "Cycles compares eta with exactly 1 when no active film requires the layer"
 )]
-fn specular_layer(params: &BsdfParams) -> Option<SpecularLayer> {
+fn specular_layer(params: &BsdfParams, apply_thin_film: bool) -> Option<SpecularLayer> {
     let level = params.specular_ior_level.max(0.0);
     let f0_scalar = dielectric_f0(params.ior, level);
     let eta = specular_eta(params);
-    if eta == 1.0 {
+    if eta == 1.0 && !(apply_thin_film && params.thin_film_thickness > THICKNESS_CUTOFF) {
         return None;
     }
     let tint = DVec3::new(
@@ -1117,6 +1169,9 @@ const GLASS_SINGULAR_ALPHA_SQUARED: f64 = 2.0e-10;
 /// Transmission Weight (`kernel/svm/closure.h`) and the Glass BSDF node both build it.
 #[derive(Clone, Copy, Debug)]
 struct GlassLobe {
+    /// Thin-film coating in nanometers, with its IOR adjusted for a back-facing surface.
+    thin_film_thickness: f64,
+    thin_film_ior: f64,
     /// Cycles' `bsdf->ior`: the closure's IOR, inverted at a back face.
     ior: f64,
     /// GGX `alpha`, the roughness squared (Cycles' `alpha_x`).
@@ -1144,6 +1199,12 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
     if (1.0 - metallic) * transmission <= 0.0 || cos_ni <= 0.0 {
         return None;
     }
+    // Thin Wall's two-interface thin-glass Fresnel remains unsupported.
+    let thin_film_thickness = if params.thin_wall {
+        0.0
+    } else {
+        params.thin_film_thickness
+    };
     let roughness = params.roughness.clamp(0.0, 1.0);
     let alpha = roughness * roughness;
     let input_ior = params.ior.max(1.0e-5);
@@ -1151,6 +1212,12 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
         1.0 / input_ior
     } else {
         input_ior
+    };
+    let thin_film_ior = params.thin_film_ior.max(1.0e-5);
+    let thin_film_ior = if params.back_facing && thin_film_thickness > THICKNESS_CUTOFF {
+        thin_film_ior / input_ior
+    } else {
+        thin_film_ior
     };
     // `generalized_schlick_setup` tints F0 of the closure's own IOR, which a back face does not invert.
     let f0 = (DVec3::from_array(params.specular_tint).max(DVec3::ZERO)
@@ -1189,6 +1256,8 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
     };
     let gain = multiscatter_gain(fss, energy_average, missing);
     Some(GlassLobe {
+        thin_film_thickness,
+        thin_film_ior,
         ior,
         alpha,
         f0,
@@ -1205,8 +1274,18 @@ impl GlassLobe {
     /// transmittance at the cosine `cos_hi` between the half vector and the view, and the cosine of the
     /// refracted angle.
     fn fresnel(&self, cos_hi: f64) -> (DVec3, DVec3, f64) {
-        let (real, cos_ht) = dielectric_fresnel(cos_hi, self.ior);
-        let fresnel = remapped_fresnel(self.f0, self.ior, real);
+        let (fresnel, cos_ht) = if self.thin_film_thickness > THICKNESS_CUTOFF {
+            thin_film_dielectric_fresnel(
+                cos_hi,
+                self.thin_film_thickness,
+                self.thin_film_ior,
+                self.ior,
+                self.f0,
+            )
+        } else {
+            let (real, cos_ht) = dielectric_fresnel(cos_hi, self.ior);
+            (remapped_fresnel(self.f0, self.ior, real), cos_ht)
+        };
         (
             fresnel * self.reflection_tint,
             (DVec3::ONE - fresnel) * self.transmission_tint,
@@ -1740,6 +1819,8 @@ mod glass_tests {
         // follows the view, so it is not reciprocal). The back lobe is the front one seen from below.
         let ior = 1.5;
         let front = GlassLobe {
+            thin_film_thickness: 0.0,
+            thin_film_ior: 1.33,
             ior,
             alpha: 0.25,
             f0: DVec3::splat(dielectric_f0(ior, 0.5)),
