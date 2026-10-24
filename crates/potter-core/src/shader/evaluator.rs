@@ -40,13 +40,11 @@ pub(crate) fn principled_glass_tint(base: [f64; 4]) -> [f64; 3] {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 4] {
+) -> [Option<(&'static str, &'static str)>; 3] {
     [
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
         (params.thin_film_thickness > 0.0)
             .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
-        (params.diffuse_roughness > 0.0)
-            .then_some(("shader.principled.diffuse_roughness", "Diffuse Roughness")),
         params
             .thin_wall
             .then_some(("shader.principled.thin_wall", "Thin Wall")),
@@ -213,8 +211,8 @@ pub struct BsdfParams {
     pub anisotropic_rotation: f64,
     pub thin_film_thickness: f64,
     pub thin_film_ior: f64,
-    /// Oren-Nayar roughness of the diffuse lobe. Potter's diffuse lobe is Lambert, so a value above
-    /// zero is reported as unevaluated (Cycles `bsdf_oren_nayar_setup`).
+    /// Oren-Nayar roughness of the diffuse lobe (`bsdf_oren_nayar_setup`); Cycles uses the
+    /// improved energy-preserving model when this is at least 1e-5.
     pub diffuse_roughness: f64,
     /// Thin Wall (Cycles' `thin_wall`, `svm/closure.h`): the thin branch replaces the BSSRDF with the thin-subsurface
     /// closure. Potter evaluates that closure's diffuse reflection (`subsurface_share`), but not its translucent
@@ -1483,9 +1481,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                 Ok(self.closure_value(&params))
             }
             NodeKind::Diffuse => {
-                // Blender's Diffuse BSDF is a Lambert lobe with no specular. Its Roughness input is Oren-Nayar, which
-                // Potter does not evaluate, so the default dielectric layer must not come from it: keeping it made a
-                // roughness-0 floor under a sun a 1600x GGX spike (`source/blender/nodes/shader/nodes/node_shader_bsdf_diffuse.cc`).
+                // Blender's Diffuse BSDF has no specular layer; its Roughness selects the same
+                // Oren-Nayar closure as Principled's Diffuse Roughness.
                 let mut params = self.diffuse(node_id)?;
                 params.specular_ior_level = 0.0;
                 Ok(self.closure_value(&params))
@@ -1731,6 +1728,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let mut params = self.closure_params();
         params.base_color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
+        params.diffuse_roughness = params.roughness;
         params.normal = normalize_or(
             self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
             self.hit_ctx.normal,

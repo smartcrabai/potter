@@ -197,16 +197,27 @@ fn half_vector_pdf(normal: DVec3, roughness: f64, view: DVec3, light: DVec3) -> 
     pdf_half / (4.0 * v_dot_h).max(1.0e-8)
 }
 
-/// Diffuse lobe of the Principled BSDF: Lambert under the dielectric-layering weight, times reflectance, less the
-/// share the subsurface closure takes. This is the lobe `evaluate_masked` uses, so the path tracer's direct light keeps the
-/// share. The raster preview has no subsurface closure and shades the lobe without it (`without_subsurface`).
-pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers) -> DVec3 {
+/// Diffuse lobe of the Principled BSDF: Cycles' improved energy-preserving Oren-Nayar closure
+/// under the dielectric-layering weight, times reflectance, less the share the subsurface closure
+/// takes. The path tracer evaluates its view- and light-dependent BRDF.
+pub(crate) fn diffuse_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
+    diffuse_coefficient_with_roughness(params, layers, light, params.diffuse_roughness)
+}
+
+fn diffuse_coefficient_with_roughness(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    diffuse_roughness: f64,
+) -> DVec3 {
     diffuse_lobe(
         params,
         layers.energy_roughness,
         layers.normal,
         layers.view,
+        light,
         layers.lower,
+        diffuse_roughness,
     )
 }
 
@@ -295,18 +306,63 @@ fn diffuse_lobe(
     energy_roughness: f64,
     normal: DVec3,
     view: DVec3,
+    light: DVec3,
     lower: DVec3,
+    diffuse_roughness: f64,
 ) -> DVec3 {
     let n_dot_v = normal.dot(view).max(0.0);
     if n_dot_v <= 0.0 {
         return DVec3::ZERO;
     }
     let weight = diffuse_layer_weight(params, energy_roughness, normal, view);
+    let brdf = oren_nayar_brdf(base_color(params), diffuse_roughness, normal, view, light);
     diffuse_albedo(params)
         * subsurface_share(params)
-        * (weight / PI)
+        * brdf
+        * weight
         * params.reflectance.clamp(0.0, 1.0)
         * lower
+}
+
+fn oren_nayar_brdf(
+    color: DVec3,
+    roughness: f64,
+    normal: DVec3,
+    view: DVec3,
+    light: DVec3,
+) -> DVec3 {
+    let sigma = roughness.clamp(0.0, 1.0);
+    if sigma < 1.0e-5 {
+        return DVec3::splat(1.0 / PI);
+    }
+    let a = 1.0 / (PI + sigma * (FRAC_PI_2 - 2.0 / 3.0));
+    let b = sigma * a;
+    let nl = normal.dot(light).max(0.0);
+    let nv = normal.dot(view).max(0.0);
+    let mut t = light.dot(view) - nl * nv;
+    if t > 0.0 {
+        t /= nl.max(nv) + f64::MIN_POSITIVE;
+    }
+    let single_scatter = a + b * t;
+    let e_avg = a * PI + ((2.0 * PI - 5.6) / 3.0) * b;
+    let albedo = color.clamp(DVec3::ZERO, DVec3::ONE).to_array();
+    let multi_scatter = DVec3::from_array(albedo.map(|channel| {
+        channel * channel * (e_avg / (1.0 - e_avg)) / PI / (1.0 - channel * (1.0 - e_avg))
+    }));
+    let e_v = a * PI + b * oren_nayar_g(nv);
+    let e_l = a * PI + b * oren_nayar_g(nl);
+    DVec3::splat(single_scatter) + multi_scatter * ((1.0 - e_v) * (1.0 - e_l))
+}
+
+fn oren_nayar_g(cos_theta: f64) -> f64 {
+    let cos_theta = cos_theta.clamp(0.0, 1.0);
+    if cos_theta < 1.0e-6 {
+        return FRAC_PI_2 - 2.0 / 3.0 - cos_theta;
+    }
+    let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+    let theta = cos_theta.acos();
+    sin_theta * (theta - 2.0 / 3.0 - sin_theta * cos_theta)
+        + 2.0 / 3.0 * (sin_theta / cos_theta) * (1.0 - sin_theta * sin_theta * sin_theta)
 }
 
 /// Specular (dielectric and metallic) lobes along `light`, times reflectance. Zero when the
@@ -805,7 +861,7 @@ pub(crate) fn above_shading_coefficient(
     ray_mask: u8,
 ) -> DVec3 {
     let diffuse = if ray_mask & RayKind::Diffuse.bit() != 0 {
-        diffuse_coefficient(params, layers) + sheen_coefficient(params, layers, light)
+        diffuse_coefficient(params, layers, light) + sheen_coefficient(params, layers, light)
     } else {
         DVec3::ZERO
     };
@@ -817,21 +873,31 @@ pub(crate) fn above_shading_coefficient(
     diffuse + coat
 }
 
-/// The reflected lobes of `params` at `light` that a ray mask admits, without the glass lobe and without the shading-side
-/// gate: the realtime raster's reflective term, which shades the diffuse lobe without subsurface (`without_subsurface`).
-/// The caller gates it where the raster does.
+/// The reflected lobes that EEVEE's realtime raster admits, without the glass lobe or shading-side
+/// gate. EEVEE ignores Principled Diffuse Roughness, so its diffuse lobe stays Lambertian.
 pub(crate) fn reflected_lobes_coefficient(
     params: &BsdfParams,
     layers: &Layers,
     light: DVec3,
     ray_mask: u8,
 ) -> DVec3 {
+    let diffuse = if ray_mask & RayKind::Diffuse.bit() != 0 {
+        diffuse_coefficient_with_roughness(params, layers, light, 0.0)
+            + sheen_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    let coat = if ray_mask & RayKind::Glossy.bit() != 0 {
+        coat_coefficient(params, layers, light)
+    } else {
+        DVec3::ZERO
+    };
     let specular = if ray_mask & RayKind::Glossy.bit() != 0 {
         specular_coefficient(params, layers, light)
     } else {
         DVec3::ZERO
     };
-    above_shading_coefficient(params, layers, light, ray_mask) + specular
+    diffuse + coat + specular
 }
 
 /// The glass lobe towards `light`, kept where the light's ray mask admits glossy or transmission. A glass closure is
@@ -2174,6 +2240,60 @@ mod single_bounce_tests {
             [3.286_944_471_765_309_6; 3],
             [1.506_987_510_377_347_2e-4; 3],
         );
+    }
+
+    #[test]
+    fn single_bounce_diffuse_roughness_matches_blender() {
+        // tests/fixtures/native_oracle/principled/single_bounce_diffuse_roughness_means.json.
+        let mut params = native([0.8, 0.5, 0.3, 1.0], 0.0);
+        params.specular_ior_level = 0.0;
+        for (name, roughness, mean, stderr) in [
+            (
+                "diffuse_roughness_r000",
+                0.0,
+                [
+                    3.286_944_471_765_309_6,
+                    2.054_340_287_926_607,
+                    1.232_604_213_408_194_5,
+                ],
+                [
+                    1.506_987_510_377_347e-4,
+                    9.419_285_210_001_831e-5,
+                    5.651_711_707_477_082e-5,
+                ],
+            ),
+            (
+                "diffuse_roughness_r050",
+                0.5,
+                [
+                    2.417_323_027_970_269_3,
+                    1.420_870_922_971_516_8,
+                    0.831_206_352_915_614_8,
+                ],
+                [
+                    1.327_489_060_053_661_6e-4,
+                    7.681_696_530_561_993e-5,
+                    4.463_368_364_025_854e-5,
+                ],
+            ),
+            (
+                "diffuse_roughness_r100",
+                1.0,
+                [
+                    1.734_360_327_827_744_2,
+                    0.924_668_854_568_153_6,
+                    0.518_281_015_829_416,
+                ],
+                [
+                    9.696_798_072_425_371e-5,
+                    5.107_087_522_021_459e-5,
+                    2.846_036_588_622_309e-5,
+                ],
+            ),
+        ] {
+            params.diffuse_roughness = roughness;
+            assert_matches_oracle(name, &params, mean, stderr);
+        }
     }
 
     #[test]

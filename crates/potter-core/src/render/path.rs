@@ -463,7 +463,7 @@ impl Closures {
         let above = layers.normal.dot(light) > 0.0;
         let diffuse_admitted = ray_mask & RayKind::Diffuse.bit() != 0;
         let diffuse = if above && diffuse_admitted {
-            diffuse_coefficient(params, layers)
+            diffuse_coefficient(params, layers, light)
         } else {
             DVec3::ZERO
         };

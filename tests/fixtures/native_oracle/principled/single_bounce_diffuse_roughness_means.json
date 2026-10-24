@@ -1,0 +1,47 @@
+{
+  "provenance": {
+    "blender": "5.2.2",
+    "hash": "d13f752e3b9c4f8c261cda552b1021f8bcc0382c",
+    "engine": "CYCLES",
+    "device": "CPU",
+    "threads": 1,
+    "samples_per_pixel": 4096,
+    "seeds": 16,
+    "resolution": [16, 16],
+    "patch": "central 8x8",
+    "generator": "tests/fixtures/native_oracle/principled/single_bounce_probe.py with PROBE_DIAMETER=2.4 and PROBE_VARIANTS=diffuse_roughness_r000,diffuse_roughness_r050,diffuse_roughness_r100,diffuse_bsdf_r050",
+    "geometry": {
+      "receiver": "plane at origin, normal +Z",
+      "view_theta_deg": 45.0,
+      "view_distance": 6.0,
+      "light_distance": 4.0,
+      "light_diameter": 2.4,
+      "power": 1000.0,
+      "world": "black"
+    },
+    "material": {
+      "base_color": [0.8, 0.5, 0.3],
+      "metallic": 0.0,
+      "specular_ior_level": 0.0
+    },
+    "stderr": "standard error across 16 independent Blender seeds"
+  },
+  "variants": {
+    "diffuse_roughness_r000": {
+      "mean": [3.2869444717653096, 2.054340287926607, 1.2326042134081945],
+      "stderr": [0.0001506987510377347, 0.00009419285210001831, 0.00005651711707477082]
+    },
+    "diffuse_roughness_r050": {
+      "mean": [2.4173230279702693, 1.4208709229715168, 0.8312063529156148],
+      "stderr": [0.00013274890600536616, 0.00007681696530561993, 0.00004463368364025854]
+    },
+    "diffuse_roughness_r100": {
+      "mean": [1.7343603278277442, 0.9246688545681536, 0.518281015829416],
+      "stderr": [0.00009696798072425371, 0.00005107087522021459, 0.00002846036588622309]
+    },
+    "diffuse_bsdf_r050": {
+      "mean": [2.4173230279702693, 1.4208709229715168, 0.8312063529156148],
+      "stderr": [0.00013274890600536616, 0.00007681696530561993, 0.00004463368364025854]
+    }
+  }
+}
