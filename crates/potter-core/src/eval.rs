@@ -39,6 +39,7 @@ fn mesh_to_volume_default(parameter: &str) -> Result<&'static Value> {
 }
 
 pub mod animation;
+mod fcurve_modifiers;
 mod ik_solver;
 pub mod rig;
 const EVALUATION_ENGINE: &str = "potter-eval-5";
