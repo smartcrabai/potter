@@ -256,6 +256,13 @@ fn complete_scene_schema(root: &mut Value) {
     defs["color_management"] = json!({"type":"object","required":["display_device","view_transform","look","exposure","gamma","curve"],"properties":{"display_device":{"type":"string"},"view_transform":{"enum":["standard","ag_x","filmic","raw","false_color"]},"look":{"type":"string"},"exposure":{"type":"number"},"gamma":{"type":"number"},"curve":{"anyOf":[{"type":"null"},{"$ref":"#/$defs/curve_mapping"}]}},"additionalProperties":false});
     defs["curve_mapping"] = json!({"type":"object","required":["tone","extend_extrapolate","use_clip","clip","black","white","curves"],"properties":{"tone":{"enum":["standard","film_like"]},"extend_extrapolate":{"type":"boolean"},"use_clip":{"type":"boolean"},"clip":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"black":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"white":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"curves":{"type":"array","items":{"type":"object","required":["points"],"properties":{"points":{"type":"array","minItems":2,"items":{"type":"object","required":["location","handle"],"properties":{"location":{"$ref":"#/$defs/vec2"},"handle":{"enum":["auto","auto_clamped","vector"]}},"additionalProperties":false}}},"additionalProperties":false},"minItems":4,"maxItems":4}},"additionalProperties":false});
     defs["sequencer"] = json!({"type":"object","required":["channels","strips"],"properties":{"channels":{"type":"integer","minimum":0,"maximum":u32::MAX},"strips":{"type":"array","items":{"type":"object","required":["id","name","type","channel","frame_start","frame_offset_start","frame_offset_end","length","blend_type","opacity","mute","retiming_keys","modifiers","sound_volume","sound_pan","sound_pitch","source","color","text","transition","inputs","effect"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"type":{"enum":["image","image_sequence","movie","sound","scene","color","text","meta","transition","effect"]},"channel":{"type":"integer","minimum":0,"maximum":u32::MAX},"frame_start":{"type":"number"},"frame_offset_start":{"type":"number"},"frame_offset_end":{"type":"number"},"length":{"type":"number"},"blend_type":{"enum":["replace","alpha_over","add","subtract","multiply"]},"opacity":{"type":"number","minimum":0,"maximum":1},"mute":{"type":"boolean"},"retiming_keys":{"type":"array","items":{"type":"object","required":["frame","source_frame"],"properties":{"frame":{"type":"number"},"source_frame":{"type":"number"}},"additionalProperties":false}},"modifiers":{"type":"array","items":{"type":"object","required":["brightness","contrast","color_balance","curves"],"properties":{"brightness":{"type":"number"},"contrast":{"type":"number"},"color_balance":{"$ref":"#/$defs/vec3"},"curves":{"type":"array","items":{"$ref":"#/$defs/vec2"}}},"additionalProperties":false}},"sound_volume":{"type":"number","minimum":0},"sound_pan":{"type":"number","minimum":-1,"maximum":1},"sound_pitch":{"type":"number","exclusiveMinimum":0},"source":{"type":["string","null"]},"color":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"text":{"type":["string","null"]},"transition":{"enum":["cross","gamma_cross","wipe",null]},"inputs":{"type":"array","items":{"type":"string"}},"effect":{"enum":["add","subtract","multiply","alpha_over","transform","speed","glow","gaussian_blur",null]}},"additionalProperties":false}}},"additionalProperties":false});
+    defs["sequencer"]["properties"]["colorspace"] = json!({"enum":["srgb","linear"]});
+    defs["sequencer"]["properties"]["strips"]["items"]["properties"]["multiply_alpha"] =
+        json!({"type":"boolean"});
+    defs["sequencer"]["properties"]["strips"]["items"]["properties"]["color_multiply"] =
+        json!({"type":"number","minimum":0,"maximum":20});
+    defs["sequencer"]["properties"]["strips"]["items"]["properties"]["source_files"] =
+        json!({"type":"array","items":{"type":"string"},"default":[]});
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["channel"]["minimum"] =
         json!(1);
     let scene = &mut defs["scene"];
@@ -308,6 +315,18 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["eevee_light_threshold"] = json!({"type":"number","minimum":0.0});
     render["properties"]["eevee_use_volumetric_shadows"] =
         json!({"type":"boolean","default":false});
+    render["properties"]["eevee_volumetric_tile_size"] =
+        json!({"type":"integer","enum":[1,2,4,8,16],"default":8});
+    render["properties"]["eevee_volumetric_samples"] =
+        json!({"type":"integer","minimum":1,"maximum":256,"default":64});
+    render["properties"]["eevee_volumetric_sample_distribution"] =
+        json!({"type":"number","minimum":0,"maximum":1,"default":0.8});
+    render["properties"]["eevee_use_volume_custom_range"] =
+        json!({"type":"boolean","default":false});
+    render["properties"]["eevee_volumetric_start"] =
+        json!({"type":"number","exclusiveMinimum":0,"default":0.1});
+    render["properties"]["eevee_volumetric_end"] =
+        json!({"type":"number","exclusiveMinimum":0,"default":100.0});
     render["required"] = json!([
         "resolution_x",
         "resolution_y",
@@ -346,6 +365,8 @@ fn complete_scene_schema(root: &mut Value) {
     render["properties"]["filter_glossy"] = json!({"type":"number","minimum":0,"maximum":10});
     render["properties"]["volume_bounces"] = json!({"type":"integer","minimum":0,"maximum":1024});
 
+    defs["light"]["properties"]["sun_angle"] =
+        json!({"type":"number","minimum":0,"maximum":std::f64::consts::PI});
     defs["node"]["properties"]["kind"]["enum"] =
         json!(["empty", "mesh", "camera", "light", "armature"]);
     let material = &mut defs["material"];
@@ -1928,6 +1949,47 @@ fn operation_contract(name: &str) -> OperationContract {
             "none",
             json!({}),
         ),
+        "sequencer.strip_create" => (
+            vec![
+                "target",
+                "id",
+                "name",
+                "type",
+                "channel",
+                "frame_start",
+                "frame_offset_start",
+                "frame_offset_end",
+                "length",
+                "blend_type",
+                "opacity",
+                "color_multiply",
+                "multiply_alpha",
+                "mute",
+                "retiming_keys",
+                "modifiers",
+                "sound_volume",
+                "sound_pan",
+                "sound_pitch",
+                "source",
+                "source_files",
+                "color",
+                "text",
+                "transition",
+                "inputs",
+                "effect",
+            ],
+            vec!["op", "id", "type"],
+            "scene sequencer strip",
+            "none",
+            json!({"name":"id","source_files":[]}),
+        ),
+        "sequencer.strip_update" => (
+            vec!["target", "id", "set"],
+            vec!["op", "id", "set"],
+            "scene sequencer strip",
+            "none",
+            json!({}),
+        ),
         "resource.pack" => (
             vec!["id", "uri", "kind", "sequence"],
             vec!["op", "id", "uri"],
@@ -2096,9 +2158,25 @@ fn field_schema(operation: &str, field: &str) -> Value {
             _ => common_field_schema(field),
         };
     }
+    if matches!(
+        operation,
+        "sequencer.strip_create" | "sequencer.strip_update"
+    ) && field == "source"
+    {
+        return json!({"type":["string","null"]});
+    }
+    if matches!(
+        operation,
+        "sequencer.strip_create" | "sequencer.strip_update"
+    ) && field == "source_files"
+    {
+        return json!({"type":"array","items":{"type":"string"},"default":[]});
+    }
     if field == "target" {
         if [
             "scene.update",
+            "sequencer.strip_create",
+            "sequencer.strip_update",
             "action.update",
             "action.delete",
             "world.update",
@@ -2563,6 +2641,43 @@ fn set_schema(operation: &str) -> Value {
             "root_collection":{"$ref":"#/$defs/id"},
             "unit":{"type":"object","properties":{"system":{"type":"string"},"scale_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false}
         }),
+        "sequencer.strip_update" => {
+            let mut properties = Map::new();
+            for field in [
+                "type",
+                "channel",
+                "name",
+                "frame_start",
+                "frame_offset_start",
+                "frame_offset_end",
+                "length",
+                "blend_type",
+                "opacity",
+                "mute",
+                "retiming_keys",
+                "color_multiply",
+                "multiply_alpha",
+                "modifiers",
+                "sound_volume",
+                "sound_pan",
+                "sound_pitch",
+                "source",
+                "source_files",
+                "color",
+                "text",
+                "transition",
+                "inputs",
+                "effect",
+            ] {
+                let schema = if matches!(field, "source" | "source_files") {
+                    field_schema(operation, field)
+                } else {
+                    json!({})
+                };
+                properties.insert(field.to_owned(), schema);
+            }
+            Value::Object(properties)
+        }
         "collection.update" => json!({"name":{"type":"string"},"exclude":{"type":"boolean"}}),
         "node.update" => json!({
             "name":{"type":"string"},"tags":{"type":"array","items":id_schema()},
@@ -2637,6 +2752,12 @@ fn set_schema(operation: &str) -> Value {
             "filter_glossy":{"type":"number","minimum":0,"maximum":10},
             "film_transparent":{"type":"boolean"},
             "eevee_use_volumetric_shadows":{"type":"boolean","default":false},
+            "eevee_volumetric_tile_size":{"type":"integer","enum":[1,2,4,8,16]},
+            "eevee_volumetric_samples":{"type":"integer","minimum":1,"maximum":256},
+            "eevee_volumetric_sample_distribution":{"type":"number","minimum":0,"maximum":1},
+            "eevee_use_volume_custom_range":{"type":"boolean"},
+            "eevee_volumetric_start":{"type":"number","exclusiveMinimum":0},
+            "eevee_volumetric_end":{"type":"number","exclusiveMinimum":0},
             "filter_size":{"type":"number","minimum":0,"maximum":500},
             "engine":{"enum":["path","realtime"]},
             "use_sequencer":{"type":"boolean"},

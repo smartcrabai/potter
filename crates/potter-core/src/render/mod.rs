@@ -4,6 +4,7 @@ mod bvh;
 mod eevee_ltc;
 mod eevee_transmission;
 mod eevee_transmission_tables;
+mod eevee_volume_resolve;
 mod light_model;
 mod path;
 mod pick;

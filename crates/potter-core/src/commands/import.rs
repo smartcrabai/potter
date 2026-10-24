@@ -286,6 +286,18 @@ fn asset_record(digest: &str) -> Value {
     json!({ "name": "blob", "hash": digest, "path": format!("assets/sha256/{hex}/blob") })
 }
 
+fn resource_reference_key(path: &str) -> String {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 fn configure_blender_resources(
     doc: &mut SceneDoc,
     staged_assets: &BTreeMap<String, Vec<u8>>,
@@ -349,7 +361,7 @@ fn configure_blender_resources(
             }));
         }
         if let Some(original_path) = original_path.as_ref() {
-            reference_uris.insert(original_path.clone(), uri.clone());
+            reference_uris.insert(resource_reference_key(original_path), uri.clone());
         }
         if let Some(resource) = doc.resources.get_mut(&id) {
             resource["uri"] = json!(uri);
@@ -371,16 +383,21 @@ fn configure_blender_resources(
         let Some(text) = data.text.as_mut() else {
             continue;
         };
-        if let Some(uri) = reference_uris.get(&text.font) {
+        if let Some(uri) = reference_uris.get(&resource_reference_key(&text.font)) {
             text.font.clone_from(uri);
         }
     }
     for scene in doc.scenes.values_mut() {
         for strip in &mut scene.sequencer.strips {
             if let Some(source) = strip.source.as_ref()
-                && let Some(uri) = reference_uris.get(source)
+                && let Some(uri) = reference_uris.get(&resource_reference_key(source))
             {
                 strip.source.clone_from(&Some(uri.clone()));
+            }
+            for source_file in &mut strip.source_files {
+                if let Some(uri) = reference_uris.get(&resource_reference_key(source_file)) {
+                    source_file.clone_from(uri);
+                }
             }
         }
     }
@@ -848,6 +865,60 @@ mod tests {
         let scene = imported.scenes.get(&base.active_scene).unwrap();
         assert_eq!(scene.world, Some(base_world));
         assert_eq!(scene.camera, Some(base_camera));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blender_resource_reference_paths_rewrite_canonical_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("frame.exr");
+        let alias = directory.path().join("alias.exr");
+        fs::write(&original, b"image").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+
+        let digest = "sha256:frame-hash";
+        let uri = "assets/sha256/frame-hash/frame.exr";
+        let mut doc = SceneDoc::new("resource_path_test".to_owned());
+        let resource_id = Id::new("resource_frame").unwrap();
+        doc.resources.insert(
+            resource_id,
+            json!({
+                "original_path": original.to_string_lossy(),
+                "hash": digest,
+                "filename": "frame.exr",
+                "status": "available",
+                "kind": "image_sequence",
+                "source_packed": false,
+            }),
+        );
+        let active_scene = doc.active_scene.clone();
+        let scene = doc.scenes.get_mut(&active_scene).unwrap();
+        scene.sequencer.strips.push(crate::sequencer::Strip {
+            kind: crate::sequencer::StripType::ImageSequence,
+            source_files: vec![alias.to_string_lossy().into_owned()],
+            ..crate::sequencer::Strip::default()
+        });
+        scene.sequencer.strips.push(crate::sequencer::Strip {
+            source: Some(alias.to_string_lossy().into_owned()),
+            ..crate::sequencer::Strip::default()
+        });
+        scene.sequencer.strips.push(crate::sequencer::Strip {
+            kind: crate::sequencer::StripType::Scene,
+            source: Some("scene_source".to_owned()),
+            ..crate::sequencer::Strip::default()
+        });
+
+        configure_blender_resources(
+            &mut doc,
+            &BTreeMap::from([(digest.to_owned(), b"image".to_vec())]),
+            AssetPolicy::Copy,
+        )
+        .unwrap();
+
+        let strips = &doc.scenes[&doc.active_scene].sequencer.strips;
+        assert_eq!(strips[0].source_files[0], uri);
+        assert_eq!(strips[1].source.as_deref(), Some(uri));
+        assert_eq!(strips[2].source.as_deref(), Some("scene_source"));
     }
 
     #[test]

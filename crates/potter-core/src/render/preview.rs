@@ -238,7 +238,9 @@ pub fn render_previews(
                 1,
                 0,
                 scene.render.filter_size,
+                realtime_film_exposure_scale(scene.color_management.exposure),
                 shader.as_deref(),
+                None,
                 None,
             )?
         };
@@ -404,6 +406,18 @@ pub(crate) fn render_camera_frame(
     } else {
         None
     };
+    let realtime_camera_lights = if engine == "realtime" && matches!(mode, Mode::Beauty) {
+        Some(super::path::prepare_realtime_camera_light_context(
+            doc,
+            &snapshot,
+            realtime_volume_transport.as_ref(),
+            &camera.camera,
+            width,
+            height,
+        )?)
+    } else {
+        None
+    };
     let mut volume_scratch = super::path::RealtimeVolumeScratch::default();
     let mut volume_pass = realtime_volume_transport.as_ref().map(|transport| {
         super::path::RealtimeVolumePass::new(transport, &geometry, &mut volume_scratch, seed)
@@ -439,7 +453,9 @@ pub(crate) fn render_camera_frame(
             samples,
             seed,
             scene.render.filter_size,
+            realtime_film_exposure_scale(scene.color_management.exposure),
             shader.as_deref(),
+            realtime_camera_lights.as_ref(),
             volume_pass.as_mut(),
         )?
     };
@@ -693,7 +709,9 @@ fn rasterize_view(
     samples: u32,
     seed: u32,
     filter_size: f64,
+    exposure_scale: f32,
     shader: Option<&dyn SurfaceShader>,
+    camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
 ) -> Result<RasterOutput> {
     if !matches!(mode, Mode::Wire) {
@@ -709,8 +727,10 @@ fn rasterize_view(
             samples,
             seed,
             filter_size,
+            exposure_scale,
             shader,
             geometry.prepared.as_slice(),
+            camera_lights,
             volume_pass,
         );
     }
@@ -1273,6 +1293,12 @@ fn safe_relative_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// EEVEE's `pow2f(exposure)` is the square of exposure, not `2^exposure`.
+fn realtime_film_exposure_scale(exposure: f64) -> f32 {
+    let exposure = exposure as f32;
+    exposure * exposure
 }
 
 #[cfg(test)]

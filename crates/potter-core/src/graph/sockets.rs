@@ -70,6 +70,9 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "GeometryNodeRepeatOutput"
             | "GeometryNodeBake"
             | "CompositorNodeRLayers"
+            | "CompositorNodeAlphaOver"
+            | "CompositorNodeBlur"
+            | "CompositorNodeOutputFile"
             | "CompositorNodeExposure"
             | "CompositorNodeComposite"
             | "CompositorNodeMask"
@@ -181,11 +184,25 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             sockets(MESH_OUT),
         ),
         "CompositorNodeRLayers" => (Vec::new(), sockets(&[("Image", "image")])),
+        "CompositorNodeAlphaOver" => (
+            sockets(&[
+                ("Factor", "float"),
+                ("Background", "image"),
+                ("Foreground", "image"),
+            ]),
+            sockets(&[("Image", "image")]),
+        ),
+        "CompositorNodeBlur" => (
+            sockets(&[("Image", "image"), ("Size", "vector")]),
+            sockets(&[("Image", "image")]),
+        ),
+        "CompositorNodeOutputFile" | "CompositorNodeComposite" => {
+            (sockets(&[("Image", "image")]), Vec::new())
+        }
         "CompositorNodeExposure" => (
             sockets(&[("Image", "image"), ("Exposure", "float")]),
             sockets(&[("Image", "image")]),
         ),
-        "CompositorNodeComposite" => (sockets(&[("Image", "image")]), Vec::new()),
         "CompositorNodeMask" => (Vec::new(), sockets(&[("Mask", "image")])),
         "GeometryNodeTransform" => (
             sockets(&[

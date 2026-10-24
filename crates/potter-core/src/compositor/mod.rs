@@ -18,6 +18,7 @@ use crate::{
     render::raster::RasterOutput,
 };
 
+use image::compositor_gaussian_blur;
 pub use image::{BlendMode, Image, gaussian_blur, mix_rgb};
 
 /// Applies compositor nodes (when enabled) and the selected display transform to render output.
@@ -46,28 +47,41 @@ pub(crate) fn apply(
                 "scene compositor reference must identify a compositor node group",
             ));
         }
+        let associated = output.linear_rgba_associated;
         let base = Image {
             width,
             height,
             pixels: output.linear_rgba.clone(),
         };
-        let composite = evaluate_graph(graph, &base, Some(output), doc, frame)?;
+        let composite =
+            evaluate_graph_with_association(graph, &base, Some(output), doc, frame, associated)?;
         output.linear_rgba = composite.pixels;
     }
     encode_display(
         &mut output.rgba,
         &output.linear_rgba,
         &scene.color_management,
+        output.linear_rgba_associated,
     )?;
     Ok(())
 }
 
-/// Applies the selected scene compositor to an already-linear image without display encoding.
-pub(crate) fn apply_image(
+/// Applies the scene compositor to associated float RGBA, preserving additive RGB at alpha zero.
+pub(crate) fn apply_associated_image(
     image: Image,
     doc: &SceneDoc,
     scene: &Scene,
     frame: f64,
+) -> Result<Image> {
+    apply_image_with_association(image, doc, scene, frame, true)
+}
+
+fn apply_image_with_association(
+    image: Image,
+    doc: &SceneDoc,
+    scene: &Scene,
+    frame: f64,
+    associated_alpha: bool,
 ) -> Result<Image> {
     if !scene.use_compositing {
         return Ok(image);
@@ -88,7 +102,7 @@ pub(crate) fn apply_image(
             "scene compositor reference must identify a compositor node group",
         ));
     }
-    evaluate_graph(graph, &image, None, doc, frame)
+    evaluate_graph_with_association(graph, &image, None, doc, frame, associated_alpha)
 }
 
 enum NodeOutput {
@@ -96,12 +110,13 @@ enum NodeOutput {
     RenderLayers,
 }
 
-fn evaluate_graph(
+fn evaluate_graph_with_association(
     graph: &NodeGroup,
     base: &Image,
     passes: Option<&RasterOutput>,
     doc: &SceneDoc,
     frame: f64,
+    associated_alpha: bool,
 ) -> Result<Image> {
     let mut pending: BTreeSet<Id> = graph.nodes.keys().cloned().collect();
     let mut rendered: BTreeMap<Id, NodeOutput> = BTreeMap::new();
@@ -130,7 +145,13 @@ fn evaluate_graph(
                                 "compositor render-layer node disappeared",
                             )
                         })?;
-                        render_layer(source_node, &link.from_socket, base, passes)?
+                        render_layer(
+                            source_node,
+                            &link.from_socket,
+                            base,
+                            passes,
+                            associated_alpha,
+                        )?
                     }
                 };
                 inputs.insert(link.to_socket.clone(), image);
@@ -154,14 +175,16 @@ fn evaluate_graph(
                     image
                 }
                 "CompositorNodeOutputFile" | "OutputFile" => {
-                    write_file_output(node, &image)?;
+                    write_file_output(node, &image, associated_alpha)?;
                     image
                 }
                 "CompositorNodeMixRGB" | "MixRGB" => mix_images(node, &inputs, base)?,
-                "CompositorNodeAlphaOver" | "AlphaOver" => alpha_over(node, &inputs, base)?,
+                "CompositorNodeAlphaOver" | "AlphaOver" => {
+                    alpha_over(node, &inputs, base, associated_alpha)?
+                }
                 "CompositorNodeBlur" | "Blur" => {
-                    let radius = property_u32(node, &["size_x", "radius"], 1)?.min(256);
-                    gaussian_blur(&image, radius)?
+                    let radius = blur_radius(node)?.min(256);
+                    compositor_gaussian_blur(&image, radius)?
                 }
                 "CompositorNodeGlare" | "Glare" => glare(node, &image)?,
                 "CompositorNodeDenoise" | "Denoise" => {
@@ -185,7 +208,12 @@ fn evaluate_graph(
                             "compositor gamma must be positive and finite",
                         ));
                     }
-                    map_rgb(&image, |value| value.max(0.0).powf(1.0 / gamma))
+                    let transform = |value: f32| value.max(0.0).powf(1.0 / gamma);
+                    if associated_alpha {
+                        map_gamma_rgb(&image, transform)
+                    } else {
+                        map_rgb(&image, transform)
+                    }
                 }
                 "CompositorNodeInvert" | "Invert" => {
                     let factor = scalar_default_value(node, &["Fac"], &["factor", "fac"], 1.0)?
@@ -283,6 +311,7 @@ fn render_layer(
     socket: &str,
     base: &Image,
     passes: Option<&RasterOutput>,
+    associated_alpha: bool,
 ) -> Result<Image> {
     let requested = node
         .inputs
@@ -348,11 +377,43 @@ fn render_layer(
         }
         "DiffCol" | "Albedo" | "albedo" => {
             let passes = passes.ok_or_else(|| unsupported_pass("albedo"))?;
-            Image::new(base.width, base.height, passes.albedo.clone())
+            let pixels = passes
+                .albedo
+                .iter()
+                .map(|pixel| {
+                    if associated_alpha {
+                        [
+                            pixel[0] * pixel[3],
+                            pixel[1] * pixel[3],
+                            pixel[2] * pixel[3],
+                            pixel[3],
+                        ]
+                    } else {
+                        *pixel
+                    }
+                })
+                .collect();
+            Image::new(base.width, base.height, pixels)
         }
         "Emit" | "Emission" | "emission" => {
             let passes = passes.ok_or_else(|| unsupported_pass("emission"))?;
-            Image::new(base.width, base.height, passes.emission.clone())
+            let pixels = passes
+                .emission
+                .iter()
+                .map(|pixel| {
+                    if associated_alpha {
+                        [
+                            pixel[0] * pixel[3],
+                            pixel[1] * pixel[3],
+                            pixel[2] * pixel[3],
+                            pixel[3],
+                        ]
+                    } else {
+                        *pixel
+                    }
+                })
+                .collect();
+            Image::new(base.width, base.height, pixels)
         }
         "ao" | "AO" => {
             let passes = passes.ok_or_else(|| unsupported_pass("ao"))?;
@@ -443,33 +504,61 @@ fn mix_images(node: &GraphNode, inputs: &BTreeMap<String, Image>, base: &Image) 
     Image::new(first.width, first.height, pixels)
 }
 
-fn alpha_over(node: &GraphNode, inputs: &BTreeMap<String, Image>, base: &Image) -> Result<Image> {
-    let foreground = match inputs.get("Image").or_else(|| inputs.get("Foreground")) {
+fn alpha_over(
+    node: &GraphNode,
+    inputs: &BTreeMap<String, Image>,
+    base: &Image,
+    associated_alpha: bool,
+) -> Result<Image> {
+    let foreground = match inputs.get("Foreground") {
         Some(image) => image.clone(),
         None => color_image(node, "foreground", base, [0.0; 3])?,
     };
-    let background = match inputs.get("Image_001").or_else(|| inputs.get("Background")) {
+    let background = match inputs.get("Background") {
         Some(image) => image.clone(),
         None => color_image(node, "background", base, [0.0; 3])?,
     };
     ensure_same_dimensions(&foreground, &background)?;
-    let factor =
-        scalar_default_value(node, &["Fac", "factor"], &["factor", "fac"], 1.0)?.clamp(0.0, 1.0);
+    let factor = scalar_default_value(node, &["Factor"], &["factor"], 1.0)?.clamp(0.0, 1.0);
+
     let pixels = foreground
         .pixels
         .iter()
         .zip(&background.pixels)
         .map(|(front, back)| {
             let alpha = front[3].clamp(0.0, 1.0) * factor;
+            let foreground_factor = if associated_alpha { factor } else { alpha };
             [
-                front[0] * alpha + back[0] * (1.0 - alpha),
-                front[1] * alpha + back[1] * (1.0 - alpha),
-                front[2] * alpha + back[2] * (1.0 - alpha),
+                front[0] * foreground_factor + back[0] * (1.0 - alpha),
+                front[1] * foreground_factor + back[1] * (1.0 - alpha),
+                front[2] * foreground_factor + back[2] * (1.0 - alpha),
                 alpha + back[3] * (1.0 - alpha),
             ]
         })
         .collect();
     Image::new(foreground.width, foreground.height, pixels)
+}
+
+fn blur_radius(node: &GraphNode) -> Result<u32> {
+    let Some(size) = node.inputs.get("Size") else {
+        return Ok(1);
+    };
+    let size = size
+        .as_array()
+        .filter(|size| size.len() == 2)
+        .ok_or_else(|| {
+            PotError::invalid_argument("compositor Blur Size must contain two values")
+        })?;
+    let radius = size[0]
+        .as_f64()
+        .filter(|radius| radius.is_finite())
+        .ok_or_else(|| PotError::invalid_argument("compositor Blur Size must be finite"))?;
+    if radius < 0.0 || radius.fract() != 0.0 || radius > f64::from(u32::MAX) {
+        return Err(PotError::invalid_argument(
+            "compositor Blur Size must be a nonnegative integer",
+        ));
+    }
+    Ok(radius as u32)
 }
 
 fn glare(node: &GraphNode, image: &Image) -> Result<Image> {
@@ -853,8 +942,8 @@ pub(crate) fn write_multilayer_exr(
                                 .linear_rgba
                                 .iter()
                                 .map(|pixel| {
-                                    // Associated alpha, as Blender's EXR reader expects: colour times alpha, alpha as is.
-                                    if index < 3 {
+                                    // EEVEE associated RGB before film resolve; path output is straight.
+                                    if index < 3 && !output.linear_rgba_associated {
                                         pixel[index] * pixel[3]
                                     } else {
                                         pixel[index]
@@ -1007,7 +1096,7 @@ fn validate_pass_length<T>(name: &str, values: &[T], expected: usize) -> Result<
     Ok(())
 }
 
-fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
+fn write_file_output(node: &GraphNode, image: &Image, associated_alpha: bool) -> Result<()> {
     let path = property_text(node, &["path", "base_path", "file_path"])?.ok_or_else(|| {
         PotError::invalid_argument("compositor output file node requires a path property")
     })?;
@@ -1022,13 +1111,14 @@ fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
             image.height as usize,
             |x, y| {
                 let pixel = image.pixels[y * image.width as usize + x];
-                // Associated alpha, as Blender's EXR reader expects (the colour is multiplied by alpha).
-                (
-                    pixel[0] * pixel[3],
-                    pixel[1] * pixel[3],
-                    pixel[2] * pixel[3],
-                    pixel[3],
-                )
+                let channel = |index| {
+                    if associated_alpha {
+                        pixel[index]
+                    } else {
+                        pixel[index] * pixel[3]
+                    }
+                };
+                (channel(0), channel(1), channel(2), pixel[3])
             },
         )
         .map_err(|error| {
@@ -1041,8 +1131,13 @@ fn write_file_output(node: &GraphNode, image: &Image) -> Result<()> {
     }
     let mut data = Vec::with_capacity(image.pixels.len() * 4);
     for pixel in &image.pixels {
-        for channel in pixel {
-            data.push((channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+        for channel in 0..4 {
+            let value = if associated_alpha && channel < 3 && pixel[3] > 0.0 {
+                pixel[channel] / pixel[3]
+            } else {
+                pixel[channel]
+            };
+            data.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
         }
     }
     let file = fs::File::create(path).map_err(|error| PotError::io(&error))?;
@@ -1070,11 +1165,19 @@ pub(crate) fn encode_display_output(
     output: &mut RasterOutput,
     settings: &ColorManagement,
 ) -> Result<()> {
-    encode_display(&mut output.rgba, &output.linear_rgba, settings)
+    encode_display(
+        &mut output.rgba,
+        &output.linear_rgba,
+        settings,
+        output.linear_rgba_associated,
+    )
 }
 
-/// Applies scene color management and returns the image's display-encoded RGBA8 pixels.
-pub(crate) fn encode_image_display(image: &Image, settings: &ColorManagement) -> Result<Vec<u8>> {
+/// Applies scene color management to associated float RGBA and returns display-encoded pixels.
+pub(crate) fn encode_associated_image_display(
+    image: &Image,
+    settings: &ColorManagement,
+) -> Result<Vec<u8>> {
     let length = image.pixels.len().checked_mul(4).ok_or_else(|| {
         PotError::new(
             ErrorCode::LimitExceeded,
@@ -1082,11 +1185,16 @@ pub(crate) fn encode_image_display(image: &Image, settings: &ColorManagement) ->
         )
     })?;
     let mut bytes = vec![0; length];
-    encode_display(&mut bytes, &image.pixels, settings)?;
+    encode_display(&mut bytes, &image.pixels, settings, true)?;
     Ok(bytes)
 }
 
-fn encode_display(bytes: &mut [u8], pixels: &[[f32; 4]], settings: &ColorManagement) -> Result<()> {
+fn encode_display(
+    bytes: &mut [u8],
+    pixels: &[[f32; 4]],
+    settings: &ColorManagement,
+    associated_alpha: bool,
+) -> Result<()> {
     if bytes.len() != pixels.len().saturating_mul(4) {
         return Err(PotError::new(
             ErrorCode::RenderFailed,
@@ -1102,7 +1210,13 @@ fn encode_display(bytes: &mut [u8], pixels: &[[f32; 4]], settings: &ColorManagem
     }
     let encoder = settings.display_encoder()?;
     for (pixel, linear) in encoded_pixels.iter_mut().zip(pixels) {
-        let display = encoder.encode([linear[0], linear[1], linear[2]])?;
+        let alpha = linear[3];
+        let rgb = if associated_alpha && alpha > 0.0 {
+            [linear[0] / alpha, linear[1] / alpha, linear[2] / alpha]
+        } else {
+            [linear[0], linear[1], linear[2]]
+        };
+        let display = encoder.encode(rgb)?;
         for channel in 0..3 {
             pixel[channel] = (display[channel] * 255.0).round() as u8;
         }
@@ -1155,6 +1269,25 @@ fn map_rgb(image: &Image, mut transform: impl FnMut(f32) -> f32) -> Image {
                     transform(pixel[0]),
                     transform(pixel[1]),
                     transform(pixel[2]),
+                    pixel[3],
+                ]
+            })
+            .collect(),
+    }
+}
+fn map_gamma_rgb(image: &Image, mut transform: impl FnMut(f32) -> f32) -> Image {
+    Image {
+        width: image.width,
+        height: image.height,
+        pixels: image
+            .pixels
+            .iter()
+            .map(|pixel| {
+                let alpha = if pixel[3] > 0.0 { pixel[3] } else { 1.0 };
+                [
+                    transform(pixel[0] / alpha) * alpha,
+                    transform(pixel[1] / alpha) * alpha,
+                    transform(pixel[2] / alpha) * alpha,
                     pixel[3],
                 ]
             })

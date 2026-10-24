@@ -1245,6 +1245,47 @@ fn is_default_filter_width<T: Copy + Into<f64>>(value: &T) -> bool {
     equal_f64((*value).into(), DEFAULT_FILTER_WIDTH)
 }
 
+fn default_eevee_volumetric_tile_size() -> u32 {
+    8
+}
+
+fn is_default_eevee_volumetric_tile_size<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64((*value).into(), 8.0)
+}
+
+fn default_eevee_volumetric_samples() -> u32 {
+    64
+}
+
+fn is_default_eevee_volumetric_samples<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64((*value).into(), 64.0)
+}
+
+fn default_eevee_volumetric_sample_distribution() -> f64 {
+    0.8
+}
+
+// Blender stores these RNA factors and distances as floats.
+fn is_default_eevee_volumetric_sample_distribution<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64(f64::from((*value).into() as f32), f64::from(0.8_f32))
+}
+
+fn default_eevee_volumetric_start() -> f64 {
+    0.1
+}
+
+fn is_default_eevee_volumetric_start<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64(f64::from((*value).into() as f32), f64::from(0.1_f32))
+}
+
+fn default_eevee_volumetric_end() -> f64 {
+    100.0
+}
+
+fn is_default_eevee_volumetric_end<T: Copy + Into<f64>>(value: &T) -> bool {
+    equal_f64(f64::from((*value).into() as f32), f64::from(100.0_f32))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenderSettings {
@@ -1305,6 +1346,34 @@ pub struct RenderSettings {
         skip_serializing_if = "is_default_light_threshold"
     )]
     pub eevee_light_threshold: f64,
+    /// EEVEE's volume resolve settings (`scene.eevee`), omitted at Blender defaults.
+    #[serde(
+        default = "default_eevee_volumetric_tile_size",
+        skip_serializing_if = "is_default_eevee_volumetric_tile_size"
+    )]
+    pub eevee_volumetric_tile_size: u32,
+    #[serde(
+        default = "default_eevee_volumetric_samples",
+        skip_serializing_if = "is_default_eevee_volumetric_samples"
+    )]
+    pub eevee_volumetric_samples: u32,
+    #[serde(
+        default = "default_eevee_volumetric_sample_distribution",
+        skip_serializing_if = "is_default_eevee_volumetric_sample_distribution"
+    )]
+    pub eevee_volumetric_sample_distribution: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub eevee_use_volume_custom_range: bool,
+    #[serde(
+        default = "default_eevee_volumetric_start",
+        skip_serializing_if = "is_default_eevee_volumetric_start"
+    )]
+    pub eevee_volumetric_start: f64,
+    #[serde(
+        default = "default_eevee_volumetric_end",
+        skip_serializing_if = "is_default_eevee_volumetric_end"
+    )]
+    pub eevee_volumetric_end: f64,
     /// Blender's `Scene.eevee.use_volumetric_shadows`; disabled by default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub eevee_use_volumetric_shadows: bool,
@@ -1343,6 +1412,20 @@ impl RenderSettings {
                 "Cycles filter_width is outside Blender RNA range 0.01..=10",
             ));
         }
+        if !matches!(self.eevee_volumetric_tile_size, 1 | 2 | 4 | 8 | 16)
+            || !(1..=256).contains(&self.eevee_volumetric_samples)
+            || !self.eevee_volumetric_sample_distribution.is_finite()
+            || !(0.0..=1.0).contains(&self.eevee_volumetric_sample_distribution)
+            || !self.eevee_volumetric_start.is_finite()
+            || self.eevee_volumetric_start <= 0.0
+            || !self.eevee_volumetric_end.is_finite()
+            || self.eevee_volumetric_end <= 0.0
+        {
+            return Err(PotError::new(
+                ErrorCode::SceneInvalid,
+                "EEVEE volumetric settings are outside Blender RNA ranges",
+            ));
+        }
         Ok(())
     }
 }
@@ -1369,6 +1452,12 @@ impl Default for RenderSettings {
             passes: vec!["combined".to_owned()],
             cryptomatte_accurate: false,
             eevee_light_threshold: default_light_threshold(),
+            eevee_volumetric_tile_size: default_eevee_volumetric_tile_size(),
+            eevee_volumetric_samples: default_eevee_volumetric_samples(),
+            eevee_volumetric_sample_distribution: default_eevee_volumetric_sample_distribution(),
+            eevee_use_volume_custom_range: false,
+            eevee_volumetric_start: default_eevee_volumetric_start(),
+            eevee_volumetric_end: default_eevee_volumetric_end(),
             eevee_use_volumetric_shadows: false,
             motion_blur: false,
             shutter: default_shutter(),
@@ -3306,6 +3395,29 @@ mod tests {
             value["collections"]["collection_root"]["objects"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn render_settings_keep_eevee_volumetric_defaults_implicit_for_old_projects() {
+        let render: super::RenderSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(render.eevee_volumetric_tile_size, 8);
+        assert_eq!(render.eevee_volumetric_samples, 64);
+        assert_eq!(render.eevee_volumetric_sample_distribution, 0.8);
+        assert!(!render.eevee_use_volume_custom_range);
+        assert_eq!(render.eevee_volumetric_start, 0.1);
+        assert_eq!(render.eevee_volumetric_end, 100.0);
+
+        let value = serde_json::to_value(render).unwrap();
+        for field in [
+            "eevee_volumetric_tile_size",
+            "eevee_volumetric_samples",
+            "eevee_volumetric_sample_distribution",
+            "eevee_use_volume_custom_range",
+            "eevee_volumetric_start",
+            "eevee_volumetric_end",
+        ] {
+            assert!(value.get(field).is_none(), "{field} should be omitted");
+        }
     }
 
     #[test]

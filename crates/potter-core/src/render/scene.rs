@@ -914,13 +914,13 @@ pub(super) fn extract_geometry(
                                 _ => match material.alpha_mode.as_str() {
                                     "blend" => AlphaMode::Blend,
                                     "clip" => AlphaMode::Clip,
-                                    // EEVEE dithers a DITHERED graph's transparency; blending its alpha matches the dither's
-                                    // expectation. Potter's raster has no per-sample dither, so the blend stands in for it.
+                                    // Potter keeps the DITHERED graph's expected coverage in the existing opacity/tint
+                                    // model while retaining its separate depth-writing class for camera light shapes.
                                     "opaque"
                                         if matches!(mode, Mode::Beauty)
                                             && material.node_tree.is_some() =>
                                     {
-                                        AlphaMode::Blend
+                                        AlphaMode::Dithered
                                     }
                                     _ => AlphaMode::Opaque,
                                 },
@@ -1839,15 +1839,14 @@ fn world_face_normals(
 /// (`scripts/startup/bl_ui/properties_object.py`, `OBJECT_PT_visibility`, EEVEE branch): a mesh has
 /// Camera, Shadow and Raycast, and a light has Camera, Diffuse, Glossy, Transmission and Volume Scatter.
 /// EEVEE has no mesh diffuse, glossy, transmission or volume flag, so realtime warns about none of
-/// those. A light's camera visibility shows its emitter in EEVEE (`eevee_light_shape_display`, which
-/// returns unless `visible_camera`; a headless EEVEE render shows the disc), and realtime draws no
-/// emitters. EEVEE applies a light's transmission and volume scatter to its power (`eevee_light.cc`,
+/// those. A light's camera visibility shows its emitter in realtime as in EEVEE (`eevee_light_shape_display`), so it
+/// warns about none of the light's flags except the two below.
+/// EEVEE applies a light's transmission and volume scatter to its power (`eevee_light.cc`,
 /// `transmission_visibility` and `volume_visibility`), and realtime does not. The path tracer honours
 /// every flag. A light's `visible_shadow` is stored without a warning: Blender reads it nowhere
 /// (Cycles' `light_object_visibility_flags`, EEVEE's `eevee_light.cc`).
 fn ray_visibility_warnings(node_id: &Id, node: &Node, warnings: &mut Vec<serde_json::Value>) {
-    const REALTIME_LIGHT: [(&str, RayKind); 3] = [
-        ("camera", RayKind::Camera),
+    const REALTIME_LIGHT: [(&str, RayKind); 2] = [
         ("transmission", RayKind::Transmission),
         ("volume_scatter", RayKind::VolumeScatter),
     ];

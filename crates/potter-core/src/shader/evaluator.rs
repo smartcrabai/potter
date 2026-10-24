@@ -248,7 +248,7 @@ pub struct ShaderClosure {
 
 /// The shading of one hit: the surface's closures and the volume closures of its Volume output. Cycles
 /// sums volume closures, so the medium is built from their weighted coefficients.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SurfaceShading {
     pub closures: Vec<ShaderClosure>,
     pub volume: Vec<ShaderClosure>,
@@ -270,14 +270,6 @@ pub(crate) fn heaviest<T>(items: &[T], weight: impl Fn(&T) -> f64) -> Option<&T>
     items
         .iter()
         .max_by(|first, second| weight(first).total_cmp(&weight(second)))
-}
-
-/// The Vec form of a single node closure, for the surface and volume outputs.
-fn single_closure(params: &BsdfParams) -> Vec<ShaderClosure> {
-    vec![ShaderClosure {
-        weight: 1.0,
-        params: *params,
-    }]
 }
 
 impl BsdfParams {
@@ -623,18 +615,35 @@ pub fn evaluate_surface_with_workspace(
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<SurfaceShading> {
-    workspace.reset();
-    let result = evaluate_surface_inner(material, prepared, hit_ctx, workspace);
-    workspace.reset();
-    result
+    let mut shading = SurfaceShading::default();
+    evaluate_surface_with_workspace_into(material, prepared, hit_ctx, workspace, &mut shading)?;
+    Ok(shading)
 }
 
-fn evaluate_surface_inner(
+/// Evaluates a material surface into caller-owned output and graph scratch.
+pub(crate) fn evaluate_surface_with_workspace_into(
     material: &Material,
     prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
-) -> Result<SurfaceShading> {
+    shading: &mut SurfaceShading,
+) -> Result<()> {
+    workspace.reset();
+    let result = evaluate_surface_inner_into(material, prepared, hit_ctx, workspace, shading);
+    workspace.reset();
+    result
+}
+
+fn evaluate_surface_inner_into(
+    material: &Material,
+    prepared: &PreparedMaterial,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+    shading: &mut SurfaceShading,
+) -> Result<()> {
+    shading.closures.clear();
+    shading.volume.clear();
+    shading.displacement_height = 0.0;
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
         record_unevaluated_inputs(hit_ctx.warnings, &material.name, None, &params);
@@ -642,16 +651,17 @@ fn evaluate_surface_inner(
         params.base_color = textured_base(material, hit_ctx, params.base_color)?;
         params.glass_transmission_tint = principled_glass_tint(params.base_color);
         // The material's volume coefficients are its Volume output, not a surface closure.
-        let volume = single_closure(&params);
-        let mut closures = single_closure(&without_volume(params));
-        for closure in &mut closures {
-            apply_material_textures(material, hit_ctx, &mut closure.params)?;
-        }
-        return Ok(SurfaceShading {
-            closures,
-            volume,
-            displacement_height: 0.0,
+        shading.volume.push(ShaderClosure {
+            weight: 1.0,
+            params,
         });
+        let mut surface_params = without_volume(params);
+        apply_material_textures(material, hit_ctx, &mut surface_params)?;
+        shading.closures.push(ShaderClosure {
+            weight: 1.0,
+            params: surface_params,
+        });
+        return Ok(());
     };
     let group = hit_ctx.node_groups.get(graph_id).ok_or_else(|| {
         PotError::with_details(
@@ -703,24 +713,31 @@ fn evaluate_surface_inner(
         links: prepared.link_index(graph_id, group),
     };
     // Only an unlinked Surface alongside a linked Volume is empty; other Shader sockets keep their defaults.
-    let mut closures = if !has_surface && has_volume {
-        Vec::new()
+    if !has_surface && has_volume {
+        shading.closures.clear();
     } else {
         let Value::Shader(surface) = evaluator.input(output, "Surface", ValueKind::Shader)? else {
             return Err(eval_error("material surface output is not a shader"));
         };
-        evaluator.workspace.closures_of(surface).to_vec()
-    };
+        shading
+            .closures
+            .extend_from_slice(evaluator.workspace.closures_of(surface));
+    }
     // The volume closures come from the Volume output alone. Without one, the material's own
     // coefficients stand, as they do for a material with no graph.
-    let volume = if has_volume {
+    if has_volume {
         let Value::Shader(volume) = evaluator.input(output, "Volume", ValueKind::Shader)? else {
             return Err(eval_error("material volume output is not a volume shader"));
         };
-        evaluator.workspace.closures_of(volume).to_vec()
+        shading
+            .volume
+            .extend_from_slice(evaluator.workspace.closures_of(volume));
     } else {
-        single_closure(&BsdfParams::from_material(material, hit_ctx.normal))
-    };
+        shading.volume.push(ShaderClosure {
+            weight: 1.0,
+            params: BsdfParams::from_material(material, hit_ctx.normal),
+        });
+    }
     // The Thickness socket, when linked, is the refraction thickness of the whole material (EEVEE's `nodetree_thickness`);
     // unlinked, the object's bounds decide it. The mode is the material's.
     let thickness = if group
@@ -748,16 +765,13 @@ fn evaluate_surface_inner(
     } else {
         0.0
     };
-    for closure in &mut closures {
+    for closure in &mut shading.closures {
         apply_material_textures(material, hit_ctx, &mut closure.params)?;
         closure.params.thickness = thickness;
         closure.params.thickness_slab = material.thickness_mode == ThicknessMode::Slab;
     }
-    Ok(SurfaceShading {
-        closures,
-        volume,
-        displacement_height,
-    })
+    shading.displacement_height = displacement_height;
+    Ok(())
 }
 
 /// The surface closure's parameters without volume coefficients: those belong to the Volume output.

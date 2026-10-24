@@ -2,16 +2,101 @@
 
 use std::{error::Error, fs, path::Path};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use super::{frame_output_names, render_camera_frame, render_vse_frame};
 use crate::{
     eval::{EvaluationContext, EvaluationPurpose, EvaluationSession},
-    model::{Scene, SceneDoc},
+    model::{Id, ImageColorspace, Scene, SceneDoc},
     ops::apply_batch,
-    sequencer::{EffectType, Strip, StripType, TransitionType},
+    sequencer::{
+        EffectType, RetimingKey, RgbaFrame, SequencerColorSpace, Strip, StripType, TransitionType,
+    },
 };
+
+fn camera_volume_doc(grid: &Value, render_samples: u32) -> Result<SceneDoc, Box<dyn Error>> {
+    const EYE_OFFSET: f64 = 0.2;
+    let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+    let mut doc = apply_batch(
+        &base,
+        &json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op":"camera.create","id":"camera_main","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2},
+                {"op":"camera.create","id":"camera_stereo","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2,"stereo_mode":"anaglyph","interocular_distance":EYE_OFFSET * 2.0},
+                {"op":"camera.create","id":"camera_stereo_sbs","transform":{"translation":[0,0,4]},"projection":"orthographic","ortho_scale":2,"stereo_mode":"side_by_side","interocular_distance":EYE_OFFSET * 2.0},
+                {"op":"camera.create","id":"camera_left","transform":{"translation":[-EYE_OFFSET,0,4]},"projection":"orthographic","ortho_scale":2},
+                {"op":"camera.create","id":"camera_right","transform":{"translation":[EYE_OFFSET,0,4]},"projection":"orthographic","ortho_scale":2},
+                {"op":"light.create","id":"emitter","light_type":"point","energy":100,"radius":2,"transform":{"translation":[0,0,0]}},
+                {"op":"node.update","target":{"id":"emitter"},"set":{"ray_visibility":{"camera":true}}},
+                {"op":"volume.create","id":"fog","grids":[grid]},
+                {"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main"}},
+                {"op":"render.update","target":{"id":"scene_main"},"set":{"samples":render_samples,"engine":"realtime"}}
+            ]
+        }),
+    )?.doc;
+    let emitter_id = Id::new("emitter")?;
+    let data_id = doc
+        .nodes
+        .get(&emitter_id)
+        .and_then(|node| node.data.as_ref())
+        .ok_or_else(|| std::io::Error::other("fixture emitter has no light data-block"))?
+        .clone();
+    let light = doc
+        .data_blocks
+        .get_mut(&data_id)
+        .and_then(|block| block.light.as_mut())
+        .ok_or_else(|| {
+            std::io::Error::other("fixture emitter data-block has no typed light payload")
+        })?;
+    light.volume_factor = 0.0;
+    Ok(doc)
+}
+
+fn render_realtime_image(
+    doc: &SceneDoc,
+    root: &Path,
+    camera_id: &str,
+    width: u32,
+    height: u32,
+    samples: u32,
+) -> Result<Vec<[f32; 4]>, Box<dyn Error>> {
+    let context = EvaluationContext {
+        scene_id: Some(doc.active_scene.clone()),
+        frame: Some(1.0),
+        purpose: EvaluationPurpose::Render,
+        ..EvaluationContext::default()
+    };
+    let cache_directory = root.join(".potter/cache");
+    let mut session = EvaluationSession::default();
+    let (_, raster, _) = render_camera_frame(
+        doc,
+        &context,
+        &mut session,
+        root,
+        &cache_directory,
+        camera_id,
+        width,
+        height,
+        "beauty",
+        "realtime",
+        false,
+        samples,
+        0,
+    )?;
+    Ok(raster.linear_rgba)
+}
+
+fn render_realtime_pixel(
+    doc: &SceneDoc,
+    root: &Path,
+    camera_id: &str,
+    samples: u32,
+) -> Result<[f32; 4], Box<dyn Error>> {
+    Ok(render_realtime_image(doc, root, camera_id, 1, 1, samples)?[0])
+}
 
 fn strip(id: &str, kind: StripType, channel: u32) -> Strip {
     Strip {
@@ -27,8 +112,10 @@ fn strip(id: &str, kind: StripType, channel: u32) -> Strip {
 fn scene_with_strips(strips: Vec<Strip>) -> (SceneDoc, Scene) {
     let mut doc = SceneDoc::default();
     let scene_id = doc.active_scene.clone();
-    doc.scenes.get_mut(&scene_id).unwrap().sequencer.strips = strips;
-    let scene = doc.scenes.get(&scene_id).unwrap().clone();
+    let scene = doc.scenes.get_mut(&scene_id).unwrap();
+    scene.sequencer.colorspace = SequencerColorSpace::Linear;
+    scene.sequencer.strips = strips;
+    let scene = scene.clone();
     (doc, scene)
 }
 
@@ -67,10 +154,195 @@ fn color_strip(id: &str, channel: u32, color: [f32; 4]) -> Strip {
     }
 }
 
+fn float_image_strip(
+    root: &Path,
+    id: &str,
+    channel: u32,
+    color: [f32; 4],
+) -> Result<Strip, Box<dyn Error>> {
+    let source = format!("{id}.exr");
+    super::write_exr(&root.join(&source), &[color], 1, 1)?;
+    Ok(Strip {
+        source: Some(source),
+        ..strip(id, StripType::Image, channel)
+    })
+}
+
 fn assert_pixel(actual: [f32; 4], expected: [f32; 4]) {
     for (actual, expected) in actual.into_iter().zip(expected) {
         assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
     }
+}
+
+#[test]
+fn sequencer_srgb_roundtrip_and_byte_transitions_preserve_storage_semantics()
+-> Result<(), Box<dyn Error>> {
+    let input = RgbaFrame::new(
+        2,
+        1,
+        vec![[0.2, 0.1, 0.05, 0.5], [0.25, 0.125, 0.0625, 0.0]],
+    )?;
+    let working = super::scene_to_sequencer(input.clone(), ImageColorspace::Srgb)?;
+    let restored = super::sequencer_to_scene(working, ImageColorspace::Srgb)?;
+    for (actual, expected) in restored
+        .pixels
+        .iter()
+        .flatten()
+        .zip(input.pixels.iter().flatten())
+    {
+        assert!((actual - expected).abs() < 1.0e-6);
+    }
+
+    let black = super::SequencerFrame::from_straight_scene_linear(
+        RgbaFrame::new(1, 1, vec![[0.0, 0.0, 0.0, 1.0]])?,
+        ImageColorspace::Srgb,
+    )?;
+    let white = super::SequencerFrame::from_straight_scene_linear(
+        RgbaFrame::new(1, 1, vec![[1.0, 1.0, 1.0, 1.0]])?,
+        ImageColorspace::Srgb,
+    )?;
+    let (
+        super::SequencerFrame::Byte { pixels: black, .. },
+        super::SequencerFrame::Byte { pixels: white, .. },
+    ) = (black, white)
+    else {
+        unreachable!()
+    };
+    let output = super::byte_gamma_cross(1, 1, &black, &white, 0.5)?;
+    let output = output.into_scene_linear(SequencerColorSpace::Srgb)?;
+    for channel in 0..3 {
+        assert!((f64::from(output.pixels[0][channel]) - 0.051_269_881_4_f64).abs() < 1.0e-6);
+    }
+    assert_eq!(output.pixels[0][3], 1.0);
+
+    let cross = super::byte_crossfade(1, 1, &[[255, 0, 0, 0]], &[[0, 0, 0, 255]], 0.5)?;
+    let super::SequencerFrame::Byte { pixels, .. } = cross else {
+        unreachable!()
+    };
+    assert_eq!(pixels[0], [127, 0, 0, 127]);
+    Ok(())
+}
+
+#[test]
+fn color_gamma_strip_values_round_trip_through_byte_and_sequencer_spaces()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    // COLOR_GAMMA reaches the bridge as native f32 before the f64 scene-linear decode.
+    let gamma = [0.1_f32, 0.2, 0.3];
+    let color = [
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(f64::from(gamma[0])))?,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(f64::from(gamma[1])))?,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(f64::from(gamma[2])))?,
+        1.0,
+    ];
+    let (doc, mut scene) = scene_with_strips(vec![color_strip(
+        "gamma_color",
+        1,
+        [color[0], color[1], color[2], color[3]],
+    )]);
+    scene.sequencer.colorspace = SequencerColorSpace::Srgb;
+    let output = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
+    let expected = [
+        crate::color::srgb_to_linear(26.0 / 255.0),
+        crate::color::srgb_to_linear(51.0 / 255.0),
+        crate::color::srgb_to_linear(77.0 / 255.0),
+        1.0,
+    ];
+    for (actual, expected) in output.pixels[0].into_iter().zip(expected) {
+        assert!((f64::from(actual) - expected).abs() < 1.0e-6);
+    }
+    Ok(())
+}
+
+#[test]
+fn float_exr_image_replace_preserves_alpha_zero_radiance_and_fractional_base()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let source = directory.path().join("float_scene_strip.exr");
+    let expected = [[0.375, 0.25, 0.125, 0.0], [0.375, 0.3, 0.225, 0.5]];
+    super::write_exr(&source, &expected, 2, 1)?;
+    let (doc, mut scene) = scene_with_strips(vec![Strip {
+        source: Some(source.to_string_lossy().into_owned()),
+        ..strip("float_image", StripType::Image, 1)
+    }]);
+    scene.sequencer.colorspace = SequencerColorSpace::Srgb;
+    let output = render(&doc, &scene, directory.path(), 1.0, 2, 1)?;
+    for (actual, expected) in output
+        .pixels
+        .iter()
+        .flatten()
+        .zip(expected.into_iter().flatten())
+    {
+        assert!((actual - expected).abs() < 1.0e-6);
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_image_sequence_holds_float_exr_endpoints_for_out_of_range_retiming()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let expected = [[0.375, 0.25, 0.125, 0.0], [0.375, 0.3, 0.225, 0.5]];
+    super::write_exr(
+        &directory.path().join("sequence_first.exr"),
+        &expected[..1],
+        1,
+        1,
+    )?;
+    super::write_exr(
+        &directory.path().join("sequence_last.exr"),
+        &expected[1..],
+        1,
+        1,
+    )?;
+
+    for (source_frame, expected_pixel) in [
+        (0.0, expected[0]),
+        (1.0, expected[1]),
+        (1.0e20, expected[1]),
+        (-1.0e20, expected[0]),
+    ] {
+        let sequence = Strip {
+            source_files: vec![
+                "sequence_first.exr".to_owned(),
+                "sequence_last.exr".to_owned(),
+            ],
+            retiming_keys: vec![RetimingKey {
+                frame: 1.0,
+                source_frame,
+            }],
+            ..strip("explicit_sequence", StripType::ImageSequence, 1)
+        };
+        let (doc, scene) = scene_with_strips(vec![sequence]);
+        let output = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
+        assert_pixel(output.pixels[0], expected_pixel);
+    }
+    Ok(())
+}
+
+#[test]
+fn byte_replace_applies_opacity_and_multiply_alpha_independently() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let (doc, mut scene) = scene_with_strips(vec![color_strip("white", 1, [1.0, 1.0, 1.0, 1.0])]);
+    scene.sequencer.colorspace = SequencerColorSpace::Srgb;
+    scene.sequencer.strips[0].opacity = 0.5;
+    let output = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
+    let byte_color = super::finite_f64_to_f32(crate::color::srgb_to_linear(127.0 / 255.0))?;
+    assert_pixel(output.pixels[0], [byte_color, byte_color, byte_color, 1.0]);
+
+    scene.sequencer.strips[0].multiply_alpha = true;
+    let output = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
+    let alpha = f32::from(127_u8) / 255.0;
+    assert_pixel(
+        output.pixels[0],
+        [
+            byte_color * alpha,
+            byte_color * alpha,
+            byte_color * alpha,
+            alpha,
+        ],
+    );
+    Ok(())
 }
 
 fn write_red_png(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -99,9 +371,6 @@ fn frame_filenames_use_frame_values_and_disambiguate_repeats() {
 fn color_text_image_image_sequence_and_meta_strips_render_numeric_pixels()
 -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    let (doc, scene) = scene_with_strips(vec![color_strip("fill", 1, [0.25, 0.5, 0.75, 1.0])]);
-    let color = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
-    assert_pixel(color.pixels[0], [0.25, 0.5, 0.75, 1.0]);
 
     let (doc, scene) = scene_with_strips(vec![Strip {
         text: Some("A".to_owned()),
@@ -109,7 +378,14 @@ fn color_text_image_image_sequence_and_meta_strips_render_numeric_pixels()
         ..strip("title", StripType::Text, 1)
     }]);
     let text = render(&doc, &scene, directory.path(), 1.0, 5, 7)?;
-    assert_pixel(text.pixels[1], [0.8, 0.4, 0.2, 0.75]);
+    let byte_alpha = f32::from(191_u8) / 255.0;
+    let text_pixel = [
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(231.0 / 255.0))? * byte_alpha,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(170.0 / 255.0))? * byte_alpha,
+        super::finite_f64_to_f32(crate::color::srgb_to_linear(124.0 / 255.0))? * byte_alpha,
+        byte_alpha,
+    ];
+    assert_pixel(text.pixels[1], text_pixel);
     assert_pixel(text.pixels[0], [0.0, 0.0, 0.0, 0.0]);
 
     write_red_png(&directory.path().join("still.png"))?;
@@ -200,27 +476,220 @@ fn scene_strips_match_their_source_camera_render() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn nested_realtime_volume_uses_outer_sequence_sample_count() -> Result<(), Box<dyn Error>> {
+    const OUTER_SEQUENCE_SAMPLES: u32 = 4;
+    let grid = json!({
+        "dims": [5, 5, 3],
+        "voxel_size": 1.0,
+        "origin": [-2.0, -2.0, 1.0],
+        "values": vec![1.0; 75]
+    });
+    let mut doc = camera_volume_doc(&grid, 1)?;
+    let scene_id = doc.active_scene.clone();
+    let mut scene = doc.scenes.get(&scene_id).unwrap().clone();
+    scene.sequencer.strips = vec![Strip {
+        source: Some(scene_id.as_str().to_owned()),
+        ..strip("nested_volume", StripType::Scene, 1)
+    }];
+    doc.scenes.insert(scene_id.clone(), scene.clone());
+
+    assert_eq!(doc.scenes.get(&scene_id).unwrap().render.samples, 1);
+    let directory = tempdir()?;
+    let cache_directory = directory.path().join(".potter/cache");
+    let mut session = EvaluationSession::default();
+    let mut warnings = Vec::new();
+    let output = render_vse_frame(
+        &doc,
+        &scene,
+        1.0,
+        1,
+        1,
+        directory.path(),
+        &cache_directory,
+        &mut session,
+        "realtime",
+        OUTER_SEQUENCE_SAMPLES,
+        0,
+        false,
+        &mut warnings,
+    )?;
+    let pixel = output.pixels[0];
+    assert!(pixel.into_iter().all(f32::is_finite), "{pixel:?}");
+    assert!(
+        pixel[..3].iter().any(|channel| *channel > 0.0),
+        "camera-visible emitter through the nested volume rendered black: {pixel:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn anaglyph_realtime_volume_resolves_each_eye_column_independently() -> Result<(), Box<dyn Error>> {
+    const SAMPLES: u32 = 4;
+    let values = (0..3)
+        .flat_map(|_| (0..7).flat_map(|_| (0..7).map(|x| x as f32 * 0.8)))
+        .collect::<Vec<_>>();
+    let grid = json!({
+        "dims": [7, 7, 3],
+        "voxel_size": 0.5,
+        "origin": [-1.5, -1.5, 1.0],
+        "values": values
+    });
+    let mut doc = camera_volume_doc(&grid, SAMPLES)?;
+    // Keep eye contrast above RGBA16F precision in this one-pixel viewport.
+    doc.scenes
+        .get_mut(&doc.active_scene)
+        .ok_or("volume fixture has no active scene")?
+        .render
+        .eevee_volumetric_tile_size = 1;
+    let directory = tempdir()?;
+    let anaglyph = render_realtime_pixel(&doc, directory.path(), "camera_stereo", SAMPLES)?;
+    let left = render_realtime_pixel(&doc, directory.path(), "camera_left", SAMPLES)?;
+    let right = render_realtime_pixel(&doc, directory.path(), "camera_right", SAMPLES)?;
+
+    assert!(anaglyph.into_iter().all(f32::is_finite), "{anaglyph:?}");
+    assert!(left.into_iter().all(f32::is_finite), "{left:?}");
+    assert!(right.into_iter().all(f32::is_finite), "{right:?}");
+    assert!(
+        left[0] > right[0],
+        "density increases toward the right eye: {left:?} vs {right:?}"
+    );
+    assert!(
+        right[0] > 0.0,
+        "the right eye must still see the emitter: {right:?}"
+    );
+    for (channel, expected) in [(0, left[0]), (1, right[1]), (2, right[2])] {
+        assert!(
+            (anaglyph[channel] - expected).abs() < 1.0e-5,
+            "anaglyph channel {channel} is {}, expected independent-eye value {expected}; left={left:?}, right={right:?}",
+            anaglyph[channel]
+        );
+    }
+    assert!(
+        anaglyph[0] > anaglyph[1],
+        "the right-eye column was reused from the left eye: {anaglyph:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn side_by_side_realtime_volume_odd_seam_matches_each_eye() -> Result<(), Box<dyn Error>> {
+    const PACKED_WIDTH: u32 = 65;
+    const SPLIT: u32 = PACKED_WIDTH / 2;
+    const HEIGHT: u32 = 1;
+    const SAMPLES: u32 = 1;
+
+    let values = (0..3)
+        .flat_map(|_| (0..7).flat_map(|_| (0..7).map(|x| x as f32 * 0.8)))
+        .collect::<Vec<_>>();
+    let grid = json!({
+        "dims": [7, 7, 3],
+        "voxel_size": 0.5,
+        "origin": [-1.5, -1.5, 1.0],
+        "values": values
+    });
+    let mut doc = camera_volume_doc(&grid, SAMPLES)?;
+    let scene_id = doc.active_scene.clone();
+    doc.scenes
+        .get_mut(&scene_id)
+        .unwrap()
+        .render
+        .eevee_volumetric_tile_size = 16;
+
+    let mut clear_doc = doc.clone();
+    clear_doc
+        .data_blocks
+        .values_mut()
+        .find_map(|block| block.volume.as_mut())
+        .and_then(|volume| volume.grids.first_mut())
+        .and_then(|grid| grid.values.as_mut())
+        .unwrap()
+        .fill(0.0);
+
+    let directory = tempdir()?;
+    let packed = render_realtime_image(
+        &doc,
+        directory.path(),
+        "camera_stereo_sbs",
+        PACKED_WIDTH,
+        HEIGHT,
+        SAMPLES,
+    )?;
+    let clear = render_realtime_image(
+        &clear_doc,
+        directory.path(),
+        "camera_stereo_sbs",
+        PACKED_WIDTH,
+        HEIGHT,
+        SAMPLES,
+    )?;
+    let left = render_realtime_image(
+        &doc,
+        directory.path(),
+        "camera_left",
+        SPLIT,
+        HEIGHT,
+        SAMPLES,
+    )?;
+    let right = render_realtime_image(
+        &doc,
+        directory.path(),
+        "camera_right",
+        PACKED_WIDTH - SPLIT,
+        HEIGHT,
+        SAMPLES,
+    )?;
+
+    let left_seam = packed[(SPLIT - 1) as usize];
+    let right_seam = packed[SPLIT as usize];
+    let clear_left_seam = clear[(SPLIT - 1) as usize];
+    let clear_right_seam = clear[SPLIT as usize];
+    for (actual, expected, description) in [
+        (left_seam, left[(SPLIT - 1) as usize], "left-eye seam"),
+        (right_seam, right[0], "right-eye seam"),
+    ] {
+        assert!(
+            actual.into_iter().all(f32::is_finite),
+            "{description}: {actual:?}"
+        );
+        assert!(
+            actual[..3].iter().any(|channel| *channel > 0.0),
+            "{description} lost the camera-visible emitter: {actual:?}"
+        );
+        for channel in 0..3 {
+            assert!(
+                (actual[channel] - expected[channel]).abs() < 1.0e-5,
+                "{description} channel {channel} is {}, expected independent-eye value {}; left={left_seam:?}, right={right_seam:?}",
+                actual[channel],
+                expected[channel]
+            );
+        }
+    }
+    assert!(
+        clear_left_seam[0] > left_seam[0],
+        "the spatially varying volume must attenuate the left seam: {left_seam:?} vs {clear_left_seam:?}"
+    );
+    assert!(
+        clear_right_seam[0] > right_seam[0],
+        "the volume must attenuate the right seam: {right_seam:?} vs {clear_right_seam:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    for (transition, expected) in [
-        (TransitionType::Cross, [0.5, 0.0, 0.5, 1.0]),
-        (
-            TransitionType::GammaCross,
-            [0.735_356_9, 0.0, 0.735_356_9, 1.0],
-        ),
-    ] {
-        let mut transition_strip = strip("transition", StripType::Transition, 3);
-        transition_strip.length = 2.0;
-        transition_strip.transition = Some(transition);
-        transition_strip.inputs = vec!["red".to_owned(), "blue".to_owned()];
-        let (doc, scene) = scene_with_strips(vec![
-            color_strip("red", 1, [1.0, 0.0, 0.0, 1.0]),
-            color_strip("blue", 2, [0.0, 0.0, 1.0, 1.0]),
-            transition_strip,
-        ]);
-        let output = render(&doc, &scene, directory.path(), 2.0, 1, 1)?;
-        assert_pixel(output.pixels[0], expected);
-    }
+    // GammaCross is covered by the saved Blender consumer in tests/native_vse_gamma_cross.rs.
+    let mut transition_strip = strip("transition", StripType::Transition, 3);
+    transition_strip.length = 2.0;
+    transition_strip.transition = Some(TransitionType::Cross);
+    transition_strip.inputs = vec!["red".to_owned(), "blue".to_owned()];
+    let (doc, scene) = scene_with_strips(vec![
+        float_image_strip(directory.path(), "red", 1, [1.0, 0.0, 0.0, 1.0])?,
+        float_image_strip(directory.path(), "blue", 2, [0.0, 0.0, 1.0, 1.0])?,
+        transition_strip,
+    ]);
+    let output = render(&doc, &scene, directory.path(), 2.0, 1, 1)?;
+    assert_pixel(output.pixels[0], [0.5, 0.0, 0.5, 1.0]);
 
     let mut wipe_strip = strip("wipe", StripType::Transition, 3);
     wipe_strip.length = 2.0;
@@ -235,6 +704,7 @@ fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<
     assert_pixel(wipe.pixels[0], [0.0, 0.0, 1.0, 1.0]);
     assert_pixel(wipe.pixels[1], [1.0, 0.0, 0.0, 1.0]);
 
+    // Glow is non-identity and has separate focused coverage.
     let effects = [
         (EffectType::Add, [0.3, 0.6, 0.9, 1.0], true),
         (EffectType::Subtract, [0.1, 0.2, 0.3, 1.0], true),
@@ -242,7 +712,6 @@ fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<
         (EffectType::AlphaOver, [0.1, 0.2, 0.3, 1.0], true),
         (EffectType::Transform, [0.2, 0.4, 0.6, 1.0], false),
         (EffectType::Speed, [0.2, 0.4, 0.6, 1.0], false),
-        (EffectType::Glow, [0.2, 0.4, 0.6, 1.0], false),
         (EffectType::GaussianBlur, [0.2, 0.4, 0.6, 1.0], false),
     ];
     for (effect, expected, two_inputs) in effects {
@@ -253,9 +722,19 @@ fn transitions_and_effect_strips_apply_numerical_operations() -> Result<(), Box<
         } else {
             vec!["first".to_owned()]
         };
-        let mut strips = vec![color_strip("first", 1, [0.2, 0.4, 0.6, 1.0])];
+        let mut strips = vec![float_image_strip(
+            directory.path(),
+            "first",
+            1,
+            [0.2, 0.4, 0.6, 1.0],
+        )?];
         if two_inputs {
-            strips.push(color_strip("second", 2, [0.1, 0.2, 0.3, 1.0]));
+            strips.push(float_image_strip(
+                directory.path(),
+                "second",
+                2,
+                [0.1, 0.2, 0.3, 1.0],
+            )?);
         }
         strips.push(effect_strip);
         let (doc, scene) = scene_with_strips(strips);
@@ -292,24 +771,31 @@ fn unsupported_movie_and_unresolved_scene_strips_report_errors() -> Result<(), B
     Ok(())
 }
 
-/// Potter's EXR writer stores associated alpha, as Blender's `OpenEXR` path does (`openexr_api.cpp`): a straight colour
-/// `[0.8, 0.4, 0.2]` with alpha 0.5 is stored as `[0.4, 0.2, 0.1, 0.5]`. Reloading the file gives the stored values
-/// (premultiplied), and `straight_pixels` returns the straight colour again. The Blender side of this file is the
-/// `exr32` premultiplied oracle in `tests/fixtures/alpha_texture` with texels `potter` (`generate_alpha_oracle.py`).
+/// Potter's VSE `RgbaFrame` pixels are associated RGBA; the EXR writer stores them directly as Blender does. Reloading
+/// the file gives the stored premultiplied channels, and `straight_pixels` recovers straight colour for nonzero alpha.
+/// The Blender side uses the `exr32` premultiplied oracle in `tests/fixtures/alpha_texture`.
 #[test]
-fn potter_exr_writer_stores_associated_alpha_and_reloads_the_straight_colour()
+fn potter_exr_writer_preserves_associated_alpha_and_alpha_zero_radiance()
 -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    let path = directory.path().join("alpha_half.exr");
-    super::write_exr(&path, &[[0.8, 0.4, 0.2, 0.5]], 1, 1)?;
+    let path = directory.path().join("alpha_half_and_zero.exr");
+    let associated = [[0.4, 0.2, 0.1, 0.5], [0.75, 0.5, 0.25, 0.0]];
+    super::write_exr(&path, &associated, 2, 1)?;
     let (width, height, stored) =
         crate::image::decode_pixels(&fs::read(&path)?, crate::model::ImageColorspace::Linear)?;
-    assert_eq!((width, height), (1, 1));
-    for (channel, expected) in [0.4, 0.2, 0.1, 0.5].into_iter().enumerate() {
+    assert_eq!((width, height), (2, 1));
+    for (channel, expected) in associated[0].into_iter().enumerate() {
         assert!(
-            (stored[0][channel] - expected).abs() < 1.0e-6,
+            (stored[0][channel] - f64::from(expected)).abs() < 1.0e-6,
             "stored channel {channel} is {}, expected {expected}",
             stored[0][channel]
+        );
+    }
+    for (channel, expected) in associated[1].into_iter().enumerate() {
+        assert!(
+            (stored[1][channel] - f64::from(expected)).abs() < 1.0e-6,
+            "alpha-zero stored channel {channel} is {}, expected {expected}",
+            stored[1][channel]
         );
     }
     let image = crate::image::ImageData {

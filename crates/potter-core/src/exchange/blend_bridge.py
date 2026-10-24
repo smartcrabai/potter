@@ -243,6 +243,13 @@ def potter_modifier_type(blender_type):
 
 
 
+def _collection_bridge_id(collection):
+    for scene in bpy.data.scenes:
+        if scene.collection.as_pointer() == collection.as_pointer():
+            return "scene-root:" + scene.name_full
+    return "collection:" + collection.name_full
+
+
 def plain(value, depth=0):
     if depth > 8:
         return repr(value)
@@ -250,8 +257,11 @@ def plain(value, depth=0):
         return value
     if isinstance(value, (set, frozenset)):
         return [plain(item, depth + 1) for item in sorted(value)]
-    if isinstance(value, (bpy.types.ID,)):
-        return {"id_type": value.bl_rna.identifier, "name": value.name_full}
+    if isinstance(value, bpy.types.ID):
+        result = {"id_type": value.bl_rna.identifier, "name": value.name_full}
+        if isinstance(value, bpy.types.Collection):
+            result["bridge_id"] = _collection_bridge_id(value)
+        return result
     if isinstance(value, Matrix):
         return matrix_rows(value)
     if all(hasattr(value, axis) for axis in ("r", "g", "b")):
@@ -297,7 +307,7 @@ def matrix_rows(matrix):
 def custom_props(block):
     try:
         return {str(key): plain(block[key]) for key in block.keys()
-                if key != "potter.object_solver_inverses_json"}
+                if key not in ("potter.object_solver_inverses_json", "potter.root_collection")}
     except Exception:
         return {}
 
@@ -323,7 +333,7 @@ def rna_props(block, omit=()):
     result = {}
     for prop, key, val in _walk_rna_properties(block, omit=omit):
         if isinstance(val, bpy.types.ID):
-            result[key] = {"id_type": val.bl_rna.identifier, "name": val.name_full}
+            result[key] = plain(val)
         elif hasattr(val, "bl_rna"):
             result[key] = {"rna_type": val.bl_rna.identifier}
         else:
@@ -1209,6 +1219,14 @@ def images_dump():
 
 
 
+def _sequence_element_filepath(strip, element):
+    filepath = os.path.join(strip.directory, element.filename)
+    try:
+        return bpy.path.abspath(filepath, library=strip.id_data.library)
+    except TypeError:
+        return bpy.path.abspath(filepath)
+
+
 def _resource_record(kind, owner, path, packed_file=None):
     resolved = bpy.path.abspath(path) if path else None
     packed_data = None
@@ -1391,11 +1409,10 @@ def resources_dump():
                     result.append(_resource_record("sound", strip.name, sound.filepath,
                                                    getattr(sound, "packed_file", None)))
             elif getattr(strip, "type", None) == "IMAGE":
-                directory = getattr(strip, "directory", "")
                 for element in getattr(strip, "elements", ()):
                     result.append(_resource_record(
                         "image_sequence", strip.name,
-                        os.path.join(directory, element.filename)))
+                        _sequence_element_filepath(strip, element)))
             elif hasattr(strip, "filepath"):
                 kind = "movie" if getattr(strip, "type", None) == "MOVIE" else "image"
                 result.append(_resource_record(kind, strip.name, strip.filepath,
@@ -2461,7 +2478,7 @@ def object_dump(obj):
             "data_name": data.name_full if data else None, "parent": obj.parent.name_full if obj.parent else None,
             "parent_type": obj.parent_type, "parent_bone": obj.parent_bone,
             "track_axis": obj.track_axis, "up_axis": obj.up_axis,
-            "instance_collection": obj.instance_collection.name_full
+            "instance_collection": _collection_bridge_id(obj.instance_collection)
             if getattr(obj, "instance_collection", None) else None,
             "matrix_parent_inverse": matrix_rows(obj.matrix_parent_inverse),
             "location": plain(obj.location),
@@ -2594,9 +2611,10 @@ def dump_fcurve(curve):
 
 
 def collection_dump(collection):
-    return {"name": collection.get("potter.name", collection.name_full),
+    return {"bridge_id": _collection_bridge_id(collection),
+            "name": collection.get("potter.name", collection.name_full),
             "potter_id": collection.get("potter.id"), "library": library_reference(collection),
-            "children": [child.name_full for child in collection.children],
+            "children": [_collection_bridge_id(child) for child in collection.children],
             "objects": [obj.name_full for obj in collection.objects],
             "custom_properties": custom_props(collection), "hide_viewport": bool(collection.hide_viewport),
             "hide_render": bool(collection.hide_render), "fake_user": bool(collection.use_fake_user)}
@@ -2772,6 +2790,39 @@ def _eevee_use_volumetric_shadows(scene):
     return bool(getattr(eevee, "use_volumetric_shadows", False)) if eevee is not None else False
 
 
+def _eevee_volumetric_tile_size(scene):
+    eevee = getattr(scene, "eevee", None)
+    return int(getattr(eevee, "volumetric_tile_size", "8")) if eevee is not None else 8
+
+
+def _eevee_volumetric_samples(scene):
+    eevee = getattr(scene, "eevee", None)
+    return int(getattr(eevee, "volumetric_samples", 64)) if eevee is not None else 64
+
+
+def _eevee_volumetric_sample_distribution(scene):
+    eevee = getattr(scene, "eevee", None)
+    return (
+        float(getattr(eevee, "volumetric_sample_distribution", 0.8))
+        if eevee is not None
+        else 0.8
+    )
+
+
+def _eevee_use_volume_custom_range(scene):
+    eevee = getattr(scene, "eevee", None)
+    return bool(getattr(eevee, "use_volume_custom_range", False)) if eevee is not None else False
+
+
+def _eevee_volumetric_start(scene):
+    eevee = getattr(scene, "eevee", None)
+    return float(getattr(eevee, "volumetric_start", 0.1)) if eevee is not None else 0.1
+
+
+def _eevee_volumetric_end(scene):
+    eevee = getattr(scene, "eevee", None)
+    return float(getattr(eevee, "volumetric_end", 100.0)) if eevee is not None else 100.0
+
 def _cryptomatte_accurate(scene):
     return any(bool(getattr(layer, CRYPTOMATTE_ACCURATE_PROP, False)) for layer in scene.view_layers)
 
@@ -2804,16 +2855,38 @@ def _node_groups_dump():
             for group in groups]
 
 
+def _color_gamma_to_scene_linear(value):
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _scene_linear_to_color_gamma(value):
+    if value <= 0.0031308:
+        return 12.92 * value
+    return 1.055 * value ** (1.0 / 2.4) - 0.055
+
+
 def _sequencer_dump(scene):
     editor = getattr(scene, "sequence_editor", None)
     if editor is None:
-        return {"channels": 32, "strips": []}
+        return {"channels": 32, "colorspace": scene.sequencer_colorspace_settings.name, "strips": []}
     sequences = getattr(editor, "strips", None) or getattr(editor, "sequences", ())
     result = []
     for strip in sequences:
         kind = strip.type
         source = None
-        if hasattr(strip, "filepath"):
+        source_files = []
+        if kind == "IMAGE":
+            elements = getattr(strip, "elements", ())
+            if len(elements) == 1:
+                source = _sequence_element_filepath(strip, elements[0])
+            elif elements:
+                source_files = [
+                    _sequence_element_filepath(strip, element)
+                    for element in elements
+                ]
+        elif hasattr(strip, "filepath"):
             source = bpy.path.abspath(strip.filepath)
         elif getattr(strip, "sound", None) is not None:
             source = bpy.path.abspath(strip.sound.filepath)
@@ -2844,8 +2917,12 @@ def _sequencer_dump(scene):
             "GLOW": "glow", "GAUSSIAN_BLUR": "gaussian_blur",
         }.get(kind)
         color = list(plain(getattr(strip, "color", (0.0, 0.0, 0.0, 1.0))))
-        if len(color) != 4:
+        if len(color) == 3:
+            color.append(1.0)
+        elif len(color) != 4:
             color = [0.0, 0.0, 0.0, 1.0]
+        if source_type in ("color", "text"):
+            color[:3] = [_color_gamma_to_scene_linear(value) for value in color[:3]]
         retiming = []
         for key in getattr(strip, "retiming_keys", ()):
             retiming.append({"frame": float(getattr(key, "timeline_frame", 0.0)),
@@ -2860,6 +2937,8 @@ def _sequencer_dump(scene):
             "length": float(getattr(strip, "frame_final_duration", 1.0)),
             "blend_type": str(getattr(strip, "blend_type", "REPLACE")).lower(),
             "opacity": float(getattr(strip, "blend_alpha", 1.0)),
+            "color_multiply": float(getattr(strip, "color_multiply", 1.0)),
+            "multiply_alpha": bool(getattr(strip, "multiply_alpha", False)),
             "mute": bool(getattr(strip, "mute", False)),
             "retiming_keys": retiming,
             "modifiers": [],
@@ -2867,17 +2946,18 @@ def _sequencer_dump(scene):
             "sound_pan": float(getattr(strip, "pan", 0.0)),
             "sound_pitch": float(getattr(strip, "pitch", 1.0)),
             "source": source,
+            "source_files": source_files,
             "color": color,
             "text": getattr(strip, "text", None),
             "transition": transition,
-            "inputs": [getattr(strip, name).name_full for name in ("input_1", "input_2")
+            "inputs": [getattr(strip, name).name for name in ("input_1", "input_2")
                        if getattr(strip, name, None) is not None],
             "effect": effect,
         })
     channels = getattr(editor, "channels", 32)
     if not isinstance(channels, int):
         channels = len(channels)
-    return {"channels": int(channels), "strips": result}
+    return {"channels": int(channels), "colorspace": scene.sequencer_colorspace_settings.name, "strips": result}
 
 
 def potter_audio_codec(value):
@@ -2939,7 +3019,7 @@ def dump_scene(scene):
         excluded = []
         def walk(layer_collection):
             if layer_collection.exclude:
-                excluded.append(layer_collection.collection.name_full)
+                excluded.append(_collection_bridge_id(layer_collection.collection))
             for child in layer_collection.children:
                 walk(child)
         walk(view_layer.layer_collection)
@@ -3017,6 +3097,12 @@ def dump_scene(scene):
                 "cryptomatte_accurate": _cryptomatte_accurate(scene),
                 "eevee_light_threshold": _eevee_light_threshold(scene),
                 "eevee_use_volumetric_shadows": _eevee_use_volumetric_shadows(scene),
+                "eevee_volumetric_tile_size": _eevee_volumetric_tile_size(scene),
+                "eevee_volumetric_samples": _eevee_volumetric_samples(scene),
+                "eevee_volumetric_sample_distribution": _eevee_volumetric_sample_distribution(scene),
+                "eevee_use_volume_custom_range": _eevee_use_volume_custom_range(scene),
+                "eevee_volumetric_start": _eevee_volumetric_start(scene),
+                "eevee_volumetric_end": _eevee_volumetric_end(scene),
                 "use_simplify": bool(scene.render.use_simplify),
                 "simplify_volumes": float(scene.render.simplify_volumes),
             },
@@ -3032,7 +3118,7 @@ def dump_scene(scene):
                 if any(modifier.type in ("MESH_TO_VOLUME", "VOLUME_DISPLACE", "VOLUME_TO_MESH")
                        for modifier in obj.modifiers)],
             "sequencer": _sequencer_dump(scene),
-            "root_collection": scene.get("potter.root_collection", scene.collection.get("potter.name", scene.collection.name_full)),
+            "root_collection": _collection_bridge_id(scene.collection),
             "world": world_info, "custom_properties": custom_props(scene),
             "rna_properties": rna_props(scene, ("objects", "collection", "view_layers", "world", "camera", "render", "tool_settings", "unit_settings", "use_gravity"))}
 
@@ -3190,7 +3276,7 @@ def dump_all():
         bpy.context.view_layer.update()
     except Exception:
         pass
-    data = {"bridge_version": 1, "blender_version": "%d.%d.%d" % bpy.app.version,
+    data = {"bridge_version": 2, "blender_version": "%d.%d.%d" % bpy.app.version,
             "file_version": list(getattr(bpy.app, "version_file", bpy.app.version)),
             "active_scene": bpy.context.scene.name_full,
             "scenes": [dump_scene(item) for item in bpy.data.scenes],
@@ -3221,6 +3307,7 @@ def dump_all():
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                         "library": library_reference(x), "type": x.type,
                         "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
+                        "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
                         "soft_falloff": bool(getattr(x, "use_soft_falloff", True)),
                         "use_multiple_importance_sampling": bool(x.cycles.use_multiple_importance_sampling),
                         "spot_size": float(getattr(x, "spot_size", math.pi / 4)),
@@ -5278,13 +5365,20 @@ def compatibility_block(doc, collection_name, entity_kind, identifier):
         candidates = intermediate.get(collection_name, [])
     for item in candidates:
         name = item.get("name")
-        mapped = item.get("potter_id") or mappings.get(entity_kind + ":" + name)
+        mapping_name = (item.get("bridge_id")
+                        if collection_name == "collections" else name)
+        mapped = item.get("potter_id")
+        if mapped is None and isinstance(mapping_name, str):
+            mapped = mappings.get(entity_kind + ":" + mapping_name)
         if mapped == identifier:
             return item
     return {}
 
 
 def compatibility_name(doc, entity_kind, identifier, fallback):
+    if entity_kind == "Collection":
+        source = compatibility_block(doc, "collections", entity_kind, identifier)
+        return source.get("name") or fallback
     compatibility = doc.get("compatibility", {}).get("blender_adapter", {})
     for key, value in compatibility.get("id_mappings", {}).items():
         if key.startswith(entity_kind + ":") and value == identifier:
@@ -7149,7 +7243,16 @@ def _restore_rigid_body_world(scene, source):
     world.point_cache.frame_end = int(source.get("frame_end", scene.frame_end))
 
 def _restore_sequencer(scene, sequencer, scene_map, doc, target):
-    strips = sequencer.get("strips", []) if sequencer else []
+    sequencer = sequencer or {}
+    colorspaces = {
+        "srgb": "sRGB",
+        "linear": "Linear Rec.709",
+    }
+    colorspace = sequencer.get("colorspace", "srgb")
+    if colorspace not in colorspaces:
+        raise ValueError("unsupported sequencer colorspace: %s" % colorspace)
+    scene.sequencer_colorspace_settings.name = colorspaces[colorspace]
+    strips = sequencer.get("strips", [])
     if not strips:
         return
     editor = scene.sequence_editor_create()
@@ -7181,8 +7284,22 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
             kind = source.get("type", "image")
             frame_end = frame_start + int(source.get("length", 1.0))
             media_path = source.get("source")
+            source_files = source.get("source_files", [])
+            media_paths = []
             relative_media_path = None
-            if kind in ("image", "image_sequence", "movie", "sound"):
+            if kind == "image_sequence" and source_files:
+                for source_file in source_files:
+                    path = _resource_path(doc, source_file)
+                    if not path or not os.path.isfile(path):
+                        raise ValueError("sequencer image-sequence source is missing: %s" % source_file)
+                    media_paths.append(path)
+                source_directory = os.path.dirname(os.path.realpath(media_paths[0]))
+                if any(os.path.dirname(os.path.realpath(path)) != source_directory
+                       for path in media_paths[1:]):
+                    raise ValueError("sequencer image-sequence elements must share a directory")
+                media_path = media_paths[0]
+                relative_media_path = _relative_blend_path(media_path, target)
+            elif kind in ("image", "image_sequence", "movie", "sound"):
                 media_path = _resource_path(doc, media_path)
                 if not media_path or not os.path.isfile(media_path):
                     raise ValueError("sequencer media source is missing: %s" % source.get("source"))
@@ -7204,6 +7321,8 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                     strip = sequences.new_image(name, media_path, channel, frame_start)
                 elif kind == "image_sequence":
                     strip = sequences.new_image(name, media_path, channel, frame_start)
+                    for path in media_paths[1:]:
+                        strip.elements.append(os.path.basename(path))
                 elif kind == "movie":
                     strip = sequences.new_movie(name, media_path, channel, frame_start)
                 elif kind == "sound":
@@ -7223,7 +7342,11 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                     raise ValueError("unsupported sequencer strip type %s" % kind)
                 strip.name = name
                 if relative_media_path:
-                    if kind == "sound" and getattr(strip, "sound", None):
+                    if kind in ("image", "image_sequence"):
+                        directory = os.path.dirname(relative_media_path)
+                        strip.directory = directory if directory.endswith("/") else directory + "/"
+                        strip.elements[0].filename = os.path.basename(relative_media_path)
+                    elif kind == "sound" and getattr(strip, "sound", None):
                         strip.sound.filepath = relative_media_path
                     elif hasattr(strip, "filepath"):
                         strip.filepath = relative_media_path
@@ -7231,6 +7354,8 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                 strip.frame_offset_end = float(source.get("frame_offset_end", 0.0))
                 strip.blend_type = source.get("blend_type", "replace").upper()
                 strip.blend_alpha = float(source.get("opacity", 1.0))
+                strip.color_multiply = float(source.get("color_multiply", 1.0))
+                strip.multiply_alpha = bool(source.get("multiply_alpha", False))
                 strip.mute = bool(source.get("mute", False))
                 if hasattr(strip, "volume"):
                     strip.volume = float(source.get("sound_volume", 1.0))
@@ -7239,7 +7364,12 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                 if hasattr(strip, "pitch"):
                     strip.pitch = float(source.get("sound_pitch", 1.0))
                 if hasattr(strip, "color"):
-                    strip.color = source.get("color", (0.0, 0.0, 0.0, 1.0))
+                    color = list(source.get("color", (0.0, 0.0, 0.0, 1.0)))
+                    if kind == "color" and len(color) == 4:
+                        color = color[:3]
+                    if kind in ("color", "text"):
+                        color[:3] = [_scene_linear_to_color_gamma(value) for value in color[:3]]
+                    strip.color = color
                 if hasattr(strip, "text"):
                     strip.text = source.get("text") or ""
                 created[source.get("id")] = strip
@@ -8077,7 +8207,6 @@ def export_doc(doc, target, pack, scene_hash, context):
         scene["potter.scene_hash"] = scene_hash
         source = compatibility_block(doc, "scenes", "Scene", scene_id)
         set_props(scene, source.get("custom_properties", {}))
-        scene["potter.root_collection"] = collections_raw[item["root_collection"]]["name"]
         set_scene_frame(scene, item["frame_current"])
         scene.frame_start = item["frame_start"]
         scene.use_gravity = bool(item.get("use_gravity", True))
@@ -8134,6 +8263,18 @@ def export_doc(doc, target, pack, scene_hash, context):
         if hasattr(scene, "eevee"):
             scene.eevee.light_threshold = float(render.get("eevee_light_threshold", 0.01))
             scene.eevee.use_volumetric_shadows = bool(render.get("eevee_use_volumetric_shadows", False))
+            scene.eevee.volumetric_tile_size = str(
+                int(render.get("eevee_volumetric_tile_size", 8))
+            )
+            scene.eevee.volumetric_samples = int(render.get("eevee_volumetric_samples", 64))
+            scene.eevee.volumetric_sample_distribution = float(
+                render.get("eevee_volumetric_sample_distribution", 0.8)
+            )
+            scene.eevee.use_volume_custom_range = bool(
+                render.get("eevee_use_volume_custom_range", False)
+            )
+            scene.eevee.volumetric_start = float(render.get("eevee_volumetric_start", 0.1))
+            scene.eevee.volumetric_end = float(render.get("eevee_volumetric_end", 100.0))
         unit = item.get("unit", {})
         try:
             scene.unit_settings.system = unit.get("system", "metric").upper()
@@ -8399,6 +8540,8 @@ def export_doc(doc, target, pack, scene_hash, context):
             light.color = raw.get("color", [1.0, 1.0, 1.0])
             light.energy = raw.get("energy", 1000.0)
             light.shadow_soft_size = raw.get("radius", 0.1)
+            if raw.get("light_type") == "sun":
+                light.angle = float(raw.get("sun_angle", math.radians(0.526)))
             if raw.get("light_type") in ("point", "spot"):
                 light.use_soft_falloff = bool(raw.get("soft_falloff", True))
             if raw.get("light_type") == "area":
@@ -8539,16 +8682,14 @@ def export_doc(doc, target, pack, scene_hash, context):
             obj.data = obj_data
         else:
             obj = bpy.data.objects.new(item["name"], obj_data)
-        instance_name = source_object.get("instance_collection")
+        instance_reference = source_object.get("instance_collection")
         instance_id = item.get("properties", {}).get("instance_collection")
+        if instance_reference and not instance_id:
+            raise ValueError("collection instance has no imported collection bridge ID")
         instance = collection_map.get(instance_id) if instance_id else None
-        if instance is None and instance_name:
-            instance = next((candidate for candidate in collection_map.values()
-                             if candidate.name_full == instance_name), None)
-        if instance_id or instance_name:
-            if instance is None:
-                raise ValueError("collection instance references missing collection %s"
-                                 % (instance_id or instance_name))
+        if instance_id and instance is None:
+            raise ValueError("collection instance references missing collection ID %s" % instance_id)
+        if instance is not None:
             obj.instance_type = "COLLECTION"
             obj.instance_collection = instance
         set_id(obj, node_id)

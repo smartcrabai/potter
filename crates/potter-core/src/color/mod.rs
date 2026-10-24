@@ -234,16 +234,6 @@ fn linear_to_srgb_impl(value: f64, clamp_high_branch: bool) -> f64 {
     }
 }
 
-/// Converts linear `f32` values to sRGB without changing intermediate precision.
-#[must_use]
-pub(crate) fn linear_to_srgb_f32(value: f32) -> f32 {
-    if value <= 0.003_130_8 {
-        value * 12.92
-    } else {
-        1.055 * value.max(0.0).powf(1.0 / 2.4) - 0.055
-    }
-}
-
 pub(crate) fn sample_curve(value: f64, curve: &[[f64; 2]]) -> f64 {
     let first = curve[0];
     if value <= first[0] {
