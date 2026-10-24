@@ -25,6 +25,8 @@ const FACE_TEXELS: usize = 64;
 pub(super) struct WorldProbe {
     /// The six faces in the order of `face_direction`, each `FACE_TEXELS` by `FACE_TEXELS`, row by row.
     radiance: Vec<DVec3>,
+    /// EEVEE's non-directional spherical-harmonic L0, used by sphere-thickness translucent closures.
+    average_irradiance: DVec3,
 }
 
 impl WorldProbe {
@@ -35,21 +37,26 @@ impl WorldProbe {
         images: &BTreeMap<String, ImageData>,
     ) -> Result<Self> {
         let mut radiance = Vec::with_capacity(6 * FACE_TEXELS * FACE_TEXELS);
+        let mut average_irradiance = DVec3::ZERO;
+        let mut total_solid_angle = 0.0;
         for face in 0..6 {
             for row in 0..FACE_TEXELS {
                 for column in 0..FACE_TEXELS {
                     let s = texel_centre(column);
                     let t = texel_centre(row);
-                    radiance.push(evaluate_world(
-                        world,
-                        groups,
-                        images,
-                        face_direction(face, s, t),
-                    )?);
+                    let value = evaluate_world(world, groups, images, face_direction(face, s, t))?;
+                    let solid_angle = cube_texel_solid_angle(column, row);
+                    average_irradiance +=
+                        super::eevee_transmission::irradiance_probe_radiance(value) * solid_angle;
+                    total_solid_angle += solid_angle;
+                    radiance.push(value);
                 }
             }
         }
-        Ok(Self { radiance })
+        Ok(Self {
+            radiance,
+            average_irradiance: average_irradiance / total_solid_angle,
+        })
     }
 
     /// The radiance of the texel that `direction` falls in.
@@ -58,6 +65,19 @@ impl WorldProbe {
         let index = (face * FACE_TEXELS + texel(t)) * FACE_TEXELS + texel(s);
         self.radiance[index]
     }
+    /// EEVEE's non-directional world-probe value for sphere-thickness translucency.
+    pub(super) fn average_irradiance(&self) -> DVec3 {
+        self.average_irradiance
+    }
+}
+fn cube_texel_solid_angle(column: usize, row: usize) -> f64 {
+    let edge = FACE_TEXELS as f64;
+    let s0 = 2.0 * column as f64 / edge - 1.0;
+    let s1 = 2.0 * (column + 1) as f64 / edge - 1.0;
+    let t0 = 2.0 * row as f64 / edge - 1.0;
+    let t1 = 2.0 * (row + 1) as f64 / edge - 1.0;
+    let area = |s: f64, t: f64| (s * t).atan2((1.0 + s * s + t * t).sqrt());
+    area(s1, t1) - area(s0, t1) - area(s1, t0) + area(s0, t0)
 }
 
 /// The centre of texel `index` along a face edge, in `-1..1`.
@@ -142,6 +162,9 @@ mod tests {
         for direction in [DVec3::X, -DVec3::Y, DVec3::new(0.3, -0.5, 0.8).normalize()] {
             assert_eq!(probe.radiance(direction), DVec3::new(0.4, 0.8, 1.2));
         }
+        let expected =
+            crate::render::eevee_transmission::irradiance_probe_radiance(DVec3::new(0.4, 0.8, 1.2));
+        assert!((probe.average_irradiance() - expected).abs().max_element() < 1.0e-12);
         Ok(())
     }
 }

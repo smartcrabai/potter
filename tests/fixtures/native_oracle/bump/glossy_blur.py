@@ -1,17 +1,20 @@
-"""Filter Glossy's glossy blur for metal and sharp glass, rendered by Blender 5.2.2 Cycles.
+"""Filter Glossy's glossy blur for metal, glass, and a rough Principled Thin Wall pane, rendered by Blender 5.2.2 Cycles.
 
 A top-down orthographic camera sees a white diffuse floor. The floor is lit only indirectly: a floor sample goes
-up and hits a vertical roughness-0 metal or glass wall, which reflects it onto an emitter standing across the scene.
+up and hits a vertical metal or glass wall, which reflects it onto an emitter standing across the scene. For the
+Thin Wall variant, the emitter is behind a rough Principled transmission pane, so the path transmits to it instead.
 The emitter's material turns light sampling off (`emission_sampling` NONE), so nothing lights the floor except a path
-that bounces off the floor and then off the wall, which is what the blur acts on.
+that bounces off the floor and then off the wall or pane, which is what the blur acts on.
 
 After the diffuse floor bounce the sampled pdf is cos/π, below one, so Cycles blurs the wall's specular closure
-(`surface_shader_prepare_closures`): sharp reflections become rough. With Filter Glossy 0 there is no blur. The frame
-mean therefore depends on the blur for all three wall closures: metal, Glass BSDF, and Principled transmission.
+(`surface_shader_prepare_closures`): sharp reflections and transmission become rough. With Filter Glossy 0 there is
+no blur. The frame mean therefore depends on the blur for the metal, Glass BSDF, Principled transmission, and rough
+Principled Thin Wall transmission closures.
 
-Arguments after `--`: metal_blend_out, glass_blend_out, principled_glass_blend_out, and json_out. The JSON has
-per-seed means under `seed_means` / `seed_means_filter_glossy_0`, `glass_seed_means` /
-`glass_seed_means_filter_glossy_0`, and `principled_glass_seed_means` / `principled_glass_seed_means_filter_glossy_0`.
+Arguments after `--`: metal_blend_out, glass_blend_out, principled_glass_blend_out, thin_glass_blend_out, and json_out.
+The JSON has per-seed means under `seed_means` / `seed_means_filter_glossy_0`, `glass_seed_means` /
+`glass_seed_means_filter_glossy_0`, `principled_glass_seed_means` / `principled_glass_seed_means_filter_glossy_0`,
+and `thin_glass_seed_means` / `thin_glass_seed_means_filter_glossy_0`.
 """
 
 import json
@@ -22,7 +25,7 @@ import tempfile
 import bpy
 from mathutils import Vector
 
-metal_blend_out, glass_blend_out, principled_glass_blend_out, json_out = sys.argv[sys.argv.index("--") + 1:][:4]
+metal_blend_out, glass_blend_out, principled_glass_blend_out, thin_glass_blend_out, json_out = sys.argv[sys.argv.index("--") + 1:][:5]
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
@@ -120,16 +123,54 @@ glass_tree.links.new(glass_bsdf.outputs["BSDF"], glass_output.inputs["Surface"])
 principled_glass = principled_material("Principled Glass", (1.0, 1.0, 1.0, 1.0), 0.0, 0.0, 0.5)
 principled_glass.node_tree.nodes["Principled BSDF"].inputs["Transmission Weight"].default_value = 1.0
 
+thin_glass = principled_material("Principled Thin Wall", (1.0, 1.0, 1.0, 1.0), 0.0, 0.05, 0.5)
+thin_glass_principled = thin_glass.node_tree.nodes["Principled BSDF"]
+thin_glass_principled.inputs["Transmission Weight"].default_value = 1.0
+thin_glass_principled.inputs["Thin Wall"].default_value = True
+
 variants = (
-    ("", wall.data.materials[0], metal_blend_out),
-    ("glass", glass_material, glass_blend_out),
-    ("principled_glass", principled_glass, principled_glass_blend_out),
+    (
+        "",
+        wall.data.materials[0],
+        metal_blend_out,
+        (-4.0, 0.0, 5.0),
+        (0.0, 1.5707963267948966, 0.0),
+        (1.0, 1.0, 1.0),
+    ),
+    (
+        "glass",
+        glass_material,
+        glass_blend_out,
+        (-4.0, 0.0, 5.0),
+        (0.0, 1.5707963267948966, 0.0),
+        (1.0, 1.0, 1.0),
+    ),
+    (
+        "principled_glass",
+        principled_glass,
+        principled_glass_blend_out,
+        (-4.0, 0.0, 5.0),
+        (0.0, 1.5707963267948966, 0.0),
+        (1.0, 1.0, 1.0),
+    ),
+    # A narrow vertical emitter behind the pane makes its widened transmission lobe measurable.
+    (
+        "thin_glass",
+        thin_glass,
+        thin_glass_blend_out,
+        (8.0, 0.0, 10.0),
+        (0.0, -1.5707963267948966, 0.0),
+        (0.05, 1.0, 1.0),
+    ),
 )
 work = tempfile.mkdtemp()
 result = {"samples": 64}
-for key, material, variant_blend_out in variants:
+for key, material, variant_blend_out, emitter_location, emitter_rotation, emitter_scale in variants:
     wall.data.materials.clear()
     wall.data.materials.append(material)
+    emitter.location = emitter_location
+    emitter.rotation_euler = emitter_rotation
+    emitter.scale = emitter_scale
     scene.cycles.blur_glossy = 1.0
 
     bpy.ops.wm.save_as_mainfile(filepath=variant_blend_out)

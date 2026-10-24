@@ -36,65 +36,6 @@ pub(crate) fn principled_glass_tint(base: [f64; 4]) -> [f64; 3] {
     std::array::from_fn(|channel| base[channel].clamp(0.0, 1.0).sqrt())
 }
 
-/// The Principled inputs that change Cycles' result but that Potter's lobe model does not evaluate,
-/// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
-pub(crate) fn unevaluated_principled_inputs(
-    params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 1] {
-    [params
-        .thin_wall
-        .then_some(("shader.principled.thin_wall", "Thin Wall"))]
-}
-
-/// Records `UNSUPPORTED_FEATURE` for each Principled input in `params` that Potter's lobe model
-/// does not evaluate. `node` names the Principled node of a graph material; a native material
-/// passes `None`. Deduped per (material, input) in `warnings`, the sink the render output reports.
-pub(crate) fn record_unevaluated_inputs(
-    warnings: Option<&RefCell<Vec<JsonValue>>>,
-    material: &str,
-    node: Option<&Id>,
-    params: &BsdfParams,
-) {
-    let inputs = unevaluated_principled_inputs(params);
-    if inputs.iter().all(Option::is_none) {
-        return;
-    }
-    let Some(warnings) = warnings else {
-        return;
-    };
-    for (feature_id, input) in inputs.into_iter().flatten() {
-        let mut recorded = warnings.borrow_mut();
-        let duplicate = recorded.iter().any(|warning| {
-            warning["material"].as_str() == Some(material)
-                && warning["input"].as_str() == Some(input)
-        });
-        if duplicate {
-            continue;
-        }
-        recorded.push(match node {
-            Some(node) => json!({
-                "code": "UNSUPPORTED_FEATURE",
-                "feature_id": feature_id,
-                "material": material,
-                "node_id": node.to_string(),
-                "input": input,
-                "message": format!(
-                    "Principled input '{input}' of material '{material}' (node '{node}') is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
-                ),
-            }),
-            None => json!({
-                "code": "UNSUPPORTED_FEATURE",
-                "feature_id": feature_id,
-                "material": material,
-                "input": input,
-                "message": format!(
-                    "Principled input '{input}' of material '{material}' is not evaluated by Potter's lobe model; its Cycles contribution is omitted or approximated"
-                ),
-            }),
-        });
-    }
-}
-
 /// Per-channel volume closure weights per unit density (Cycles' closure weight times density).
 /// The scatter weight feeds σs, the absorption weight σa; extinction is σt = σs + σa.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -219,10 +160,11 @@ pub struct BsdfParams {
     /// Oren-Nayar roughness of the diffuse lobe (`bsdf_oren_nayar_setup`); Cycles uses the
     /// improved energy-preserving model when this is at least 1e-5.
     pub diffuse_roughness: f64,
-    /// Thin Wall (Cycles' `thin_wall`, `svm/closure.h`): the thin branch replaces the BSSRDF with the thin-subsurface
-    /// closure. Potter evaluates that closure's diffuse reflection (`subsurface_share`), but not its translucent
-    /// transmission (`bsdf_thin_subsurface_setup`), so the input is reported as unevaluated.
+    /// Thin Wall (Cycles' `thin_wall`, `svm/closure.h`): selects thin-glass and thin-subsurface
+    /// lobes rather than a volume or BSSRDF closure.
     pub thin_wall: bool,
+    /// Path state: Cycles replaces singular thin-glass transmission with a transparent closure for non-camera rays.
+    pub(crate) thin_glass_transparent: bool,
     /// Cycles' scattering coefficient σs per channel, absolute: the volume closure's scatter weight times its
     /// Density. The medium sums the volume closures by their weights (`SurfaceShading::volume`).
     pub volume_scatter: [f64; 3],
@@ -317,6 +259,7 @@ impl BsdfParams {
             thin_film_ior: 1.33,
             diffuse_roughness: 0.0,
             thin_wall: false,
+            thin_glass_transparent: false,
             volume_scatter: volume.scatter.map(|weight| weight * density),
             volume_absorption: volume.absorption.map(|weight| weight * density),
             volume_anisotropy: material.volume_anisotropy.clamp(-0.999, 0.999),
@@ -666,7 +609,6 @@ fn evaluate_surface_inner_into(
     shading.displacement_height = 0.0;
     let Some(graph_id) = &material.node_tree else {
         let mut params = BsdfParams::from_material(material, hit_ctx.normal);
-        record_unevaluated_inputs(hit_ctx.warnings, &material.name, None, &params);
         // The material is its own one arm, so its glass tint follows its textured base colour here.
         params.base_color = textured_base(material, hit_ctx, params.base_color)?;
         params.glass_transmission_tint = principled_glass_tint(params.base_color);
@@ -1614,12 +1556,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                 self.material.base_color[3]
             };
             params.alpha = self.scalar_input(id, &["Alpha"], default_alpha)?;
-            record_unevaluated_inputs(
-                self.hit_ctx.warnings,
-                &self.material.name,
-                Some(id),
-                &params,
-            );
             return Ok(params);
         }
         let mut params = self.closure_params();
@@ -1634,14 +1570,17 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             self.scalar_input(id, &["Transmission Weight", "Transmission"], 0.0)?;
         params.subsurface_weight =
             self.scalar_input(id, &["Subsurface Weight", "Subsurface"], 0.0)?;
-        params.subsurface_radius = self
-            .vector_input(id, &["Subsurface Radius"], DVec3::new(1.0, 0.2, 0.1))?
-            .to_array();
-        params.subsurface_scale = self.scalar_input(id, &["Subsurface Scale"], 0.005)?;
+        params.thin_wall = self.scalar_input(id, &["Thin Wall"], 0.0)? > 0.5;
+        if !params.thin_wall {
+            params.subsurface_radius = self
+                .vector_input(id, &["Subsurface Radius"], DVec3::new(1.0, 0.2, 0.1))?
+                .to_array();
+            params.subsurface_scale = self.scalar_input(id, &["Subsurface Scale"], 0.005)?;
+            params.subsurface_ior = self.scalar_input(id, &["Subsurface IOR"], 1.4)?;
+        }
         let method = method_token.as_str();
         params.subsurface_method = SubsurfaceMethod::parse(method)
             .ok_or_else(|| invalid(format!("unknown Principled subsurface method `{method}`")))?;
-        params.subsurface_ior = self.scalar_input(id, &["Subsurface IOR"], 1.4)?;
         params.subsurface_anisotropy = self.scalar_input(id, &["Subsurface Anisotropy"], 0.0)?;
         params.coat_weight = self.scalar_input(id, &["Coat Weight", "Clearcoat"], 0.0)?;
         params.coat_roughness =
@@ -1683,12 +1622,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let coat_normal = self.vector_input(id, &["Coat Normal"], DVec3::ZERO)?;
         params.coat_normal =
             (coat_normal.length_squared() > f64::EPSILON).then(|| coat_normal.normalize());
-        record_unevaluated_inputs(
-            self.hit_ctx.warnings,
-            &self.material.name,
-            Some(id),
-            &params,
-        );
         Ok(params)
     }
 
@@ -2883,8 +2816,9 @@ fn graph_is_transparent(group: &NodeGroup, output: &Id) -> bool {
 
 fn number(value: &JsonValue, default: f64) -> f64 {
     value
-        .as_f64()
-        .filter(|value| value.is_finite())
+        .as_bool()
+        .map(|value| if value { 1.0 } else { 0.0 })
+        .or_else(|| value.as_f64().filter(|value| value.is_finite()))
         .unwrap_or(default)
 }
 
@@ -3633,6 +3567,47 @@ mod tests {
     }
 
     #[test]
+    fn thin_wall_does_not_evaluate_disconnected_subsurface_inputs() {
+        let mut graph = principled_output(json!({"Thin Wall": 1.0, "Subsurface Weight": 0.5}));
+        insert_node(
+            &mut graph,
+            "ignored",
+            "ShaderNodeUnsupportedForThinWallTest",
+            json!({}),
+        );
+        link(
+            &mut graph,
+            "ignored",
+            "Vector",
+            "principled",
+            "Subsurface Radius",
+        );
+        link(
+            &mut graph,
+            "ignored",
+            "Value",
+            "principled",
+            "Subsurface Scale",
+        );
+        link(
+            &mut graph,
+            "ignored",
+            "Value",
+            "principled",
+            "Subsurface IOR",
+        );
+        let graph_id = Id::new("thin_wall_graph".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let material = Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let surface = evaluate_surface(&material, &HitContext::new(&groups)).unwrap();
+        assert!(surface.closures[0].params.thin_wall);
+    }
+
+    #[test]
     fn a_mix_of_two_subsurface_methods_keeps_each_closure_its_own_method() {
         use super::SubsurfaceMethod;
         // Each Principled arm carries its own method. Mix Shader concatenates the arms' closures, so both methods reach
@@ -3909,65 +3884,6 @@ mod tests {
             weighted_volume(&mixed, |params| params.volume_absorption),
             [0.6625, 0.4375, 0.2125]
         ));
-    }
-
-    #[test]
-    fn unevaluated_principled_inputs_warn_once_per_material_and_input() {
-        use std::cell::RefCell;
-
-        let sink = RefCell::new(Vec::new());
-        let mut groups = Registry::new();
-        // A native material sets rough transmission on the material itself. The glass lobe evaluates it, so it does not warn.
-        let native = Material {
-            name: "Native".to_owned(),
-            transmission: 0.5,
-            roughness: 0.3,
-            ..Material::default()
-        };
-        let context = HitContext::new(&groups).with_warnings(&sink);
-        evaluate_surface(&native, &context).unwrap();
-        evaluate_surface(&native, &context).unwrap();
-
-        // A graph material sets subsurface (the default random walk, which is evaluated) and Thin Wall (which is not)
-        // on its Principled node, with rough transmission. Thin Wall warns; subsurface, rough transmission and coat do not.
-        let mut graph = NodeGroup::new("Graph", GraphKind::Shader);
-        insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
-        insert_node(
-            &mut graph,
-            "principled",
-            "ShaderNodeBsdfPrincipled",
-            json!({"Subsurface Weight":0.5,"Thin Wall":1.0,"Transmission Weight":0.5,"Roughness":0.3}),
-        );
-        link(&mut graph, "principled", "BSDF", "output", "Surface");
-        let graph_id = Id::new("graph_shader".to_owned()).unwrap();
-        groups.insert(graph_id.clone(), graph);
-        let graph_material = Material {
-            name: "Graph".to_owned(),
-            node_tree: Some(graph_id),
-            ..Material::default()
-        };
-        let graph_context = HitContext::new(&groups).with_warnings(&sink);
-        evaluate_surface(&graph_material, &graph_context).unwrap();
-        evaluate_surface(&graph_material, &graph_context).unwrap();
-
-        let warnings = sink.borrow();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        let count = |material: &str, input: &str| {
-            warnings
-                .iter()
-                .filter(|warning| {
-                    warning["material"].as_str() == Some(material)
-                        && warning["input"].as_str() == Some(input)
-                })
-                .count()
-        };
-        assert_eq!(count("Native", "Transmission Weight"), 0);
-        assert_eq!(count("Graph", "Subsurface Weight"), 0);
-        assert_eq!(count("Graph", "Thin Wall"), 1);
-        assert_eq!(count("Graph", "Coat Weight"), 0);
-        assert_eq!(count("Graph", "Transmission Weight"), 0);
-        let thin_wall_warning = warnings.iter().find(|w| w["input"] == "Thin Wall").unwrap();
-        assert_eq!(thin_wall_warning["node_id"], "principled");
     }
 
     /// Two Principled BSDFs joined by `combiner` (Mix or Add Shader), evaluated as the surface's closures. The first

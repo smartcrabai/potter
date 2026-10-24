@@ -1,12 +1,13 @@
 //! Filter Glossy's glossy blur, against Blender 5.2.2's Cycles render (`fixtures/native_oracle/bump/glossy_blur.py`).
 //!
 //! A diffuse floor is lit only through a bounce off a roughness-0 metal or glass wall, which reflects the light of a
-//! large emitter that light sampling does not reach. The floor bounce has a cosine pdf below one, so Cycles blurs the
-//! wall's specular closure (`surface_shader_prepare_closures`, `bsdf_microfacet_blur`): sharp reflections become rough
-//! and spread the emitter's light differently. Blender's Filter Glossy 1.0 and 0.0 renders separate beyond seed noise
-//! for all three wall materials; Potter must match both settings for each.
+//! large emitter that light sampling does not reach. A rough Principled Thin Wall pane instead transmits it. The
+//! floor bounce has a cosine pdf below one, so Cycles blurs the wall's specular closure
+//! (`surface_shader_prepare_closures`, `bsdf_microfacet_blur`): sharp reflections and transmission become rougher.
+//! Blender's Filter Glossy 1.0 and 0.0 renders separate beyond seed noise; Potter must match both settings.
 //!
-//! The tolerance is `T · √(s_B² / n + s_P² / n)`, as in `native_subsurface_sphere.rs`.
+//! Potter-versus-Cycles uses `T · √(s_B² / n + s_P² / n)` as in `native_subsurface_sphere.rs`; blur-on/off controls
+//! use a paired-seed t tolerance.
 
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
@@ -145,16 +146,20 @@ fn assert_matches(wanted: &[Vec<f64>; 3], actual: &[Vec<f64>; 3], setting: &str)
     }
 }
 
-/// Asserts that Blender's Filter Glossy 1.0 and 0.0 means are separated beyond their seed noise.
+/// Asserts that Filter Glossy 1.0 and 0.0 differ beyond the per-seed noise in their paired renders.
 fn assert_separates(widened: &[Vec<f64>; 3], plain: &[Vec<f64>; 3], material: &str) {
     for channel in [0, 1] {
-        let (widened_mean, widened_stderr) = mean_and_stderr(&widened[channel]);
-        let (plain_mean, plain_stderr) = mean_and_stderr(&plain[channel]);
-        let tolerance = T_QUANTILE * widened_stderr.hypot(plain_stderr);
+        let differences = widened[channel]
+            .iter()
+            .zip(&plain[channel])
+            .map(|(blurred, unblurred)| blurred - unblurred)
+            .collect::<Vec<_>>();
+        let (mean, stderr) = mean_and_stderr(&differences);
+        let tolerance = T_QUANTILE * stderr;
         assert!(
-            (widened_mean - plain_mean).abs() > tolerance,
-            "{material}, channel {channel}: Blender's Filter Glossy 1.0 ({widened_mean}) and 0.0 ({plain_mean}) are \
-             within {tolerance}, so the case does not separate the blur"
+            mean.abs() > tolerance,
+            "{material}, channel {channel}: the paired Filter Glossy 1.0 vs 0.0 difference ({mean}) is within \
+             its seed-noise tolerance {tolerance}, so the case does not separate the blur"
         );
     }
 }
@@ -169,8 +174,15 @@ fn glossy_blur_matches_cycles() -> TestResult {
     let blend = root.path().join("scene.blend");
     let glass_blend = root.path().join("glass.blend");
     let principled_glass_blend = root.path().join("principled_glass.blend");
+    let thin_glass_blend = root.path().join("thin_glass.blend");
     let json_path = root.path().join("blender.json");
-    let arguments: [&Path; 4] = [&blend, &glass_blend, &principled_glass_blend, &json_path];
+    let arguments: [&Path; 5] = [
+        &blend,
+        &glass_blend,
+        &principled_glass_blend,
+        &thin_glass_blend,
+        &json_path,
+    ];
     run_blender_arguments(&blender, &script, None, &arguments)?;
     let expected: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
 
@@ -187,6 +199,12 @@ fn glossy_blur_matches_cycles() -> TestResult {
             principled_glass_blend,
             "principled_glass_seed_means",
             "principled_glass_seed_means_filter_glossy_0",
+        ),
+        (
+            "thin glass",
+            thin_glass_blend,
+            "thin_glass_seed_means",
+            "thin_glass_seed_means_filter_glossy_0",
         ),
     ] {
         let widened = blender_channels(&expected, widened_key)?;
@@ -209,14 +227,7 @@ fn glossy_blur_matches_cycles() -> TestResult {
         );
         let widened_potter = potter_channels(&project, root.path(), 1.0)?;
         let plain_potter = potter_channels(&project, root.path(), 0.0)?;
-        for channel in [0, 1] {
-            let (blurred_mean, _) = mean_and_stderr(&widened_potter[channel]);
-            let (plain_mean, _) = mean_and_stderr(&plain_potter[channel]);
-            assert!(
-                (blurred_mean - plain_mean).abs() > 1.0e-6,
-                "{name}, channel {channel}: Filter Glossy 1.0 did not change Potter's render"
-            );
-        }
+        assert_separates(&widened_potter, &plain_potter, name);
         assert_matches(&widened, &widened_potter, "1.0");
         assert_matches(&plain, &plain_potter, "0.0");
     }

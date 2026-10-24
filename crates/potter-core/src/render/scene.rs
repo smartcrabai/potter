@@ -22,7 +22,6 @@ use crate::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
         SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace,
         evaluate_surface_with_workspace, fill_color_layers, heaviest, make_orthonormals,
-        record_unevaluated_inputs,
     },
 };
 
@@ -40,7 +39,8 @@ use super::{
     },
     path::{hit_params, object_for_index},
     principled_bsdf::{
-        Layers, layers as principled_layers, reflected_lobes_coefficient, without_subsurface,
+        Layers, layers as principled_layers, reflected_lobes_coefficient,
+        thin_subsurface_transmission_weight, without_subsurface,
     },
     raster::{
         AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, Triangle, ViewBasis,
@@ -909,21 +909,20 @@ pub(super) fn extract_geometry(
                     // Beauty shades each hit at its own point with its normal, Solid from its view ray, and the path tracer shades its own hits,
                     // so their triangles keep the base colour, flat faces included (EEVEE decides shadows per pixel).
                     // Other passes take a flat face's colour from its material.
-                    let color = if corner_normals.is_some()
-                        || matches!(mode, Mode::Beauty | Mode::Solid)
-                    {
-                        base_color
-                    } else {
-                        let params = shading_params(material, base_color, normal, &shader_warnings);
-                        let closures = [ShaderClosure {
-                            weight: 1.0,
-                            params,
-                        }];
-                        shade(
-                            doc, snapshot, center, center, normal, normal, normal, &closures, mode,
-                            None, thickness, None,
-                        )
-                    };
+                    let color =
+                        if corner_normals.is_some() || matches!(mode, Mode::Beauty | Mode::Solid) {
+                            base_color
+                        } else {
+                            let params = shading_params(material, base_color, normal);
+                            let closures = [ShaderClosure {
+                                weight: 1.0,
+                                params,
+                            }];
+                            shade(
+                                doc, snapshot, center, center, normal, normal, normal, &closures,
+                                mode, None, thickness, None,
+                            )
+                        };
                     let triangle = Triangle {
                         positions,
                         generated,
@@ -2108,24 +2107,13 @@ fn ray_visibility_warnings(node_id: &Id, node: &Node, warnings: &mut Vec<serde_j
 /// Principled inputs of a surface shaded with `material`: the path tracer's own construction
 /// (`BsdfParams::from_material`), with the surface colour `base` in place of the material's. An
 /// unmapped slot takes the default material's.
-fn shading_params(
-    material: Option<&Material>,
-    base: [f64; 4],
-    normal: DVec3,
-    warnings: &RefCell<Vec<serde_json::Value>>,
-) -> BsdfParams {
+fn shading_params(material: Option<&Material>, base: [f64; 4], normal: DVec3) -> BsdfParams {
     let mut params = material.map_or_else(
         || BsdfParams::from_material(&Material::default(), normal),
         |material| BsdfParams::from_material(material, normal),
     );
     params.base_color = base;
     params.alpha = base[3];
-    record_unevaluated_inputs(
-        Some(warnings),
-        material.map_or("", |material| material.name.as_str()),
-        None,
-        &params,
-    );
     params
 }
 
@@ -2206,10 +2194,25 @@ impl SurfaceShader for SceneShader<'_> {
             ];
             fallback = [ShaderClosure {
                 weight: 1.0,
-                params: shading_params(material, base, hit.normal, &self.geometry.shader_warnings),
+                params: shading_params(material, base, hit.normal),
             }];
             &fallback
         };
+        if matches!(self.mode, Mode::Beauty)
+            && closures
+                .iter()
+                .any(|closure| closure.params.thin_wall && closure.params.subsurface_weight > 0.0)
+        {
+            let warning = serde_json::json!({
+                "code": "UNSUPPORTED_FEATURE",
+                "feature_id": "shader.principled.thin_wall",
+                "message": "Realtime EEVEE Thin Wall subsurface lighting is approximate; Blender 5.2.2's diffuse/translucent closure and thickness-dependent direct/probe behavior are not fully matched",
+            });
+            let mut warnings = self.geometry.shader_warnings.borrow_mut();
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
         if matches!(self.mode, Mode::Solid) {
             // A back face is lit as its front: Workbench turns the normal toward the viewer
             // before it encodes it (`workbench_normal_encode`, `front_face`).
@@ -2813,7 +2816,14 @@ fn shade(
         );
         let mut lobes = DVec3::ZERO;
         if let (Some(world), Some(diffuse_environment)) = (world, diffuse_environment) {
-            let mut environment = albedo * diffuse_environment * dielectric * lower;
+            let diffuse_albedo = if params.thin_wall {
+                let subsurface = params.subsurface_weight.clamp(0.0, 1.0);
+                let reflection = f64::midpoint(1.0, -params.subsurface_anisotropy).clamp(0.0, 1.0);
+                albedo * (1.0 - subsurface + subsurface * reflection)
+            } else {
+                albedo
+            };
+            let mut environment = diffuse_albedo * diffuse_environment * dielectric * lower;
             let reflection = (-view + normal * (2.0 * normal.dot(view))).normalize_or_zero();
             let specular_environment =
                 prefiltered_world(world, reflection, roughness, probe_radiance);
@@ -2821,6 +2831,23 @@ fn shade(
             let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
             environment += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
             lobes += environment * ambient;
+            if params.thin_wall && params.subsurface_weight > 0.0 {
+                let sphere_thickness = matches!(thickness, Thickness::Sphere(value) if value > 0.0);
+                let translucent_environment = if sphere_thickness {
+                    world.average_irradiance()
+                } else {
+                    prefiltered_world(world, -normal, 1.0, irradiance_probe_radiance)
+                };
+                let color = if sphere_thickness {
+                    albedo * albedo
+                } else {
+                    albedo
+                };
+                lobes += color
+                    * thin_subsurface_transmission_weight(&lobe, &shading, false)
+                    * translucent_environment
+                    * ambient;
+            }
             // Refraction takes no occlusion: EEVEE's deferred combine multiplies no visibility into the transmission
             // closure's probe read (`eevee_deferred_combine.bsl.hh`), so the glass environment is not attenuated.
             if let Some(glass) =
@@ -2858,6 +2885,7 @@ fn shade(
                 shadow,
                 point_shadow,
                 ray_visibility,
+                thickness,
             ) * influence;
             if let Some(glass) = &glass {
                 lobes += glass_direct_contribution(
@@ -2957,16 +2985,21 @@ fn light_contribution(
     shadow: ShadowContext<'_>,
     point_shadow: Option<&PointShadowMap>,
     lobes: RayVisibility,
+    thickness: Thickness,
 ) -> DVec3 {
     let color = DVec3::from_array(light.color).max(DVec3::ZERO);
     let energy = light.energy.max(0.0);
     let position = matrix.transform_point3(DVec3::ZERO);
-    match light.light_type {
+    let sphere_thickness = matches!(thickness, Thickness::Sphere(value) if value > 0.0);
+    let mut light_params = *params;
+    light_params.thickness = Some(thickness.value());
+    light_params.thickness_slab = matches!(thickness, Thickness::Slab(_));
+    let contribution = match light.light_type {
         crate::model::LightType::Sun => {
             let toward_light = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
             // The disc's visibility is already inside `sun_lighting`, one ray per disc sample, so the sun is not shadowed again.
             sun_lighting(
-                params,
+                &light_params,
                 shading,
                 shadow,
                 shadow_point,
@@ -2982,7 +3015,7 @@ fn light_contribution(
             let distance_squared = delta.length_squared().max(1.0e-6);
             let toward_light = delta.normalize_or_zero();
             punctual_radiance(
-                params,
+                &light_params,
                 shading,
                 toward_light,
                 color,
@@ -3008,7 +3041,7 @@ fn light_contribution(
                 return DVec3::ZERO;
             }
             punctual_radiance(
-                params,
+                &light_params,
                 shading,
                 toward_light,
                 color,
@@ -3045,26 +3078,100 @@ fn light_contribution(
                 point,
                 normal,
             ) * radiance;
+            let back = if params.thin_wall && !sphere_thickness {
+                area_side_weight(
+                    shadow,
+                    point_shadow,
+                    shadow_point,
+                    -geometric,
+                    &shape,
+                    position,
+                    light_direction,
+                    point,
+                    -normal,
+                ) * radiance
+            } else {
+                0.0
+            };
             // Integrated Lambert irradiance is exact for rectangles, and the visibility weight scales it. The specular,
             // sheen and coat lobes are evaluated towards the emitter centre on the lit side.
             let toward_centre = (position - point).normalize_or_zero();
-            let params = without_subsurface(params);
+            let front_params = if params.thin_wall {
+                *params
+            } else {
+                without_subsurface(params)
+            };
             let factors = LightFactors::of(light);
             let diffuse = reflected_lobes_coefficient(
-                &params,
+                &front_params,
                 shading,
                 toward_centre,
                 lobes.mask() & RayKind::Diffuse.bit(),
             );
             let specular = reflected_lobes_coefficient(
-                &params,
+                &front_params,
                 shading,
                 toward_centre,
                 lobes.mask() & RayKind::Glossy.bit(),
             );
+            let translucent = if params.thin_wall && !sphere_thickness {
+                reflected_lobes_coefficient(
+                    params,
+                    shading,
+                    -normal,
+                    lobes.mask() & RayKind::Diffuse.bit(),
+                )
+            } else {
+                DVec3::ZERO
+            };
             (diffuse * factors.diffuse + specular * factors.specular) * front * color
+                + translucent * (factors.diffuse * back) * color
         }
-    }
+    };
+    let sphere_translucent = if sphere_thickness
+        && params.thin_wall
+        && params.subsurface_weight > 0.0
+        && lobes.mask() & RayKind::Diffuse.bit() != 0
+    {
+        let Some(direct) = direct_emitter(light, matrix, point) else {
+            return contribution;
+        };
+        let origin = transmission_origin(
+            point,
+            geometric,
+            direct.direction,
+            direct.shadow_distance,
+            thickness,
+        );
+        let visibility = if let Some(shape) = direct.area {
+            area_transmitted_fraction(
+                shadow,
+                origin,
+                &shape,
+                (direct.centre, -direct.axis),
+                direct.direction,
+            )
+        } else {
+            transmitted_visibility(shadow, origin, &direct)
+        };
+        let albedo = base_albedo(params).max(DVec3::ZERO);
+        let weight = thin_subsurface_transmission_weight(params, shading, false);
+        let form = direct.emitter.form_factor(
+            direct.direction,
+            shading.view,
+            [1.0, 0.0, 0.0, 1.0],
+            direct.to_centre,
+        );
+        albedo
+            * albedo
+            * weight
+            * direct.radiance
+            * (direct.attenuation * visibility * form * LightFactors::of(light).diffuse
+                / std::f64::consts::PI)
+    } else {
+        DVec3::ZERO
+    };
+    contribution + sphere_translucent
 }
 
 /// The weight of an area light over the hemisphere on `side` of a receiver: the Lambert irradiance of the emitter's
@@ -3649,13 +3756,20 @@ fn sun_lighting(
     light: &crate::model::LightData,
     lobes: RayVisibility,
 ) -> DVec3 {
-    let params = without_subsurface(params);
+    let front_params = if params.thin_wall {
+        *params
+    } else {
+        without_subsurface(params)
+    };
     let energy = light.energy.max(0.0);
+    let sphere_thickness =
+        !params.thickness_slab && params.thickness.is_some_and(|value| value > 0.0);
     let factors = LightFactors::of(light);
     let radius = sun_disc_radius(light.sun_angle);
     let weight = energy / SUN_DISC_SAMPLES as f64;
     let mut mean_visibility = 0.0;
     let mut specular = DVec3::ZERO;
+    let mut translucent = DVec3::ZERO;
     for sample in sun_disc_directions(toward_light, radius) {
         let visibility = match shadow {
             Some(shadow) => ray_transmittance(
@@ -3671,18 +3785,26 @@ fn sun_lighting(
         let cosine = shading.normal.dot(sample);
         if cosine > 0.0 {
             let lobe = reflected_lobes_coefficient(
-                &params,
+                &front_params,
                 shading,
                 sample,
                 lobes.mask() & RayKind::Glossy.bit(),
             );
             specular += lobe * (weight * cosine * visibility);
+        } else if params.thin_wall && !sphere_thickness && cosine < 0.0 {
+            let lobe = reflected_lobes_coefficient(
+                params,
+                shading,
+                sample,
+                lobes.mask() & RayKind::Diffuse.bit(),
+            );
+            translucent += lobe * (weight * -cosine * visibility);
         }
     }
     let cosine = shading.normal.dot(toward_light);
     let diffuse = if cosine > 0.0 {
         reflected_lobes_coefficient(
-            &params,
+            &front_params,
             shading,
             toward_light,
             lobes.mask() & RayKind::Diffuse.bit(),
@@ -3690,12 +3812,12 @@ fn sun_lighting(
     } else {
         DVec3::ZERO
     };
-    (diffuse * factors.diffuse + specular * factors.specular) * color
+    (diffuse * factors.diffuse + specular * factors.specular + translucent * factors.diffuse)
+        * color
 }
 
-/// Radiance a point, spot or sun light reflects toward the view of `shading`: the Principled
-/// diffuse, specular, sheen and coat lobes along `light`, times the light colour and `intensity`
-/// weighted by the receiver cosine. The glass lobes are `glass_direct_contribution`'s.
+/// Radiance a point, spot or sun light reflects toward the view of `shading`, plus Thin Wall's translucent lobe on the
+/// reverse hemisphere. The glass transmission lobes are `glass_direct_contribution`'s.
 fn punctual_radiance(
     params: &BsdfParams,
     shading: &Layers,
@@ -3705,30 +3827,45 @@ fn punctual_radiance(
     factors: LightFactors,
     lobes: RayVisibility,
 ) -> DVec3 {
+    let sphere_thickness =
+        !params.thickness_slab && params.thickness.is_some_and(|value| value > 0.0);
     let normal_light_cosine = shading.normal.dot(light).abs();
     if normal_light_cosine <= 0.0 {
         return DVec3::ZERO;
     }
     // The reflective lobes sit above the surface.
-    if shading.normal.dot(light) <= 0.0 {
-        return DVec3::ZERO;
+    if shading.normal.dot(light) > 0.0 {
+        let front_params = if params.thin_wall {
+            *params
+        } else {
+            without_subsurface(params)
+        };
+        let diffuse = reflected_lobes_coefficient(
+            &front_params,
+            shading,
+            light,
+            lobes.mask() & RayKind::Diffuse.bit(),
+        );
+        let specular = reflected_lobes_coefficient(
+            &front_params,
+            shading,
+            light,
+            lobes.mask() & RayKind::Glossy.bit(),
+        );
+        (diffuse * factors.diffuse + specular * factors.specular)
+            * color
+            * (intensity * normal_light_cosine)
+    } else if params.thin_wall && !sphere_thickness {
+        let translucent = reflected_lobes_coefficient(
+            params,
+            shading,
+            light,
+            lobes.mask() & RayKind::Diffuse.bit(),
+        );
+        translucent * factors.diffuse * color * (intensity * normal_light_cosine)
+    } else {
+        DVec3::ZERO
     }
-    let params = without_subsurface(params);
-    let diffuse = reflected_lobes_coefficient(
-        &params,
-        shading,
-        light,
-        lobes.mask() & RayKind::Diffuse.bit(),
-    );
-    let specular = reflected_lobes_coefficient(
-        &params,
-        shading,
-        light,
-        lobes.mask() & RayKind::Glossy.bit(),
-    );
-    (diffuse * factors.diffuse + specular * factors.specular)
-        * color
-        * (intensity * normal_light_cosine)
 }
 
 /// The light's closure multipliers, which EEVEE applies per closure class (`eevee_light.cc`, `power[LIGHT_DIFFUSE]`,

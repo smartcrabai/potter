@@ -4,7 +4,7 @@ mod evaluator;
 
 pub(crate) use evaluator::{
     AnisotropyModel, dielectric_f0, evaluate_surface_with_workspace_into, heaviest,
-    make_orthonormals, record_unevaluated_inputs,
+    make_orthonormals,
 };
 pub use evaluator::{
     BsdfParams, EvaluatorWorkspace, HitContext, HitFootprint, HitUvLayers, PreparedMaterial,
