@@ -25,17 +25,17 @@ use crate::{
         Action, ActionSlot, ArmatureData, Bone, CameraData, CameraProjection, Collection,
         Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveHandleType,
         CurvePoint, CurveSpline, CurveSplineType, DEFAULT_FILTER_WIDTH, DataBlock, Driver,
-        DriverType, DriverVariable, DriverVariableType, Extrapolation, FCurve, ForceField,
-        ForceFieldType, GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
-        GreasePencilStroke, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
-        Interpolation, Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty,
-        LibraryStatus, LightData, LightType, Material, MaterialLink, Modifier,
-        ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
-        NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind, RayVisibility,
-        Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene,
-        SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData,
-        TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer, ViewportDisplay,
-        VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
+        DriverType, DriverVariable, DriverVariableType, Extrapolation, FCurve, FCurveModifier,
+        ForceField, ForceFieldType, GreasePencilData, GreasePencilFrame, GreasePencilLayer,
+        GreasePencilPoint, GreasePencilStroke, Id, Image, ImageAlphaMode, ImageColorspace,
+        ImageSource, ImageTile, Interpolation, Keyframe, Library, LibraryKind, LibraryOverride,
+        LibraryOverrideProperty, LibraryStatus, LightData, LightType, Material, MaterialLink,
+        Modifier, ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType,
+        NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind,
+        RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
+        RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint,
+        TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer,
+        ViewportDisplay, VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, SequencerColorSpace, Strip as SequenceStrip,
@@ -8507,11 +8507,16 @@ fn convert_fcurve(value: &Value, mappings: &BTreeMap<String, String>) -> Result<
         "LINEAR" => Extrapolation::Linear,
         _ => Extrapolation::Constant,
     };
+    let modifiers = serde_json::from_value::<Vec<FCurveModifier>>(
+        value.get("modifiers").cloned().unwrap_or_else(|| json!([])),
+    )
+    .map_err(|error| invalid_intermediate(&format!("F-Curve modifiers are invalid: {error}")))?;
     Ok(FCurve {
         path,
         index,
         keyframes,
         extrapolation,
+        modifiers,
     })
 }
 
@@ -9936,16 +9941,25 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     "modifier F-Curve is preserved in compatibility data but lacks a supported stable-ID parameter binding; only Ocean.time is evaluated",
                 ));
             }
-            if curve
+            for modifier in curve
                 .get("modifiers")
                 .and_then(Value::as_array)
-                .is_some_and(|items| !items.is_empty())
+                .into_iter()
+                .flatten()
             {
-                losses.push(loss(
-                    "blender.animation.fcurve_modifier",
-                    action_name,
-                    "F-Curve modifiers are retained in compatibility data but not editable",
-                ));
+                let modifier_type = modifier
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                if !FCurveModifier::is_supported_type(modifier_type) {
+                    losses.push(loss(
+                        "blender.animation.fcurve_modifier",
+                        action_name,
+                        &format!(
+                            "F-Curve modifier type `{modifier_type}` is retained in compatibility data but is not evaluated",
+                        ),
+                    ));
+                }
             }
             if !matches!(
                 curve.get("extrapolation").and_then(Value::as_str),
@@ -13141,6 +13155,7 @@ mod tests {
                         },
                     ],
                     extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
                 }],
                 slots: Vec::new(),
                 active_slots: BTreeMap::new(),
@@ -17494,6 +17509,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                         },
                     ],
                     extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
                 }],
                 slots: Vec::new(),
                 active_slots: BTreeMap::new(),

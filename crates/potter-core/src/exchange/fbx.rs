@@ -3792,6 +3792,7 @@ fn import_animations(
             index: component,
             keyframes,
             extrapolation: Extrapolation::Constant,
+            modifiers: Vec::new(),
         });
         stack_models.entry(*stack_id).or_default().insert(*model_id);
     }

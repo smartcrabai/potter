@@ -676,6 +676,7 @@ fn validation_reports_all_check_statuses_issue_severities_and_format_losses() {
                     interpolation: Interpolation::Linear,
                     ..Keyframe::default()
                 }],
+                modifiers: Vec::new(),
             }],
             ..Action::default()
         },

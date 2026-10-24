@@ -77,8 +77,73 @@ fn keyframe_schema() -> Value {
     })
 }
 
+fn fcurve_modifier_schema() -> Value {
+    let properties = json!({
+        "name":{"type":"string"},
+        "show_expanded":{"type":"boolean"},
+        "mute":{"type":"boolean"},
+        "active":{"type":"boolean"},
+        "use_restricted_range":{"type":"boolean"},
+        "frame_start":{"type":"number"},
+        "frame_end":{"type":"number"},
+        "blend_in":{"type":"number","minimum":0},
+        "blend_out":{"type":"number","minimum":0},
+        "use_influence":{"type":"boolean"},
+        "influence":{"type":"number","minimum":0,"maximum":1},
+        "use_additive":{"type":"boolean"},
+        "mode":{"enum":["POLYNOMIAL","POLYNOMIAL_FACTORISED"]},
+        "poly_order":{"type":"integer","minimum":1,"maximum":100},
+        "coefficients":{"type":"array","items":{"type":"number"}},
+        "function_type":{"enum":["SIN","COS","TAN","SINC","LN","SQRT"]},
+        "amplitude":{"type":"number"},
+        "phase_multiplier":{"type":"number"},
+        "phase_offset":{"type":"number"},
+        "value_offset":{"type":"number"},
+        "control_points":{"type":"array","items":{"type":"object","required":["frame","min","max"],"properties":{"frame":{"type":"number"},"min":{"type":"number"},"max":{"type":"number"}},"additionalProperties":false}},
+        "reference_value":{"type":"number"},
+        "default_min":{"type":"number"},
+        "default_max":{"type":"number"},
+        "mode_before":{"enum":["NONE","REPEAT","REPEAT_OFFSET","MIRROR"]},
+        "mode_after":{"enum":["NONE","REPEAT","REPEAT_OFFSET","MIRROR"]},
+        "cycles_before":{"type":"integer","minimum":i16::MIN,"maximum":i16::MAX},
+        "cycles_after":{"type":"integer","minimum":i16::MIN,"maximum":i16::MAX},
+        "blend_type":{"enum":["REPLACE","MULTIPLY","ADD","SUBTRACT"]},
+        "scale":{"type":"number"},
+        "strength":{"type":"number"},
+        "phase":{"type":"number"},
+        "offset":{"type":"number"},
+        "lacunarity":{"type":"number"},
+        "roughness":{"type":"number"},
+        "depth":{"type":"integer","minimum":0,"maximum":i16::MAX},
+        "use_legacy_noise":{"type":"boolean"},
+        "use_min_x":{"type":"boolean"},
+        "use_min_y":{"type":"boolean"},
+        "use_max_x":{"type":"boolean"},
+        "use_max_y":{"type":"boolean"},
+        "min_x":{"type":"number"},
+        "min_y":{"type":"number"},
+        "max_x":{"type":"number"},
+        "max_y":{"type":"number"},
+        "frame_step":{"type":"number"},
+        "frame_offset":{"type":"number"},
+        "use_frame_start":{"type":"boolean"},
+        "use_frame_end":{"type":"boolean"},
+        "sigma":{"type":"number","minimum":0.1,"maximum":100},
+        "filter_width":{"type":"integer","minimum":1,"maximum":32}
+    });
+    json!({
+        "type":"object",
+        "required":["type","properties"],
+        "properties":{
+            "type":{"enum":["GENERATOR","FNGENERATOR","ENVELOPE","CYCLES","NOISE","LIMITS","STEPPED","SMOOTH"]},
+            "properties":{"type":"object","properties":properties,"additionalProperties":false}
+        },
+        "additionalProperties":false
+    })
+}
+
 fn fcurve_schema() -> Value {
-    json!({"type":"object","required":["path","index"],"properties":{"path":{"type":"string"},"index":{"type":"integer","minimum":0,"maximum":u32::MAX},"keyframes":{"type":"array","items":{"$ref":"#/$defs/keyframe"},"default":[]},"extrapolation":{"enum":["constant","linear"],"default":"constant"}},"additionalProperties":false})
+    json!({"type":"object","required":["path","index"],"properties":{"path":{"type":"string"},"index":{"type":"integer","minimum":0,"maximum":u32::MAX},"keyframes":{"type":"array","items":{"$ref":"#/$defs/keyframe"},"default":[]},"extrapolation":{"enum":["constant","linear"],"default":"constant"},"modifiers":{"type":"array","items":{"$ref":"#/$defs/fcurve_modifier"},"default":[]}},"additionalProperties":false})
 }
 
 fn action_schema() -> Value {
@@ -146,6 +211,7 @@ fn scene_schema() -> Value {
         "texture_ref":texture_ref,
         "world":{"type":"object","required":["color","strength"],"properties":{"color":{"$ref":"#/$defs/vec3"},"strength":{"type":"number","minimum":0}},"additionalProperties":false},
         "keyframe":keyframe_schema(),
+        "fcurve_modifier":fcurve_modifier_schema(),
         "fcurve":fcurve_schema(),
         "action":action_schema(),
         "history":{"type":"object","properties":{"head":{"type":["string","null"]},"undo":{"type":"array","items":{"type":"string"}},"redo":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}
@@ -592,6 +658,7 @@ fn operations_schema() -> Value {
     defs.insert("id".to_owned(), id_schema());
     defs.insert("keyframe".to_owned(), keyframe_schema());
     defs.insert("fcurve".to_owned(), fcurve_schema());
+    defs.insert("fcurve_modifier".to_owned(), fcurve_modifier_schema());
     for name in ops::OP_NAMES {
         defs.insert(def_key(name), operation_schema(name));
     }
@@ -619,7 +686,7 @@ fn operation_schema(name: &str) -> Value {
         properties.insert((*field).to_owned(), schema);
     }
     let mut result = json!({"$schema":DRAFT,"title":format!("Operation {name}"),"type":"object","properties":properties,"required":contract.required,"additionalProperties":false,
-        "$defs":{"id":id_schema(),"keyframe":keyframe_schema(),"fcurve":fcurve_schema()},"x-potter":{"target_type":contract.target_type,"scope":contract.scope,"reversible":contract.reversible,"defaults":contract.defaults}});
+        "$defs":{"id":id_schema(),"keyframe":keyframe_schema(),"fcurve":fcurve_schema(),"fcurve_modifier":fcurve_modifier_schema()},"x-potter":{"target_type":contract.target_type,"scope":contract.scope,"reversible":contract.reversible,"defaults":contract.defaults}});
     if name == "node.delete" {
         result["allOf"] = json!([
             {"not":{"required":["recursive","reparent"],"properties":{"recursive":{"const":true}}}},
@@ -2726,7 +2793,9 @@ fn set_schema(operation: &str) -> Value {
         "action.update" => {
             json!({"name":{"type":"string"},"fcurves":{"type":"array","items":{"$ref":"#/$defs/fcurve"}}})
         }
-        "fcurve.update" => json!({"extrapolation":{"enum":["constant","linear"]}}),
+        "fcurve.update" => {
+            json!({"extrapolation":{"enum":["constant","linear"]},"modifiers":{"type":"array","items":{"$ref":"#/$defs/fcurve_modifier"}}})
+        }
         "camera.update" => camera_set_properties(),
         "light.update" => light_set_properties(),
         "world.update" => world_set_properties(),
@@ -3084,7 +3153,7 @@ mod tests {
         let document = operations_schema();
         assert_eq!(
             document["$defs"].as_object().map(serde_json::Map::len),
-            Some(crate::ops::OP_NAMES.len() + 3)
+            Some(crate::ops::OP_NAMES.len() + 4)
         );
     }
 
@@ -3156,6 +3225,24 @@ mod tests {
                     .as_array()
                     .is_some_and(|values| values.iter().any(|value| value == "TRACK_Z"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn fcurve_modifier_schema_uses_blender_rna_and_dna_ranges() -> crate::error::Result<()> {
+        let update = schema("operations", Some("fcurve.update"))?;
+        let properties =
+            &update["$defs"]["fcurve_modifier"]["properties"]["properties"]["properties"];
+        assert_eq!(properties["influence"]["minimum"], 0);
+        assert_eq!(properties["influence"]["maximum"], 1);
+        assert_eq!(properties["blend_in"]["minimum"], 0);
+        assert_eq!(properties["blend_out"]["minimum"], 0);
+        assert_eq!(properties["depth"]["minimum"], 0);
+        assert_eq!(properties["depth"]["maximum"], 32767);
+        for field in ["cycles_before", "cycles_after"] {
+            assert_eq!(properties[field]["minimum"], -32768);
+            assert_eq!(properties[field]["maximum"], 32767);
+        }
         Ok(())
     }
 

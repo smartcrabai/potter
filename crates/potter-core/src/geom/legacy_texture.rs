@@ -3038,6 +3038,15 @@ fn generic_noise(noise_size: f32, x: f32, y: f32, z: f32, hard: bool, basis: u8)
     }
 }
 
+/// Blender's `BLI_noise_hnoise` using the already-portable legacy texture noise basis.
+pub(crate) fn blender_legacy_noise_hnoise(noise_size: f32, x: f32, y: f32, z: f32) -> f32 {
+    if noise_size == 0.0 {
+        0.0
+    } else {
+        generic_noise(noise_size, x, y, z, false, 0)
+    }
+}
+
 fn generic_turbulence(
     noise_size: f32,
     x: f32,
