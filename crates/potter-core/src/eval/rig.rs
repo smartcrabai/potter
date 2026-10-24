@@ -5700,6 +5700,7 @@ fn depth_object_ray_hit(
     object_world: DMat4,
     origin: DVec3,
     direction: DVec3,
+    evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
 ) -> Result<Option<DVec3>> {
     let node = doc.nodes.get(object_id).ok_or_else(|| {
         evaluation_error_with(
@@ -5707,31 +5708,18 @@ fn depth_object_ray_hit(
             json!({"depth_object":object_id}),
         )
     })?;
-    if !node.modifiers.is_empty() {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "Follow Track depth_object ray casting requires evaluated modifier geometry",
-            json!({
-                "feature_id":"constraint.follow_track.depth_object_modifiers",
-                "depth_object":object_id,
-            }),
-        ));
-    }
-    let mesh = node
-        .data
-        .as_ref()
-        .and_then(|data_id| doc.data_blocks.get(data_id))
-        .and_then(|data| data.mesh.as_ref())
-        .ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                "Follow Track depth_object ray casting requires mesh data",
-                json!({
-                    "feature_id":"constraint.follow_track.depth_object_mesh",
-                    "depth_object":object_id,
-                }),
-            )
-        })?;
+    let mesh = evaluated_meshes.map_or_else(
+        || {
+            node.data
+                .as_ref()
+                .and_then(|data_id| doc.data_blocks.get(data_id))
+                .and_then(|data| data.mesh.as_ref())
+        },
+        |meshes| meshes.get(object_id),
+    );
+    let Some(mesh) = mesh.filter(|mesh| !mesh.faces.is_empty()) else {
+        return Ok(None);
+    };
     let object_inverse = checked_inverse(object_world, "Follow Track depth object")?;
     let local_origin = object_inverse.transform_point3(origin);
     let local_direction = object_inverse
@@ -5740,11 +5728,15 @@ fn depth_object_ray_hit(
     if local_direction.length_squared() <= f64::EPSILON {
         return Err(evaluation_error("Follow Track depth ray is degenerate"));
     }
+    let vertex_positions: HashMap<_, _> = mesh
+        .vertices
+        .iter()
+        .map(|vertex| (vertex.id, vertex.co))
+        .collect();
     let vertex_position = |vertex_id: u32| {
-        mesh.vertices
-            .iter()
-            .find(|vertex| vertex.id == vertex_id)
-            .map(|vertex| vertex.co)
+        vertex_positions
+            .get(&vertex_id)
+            .copied()
             .ok_or_else(|| evaluation_error("Follow Track depth mesh has invalid topology"))
     };
     let mut nearest = None;
@@ -5775,6 +5767,7 @@ fn follow_track_matrix(
     doc: &SceneDoc,
     frame: f64,
     world_matrices: &BTreeMap<Id, DMat4>,
+    evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
     world_to_owner: Option<DMat4>,
 ) -> Result<DMat4> {
     let clip = constraint_clip(doc, constraint)?;
@@ -5943,6 +5936,8 @@ fn follow_track_matrix(
     if object_depth <= f64::EPSILON {
         return Ok(source);
     }
+    let projected_location =
+        camera_world.transform_point3(ray_origin_local + direction * object_depth);
     let location = if let Some(depth_id) = constraint
         .params
         .get("depth_object")
@@ -5961,25 +5956,22 @@ fn follow_track_matrix(
             )
         })?;
         let depth_matrix = world_to_owner.map_or(world_matrix, |matrix| matrix * world_matrix);
-        let ray_direction = camera_world
-            .transform_vector3(direction)
-            .normalize_or_zero();
+        let ray_origin = camera_world.w_axis.truncate();
+        let ray_direction = (projected_location - ray_origin).normalize_or_zero();
         if ray_direction.length_squared() <= f64::EPSILON {
             return Err(evaluation_error("Follow Track camera ray is degenerate"));
         }
-        let Some(location) = depth_object_ray_hit(
+        depth_object_ray_hit(
             doc,
             &depth_id,
             depth_matrix,
-            camera_world.transform_point3(ray_origin_local),
+            ray_origin,
             ray_direction,
+            evaluated_meshes,
         )?
-        else {
-            return Ok(source);
-        };
-        location
+        .unwrap_or(projected_location)
     } else {
-        camera_world.transform_point3(ray_origin_local + direction * object_depth)
+        projected_location
     };
     let mut camera_rotation = camera_world;
     camera_rotation.w_axis = glam::DVec4::W;
@@ -6997,6 +6989,7 @@ fn apply_object_constraint_in_space(
                 doc,
                 frame,
                 world_matrices,
+                evaluated_meshes,
                 world_to_owner,
             )?;
             return blend_transform(source, desired, influence);
