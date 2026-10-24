@@ -166,7 +166,7 @@ fn assert_float_sequence_frame(label: &str, pixels: &[[f64; 4]], channel: usize)
     );
     assert!(
         pixels.iter().any(|pixel| {
-            pixel[3] == 0.5
+            pixel[3].total_cmp(&0.5).is_eq()
                 && (0.1..0.15).contains(&pixel[0])
                 && (0.04..0.06).contains(&pixel[1])
                 && (0.02..0.03).contains(&pixel[2])
@@ -177,6 +177,13 @@ fn assert_float_sequence_frame(label: &str, pixels: &[[f64; 4]], channel: usize)
 
 #[test]
 fn native_image_sequence_elements_render_in_order_with_float_rgba_intact() -> TestResult {
+    const EMITTER_SAMPLE: f32 = f32::from_bits(0x3e01_a000);
+    const BASE_SAMPLE: (f32, f32, f32, f32) = (
+        0.125,
+        f32::from_bits(0x3d4c_c000),
+        f32::from_bits(0x3ccc_c000),
+        0.5,
+    );
     let Some(blender) = blender_executable() else {
         eprintln!("skipping native image-sequence consumer; Blender is unavailable");
         return Ok(());
@@ -190,18 +197,18 @@ fn native_image_sequence_elements_render_in_order_with_float_rgba_intact() -> Te
     let image_size = usize::try_from(RESOLUTION)?;
     exr::prelude::write_rgba_file(&first_path, image_size, image_size, |x, y| {
         if (x, y) == (32, 32) {
-            (0.126_586_914_062_5, 0.0, 0.0, 0.0)
+            (EMITTER_SAMPLE, 0.0, 0.0, 0.0)
         } else if (x, y) == (52, 51) {
-            (0.125, 0.049_987_792_968_75, 0.024_993_896_484_375, 0.5)
+            BASE_SAMPLE
         } else {
             (0.0, 0.0, 0.0, 0.0)
         }
     })?;
     exr::prelude::write_rgba_file(&second_path, image_size, image_size, |x, y| {
         if (x, y) == (32, 32) {
-            (0.0, 0.126_586_914_062_5, 0.0, 0.0)
+            (0.0, EMITTER_SAMPLE, 0.0, 0.0)
         } else if (x, y) == (52, 51) {
-            (0.125, 0.049_987_792_968_75, 0.024_993_896_484_375, 0.5)
+            BASE_SAMPLE
         } else {
             (0.0, 0.0, 0.0, 0.0)
         }
