@@ -391,7 +391,7 @@ struct FollowCase {
     camera: &'static str,
 }
 
-const FOLLOW_CASES: [FollowCase; 9] = [
+const FOLLOW_CASES: [FollowCase; 14] = [
     FollowCase {
         id: "active_undistorted",
         clip: "active",
@@ -473,6 +473,51 @@ const FOLLOW_CASES: [FollowCase; 9] = [
         frame_method: "STRETCH",
         camera: "perspective",
     },
+    FollowCase {
+        id: "active_depth_unmodified",
+        clip: "active",
+        active: true,
+        use_3d: false,
+        undistorted: false,
+        frame_method: "STRETCH",
+        camera: "perspective",
+    },
+    FollowCase {
+        id: "active_depth_ortho",
+        clip: "active",
+        active: true,
+        use_3d: false,
+        undistorted: false,
+        frame_method: "STRETCH",
+        camera: "orthographic",
+    },
+    FollowCase {
+        id: "active_depth_non_mesh",
+        clip: "active",
+        active: true,
+        use_3d: false,
+        undistorted: false,
+        frame_method: "STRETCH",
+        camera: "perspective",
+    },
+    FollowCase {
+        id: "active_depth_miss",
+        clip: "active",
+        active: true,
+        use_3d: false,
+        undistorted: false,
+        frame_method: "STRETCH",
+        camera: "perspective",
+    },
+    FollowCase {
+        id: "active_depth_miss_ortho",
+        clip: "active",
+        active: true,
+        use_3d: false,
+        undistorted: false,
+        frame_method: "STRETCH",
+        camera: "orthographic",
+    },
 ];
 
 fn follow_doc(expected: &Value) -> TestResult<SceneDoc> {
@@ -488,7 +533,12 @@ fn follow_doc(expected: &Value) -> TestResult<SceneDoc> {
         json!({"op":"camera.create","id":"camera","name":"Perspective","projection":"perspective","lens_mm":50.0,"sensor_width_mm":36.0}),
         json!({"op":"camera.create","id":"ortho_camera","name":"Orthographic","projection":"orthographic","ortho_scale":3.5}),
         json!({"op":"tracking.track_add","id":"clip_active","track":"active_track","name":"Active Track","frame":1,"co":[80.0,45.0]}),
-        json!({"op":"node.create","id":"depth","kind":"plane","params":{"size":2.0},"transform":{"translation":[0.0,0.0,-2.0],"scale":[10.0,10.0,1.0]}}),
+        json!({"op":"node.create","id":"zz_depth","kind":"plane","params":{"size":2.0},"transform":{"translation":[0.0,0.0,-2.0],"scale":[10.0,10.0,1.0]}}),
+        json!({"op":"node.create","id":"depth_base","kind":"plane","params":{"size":2.0},"transform":{"translation":[0.0,0.0,-2.0],"scale":[10.0,10.0,1.0]}}),
+        json!({"op":"texture.create","id":"depth_noise","texture_type":"CLOUDS"}),
+        json!({"op":"modifier.create","target":{"id":"zz_depth"},"id":"displace","type":"displace","params":{"direction":"Z","strength":0.8,"mid_level":0.0,"texture":"depth_noise","texture_coords":"LOCAL"}}),
+        json!({"op":"node.create","id":"depth_non_mesh","kind":"empty"}),
+        json!({"op":"node.create","id":"depth_miss","kind":"plane","params":{"size":2.0},"transform":{"translation":[100.0,0.0,-2.0],"scale":[10.0,10.0,1.0]}}),
         json!({"op":"tracking.track_add","id":"clip_explicit","track":"explicit_track","name":"Explicit Track","frame":1,"co":[40.0,60.0]}),
     ];
     for case in FOLLOW_CASES {
@@ -511,7 +561,7 @@ fn follow_doc(expected: &Value) -> TestResult<SceneDoc> {
         operations.push(json!({
             "op":"constraint.create","target":{"id":format!("owner_{}",case.id)},"id":"follow_track","type":"follow_track",
             "constraint_target":camera,
-            "params":{"clip":if case.active { Value::Null } else { json!(clip) },"use_active_clip":case.active,"track":track,"use_3d_position":case.use_3d,"use_undistorted_position":case.undistorted,"frame_method":case.frame_method,"camera":camera,"depth_object":if case.id == "active_depth_hit" { json!("depth") } else { Value::Null }}
+            "params":{"clip":if case.active { Value::Null } else { json!(clip) },"use_active_clip":case.active,"track":track,"use_3d_position":case.use_3d,"use_undistorted_position":case.undistorted,"frame_method":case.frame_method,"camera":camera,"depth_object":match case.id {"active_depth_hit" | "active_depth_ortho" => json!("zz_depth"),"active_depth_unmodified" => json!("depth_base"),"active_depth_non_mesh" => json!("depth_non_mesh"),"active_depth_miss" | "active_depth_miss_ortho" => json!("depth_miss"),_ => Value::Null}}
         }));
     }
     let mut doc = ops::apply_batch(
@@ -689,19 +739,39 @@ depth_mesh.from_pydata([(-10,-10,0),(10,-10,0),(10,10,0),(-10,10,0)], [], [(0,1,
 depth_object = bpy.data.objects.new("DepthPlane", depth_mesh)
 depth_object.location = (0.0, 0.0, -2.0)
 scene.collection.objects.link(depth_object)
+depth_base = bpy.data.objects.new("DepthBasePlane", depth_mesh)
+depth_base.location = (0.0, 0.0, -2.0)
+scene.collection.objects.link(depth_base)
+depth_texture = bpy.data.textures.new("DepthClouds", type="CLOUDS")
+depth_displace = depth_object.modifiers.new("DepthDisplace", "DISPLACE")
+depth_displace.texture = depth_texture
+depth_displace.direction = "Z"
+depth_displace.strength = 0.8
+depth_displace.mid_level = 0.0
+depth_displace.texture_coords = "LOCAL"
+depth_non_mesh = bpy.data.objects.new("DepthEmpty", None)
+scene.collection.objects.link(depth_non_mesh)
+depth_miss = bpy.data.objects.new("DepthMiss", depth_mesh)
+depth_miss.location = (100.0, 0.0, -2.0)
+scene.collection.objects.link(depth_miss)
 cases = [
-    ("active_undistorted", active, active_track, True, False, True, "STRETCH", camera),
-    ("active_raw", active, active_track, True, False, False, "STRETCH", camera),
-    ("active_fit", active, active_track, True, False, False, "FIT", camera),
-    ("active_crop", active, active_track, True, False, False, "CROP", camera),
-    ("active_3d", active, active_track, True, True, False, "STRETCH", camera),
-    ("explicit_raw", explicit, explicit_track, False, False, False, "FIT", camera),
-    ("explicit_undistorted", explicit, explicit_track, False, False, True, "FIT", camera),
-    ("active_ortho", active, active_track, True, False, False, "CROP", ortho_camera),
-    ("active_depth_hit", active, active_track, True, False, False, "STRETCH", camera),
+    ("active_undistorted", active, active_track, True, False, True, "STRETCH", camera, None),
+    ("active_raw", active, active_track, True, False, False, "STRETCH", camera, None),
+    ("active_fit", active, active_track, True, False, False, "FIT", camera, None),
+    ("active_crop", active, active_track, True, False, False, "CROP", camera, None),
+    ("active_3d", active, active_track, True, True, False, "STRETCH", camera, None),
+    ("explicit_raw", explicit, explicit_track, False, False, False, "FIT", camera, None),
+    ("explicit_undistorted", explicit, explicit_track, False, False, True, "FIT", camera, None),
+    ("active_ortho", active, active_track, True, False, False, "CROP", ortho_camera, None),
+    ("active_depth_hit", active, active_track, True, False, False, "STRETCH", camera, depth_object),
+    ("active_depth_unmodified", active, active_track, True, False, False, "STRETCH", camera, depth_base),
+    ("active_depth_ortho", active, active_track, True, False, False, "STRETCH", ortho_camera, depth_object),
+    ("active_depth_non_mesh", active, active_track, True, False, False, "STRETCH", camera, depth_non_mesh),
+    ("active_depth_miss", active, active_track, True, False, False, "STRETCH", camera, depth_miss),
+    ("active_depth_miss_ortho", active, active_track, True, False, False, "STRETCH", ortho_camera, depth_miss),
 ]
 owners = {}
-for name, clip, track, use_active, use_3d, undistorted, frame_method, target_camera in cases:
+for name, clip, track, use_active, use_3d, undistorted, frame_method, target_camera, depth_object in cases:
     owner = bpy.data.objects.new("Owner_" + name, None)
     owner.location = (0.0, 0.0, -4.0)
     scene.collection.objects.link(owner)
@@ -709,7 +779,7 @@ for name, clip, track, use_active, use_3d, undistorted, frame_method, target_cam
     constraint.clip = None if use_active else clip
     constraint.use_active_clip = use_active
     constraint.track = track.name
-    if name == "active_depth_hit":
+    if depth_object is not None:
         constraint.depth_object = depth_object
     constraint.camera = target_camera
     constraint.use_3d_position = use_3d
@@ -758,6 +828,17 @@ with open(os.path.join(root, "follow_expected.json"), "w", encoding="utf-8") as 
         assert_matrix_parity(actual, expected, case.id);
     }
     let undistorted = node_matrix(&snapshot, "owner_active_undistorted")?;
+    let displaced = node_matrix(&snapshot, "owner_active_depth_hit")?.to_cols_array();
+    let unmodified = node_matrix(&snapshot, "owner_active_depth_unmodified")?.to_cols_array();
+    let displacement = displaced
+        .iter()
+        .zip(unmodified)
+        .map(|(displaced, unmodified)| (displaced - unmodified).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        displacement > 1.0e-4,
+        "displace modifier must move the depth hit away from the unmodified plane"
+    );
     let raw = node_matrix(&snapshot, "owner_active_raw")?;
     let lens_adjustment = undistorted
         .to_cols_array()
