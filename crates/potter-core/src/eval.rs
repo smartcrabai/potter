@@ -2124,10 +2124,15 @@ impl Snapshot {
                 && node.constraints.iter().any(|constraint| {
                     constraint.enabled
                         && constraint.influence != 0.0
-                        && matches!(
+                        && (matches!(
                             constraint.constraint_type,
                             ConstraintType::Shrinkwrap | ConstraintType::GeometryAttribute
-                        )
+                        ) || (constraint.constraint_type == ConstraintType::FollowTrack
+                            && constraint
+                                .params
+                                .get("depth_object")
+                                .and_then(Value::as_str)
+                                .is_some_and(|depth_object| !depth_object.is_empty())))
                 })
         });
         if has_mesh_dependent_constraints {

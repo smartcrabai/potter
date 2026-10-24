@@ -1515,19 +1515,31 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "constraint.follow_track.depth_object_mesh",
             "Follow Track depth objects without mesh data",
             "FOLLOW_TRACK",
-            &[],
-            "Depth-object ray casting is defined only for mesh data.",
+            &[
+                "tracking.track_add",
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "constraint.follow_track.depth_object_modifiers",
             "Follow Track depth objects with modifiers",
             "FOLLOW_TRACK",
-            &[],
-            "Depth-object ray casting currently reads base mesh data rather than evaluated modifier output.",
+            &[
+                "tracking.track_add",
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
         ),
         supported(
             "constraint.object_solver",
