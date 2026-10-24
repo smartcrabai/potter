@@ -214,6 +214,8 @@ pub struct BsdfParams {
     /// Oren-Nayar roughness of the diffuse lobe (`bsdf_oren_nayar_setup`); Cycles uses the
     /// improved energy-preserving model when this is at least 1e-5.
     pub diffuse_roughness: f64,
+    /// Thin Wall (Cycles' `thin_wall`, `svm/closure.h`): the thin branch replaces the BSSRDF with the thin-subsurface
+    /// closure. Potter evaluates that closure's diffuse reflection (`subsurface_share`), but not its translucent
     /// transmission (`bsdf_thin_subsurface_setup`), so the input is reported as unevaluated.
     pub thin_wall: bool,
     /// Cycles' scattering coefficient σs per channel, absolute: the volume closure's scatter weight times its
