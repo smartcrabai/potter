@@ -138,6 +138,87 @@ pub fn gaussian_blur(image: &Image, radius: u32) -> Result<Image> {
     })
 }
 
+/// Blender's default compositor Blur kernel: a separable Gaussian with radius-sized support.
+pub(super) fn compositor_gaussian_blur(image: &Image, radius: u32) -> Result<Image> {
+    if radius == 0 {
+        return Ok(image.clone());
+    }
+
+    let radius = usize::try_from(radius)
+        .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "blur radius is too large"))?;
+    let size = radius
+        .checked_add(1)
+        .ok_or_else(|| PotError::new(ErrorCode::LimitExceeded, "blur radius is too large"))?;
+    let mut kernel = vec![0.0_f32; size];
+    let filter_scale = 3.0_f32 * 1.6_f32;
+    let two_scale_squared = 2.0_f32 * 1.6_f32 * 1.6_f32;
+    let normalization = 1.0_f32 / (std::f32::consts::PI * two_scale_squared).sqrt();
+    let scale = 1.0_f32 / radius as f32;
+    let mut total = 0.0_f32;
+    for (offset, weight) in kernel.iter_mut().enumerate() {
+        let x = offset as f32 * scale * filter_scale;
+        *weight = normalization * (-x * x / two_scale_squared).exp();
+        total += *weight * if offset == 0 { 1.0 } else { 2.0 };
+    }
+    for weight in &mut kernel {
+        *weight /= total;
+    }
+
+    let width = usize::try_from(image.width).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "image width exceeds platform limits",
+        )
+    })?;
+    let height = usize::try_from(image.height).map_err(|_| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "image height exceeds platform limits",
+        )
+    })?;
+    let count = pixel_count(image.width, image.height)?;
+    let mut horizontal = vec![[0.0_f32; 4]; count];
+    let mut output = vec![[0.0_f32; 4]; count];
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel_index = y * width + x;
+            for channel in 0..4 {
+                let mut accumulated = image.pixels[pixel_index][channel] * kernel[0];
+                for (offset, weight) in kernel.iter().enumerate().skip(1) {
+                    let left = x.saturating_sub(offset);
+                    let right = x.saturating_add(offset).min(width - 1);
+                    accumulated += image.pixels[y * width + right][channel] * weight;
+                    accumulated += image.pixels[y * width + left][channel] * weight;
+                }
+                horizontal[pixel_index][channel] = accumulated;
+            }
+        }
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel_index = y * width + x;
+            for channel in 0..4 {
+                let mut accumulated = horizontal[pixel_index][channel] * kernel[0];
+                for (offset, weight) in kernel.iter().enumerate().skip(1) {
+                    let top = y.saturating_sub(offset);
+                    let bottom = y.saturating_add(offset).min(height - 1);
+                    accumulated += horizontal[bottom * width + x][channel] * weight;
+                    accumulated += horizontal[top * width + x][channel] * weight;
+                }
+                output[pixel_index][channel] = accumulated;
+            }
+        }
+    }
+
+    Ok(Image {
+        width: image.width,
+        height: image.height,
+        pixels: output,
+    })
+}
+
 pub(super) fn pixel_count(width: u32, height: u32) -> Result<usize> {
     if width == 0 || height == 0 {
         return Err(PotError::invalid_argument(

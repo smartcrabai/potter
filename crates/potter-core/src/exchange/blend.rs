@@ -5935,6 +5935,14 @@ fn parse_sequencer(
                 .collect();
             let color =
                 vec4_field(strip, "color", [0.0, 0.0, 0.0, 1.0]).map(|component| component as f32);
+            let source_files = optional_array(strip, "source_files")?
+                .iter()
+                .map(|source| {
+                    source.as_str().map(str::to_owned).ok_or_else(|| {
+                        invalid_intermediate("sequencer image source file must be a string")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             let source = strip
                 .get("source")
                 .and_then(Value::as_str)
@@ -5976,6 +5984,7 @@ fn parse_sequencer(
                 sound_volume: number_field(strip, "sound_volume", 1.0),
                 sound_pan: number_field(strip, "sound_pan", 0.0),
                 sound_pitch: number_field(strip, "sound_pitch", 1.0),
+                source_files,
                 source,
                 color,
                 text: strip.get("text").and_then(Value::as_str).map(str::to_owned),

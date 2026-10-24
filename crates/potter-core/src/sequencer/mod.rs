@@ -67,6 +67,9 @@ pub struct Strip {
     pub sound_pan: f64,
     pub sound_pitch: f64,
     pub source: Option<String>,
+    /// Ordered explicit paths for image sequences that do not use a source template.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_files: Vec<String>,
     /// Scene-linear RGBA; Blender's `COLOR_GAMMA` Color/Text properties are decoded on import.
     pub color: [f32; 4],
     pub text: Option<String>,
@@ -97,6 +100,7 @@ impl Default for Strip {
             sound_pan: 0.0,
             sound_pitch: 1.0,
             source: None,
+            source_files: Vec::new(),
             color: [0.0, 0.0, 0.0, 1.0],
             text: None,
             transition: None,
@@ -137,6 +141,20 @@ impl Strip {
                 ErrorCode::InvalidOperation,
                 "sequencer strip has invalid identity, timing, channel, or settings",
             ));
+        }
+        if !self.source_files.is_empty() {
+            if self.kind != StripType::ImageSequence {
+                return Err(PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "sequencer source_files are only valid for image_sequence strips",
+                ));
+            }
+            if self.source.is_some() {
+                return Err(PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "sequencer image sequence cannot specify both source and source_files",
+                ));
+            }
         }
         let expected_inputs = match (self.kind, self.effect) {
             (StripType::Transition, _)

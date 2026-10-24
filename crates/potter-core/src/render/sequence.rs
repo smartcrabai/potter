@@ -1456,22 +1456,49 @@ fn render_strip_content(
 ) -> Result<Option<SequencerFrame>> {
     let result = match strip.kind {
         StripType::Image | StripType::ImageSequence => {
-            let source = strip.source.as_deref().ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::InvalidOperation,
-                    "image strip requires a source",
-                    json!({"strip_id":strip.id}),
-                )
-            })?;
-            Some(load_strip_image(
-                doc,
-                root,
-                source,
-                strip.source_frame(frame),
-                width,
-                height,
-                scene.sequencer.colorspace,
-            )?)
+            let source_frame = strip.source_frame(frame);
+            if strip.source_files.is_empty() {
+                let source = strip.source.as_deref().ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::InvalidOperation,
+                        "image strip requires a source",
+                        json!({"strip_id":strip.id}),
+                    )
+                })?;
+                Some(load_strip_image(
+                    doc,
+                    root,
+                    source,
+                    source_frame,
+                    width,
+                    height,
+                    scene.sequencer.colorspace,
+                )?)
+            } else {
+                let last_index = strip.source_files.len() - 1;
+                let frame_number = rounded_frame(source_frame)?;
+                let index = usize::try_from(frame_number.max(0))
+                    .unwrap_or(usize::MAX)
+                    .min(last_index);
+                let source_file = strip.source_files.get(index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InvalidOperation,
+                        "image sequence has no source files",
+                    )
+                })?;
+                let source_path = Path::new(source_file);
+                let image = if source_path.is_absolute() {
+                    load_strip_image_file(source_path, width, height, scene.sequencer.colorspace)?
+                } else {
+                    load_strip_image_file(
+                        &root.join(source_path),
+                        width,
+                        height,
+                        scene.sequencer.colorspace,
+                    )?
+                };
+                Some(image)
+            }
         }
         StripType::Movie => {
             return Err(PotError::with_details(
@@ -1968,7 +1995,16 @@ fn load_strip_image(
         };
     }
     let path = resolve_image_sequence_path(root, source, source_frame)?;
-    let bytes = fs::read(&path).map_err(|error| PotError::io(&error))?;
+    load_strip_image_file(&path, width, height, working)
+}
+
+fn load_strip_image_file(
+    path: &Path,
+    width: u32,
+    height: u32,
+    working: SequencerColorSpace,
+) -> Result<SequencerFrame> {
+    let bytes = fs::read(path).map_err(|error| PotError::io(&error))?;
     let (colorspace, image_width, image_height, pixels) =
         storage::decode_pixels_with_default_colorspace(&bytes, None)?;
     let precision = storage::source_precision(&bytes);

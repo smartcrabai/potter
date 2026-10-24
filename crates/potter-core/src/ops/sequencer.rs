@@ -405,6 +405,7 @@ const STRIP_FIELDS: &[&str] = &[
     "sound_pan",
     "sound_pitch",
     "source",
+    "source_files",
     "color",
     "text",
     "transition",
@@ -430,9 +431,128 @@ const STRIP_SET_FIELDS: &[&str] = &[
     "sound_pan",
     "sound_pitch",
     "source",
+    "source_files",
     "color",
     "text",
     "transition",
     "inputs",
     "effect",
 ];
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "tests")]
+
+    use crate::{error::ErrorCode, model::SceneDoc, ops::apply_batch};
+    use serde_json::json;
+
+    #[test]
+    fn image_sequence_source_files_create_update_and_conflict() {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let created = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "sequencer.strip_create",
+                    "id": "sequence",
+                    "type": "image_sequence",
+                    "source_files": ["/tmp/odd-a.exr", "/tmp/not-numbered-b.exr"]
+                }]
+            }),
+        )
+        .unwrap();
+        let strip = created.doc.scenes[&created.doc.active_scene]
+            .sequencer
+            .strips
+            .iter()
+            .find(|strip| strip.id == "sequence")
+            .unwrap();
+        assert_eq!(
+            strip.source_files,
+            vec![
+                "/tmp/odd-a.exr".to_owned(),
+                "/tmp/not-numbered-b.exr".to_owned()
+            ]
+        );
+
+        let updated = apply_batch(
+            &created.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": created.doc.revision,
+                "operations": [{
+                    "op": "sequencer.strip_update",
+                    "id": "sequence",
+                    "set": {"source_files": ["/tmp/replacement.exr"]}
+                }]
+            }),
+        )
+        .unwrap();
+        let strip = updated.doc.scenes[&updated.doc.active_scene]
+            .sequencer
+            .strips
+            .iter()
+            .find(|strip| strip.id == "sequence")
+            .unwrap();
+        assert_eq!(strip.source_files, vec!["/tmp/replacement.exr".to_owned()]);
+
+        let templated = apply_batch(
+            &updated.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": updated.doc.revision,
+                "operations": [{
+                    "op": "sequencer.strip_create",
+                    "id": "template",
+                    "type": "image_sequence",
+                    "source": "/tmp/frame_####.exr"
+                }]
+            }),
+        )
+        .unwrap();
+        let strip = templated.doc.scenes[&templated.doc.active_scene]
+            .sequencer
+            .strips
+            .iter()
+            .find(|strip| strip.id == "template")
+            .unwrap();
+        assert_eq!(strip.source.as_deref(), Some("/tmp/frame_####.exr"));
+
+        let error = apply_batch(
+            &templated.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": templated.doc.revision,
+                "operations": [{
+                    "op": "sequencer.strip_update",
+                    "id": "template",
+                    "set": {"source_files": ["/tmp/another.exr"]}
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+    }
+
+    #[test]
+    fn source_files_reject_non_image_sequence_strips() {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let error = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "sequencer.strip_create",
+                    "id": "movie",
+                    "type": "movie",
+                    "source_files": ["/tmp/movie-frame.exr"]
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+    }
+}

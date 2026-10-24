@@ -18,6 +18,7 @@ use crate::{
     render::raster::RasterOutput,
 };
 
+use image::compositor_gaussian_blur;
 pub use image::{BlendMode, Image, gaussian_blur, mix_rgb};
 
 /// Applies compositor nodes (when enabled) and the selected display transform to render output.
@@ -183,7 +184,7 @@ fn evaluate_graph_with_association(
                 }
                 "CompositorNodeBlur" | "Blur" => {
                     let radius = blur_radius(node)?.min(256);
-                    gaussian_blur(&image, radius)?
+                    compositor_gaussian_blur(&image, radius)?
                 }
                 "CompositorNodeGlare" | "Glare" => glare(node, &image)?,
                 "CompositorNodeDenoise" | "Denoise" => {

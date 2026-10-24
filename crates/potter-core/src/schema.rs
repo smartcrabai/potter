@@ -261,6 +261,8 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"boolean"});
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["color_multiply"] =
         json!({"type":"number","minimum":0,"maximum":20});
+    defs["sequencer"]["properties"]["strips"]["items"]["properties"]["source_files"] =
+        json!({"type":"array","items":{"type":"string"},"default":[]});
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["channel"]["minimum"] =
         json!(1);
     let scene = &mut defs["scene"];
@@ -1947,6 +1949,47 @@ fn operation_contract(name: &str) -> OperationContract {
             "none",
             json!({}),
         ),
+        "sequencer.strip_create" => (
+            vec![
+                "target",
+                "id",
+                "name",
+                "type",
+                "channel",
+                "frame_start",
+                "frame_offset_start",
+                "frame_offset_end",
+                "length",
+                "blend_type",
+                "opacity",
+                "color_multiply",
+                "multiply_alpha",
+                "mute",
+                "retiming_keys",
+                "modifiers",
+                "sound_volume",
+                "sound_pan",
+                "sound_pitch",
+                "source",
+                "source_files",
+                "color",
+                "text",
+                "transition",
+                "inputs",
+                "effect",
+            ],
+            vec!["op", "id", "type"],
+            "scene sequencer strip",
+            "none",
+            json!({"name":"id","source_files":[]}),
+        ),
+        "sequencer.strip_update" => (
+            vec!["target", "id", "set"],
+            vec!["op", "id", "set"],
+            "scene sequencer strip",
+            "none",
+            json!({}),
+        ),
         "resource.pack" => (
             vec!["id", "uri", "kind", "sequence"],
             vec!["op", "id", "uri"],
@@ -2115,9 +2158,25 @@ fn field_schema(operation: &str, field: &str) -> Value {
             _ => common_field_schema(field),
         };
     }
+    if matches!(
+        operation,
+        "sequencer.strip_create" | "sequencer.strip_update"
+    ) && field == "source"
+    {
+        return json!({"type":["string","null"]});
+    }
+    if matches!(
+        operation,
+        "sequencer.strip_create" | "sequencer.strip_update"
+    ) && field == "source_files"
+    {
+        return json!({"type":"array","items":{"type":"string"},"default":[]});
+    }
     if field == "target" {
         if [
             "scene.update",
+            "sequencer.strip_create",
+            "sequencer.strip_update",
             "action.update",
             "action.delete",
             "world.update",
@@ -2582,6 +2641,43 @@ fn set_schema(operation: &str) -> Value {
             "root_collection":{"$ref":"#/$defs/id"},
             "unit":{"type":"object","properties":{"system":{"type":"string"},"scale_length":{"type":"number","exclusiveMinimum":0}},"additionalProperties":false}
         }),
+        "sequencer.strip_update" => {
+            let mut properties = Map::new();
+            for field in [
+                "type",
+                "channel",
+                "name",
+                "frame_start",
+                "frame_offset_start",
+                "frame_offset_end",
+                "length",
+                "blend_type",
+                "opacity",
+                "mute",
+                "retiming_keys",
+                "color_multiply",
+                "multiply_alpha",
+                "modifiers",
+                "sound_volume",
+                "sound_pan",
+                "sound_pitch",
+                "source",
+                "source_files",
+                "color",
+                "text",
+                "transition",
+                "inputs",
+                "effect",
+            ] {
+                let schema = if matches!(field, "source" | "source_files") {
+                    field_schema(operation, field)
+                } else {
+                    json!({})
+                };
+                properties.insert(field.to_owned(), schema);
+            }
+            Value::Object(properties)
+        }
         "collection.update" => json!({"name":{"type":"string"},"exclude":{"type":"boolean"}}),
         "node.update" => json!({
             "name":{"type":"string"},"tags":{"type":"array","items":id_schema()},

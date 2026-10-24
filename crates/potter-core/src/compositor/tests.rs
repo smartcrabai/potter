@@ -222,7 +222,7 @@ fn associated_mix_rgb_keeps_additive_radiance_when_output_alpha_changes() -> Res
 }
 
 #[test]
-fn associated_blur_and_defocus_filter_zero_alpha_radiance_without_reassociation() -> Result<()> {
+fn associated_defocus_filters_zero_alpha_radiance_without_reassociation() -> Result<()> {
     let input = Image::new(
         3,
         1,
@@ -233,20 +233,53 @@ fn associated_blur_and_defocus_filter_zero_alpha_radiance_without_reassociation(
         ],
     )?;
     let expected = super::gaussian_blur(&input, 1)?;
-    for node_type in [
-        "CompositorNodeBlur",
-        "Blur",
-        "CompositorNodeDefocus",
-        "Defocus",
-    ] {
-        let node = if matches!(node_type, "CompositorNodeBlur" | "Blur") {
-            test_node_with_inputs(node_type, json!({"Size": [1.0, 1.0]}))
-        } else {
-            test_node(node_type, json!({"radius": 1}))
-        };
-        let output = run_associated_graph(graph_with_node(node, "Image"), &input)?;
+    for node_type in ["CompositorNodeDefocus", "Defocus"] {
+        let output = run_associated_graph(
+            graph_with_node(test_node(node_type, json!({"radius": 1})), "Image"),
+            &input,
+        )?;
         assert_eq!(output, expected, "{node_type}");
     }
+    Ok(())
+}
+
+#[test]
+fn compositor_blur_matches_native_gaussian_impulse_and_step() -> Result<()> {
+    let mut impulse_pixels = vec![[0.0; 4]; 9 * 9];
+    impulse_pixels[4 * 9 + 4] = [4.0, 2.0, 1.0, 0.0];
+    let impulse = Image::new(9, 9, impulse_pixels)?;
+    let impulse_blur = run_associated_graph(
+        graph_with_node(
+            test_node_with_inputs("CompositorNodeBlur", json!({"Size": [2.0, 2.0]})),
+            "Image",
+        ),
+        &impulse,
+    )?;
+    assert_pixel(
+        impulse_blur.pixels[4 * 9 + 4],
+        [1.431_644_9, 0.715_822_46, 0.357_911_23, 0.0],
+    );
+    assert_pixel(
+        impulse_blur.pixels[4 * 9 + 5],
+        [0.464_787_04, 0.232_393_52, 0.116_196_76, 0.0],
+    );
+
+    let step = Image::new(
+        9,
+        9,
+        (0..9 * 9)
+            .map(|index| if index % 9 >= 4 { [1.0; 4] } else { [0.0; 4] })
+            .collect(),
+    )?;
+    let step_blur = run_associated_graph(
+        graph_with_node(
+            test_node_with_inputs("CompositorNodeBlur", json!({"Size": [2.0, 2.0]})),
+            "Image",
+        ),
+        &step,
+    )?;
+    assert_pixel(step_blur.pixels[4 * 9 + 3], [0.200_871_59; 4]);
+    assert_pixel(step_blur.pixels[4 * 9 + 4], [0.799_128_4; 4]);
     Ok(())
 }
 

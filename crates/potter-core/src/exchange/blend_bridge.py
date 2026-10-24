@@ -1219,6 +1219,14 @@ def images_dump():
 
 
 
+def _sequence_element_filepath(strip, element):
+    filepath = os.path.join(strip.directory, element.filename)
+    try:
+        return bpy.path.abspath(filepath, library=strip.id_data.library)
+    except TypeError:
+        return bpy.path.abspath(filepath)
+
+
 def _resource_record(kind, owner, path, packed_file=None):
     resolved = bpy.path.abspath(path) if path else None
     packed_data = None
@@ -1401,11 +1409,10 @@ def resources_dump():
                     result.append(_resource_record("sound", strip.name, sound.filepath,
                                                    getattr(sound, "packed_file", None)))
             elif getattr(strip, "type", None) == "IMAGE":
-                directory = getattr(strip, "directory", "")
                 for element in getattr(strip, "elements", ()):
                     result.append(_resource_record(
                         "image_sequence", strip.name,
-                        os.path.join(directory, element.filename)))
+                        _sequence_element_filepath(strip, element)))
             elif hasattr(strip, "filepath"):
                 kind = "movie" if getattr(strip, "type", None) == "MOVIE" else "image"
                 result.append(_resource_record(kind, strip.name, strip.filepath,
@@ -2869,7 +2876,17 @@ def _sequencer_dump(scene):
     for strip in sequences:
         kind = strip.type
         source = None
-        if hasattr(strip, "filepath"):
+        source_files = []
+        if kind == "IMAGE":
+            elements = getattr(strip, "elements", ())
+            if len(elements) == 1:
+                source = _sequence_element_filepath(strip, elements[0])
+            elif elements:
+                source_files = [
+                    _sequence_element_filepath(strip, element)
+                    for element in elements
+                ]
+        elif hasattr(strip, "filepath"):
             source = bpy.path.abspath(strip.filepath)
         elif getattr(strip, "sound", None) is not None:
             source = bpy.path.abspath(strip.sound.filepath)
@@ -2929,6 +2946,7 @@ def _sequencer_dump(scene):
             "sound_pan": float(getattr(strip, "pan", 0.0)),
             "sound_pitch": float(getattr(strip, "pitch", 1.0)),
             "source": source,
+            "source_files": source_files,
             "color": color,
             "text": getattr(strip, "text", None),
             "transition": transition,
@@ -7266,8 +7284,22 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
             kind = source.get("type", "image")
             frame_end = frame_start + int(source.get("length", 1.0))
             media_path = source.get("source")
+            source_files = source.get("source_files", [])
+            media_paths = []
             relative_media_path = None
-            if kind in ("image", "image_sequence", "movie", "sound"):
+            if kind == "image_sequence" and source_files:
+                for source_file in source_files:
+                    path = _resource_path(doc, source_file)
+                    if not path or not os.path.isfile(path):
+                        raise ValueError("sequencer image-sequence source is missing: %s" % source_file)
+                    media_paths.append(path)
+                source_directory = os.path.dirname(os.path.realpath(media_paths[0]))
+                if any(os.path.dirname(os.path.realpath(path)) != source_directory
+                       for path in media_paths[1:]):
+                    raise ValueError("sequencer image-sequence elements must share a directory")
+                media_path = media_paths[0]
+                relative_media_path = _relative_blend_path(media_path, target)
+            elif kind in ("image", "image_sequence", "movie", "sound"):
                 media_path = _resource_path(doc, media_path)
                 if not media_path or not os.path.isfile(media_path):
                     raise ValueError("sequencer media source is missing: %s" % source.get("source"))
@@ -7289,6 +7321,8 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                     strip = sequences.new_image(name, media_path, channel, frame_start)
                 elif kind == "image_sequence":
                     strip = sequences.new_image(name, media_path, channel, frame_start)
+                    for path in media_paths[1:]:
+                        strip.elements.append(os.path.basename(path))
                 elif kind == "movie":
                     strip = sequences.new_movie(name, media_path, channel, frame_start)
                 elif kind == "sound":
@@ -7308,7 +7342,11 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                     raise ValueError("unsupported sequencer strip type %s" % kind)
                 strip.name = name
                 if relative_media_path:
-                    if kind == "sound" and getattr(strip, "sound", None):
+                    if kind in ("image", "image_sequence"):
+                        directory = os.path.dirname(relative_media_path)
+                        strip.directory = directory if directory.endswith("/") else directory + "/"
+                        strip.elements[0].filename = os.path.basename(relative_media_path)
+                    elif kind == "sound" and getattr(strip, "sound", None):
                         strip.sound.filepath = relative_media_path
                     elif hasattr(strip, "filepath"):
                         strip.filepath = relative_media_path
