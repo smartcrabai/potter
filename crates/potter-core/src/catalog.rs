@@ -82,12 +82,12 @@ pub fn feature_catalog() -> Value {
             &["material.create", "material.update"],
             "Potter's GGX lobe is isotropic; a render with Anisotropic above zero reports UNSUPPORTED_FEATURE.",
         ),
-        unsupported(
+        supported(
             "shader.principled.thin_film",
             "Principled thin film",
             "ShaderNodeBsdfPrincipled",
             &["material.create", "material.update"],
-            "Potter does not evaluate thin-film interference; a render with Thin Film Thickness above zero reports UNSUPPORTED_FEATURE.",
+            [true, true, true, true, true, true, true],
         ),
         supported(
             "shader.principled.diffuse_roughness",

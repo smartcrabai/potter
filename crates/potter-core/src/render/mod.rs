@@ -13,6 +13,8 @@ mod preview;
 mod principled_bsdf;
 mod principled_tables;
 mod principled_tables_data;
+mod principled_thin_film;
+mod principled_thin_film_table;
 mod scene;
 mod sequence;
 mod studio;
