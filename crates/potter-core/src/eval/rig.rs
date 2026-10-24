@@ -22,9 +22,9 @@ use crate::{
         uv_layers,
     },
     model::{
-        ArmatureData, Constraint, ConstraintType, DataBlock, Driver, DriverType, DriverVariable,
-        DriverVariableType, Id, Modifier, Node, ParentType, PoseBone, SceneDoc, ShapeKeyData,
-        Transform, VertexGroup,
+        ArmatureData, Constraint, ConstraintType, CurveSplineType, DataBlock, Driver, DriverType,
+        DriverVariable, DriverVariableType, Id, Modifier, Node, ParentType, PoseBone, SceneDoc,
+        ShapeKeyData, Transform, VertexGroup,
     },
 };
 
@@ -6615,7 +6615,8 @@ fn apply_object_constraint_in_space(
             let (curve, spline, samples) =
                 constraint_curve_path_samples(doc, target_id, constraint)?;
             if curve.use_path {
-                let (minimum, maximum) = constraint_curve_bounds(curve, target)?;
+                super::ensure_curve_fill_supported(curve, target_id)?;
+                let (minimum, maximum) = constraint_curve_bounds(curve)?;
                 let axis = clamp_to_axis_index(
                     minimum,
                     maximum,
@@ -7094,21 +7095,29 @@ fn curve_eval_time(curve: &crate::model::CurveData, frame: f64) -> Result<f64> {
     Ok(curve.eval_time)
 }
 
-fn constraint_curve_bounds(
-    curve: &crate::model::CurveData,
-    target: DMat4,
-) -> Result<(DVec3, DVec3)> {
-    let mesh = crate::geom::curve::evaluate_curve(curve)
-        .map_err(|error| evaluation_error(format!("constraint curve bounds failed: {error}")))?;
+fn constraint_curve_bounds(curve: &crate::model::CurveData) -> Result<(DVec3, DVec3)> {
     let mut minimum = DVec3::splat(f64::INFINITY);
     let mut maximum = DVec3::splat(f64::NEG_INFINITY);
-    for vertex in &mesh.vertices {
-        let point = target.transform_point3(vertex.co);
-        if !point.is_finite() {
-            return Err(evaluation_error("constraint curve bounds are non-finite"));
+    for spline in &curve.splines {
+        for point in &spline.points {
+            let position = DVec3::from_array(point.co);
+            let radius = DVec3::splat(point.radius);
+            if !position.is_finite() || !radius.is_finite() {
+                return Err(evaluation_error("constraint curve bounds are non-finite"));
+            }
+            if spline.spline_type == CurveSplineType::Bezier {
+                let left = DVec3::from_array(point.handle_left);
+                let right = DVec3::from_array(point.handle_right);
+                if !left.is_finite() || !right.is_finite() {
+                    return Err(evaluation_error("constraint curve bounds are non-finite"));
+                }
+                minimum = minimum.min(left).min(right).min(position - radius);
+                maximum = maximum.max(left).max(right).max(position + radius);
+            } else {
+                minimum = minimum.min(position - radius);
+                maximum = maximum.max(position + radius);
+            }
         }
-        minimum = minimum.min(point);
-        maximum = maximum.max(point);
     }
     if !minimum.is_finite() || !maximum.is_finite() {
         return Err(evaluation_error("constraint curve has no evaluated bounds"));

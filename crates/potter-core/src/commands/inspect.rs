@@ -563,9 +563,16 @@ fn data_item(doc: &SceneDoc, id: &Id, data: &DataBlock) -> Value {
         "grease_pencil": data.grease_pencil,
         "curve": data.curve.as_ref().map(|curve| json!({
             "dimensions": curve.dimensions,
+            "resolution_u": curve.resolution_u,
             "spline_count": curve.splines.len(),
             "spline_types": curve.splines.iter().map(|spline| spline.spline_type).collect::<Vec<_>>(),
             "point_counts": curve.splines.iter().map(|spline| spline.points.len()).collect::<Vec<_>>(),
+            "taper": curve.taper.as_ref(),
+            "taper_radius_mode": curve.taper_radius_mode,
+            "use_map_taper": curve.use_map_taper,
+            "fill_mode": curve.fill_mode,
+            "fill_solver": curve.fill_solver,
+            "fill_rule": curve.fill_rule,
         })),
         "surface": data.surface.as_ref().map(|surface| json!({
             "grid": [surface.points.len(), surface.points.first().map_or(0, Vec::len)],

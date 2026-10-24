@@ -1017,6 +1017,8 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "constraint.spline_ik.multiple_splines",
         "driver.location_rotation_difference",
         "shape_key.absolute",
+        "curve.taper_object",
+        "curve.fill.multiple_contours",
     ] {
         assert!(
             features.iter().any(|feature| {

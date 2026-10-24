@@ -1,10 +1,18 @@
 //! Curve and surface tessellation into persistent meshes.
 
-use glam::{DMat3, DQuat, DVec3};
+use std::ops::Range;
 
-use crate::model::{
-    CurveData, CurveDimensions, CurveFillMode, CurvePoint, CurveSpline, CurveSplineType,
-    HairCurvesData, SurfaceData, SurfacePoint,
+use glam::{DMat3, DQuat, DVec2, DVec3};
+
+use crate::{
+    geom::boolean::{
+        cdt::{CdtInput, delaunay_2d_calc_inside},
+        exact::{Rat2, rat_from_f64},
+    },
+    model::{
+        CurveData, CurveDimensions, CurveFillMode, CurvePoint, CurveSpline, CurveSplineType,
+        CurveTaperRadiusMode, HairCurvesData, SurfaceData, SurfacePoint,
+    },
 };
 
 use super::{Mesh, MeshError};
@@ -113,12 +121,20 @@ struct Frame {
 /// Tessellate all curve splines as line paths, filled 2D polygons, or bevel sweeps.
 ///
 /// Bevelled splines form polygon tubes; un-bevelled splines produce loose edges.
-/// 2D fills support one simple, closed spline at a time, and do not combine with bevels.
+/// 2D fills support nested contours, including holes and separate islands.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid, non-finite, unsupported, or over-budget curve data.
 pub fn evaluate_curve(data: &CurveData) -> Result<Mesh, MeshError> {
+    evaluate_curve_with_taper(data, None)
+}
+
+/// Evaluate a curve with its resolved taper profile, if it has one.
+pub(crate) fn evaluate_curve_with_taper(
+    data: &CurveData,
+    taper_profile: Option<&[[f64; 2]]>,
+) -> Result<Mesh, MeshError> {
     validate_curve_settings(data)?;
     let has_fill = data.fill_mode != CurveFillMode::None;
     if has_fill && data.dimensions != CurveDimensions::TwoD {
@@ -141,18 +157,14 @@ pub fn evaluate_curve(data: &CurveData) -> Result<Mesh, MeshError> {
             "2D curve fill and bevel cannot be combined",
         ));
     }
-    if data.taper.is_some() {
+    if data.taper.is_some() && data.bevel_depth > 0.0 && taper_profile.is_none() {
         return Err(MeshError::InvalidParameter(
-            "curve taper objects are not supported by geometry evaluation",
-        ));
-    }
-    if has_fill && data.splines.len() != 1 {
-        return Err(MeshError::InvalidParameter(
-            "2D fill requires exactly one closed spline; holes and multiple contours are unsupported",
+            "curve taper reference must be resolved before evaluation",
         ));
     }
 
     let mut total_input_points = 0_usize;
+    let mut total_fill_samples = 0_usize;
     let mut predicted_vertices = 0_usize;
     let mut predicted_edges = 0_usize;
     let mut predicted_faces = 0_usize;
@@ -168,28 +180,30 @@ pub fn evaluate_curve(data: &CurveData) -> Result<Mesh, MeshError> {
         let sample_count = estimated_spline_samples(spline)?;
         path_counts.push(sample_count);
         if has_fill {
-            let points = spline.points.len();
-            if !spline.cyclic || points < 3 {
+            if !spline.cyclic || spline.points.len() < 3 {
                 return Err(MeshError::InvalidParameter(
-                    "2D fill requires a closed spline with at least three control points",
+                    "2D fill requires closed splines with at least three control points",
                 ));
             }
-            if sample_count > MAX_FILL_POINTS {
+            total_fill_samples = checked_add(total_fill_samples, sample_count)?;
+            if total_fill_samples > MAX_FILL_POINTS {
                 return Err(MeshError::InvalidParameter(
-                    "2D fill contour exceeds the supported fill limit",
+                    "2D fill exceeds the supported 4096-sample limit",
                 ));
             }
-            if data.extrude > 0.0 {
-                predicted_vertices =
-                    checked_add(predicted_vertices, checked_mul(sample_count, 2)?)?;
-                predicted_edges = checked_add(predicted_edges, checked_mul(sample_count, 3)?)?;
-                predicted_faces = checked_add(predicted_faces, sample_count)?;
-                predicted_faces = checked_add(predicted_faces, fill_cap_count(data.fill_mode))?;
-            } else {
-                predicted_vertices = checked_add(predicted_vertices, sample_count)?;
-                predicted_edges = checked_add(predicted_edges, sample_count)?;
-                predicted_faces = checked_add(predicted_faces, fill_cap_count(data.fill_mode))?;
-            }
+            let extruded = data.extrude > 0.0;
+            predicted_vertices = checked_add(
+                predicted_vertices,
+                checked_mul(sample_count, if extruded { 2 } else { 1 })?,
+            )?;
+            predicted_edges = checked_add(
+                predicted_edges,
+                checked_mul(sample_count, if extruded { 6 } else { 3 })?,
+            )?;
+            predicted_faces = checked_add(
+                predicted_faces,
+                checked_mul(sample_count, if extruded { 5 } else { 2 })?,
+            )?;
         } else if data.bevel_depth > 0.0 {
             let rings = bevel_ring_count(data.bevel_resolution)?;
             let vertices = checked_mul(sample_count, rings)?;
@@ -218,24 +232,58 @@ pub fn evaluate_curve(data: &CurveData) -> Result<Mesh, MeshError> {
 
     let mut mesh = Mesh::new();
     if has_fill {
-        let spline = &data.splines[0];
-        let samples = tessellate_spline(spline)?;
-        insert_fill(&mut mesh, &samples, data.fill_mode, data.extrude)?;
+        let mut contours = Vec::with_capacity(data.splines.len());
+        for (spline, expected_count) in data.splines.iter().zip(path_counts) {
+            let samples = tessellate_spline(spline)?;
+            if samples.len() != expected_count {
+                return Err(MeshError::InvalidTopology(
+                    "curve tessellation sample count changed unexpectedly",
+                ));
+            }
+            contours.push(samples);
+        }
+        insert_fill(&mut mesh, &contours, data.fill_mode, data.extrude)?;
         return Ok(mesh);
     }
 
-    for (spline, expected_count) in data.splines.iter().zip(path_counts) {
-        let samples = tessellate_spline(spline)?;
+    let mut two_d_bevel_samples =
+        if data.bevel_depth > 0.0 && data.dimensions == CurveDimensions::TwoD {
+            Some(two_d_bevel_samples_and_reversal_flags(&data.splines)?)
+        } else {
+            None
+        };
+    for (spline_index, (spline, expected_count)) in data.splines.iter().zip(path_counts).enumerate()
+    {
+        let reverse = two_d_bevel_samples
+            .as_ref()
+            .is_some_and(|(_, reversals)| reversals[spline_index]);
+        let mut samples = match &mut two_d_bevel_samples {
+            Some((all_samples, _)) => std::mem::take(&mut all_samples[spline_index]),
+            None => tessellate_spline(spline)?,
+        };
+        if reverse {
+            samples.reverse();
+        }
         if samples.len() != expected_count {
             return Err(MeshError::InvalidTopology(
                 "curve tessellation sample count changed unexpectedly",
             ));
         }
         if data.bevel_depth > 0.0 {
+            if data.taper.is_some() {
+                apply_taper(
+                    &mut samples,
+                    taper_profile.unwrap_or(&[]),
+                    data.taper_radius_mode,
+                    data.use_map_taper,
+                );
+            }
             insert_tube(
                 &mut mesh,
                 &samples,
+                spline,
                 spline.cyclic,
+                data.dimensions,
                 data.twist_mode.as_str(),
                 data.bevel_depth,
                 bevel_ring_count(data.bevel_resolution)?,
@@ -245,6 +293,78 @@ pub fn evaluate_curve(data: &CurveData) -> Result<Mesh, MeshError> {
         }
     }
     Ok(mesh)
+}
+
+struct TaperContour {
+    spline_index: usize,
+    left: f64,
+    direction: bool,
+}
+
+// Mirrors Blender 5.2.2 `BKE_curve_bevelList_make`'s hole/direction test and reversal.
+fn two_d_bevel_samples_and_reversal_flags(
+    splines: &[CurveSpline],
+) -> Result<(Vec<Vec<CurveSample>>, Vec<bool>), MeshError> {
+    let mut samples = Vec::with_capacity(splines.len());
+    for spline in splines {
+        samples.push(tessellate_spline(spline)?);
+    }
+    let mut reversals = vec![false; splines.len()];
+    let mut contours = Vec::with_capacity(splines.len());
+    for (index, (spline, samples)) in splines.iter().zip(&samples).enumerate() {
+        if !spline.cyclic {
+            continue;
+        }
+        let mut leftmost = 0;
+        for (sample_index, sample) in samples.iter().enumerate().skip(1) {
+            if sample.position.x < samples[leftmost].position.x {
+                leftmost = sample_index;
+            }
+        }
+        let previous = samples[(leftmost + samples.len() - 1) % samples.len()].position;
+        let point = samples[leftmost].position;
+        let next = samples[(leftmost + 1) % samples.len()].position;
+        let turn = (point.x - previous.x) * (previous.y - next.y)
+            + (previous.y - point.y) * (previous.x - next.x);
+        contours.push(TaperContour {
+            spline_index: index,
+            left: point.x,
+            direction: turn > 0.0,
+        });
+    }
+
+    for (contour_index, contour) in contours.iter().enumerate() {
+        let point = samples[contour.spline_index][0].position.truncate();
+        let mut hole = false;
+        for (candidate_index, candidate) in contours.iter().enumerate() {
+            if candidate_index != contour_index
+                && candidate.left <= contour.left
+                && contour_contains(&samples[candidate.spline_index], point)
+            {
+                hole = !hole;
+            }
+        }
+        reversals[contour.spline_index] = hole == contour.direction;
+    }
+    Ok((samples, reversals))
+}
+
+fn contour_contains(contour: &[CurveSample], point: DVec2) -> bool {
+    let mut inside = false;
+    let mut previous = contour.last().map(|sample| sample.position.truncate());
+    for sample in contour {
+        let current = sample.position.truncate();
+        if let Some(previous) = previous
+            && (current.y > point.y) != (previous.y > point.y)
+            && point.x
+                < (previous.x - current.x) * (point.y - current.y) / (previous.y - current.y)
+                    + current.x
+        {
+            inside = !inside;
+        }
+        previous = Some(current);
+    }
+    inside
 }
 
 /// Represent hair curves as loose mesh edges for line-based consumers.
@@ -636,20 +756,56 @@ fn check_mesh_budget(vertices: usize, edges: usize, faces: usize) -> Result<(), 
     Ok(())
 }
 
-fn fill_cap_count(mode: CurveFillMode) -> usize {
-    match mode {
-        CurveFillMode::Front | CurveFillMode::Back => 1,
-        CurveFillMode::Both => 2,
-        CurveFillMode::None => 0,
-    }
-}
-
 fn tessellate_spline(spline: &CurveSpline) -> Result<Vec<CurveSample>, MeshError> {
     match spline.spline_type {
         CurveSplineType::Poly => tessellate_poly(spline),
         CurveSplineType::Bezier => tessellate_bezier(spline),
         CurveSplineType::Nurbs => tessellate_nurbs(spline),
     }
+}
+/// The taper source is the first display-list block, not necessarily its control-point spline.
+pub(crate) fn taper_profile_samples(
+    data: &CurveData,
+    taper_profile: Option<&[[f64; 2]]>,
+) -> Result<Vec<[f64; 2]>, MeshError> {
+    if data.bevel_depth > 0.0 {
+        let mesh = evaluate_curve_with_taper(data, taper_profile)?;
+        let count = bevel_ring_count(data.bevel_resolution)?;
+        let ring = mesh
+            .vertices
+            .get(..count)
+            .ok_or(MeshError::InvalidTopology(
+                "curve taper bevel ring is missing",
+            ))?;
+        let first_profile_vertex = usize::from(data.dimensions != CurveDimensions::TwoD);
+        return Ok((0..count)
+            .map(|index| {
+                let vertex = &ring[(index + first_profile_vertex) % count];
+                [vertex.co.x, vertex.co.y]
+            })
+            .collect());
+    }
+    if data.fill_mode != CurveFillMode::None {
+        if data.extrude > 0.0 {
+            return Err(MeshError::InvalidParameter(
+                "extruded fill curves cannot define a taper profile",
+            ));
+        }
+        let mesh = evaluate_curve_with_taper(data, taper_profile)?;
+        return Ok(mesh
+            .vertices
+            .iter()
+            .map(|vertex| [vertex.co.x, vertex.co.y])
+            .collect());
+    }
+    let Some(spline) = data.splines.first() else {
+        return Ok(Vec::new());
+    };
+    validate_spline(spline)?;
+    Ok(tessellate_spline(spline)?
+        .into_iter()
+        .map(|sample| [sample.position.x, sample.position.y])
+        .collect())
 }
 
 pub(crate) fn evaluate_curve_spline(
@@ -975,26 +1131,45 @@ fn insert_path_edges(
 fn insert_tube(
     mesh: &mut Mesh,
     samples: &[CurveSample],
+    spline: &CurveSpline,
     cyclic: bool,
+    dimensions: CurveDimensions,
     twist_mode: &str,
     depth: f64,
     ring_count: usize,
 ) -> Result<(), MeshError> {
-    let frames = parallel_transport_frames(samples, cyclic, twist_mode)?;
     let mut rings = Vec::with_capacity(samples.len());
-    for (sample, frame) in samples.iter().zip(frames) {
-        let cosine = sample.tilt.cos();
-        let sine = sample.tilt.sin();
-        let normal = frame.normal * cosine + frame.binormal * sine;
-        let binormal = frame.binormal * cosine - frame.normal * sine;
-        let radius = depth * sample.radius;
-        let mut ring = Vec::with_capacity(ring_count);
-        for point in 0..ring_count {
-            let angle = std::f64::consts::TAU * point as f64 / ring_count as f64;
-            let offset = normal * angle.cos() + binormal * angle.sin();
-            ring.push(mesh.insert_vertex(sample.position + offset * radius)?);
+    if dimensions == CurveDimensions::TwoD {
+        let angle_step = std::f64::consts::TAU / ring_count as f64;
+        for (index, sample) in samples.iter().enumerate() {
+            let (sina, cosa) = bevel_sin_cos_2d(samples, index, cyclic, spline)?;
+            let radius = depth * sample.radius;
+            let mut ring = Vec::with_capacity(ring_count);
+            for point in 0..ring_count {
+                let angle = -((ring_count - 1) as f64) * angle_step + point as f64 * angle_step;
+                let profile_y = radius * angle.cos();
+                let profile_z = radius * angle.sin();
+                let offset = DVec3::new(profile_y * sina, profile_y * cosa, profile_z);
+                ring.push(mesh.insert_vertex(sample.position + offset)?);
+            }
+            rings.push(ring);
         }
-        rings.push(ring);
+    } else {
+        let frames = parallel_transport_frames(samples, cyclic, twist_mode)?;
+        for (sample, frame) in samples.iter().zip(frames) {
+            let cosine = sample.tilt.cos();
+            let sine = sample.tilt.sin();
+            let normal = frame.normal * cosine + frame.binormal * sine;
+            let binormal = frame.binormal * cosine - frame.normal * sine;
+            let radius = depth * sample.radius;
+            let mut ring = Vec::with_capacity(ring_count);
+            for point in 0..ring_count {
+                let angle = std::f64::consts::TAU * point as f64 / ring_count as f64;
+                let offset = normal * angle.cos() + binormal * angle.sin();
+                ring.push(mesh.insert_vertex(sample.position + offset * radius)?);
+            }
+            rings.push(ring);
+        }
     }
     let segment_count = if cyclic {
         samples.len()
@@ -1004,19 +1179,178 @@ fn insert_tube(
     for segment in 0..segment_count {
         let next_segment = (segment + 1) % samples.len();
         for point in 0..ring_count {
-            let next_point = (point + 1) % ring_count;
-            mesh.insert_face(
+            let face = if dimensions == CurveDimensions::TwoD {
+                let previous_point = if point == 0 {
+                    ring_count - 1
+                } else {
+                    point - 1
+                };
+                vec![
+                    rings[segment][point],
+                    rings[next_segment][point],
+                    rings[next_segment][previous_point],
+                    rings[segment][previous_point],
+                ]
+            } else {
+                let next_point = (point + 1) % ring_count;
                 vec![
                     rings[segment][point],
                     rings[segment][next_point],
                     rings[next_segment][next_point],
                     rings[next_segment][point],
-                ],
-                0,
-            )?;
+                ]
+            };
+            mesh.insert_face(face, 0)?;
         }
     }
     Ok(())
+}
+// Mirrors Blender 5.2.2 `calc_bevel_sin_cos`: 2D bevel offsets use the corner miter length.
+fn bevel_sin_cos_2d(
+    samples: &[CurveSample],
+    index: usize,
+    cyclic: bool,
+    spline: &CurveSpline,
+) -> Result<(f64, f64), MeshError> {
+    let count = samples.len();
+    if count < 2 {
+        return Err(MeshError::InvalidParameter(
+            "a bevel sweep requires at least two path samples",
+        ));
+    }
+    if count == 2 {
+        let direction = samples[1].position - samples[0].position;
+        let length = direction.truncate().length();
+        if length <= 0.0 {
+            return Err(MeshError::InvalidParameter(
+                "bevel path contains no usable tangent",
+            ));
+        }
+        return Ok((-direction.y / length, direction.x / length));
+    }
+    if !cyclic && (index == 0 || index + 1 == count) {
+        // Blender uses the control-point edges to orient open NURBS bevel end rings.
+        let mut direction = if spline.spline_type == CurveSplineType::Nurbs {
+            let last = spline.points.len() - 1;
+            if index == 0 {
+                (DVec3::from_array(spline.points[1].co) - DVec3::from_array(spline.points[0].co))
+                    .truncate()
+            } else {
+                (DVec3::from_array(spline.points[last].co)
+                    - DVec3::from_array(spline.points[last - 1].co))
+                .truncate()
+            }
+        } else {
+            samples[index].tangent.truncate()
+        };
+        if direction.length_squared() <= EPSILON_SQUARED {
+            direction = if index == 0 {
+                (samples[1].position - samples[0].position).truncate()
+            } else {
+                (samples[count - 1].position - samples[count - 2].position).truncate()
+            };
+        }
+        let length = direction.length();
+        if length <= 0.0 {
+            return Err(MeshError::InvalidParameter(
+                "bevel path contains no usable tangent",
+            ));
+        }
+        return Ok((-direction.y / length, direction.x / length));
+    }
+
+    let point = samples[index].position;
+    let previous = samples[if index == 0 { count - 1 } else { index - 1 }].position;
+    let next = samples[if index + 1 == count { 0 } else { index + 1 }].position;
+    let mut x1 = point.x - previous.x;
+    let mut y1 = point.y - previous.y;
+    let mut x2 = point.x - next.x;
+    let mut y2 = point.y - next.y;
+    let length1 = (x1 * x1 + y1 * y1).sqrt();
+    let length2 = (x2 * x2 + y2 * y2).sqrt();
+    let length1 = if length1 == 0.0 { 1.0 } else { length1 };
+    let length2 = if length2 == 0.0 { 1.0 } else { length2 };
+    x1 /= length1;
+    y1 /= length1;
+    x2 /= length2;
+    y2 /= length2;
+
+    let dot = x1 * x2 + y1 * y2;
+    let mut half_angle_sine = if dot.abs() >= 1.0 {
+        std::f64::consts::FRAC_PI_2
+    } else {
+        dot.acos() / 2.0
+    }
+    .sin();
+    if half_angle_sine == 0.0 {
+        half_angle_sine = 1.0;
+    }
+    let mut miter_x = x1 - x2;
+    let mut miter_y = y1 - y2;
+    if miter_x == 0.0 && miter_y == 0.0 {
+        miter_x = y1;
+        miter_y = -x1;
+    } else {
+        let miter_length = (miter_x * miter_x + miter_y * miter_y).sqrt();
+        miter_x /= miter_length;
+        miter_y /= miter_length;
+    }
+    Ok((-miter_y / half_angle_sine, miter_x / half_angle_sine))
+}
+fn apply_taper(
+    samples: &mut [CurveSample],
+    profile: &[[f64; 2]],
+    radius_mode: CurveTaperRadiusMode,
+    use_map_taper: bool,
+) {
+    if samples.len() < 2 {
+        return;
+    }
+    let last = samples.len() - 1;
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let factor = if use_map_taper && index == 0 {
+            0.0
+        } else if use_map_taper && index == last {
+            1.0
+        } else {
+            index as f64 / last as f64
+        };
+        let taper = taper_value(profile, factor);
+        sample.radius = match radius_mode {
+            CurveTaperRadiusMode::Override => taper,
+            CurveTaperRadiusMode::Multiply => taper * sample.radius,
+            CurveTaperRadiusMode::Add => taper + sample.radius,
+        };
+    }
+}
+
+fn taper_value(profile: &[[f64; 2]], factor: f64) -> f64 {
+    let Some(first) = profile.first() else {
+        return 1.0;
+    };
+    let Some(last) = profile.last() else {
+        return 1.0;
+    };
+    let min_x = first[0];
+    let dx = last[0] - min_x;
+    if dx <= 0.0 {
+        return 1.0;
+    }
+    for (index, point) in profile.iter().enumerate() {
+        if (point[0] - min_x) / dx >= factor {
+            if let Some(previous) = index.checked_sub(1).and_then(|index| profile.get(index)) {
+                let previous_factor = (previous[0] - min_x) / dx;
+                let point_factor = (point[0] - min_x) / dx;
+                if previous_factor.partial_cmp(&point_factor) != Some(std::cmp::Ordering::Equal) {
+                    return point[1] * (previous_factor - factor)
+                        / (previous_factor - point_factor)
+                        + previous[1] * (factor - point_factor) / (previous_factor - point_factor);
+                }
+            }
+            return point[1];
+        }
+    }
+    last[1]
 }
 
 #[expect(
@@ -1189,20 +1523,27 @@ fn rotate_about_axis(vector: DVec3, axis: DVec3, angle: f64) -> DVec3 {
 
 fn insert_fill(
     mesh: &mut Mesh,
-    samples: &[CurveSample],
+    samples: &[Vec<CurveSample>],
     mode: CurveFillMode,
     extrude: f64,
 ) -> Result<(), MeshError> {
-    let mut contour: Vec<DVec3> = samples.iter().map(|sample| sample.position).collect();
-    validate_fill_contour(&contour)?;
-    if signed_area_xy(&contour)? < 0.0 {
-        contour.reverse();
+    let total = samples
+        .iter()
+        .try_fold(0_usize, |total, contour| checked_add(total, contour.len()))?;
+    let mut positions = Vec::with_capacity(total);
+    let mut contours = Vec::with_capacity(samples.len());
+    for contour in samples {
+        let start = positions.len();
+        positions.extend(contour.iter().map(|sample| sample.position));
+        contours.push(start..positions.len());
     }
-    let base_z = contour[0].z;
+    let depths = validate_fill_contours(&positions, &contours)?;
+    let triangles = triangulate_fill_contours(&positions, &contours, &depths)?;
+
+    let mut bottom = Vec::with_capacity(positions.len());
+    let mut top = Vec::with_capacity(positions.len());
     if extrude > 0.0 {
-        let mut bottom = Vec::with_capacity(contour.len());
-        let mut top = Vec::with_capacity(contour.len());
-        for position in &contour {
+        for position in &positions {
             bottom.push(mesh.insert_vertex(DVec3::new(
                 position.x,
                 position.y,
@@ -1214,32 +1555,238 @@ fn insert_fill(
                 position.z + extrude,
             ))?);
         }
-        for index in 0..contour.len() {
-            let next = (index + 1) % contour.len();
-            mesh.insert_face(vec![bottom[index], bottom[next], top[next], top[index]], 0)?;
-        }
-        if matches!(mode, CurveFillMode::Front | CurveFillMode::Both) {
-            mesh.insert_face(top, 0)?;
-        }
-        if matches!(mode, CurveFillMode::Back | CurveFillMode::Both) {
-            bottom.reverse();
-            mesh.insert_face(bottom, 0)?;
+        for (contour, depth) in contours.iter().zip(&depths) {
+            let winding_is_ccw = signed_area_xy(&positions[contour.clone()])? > 0.0;
+            let keep_ccw = depth % 2 == 0;
+            for index in contour.clone() {
+                let next = if index + 1 == contour.end {
+                    contour.start
+                } else {
+                    index + 1
+                };
+                let (first, second) = if winding_is_ccw == keep_ccw {
+                    (index, next)
+                } else {
+                    (next, index)
+                };
+                mesh.insert_face(
+                    vec![bottom[first], bottom[second], top[second], top[first]],
+                    0,
+                )?;
+            }
         }
     } else {
-        let mut ids = Vec::with_capacity(contour.len());
-        for position in contour {
-            ids.push(mesh.insert_vertex(position)?);
-        }
-        if matches!(mode, CurveFillMode::Front | CurveFillMode::Both) {
-            mesh.insert_face(ids.clone(), 0)?;
-        }
-        if matches!(mode, CurveFillMode::Back | CurveFillMode::Both) {
-            ids.reverse();
-            mesh.insert_face(ids, 0)?;
+        for position in &positions {
+            bottom.push(mesh.insert_vertex(*position)?);
         }
     }
-    let _ = base_z;
+
+    for triangle in triangles {
+        if matches!(mode, CurveFillMode::Front | CurveFillMode::Both) {
+            let vertices = if extrude > 0.0 { &top } else { &bottom };
+            mesh.insert_face(triangle.map(|index| vertices[index]).to_vec(), 0)?;
+        }
+        if matches!(mode, CurveFillMode::Back | CurveFillMode::Both) {
+            let mut face = triangle.map(|index| bottom[index]).to_vec();
+            face.reverse();
+            mesh.insert_face(face, 0)?;
+        }
+    }
     Ok(())
+}
+
+fn validate_fill_contours(
+    positions: &[DVec3],
+    contours: &[Range<usize>],
+) -> Result<Vec<usize>, MeshError> {
+    if positions.len() > MAX_FILL_POINTS {
+        return Err(MeshError::InvalidParameter(
+            "2D fill exceeds the supported 4096-sample limit",
+        ));
+    }
+    for contour in contours {
+        let points = positions
+            .get(contour.clone())
+            .ok_or(MeshError::InvalidTopology(
+                "curve fill contour references missing samples",
+            ))?;
+        validate_fill_contour(points)?;
+    }
+    let scale = positions
+        .iter()
+        .map(|point| point.abs().max_element())
+        .fold(1.0_f64, f64::max);
+    let reference_z = positions.first().map_or(0.0, |point| point.z / scale);
+    if positions
+        .iter()
+        .any(|point| (point.z / scale - reference_z).abs() > 1.0e-9)
+    {
+        return Err(MeshError::InvalidParameter(
+            "2D fill contours must be coplanar in the XY plane",
+        ));
+    }
+    let normalized: Vec<[f64; 2]> = positions
+        .iter()
+        .map(|point| [point.x / scale, point.y / scale])
+        .collect();
+    for (first_index, first) in contours.iter().enumerate() {
+        for second in contours.iter().skip(first_index + 1) {
+            for first_edge in first.clone() {
+                let first_next = if first_edge + 1 == first.end {
+                    first.start
+                } else {
+                    first_edge + 1
+                };
+                for second_edge in second.clone() {
+                    let second_next = if second_edge + 1 == second.end {
+                        second.start
+                    } else {
+                        second_edge + 1
+                    };
+                    if segments_intersect(
+                        normalized[first_edge],
+                        normalized[first_next],
+                        normalized[second_edge],
+                        normalized[second_next],
+                    ) {
+                        return Err(MeshError::InvalidParameter(
+                            "2D fill contours must not intersect",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(contours
+        .iter()
+        .enumerate()
+        .map(|(index, contour)| {
+            let point = normalized[contour.start];
+            contours
+                .iter()
+                .enumerate()
+                .filter(|(other_index, other)| {
+                    *other_index != index
+                        && point_in_polygon(point, &normalized[other.start..other.end])
+                })
+                .count()
+        })
+        .collect())
+}
+
+fn triangulate_fill_contours(
+    positions: &[DVec3],
+    contours: &[Range<usize>],
+    depths: &[usize],
+) -> Result<Vec<[usize; 3]>, MeshError> {
+    let scale = positions
+        .iter()
+        .map(|point| point.abs().max_element())
+        .fold(1.0_f64, f64::max);
+    let normalized: Vec<[f64; 2]> = positions
+        .iter()
+        .map(|point| [point.x / scale, point.y / scale])
+        .collect();
+    let verts: Vec<Rat2> = normalized
+        .iter()
+        .map(|point| [rat_from_f64(point[0]), rat_from_f64(point[1])])
+        .collect();
+    let mut edges = Vec::with_capacity(positions.len());
+    let mut faces = Vec::with_capacity(contours.len());
+    for (contour, depth) in contours.iter().zip(depths) {
+        let mut face = (depth % 2 == 0).then(|| Vec::with_capacity(contour.len()));
+        for index in contour.clone() {
+            let next = if index + 1 == contour.end {
+                contour.start
+            } else {
+                index + 1
+            };
+            let index = u32::try_from(index)
+                .map_err(|_| MeshError::InvalidParameter("2D fill has too many contour samples"))?;
+            let next = u32::try_from(next)
+                .map_err(|_| MeshError::InvalidParameter("2D fill has too many contour samples"))?;
+            edges.push((index, next));
+            if let Some(face) = &mut face {
+                face.push(index);
+            }
+        }
+        if let Some(mut face) = face {
+            if signed_area_xy_2d(&normalized[contour.clone()]) < 0.0 {
+                face.reverse();
+            }
+            faces.push(face);
+        }
+    }
+    let output = delaunay_2d_calc_inside(&CdtInput {
+        verts,
+        edges,
+        faces,
+    });
+    let output_to_input: Vec<usize> = output
+        .vert_orig
+        .iter()
+        .map(|originals| {
+            originals.first().map_or_else(
+                || {
+                    Err(MeshError::InvalidTopology(
+                        "curve fill triangulation created an unreferenced vertex",
+                    ))
+                },
+                |index| Ok(*index as usize),
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    let mut triangles = Vec::with_capacity(output.faces.len());
+    for triangle in output.faces {
+        let mut input_triangle = [0; 3];
+        for (corner, output_index) in triangle.into_iter().enumerate() {
+            input_triangle[corner] =
+                *output_to_input
+                    .get(output_index as usize)
+                    .ok_or(MeshError::InvalidTopology(
+                        "curve fill triangulation references a missing vertex",
+                    ))?;
+        }
+        let center = (DVec2::from_array(normalized[input_triangle[0]])
+            + DVec2::from_array(normalized[input_triangle[1]])
+            + DVec2::from_array(normalized[input_triangle[2]]))
+            / 3.0;
+        let inside_count = contours
+            .iter()
+            .filter(|contour| {
+                point_in_polygon(center.to_array(), &normalized[contour.start..contour.end])
+            })
+            .count();
+        if inside_count % 2 == 1 {
+            triangles.push(input_triangle);
+        }
+    }
+    Ok(triangles)
+}
+
+fn point_in_polygon(point: [f64; 2], polygon: &[[f64; 2]]) -> bool {
+    let mut inside = false;
+    for index in 0..polygon.len() {
+        let current = polygon[index];
+        let next = polygon[(index + 1) % polygon.len()];
+        if (current[1] > point[1]) != (next[1] > point[1])
+            && point[0]
+                < (next[0] - current[0]) * (point[1] - current[1]) / (next[1] - current[1])
+                    + current[0]
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn signed_area_xy_2d(contour: &[[f64; 2]]) -> f64 {
+    contour
+        .iter()
+        .zip(contour.iter().cycle().skip(1))
+        .map(|(current, next)| current[0] * next[1] - current[1] * next[0])
+        .sum::<f64>()
+        * 0.5
 }
 
 fn validate_fill_contour(contour: &[DVec3]) -> Result<(), MeshError> {
@@ -1297,16 +1844,25 @@ fn segments_intersect(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> boo
         (second[0] - first[0]) * (third[1] - first[1])
             - (second[1] - first[1]) * (third[0] - first[0])
     }
+    fn on_segment(first: [f64; 2], second: [f64; 2], point: [f64; 2]) -> bool {
+        point[0] >= first[0].min(second[0])
+            && point[0] <= first[0].max(second[0])
+            && point[1] >= first[1].min(second[1])
+            && point[1] <= first[1].max(second[1])
+    }
     let first = orient(a, b, c);
     let second = orient(a, b, d);
     let third = orient(c, d, a);
     let fourth = orient(c, d, b);
-    (crate::float::equal_f64(first, 0.0)
-        || crate::float::equal_f64(second, 0.0)
-        || first.is_sign_positive() != second.is_sign_positive())
-        && (crate::float::equal_f64(third, 0.0)
-            || crate::float::equal_f64(fourth, 0.0)
-            || third.is_sign_positive() != fourth.is_sign_positive())
+    if crate::float::equal_f64(first, 0.0) && on_segment(a, b, c)
+        || crate::float::equal_f64(second, 0.0) && on_segment(a, b, d)
+        || crate::float::equal_f64(third, 0.0) && on_segment(c, d, a)
+        || crate::float::equal_f64(fourth, 0.0) && on_segment(c, d, b)
+    {
+        return true;
+    }
+    (first < 0.0 && second > 0.0 || first > 0.0 && second < 0.0)
+        && (third < 0.0 && fourth > 0.0 || third > 0.0 && fourth < 0.0)
 }
 
 fn signed_area_xy(contour: &[DVec3]) -> Result<f64, MeshError> {

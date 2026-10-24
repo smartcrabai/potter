@@ -1807,6 +1807,8 @@ def curve_dump(curve):
             "use_endpoint_v": bool(getattr(spline, "use_endpoint_v", False)),
         })
     curve_type = getattr(curve, "type", "CURVE")
+    taper_object = getattr(curve, "taper_object", None)
+    taper_data = getattr(taper_object, "data", None) if taper_object and taper_object.type == "CURVE" else None
     eval_time_fcurves = []
     eval_time_action_name = None
     eval_time_action_slot_name = None
@@ -1845,6 +1847,7 @@ def curve_dump(curve):
         "bevel_depth": float(getattr(curve, "bevel_depth", 0.0)),
         "bevel_resolution": int(getattr(curve, "bevel_resolution", 0)),
         "extrude": float(getattr(curve, "extrude", 0.0)),
+        "dimensions": "2D" if getattr(curve, "dimensions", "3D") == "2D" else "3D",
         "fill_mode": str(getattr(curve, "fill_mode", "NONE")),
         "splines": splines,
         "custom_properties": custom_props(curve),
@@ -1853,11 +1856,16 @@ def curve_dump(curve):
     }
     if curve_type == "CURVE":
         result.update({
+            "fill_solver": str(getattr(curve, "fill_solver", "SWEEP_LINE")),
+            "fill_rule": str(getattr(curve, "fill_rule", "EVEN_ODD")),
             "twist_mode": str(getattr(curve, "twist_mode", "MINIMUM")),
             "use_path": bool(curve.use_path),
             "path_duration": int(curve.path_duration),
             "eval_time": float(curve.eval_time),
             "eval_time_fcurves": eval_time_fcurves,
+            "taper": taper_data.name_full if taper_data else None,
+            "taper_radius_mode": str(getattr(curve, "taper_radius_mode", "OVERRIDE")),
+            "use_map_taper": bool(getattr(curve, "use_map_taper", False)),
         })
     if curve_type == "SURFACE":
         result["surface"] = [{
@@ -3281,7 +3289,8 @@ def dump_all():
             "active_scene": bpy.context.scene.name_full,
             "scenes": [dump_scene(item) for item in bpy.data.scenes],
             "collections": collection_dumps(),
-            "objects": [object_dump(item) for item in bpy.data.objects],
+            "objects": [object_dump(item) for item in bpy.data.objects
+                        if not item.get("_potter.taper_proxy", False)],
             "armatures": [_armature_dump(item) for item in bpy.data.armatures],
             "grease_pencil": [_grease_pencil_dump(item) for item in
                               getattr(bpy.data, "grease_pencils", ())],
@@ -7043,13 +7052,22 @@ def _curve_data_create(name, data_id, item, source, doc, target, pack):
     else:
         raw = item.get("curve") or {}
         curve = bpy.data.curves.new(name, "CURVE")
+        # Setting Curve.resolution_u rewrites every spline's resolution, so it comes before the splines.
+        curve.resolution_u = int(resolution_u)
         curve.dimensions = "2D" if raw.get("dimensions") == "two_d" else "3D"
         curve.twist_mode = str(raw.get("twist_mode", "MINIMUM")).upper()
         curve.bevel_depth = float(raw.get("bevel_depth", 0.0))
         curve.bevel_resolution = int(raw.get("bevel_resolution", 0))
         curve.extrude = float(raw.get("extrude", 0.0))
         fill_mode = raw.get("fill_mode", "none").upper()
-        curve.fill_mode = {"NONE": "FULL", "BOTH": "FULL"}.get(fill_mode, fill_mode)
+        if curve.dimensions == "2D":
+            curve.fill_mode = {"NONE": "NONE", "BOTH": "BOTH"}.get(fill_mode, fill_mode)
+        else:
+            curve.fill_mode = {"NONE": "FULL", "BOTH": "HALF"}.get(fill_mode, fill_mode)
+        curve.fill_solver = str(raw.get("fill_solver", "sweep_line")).upper()
+        curve.fill_rule = str(raw.get("fill_rule", "even_odd")).upper()
+        curve.taper_radius_mode = str(raw.get("taper_radius_mode", "override")).upper()
+        curve.use_map_taper = bool(raw.get("use_map_taper", False))
         curve.use_path = bool(raw.get("use_path", False))
         curve.path_duration = int(raw.get("path_duration", 100))
         curve.eval_time = float(raw.get("eval_time", 0.0))
@@ -7096,7 +7114,8 @@ def _curve_data_create(name, data_id, item, source, doc, target, pack):
             channelbag = strip.channelbag(slot, ensure=True)
             _restore_action_curves(
                 channelbag, eval_time_fcurves, "Curve %s evaluation time" % name, doc)
-    curve.resolution_u = int(resolution_u)
+    if item.get("type") in ("text", "surface"):
+        curve.resolution_u = int(resolution_u)
     set_id(curve, data_id)
     set_props(curve, source.get("custom_properties", {}))
     if source.get("fake_user"):
@@ -8785,6 +8804,34 @@ def export_doc(doc, target, pack, scene_hash, context):
                     mesh_source["shape_keys"] = {}
                 _restore_shape_keys(obj, mesh_source)
                 shape_key_meshes.add(data_id)
+    taper_objects_by_data = {}
+    for node_id, item in doc.get("nodes", {}).items():
+        data_id = item.get("data")
+        obj = object_map.get(node_id)
+        if data_id in curve_map and obj is not None:
+            taper_objects_by_data.setdefault(data_id, obj)
+    for data_id, item in data_raw.items():
+        taper_id = (item.get("curve") or {}).get("taper")
+        if taper_id is None:
+            continue
+        target_raw = data_raw.get(taper_id)
+        if item.get("type") != "curve" or target_raw is None or target_raw.get("type") != "curve":
+            raise ValueError("curve taper references a missing or non-curve Data-Block")
+        curve = curve_map.get(data_id)
+        taper_data = curve_map.get(taper_id)
+        if curve is None or taper_data is None:
+            raise ValueError("curve taper references missing curve data")
+        taper_object = taper_objects_by_data.get(taper_id)
+        if taper_object is None:
+            taper_object = bpy.data.objects.new("_Potter Taper Proxy " + str(taper_id), taper_data)
+            taper_object["_potter.taper_proxy"] = True
+            taper_object.hide_render = True
+            taper_object.hide_viewport = True
+            # A hidden proxy must be scene-linked to survive save/reload and resolve the taper pointer.
+            for scene in scene_map.values():
+                scene.collection.objects.link(taper_object)
+            taper_objects_by_data[taper_id] = taper_object
+        curve.taper_object = taper_object
     object_lookup = {obj.name_full: obj for obj in object_map.values()}
     id_lookup = {}
     for collection in (mesh_map, camera_map, light_map, armature_map, grease_pencil_map,

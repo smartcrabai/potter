@@ -272,65 +272,117 @@ fn snapshot_evaluates_hair_curves_as_lines() {
 }
 
 #[test]
-fn unsupported_curve_taper_reports_feature_id() {
+fn curve_taper_missing_data_block_is_rejected_during_create() {
     let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
     let error = apply_batch(
         &base,
         &json!({
             "schema_version": 1,
-            "base_revision": 0,
+            "base_revision": base.revision,
             "operations": [{
-                "op": "curve.create",
-                "id": "tapered",
-                "dimensions": "three_d",
-                "taper": "profile",
-                "splines": [{
-                    "type": "poly",
-                    "points": [{"co": [0.0, 0.0, 0.0]}, {"co": [1.0, 0.0, 0.0]}],
-                    "order": 2,
-                    "resolution": 1
-                }]
+                "op":"curve.create",
+                "id":"tapered",
+                "dimensions":"three_d",
+                "bevel_depth":0.1,
+                "taper":"missing_profile",
+                "splines":[{"type":"poly","points":[{"co":[0.0,0.0,0.0]},{"co":[1.0,0.0,0.0]}],"order":2,"resolution":1}]
             }]
         }),
     )
     .unwrap_err();
-    assert_eq!(
-        error.code,
-        potter_core::error::ErrorCode::UnsupportedFeature
-    );
-    assert_eq!(error.details["feature_id"], "curve.taper_object");
+    assert_eq!(error.code, potter_core::error::ErrorCode::DependencyMissing);
+    assert_eq!(error.details["operation_index"], 0);
+    assert_eq!(error.details["pointer"], "/operations/0/taper");
 }
+
 #[test]
-fn unsupported_multiple_fill_contours_report_feature_id() {
+fn curve_taper_dependency_cycles_are_rejected_during_update() {
     let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-    let contour = json!([
-        {"co":[0.0,0.0,0.0]},
-        {"co":[1.0,0.0,0.0]},
-        {"co":[0.0,1.0,0.0]}
-    ]);
-    let error = apply_batch(
+    let doc = apply(
         &base,
+        &json!([
+            {
+                "op":"curve.create",
+                "id":"first",
+                "data_id":"first_data",
+                "dimensions":"three_d",
+                "bevel_depth":0.1,
+                "splines":[{"type":"poly","points":[{"co":[0.0,0.0,0.0]},{"co":[1.0,0.0,0.0]}],"order":2,"resolution":1}]
+            },
+            {
+                "op":"curve.create",
+                "id":"second",
+                "data_id":"second_data",
+                "dimensions":"three_d",
+                "bevel_depth":0.1,
+                "splines":[{"type":"poly","points":[{"co":[0.0,0.0,0.0]},{"co":[1.0,0.0,0.0]}],"order":2,"resolution":1}]
+            }
+        ]),
+    );
+    let error = apply_batch(
+        &doc,
         &json!({
             "schema_version": 1,
-            "base_revision": 0,
-            "operations": [{
-                "op": "curve.create",
-                "id": "multi_fill",
-                "dimensions": "two_d",
-                "fill_mode": "both",
-                "splines": [
-                    {"type":"poly","points":contour,"order":2,"cyclic":true,"resolution":1},
-                    {"type":"poly","points":contour,"order":2,"cyclic":true,"resolution":1}
-                ]
-            }]
+            "base_revision": doc.revision,
+            "operations": [
+                {"op":"curve.update","target":{"id":"first"},"set":{"taper":"second_data"}},
+                {"op":"curve.update","target":{"id":"second"},"set":{"taper":"first_data"}}
+            ]
         }),
     )
     .unwrap_err();
-    assert_eq!(
-        error.code,
-        potter_core::error::ErrorCode::UnsupportedFeature
+    assert_eq!(error.code, potter_core::error::ErrorCode::InvalidOperation);
+    assert_eq!(error.details["operation_index"], 1);
+    assert!(error.message.contains("curve taper dependency cycle"));
+}
+
+#[test]
+fn non_curve_taper_profile_uses_blenders_unit_factor() {
+    let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+    let doc = apply(
+        &base,
+        &json!([
+            {"op":"node.create","id":"profile_mesh","kind":"box","params":{"size":1.0}},
+            {
+                "op":"curve.create",
+                "id":"host",
+                "data_id":"host_data",
+                "dimensions":"three_d",
+                "bevel_depth":0.2,
+                "bevel_resolution":1,
+                "splines":[{"type":"poly","points":[{"co":[0.0,0.0,0.0]},{"co":[1.0,0.0,0.0]}],"order":2,"resolution":1}]
+            }
+        ]),
     );
-    assert_eq!(error.details["feature_id"], "curve.fill.multiple_contours");
+    let mut with_non_curve_taper = doc.clone();
+    let taper_id = with_non_curve_taper.nodes[&Id::new("profile_mesh").unwrap()]
+        .data
+        .clone()
+        .unwrap();
+    with_non_curve_taper
+        .data_blocks
+        .get_mut(&Id::new("host_data").unwrap())
+        .unwrap()
+        .curve
+        .as_mut()
+        .unwrap()
+        .taper = Some(taper_id);
+
+    let baseline = evaluated(&doc).meshes[&Id::new("host").unwrap()].clone();
+    let tapered = evaluated(&with_non_curve_taper).meshes[&Id::new("host").unwrap()].clone();
+    assert_eq!(
+        baseline
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>(),
+        tapered
+            .vertices
+            .iter()
+            .map(|vertex| vertex.co)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(baseline.faces, tapered.faces);
 }
 
 proptest! {

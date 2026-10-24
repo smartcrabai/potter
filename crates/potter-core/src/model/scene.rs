@@ -2828,6 +2828,32 @@ pub enum CurveFillMode {
     Both,
 }
 
+// Blender 5.2.2 DNA_curve_types.h:282-286 defines Curve::fill_solver/fill_rule and defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveFillSolver {
+    #[default]
+    SweepLine,
+    Cdt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveFillRule {
+    #[default]
+    EvenOdd,
+    Nonzero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveTaperRadiusMode {
+    #[default]
+    Override,
+    Multiply,
+    Add,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CurvePoint {
@@ -2889,7 +2915,11 @@ pub struct CurveData {
     pub bevel_resolution: u32,
     pub extrude: f64,
     pub taper: Option<Id>,
+    pub taper_radius_mode: CurveTaperRadiusMode,
+    pub use_map_taper: bool,
     pub fill_mode: CurveFillMode,
+    pub fill_solver: CurveFillSolver,
+    pub fill_rule: CurveFillRule,
     pub twist_mode: String,
     pub use_path: bool,
     pub path_duration: u32,
@@ -2907,7 +2937,11 @@ impl Default for CurveData {
             bevel_resolution: 0,
             extrude: 0.0,
             taper: None,
+            taper_radius_mode: CurveTaperRadiusMode::Override,
+            use_map_taper: false,
             fill_mode: CurveFillMode::None,
+            fill_solver: CurveFillSolver::SweepLine,
+            fill_rule: CurveFillRule::EvenOdd,
             twist_mode: "MINIMUM".to_owned(),
             use_path: false,
             path_duration: 100,

@@ -309,7 +309,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "curve.spline_geometry",
-            "Bezier, polyline, and rational NURBS splines with bevel and simple 2D fill",
+            "Bezier, polyline, and rational NURBS splines with bevel and 2D fill",
             "Curve",
             &[
                 "curve.create",
@@ -349,12 +349,12 @@ pub fn feature_catalog() -> Value {
             &[],
             [false, false, true, true, true, false, true],
         ),
-        unsupported(
+        supported(
             "curve.taper_object",
             "Curve taper objects",
             "Curve",
-            &["curve.create", "curve.update"],
-            "Taper profiles reference another curve Data-Block and are not evaluated.",
+            &["curve.create", "curve.update", "curve.convert"],
+            [true, true, true, true, false, false, false],
         ),
         unsupported(
             "curve.convert.destination",
@@ -363,12 +363,12 @@ pub fn feature_catalog() -> Value {
             &["curve.convert"],
             "Curve conversion currently supports explicit conversion to mesh only.",
         ),
-        unsupported(
+        supported(
             "curve.fill.multiple_contours",
-            "Multi-contour 2D curve fills",
+            "Multi-contour even-odd 2D curve fills (CDT NONZERO is rejected)",
             "Curve",
-            &["curve.create", "curve.update"],
-            "2D fill evaluation supports one simple closed contour and cannot combine holes or separate filled contours.",
+            &["curve.create", "curve.update", "curve.convert"],
+            [true, true, true, true, false, false, false],
         ),
         supported(
             "mesh.element_edit",
