@@ -2,7 +2,7 @@
 With a black world, the plane's pixel is exactly the single-bounce integral of the material lobe.
 Run: Blender -b --factory-startup --threads 1 --python probe.py -- OUT_DIR
 """
-import bpy, json, math, os, sys
+import bpy, json, math, os, statistics, sys
 from mathutils import Vector
 
 out = sys.argv[sys.argv.index('--') + 1]
@@ -20,6 +20,14 @@ VARIANTS = {
     "metal_r024": dict(metallic=1.0, roughness=0.24, base=BASE),
     "metal_r024_white": dict(metallic=1.0, roughness=0.24, base=(1.0, 1.0, 1.0, 1.0)),
     "diffuse_white": dict(metallic=0.0, roughness=0.5, base=(0.8, 0.8, 0.8, 1.0), spec=0.0),
+    "diffuse_roughness_r000": dict(metallic=0.0, roughness=0.5, base=(0.8, 0.5, 0.3, 1.0), spec=0.0,
+                                   diffuse_roughness=0.0),
+    "diffuse_roughness_r050": dict(metallic=0.0, roughness=0.5, base=(0.8, 0.5, 0.3, 1.0), spec=0.0,
+                                   diffuse_roughness=0.5),
+    "diffuse_roughness_r100": dict(metallic=0.0, roughness=0.5, base=(0.8, 0.5, 0.3, 1.0), spec=0.0,
+                                   diffuse_roughness=1.0),
+    "diffuse_bsdf_r050": dict(node="diffuse", roughness=0.5, metallic=0.0,
+                              base=(0.8, 0.5, 0.3, 1.0), diffuse_roughness=0.5),
     "spec_only_r024": dict(metallic=0.0, roughness=0.24, base=(0.0, 0.0, 0.0, 1.0)),
     "dielectric_white": dict(metallic=0.0, roughness=0.24, base=(0.8, 0.8, 0.8, 1.0)),
     # Coat alone: no base diffuse and no base dielectric layer (Specular IOR Level 0).
@@ -68,22 +76,34 @@ def make(v, seed):
     bpy.ops.mesh.primitive_plane_add(size=40, location=(0, 0, 0))
     plane = bpy.context.object
     mat = bpy.data.materials.new('Lobe'); mat.use_nodes = True
-    b = mat.node_tree.nodes['Principled BSDF']
-    b.inputs['Base Color'].default_value = v['base']
-    b.inputs['Metallic'].default_value = v['metallic']
-    b.inputs['Roughness'].default_value = v['roughness']
-    b.inputs['IOR'].default_value = 1.5
-    if 'spec' in v:
-        b.inputs['Specular IOR Level'].default_value = v['spec']
-    if 'coat' in v:
-        b.inputs['Coat Weight'].default_value = v['coat']
-        b.inputs['Coat Roughness'].default_value = v['coat_roughness']
-        b.inputs['Coat IOR'].default_value = v['coat_ior']
-        b.inputs['Coat Tint'].default_value = (*v['coat_tint'], 1.0)
-    if 'sheen' in v:
-        b.inputs['Sheen Weight'].default_value = v['sheen']
-        b.inputs['Sheen Roughness'].default_value = v['sheen_roughness']
-        b.inputs['Sheen Tint'].default_value = (*v['sheen_tint'], 1.0)
+    nodes = mat.node_tree.nodes
+    p = nodes['Principled BSDF']
+    output = nodes['Material Output']
+    if v.get('node') == 'diffuse':
+        nodes.remove(p)
+        b = nodes.new('ShaderNodeBsdfDiffuse')
+        b.inputs['Color'].default_value = v['base']
+        b.inputs['Roughness'].default_value = v['diffuse_roughness']
+        mat.node_tree.links.new(b.outputs['BSDF'], output.inputs['Surface'])
+    else:
+        b = p
+        b.inputs['Base Color'].default_value = v['base']
+        b.inputs['Metallic'].default_value = v['metallic']
+        b.inputs['Roughness'].default_value = v['roughness']
+        b.inputs['IOR'].default_value = 1.5
+        if 'spec' in v:
+            b.inputs['Specular IOR Level'].default_value = v['spec']
+        if 'diffuse_roughness' in v:
+            b.inputs['Diffuse Roughness'].default_value = v['diffuse_roughness']
+        if 'coat' in v:
+            b.inputs['Coat Weight'].default_value = v['coat']
+            b.inputs['Coat Roughness'].default_value = v['coat_roughness']
+            b.inputs['Coat IOR'].default_value = v['coat_ior']
+            b.inputs['Coat Tint'].default_value = (*v['coat_tint'], 1.0)
+        if 'sheen' in v:
+            b.inputs['Sheen Weight'].default_value = v['sheen']
+            b.inputs['Sheen Roughness'].default_value = v['sheen_roughness']
+            b.inputs['Sheen Tint'].default_value = (*v['sheen_tint'], 1.0)
     plane.data.materials.append(mat)
     ld = bpy.data.lights.new('Disk', 'AREA')
     ld.shape = 'DISK'
@@ -115,6 +135,16 @@ def centre_mean(path):
 
 result = {}
 # PROBE_VARIANTS=name,name... renders a subset; committed means are never regenerated in place.
+args = sys.argv[sys.argv.index('--') + 1:]
+out = args[0]
+os.makedirs(out, exist_ok=True)
+if len(args) > 1 and args[1] == '--save-only':
+    name, diameter, blend_path = args[2], float(args[3]), args[4]
+    LIGHT_DIAMETER = diameter
+    make(VARIANTS[name], 0)
+    bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+    print('SAVED', name, blend_path, flush=True)
+    sys.exit(0)
 selected = os.environ.get('PROBE_VARIANTS')
 for name, v in ((n, VARIANTS[n]) for n in (selected.split(',') if selected else VARIANTS)):
     vals = []
@@ -124,7 +154,11 @@ for name, v in ((n, VARIANTS[n]) for n in (selected.split(',') if selected else 
         bpy.ops.render.render(write_still=True)
         vals.append(centre_mean(p))
     m = [sum(x[c] for x in vals) / len(vals) for c in range(3)]
-    result[name] = {"mean": m, "per_seed": vals}
+    stderr = [
+        statistics.stdev(x[c] for x in vals) / math.sqrt(len(vals))
+        for c in range(3)
+    ]
+    result[name] = {"mean": m, "stderr": stderr, "per_seed": vals}
     print('VARIANT', name, [round(x, 8) for x in m], flush=True)
 json.dump({"view_theta_deg": 45.0, "dist": DIST, "light_dist": LIGHT_DIST,
            "light_diameter": LIGHT_DIAMETER, "power": POWER, "samples": SAMPLES,

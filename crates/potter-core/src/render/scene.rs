@@ -4320,8 +4320,11 @@ mod shading_normal_tests {
             DVec3::ZERO,
             "the specular lobe towards a below-horizon centre is zero"
         );
-        let output =
-            diffuse_coefficient(&params, &principled_layers(&params, normal, normal)) * irradiance;
+        let output = diffuse_coefficient(
+            &params,
+            &principled_layers(&params, normal, normal),
+            DVec3::Z,
+        ) * irradiance;
         assert!(
             output.x > 0.0,
             "visible upper strip must retain diffuse light: {output:?}"
