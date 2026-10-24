@@ -9459,6 +9459,7 @@ fn import_animations(
                         .map_err(|_| import_error("animation component index exceeds u32 range"))?,
                     keyframes,
                     extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
                 });
             }
         }

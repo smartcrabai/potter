@@ -1252,12 +1252,19 @@ pub fn feature_catalog() -> Value {
             &[],
             "Bezier handle editing and Blender-specific retiming/blend semantics are not implemented.",
         ),
+        supported(
+            "animation.fcurve_modifiers",
+            "Blender F-Curve modifiers",
+            "FCurve",
+            &["fcurve.update"],
+            [true, true, true, true, true, false, false],
+        ),
         unsupported(
-            "animation.fcurve",
-            "Full Blender F-Curve feature set",
+            "animation.fcurve_non_transform_channels",
+            "Non-transform F-Curve channels",
             "FCurve",
             &[],
-            "Curve modifiers and non-transform channels beyond the supported Action and driver subsets are not implemented.",
+            "F-Curve modifiers do not add support for Action or driver channel paths outside the existing supported subsets.",
         ),
         supported(
             "rig.advanced",

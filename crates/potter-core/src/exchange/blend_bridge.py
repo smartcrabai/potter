@@ -2613,9 +2613,18 @@ def dump_fcurve(curve):
                      "interpolation": point.interpolation,
                      "handle_left": plain(point.handle_left), "handle_right": plain(point.handle_right),
                      "handle_left_type": point.handle_left_type, "handle_right_type": point.handle_right_type})
+    modifiers = []
+    for modifier in curve.modifiers:
+        properties = rna_props(modifier)
+        if modifier.type == "ENVELOPE":
+            properties["control_points"] = [
+                {"frame": float(point.frame), "min": float(point.min), "max": float(point.max)}
+                for point in modifier.control_points
+            ]
+        modifiers.append({"type": modifier.type, "properties": properties})
     return {"path": curve.data_path, "index": int(curve.array_index), "keyframes": keys,
             "extrapolation": curve.extrapolation, "mute": bool(curve.mute),
-            "modifiers": [{"type": m.type, "properties": rna_props(m)} for m in curve.modifiers]}
+            "modifiers": modifiers}
 
 
 def collection_dump(collection):
@@ -7438,6 +7447,7 @@ def _canonical_fcurves(model_curves, source_curves, doc, include_unmatched=True,
                         key[field] = old[field]
             keyframes.append(key)
         curve["keyframes"] = keyframes
+        curve["modifiers"] = model.get("modifiers", [])
         result.append(curve)
     return result
 
@@ -7583,11 +7593,83 @@ def _restore_action_curves(channelbag, curves, owner, doc):
                     point.handle_left = key.get("handle_left", point.handle_left)
                 if point.handle_right_type in ("FREE", "ALIGNED"):
                     point.handle_right = key.get("handle_right", point.handle_right)
+            modifier_active = []
             for modifier_source in source.get("modifiers", []):
                 modifier = curve.modifiers.new(modifier_source["type"])
-                set_rna(modifier, modifier_source.get("properties", {}),
-                        {}, strict=True, owner="%s FCurve modifier" % owner)
+                properties = dict(modifier_source.get("properties", {}))
+                modifier_name = properties.pop("name", None)
+                if modifier_name is not None:
+                    modifier.name = str(modifier_name)
+                active = properties.pop("active", None)
+                modifier_active.append((modifier, active))
+                control_points = properties.pop("control_points", None)
+                if modifier_source["type"] == "STEPPED":
+                    invalid_range = (
+                        float(properties.get("frame_start", 0.0)) >
+                        float(properties.get("frame_end", 0.0)))
+                    if invalid_range:
+                        property_order = (
+                            "blend_in", "blend_out", "frame_start", "frame_end",
+                            "use_restricted_range", "use_influence",
+                            "use_frame_start", "use_frame_end", "influence")
+                    else:
+                        property_order = (
+                            "frame_start", "frame_end", "use_restricted_range",
+                            "use_influence", "use_frame_start", "use_frame_end",
+                            "blend_in", "blend_out", "influence")
+                else:
+                    frame_start = float(properties.get("frame_start", 0.0))
+                    frame_end = float(properties.get("frame_end", 0.0))
+                    blend_in = float(properties.get("blend_in", 0.0))
+                    blend_out = float(properties.get("blend_out", 0.0))
+                    expanded_end = max(frame_end, frame_start + blend_in, frame_start + blend_out)
+                    if properties.get("use_restricted_range", False) and expanded_end > frame_end:
+                        # Blend setters clamp against the range, so expand temporarily after a valid range shrink.
+                        if "frame_start" in properties:
+                            set_rna(modifier, {"frame_start": properties.pop("frame_start")}, {},
+                                    strict=True, owner="%s FCurve modifier" % owner)
+                        set_rna(modifier, {"frame_end": expanded_end}, {},
+                                strict=True, owner="%s FCurve modifier" % owner)
+                        if "use_restricted_range" in properties:
+                            set_rna(modifier, {"use_restricted_range":
+                                               properties.pop("use_restricted_range")}, {},
+                                    strict=True, owner="%s FCurve modifier" % owner)
+                        for property_name in ("blend_in", "blend_out"):
+                            if property_name in properties:
+                                set_rna(modifier, {property_name: properties.pop(property_name)}, {},
+                                        strict=True, owner="%s FCurve modifier" % owner)
+                        set_rna(modifier, {"frame_end": frame_end}, {},
+                                strict=True, owner="%s FCurve modifier" % owner)
+                        properties.pop("frame_end", None)
+                    property_order = (
+                        "use_restricted_range", "use_influence",
+                        "use_frame_start", "use_frame_end", "frame_end", "frame_start",
+                        "blend_in", "blend_out", "influence")
+                for property_name in property_order:
+                    if property_name in properties:
+                        set_rna(
+                            modifier, {property_name: properties.pop(property_name)}, {},
+                            strict=True, owner="%s FCurve modifier" % owner)
+                if modifier_source["type"] == "GENERATOR":
+                    for property_name in ("mode", "poly_order"):
+                        if property_name in properties:
+                            set_rna(
+                                modifier, {property_name: properties.pop(property_name)}, {},
+                                strict=True, owner="%s FCurve modifier" % owner)
+                set_rna(modifier, properties, {}, strict=True,
+                        owner="%s FCurve modifier" % owner)
+                if control_points is not None:
+                    for control_point in control_points:
+                        point = modifier.control_points.add(float(control_point["frame"]))
+                        point.min = float(control_point["min"])
+                        point.max = float(control_point["max"])
             curve.update()
+            for modifier, active in modifier_active:
+                if active is not None and not bool(active):
+                    modifier.active = False
+            for modifier, active in modifier_active:
+                if active:
+                    modifier.active = True
         except Exception as error:
             raise ValueError("%s cannot restore FCurve %s" %
                              (owner, source.get("path", ""))) from error

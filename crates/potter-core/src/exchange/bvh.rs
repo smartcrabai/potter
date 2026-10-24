@@ -229,6 +229,7 @@ pub(crate) fn import(file: &Path, scene_id: String) -> Result<ImportedGraph> {
             index,
             keyframes,
             extrapolation: Extrapolation::Constant,
+            modifiers: Vec::new(),
         })
         .collect::<Vec<_>>();
     if !fcurves.is_empty() {
