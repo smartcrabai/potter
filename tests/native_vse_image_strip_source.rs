@@ -135,7 +135,7 @@ fn render_frame(
     root: &Path,
     frame: u32,
 ) -> TestResult<Vec<[f64; 4]>> {
-    let output_dir = root.join(format!("frames_{frame}"));
+    let output_dir = root.join(format!("frames_{scene_id}_{frame}"));
     let mut command = pot();
     command
         .arg("render")
