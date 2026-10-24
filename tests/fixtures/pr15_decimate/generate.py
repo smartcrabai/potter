@@ -126,6 +126,27 @@ def build_base(spec):
     if kind == "explicit":
         data = explicit_mesh(spec)
         return [tuple(v) for v in data["positions"]], [tuple(f) for f in data["faces"]]
+    if kind == "shared_vertex_fans":
+        verts = [(0.0, 0.0, 0.0)]
+        faces = []
+        for fan in range(2):
+            inner = []
+            outer = []
+            for i in range(3):
+                angle = fan * math.pi + math.pi * 0.5 * i / 2
+                inner_radius = 1.0 + 0.1 * math.sin((i + 1) * 0.7 + fan)
+                outer_radius = 2.0 + 0.2 * math.cos((i + 1) * 0.8 + fan)
+                inner.append(len(verts))
+                verts.append((inner_radius * math.cos(angle),
+                              inner_radius * math.sin(angle),
+                              0.3 * math.sin((i + 1) * 0.6 + fan)))
+                outer.append(len(verts))
+                verts.append((outer_radius * math.cos(angle),
+                              outer_radius * math.sin(angle),
+                              0.4 * math.cos((i + 1) * 1.4 + fan)))
+            for i in range(2):
+                faces.append((0, inner[i], outer[i], outer[i + 1], inner[i + 1]))
+        return verts, faces
     raise ValueError(kind)
 
 
@@ -417,6 +438,9 @@ def all_cases():
     # Boolean FLOAT stack FLOAT-1 with Potter's edge order: Blender's COLLAPSE rings depend on edge order.
     cases["float1_edge_potter_r0.6"] = (dict(mesh="explicit", file="inputs/float1_edge_potter_order.json"),
                                         {"decimate_type": "COLLAPSE", "ratio": 0.6})
+    cases["shared_vertex_fans_nonmanifold_r0.35"] = (
+        dict(mesh="shared_vertex_fans"),
+        {"decimate_type": "COLLAPSE", "ratio": 0.35})
     cases["cube_r0.7"] = (dict(mesh="cube"), {"decimate_type": "COLLAPSE", "ratio": 0.7})
     # Boolean-applied hollow cube (two closed shells). Its inner shell triangulates and joins back into a
     # face that doubles one already made; Blender keeps the existing face (`bm_decim_triangulate_end`).
