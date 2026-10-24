@@ -892,7 +892,10 @@ impl BMesh {
     /// `e`), which is `BM_faces_join`'s `v1`; each new corner copies UVs from the boundary loop on its edge.
     /// A join that doubles an existing face (`BM_face_find_double`) is killed after the joined faces, so
     /// the existing face stays (`bm_decim_triangulate_end`, #159549).
-    /// shortcut: a boundary vertex with several open boundary edges takes the first in discovery order, Blender takes disk order; only non-manifold boundaries differ.
+    /// `bm_edges_sort_winding` uses disk order when a joined boundary branches. Potter-valid face rings
+    /// are simple; Blender 5.2.2 probes for two-fan, multi-radial-edge and T-junction meshes had no
+    /// branched `join_across` boundary after collapse, leaving one continuation at each vertex. Revisit
+    /// if a valid collapse can produce a branched join boundary.
     fn join_across(&mut self, e: usize) {
         let Some((la, lb)) = self.edge_loop_pair(e) else {
             return;
