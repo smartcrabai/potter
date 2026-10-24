@@ -895,7 +895,7 @@ pub(crate) fn write_multilayer_exr(
 ) -> Result<()> {
     use exr::prelude::{
         AnyChannel, AnyChannels, Encoding, FlatSamples, Image as ExrImage, ImageAttributes, Layer,
-        LayerAttributes, WritableImage,
+        LayerAttributes, LineOrder, WritableImage,
     };
 
     let width = usize::try_from(width).map_err(|_| {
@@ -1070,7 +1070,10 @@ pub(crate) fn write_multilayer_exr(
         layers.push(Layer::new(
             (width, height),
             LayerAttributes::named(name),
-            Encoding::FAST_LOSSLESS,
+            Encoding {
+                line_order: LineOrder::Increasing,
+                ..Encoding::FAST_LOSSLESS
+            },
             channels,
         ));
     }
@@ -1105,7 +1108,7 @@ fn write_file_output(node: &GraphNode, image: &Image, associated_alpha: bool) ->
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("exr"))
     {
-        exr::prelude::write_rgba_file(
+        crate::image::storage::write_rgba_exr_file(
             &path,
             image.width as usize,
             image.height as usize,

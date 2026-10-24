@@ -1970,7 +1970,7 @@ fn write_ocean_exr(path: &Path, image: &crate::geom::modifiers::OceanBakeImage) 
             "Ocean EXR pixel count does not match its dimensions",
         ));
     }
-    exr::prelude::write_rgba_file(path, resolution, resolution, |x, y| {
+    crate::image::storage::write_rgba_exr_file(path, resolution, resolution, |x, y| {
         // Blender writes the image's top row first, so file row `y` is buffer row `height - 1 - y`.
         let pixel = image.pixels[(resolution - 1 - y) * resolution + x];
         (

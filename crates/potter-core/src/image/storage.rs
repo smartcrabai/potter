@@ -57,6 +57,32 @@ pub fn encode_pixels(width: u32, height: u32, pixels: &[[f64; 4]]) -> Result<Vec
     .map_err(|error| PotError::new(ErrorCode::InternalError, error.to_string()))
 }
 
+/// Writes RGBA `OpenEXR` with a canonical chunk order while retaining `FAST_LOSSLESS` compression.
+pub(crate) fn write_rgba_exr_file<R, G, B, A, Pixels>(
+    path: impl AsRef<Path>,
+    width: usize,
+    height: usize,
+    colors: Pixels,
+) -> exr::prelude::Result<()>
+where
+    R: exr::prelude::IntoSample,
+    G: exr::prelude::IntoSample,
+    B: exr::prelude::IntoSample,
+    A: exr::prelude::IntoSample,
+    Pixels: Fn(usize, usize) -> (R, G, B, A) + Sync,
+{
+    use exr::prelude::{Encoding, Image, LineOrder, SpecificChannels, Vec2, WritableImage};
+
+    let channels = SpecificChannels::rgba(|Vec2(x, y)| colors(x, y));
+    let encoding = Encoding {
+        line_order: LineOrder::Increasing,
+        ..Encoding::FAST_LOSSLESS
+    };
+    Image::from_encoded_channels((width, height), encoding, channels)
+        .write()
+        .to_file(path)
+}
+
 /// Reads an image's base pixels and UDIM tiles from its scene asset store.
 /// Linked images are checked against their registered source hash before use.
 ///
