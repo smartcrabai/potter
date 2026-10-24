@@ -542,9 +542,9 @@ impl MtlWriter<'_> {
             reason = "exact zero test: an emissive factor of exactly zero skips map_Ke, as Blender does for zero strength"
         )]
         let ke_map = match &surface.emissive.texture {
-            // Blender skips map_Ke when Emission Strength is zero.
-            // shortcut: Potter keeps only the emitted factor (colour times strength), so a textured
-            // emission with black colour and nonzero strength is not written, unlike Blender.
+            // Blender writes map_Ke only for a texture linked to Emission Color with nonzero Emission Strength
+            // (`obj_export_mtl.cc`, `store_image_textures`). A linked texture's factor is that strength, and a zero
+            // emitted factor already drops the texture (`material_surface.rs`, `emission_value`).
             Some(texture) if surface.emissive.factor != [0.0; 3] => {
                 Some(self.map("map_Ke", texture, &rgb_channels(&texture.channels), None)?)
             }
