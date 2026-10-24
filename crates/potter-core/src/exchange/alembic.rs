@@ -4323,6 +4323,7 @@ fn create_transform_action(
                 })?,
                 keyframes,
                 extrapolation: crate::model::Extrapolation::default(),
+                modifiers: Vec::new(),
             });
         }
     }
@@ -4608,6 +4609,7 @@ mod tests {
                         },
                     ],
                     extrapolation: crate::model::Extrapolation::default(),
+                    modifiers: Vec::new(),
                 }],
                 ..Action::default()
             },

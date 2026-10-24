@@ -1630,7 +1630,7 @@ fn write_animation(output: &mut String, doc: &SceneDoc, node: &Node, depth: usiz
             }
             path => {
                 return Err(unsupported(
-                    "animation.fcurve",
+                    "animation.fcurve_non_transform_channels",
                     format!("USD cannot represent animation path `{path}`"),
                 ));
             }
@@ -3321,6 +3321,7 @@ fn import_time_samples(prim: &Prim) -> Result<Action> {
                 index: component as u32,
                 keyframes,
                 extrapolation: crate::model::Extrapolation::default(),
+                modifiers: Vec::new(),
             });
         }
     }

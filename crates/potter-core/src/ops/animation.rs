@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::{ErrorCode, Result},
-    model::{Action, Extrapolation, FCurve, Id, Interpolation, Keyframe},
+    model::{Action, Extrapolation, FCurve, FCurveModifier, Id, Interpolation, Keyframe},
 };
 
 use super::{
@@ -113,6 +113,7 @@ fn update_action(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             for curve in &curves {
                 validate_path(engine, &curve.path, curve.index, "set/fcurves")?;
                 validate_keyframes(engine, &curve.keyframes, "set/fcurves")?;
+                validate_fcurve_modifiers(engine, &curve.modifiers, "set/fcurves/modifiers")?;
             }
             Ok(curves)
         })
@@ -242,6 +243,7 @@ fn insert_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
             index,
             keyframes: Vec::new(),
             extrapolation: Extrapolation::Constant,
+            modifiers: Vec::new(),
         });
         action.fcurves.len() - 1
     };
@@ -357,24 +359,44 @@ fn update_fcurve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 &operation_pointer(engine.operation_index, "set"),
             )
         })?;
-    if set.len() != 1 || !set.contains_key("extrapolation") {
+    if set.is_empty()
+        || set
+            .keys()
+            .any(|key| key != "extrapolation" && key != "modifiers")
+    {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
-            "fcurve.update set requires only extrapolation",
+            "fcurve.update set must contain extrapolation and/or modifiers",
             &operation_pointer(engine.operation_index, "set"),
         ));
     }
-    let extrapolation = match set.get("extrapolation").and_then(Value::as_str) {
-        Some("constant") => Extrapolation::Constant,
-        Some("linear") => Extrapolation::Linear,
-        _ => {
-            return Err(engine.error(
+    let extrapolation = set
+        .get("extrapolation")
+        .map(|value| match value.as_str() {
+            Some("constant") => Ok(Extrapolation::Constant),
+            Some("linear") => Ok(Extrapolation::Linear),
+            _ => Err(engine.error(
                 ErrorCode::InvalidOperation,
                 "extrapolation must be constant or linear",
                 &operation_pointer(engine.operation_index, "set/extrapolation"),
-            ));
-        }
-    };
+            )),
+        })
+        .transpose()?;
+    let modifiers = set
+        .get("modifiers")
+        .map(|value| {
+            serde_json::from_value::<Vec<FCurveModifier>>(value.clone()).map_err(|error| {
+                engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!("invalid F-Curve modifiers: {error}"),
+                    &operation_pointer(engine.operation_index, "set/modifiers"),
+                )
+            })
+        })
+        .transpose()?;
+    if let Some(modifiers) = &modifiers {
+        validate_fcurve_modifiers(engine, modifiers, "set/modifiers")?;
+    }
     let action = engine.doc.actions.get(&action_id).ok_or_else(|| {
         crate::error::PotError::new(ErrorCode::InternalError, "assigned action disappeared")
     })?;
@@ -389,13 +411,23 @@ fn update_fcurve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 &operation_pointer(engine.operation_index, "path"),
             )
         })?;
-    if action.fcurves[curve_position].extrapolation == extrapolation {
+    let curve = &action.fcurves[curve_position];
+    let changed = extrapolation.is_some_and(|value| curve.extrapolation != value)
+        || modifiers
+            .as_ref()
+            .is_some_and(|value| curve.modifiers != *value);
+    if !changed {
         return Ok(false);
     }
     let action = engine.doc.actions.get_mut(&action_id).ok_or_else(|| {
         crate::error::PotError::new(ErrorCode::InternalError, "assigned action disappeared")
     })?;
-    action.fcurves[curve_position].extrapolation = extrapolation;
+    if let Some(extrapolation) = extrapolation {
+        action.fcurves[curve_position].extrapolation = extrapolation;
+    }
+    if let Some(modifiers) = modifiers {
+        action.fcurves[curve_position].modifiers = modifiers;
+    }
     engine.mark("actions", &action_id, ChangeKind::Updated);
     Ok(true)
 }
@@ -582,6 +614,395 @@ fn validate_keyframes(engine: &Engine<'_>, keyframes: &[Keyframe], field: &str) 
     Ok(())
 }
 
+fn validate_fcurve_modifiers(
+    engine: &Engine<'_>,
+    modifiers: &[FCurveModifier],
+    field: &str,
+) -> Result<()> {
+    const COMMON: [&str; 11] = [
+        "name",
+        "show_expanded",
+        "mute",
+        "active",
+        "use_restricted_range",
+        "frame_start",
+        "frame_end",
+        "blend_in",
+        "blend_out",
+        "use_influence",
+        "influence",
+    ];
+    const COMMON_STRING: [&str; 1] = ["name"];
+    const COMMON_BOOLEAN: [&str; 5] = [
+        "show_expanded",
+        "mute",
+        "active",
+        "use_restricted_range",
+        "use_influence",
+    ];
+    const COMMON_NUMBER: [&str; 5] = [
+        "frame_start",
+        "frame_end",
+        "blend_in",
+        "blend_out",
+        "influence",
+    ];
+    for (index, modifier) in modifiers.iter().enumerate() {
+        let modifier_field = format!("{field}/{index}");
+        if !modifier.is_supported() {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!(
+                    "F-Curve modifier type `{}` is not supported",
+                    modifier.modifier_type
+                ),
+                &operation_pointer(engine.operation_index, &format!("{modifier_field}/type")),
+            ));
+        }
+        let specific: &[&str] = match modifier.modifier_type.as_str() {
+            "GENERATOR" => &["use_additive", "mode", "poly_order", "coefficients"],
+            "FNGENERATOR" => &[
+                "amplitude",
+                "phase_multiplier",
+                "phase_offset",
+                "value_offset",
+                "use_additive",
+                "function_type",
+            ],
+            "ENVELOPE" => &[
+                "reference_value",
+                "default_min",
+                "default_max",
+                "control_points",
+            ],
+            "CYCLES" => &["mode_before", "cycles_before", "mode_after", "cycles_after"],
+            "NOISE" => &[
+                "blend_type",
+                "scale",
+                "strength",
+                "phase",
+                "offset",
+                "lacunarity",
+                "roughness",
+                "depth",
+                "use_legacy_noise",
+            ],
+            "LIMITS" => &[
+                "use_min_x",
+                "use_min_y",
+                "use_max_x",
+                "use_max_y",
+                "min_x",
+                "min_y",
+                "max_x",
+                "max_y",
+            ],
+            "STEPPED" => &[
+                "frame_step",
+                "frame_offset",
+                "use_frame_start",
+                "use_frame_end",
+            ],
+            _ => &[],
+        };
+        for key in modifier.properties.keys() {
+            if !COMMON.contains(&key.as_str()) && !specific.contains(&key.as_str()) {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!(
+                        "unknown `{}` F-Curve modifier property `{key}`",
+                        modifier.modifier_type
+                    ),
+                    &operation_pointer(
+                        engine.operation_index,
+                        &format!("{modifier_field}/properties/{key}"),
+                    ),
+                ));
+            }
+        }
+        let boolean_fields = match modifier.modifier_type.as_str() {
+            "GENERATOR" | "FNGENERATOR" => &["use_additive"][..],
+            "NOISE" => &["use_legacy_noise"][..],
+            "LIMITS" => &["use_min_x", "use_min_y", "use_max_x", "use_max_y"][..],
+            "STEPPED" => &["use_frame_start", "use_frame_end"][..],
+            _ => &[][..],
+        };
+        let number_fields: &[&str] = match modifier.modifier_type.as_str() {
+            "FNGENERATOR" => &[
+                "amplitude",
+                "phase_multiplier",
+                "phase_offset",
+                "value_offset",
+            ],
+            "ENVELOPE" => &["reference_value", "default_min", "default_max"],
+            "NOISE" => &[
+                "scale",
+                "strength",
+                "phase",
+                "offset",
+                "lacunarity",
+                "roughness",
+            ],
+            "LIMITS" => &["min_x", "min_y", "max_x", "max_y"],
+            "STEPPED" => &["frame_step", "frame_offset"],
+            _ => &[],
+        };
+        let integer_fields: &[&str] = match modifier.modifier_type.as_str() {
+            "GENERATOR" => &["poly_order"],
+            "CYCLES" => &["cycles_before", "cycles_after"],
+            "NOISE" => &["depth"],
+            _ => &[],
+        };
+        for (key, value) in &modifier.properties {
+            let value_field = format!("{modifier_field}/properties/{key}");
+            if COMMON_STRING.contains(&key.as_str()) && !value.is_string() {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "`name` must be a string",
+                    &operation_pointer(engine.operation_index, &value_field),
+                ));
+            }
+            if COMMON_BOOLEAN.contains(&key.as_str()) || boolean_fields.contains(&key.as_str()) {
+                if !value.is_boolean() {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        format!("`{key}` must be a boolean"),
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                }
+            } else if COMMON_NUMBER.contains(&key.as_str()) || number_fields.contains(&key.as_str())
+            {
+                let number = value.as_f64();
+                if !number.is_some_and(|number| number.is_finite() && (number as f32).is_finite()) {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        format!("`{key}` must be a finite Blender float"),
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                }
+                if key == "influence"
+                    && !number.is_some_and(|influence| (0.0..=1.0).contains(&influence))
+                {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        "`influence` must be between 0 and 1",
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                }
+            } else if integer_fields.contains(&key.as_str()) && value.as_i64().is_none() {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!("`{key}` must be an integer"),
+                    &operation_pointer(engine.operation_index, &value_field),
+                ));
+            } else if key == "depth"
+                && value
+                    .as_i64()
+                    .is_some_and(|depth| !(0..=i64::from(i16::MAX)).contains(&depth))
+            {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "`depth` must be between 0 and 32767",
+                    &operation_pointer(engine.operation_index, &value_field),
+                ));
+            } else if matches!(key.as_str(), "cycles_before" | "cycles_after")
+                && value.as_i64().is_some_and(|cycles| {
+                    !(i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(&cycles)
+                })
+            {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!("`{key}` must fit a signed 16-bit integer"),
+                    &operation_pointer(engine.operation_index, &value_field),
+                ));
+            } else if key == "mode" {
+                if !matches!(value.as_str(), Some("POLYNOMIAL" | "POLYNOMIAL_FACTORISED")) {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        "`mode` must be POLYNOMIAL or POLYNOMIAL_FACTORISED",
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                }
+            } else if key == "function_type" {
+                if !matches!(
+                    value.as_str(),
+                    Some("SIN" | "COS" | "TAN" | "SINC" | "LN" | "SQRT")
+                ) {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        "invalid function-generator type",
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                }
+            } else if matches!(key.as_str(), "mode_before" | "mode_after") {
+                if !matches!(
+                    value.as_str(),
+                    Some("NONE" | "REPEAT" | "REPEAT_OFFSET" | "MIRROR")
+                ) {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        "invalid Cycles extrapolation mode",
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                }
+            } else if key == "blend_type" {
+                if !matches!(
+                    value.as_str(),
+                    Some("REPLACE" | "MULTIPLY" | "ADD" | "SUBTRACT")
+                ) {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        "invalid Noise blend type",
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                }
+            } else if key == "coefficients" {
+                let valid = value.as_array().is_some_and(|items| {
+                    items.iter().all(|item| {
+                        item.as_f64()
+                            .is_some_and(|number| number.is_finite() && (number as f32).is_finite())
+                    })
+                });
+                if !valid {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        "`coefficients` must contain finite Blender floats",
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                }
+            } else if key == "control_points" {
+                let Some(points) = value.as_array() else {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        "`control_points` must be an array",
+                        &operation_pointer(engine.operation_index, &value_field),
+                    ));
+                };
+                let mut previous_frame = None;
+                for point in points {
+                    let frame = point.get("frame").and_then(Value::as_f64);
+                    let minimum = point.get("min").and_then(Value::as_f64);
+                    let maximum = point.get("max").and_then(Value::as_f64);
+                    let valid = frame.zip(minimum).zip(maximum).is_some_and(
+                        |((frame, minimum), maximum)| {
+                            frame.is_finite()
+                                && minimum.is_finite()
+                                && maximum.is_finite()
+                                && (frame as f32).is_finite()
+                                && (minimum as f32).is_finite()
+                                && (maximum as f32).is_finite()
+                                && previous_frame.is_none_or(|previous| previous < frame)
+                        },
+                    );
+                    if !valid {
+                        return Err(engine.error(
+                            ErrorCode::InvalidOperation,
+                            "envelope control points need finite, strictly ordered frame/min/max values",
+                            &operation_pointer(engine.operation_index, &value_field),
+                        ));
+                    }
+                    previous_frame = frame;
+                }
+            }
+        }
+        let frame_start = modifier
+            .properties
+            .get("frame_start")
+            .and_then(Value::as_f64)
+            .unwrap_or_default() as f32;
+        let frame_end = modifier
+            .properties
+            .get("frame_end")
+            .and_then(Value::as_f64)
+            .unwrap_or_default() as f32;
+        if frame_start > frame_end {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "`frame_start` must not exceed `frame_end`",
+                &operation_pointer(
+                    engine.operation_index,
+                    &format!("{modifier_field}/properties/frame_start"),
+                ),
+            ));
+        }
+        let blend_range = frame_end - frame_start;
+        for key in ["blend_in", "blend_out"] {
+            let blend = modifier
+                .properties
+                .get(key)
+                .and_then(Value::as_f64)
+                .unwrap_or_default() as f32;
+            if blend < 0.0 || blend > blend_range {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    format!("`{key}` must be between 0 and the frame range"),
+                    &operation_pointer(
+                        engine.operation_index,
+                        &format!("{modifier_field}/properties/{key}"),
+                    ),
+                ));
+            }
+        }
+        if modifier.modifier_type == "GENERATOR" {
+            let order = modifier
+                .properties
+                .get("poly_order")
+                .and_then(Value::as_i64)
+                .unwrap_or(1);
+            if !(1..=100).contains(&order) {
+                return Err(engine.error(
+                    ErrorCode::InvalidOperation,
+                    "generator poly_order must be between 1 and 100",
+                    &operation_pointer(
+                        engine.operation_index,
+                        &format!("{modifier_field}/properties/poly_order"),
+                    ),
+                ));
+            }
+            if let Some(coefficients) = modifier
+                .properties
+                .get("coefficients")
+                .and_then(Value::as_array)
+            {
+                let expected = if modifier.properties.get("mode").and_then(Value::as_str)
+                    == Some("POLYNOMIAL_FACTORISED")
+                {
+                    order * 2
+                } else {
+                    order + 1
+                };
+                if coefficients.len() != expected as usize {
+                    return Err(engine.error(
+                        ErrorCode::InvalidOperation,
+                        "generator coefficients do not match its mode and order",
+                        &operation_pointer(
+                            engine.operation_index,
+                            &format!("{modifier_field}/properties/coefficients"),
+                        ),
+                    ));
+                }
+            }
+        }
+        if modifier.modifier_type == "STEPPED"
+            && modifier
+                .properties
+                .get("frame_step")
+                .and_then(Value::as_f64)
+                .is_some_and(|step| step == 0.0)
+        {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                "stepped frame_step must be nonzero",
+                &operation_pointer(
+                    engine.operation_index,
+                    &format!("{modifier_field}/properties/frame_step"),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
@@ -589,6 +1010,7 @@ mod tests {
     use serde_json::json;
 
     use crate::{
+        error::ErrorCode,
         model::{Action, Extrapolation, FCurve, Id, Interpolation, Keyframe},
         ops::apply_batch,
     };
@@ -636,6 +1058,7 @@ mod tests {
                         ..Keyframe::default()
                     }],
                     extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
                 }],
                 ..Action::default()
             },
@@ -693,6 +1116,7 @@ mod tests {
                         ..Keyframe::default()
                     }],
                     extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
                 }],
                 ..Action::default()
             },
@@ -710,5 +1134,177 @@ mod tests {
         assert_eq!(outcome.operations[3]["changed"], true);
         assert!(outcome.doc.actions.is_empty());
         assert_eq!(outcome.doc.nodes[&node_id].action, None);
+    }
+
+    #[test]
+    fn fcurve_modifier_operation_rejects_out_of_range_rna_values() {
+        let mut doc =
+            crate::model::SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let node_id = Id::new("animated").unwrap();
+        let action_id = Id::new("generated").unwrap();
+        doc.nodes.insert(
+            node_id,
+            crate::model::Node {
+                name: "Animated".to_owned(),
+                kind: "empty".to_owned(),
+                action: Some(action_id.clone()),
+                ..crate::model::Node::default()
+            },
+        );
+        doc.actions.insert(
+            action_id.clone(),
+            Action {
+                name: "Generated".to_owned(),
+                fcurves: vec![FCurve {
+                    path: "transform.translation".to_owned(),
+                    index: 0,
+                    keyframes: Vec::new(),
+                    extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
+                }],
+                ..Action::default()
+            },
+        );
+        let invalid_modifiers = [
+            (
+                json!({"type":"NOISE","properties":{"influence":-0.01}}),
+                "influence",
+            ),
+            (
+                json!({"type":"NOISE","properties":{"influence":1.01}}),
+                "influence",
+            ),
+            (
+                json!({"type":"NOISE","properties":{"frame_start":11.0,"frame_end":10.0}}),
+                "frame_start",
+            ),
+            (
+                json!({"type":"NOISE","properties":{
+                    "frame_start":0.0,"frame_end":10.0,"blend_in":-1.0
+                }}),
+                "blend_in",
+            ),
+            (
+                json!({"type":"NOISE","properties":{
+                    "frame_start":0.0,"frame_end":10.0,"blend_in":11.0
+                }}),
+                "blend_in",
+            ),
+            (
+                json!({"type":"NOISE","properties":{
+                    "frame_start":0.0,"frame_end":10.0,"blend_out":-1.0
+                }}),
+                "blend_out",
+            ),
+            (
+                json!({"type":"NOISE","properties":{
+                    "frame_start":0.0,"frame_end":10.0,"blend_out":11.0
+                }}),
+                "blend_out",
+            ),
+            (json!({"type":"NOISE","properties":{"depth":-1}}), "depth"),
+            (
+                json!({"type":"NOISE","properties":{"depth":32768}}),
+                "depth",
+            ),
+            (
+                json!({"type":"CYCLES","properties":{"cycles_before":-32769}}),
+                "cycles_before",
+            ),
+            (
+                json!({"type":"CYCLES","properties":{"cycles_after":32768}}),
+                "cycles_after",
+            ),
+        ];
+        for (modifier, property) in invalid_modifiers {
+            let error = apply_batch(
+                &doc,
+                &json!({"schema_version":1,"base_revision":0,"operations":[
+                    {"op":"fcurve.update","target":{"id":"animated"},
+                     "path":"transform.translation","index":0,
+                     "set":{"modifiers":[modifier]}}
+                ]}),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidOperation);
+            assert_eq!(
+                error.details["pointer"],
+                format!("/operations/0/set/modifiers/0/properties/{property}")
+            );
+        }
+        let outcome = apply_batch(
+            &doc,
+            &json!({"schema_version":1,"base_revision":0,"operations":[
+                {"op":"fcurve.update","target":{"id":"animated"},
+                 "path":"transform.translation","index":0,
+                 "set":{"modifiers":[
+                     {"type":"NOISE","properties":{"influence":0.0,"frame_start":1.0,
+                      "frame_end":11.0,"blend_in":10.0,"blend_out":10.0,"depth":0}},
+                     {"type":"NOISE","properties":{"influence":1.0,"frame_start":2.0,
+                      "frame_end":2.0,"blend_in":0.0,"blend_out":0.0,"depth":32767}},
+                     {"type":"CYCLES","properties":{"cycles_before":-32768,"cycles_after":32767}}
+                 ]}}
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.doc.actions[&action_id].fcurves[0].modifiers.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn fcurve_modifier_operation_evaluates_generator_through_transform_consumer() {
+        let mut doc =
+            crate::model::SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let node_id = Id::new("animated").unwrap();
+        let action_id = Id::new("generated").unwrap();
+        doc.nodes.insert(
+            node_id.clone(),
+            crate::model::Node {
+                name: "Animated".to_owned(),
+                kind: "empty".to_owned(),
+                action: Some(action_id.clone()),
+                ..crate::model::Node::default()
+            },
+        );
+        doc.actions.insert(
+            action_id,
+            Action {
+                name: "Generated".to_owned(),
+                fcurves: vec![FCurve {
+                    path: "transform.translation".to_owned(),
+                    index: 0,
+                    keyframes: Vec::new(),
+                    extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
+                }],
+                ..Action::default()
+            },
+        );
+        let outcome = apply_batch(
+            &doc,
+            &json!({"schema_version":1,"base_revision":0,"operations":[
+                {"op":"fcurve.update","target":{"id":"animated"},
+                 "path":"transform.translation","index":0,
+                 "set":{"modifiers":[{"type":"GENERATOR","properties":{
+                     "mode":"POLYNOMIAL","poly_order":1,"coefficients":[0.5,2.0]
+                 }}]}}
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.doc.actions[&Id::new("generated").unwrap()].fcurves[0].modifiers[0]
+                .modifier_type,
+            "GENERATOR"
+        );
+        let value = crate::eval::animation::animated_transform(
+            &outcome.doc.nodes[&node_id],
+            &outcome.doc,
+            2.0,
+        )
+        .unwrap()
+        .translation[0];
+        assert_eq!(value, 4.5);
     }
 }

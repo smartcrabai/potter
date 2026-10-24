@@ -695,8 +695,56 @@ pub(crate) fn export_losses(
     if matches!(format, "fbx" | "fbx-binary") {
         losses.extend(exchange::fbx::material_graph_losses(doc));
     }
-    if let Some(loss) = avatar_settings_loss(doc, format) {
-        losses.push(loss);
+    losses.extend(fcurve_modifier_losses(doc, format));
+    losses
+}
+
+/// F-Curve modifiers are not written or evaluated by these exporters. Report them on Actions
+/// assigned directly to nodes or through active NLA strips.
+fn fcurve_modifier_losses(doc: &SceneDoc, format: &str) -> Vec<Loss> {
+    if !matches!(
+        format,
+        "fbx" | "fbx-binary" | "glb" | "gltf" | "vrm" | "vrm0" | "usda" | "usdc" | "usd" | "usdz"
+    ) {
+        return Vec::new();
+    }
+
+    let mut action_ids = BTreeSet::new();
+    for node in doc.nodes.values() {
+        if let Some(action_id) = node.action.as_ref() {
+            action_ids.insert(action_id);
+        }
+        let has_solo = node
+            .nla_tracks
+            .iter()
+            .any(|track| track.solo && !track.mute);
+        action_ids.extend(
+            node.nla_tracks
+                .iter()
+                .filter(|track| !track.mute && (!has_solo || track.solo))
+                .flat_map(|track| track.strips.iter().map(|strip| &strip.action)),
+        );
+    }
+    let mut losses = Vec::new();
+    for action_id in action_ids {
+        let Some(action) = doc.actions.get(action_id) else {
+            continue;
+        };
+        for (curve_index, curve) in action.fcurves.iter().enumerate() {
+            for (modifier_index, modifier) in curve.modifiers.iter().enumerate() {
+                losses.push(Loss {
+                    feature_id: "animation.fcurve_modifier".to_owned(),
+                    data_id: Some(action_id.to_string()),
+                    reason: format!(
+                        "{format} export does not evaluate or preserve F-Curve modifier {modifier_index} (`{}`) on Action `{}` ({action_id}) curve {curve_index} (`{}`[{}])",
+                        modifier.modifier_type, action.name, curve.path, curve.index
+                    ),
+                    suggestion: Some(
+                        "export as blend to preserve F-Curve modifiers".to_owned(),
+                    ),
+                });
+            }
+        }
     }
     losses
 }

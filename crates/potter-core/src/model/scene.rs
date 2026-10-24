@@ -2102,6 +2102,32 @@ pub struct FCurve {
     pub keyframes: Vec<Keyframe>,
     #[serde(default)]
     pub extrapolation: Extrapolation,
+    #[serde(default)]
+    pub modifiers: Vec<FCurveModifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FCurveModifier {
+    #[serde(rename = "type")]
+    pub modifier_type: String,
+    #[serde(default)]
+    pub properties: Map<String, Value>,
+}
+
+impl FCurveModifier {
+    #[must_use]
+    pub(crate) fn is_supported(&self) -> bool {
+        Self::is_supported_type(&self.modifier_type)
+    }
+
+    #[must_use]
+    pub(crate) fn is_supported_type(modifier_type: &str) -> bool {
+        matches!(
+            modifier_type,
+            "GENERATOR" | "FNGENERATOR" | "ENVELOPE" | "CYCLES" | "NOISE" | "LIMITS" | "STEPPED"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

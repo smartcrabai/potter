@@ -487,7 +487,7 @@ fn sample_action_transform(
                 if let Some(component_count) = non_transform_component_count(path) {
                     component_index(curve, component_count)?;
                 } else if pose_curve_path(path).is_none() {
-                    let feature_id = format!("animation.fcurve.{path}");
+                    let feature_id = format!("animation.fcurve_non_transform_channels.{path}");
                     return Err(PotError::with_details(
                         ErrorCode::UnsupportedFeature,
                         format!("animation curve path `{path}` is not supported"),
@@ -943,8 +943,34 @@ fn component_index(curve: &FCurve, count: usize) -> Result<usize> {
     Ok(index)
 }
 
-/// Sample one scalar curve. Empty curves have no animated value.
+/// Sample one scalar curve, applying its Blender F-Curve modifier stack.
 pub(crate) fn sample_curve(curve: &FCurve, frame: f64) -> Result<Option<f64>> {
+    if curve.keyframes.is_empty()
+        && !curve.modifiers.iter().any(|modifier| {
+            matches!(
+                modifier.modifier_type.as_str(),
+                "GENERATOR" | "FNGENERATOR" | "LIMITS" | "STEPPED"
+            )
+        })
+    {
+        return Ok(None);
+    }
+    if curve.modifiers.is_empty() {
+        return sample_curve_base(curve, frame);
+    }
+    let (evaltime, cycle_offsets) =
+        crate::eval::fcurve_modifiers::evaluate_time(curve, frame as f32)?;
+    let value = sample_curve_base(curve, f64::from(evaltime))?.unwrap_or(0.0);
+    let value = crate::eval::fcurve_modifiers::evaluate_value(
+        curve,
+        evaltime,
+        value as f32,
+        &cycle_offsets,
+    )?;
+    finite_sample(curve, f64::from(value))
+}
+
+fn sample_curve_base(curve: &FCurve, frame: f64) -> Result<Option<f64>> {
     if curve.keyframes.is_empty() {
         return Ok(None);
     }
@@ -1192,6 +1218,7 @@ mod tests {
             index: 0,
             keyframes: keys,
             extrapolation,
+            modifiers: Vec::new(),
         }
     }
 
@@ -1224,6 +1251,7 @@ mod tests {
                 },
             ],
             extrapolation: Extrapolation::Constant,
+            modifiers: Vec::new(),
         }
     }
 
@@ -1306,6 +1334,7 @@ mod tests {
                         },
                     ],
                     extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
                 }],
                 ..Action::default()
             },
