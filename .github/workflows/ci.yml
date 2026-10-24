@@ -15,8 +15,9 @@ jobs:
     env:
       # Test artifacts stay optimized; DWARF is unnecessary for ~200 test executables.
       CARGO_PROFILE_TEST_DEBUG: "0"
-    # About 40 minutes (tests, then clippy) with warm caches; a hung Blender test should not hold the runner for 6 hours.
-    timeout-minutes: 75
+    # About 50-75 minutes (build, clippy, then tests); tests/blend_realistic_scene.rs alone takes ~26-32 minutes.
+    # A hung Blender test should still not hold the runner for 6 hours.
+    timeout-minutes: 100
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
