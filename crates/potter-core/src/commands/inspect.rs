@@ -113,6 +113,7 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
             "items": items,
             "libraries": doc.libraries,
             "references": {},
+            "masks": doc.masks,
             "resources": [],
             "features": features,
             "evaluation": {
@@ -690,6 +691,7 @@ fn summary(doc: &SceneDoc) -> Value {
             "node_groups": doc.node_groups.len(),
             "worlds": doc.worlds.len(),
             "actions": doc.actions.len(),
+            "masks": doc.masks.len(),
             "resources": doc.resources.len(),
             "libraries": doc.libraries.len(),
         },

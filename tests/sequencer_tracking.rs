@@ -182,8 +182,15 @@ fn mask_operation_stores_a_rasterizable_spline() {
         .unwrap()
         .clone();
     let image = mask.rasterize(10, 10, 1.0).unwrap();
-    let area: f32 = image.pixels.iter().sum();
-    assert!((area - 36.0).abs() <= 2.0);
+    assert!(image.get(5, 5).unwrap() > 0.99);
+    assert!(image.get(0, 0).unwrap() < 0.01);
+    for edge_x in [1, 8] {
+        let coverage = image.get(edge_x, 5).unwrap();
+        assert!(
+            coverage > 0.0 && coverage < 1.0,
+            "AA edge coverage at x={edge_x}: {coverage}"
+        );
+    }
 }
 
 #[test]
@@ -270,7 +277,7 @@ fn audio_mix_follows_source_frame_retiming_keys() {
 }
 
 #[test]
-fn polygon_mask_reference_area_is_geometric() {
+fn polygon_mask_has_interior_and_exterior_coverage() {
     let mask = Mask::new(vec![
         MaskSpline::from_control_points(
             vec![
@@ -285,8 +292,15 @@ fn polygon_mask_reference_area_is_geometric() {
     ])
     .unwrap();
     let image = mask.rasterize(10, 10, 1.0).unwrap();
-    let area: f32 = image.pixels.iter().sum();
-    assert!((area - 36.0).abs() <= 2.0);
+    assert!(image.get(5, 5).unwrap() > 0.99);
+    assert!(image.get(0, 0).unwrap() < 0.01);
+    for edge_x in [1, 8] {
+        let coverage = image.get(edge_x, 5).unwrap();
+        assert!(
+            coverage > 0.0 && coverage < 1.0,
+            "AA edge coverage at x={edge_x}: {coverage}"
+        );
+    }
 }
 
 #[test]

@@ -780,8 +780,13 @@ fn mask_input(node: &GraphNode, base: &Image, doc: &SceneDoc, frame: f64) -> Res
                 serde_json::json!({"mask": mask_id}),
             )
         })?;
+        let use_feather = node
+            .inputs
+            .get("Feather")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let mask_image = mask
-            .rasterize(base.width, base.height, frame)
+            .rasterize_with_feather(base.width, base.height, frame, use_feather)
             .map_err(|error| {
                 PotError::invalid_argument(format!("mask rasterization failed: {error}"))
             })?;

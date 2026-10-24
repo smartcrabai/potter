@@ -2040,17 +2040,17 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "mask",
-            "Polygon masks",
+            "Polygon and Bezier masks",
             "Mask",
             &["mask.create", "mask.update", "mask.delete"],
             [true, true, true, false, false, false, false],
         ),
-        unsupported(
+        supported(
             "mask.bezier_spline",
-            "Bezier mask spline handles",
+            "Bezier mask splines with handles and feather weights",
             "MaskSpline",
-            &[],
-            "Mask contours currently use polygonal line segments rather than Bezier handles.",
+            &["mask.create", "mask.update", "mask.delete"],
+            [true, true, true, false, false, false, false],
         ),
         supported(
             "sequencer",

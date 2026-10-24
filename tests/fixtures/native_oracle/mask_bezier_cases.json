@@ -1,0 +1,141 @@
+{
+  "width": 64,
+  "height": 64,
+  "cases": [
+    {
+      "name": "cyclic_hard",
+      "frame": 1,
+      "cyclic": true,
+      "feather": 0.0,
+      "use_feather": true,
+      "points": [
+        {"position": [32.0, 7.0], "handle_left": [18.0, 7.0], "handle_right": [46.0, 7.0]},
+        {"position": [57.0, 32.0], "handle_left": [57.0, 18.0], "handle_right": [57.0, 46.0]},
+        {"position": [32.0, 57.0], "handle_left": [46.0, 57.0], "handle_right": [18.0, 57.0]},
+        {"position": [7.0, 32.0], "handle_left": [7.0, 46.0], "handle_right": [7.0, 18.0]}
+      ]
+    },
+    {
+      "name": "cyclic_weighted_feather",
+      "frame": 1,
+      "cyclic": true,
+      "feather": 0.0,
+      "use_feather": true,
+      "points": [
+        {"position": [32.0, 7.0], "handle_left": [18.0, 7.0], "handle_right": [46.0, 7.0], "weight": 3.0},
+        {"position": [57.0, 32.0], "handle_left": [57.0, 18.0], "handle_right": [57.0, 46.0], "weight": 4.0},
+        {"position": [32.0, 57.0], "handle_left": [46.0, 57.0], "handle_right": [18.0, 57.0], "weight": 2.0},
+        {"position": [7.0, 32.0], "handle_left": [7.0, 46.0], "handle_right": [7.0, 18.0], "weight": 3.5}
+      ]
+    },
+    {
+      "name": "cyclic_ccw_weighted_feather",
+      "frame": 1,
+      "cyclic": true,
+      "feather": 0.0,
+      "use_feather": true,
+      "points": [
+        {"position": [7.0, 32.0], "handle_left": [7.0, 46.0], "handle_right": [7.0, 18.0], "weight": 3.5},
+        {"position": [32.0, 57.0], "handle_left": [18.0, 57.0], "handle_right": [46.0, 57.0], "weight": 2.0},
+        {"position": [57.0, 32.0], "handle_left": [57.0, 46.0], "handle_right": [57.0, 18.0], "weight": 4.0},
+        {"position": [32.0, 7.0], "handle_left": [46.0, 7.0], "handle_right": [18.0, 7.0], "weight": 3.0}
+      ]
+    },
+    {
+      "name": "square_spline_feather",
+      "frame": 1,
+      "cyclic": true,
+      "feather": 3.0,
+      "use_feather": true,
+      "points": [
+        {"position": [16.0, 16.0]},
+        {"position": [48.0, 16.0]},
+        {"position": [48.0, 48.0]},
+        {"position": [16.0, 48.0]}
+      ]
+    },
+    {
+      "name": "feather_input_off",
+      "frame": 1,
+      "cyclic": true,
+      "feather": 0.0,
+      "use_feather": false,
+      "points": [
+        {"position": [32.0, 7.0], "handle_left": [18.0, 7.0], "handle_right": [46.0, 7.0], "weight": 3.0},
+        {"position": [57.0, 32.0], "handle_left": [57.0, 18.0], "handle_right": [57.0, 46.0], "weight": 4.0},
+        {"position": [32.0, 57.0], "handle_left": [46.0, 57.0], "handle_right": [18.0, 57.0], "weight": 2.0},
+        {"position": [7.0, 32.0], "handle_left": [7.0, 46.0], "handle_right": [7.0, 18.0], "weight": 3.5}
+      ]
+    },
+    {
+      "name": "open_filled",
+      "frame": 1,
+      "cyclic": false,
+      "feather": 0.0,
+      "use_feather": true,
+      "points": [
+        {"position": [12.0, 46.0], "handle_left": [8.0, 50.0], "handle_right": [20.0, 34.0]},
+        {"position": [32.0, 12.0], "handle_left": [24.0, 24.0], "handle_right": [40.0, 24.0]},
+        {"position": [52.0, 46.0], "handle_left": [44.0, 34.0], "handle_right": [56.0, 50.0]}
+      ]
+    },
+    {
+      "name": "keyframed_handles",
+      "frame": 2,
+      "cyclic": true,
+      "feather": 0.0,
+      "use_feather": true,
+      "points": [
+        {"position": [32.0, 7.0], "handle_left": [18.0, 7.0], "handle_right": [52.0, 12.0], "keyframes": [{"frame": 1, "position": [32.0, 7.0], "handle_right": [52.0, 12.0]}, {"frame": 3, "position": [32.0, 7.0], "handle_right": [61.0, 22.0]}]},
+        {"position": [57.0, 32.0], "handle_left": [57.0, 18.0], "handle_right": [57.0, 46.0]},
+        {"position": [32.0, 57.0], "handle_left": [46.0, 57.0], "handle_right": [18.0, 57.0]},
+        {"position": [7.0, 32.0], "handle_left": [7.0, 46.0], "handle_right": [7.0, 18.0]}
+      ]
+    },
+    {
+      "name": "non_square_wide_feather",
+      "frame": 1,
+      "width": 128,
+      "height": 64,
+      "cyclic": true,
+      "feather": 4.0,
+      "use_feather": true,
+      "points": [
+        {"position": [32.0, 16.0]},
+        {"position": [96.0, 16.0]},
+        {"position": [96.0, 48.0]},
+        {"position": [32.0, 48.0]}
+      ]
+    },
+    {
+      "name": "non_square_tall_feather",
+      "frame": 1,
+      "width": 64,
+      "height": 128,
+      "cyclic": true,
+      "feather": 4.0,
+      "use_feather": true,
+      "points": [
+        {"position": [16.0, 32.0]},
+        {"position": [48.0, 32.0]},
+        {"position": [48.0, 96.0]},
+        {"position": [16.0, 96.0]}
+      ]
+    },
+    {
+      "name": "sixteen_nine_feather",
+      "frame": 1,
+      "width": 128,
+      "height": 72,
+      "cyclic": true,
+      "feather": 4.0,
+      "use_feather": true,
+      "points": [
+        {"position": [32.0, 18.0]},
+        {"position": [96.0, 18.0]},
+        {"position": [96.0, 54.0]},
+        {"position": [32.0, 54.0]}
+      ]
+    }
+  ]
+}

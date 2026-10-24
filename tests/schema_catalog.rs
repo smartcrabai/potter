@@ -337,7 +337,13 @@ fn tracking_masks_and_sequencer_operations_run_through_cli() {
 
     let catalog = potter_core::catalog::feature_catalog();
     let rows = catalog["features"].as_array().unwrap();
-    for supported in ["tracking", "tracking.object_solve", "mask", "sequencer"] {
+    for supported in [
+        "tracking",
+        "tracking.object_solve",
+        "mask",
+        "mask.bezier_spline",
+        "sequencer",
+    ] {
         assert_eq!(
             rows.iter()
                 .find(|row| row["feature_id"] == supported)
@@ -345,11 +351,7 @@ fn tracking_masks_and_sequencer_operations_run_through_cli() {
             "supported"
         );
     }
-    for unsupported in [
-        "mask.bezier_spline",
-        "sequencer.strip.movie",
-        "sequencer.strip.text.unicode",
-    ] {
+    for unsupported in ["sequencer.strip.movie", "sequencer.strip.text.unicode"] {
         assert_eq!(
             rows.iter()
                 .find(|row| row["feature_id"] == unsupported)
