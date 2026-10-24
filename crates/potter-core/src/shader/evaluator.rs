@@ -40,11 +40,9 @@ pub(crate) fn principled_glass_tint(base: [f64; 4]) -> [f64; 3] {
 /// as `(feature_id, Blender input)` pairs in a fixed array, so checking a hit allocates nothing.
 pub(crate) fn unevaluated_principled_inputs(
     params: &BsdfParams,
-) -> [Option<(&'static str, &'static str)>; 3] {
+) -> [Option<(&'static str, &'static str)>; 2] {
     [
         (params.anisotropic_ior > 0.0).then_some(("shader.principled.anisotropic", "Anisotropic")),
-        (params.thin_film_thickness > 0.0)
-            .then_some(("shader.principled.thin_film", "Thin Film Thickness")),
         params
             .thin_wall
             .then_some(("shader.principled.thin_wall", "Thin Wall")),
