@@ -187,20 +187,21 @@ fn native_image_sequence_elements_render_in_order_with_float_rgba_intact() -> Te
     fs::create_dir(&input_dir)?;
     let first_path = input_dir.join("source-red.exr");
     let second_path = input_dir.join("source-green.exr");
-    exr::prelude::write_rgba_file(&first_path, RESOLUTION, RESOLUTION, |x, y| {
+    let image_size = usize::try_from(RESOLUTION)?;
+    exr::prelude::write_rgba_file(&first_path, image_size, image_size, |x, y| {
         if (x, y) == (32, 32) {
-            (0.1265869140625, 0.0, 0.0, 0.0)
+            (0.126_586_914_062_5, 0.0, 0.0, 0.0)
         } else if (x, y) == (52, 51) {
-            (0.125, 0.04998779296875, 0.024993896484375, 0.5)
+            (0.125, 0.049_987_792_968_75, 0.024_993_896_484_375, 0.5)
         } else {
             (0.0, 0.0, 0.0, 0.0)
         }
     })?;
-    exr::prelude::write_rgba_file(&second_path, RESOLUTION, RESOLUTION, |x, y| {
+    exr::prelude::write_rgba_file(&second_path, image_size, image_size, |x, y| {
         if (x, y) == (32, 32) {
-            (0.0, 0.1265869140625, 0.0, 0.0)
+            (0.0, 0.126_586_914_062_5, 0.0, 0.0)
         } else if (x, y) == (52, 51) {
-            (0.125, 0.04998779296875, 0.024993896484375, 0.5)
+            (0.125, 0.049_987_792_968_75, 0.024_993_896_484_375, 0.5)
         } else {
             (0.0, 0.0, 0.0, 0.0)
         }
