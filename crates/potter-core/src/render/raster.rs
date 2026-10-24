@@ -4733,9 +4733,12 @@ mod tests {
     #[test]
     fn film_half_storage_matches_native_truncation_and_single_rounding() {
         let input = store_film_f16_truncated(0.3334);
-        assert_eq!(input, 0.333251953125);
+        assert_eq!(f64::from(input), 0.333_251_953_125_f64);
         assert_eq!(store_film_history_f16(input), input);
-        assert_eq!(store_film_history_f16(0.3334), 0.33349609375);
+        assert_eq!(
+            f64::from(store_film_history_f16(0.3334)),
+            0.333_496_093_75_f64
+        );
     }
 }
 
