@@ -1,34 +1,73 @@
-//! Animated polygon masks and their CPU rasterization.
+//! Animated Bezier masks and their CPU rasterization, following Blender 5.2.2.
 //!
-//! Coordinates are pixel-space `(x, y)` with the origin at the top-left. Control
-//! points are connected by straight segments; multiple splines are combined as a
-//! union. Feathering fades inward from each spline boundary over the configured
-//! pixel width.
+//! Coordinates are pixel-space `(x, y)` with the origin at the top-left. A spline is a cyclic or
+//! open chain of cubic Bezier segments; each point carries optional handles and feather weights.
+//! Splines are combined as Blender's default Merge Add layers. The mask is sampled in Blender's
+//! normalized mask space (`x / width`, `1 - y / height`) through `evaluate` and `raster`.
+
+mod evaluate;
+mod raster;
 
 use std::{error::Error, fmt};
 
 use glam::DVec2;
 use serde::{Deserialize, Serialize};
 
-/// A frame-indexed two-dimensional control-point position.
+use evaluate::Point;
+
+/// A frame-indexed control-point key: a position and optional animated handles.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PositionKeyframe {
-    /// Frame at which `position` is reached; fractional frames are supported.
+    /// Frame at which the key is reached; fractional frames are supported.
     pub frame: f64,
     /// Pixel-space control-point position.
     pub position: DVec2,
+    /// Pixel-space left handle; omitted, the point's stored left handle applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_left: Option<DVec2>,
+    /// Pixel-space right handle; omitted, the point's stored right handle applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_right: Option<DVec2>,
 }
 
 impl PositionKeyframe {
-    /// Creates a position keyframe.
+    /// Creates a position keyframe without handle keys.
     #[must_use]
     pub const fn new(frame: f64, position: DVec2) -> Self {
-        Self { frame, position }
+        Self {
+            frame,
+            position,
+            handle_left: None,
+            handle_right: None,
+        }
     }
 }
 
-/// A polygon control point with an optional linearly interpolated animation.
+/// A Bezier handle type: how a handle is placed relative to its point.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandleType {
+    /// The handle is stored as given.
+    #[default]
+    Free,
+    /// The handle is smoothed from the neighbouring control points.
+    Auto,
+    /// The handle points one third of the way to the neighbouring control point.
+    Vector,
+}
+
+/// A feather-weight multiplier at parameter `u` along a point's outgoing segment.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatherPoint {
+    /// Segment parameter in `[0, 1]`, strictly increasing along the point's list.
+    pub u: f64,
+    /// Multiplier of the interpolated feather weight at `u`.
+    pub w: f64,
+}
+
+/// A Bezier control point with optional linearly interpolated animation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlPoint {
@@ -36,15 +75,39 @@ pub struct ControlPoint {
     pub position: DVec2,
     /// Strictly increasing animation keys; outside their range the nearest key is held.
     pub keyframes: Vec<PositionKeyframe>,
+    /// Stored pixel-space left handle; omitted, it coincides with the position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_left: Option<DVec2>,
+    /// Stored pixel-space right handle; omitted, it coincides with the position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_right: Option<DVec2>,
+    /// Left handle type.
+    #[serde(default)]
+    pub handle_left_type: HandleType,
+    /// Right handle type.
+    #[serde(default)]
+    pub handle_right_type: HandleType,
+    /// Feather width in pixels at this point; omitted, the spline's `feather` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    /// Feather-weight multipliers along the outgoing segment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feather_points: Vec<FeatherPoint>,
 }
 
 impl ControlPoint {
-    /// Creates a static control point.
+    /// Creates a control point with coincident handles and no feather of its own.
     #[must_use]
     pub const fn new(position: DVec2) -> Self {
         Self {
             position,
             keyframes: Vec::new(),
+            handle_left: None,
+            handle_right: None,
+            handle_left_type: HandleType::Free,
+            handle_right_type: HandleType::Free,
+            weight: None,
+            feather_points: Vec::new(),
         }
     }
 
@@ -61,32 +124,71 @@ impl ControlPoint {
     }
 
     fn validate(&self) -> Result<(), MaskError> {
-        if !self.position.is_finite() {
+        if !self.position.is_finite()
+            || self.handle_left.is_some_and(|handle| !handle.is_finite())
+            || self.handle_right.is_some_and(|handle| !handle.is_finite())
+            || self.weight.is_some_and(|weight| !weight.is_finite())
+        {
             return Err(MaskError::InvalidParameter(
-                "control-point coordinates must be finite",
+                "control-point coordinates, handles and weights must be finite",
             ));
         }
         if !self.keyframes.is_empty() {
             validate_keyframes(&self.keyframes)?;
         }
+        let mut previous_u = f64::NEG_INFINITY;
+        for feather in &self.feather_points {
+            if !feather.u.is_finite()
+                || !(0.0..=1.0).contains(&feather.u)
+                || feather.u <= previous_u
+                || !feather.w.is_finite()
+            {
+                return Err(MaskError::InvalidParameter(
+                    "feather points need finite, strictly increasing u in [0, 1] and finite w",
+                ));
+            }
+            previous_u = feather.u;
+        }
         Ok(())
     }
 
-    fn evaluate(&self, frame: f64) -> DVec2 {
+    /// The point's pixel-space position and handles at `frame`. Keys interpolate linearly; a key
+    /// without a handle falls back to the stored handle, then to the position.
+    fn evaluate(&self, frame: f64) -> (DVec2, DVec2, DVec2) {
+        let stored_left = self.handle_left.unwrap_or(self.position);
+        let stored_right = self.handle_right.unwrap_or(self.position);
         if self.keyframes.is_empty() {
-            return self.position;
+            return (self.position, stored_left, stored_right);
         }
         let upper = self.keyframes.partition_point(|key| key.frame <= frame);
         if upper == 0 {
-            return self.keyframes[0].position;
+            return self.key_values(&self.keyframes[0]);
         }
         if upper == self.keyframes.len() {
-            return self.keyframes[self.keyframes.len() - 1].position;
+            return self.key_values(&self.keyframes[upper - 1]);
         }
-        let left = self.keyframes[upper - 1];
-        let right = self.keyframes[upper];
-        let amount = interpolation_amount(frame, left.frame, right.frame);
-        interpolate_position(left.position, right.position, amount)
+        let left = self.key_values(&self.keyframes[upper - 1]);
+        let right = self.key_values(&self.keyframes[upper]);
+        let amount = interpolation_amount(
+            frame,
+            self.keyframes[upper - 1].frame,
+            self.keyframes[upper].frame,
+        );
+        (
+            interpolate_position(left.0, right.0, amount),
+            interpolate_position(left.1, right.1, amount),
+            interpolate_position(left.2, right.2, amount),
+        )
+    }
+
+    fn key_values(&self, key: &PositionKeyframe) -> (DVec2, DVec2, DVec2) {
+        (
+            key.position,
+            key.handle_left.or(self.handle_left).unwrap_or(key.position),
+            key.handle_right
+                .or(self.handle_right)
+                .unwrap_or(key.position),
+        )
     }
 }
 
@@ -112,45 +214,65 @@ fn interpolate_position(left: DVec2, right: DVec2, amount: f64) -> DVec2 {
     )
 }
 
-/// A closed polygon contour with a uniform inward feather width.
+const fn default_cyclic() -> bool {
+    true
+}
+
+/// A Bezier contour, filled and feathered as one Blender mask layer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaskSpline {
-    /// Ordered points joined by straight segments and closed back to the first point.
+    /// Ordered control points joined by cubic Bezier segments.
     pub points: Vec<ControlPoint>,
-    /// Inward edge-fade width in pixels; zero gives a hard edge.
+    /// Feather width in pixels for points without their own `weight`.
     pub feather: f64,
+    /// Whether the last point connects back to the first; an open spline fills its closed chord.
+    #[serde(default = "default_cyclic")]
+    pub cyclic: bool,
 }
 
 impl MaskSpline {
-    /// Creates a hard-edged closed polygon from pixel-space vertices.
+    /// Creates a hard-edged cyclic polygon from straight-handle pixel-space vertices.
     ///
     /// # Errors
     ///
-    /// Returns [`MaskError::InvalidParameter`] for fewer than three or non-finite
-    /// vertices.
+    /// Returns [`MaskError::InvalidParameter`] for fewer than three or non-finite vertices.
     pub fn new(points: Vec<DVec2>) -> Result<Self, MaskError> {
         Self::from_control_points(points.into_iter().map(ControlPoint::new).collect(), 0.0)
     }
 
-    /// Creates a polygon from animated control points and a feather width.
+    /// Creates a cyclic spline from control points and a feather width.
     ///
     /// # Errors
     ///
-    /// Returns [`MaskError::InvalidParameter`] for fewer than three points, invalid
-    /// point/keyframe values, or a negative/non-finite feather width.
+    /// Returns [`MaskError::InvalidParameter`] for invalid point or keyframe values, fewer than
+    /// three points, or an invalid feather width.
     pub fn from_control_points(points: Vec<ControlPoint>, feather: f64) -> Result<Self, MaskError> {
-        let spline = Self { points, feather };
+        let spline = Self {
+            points,
+            feather,
+            cyclic: true,
+        };
         spline.validate()?;
         Ok(spline)
     }
 
-    /// Sets the inward feather width in pixels.
+    /// Sets whether the spline is cyclic.
     ///
     /// # Errors
     ///
-    /// Returns [`MaskError::InvalidParameter`] unless the width is finite and
-    /// non-negative.
+    /// Returns [`MaskError::InvalidParameter`] if the point count is invalid for the setting.
+    pub fn with_cyclic(mut self, cyclic: bool) -> Result<Self, MaskError> {
+        self.cyclic = cyclic;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Sets the feather width in pixels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaskError::InvalidParameter`] unless the width is finite and non-negative.
     pub fn with_feather(mut self, feather: f64) -> Result<Self, MaskError> {
         self.feather = feather;
         self.validate()?;
@@ -158,9 +280,9 @@ impl MaskSpline {
     }
 
     fn validate(&self) -> Result<(), MaskError> {
-        if self.points.len() < 3 {
+        if self.points.len() < if self.cyclic { 3 } else { 2 } {
             return Err(MaskError::InvalidParameter(
-                "a mask spline requires at least three control points",
+                "a cyclic mask spline needs three points and an open one needs two",
             ));
         }
         if !self.feather.is_finite() || self.feather < 0.0 {
@@ -175,11 +297,11 @@ impl MaskSpline {
     }
 }
 
-/// A union of animated polygon splines rasterized into coverage values.
+/// A union of Bezier splines rasterized into coverage values.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mask {
-    /// Contours combined by maximum coverage; an empty mask covers no pixels.
+    /// Splines combined by Blender's Merge Add; an empty mask covers no pixels.
     pub splines: Vec<MaskSpline>,
 }
 
@@ -195,17 +317,28 @@ impl Mask {
         Ok(mask)
     }
 
-    /// Rasterizes coverage into floating-point values in `[0, 1]`.
+    /// Rasterizes coverage into floating-point values in `[0, 1]`, with feathering on.
     ///
-    /// Each pixel is sampled at its center. Keyframed points interpolate linearly
-    /// between keys and hold the nearest endpoint outside the keyed frame range.
+    /// Each pixel is sampled at its center, as Blender's mask buffer does. Keyframed points and
+    /// handles interpolate linearly between keys and hold the nearest key outside their range.
     ///
     /// # Errors
     ///
-    /// Returns [`MaskError::InvalidParameter`] for zero dimensions, a non-finite
-    /// frame, or invalid mask data; returns [`MaskError::AllocationFailed`] if
-    /// buffers cannot be allocated.
+    /// Returns [`MaskError::InvalidParameter`] for zero dimensions, a non-finite frame, or invalid
+    /// mask data; returns [`MaskError::AllocationFailed`] if buffers cannot be allocated.
     pub fn rasterize(&self, width: u32, height: u32, frame: f64) -> Result<MaskImage, MaskError> {
+        self.rasterize_with_feather(width, height, frame, true)
+    }
+
+    /// Rasterizes with Blender's `Feather` option: off, the feather is dropped and only the
+    /// one-pixel anti-aliasing ring remains.
+    pub(crate) fn rasterize_with_feather(
+        &self,
+        width: u32,
+        height: u32,
+        frame: f64,
+        use_feather: bool,
+    ) -> Result<MaskImage, MaskError> {
         self.validate()?;
         if width == 0 || height == 0 {
             return Err(MaskError::InvalidParameter(
@@ -217,7 +350,6 @@ impl Mask {
                 "mask evaluation frame must be finite",
             ));
         }
-
         let width_usize = usize::try_from(width)
             .map_err(|_| MaskError::InvalidParameter("mask image width is too large"))?;
         let height_usize = usize::try_from(height)
@@ -229,37 +361,33 @@ impl Mask {
                     "mask image dimensions overflow",
                 ))?;
 
-        let mut evaluated = Vec::new();
-        evaluated
+        let mut layers = Vec::new();
+        layers
             .try_reserve_exact(self.splines.len())
             .map_err(|_| MaskError::AllocationFailed)?;
         for spline in &self.splines {
-            let mut points = Vec::new();
-            points
-                .try_reserve_exact(spline.points.len())
-                .map_err(|_| MaskError::AllocationFailed)?;
-            points.extend(spline.points.iter().map(|point| point.evaluate(frame)));
-            evaluated.push(points);
+            let mut points = spline_points(spline, frame, width, height)?;
+            evaluate::calculate_handles(&mut points, spline.cyclic);
+            let contour =
+                evaluate::build_contour(&points, spline.cyclic, width, height, use_feather, true)?;
+            layers.push(raster::Layer::new(contour));
         }
 
         let mut pixels = Vec::new();
         pixels
             .try_reserve_exact(pixel_count)
             .map_err(|_| MaskError::AllocationFailed)?;
-        pixels.resize(pixel_count, 0.0);
-
-        for (y_index, y) in (0..height).enumerate() {
-            for (x_index, x) in (0..width).enumerate() {
-                let sample = DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
-                let mut coverage = 0.0_f64;
-                for (spline, points) in self.splines.iter().zip(&evaluated) {
-                    let spline_coverage = polygon_coverage(sample, points, spline.feather);
-                    coverage = coverage.max(spline_coverage);
-                    if coverage >= 1.0 {
-                        break;
-                    }
-                }
-                pixels[y_index * width_usize + x_index] = coverage_to_f32(coverage);
+        for row in 0..height {
+            for column in 0..width {
+                let sample = DVec2::new(
+                    (f64::from(column) + 0.5) / f64::from(width),
+                    1.0 - (f64::from(row) + 0.5) / f64::from(height),
+                );
+                let coverage = layers.iter().fold(0.0_f64, |value, layer| {
+                    let layer_value = layer.value(sample);
+                    (value + layer_value * (1.0 - value)).clamp(0.0, 1.0)
+                });
+                pixels.push(coverage_to_f32(coverage));
             }
         }
 
@@ -290,6 +418,47 @@ impl Mask {
         }
         Ok(())
     }
+}
+
+/// The spline's points at `frame`, in Blender's normalized mask space, with feather weights in
+/// normalized units (`pixels / max(width, height)`).
+fn spline_points(
+    spline: &MaskSpline,
+    frame: f64,
+    width: u32,
+    height: u32,
+) -> Result<Vec<Point>, MaskError> {
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(spline.points.len())
+        .map_err(|_| MaskError::AllocationFailed)?;
+    let pixel_size = 1.0 / f64::from(width.max(height));
+    let squeeze = f64::from(width.min(height)) / f64::from(width.max(height));
+    let to_mask_space = |position: DVec2| {
+        let mut position = DVec2::new(
+            position.x / f64::from(width),
+            1.0 - position.y / f64::from(height),
+        );
+        if width > height {
+            position.y = (position.y - 0.5) * squeeze + 0.5;
+        } else if height > width {
+            position.x = (position.x - 0.5) * squeeze + 0.5;
+        }
+        position
+    };
+    for point in &spline.points {
+        let (position, handle_left, handle_right) = point.evaluate(frame);
+        points.push(Point {
+            position: to_mask_space(position),
+            handle_left: to_mask_space(handle_left),
+            handle_right: to_mask_space(handle_right),
+            left_type: point.handle_left_type,
+            right_type: point.handle_right_type,
+            weight: point.weight.unwrap_or(spline.feather) * pixel_size,
+            feather_points: point.feather_points.clone(),
+        });
+    }
+    Ok(points)
 }
 
 /// Floating-point coverage image in row-major order.
@@ -390,6 +559,12 @@ fn validate_keyframes(keyframes: &[PositionKeyframe]) -> Result<(), MaskError> {
     for keyframe in keyframes {
         if !keyframe.frame.is_finite()
             || !keyframe.position.is_finite()
+            || keyframe
+                .handle_left
+                .is_some_and(|handle| !handle.is_finite())
+            || keyframe
+                .handle_right
+                .is_some_and(|handle| !handle.is_finite())
             || keyframe.frame <= previous_frame
         {
             return Err(MaskError::InvalidParameter(
@@ -399,72 +574,6 @@ fn validate_keyframes(keyframes: &[PositionKeyframe]) -> Result<(), MaskError> {
         previous_frame = keyframe.frame;
     }
     Ok(())
-}
-
-fn polygon_coverage(sample: DVec2, points: &[DVec2], feather: f64) -> f64 {
-    let inside = point_inside_polygon(sample, points);
-    if !inside {
-        return 0.0;
-    }
-    if feather <= 0.0 {
-        return 1.0;
-    }
-    let distance = distance_to_polygon(sample, points);
-    let amount = (distance / feather).clamp(0.0, 1.0);
-    amount * amount * (3.0 - 2.0 * amount)
-}
-
-fn point_inside_polygon(point: DVec2, vertices: &[DVec2]) -> bool {
-    let mut inside = false;
-    let mut previous = vertices[vertices.len() - 1];
-    for &current in vertices {
-        if (current.y > point.y) != (previous.y > point.y) {
-            let amount = interpolation_amount(point.y, current.y, previous.y);
-            let intersection_x = interpolate_scalar(current.x, previous.x, amount);
-            if point.x < intersection_x {
-                inside = !inside;
-            }
-        }
-        previous = current;
-    }
-    inside
-}
-
-fn distance_to_polygon(point: DVec2, vertices: &[DVec2]) -> f64 {
-    let mut distance = f64::INFINITY;
-    let mut previous = vertices[vertices.len() - 1];
-    for &current in vertices {
-        distance = distance.min(distance_to_segment(point, previous, current));
-        previous = current;
-    }
-    distance
-}
-
-fn distance_to_segment(point: DVec2, start: DVec2, end: DVec2) -> f64 {
-    let scale = point
-        .x
-        .abs()
-        .max(point.y.abs())
-        .max(start.x.abs())
-        .max(start.y.abs())
-        .max(end.x.abs())
-        .max(end.y.abs());
-    if scale == 0.0 {
-        return 0.0;
-    }
-
-    let scaled_point = point / scale;
-    let scaled_start = start / scale;
-    let scaled_end = end / scale;
-    let segment = scaled_end - scaled_start;
-    let length_squared = segment.length_squared();
-    let scaled_distance = if length_squared <= f64::MIN_POSITIVE {
-        scaled_point.distance(scaled_start)
-    } else {
-        let amount = ((scaled_point - scaled_start).dot(segment) / length_squared).clamp(0.0, 1.0);
-        scaled_point.distance(scaled_start + amount * segment)
-    };
-    scaled_distance * scale
 }
 
 #[expect(
@@ -489,7 +598,9 @@ mod tests {
 
     use glam::DVec2;
 
-    use super::{ControlPoint, Mask, MaskSpline, PositionKeyframe};
+    use super::{
+        ControlPoint, FeatherPoint, HandleType, Mask, MaskImage, MaskSpline, PositionKeyframe,
+    };
 
     fn square(min: f64, max: f64) -> MaskSpline {
         MaskSpline::new(vec![
@@ -502,13 +613,14 @@ mod tests {
     }
 
     #[test]
-    fn rasterized_square_area_matches_polygon_area() {
-        let mask = Mask::new(vec![square(1.0, 11.0)]).unwrap();
-        let raster = mask.rasterize(16, 16, 1.0).unwrap();
+    fn square_interior_is_fully_covered_and_exterior_is_empty() {
+        let raster = Mask::new(vec![square(1.0, 11.0)])
+            .unwrap()
+            .rasterize(16, 16, 1.0)
+            .unwrap();
 
-        let covered_area: f64 = raster.pixels.iter().map(|value| f64::from(*value)).sum();
-        assert!((covered_area - 100.0).abs() < 1.0);
-        assert_eq!(raster.pixels.len(), 256);
+        assert_eq!(raster.get(5, 5), Some(1.0));
+        assert_eq!(raster.get(15, 15), Some(0.0));
     }
 
     #[test]
@@ -540,93 +652,160 @@ mod tests {
         assert_eq!(last.get(6, 2), Some(1.0));
         assert_eq!(last.get(2, 2), Some(0.0));
     }
-    #[test]
-    fn animated_feathered_spline_interpolates_and_holds_boundary_coverage() {
-        let base = [
-            DVec2::new(2.0, 2.0),
-            DVec2::new(12.0, 2.0),
-            DVec2::new(12.0, 12.0),
-            DVec2::new(2.0, 12.0),
-        ];
-        let points = base
-            .into_iter()
-            .map(|position| {
-                ControlPoint::new(position)
-                    .with_keyframes(vec![
-                        PositionKeyframe::new(2.0, position),
-                        PositionKeyframe::new(6.0, position + DVec2::new(8.0, 0.0)),
-                    ])
-                    .unwrap()
-            })
-            .collect();
-        let mask = Mask::new(vec![MaskSpline::from_control_points(points, 2.0).unwrap()]).unwrap();
 
-        let before = mask.rasterize(20, 16, 1.0).unwrap();
-        let between = mask.rasterize(20, 16, 4.0).unwrap();
-        let after = mask.rasterize(20, 16, 7.0).unwrap();
-        assert_eq!(before.get(2, 7), Some(0.15625));
-        assert_eq!(between.get(6, 7), Some(0.15625));
-        assert_eq!(after.get(10, 7), Some(0.15625));
-        assert_eq!(between.get(16, 7), Some(0.0));
-        assert_eq!(between.get(9, 7), Some(1.0));
-    }
     #[test]
-    fn animation_interpolation_avoids_overflow_between_finite_extreme_frames() {
-        let base = [
-            DVec2::new(2.0, 2.0),
-            DVec2::new(6.0, 2.0),
-            DVec2::new(6.0, 6.0),
-            DVec2::new(2.0, 6.0),
-        ];
-        let points = base
-            .into_iter()
-            .map(|position| {
-                ControlPoint::new(position)
-                    .with_keyframes(vec![
-                        PositionKeyframe::new(-f64::MAX, position),
-                        PositionKeyframe::new(f64::MAX, position + DVec2::new(4.0, 0.0)),
-                    ])
-                    .unwrap()
-            })
-            .collect();
-        let mask = Mask::new(vec![MaskSpline::from_control_points(points, 0.0).unwrap()]).unwrap();
-        let midpoint = mask.rasterize(12, 8, 0.0).unwrap();
-
-        assert_eq!(midpoint.get(2, 3), Some(0.0));
-        assert_eq!(midpoint.get(5, 3), Some(1.0));
-    }
-    #[test]
-    fn feathered_rasterization_handles_large_finite_polygon_coordinates() {
-        let extent = 1.0e308;
-        let spline = MaskSpline::new(vec![
-            DVec2::new(-extent, -extent),
-            DVec2::new(extent, -extent),
-            DVec2::new(0.0, extent),
-        ])
-        .unwrap()
-        .with_feather(2.0)
-        .unwrap();
+    fn clockwise_feather_extends_outside_the_contour() {
+        // Pixel y grows downward, so these vertices run clockwise on screen.
+        let spline = square(4.0, 12.0).with_feather(2.0).unwrap();
         let raster = Mask::new(vec![spline])
-            .unwrap()
-            .rasterize(1, 1, 1.0)
-            .unwrap();
-
-        assert_eq!(raster.get(0, 0), Some(1.0));
-    }
-
-    #[test]
-    fn feather_softens_the_inside_edge_without_changing_the_interior() {
-        let soft_spline = square(2.0, 12.0).with_feather(2.0).unwrap();
-        let raster = Mask::new(vec![soft_spline])
             .unwrap()
             .rasterize(16, 16, 1.0)
             .unwrap();
 
-        assert_eq!(raster.get(7, 7), Some(1.0));
-        let edge = raster.get(2, 7).unwrap();
-        assert!(edge > 0.0 && edge < 1.0);
-        assert_eq!(raster.get(1, 7), Some(0.0));
-        assert!(raster.to_u8().get(2, 7).is_some_and(|value| value > 0));
+        assert_eq!(raster.get(8, 8), Some(1.0));
+        let outer = raster.get(3, 8).unwrap();
+        assert!(outer > 0.0 && outer < 1.0, "feather value {outer}");
+        assert_eq!(raster.get(0, 8), Some(0.0));
+    }
+
+    #[test]
+    fn counter_clockwise_feather_lies_inside_and_is_hidden_by_the_fill() {
+        // The same square in the opposite order: its ring points inward, under the filled body.
+        let points = [
+            DVec2::new(4.0, 4.0),
+            DVec2::new(4.0, 12.0),
+            DVec2::new(12.0, 12.0),
+            DVec2::new(12.0, 4.0),
+        ];
+        let spline = MaskSpline::new(points.to_vec())
+            .unwrap()
+            .with_feather(2.0)
+            .unwrap();
+        let raster = Mask::new(vec![spline])
+            .unwrap()
+            .rasterize(16, 16, 1.0)
+            .unwrap();
+
+        assert_eq!(raster.get(4, 8), Some(1.0));
+        assert_eq!(raster.get(3, 8), Some(0.0));
+    }
+
+    #[test]
+    fn point_weights_and_handles_bend_the_contour() {
+        let points = vec![
+            ControlPoint {
+                handle_left: Some(DVec2::new(2.0, 14.0)),
+                handle_right: Some(DVec2::new(14.0, 14.0)),
+                ..ControlPoint::new(DVec2::new(8.0, 2.0))
+            },
+            ControlPoint::new(DVec2::new(14.0, 8.0)),
+            ControlPoint::new(DVec2::new(8.0, 14.0)),
+            ControlPoint::new(DVec2::new(2.0, 8.0)),
+        ];
+        let curved = Mask::new(vec![MaskSpline::from_control_points(points, 0.0).unwrap()])
+            .unwrap()
+            .rasterize(16, 16, 1.0)
+            .unwrap();
+        let straight = Mask::new(vec![square(2.0, 14.0)])
+            .unwrap()
+            .rasterize(16, 16, 1.0)
+            .unwrap();
+
+        assert_eq!(curved.get(8, 8), Some(1.0));
+        assert_ne!(curved.get(13, 3), straight.get(13, 3));
+    }
+
+    #[test]
+    fn auto_handles_bulge_the_contour_past_the_straight_edges() {
+        let corners = [
+            DVec2::new(8.0, 2.0),
+            DVec2::new(14.0, 8.0),
+            DVec2::new(8.0, 14.0),
+            DVec2::new(2.0, 8.0),
+        ];
+        let auto = corners.map(|position| ControlPoint {
+            handle_left_type: HandleType::Auto,
+            handle_right_type: HandleType::Auto,
+            ..ControlPoint::new(position)
+        });
+        let smoothed = Mask::new(vec![
+            MaskSpline::from_control_points(auto.to_vec(), 0.0).unwrap(),
+        ])
+        .unwrap()
+        .rasterize(16, 16, 1.0)
+        .unwrap();
+        let straight = Mask::new(vec![MaskSpline::new(corners.to_vec()).unwrap()])
+            .unwrap()
+            .rasterize(16, 16, 1.0)
+            .unwrap();
+
+        // Auto handles bulge the curve past the diamond's straight edges, so it covers more area.
+        let covered = |raster: &MaskImage| {
+            raster
+                .pixels
+                .iter()
+                .map(|value| f64::from(*value))
+                .sum::<f64>()
+        };
+        assert!(covered(&smoothed) > covered(&straight) + 1.0);
+    }
+
+    #[test]
+    fn feather_point_multiplier_narrows_the_ring_along_its_segment() {
+        let corners = [
+            DVec2::new(4.0, 4.0),
+            DVec2::new(12.0, 4.0),
+            DVec2::new(12.0, 12.0),
+            DVec2::new(4.0, 12.0),
+        ];
+        let weighted = |feather_points: Vec<FeatherPoint>| {
+            let mut points: Vec<ControlPoint> = corners.map(ControlPoint::new).to_vec();
+            points[0].weight = Some(4.0);
+            points[0].feather_points = feather_points;
+            Mask::new(vec![MaskSpline::from_control_points(points, 0.0).unwrap()])
+                .unwrap()
+                .rasterize(16, 16, 1.0)
+                .unwrap()
+        };
+        let plain = weighted(Vec::new());
+        // A multiplier of zero at the segment's midpoint pinches the 4-pixel ring to nothing there.
+        let pinched = weighted(vec![FeatherPoint { u: 0.5, w: 0.0 }]);
+
+        assert!(plain.get(8, 2).unwrap() > 0.0);
+        assert_eq!(pinched.get(8, 2), Some(0.0));
+    }
+
+    #[test]
+    fn open_spline_fills_its_closed_chord() {
+        let points = [
+            DVec2::new(2.0, 13.0),
+            DVec2::new(8.0, 2.0),
+            DVec2::new(14.0, 13.0),
+        ]
+        .map(ControlPoint::new)
+        .to_vec();
+        let spline = MaskSpline::from_control_points(points, 0.0)
+            .unwrap()
+            .with_cyclic(false)
+            .unwrap();
+        let raster = Mask::new(vec![spline])
+            .unwrap()
+            .rasterize(16, 16, 1.0)
+            .unwrap();
+
+        assert_eq!(raster.get(8, 10), Some(1.0));
+        assert_eq!(raster.get(8, 15), Some(0.0));
+    }
+
+    #[test]
+    fn feather_option_off_keeps_only_the_anti_aliased_edge() {
+        let spline = square(4.0, 12.0).with_feather(4.0).unwrap();
+        let mask = Mask::new(vec![spline]).unwrap();
+        let feathered = mask.rasterize(16, 16, 1.0).unwrap();
+        let unfeathered = mask.rasterize_with_feather(16, 16, 1.0, false).unwrap();
+
+        assert!(feathered.get(3, 8).unwrap() > unfeathered.get(3, 8).unwrap());
+        assert_eq!(unfeathered.get(0, 8), Some(0.0));
     }
 
     #[test]
@@ -644,6 +823,9 @@ mod tests {
                 .is_err()
         );
         assert!(square(1.0, 4.0).with_feather(f64::INFINITY).is_err());
+        assert!(
+            MaskSpline::from_control_points(vec![ControlPoint::new(DVec2::ZERO); 2], 0.0).is_err()
+        );
     }
 
     #[test]

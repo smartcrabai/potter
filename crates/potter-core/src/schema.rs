@@ -312,9 +312,53 @@ fn complete_scene_schema(root: &mut Value) {
 
     defs["image_tile"] = json!({"type":"object","required":["number","width","height","blob"],"properties":{"number":{"type":"integer","minimum":1,"maximum":u32::MAX},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"blob":{"type":["string","null"]},"label":{"type":"string"}},"additionalProperties":false});
     defs["image"] = json!({"type":"object","required":["name","source","colorspace","width","height","tiles","blob","source_path","source_hash","alpha_mode"],"properties":{"name":{"type":"string"},"source":{"enum":["generated","file","packed"]},"colorspace":{"enum":["srgb","linear","non_color"]},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"tiles":{"type":"array","items":{"$ref":"#/$defs/image_tile"}},"blob":{"type":["string","null"]},"source_path":{"type":["string","null"]},"source_hash":{"type":["string","null"]},"alpha_mode":{"enum":["straight","premultiplied","none"]},"tiled":{"type":"boolean"}},"additionalProperties":false});
-    defs["mask"] = json!({"type":"object","required":["splines"],"properties":{"splines":{"type":"array","items":{"$ref":"#/$defs/mask_spline"}}},"additionalProperties":false});
-    defs["mask_spline"] = json!({"type":"object","required":["points","feather"],"properties":{"points":{"type":"array","minItems":3,"items":{"$ref":"#/$defs/mask_control_point"}},"feather":{"type":"number","minimum":0}},"additionalProperties":false});
-    defs["mask_control_point"] = json!({"type":"object","required":["position","keyframes"],"properties":{"position":{"$ref":"#/$defs/vec2"},"keyframes":{"type":"array","items":{"type":"object","required":["frame","position"],"properties":{"frame":{"type":"number"},"position":{"$ref":"#/$defs/vec2"}},"additionalProperties":false}}},"additionalProperties":false});
+    defs["mask"] = json!({
+        "type":"object",
+        "required":["splines"],
+        "properties":{"splines":{"type":"array","items":{"$ref":"#/$defs/mask_spline"}}},
+        "additionalProperties":false
+    });
+    defs["mask_spline"] = json!({
+        "type":"object",
+        "required":["points","feather"],
+        "properties":{
+            "points":{"type":"array","minItems":2,"items":{"$ref":"#/$defs/mask_control_point"}},
+            "feather":{"type":"number","minimum":0},
+            "cyclic":{"type":"boolean","default":true}
+        },
+        "allOf":[{"if":{"properties":{"cyclic":{"const":true}}},"then":{"properties":{"points":{"minItems":3}}}}],
+        "additionalProperties":false
+    });
+    defs["mask_control_point"] = json!({
+        "type":"object",
+        "required":["position","keyframes"],
+        "properties":{
+            "position":{"$ref":"#/$defs/vec2"},
+            "keyframes":{"type":"array","items":{
+                "type":"object",
+                "required":["frame","position"],
+                "properties":{
+                    "frame":{"type":"number"},
+                    "position":{"$ref":"#/$defs/vec2"},
+                    "handle_left":{"$ref":"#/$defs/vec2"},
+                    "handle_right":{"$ref":"#/$defs/vec2"}
+                },
+                "additionalProperties":false
+            }},
+            "handle_left":{"$ref":"#/$defs/vec2"},
+            "handle_right":{"$ref":"#/$defs/vec2"},
+            "handle_left_type":{"enum":["free","auto","vector"]},
+            "handle_right_type":{"enum":["free","auto","vector"]},
+            "weight":{"type":"number"},
+            "feather_points":{"type":"array","items":{
+                "type":"object",
+                "required":["u","w"],
+                "properties":{"u":{"type":"number","minimum":0,"maximum":1},"w":{"type":"number"}},
+                "additionalProperties":false
+            }}
+        },
+        "additionalProperties":false
+    });
     defs["movie_clip"] = json!({"type":"object","required":["name","source","source_hash","frame_start","width","height","fps","tracking"],"properties":{"name":{"type":"string"},"source":{"type":["string","null"]},"source_hash":{"type":["string","null"]},"frame_start":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"width":{"type":"integer","minimum":0,"maximum":u32::MAX},"height":{"type":"integer","minimum":0,"maximum":u32::MAX},"fps":{"type":"number","exclusiveMinimum":0},"tracking":{"$ref":"#/$defs/movie_tracking"}},"additionalProperties":false});
     defs["movie_tracking"] = json!({"type":"object","required":["tracks","plane_tracks","camera","reconstruction","objects"],"properties":{"tracks":{"type":"array","items":{"type":"object","required":["id","name","markers"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"markers":{"type":"array","items":{"type":"object","required":["frame","co","pattern_corners","search_area","disabled"],"properties":{"frame":{"type":"number"},"co":{"$ref":"#/$defs/vec2"},"pattern_corners":{"type":"array","items":{"$ref":"#/$defs/vec2"},"minItems":4,"maxItems":4},"search_area":{"type":"array","items":{"$ref":"#/$defs/vec2"},"minItems":4,"maxItems":4},"disabled":{"type":"boolean"}},"additionalProperties":false}}},"additionalProperties":false}},"plane_tracks":{"type":"array","items":{"type":"object","required":["id","name","track_ids","reference_frame","homographies"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"track_ids":{"type":"array","items":{"type":"string"}},"reference_frame":{"type":"number"},"homographies":{"type":"array","items":{"type":"object","required":["frame","matrix"],"properties":{"frame":{"type":"number"},"matrix":{"type":"array","items":{"$ref":"#/$defs/vec3"},"minItems":3,"maxItems":3}},"additionalProperties":false}}},"additionalProperties":false}},"camera":{"type":"object","required":["focal_mm","sensor_width_mm","principal","units","pixel_aspect","distortion_model","k1","k2","k3","division_k1","division_k2","nuke_k1","nuke_k2","nuke_p1","nuke_p2","brown_k1","brown_k2","brown_k3","brown_k4","brown_p1","brown_p2"],"properties":{"focal_mm":{"type":"number"},"sensor_width_mm":{"type":"number"},"principal":{"$ref":"#/$defs/vec2"},"units":{"enum":["PIXELS","MILLIMETERS"]},"pixel_aspect":{"type":"number"},"distortion_model":{"enum":["POLYNOMIAL","DIVISION","NUKE","BROWN"]},"k1":{"type":"number"},"k2":{"type":"number"},"k3":{"type":"number"},"division_k1":{"type":"number"},"division_k2":{"type":"number"},"nuke_k1":{"type":"number"},"nuke_k2":{"type":"number"},"nuke_p1":{"type":"number"},"nuke_p2":{"type":"number"},"brown_k1":{"type":"number"},"brown_k2":{"type":"number"},"brown_k3":{"type":"number"},"brown_k4":{"type":"number"},"brown_p1":{"type":"number"},"brown_p2":{"type":"number"}},"additionalProperties":false},"reconstruction":{"type":"object","required":["cameras","points","is_valid","average_error"],"properties":{"cameras":{"type":"array","items":{"type":"object","required":["frame","matrix","average_error","matrix_is_camera_to_world"],"properties":{"frame":{"type":"integer","minimum":i32::MIN,"maximum":i32::MAX},"matrix":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"minItems":3,"maxItems":3},"average_error":{"type":"number"},"matrix_is_camera_to_world":{"type":"boolean"}},"additionalProperties":false}},"points":{"type":"array","items":{"type":"object","required":["track","co"],"properties":{"track":{"type":"string"},"co":{"$ref":"#/$defs/vec3"}},"additionalProperties":false}},"is_valid":{"type":"boolean"},"average_error":{"type":"number"}},"additionalProperties":false},"objects":{"type":"array"}},"additionalProperties":false});
     defs["movie_tracking"]["properties"]["objects"]["items"] = json!({"type":"object","required":["id","name","tracks","reconstruction","reconstruction_is_valid","reconstruction_average_error","scale"],"properties":{"id":{"type":"string"},"name":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"reconstruction":{"type":"array","items":{"type":"object","required":["frame","matrix","average_error","matrix_is_camera_to_world"],"properties":{"frame":{"type":"number"},"matrix":{"type":"array","items":{"type":"number"},"minItems":16,"maxItems":16},"average_error":{"type":"number"},"matrix_is_camera_to_world":{"type":"boolean"}},"additionalProperties":false}},"reconstruction_is_valid":{"type":"boolean"},"reconstruction_average_error":{"type":"number"},"scale":{"type":"number"}},"additionalProperties":false});

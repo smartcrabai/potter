@@ -780,8 +780,14 @@ fn mask_input(node: &GraphNode, base: &Image, doc: &SceneDoc, frame: f64) -> Res
                 serde_json::json!({"mask": mask_id}),
             )
         })?;
+        let use_feather = match node.inputs.get("Feather") {
+            None => true,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                PotError::invalid_argument("Mask node Feather input must be a boolean")
+            })?,
+        };
         let mask_image = mask
-            .rasterize(base.width, base.height, frame)
+            .rasterize_with_feather(base.width, base.height, frame, use_feather)
             .map_err(|error| {
                 PotError::invalid_argument(format!("mask rasterization failed: {error}"))
             })?;
