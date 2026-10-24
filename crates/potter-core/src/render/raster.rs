@@ -3121,8 +3121,8 @@ impl FilmFilter {
     }
 
     fn store_sample(&mut self, pixel: usize, color: [f64; 4]) {
-        let mut stored = color.map(|channel| exr::prelude::f16::from_f32(channel as f32).to_f32());
-        stored[3] = exr::prelude::f16::from_f32(1.0_f32 - color[3] as f32).to_f32();
+        let mut stored = color.map(|channel| store_film_f16_truncated(channel as f32));
+        stored[3] = store_film_f16_truncated(1.0_f32 - color[3] as f32);
         self.sample_color[pixel] = stored;
     }
 
@@ -3277,7 +3277,35 @@ fn film_luma_weight(luma: f32, exposure_scale: f32) -> f32 {
 
 fn store_film_history_f16(value: f32) -> f32 {
     let patched = f32::from_bits(value.to_bits().wrapping_add(0x1000));
-    exr::prelude::f16::from_f32(patched).to_f32()
+    store_film_f16_truncated(patched)
+}
+
+/// Native EEVEE 16-bit render targets and image stores truncate float mantissas.
+fn store_film_f16_truncated(value: f32) -> f32 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let significand = bits & 0x7f_ffff;
+    let half_bits = if exponent == 0xff {
+        sign | 0x7c00
+            | if significand == 0 {
+                0
+            } else {
+                ((significand >> 13) as u16).max(1)
+            }
+    } else {
+        let half_exponent = exponent - 127 + 15;
+        if half_exponent >= 0x1f {
+            sign | 0x7c00
+        } else if half_exponent > 0 {
+            sign | ((half_exponent as u16) << 10) | (significand >> 13) as u16
+        } else if half_exponent >= -10 {
+            sign | (((significand | 0x80_0000) >> (14 - half_exponent)) as u16)
+        } else {
+            sign
+        }
+    };
+    exr::prelude::f16::from_bits(half_bits).to_f32()
 }
 
 /// The film radius of realtime Beauty, or `None` for the one-sample render, where EEVEE's filter is zero and the sample
@@ -4146,6 +4174,7 @@ mod tests {
     use super::{
         Camera, CameraEngine, Line, Mode, Projection, SensorFit, StereoMode, camera_frame,
         pixel_in_bounds, projection_for_camera, rasterize_with_lines, ray_for_pixel,
+        store_film_f16_truncated, store_film_history_f16,
     };
     use crate::model::{CameraData, CameraProjection};
     use glam::DVec3;
@@ -4700,6 +4729,13 @@ mod tests {
             "the part of the stroke inside the circle must be drawn"
         );
         Ok(())
+    }
+    #[test]
+    fn film_half_storage_matches_native_truncation_and_single_rounding() {
+        let input = store_film_f16_truncated(0.3334);
+        assert_eq!(input, 0.333251953125);
+        assert_eq!(store_film_history_f16(input), input);
+        assert_eq!(store_film_history_f16(0.3334), 0.33349609375);
     }
 }
 

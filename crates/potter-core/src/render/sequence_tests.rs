@@ -490,7 +490,13 @@ fn anaglyph_realtime_volume_resolves_each_eye_column_independently() -> Result<(
         "origin": [-1.5, -1.5, 1.0],
         "values": values
     });
-    let doc = camera_volume_doc(&grid, SAMPLES)?;
+    let mut doc = camera_volume_doc(&grid, SAMPLES)?;
+    // Keep eye contrast above RGBA16F precision in this one-pixel viewport.
+    doc.scenes
+        .get_mut(&doc.active_scene)
+        .ok_or("volume fixture has no active scene")?
+        .render
+        .eevee_volumetric_tile_size = 1;
     let directory = tempdir()?;
     let anaglyph = render_realtime_pixel(&doc, directory.path(), "camera_stereo", SAMPLES)?;
     let left = render_realtime_pixel(&doc, directory.path(), "camera_left", SAMPLES)?;
