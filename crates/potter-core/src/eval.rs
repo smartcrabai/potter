@@ -592,17 +592,13 @@ impl Snapshot {
                 for constraint in &reference.constraints {
                     if constraint.enabled
                         && constraint.influence != 0.0
-                        && matches!(
-                            constraint.constraint_type,
-                            ConstraintType::Shrinkwrap | ConstraintType::GeometryAttribute
-                        )
-                        && let Some(dependency_id) = &constraint.target
+                        && let Some(dependency_id) = constraint_mesh_dependency_id(constraint)
                         && mesh_dependencies
                             .other
                             .get(&reference_id)
-                            .is_some_and(|dependencies| dependencies.contains(dependency_id))
+                            .is_some_and(|dependencies| dependencies.contains(&dependency_id))
                     {
-                        selected_nodes.insert(dependency_id.clone());
+                        selected_nodes.insert(dependency_id);
                     }
                 }
             }
@@ -834,17 +830,13 @@ impl Snapshot {
                     for constraint in &reference.constraints {
                         if constraint.enabled
                             && constraint.influence != 0.0
-                            && matches!(
-                                constraint.constraint_type,
-                                ConstraintType::Shrinkwrap | ConstraintType::GeometryAttribute
-                            )
-                            && let Some(dependency_id) = &constraint.target
+                            && let Some(dependency_id) = constraint_mesh_dependency_id(constraint)
                             && mesh_dependencies
                                 .other
                                 .get(&reference_id)
-                                .is_some_and(|dependencies| dependencies.contains(dependency_id))
+                                .is_some_and(|dependencies| dependencies.contains(&dependency_id))
                         {
-                            selected.insert(dependency_id.clone());
+                            selected.insert(dependency_id);
                         }
                     }
                 }
@@ -3070,6 +3062,18 @@ struct ObjectMeshDependencies {
     other: BTreeMap<Id, BTreeSet<Id>>,
 }
 
+fn constraint_mesh_dependency_id(constraint: &crate::model::Constraint) -> Option<Id> {
+    match constraint.constraint_type {
+        ConstraintType::Shrinkwrap | ConstraintType::GeometryAttribute => constraint.target.clone(),
+        ConstraintType::FollowTrack => constraint
+            .params
+            .get("depth_object")
+            .and_then(Value::as_str)
+            .and_then(|id| Id::new(id.to_owned()).ok()),
+        _ => None,
+    }
+}
+
 fn object_mesh_dependencies(
     doc: &SceneDoc,
     gate: ModifierGate<'_>,
@@ -3144,19 +3148,16 @@ fn object_mesh_dependencies(
                 }
             }
         }
-        for constraint in node.constraints.iter().filter(|constraint| {
-            constraint.enabled
-                && constraint.influence != 0.0
-                && matches!(
-                    constraint.constraint_type,
-                    ConstraintType::Shrinkwrap | ConstraintType::GeometryAttribute
-                )
-        }) {
-            if let Some(target_id) = &constraint.target
-                && dependencies.other.contains_key(target_id)
+        for constraint in node
+            .constraints
+            .iter()
+            .filter(|constraint| constraint.enabled && constraint.influence != 0.0)
+        {
+            if let Some(target_id) = constraint_mesh_dependency_id(constraint)
+                && dependencies.other.contains_key(&target_id)
                 && let Some(owner_dependencies) = dependencies.other.get_mut(owner_id)
             {
-                owner_dependencies.insert(target_id.clone());
+                owner_dependencies.insert(target_id);
             }
         }
     }

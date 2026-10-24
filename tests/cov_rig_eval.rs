@@ -854,6 +854,91 @@ with open(os.path.join(root, "follow_expected.json"), "w", encoding="utf-8") as 
 }
 
 #[test]
+fn modifier_apply_uses_follow_track_depth_mesh_dependency() -> TestResult {
+    let base = SceneDoc::new("00000000-0000-4000-8000-000000000002".to_owned());
+    let doc = ops::apply_batch(
+        &base,
+        &json!({
+            "schema_version":1,
+            "base_revision":base.revision,
+            "operations":[
+                {"op":"tracking.clip_create","id":"clip","name":"Clip","width":100,"height":100},
+                {"op":"tracking.track_add","id":"clip","track":"track","name":"Track","frame":1,"co":[50.0,50.0]},
+                {"op":"camera.create","id":"camera","name":"Camera","lens_mm":50.0,"sensor_width_mm":36.0},
+                {"op":"node.create","id":"depth","kind":"plane","params":{"size":8.0},"transform":{"translation":[0.0,0.0,-2.0]}},
+                {"op":"node.create","id":"follower","kind":"empty","transform":{"translation":[0.0,0.0,-4.0]}},
+                {"op":"constraint.create","target":{"id":"follower"},"id":"follow","type":"follow_track","constraint_target":"camera","params":{"clip":"clip","use_active_clip":false,"track":"track","use_3d_position":false,"use_undistorted_position":false,"frame_method":"STRETCH","camera":"camera","depth_object":"depth"}},
+                {"op":"node.create","id":"subject","kind":"plane","params":{"size":2.0}},
+                {"op":"modifier.create","target":{"id":"subject"},"id":"hook","type":"hook","params":{"object":"follower","vertex_indices":[0,1,2,3],"falloff_type":"NONE","falloff_radius":0.0,"strength":1.0,"center":[0.0,0.0,0.0],"use_falloff_uniform":false,"matrix_inverse":DMat4::IDENTITY.to_cols_array()}}
+            ]
+        }),
+    )?
+    .doc;
+
+    let full_snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+    let follower_id = Id::new("follower".to_owned())?;
+    let follower_position = DMat4::from_cols_array(&full_snapshot.nodes[&follower_id].world_matrix)
+        .w_axis
+        .truncate();
+    assert!(
+        (follower_position.z + 2.0).abs() < 1.0e-8,
+        "full-scene evaluation must place Follow Track on the depth plane: {follower_position}"
+    );
+
+    let subject_id = Id::new("subject".to_owned())?;
+    let expected_positions: Vec<_> = full_snapshot.meshes[&subject_id]
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect();
+    let source_data_id = doc.nodes[&subject_id]
+        .data
+        .as_ref()
+        .ok_or("subject has no mesh data")?;
+    let source_mesh = doc.data_blocks[source_data_id]
+        .mesh
+        .as_ref()
+        .ok_or("subject data has no mesh")?;
+    let source_positions: Vec<_> = source_mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect();
+    assert_ne!(
+        expected_positions, source_positions,
+        "the Hook must move the subject using the follower transform"
+    );
+
+    let applied_doc = ops::apply_batch(
+        &doc,
+        &json!({
+            "schema_version":1,
+            "base_revision":doc.revision,
+            "operations":[{"op":"modifier.apply","target":{"id":"subject"},"modifier_id":"hook"}]
+        }),
+    )?
+    .doc;
+    let applied_data_id = applied_doc.nodes[&subject_id]
+        .data
+        .as_ref()
+        .ok_or("applied subject has no mesh data")?;
+    let applied_mesh = applied_doc.data_blocks[applied_data_id]
+        .mesh
+        .as_ref()
+        .ok_or("applied subject data has no mesh")?;
+    let applied_positions: Vec<_> = applied_mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.co)
+        .collect();
+    assert_eq!(
+        applied_positions, expected_positions,
+        "modifier.apply must use the same depth hit as full-scene evaluation"
+    );
+    Ok(())
+}
+
+#[test]
 fn follow_track_reports_missing_reconstruction_marker_and_clip_data() -> TestResult {
     let base_ops = json!([
         {"op":"tracking.clip_create","id":"clip","name":"Clip","width":100,"height":50},
