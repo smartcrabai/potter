@@ -5,7 +5,7 @@ mod common;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 use potter_core::{
     eval::{EvaluationContext, animation::animated_transform},
@@ -269,6 +269,81 @@ fn fcurve_modifiers_match_blender_oracle_and_roundtrip() -> TestResult {
         },
     )?;
     let roundtrip = import_blend(&exported, Some(&blender))?;
+    let readback_script = temporary.path().join("fcurve_readback.py");
+    fs::write(
+        &readback_script,
+        r#"
+import bpy
+import json
+import sys
+
+blend_path, output_path = sys.argv[sys.argv.index("--") + 1:]
+bpy.ops.wm.open_mainfile(filepath=blend_path)
+obj = bpy.data.objects["stepped_blend_after_range_shrink"]
+action = obj.animation_data.action
+slot = obj.animation_data.action_slot
+curve = next(
+    curve
+    for layer in action.layers
+    for strip in layer.strips
+    for channelbag in [strip.channelbag(slot)]
+    if channelbag is not None
+    for curve in channelbag.fcurves
+    if curve.data_path == "location" and curve.array_index == 0
+)
+modifier = next(modifier for modifier in curve.modifiers if modifier.type == "STEPPED")
+bpy.context.scene.frame_set(5)
+bpy.context.view_layer.update()
+depsgraph = bpy.context.evaluated_depsgraph_get()
+depsgraph.update()
+value = float(obj.evaluated_get(depsgraph).location.x)
+with open(output_path, "w", encoding="utf-8") as output:
+    json.dump({"blend_in": float(modifier.blend_in), "value": value}, output)
+"#,
+    )?;
+    let readback_path = temporary.path().join("fcurve_readback.json");
+    let mut blender_command = Command::new(&blender);
+    blender_command
+        .args(["--background", "--factory-startup", "--python"])
+        .arg(&readback_script)
+        .arg("--")
+        .arg(&exported)
+        .arg(&readback_path);
+    let blender_output = process::run_guarded(blender_command)?;
+    assert!(
+        blender_output.status.success(),
+        "Blender F-Curve readback failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&blender_output.stdout),
+        String::from_utf8_lossy(&blender_output.stderr)
+    );
+    let native_readback: Value = serde_json::from_slice(&fs::read(readback_path)?)?;
+    assert_eq!(
+        native_readback["blend_in"].as_f64(),
+        Some(15.0),
+        "exported Stepped blend_in was clamped on Blender re-read: {native_readback}"
+    );
+    let expected_stepped_value = expected["cases"]
+        .as_array()
+        .and_then(|cases| {
+            cases
+                .iter()
+                .find(|case| case["name"] == "stepped_blend_after_range_shrink")
+        })
+        .and_then(|case| case["samples"].as_array())
+        .and_then(|samples| {
+            samples
+                .iter()
+                .find(|sample| sample["frame"].as_f64() == Some(5.0))
+        })
+        .and_then(|sample| sample["value"].as_f64())
+        .ok_or("range-shrunk Stepped oracle sample is missing")?;
+    let actual_stepped_value = native_readback["value"]
+        .as_f64()
+        .ok_or("Blender Stepped readback value is missing")?;
+    assert!(
+        (actual_stepped_value - expected_stepped_value).abs() <= tolerance,
+        "exported Stepped evaluation at frame 5: expected {expected_stepped_value}, got {actual_stepped_value}"
+    );
     for action in imported.doc.actions.values() {
         let restored = roundtrip
             .doc

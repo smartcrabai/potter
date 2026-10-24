@@ -258,6 +258,15 @@ CASES = [
         "frames": [0.0, 1.0, 2.0, 4.0, 5.0, 8.0],
     },
     {
+        "name": "stepped_blend_after_range_shrink",
+        "keys": [[0.0, 0.0], [20.0, 20.0]],
+        "modifiers": [{"type": "STEPPED", "properties": {
+            "use_restricted_range": True, "frame_start": 0.0, "frame_end": 20.0,
+            "frame_step": 2.0, "blend_in": 15.0,
+        }, "property_updates": [["frame_end", 10.0]]}],
+        "frames": [0.0, 2.0, 5.0, 10.0, 11.0],
+    },
+    {
         "name": "empty_noise_static",
         "location": 7.0,
         "keys": [],

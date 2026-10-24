@@ -7603,10 +7603,12 @@ def _restore_action_curves(channelbag, curves, owner, doc):
                 active = properties.pop("active", None)
                 modifier_active.append((modifier, active))
                 control_points = properties.pop("control_points", None)
-                if modifier_source["type"] == "STEPPED":
-                    invalid_range = (
-                        float(properties.get("frame_start", 0.0)) >
-                        float(properties.get("frame_end", 0.0)))
+                is_stepped = modifier_source["type"] == "STEPPED"
+                invalid_range = (
+                    is_stepped and
+                    float(properties.get("frame_start", 0.0)) >
+                    float(properties.get("frame_end", 0.0)))
+                if is_stepped:
                     if invalid_range:
                         property_order = (
                             "blend_in", "blend_out", "frame_start", "frame_end",
@@ -7618,6 +7620,11 @@ def _restore_action_curves(channelbag, curves, owner, doc):
                             "use_influence", "use_frame_start", "use_frame_end",
                             "blend_in", "blend_out", "influence")
                 else:
+                    property_order = (
+                        "use_restricted_range", "use_influence",
+                        "use_frame_start", "use_frame_end", "frame_end", "frame_start",
+                        "blend_in", "blend_out", "influence")
+                if not invalid_range:
                     frame_start = float(properties.get("frame_start", 0.0))
                     frame_end = float(properties.get("frame_end", 0.0))
                     blend_in = float(properties.get("blend_in", 0.0))
@@ -7641,10 +7648,6 @@ def _restore_action_curves(channelbag, curves, owner, doc):
                         set_rna(modifier, {"frame_end": frame_end}, {},
                                 strict=True, owner="%s FCurve modifier" % owner)
                         properties.pop("frame_end", None)
-                    property_order = (
-                        "use_restricted_range", "use_influence",
-                        "use_frame_start", "use_frame_end", "frame_end", "frame_start",
-                        "blend_in", "blend_out", "influence")
                 for property_name in property_order:
                     if property_name in properties:
                         set_rna(
