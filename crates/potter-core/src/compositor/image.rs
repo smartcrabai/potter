@@ -183,7 +183,7 @@ pub(super) fn compositor_gaussian_blur(image: &Image, radius: u32) -> Result<Ima
     for y in 0..height {
         for x in 0..width {
             let pixel_index = y * width + x;
-            for channel in 0..4 {
+            for (channel, destination) in horizontal[pixel_index].iter_mut().enumerate() {
                 let mut accumulated = image.pixels[pixel_index][channel] * kernel[0];
                 for (offset, weight) in kernel.iter().enumerate().skip(1) {
                     let left = x.saturating_sub(offset);
@@ -191,7 +191,7 @@ pub(super) fn compositor_gaussian_blur(image: &Image, radius: u32) -> Result<Ima
                     accumulated += image.pixels[y * width + right][channel] * weight;
                     accumulated += image.pixels[y * width + left][channel] * weight;
                 }
-                horizontal[pixel_index][channel] = accumulated;
+                *destination = accumulated;
             }
         }
     }
@@ -199,7 +199,7 @@ pub(super) fn compositor_gaussian_blur(image: &Image, radius: u32) -> Result<Ima
     for y in 0..height {
         for x in 0..width {
             let pixel_index = y * width + x;
-            for channel in 0..4 {
+            for (channel, destination) in output[pixel_index].iter_mut().enumerate() {
                 let mut accumulated = horizontal[pixel_index][channel] * kernel[0];
                 for (offset, weight) in kernel.iter().enumerate().skip(1) {
                     let top = y.saturating_sub(offset);
@@ -207,7 +207,7 @@ pub(super) fn compositor_gaussian_blur(image: &Image, radius: u32) -> Result<Ima
                     accumulated += horizontal[bottom * width + x][channel] * weight;
                     accumulated += horizontal[top * width + x][channel] * weight;
                 }
-                output[pixel_index][channel] = accumulated;
+                *destination = accumulated;
             }
         }
     }

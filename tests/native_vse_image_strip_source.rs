@@ -228,6 +228,8 @@ fn native_image_sequence_elements_render_in_order_with_float_rgba_intact() -> Te
 
     let (project, imported) = import_blend(&blender, root, &blend)?;
     assert_eq!(imported["result"]["committed"], true);
+    fs::remove_file(&first_path)?;
+    fs::remove_file(&second_path)?;
     let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     let single_scene_id = scene_id_named(&scene, "ActualSingleImage")?;
     let single_strip = &scene["scenes"][&single_scene_id]["sequencer"]["strips"][0];

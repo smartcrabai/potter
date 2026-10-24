@@ -382,6 +382,11 @@ fn configure_blender_resources(
             {
                 strip.source.clone_from(&Some(uri.clone()));
             }
+            for source_file in &mut strip.source_files {
+                if let Some(uri) = reference_uris.get(source_file) {
+                    source_file.clone_from(uri);
+                }
+            }
         }
     }
     Ok((result, warnings))

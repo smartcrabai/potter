@@ -10,7 +10,9 @@ use crate::{
     eval::{EvaluationContext, EvaluationPurpose, EvaluationSession},
     model::{Id, ImageColorspace, Scene, SceneDoc},
     ops::apply_batch,
-    sequencer::{EffectType, RgbaFrame, SequencerColorSpace, Strip, StripType, TransitionType},
+    sequencer::{
+        EffectType, RetimingKey, RgbaFrame, SequencerColorSpace, Strip, StripType, TransitionType,
+    },
 };
 
 fn camera_volume_doc(grid: &Value, render_samples: u32) -> Result<SceneDoc, Box<dyn Error>> {
@@ -272,6 +274,48 @@ fn float_exr_image_replace_preserves_alpha_zero_radiance_and_fractional_base()
         .zip(expected.into_iter().flatten())
     {
         assert!((actual - expected).abs() < 1.0e-6);
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_image_sequence_holds_float_exr_endpoints_for_out_of_range_retiming()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let expected = [[0.375, 0.25, 0.125, 0.0], [0.375, 0.3, 0.225, 0.5]];
+    super::write_exr(
+        &directory.path().join("sequence_first.exr"),
+        &expected[..1],
+        1,
+        1,
+    )?;
+    super::write_exr(
+        &directory.path().join("sequence_last.exr"),
+        &expected[1..],
+        1,
+        1,
+    )?;
+
+    for (source_frame, expected_pixel) in [
+        (0.0, expected[0]),
+        (1.0, expected[1]),
+        (1.0e20, expected[1]),
+        (-1.0e20, expected[0]),
+    ] {
+        let sequence = Strip {
+            source_files: vec![
+                "sequence_first.exr".to_owned(),
+                "sequence_last.exr".to_owned(),
+            ],
+            retiming_keys: vec![RetimingKey {
+                frame: 1.0,
+                source_frame,
+            }],
+            ..strip("explicit_sequence", StripType::ImageSequence, 1)
+        };
+        let (doc, scene) = scene_with_strips(vec![sequence]);
+        let output = render(&doc, &scene, directory.path(), 1.0, 1, 1)?;
+        assert_pixel(output.pixels[0], expected_pixel);
     }
     Ok(())
 }

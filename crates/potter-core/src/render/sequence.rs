@@ -1476,9 +1476,25 @@ fn render_strip_content(
                 )?)
             } else {
                 let last_index = strip.source_files.len() - 1;
-                let frame_number = rounded_frame(source_frame)?;
-                let index = usize::try_from(frame_number.max(0))
-                    .unwrap_or(usize::MAX)
+                let last_frame = num_traits::ToPrimitive::to_f64(&last_index).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "image sequence has too many source files",
+                    )
+                })?;
+                let bounded_source_frame = if source_frame.is_finite() {
+                    source_frame.clamp(0.0, last_frame)
+                } else {
+                    source_frame
+                };
+                let frame_number = rounded_frame(bounded_source_frame)?;
+                let index = num_traits::ToPrimitive::to_usize(&frame_number)
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "image sequence frame exceeds the supported range",
+                        )
+                    })?
                     .min(last_index);
                 let source_file = strip.source_files.get(index).ok_or_else(|| {
                     PotError::new(
