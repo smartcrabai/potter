@@ -75,12 +75,12 @@ pub fn feature_catalog() -> Value {
             &["material.create"],
             [true, false, true, true, false, false, true],
         ),
-        unsupported(
+        supported(
             "shader.principled.anisotropic",
-            "Principled anisotropic highlight",
+            "Principled anisotropic GGX highlight",
             "ShaderNodeBsdfPrincipled",
             &["material.create", "material.update"],
-            "Potter's GGX lobe is isotropic; a render with Anisotropic above zero reports UNSUPPORTED_FEATURE.",
+            [true, true, true, true, true, true, true],
         ),
         supported(
             "shader.principled.thin_film",

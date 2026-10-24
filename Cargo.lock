@@ -884,6 +884,12 @@ dependencies = [
 
 [[package]]
 name = "glam"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3abb554f8ee44336b72d522e0a7fe86a29e09f839a36022fa869a7dfe941a54b"
+
+[[package]]
+name = "glam"
 version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc148d4ddd3930c52f9e5ae79b89805c6f07e9ff417e7b083e0348cea60a5aba"
@@ -1654,6 +1660,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a86d3146ed3995b5913c414f6664344b9617457320782e64f0bb44afd49d74"
 
 [[package]]
+name = "mikktspace"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d0b56b403871a8f992ca626d52cc0a690d4841baea8955dc4af6304ac62f8b0"
+dependencies = [
+ "glam 0.15.2",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1873,7 +1888,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "exr",
- "glam",
+ "glam 0.34.1",
  "hex",
  "image",
  "jsonschema 0.59.0",
@@ -1898,10 +1913,11 @@ dependencies = [
  "clap",
  "exr",
  "flate2",
- "glam",
+ "glam 0.34.1",
  "hex",
  "image",
  "lz4_flex",
+ "mikktspace",
  "num-rational",
  "num-traits",
  "png",

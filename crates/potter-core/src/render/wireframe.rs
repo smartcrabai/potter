@@ -920,6 +920,7 @@ mod oracle_tests {
             material_index: 0,
             uv: [[0.0, 0.0]; 3],
             layer_uvs: Vec::new(),
+            layer_tangents: Vec::new(),
             normals: None,
             layer_colors: Vec::new(),
             lit_per_pixel: false,

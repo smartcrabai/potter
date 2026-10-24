@@ -1,17 +1,17 @@
-"""Filter Glossy's glossy blur, rendered by Blender 5.2.2 Cycles.
+"""Filter Glossy's glossy blur for metal and sharp glass, rendered by Blender 5.2.2 Cycles.
 
 A top-down orthographic camera sees a white diffuse floor. The floor is lit only indirectly: a floor sample goes
-up and hits a vertical roughness-0 metal wall, which reflects it onto an emitter standing across the scene. The
-emitter's material turns light sampling off (`emission_sampling` NONE), so nothing lights the floor except a path
+up and hits a vertical roughness-0 metal or glass wall, which reflects it onto an emitter standing across the scene.
+The emitter's material turns light sampling off (`emission_sampling` NONE), so nothing lights the floor except a path
 that bounces off the floor and then off the wall, which is what the blur acts on.
 
 After the diffuse floor bounce the sampled pdf is cos/π, below one, so Cycles blurs the wall's specular closure
-(`surface_shader_prepare_closures`): a sharp reflection becomes a rough one, which spreads the emitter's light over
-the floor differently. With Filter Glossy 0 there is no blur and the wall stays a mirror. The frame mean therefore
-depends on the blur.
+(`surface_shader_prepare_closures`): sharp reflections become rough. With Filter Glossy 0 there is no blur. The frame
+mean therefore depends on the blur for all three wall closures: metal, Glass BSDF, and Principled transmission.
 
-Arguments after `--`: blend_out and json_out. The JSON has `seed_means` (Filter Glossy 1.0, the default) and
-`seed_means_filter_glossy_0` (Filter Glossy 0.0).
+Arguments after `--`: metal_blend_out, glass_blend_out, principled_glass_blend_out, and json_out. The JSON has
+per-seed means under `seed_means` / `seed_means_filter_glossy_0`, `glass_seed_means` /
+`glass_seed_means_filter_glossy_0`, and `principled_glass_seed_means` / `principled_glass_seed_means_filter_glossy_0`.
 """
 
 import json
@@ -22,7 +22,7 @@ import tempfile
 import bpy
 from mathutils import Vector
 
-blend_out, json_out = sys.argv[sys.argv.index("--") + 1:][:2]
+metal_blend_out, glass_blend_out, principled_glass_blend_out, json_out = sys.argv[sys.argv.index("--") + 1:][:4]
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
@@ -91,7 +91,7 @@ scene.collection.objects.link(camera)
 camera.location = Vector((0.0, 0.0, 10.0))
 scene.camera = camera
 
-bpy.ops.wm.save_as_mainfile(filepath=blend_out)
+bpy.ops.wm.save_as_mainfile(filepath=metal_blend_out)
 
 
 def frame_mean(path):
@@ -106,17 +106,46 @@ def frame_mean(path):
     return [total / (width * height) for total in totals]
 
 
+glass_material = bpy.data.materials.new("Glass BSDF")
+glass_material.use_nodes = True
+glass_tree = glass_material.node_tree
+glass_tree.nodes.clear()
+glass_output = glass_tree.nodes.new("ShaderNodeOutputMaterial")
+glass_bsdf = glass_tree.nodes.new("ShaderNodeBsdfGlass")
+glass_bsdf.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+glass_bsdf.inputs["IOR"].default_value = 1.5
+glass_bsdf.inputs["Roughness"].default_value = 0.0
+glass_tree.links.new(glass_bsdf.outputs["BSDF"], glass_output.inputs["Surface"])
+
+principled_glass = principled_material("Principled Glass", (1.0, 1.0, 1.0, 1.0), 0.0, 0.0, 0.5)
+principled_glass.node_tree.nodes["Principled BSDF"].inputs["Transmission Weight"].default_value = 1.0
+
+variants = (
+    ("", wall.data.materials[0], metal_blend_out),
+    ("glass", glass_material, glass_blend_out),
+    ("principled_glass", principled_glass, principled_glass_blend_out),
+)
 work = tempfile.mkdtemp()
 result = {"samples": 64}
-for key, filter_glossy in (("seed_means", 1.0), ("seed_means_filter_glossy_0", 0.0)):
-    scene.cycles.blur_glossy = filter_glossy
-    seed_means = []
-    for seed in range(8):
-        scene.cycles.seed = seed
-        scene.render.filepath = os.path.join(work, f"glossy_blur_{key}_{seed}.exr")
-        bpy.ops.render.render(write_still=True)
-        seed_means.append(frame_mean(scene.render.filepath))
-    result[key] = seed_means
+for key, material, variant_blend_out in variants:
+    wall.data.materials.clear()
+    wall.data.materials.append(material)
+    scene.cycles.blur_glossy = 1.0
+
+    bpy.ops.wm.save_as_mainfile(filepath=variant_blend_out)
+    seed_key = f"{key}_seed_means" if key else "seed_means"
+    for filter_glossy, output_key in (
+        (1.0, seed_key),
+        (0.0, f"{seed_key}_filter_glossy_0"),
+    ):
+        scene.cycles.blur_glossy = filter_glossy
+        seed_means = []
+        for seed in range(8):
+            scene.cycles.seed = seed
+            scene.render.filepath = os.path.join(work, f"glossy_blur_{output_key}_{seed}.exr")
+            bpy.ops.render.render(write_still=True)
+            seed_means.append(frame_mean(scene.render.filepath))
+        result[output_key] = seed_means
 
 with open(json_out, "w") as handle:
     json.dump(result, handle, indent=2)
