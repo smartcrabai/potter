@@ -175,6 +175,18 @@ fn assert_float_sequence_frame(label: &str, pixels: &[[f64; 4]], channel: usize)
     );
 }
 
+fn assert_project_owned_asset(project: &Path, reference: &str) {
+    let path = Path::new(reference);
+    assert!(
+        path.starts_with("assets/sha256"),
+        "asset reference is not project-owned: {reference}"
+    );
+    assert!(
+        project.join(path).is_file(),
+        "project asset is missing: {reference}"
+    );
+}
+
 #[test]
 fn native_image_sequence_elements_render_in_order_with_float_rgba_intact() -> TestResult {
     const EMITTER_SAMPLE: f32 = f32::from_bits(0x3e01_a000);
@@ -242,16 +254,16 @@ fn native_image_sequence_elements_render_in_order_with_float_rgba_intact() -> Te
     let single_scene_id = scene_id_named(&scene, "ActualSingleImage")?;
     let single_strip = &scene["scenes"][&single_scene_id]["sequencer"]["strips"][0];
     assert_eq!(single_strip["type"], "image");
+    let single_source = single_strip["source"]
+        .as_str()
+        .ok_or("single IMAGE source is missing")?;
     assert_eq!(
-        Path::new(
-            single_strip["source"]
-                .as_str()
-                .ok_or("single IMAGE source is missing")?
-        )
-        .file_name()
-        .and_then(|name| name.to_str()),
+        Path::new(single_source)
+            .file_name()
+            .and_then(|name| name.to_str()),
         Some("source-red.exr")
     );
+    assert_project_owned_asset(&project, single_source);
     assert_float_sequence_frame(
         "single IMAGE",
         &render_frame(&project, &single_scene_id, root, 1)?,
@@ -265,6 +277,17 @@ fn native_image_sequence_elements_render_in_order_with_float_rgba_intact() -> Te
         sequence_strip["source_files"].as_array().map(Vec::len),
         Some(2)
     );
+    for source_file in sequence_strip["source_files"]
+        .as_array()
+        .ok_or("image sequence source files are missing")?
+    {
+        assert_project_owned_asset(
+            &project,
+            source_file
+                .as_str()
+                .ok_or("image sequence source file is not a string")?,
+        );
+    }
     assert_float_sequence_frame(
         "first image element",
         &render_frame(&project, &sequence_id, root, 1)?,
