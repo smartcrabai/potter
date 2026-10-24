@@ -238,7 +238,7 @@ pub fn render_previews(
                 1,
                 0,
                 scene.render.filter_size,
-                2.0_f32.powf(scene.color_management.exposure as f32),
+                realtime_film_exposure_scale(scene.color_management.exposure),
                 shader.as_deref(),
                 None,
                 None,
@@ -453,7 +453,7 @@ pub(crate) fn render_camera_frame(
             samples,
             seed,
             scene.render.filter_size,
-            2.0_f32.powf(scene.color_management.exposure as f32),
+            realtime_film_exposure_scale(scene.color_management.exposure),
             shader.as_deref(),
             realtime_camera_lights.as_ref(),
             volume_pass.as_mut(),
@@ -1293,6 +1293,12 @@ fn safe_relative_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// EEVEE's `pow2f(exposure)` is the square of exposure, not `2^exposure`.
+fn realtime_film_exposure_scale(exposure: f64) -> f32 {
+    let exposure = exposure as f32;
+    exposure * exposure
 }
 
 #[cfg(test)]
