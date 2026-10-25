@@ -2606,7 +2606,6 @@ def action_dump(action):
 
 
 def dump_fcurve(curve):
-    curve.update()
     keys = []
     for point in curve.keyframe_points:
         keys.append({"frame": float(point.co.x), "value": float(point.co.y),
@@ -2623,8 +2622,8 @@ def dump_fcurve(curve):
             ]
         modifiers.append({"type": modifier.type, "properties": properties})
     return {"path": curve.data_path, "index": int(curve.array_index), "keyframes": keys,
-            "extrapolation": curve.extrapolation, "mute": bool(curve.mute),
-            "modifiers": modifiers}
+            "extrapolation": curve.extrapolation, "auto_smoothing": curve.auto_smoothing,
+            "mute": bool(curve.mute), "modifiers": modifiers}
 
 
 def collection_dump(collection):
@@ -7431,6 +7430,10 @@ def _canonical_fcurves(model_curves, source_curves, doc, include_unmatched=True,
         curve["path"] = path
         curve["index"] = index
         curve["extrapolation"] = str(model.get("extrapolation", "constant")).upper()
+        if "auto_smoothing" in model:
+            curve["auto_smoothing"] = str(model["auto_smoothing"]).upper()
+        elif source is None:
+            curve["auto_smoothing"] = "NONE"
         old_keys = {float(item.get("frame", 0.0)): item
                     for item in (source or {}).get("keyframes", [])}
         keyframes = []
@@ -7440,11 +7443,16 @@ def _canonical_fcurves(model_curves, source_curves, doc, include_unmatched=True,
             key = {"frame": frame, "value": value,
                    "interpolation": str(item.get("interpolation", "linear")).upper()}
             old = old_keys.get(frame)
-            if old is not None and float(old.get("value", 0.0)) == value:
-                for field in ("handle_left", "handle_right",
-                              "handle_left_type", "handle_right_type"):
-                    if field in old:
-                        key[field] = old[field]
+            for field in ("handle_left", "handle_right",
+                          "handle_left_type", "handle_right_type"):
+                if field in item:
+                    key[field] = item[field]
+                elif old is not None and float(old.get("value", 0.0)) == value and field in old:
+                    key[field] = old[field]
+                elif field == "handle_left_type" and key.get("handle_left") is not None:
+                    key[field] = "free"
+                elif field == "handle_right_type" and key.get("handle_right") is not None:
+                    key[field] = "free"
             keyframes.append(key)
         curve["keyframes"] = keyframes
         curve["modifiers"] = model.get("modifiers", [])
@@ -7583,6 +7591,8 @@ def _restore_action_curves(channelbag, curves, owner, doc):
                 data_path=path,
                 index=array_index)
             curve.extrapolation = source.get("extrapolation", "CONSTANT").upper()
+            if "auto_smoothing" in source:
+                curve.auto_smoothing = source["auto_smoothing"].upper()
             curve.mute = bool(source.get("mute", False))
             for key in source.get("keyframes", []):
                 point = curve.keyframe_points.insert(float(key["frame"]), float(key["value"]))

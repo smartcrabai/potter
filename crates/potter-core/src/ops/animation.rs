@@ -2,7 +2,10 @@ use serde_json::{Map, Value};
 
 use crate::{
     error::{ErrorCode, Result},
-    model::{Action, Extrapolation, FCurve, FCurveModifier, Id, Interpolation, Keyframe},
+    model::{
+        Action, Extrapolation, FCurve, FCurveAutoSmoothing, FCurveHandleType, FCurveModifier, Id,
+        Interpolation, Keyframe,
+    },
 };
 
 use super::{
@@ -103,17 +106,19 @@ fn update_action(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
     let fcurves = set
         .get("fcurves")
         .map(|value| -> Result<Vec<FCurve>> {
-            let curves = serde_json::from_value::<Vec<FCurve>>(value.clone()).map_err(|error| {
-                engine.error(
-                    ErrorCode::InvalidOperation,
-                    format!("invalid fcurves: {error}"),
-                    &operation_pointer(engine.operation_index, "set/fcurves"),
-                )
-            })?;
-            for curve in &curves {
+            let mut curves =
+                serde_json::from_value::<Vec<FCurve>>(value.clone()).map_err(|error| {
+                    engine.error(
+                        ErrorCode::InvalidOperation,
+                        format!("invalid fcurves: {error}"),
+                        &operation_pointer(engine.operation_index, "set/fcurves"),
+                    )
+                })?;
+            for curve in &mut curves {
                 validate_path(engine, &curve.path, curve.index, "set/fcurves")?;
                 validate_keyframes(engine, &curve.keyframes, "set/fcurves")?;
                 validate_fcurve_modifiers(engine, &curve.modifiers, "set/fcurves/modifiers")?;
+                super::animation_handles::recalculate(curve);
             }
             Ok(curves)
         })
@@ -199,6 +204,8 @@ fn insert_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
             "frame",
             "value",
             "interpolation",
+            "handle_left_type",
+            "handle_right_type",
         ],
         &["target", "path", "index", "frame", "value"],
     )?;
@@ -220,6 +227,23 @@ fn insert_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
     )?;
     let interpolation =
         parse_interpolation(engine, operation.get("interpolation"), "interpolation")?;
+    let left_type = parse_keyframe_handle_type(
+        engine,
+        operation.get("handle_left_type"),
+        "handle_left_type",
+    )?;
+    let right_type = parse_keyframe_handle_type(
+        engine,
+        operation.get("handle_right_type"),
+        "handle_right_type",
+    )?;
+    if !(frame as f32).is_finite() || !(value as f32).is_finite() {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "keyframe frame and value must fit finite Blender float coordinates",
+            &operation_pointer(engine.operation_index, "frame"),
+        ));
+    }
     if let Some(action) = engine.doc.actions.get(&action_id)
         && let Some(curve) = action
             .fcurves
@@ -243,6 +267,7 @@ fn insert_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
             index,
             keyframes: Vec::new(),
             extrapolation: Extrapolation::Constant,
+            auto_smoothing: None,
             modifiers: Vec::new(),
         });
         action.fcurves.len() - 1
@@ -250,10 +275,12 @@ fn insert_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
     let curve = action.fcurves.get_mut(curve_index).ok_or_else(|| {
         crate::error::PotError::new(ErrorCode::InternalError, "inserted FCurve is missing")
     })?;
-    let keyframe = Keyframe {
+    let mut keyframe = Keyframe {
         frame,
         value,
         interpolation,
+        handle_left_type: Some(left_type.unwrap_or(FCurveHandleType::AutoClamped)),
+        handle_right_type: Some(right_type.unwrap_or(FCurveHandleType::AutoClamped)),
         ..Keyframe::default()
     };
     match curve.keyframes.binary_search_by(|key| {
@@ -262,22 +289,56 @@ fn insert_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
             .unwrap_or(std::cmp::Ordering::Equal)
     }) {
         Ok(position) => {
-            let existing = &curve.keyframes[position];
-            if existing.value == value && existing.interpolation == interpolation {
+            let existing = &mut curve.keyframes[position];
+            let changed = existing.value != value
+                || existing.interpolation != interpolation
+                || left_type
+                    .is_some_and(|handle_type| existing.handle_left_type != Some(handle_type))
+                || right_type
+                    .is_some_and(|handle_type| existing.handle_right_type != Some(handle_type));
+            if !changed {
                 return Ok(false);
             }
-            curve.keyframes[position] = keyframe;
+            let value_delta = value - existing.value;
+            if !(value_delta as f32).is_finite() {
+                return Err(crate::error::PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "keyframe value change must fit finite Blender float coordinates",
+                ));
+            }
+            if let Some(handle) = &mut existing.handle_left {
+                handle[1] += value_delta;
+            }
+            if let Some(handle) = &mut existing.handle_right {
+                handle[1] += value_delta;
+            }
+            existing.value = value;
+            existing.interpolation = interpolation;
+            if let Some(handle_type) = left_type {
+                existing.handle_left_type = Some(handle_type);
+            }
+            if let Some(handle_type) = right_type {
+                existing.handle_right_type = Some(handle_type);
+            }
         }
-        Err(position) => curve.keyframes.insert(position, keyframe),
+        Err(position) => {
+            super::animation_handles::prepare_key_insert(curve, position, &mut keyframe);
+            curve.keyframes.insert(position, keyframe);
+        }
     }
     if curve.keyframes.windows(2).any(|pair| {
-        !(pair[1].frame - pair[0].frame).is_finite() || !(pair[1].value - pair[0].value).is_finite()
+        !(pair[1].frame - pair[0].frame).is_finite()
+            || !(pair[1].value - pair[0].value).is_finite()
+            || (pair[0].frame as f32) >= (pair[1].frame as f32)
+            || !((pair[1].frame - pair[0].frame) as f32).is_finite()
+            || !((pair[1].value - pair[0].value) as f32).is_finite()
     }) {
         return Err(crate::error::PotError::new(
             ErrorCode::InvalidOperation,
-            "keyframe interval must be numerically bounded",
+            "keyframe interval must be numerically bounded in Blender float coordinates",
         ));
     }
+    super::animation_handles::recalculate(curve);
     engine.mark("actions", &action_id, ChangeKind::Updated);
     Ok(true)
 }
@@ -331,9 +392,9 @@ fn delete_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
     let action = engine.doc.actions.get_mut(&action_id).ok_or_else(|| {
         crate::error::PotError::new(ErrorCode::InternalError, "assigned action disappeared")
     })?;
-    action.fcurves[curve_position]
-        .keyframes
-        .remove(key_position);
+    let curve = &mut action.fcurves[curve_position];
+    curve.keyframes.remove(key_position);
+    super::animation_handles::recalculate(curve);
     engine.mark("actions", &action_id, ChangeKind::Updated);
     Ok(true)
 }
@@ -362,14 +423,18 @@ fn update_fcurve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
     if set.is_empty()
         || set
             .keys()
-            .any(|key| key != "extrapolation" && key != "modifiers")
+            .any(|key| key != "auto_smoothing" && key != "extrapolation" && key != "modifiers")
     {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
-            "fcurve.update set must contain extrapolation and/or modifiers",
+            "fcurve.update set must contain auto_smoothing, extrapolation, and/or modifiers",
             &operation_pointer(engine.operation_index, "set"),
         ));
     }
+    let auto_smoothing = set
+        .get("auto_smoothing")
+        .map(|value| parse_fcurve_auto_smoothing(engine, value, "set/auto_smoothing"))
+        .transpose()?;
     let extrapolation = set
         .get("extrapolation")
         .map(|value| match value.as_str() {
@@ -412,7 +477,8 @@ fn update_fcurve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             )
         })?;
     let curve = &action.fcurves[curve_position];
-    let changed = extrapolation.is_some_and(|value| curve.extrapolation != value)
+    let changed = auto_smoothing.is_some_and(|value| curve.auto_smoothing != Some(value))
+        || extrapolation.is_some_and(|value| curve.extrapolation != value)
         || modifiers
             .as_ref()
             .is_some_and(|value| curve.modifiers != *value);
@@ -422,12 +488,17 @@ fn update_fcurve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
     let action = engine.doc.actions.get_mut(&action_id).ok_or_else(|| {
         crate::error::PotError::new(ErrorCode::InternalError, "assigned action disappeared")
     })?;
+    let curve = &mut action.fcurves[curve_position];
+    if let Some(auto_smoothing) = auto_smoothing {
+        curve.auto_smoothing = Some(auto_smoothing);
+    }
     if let Some(extrapolation) = extrapolation {
-        action.fcurves[curve_position].extrapolation = extrapolation;
+        curve.extrapolation = extrapolation;
     }
     if let Some(modifiers) = modifiers {
-        action.fcurves[curve_position].modifiers = modifiers;
+        curve.modifiers = modifiers;
     }
+    super::animation_handles::recalculate(curve);
     engine.mark("actions", &action_id, ChangeKind::Updated);
     Ok(true)
 }
@@ -530,6 +601,58 @@ fn parse_interpolation(
     }
 }
 
+fn parse_keyframe_handle_type(
+    engine: &Engine<'_>,
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Option<FCurveHandleType>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let handle_type = value.as_str().ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "Bezier handle type must be a string",
+            &operation_pointer(engine.operation_index, field),
+        )
+    })?;
+    match handle_type {
+        "auto" => Ok(Some(FCurveHandleType::Auto)),
+        "auto_clamped" => Ok(Some(FCurveHandleType::AutoClamped)),
+        "vector" => Ok(Some(FCurveHandleType::Vector)),
+        "aligned" => Ok(Some(FCurveHandleType::Aligned)),
+        "free" => Ok(Some(FCurveHandleType::Free)),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "Bezier handle type must be auto, auto_clamped, vector, aligned, or free",
+            &operation_pointer(engine.operation_index, field),
+        )),
+    }
+}
+
+fn parse_fcurve_auto_smoothing(
+    engine: &Engine<'_>,
+    value: &Value,
+    field: &str,
+) -> Result<FCurveAutoSmoothing> {
+    let smoothing = value.as_str().ok_or_else(|| {
+        engine.error(
+            ErrorCode::InvalidOperation,
+            "auto_smoothing must be a string",
+            &operation_pointer(engine.operation_index, field),
+        )
+    })?;
+    match smoothing {
+        "none" => Ok(FCurveAutoSmoothing::None),
+        "cont_accel" => Ok(FCurveAutoSmoothing::ContAccel),
+        _ => Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "auto_smoothing must be none or cont_accel",
+            &operation_pointer(engine.operation_index, field),
+        )),
+    }
+}
+
 fn validate_path(engine: &Engine<'_>, path: &str, index: u32, field: &str) -> Result<()> {
     let Some(component_count) = animation_path_component_count(path) else {
         return Err(engine.error(
@@ -594,16 +717,27 @@ fn validate_keyframes(engine: &Engine<'_>, keyframes: &[Keyframe], field: &str) 
     if keyframes.iter().any(|key| {
         !key.frame.is_finite()
             || !key.value.is_finite()
-            || key
-                .handle_left
-                .is_some_and(|handle| !handle[0].is_finite() || !handle[1].is_finite())
-            || key
-                .handle_right
-                .is_some_and(|handle| !handle[0].is_finite() || !handle[1].is_finite())
+            || !(key.frame as f32).is_finite()
+            || !(key.value as f32).is_finite()
+            || key.handle_left.is_some_and(|handle| {
+                !handle[0].is_finite()
+                    || !handle[1].is_finite()
+                    || !(handle[0] as f32).is_finite()
+                    || !(handle[1] as f32).is_finite()
+            })
+            || key.handle_right.is_some_and(|handle| {
+                !handle[0].is_finite()
+                    || !handle[1].is_finite()
+                    || !(handle[0] as f32).is_finite()
+                    || !(handle[1] as f32).is_finite()
+            })
     }) || keyframes.windows(2).any(|pair| {
         pair[0].frame >= pair[1].frame
+            || (pair[0].frame as f32) >= (pair[1].frame as f32)
             || !(pair[1].frame - pair[0].frame).is_finite()
             || !(pair[1].value - pair[0].value).is_finite()
+            || !((pair[1].frame - pair[0].frame) as f32).is_finite()
+            || !((pair[1].value - pair[0].value) as f32).is_finite()
     }) {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
@@ -1064,6 +1198,7 @@ mod tests {
                         ..Keyframe::default()
                     }],
                     extrapolation: Extrapolation::Constant,
+                    auto_smoothing: None,
                     modifiers: Vec::new(),
                 }],
                 ..Action::default()
@@ -1122,6 +1257,7 @@ mod tests {
                         ..Keyframe::default()
                     }],
                     extrapolation: Extrapolation::Constant,
+                    auto_smoothing: None,
                     modifiers: Vec::new(),
                 }],
                 ..Action::default()
@@ -1166,6 +1302,7 @@ mod tests {
                     index: 0,
                     keyframes: Vec::new(),
                     extrapolation: Extrapolation::Constant,
+                    auto_smoothing: None,
                     modifiers: Vec::new(),
                 }],
                 ..Action::default()
@@ -1279,6 +1416,7 @@ mod tests {
                     index: 0,
                     keyframes: Vec::new(),
                     extrapolation: Extrapolation::Constant,
+                    auto_smoothing: None,
                     modifiers: Vec::new(),
                 }],
                 ..Action::default()

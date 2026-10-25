@@ -225,6 +225,7 @@ pub(crate) fn import(file: &Path, scene_id: String) -> Result<ImportedGraph> {
     let fcurves = curves
         .into_iter()
         .map(|((bone, channel, index), keyframes)| FCurve {
+            auto_smoothing: None,
             path: format!("pose.bones[\"{bone}\"].{channel}"),
             index,
             keyframes,

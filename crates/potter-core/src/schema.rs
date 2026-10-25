@@ -71,7 +71,9 @@ fn keyframe_schema() -> Value {
             "value":{"type":"number"},
             "interpolation":{"enum":["constant", "linear", "bezier"], "default":"linear"},
             "handle_left":bezier_handle,
-            "handle_right":bezier_handle
+            "handle_right":bezier_handle,
+            "handle_left_type":{"enum":["auto","auto_clamped","vector","aligned","free"]},
+            "handle_right_type":{"enum":["auto","auto_clamped","vector","aligned","free"]}
         },
         "additionalProperties":false
     })
@@ -143,7 +145,7 @@ fn fcurve_modifier_schema() -> Value {
 }
 
 fn fcurve_schema() -> Value {
-    json!({"type":"object","required":["path","index"],"properties":{"path":{"type":"string"},"index":{"type":"integer","minimum":0,"maximum":u32::MAX},"keyframes":{"type":"array","items":{"$ref":"#/$defs/keyframe"},"default":[]},"extrapolation":{"enum":["constant","linear"],"default":"constant"},"modifiers":{"type":"array","items":{"$ref":"#/$defs/fcurve_modifier"},"default":[]}},"additionalProperties":false})
+    json!({"type":"object","required":["path","index"],"properties":{"path":{"type":"string"},"index":{"type":"integer","minimum":0,"maximum":u32::MAX},"keyframes":{"type":"array","items":{"$ref":"#/$defs/keyframe"},"default":[]},"extrapolation":{"enum":["constant","linear"],"default":"constant"},"auto_smoothing":{"enum":["none","cont_accel"],"default":"none"},"modifiers":{"type":"array","items":{"$ref":"#/$defs/fcurve_modifier"},"default":[]}},"additionalProperties":false})
 }
 
 fn action_schema() -> Value {
@@ -1821,11 +1823,20 @@ fn operation_contract(name: &str) -> OperationContract {
             json!({}),
         ),
         "keyframe.insert" => (
-            vec!["target", "path", "index", "frame", "value", "interpolation"],
+            vec![
+                "target",
+                "path",
+                "index",
+                "frame",
+                "value",
+                "interpolation",
+                "handle_left_type",
+                "handle_right_type",
+            ],
             vec!["op", "target", "path", "index", "frame", "value"],
             "object with assigned Action",
             "none",
-            json!({"interpolation":"linear"}),
+            json!({"interpolation":"linear","handle_left_type":"auto_clamped","handle_right_type":"auto_clamped"}),
         ),
         "keyframe.delete" => (
             vec!["target", "path", "index", "frame"],
@@ -2159,6 +2170,15 @@ fn operation_contract(name: &str) -> OperationContract {
 }
 
 fn field_schema(operation: &str, field: &str) -> Value {
+    if operation == "keyframe.insert" {
+        return match field {
+            "interpolation" => json!({"enum":["constant","linear","bezier"],"default":"linear"}),
+            "handle_left_type" | "handle_right_type" => {
+                json!({"enum":["auto","auto_clamped","vector","aligned","free"],"default":"auto_clamped"})
+            }
+            _ => common_field_schema(field),
+        };
+    }
     if operation == "avatar.update" && field == "set" {
         return avatar_update_set_schema();
     }
@@ -2841,7 +2861,7 @@ fn set_schema(operation: &str) -> Value {
             json!({"name":{"type":"string"},"fcurves":{"type":"array","items":{"$ref":"#/$defs/fcurve"}}})
         }
         "fcurve.update" => {
-            json!({"extrapolation":{"enum":["constant","linear"]},"modifiers":{"type":"array","items":{"$ref":"#/$defs/fcurve_modifier"}}})
+            json!({"auto_smoothing":{"enum":["none","cont_accel"]},"extrapolation":{"enum":["constant","linear"]},"modifiers":{"type":"array","items":{"$ref":"#/$defs/fcurve_modifier"}}})
         }
         "camera.update" => camera_set_properties(),
         "light.update" => light_set_properties(),

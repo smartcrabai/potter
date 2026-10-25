@@ -1,0 +1,22 @@
+{
+  "path": "transform.translation",
+  "index": 0,
+  "keyframes": [
+    {
+      "frame": 1.0,
+      "value": -2.0,
+      "interpolation": "bezier",
+      "handle_left": [-0.7, -3.5],
+      "handle_right": [2.4, 0.7]
+    },
+    {
+      "frame": 9.0,
+      "value": 5.0,
+      "interpolation": "bezier",
+      "handle_left": [7.6, 8.1],
+      "handle_right": [10.8, 4.4]
+    }
+  ],
+  "extrapolation": "constant",
+  "modifiers": []
+}

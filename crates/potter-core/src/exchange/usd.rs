@@ -3317,6 +3317,7 @@ fn import_time_samples(prim: &Prim) -> Result<Action> {
                 })
                 .collect::<Vec<_>>();
             curves.push(FCurve {
+                auto_smoothing: None,
                 path: path.to_owned(),
                 index: component as u32,
                 keyframes,

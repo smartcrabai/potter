@@ -2102,6 +2102,8 @@ pub struct FCurve {
     pub keyframes: Vec<Keyframe>,
     #[serde(default)]
     pub extrapolation: Extrapolation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_smoothing: Option<FCurveAutoSmoothing>,
     #[serde(default)]
     pub modifiers: Vec<FCurveModifier>,
 }
@@ -2132,6 +2134,25 @@ impl FCurveModifier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum FCurveAutoSmoothing {
+    #[default]
+    None,
+    ContAccel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FCurveHandleType {
+    #[default]
+    Auto,
+    AutoClamped,
+    Vector,
+    Aligned,
+    Free,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Extrapolation {
     #[default]
     Constant,
@@ -2158,6 +2179,10 @@ pub struct Keyframe {
     pub handle_left: Option<[f64; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle_right: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_left_type: Option<FCurveHandleType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_right_type: Option<FCurveHandleType>,
 }
 
 /// Blender-authored local `matrix_basis` and the fingerprint of the static state it was read from.

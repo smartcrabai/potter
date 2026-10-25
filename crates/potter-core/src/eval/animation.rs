@@ -1214,6 +1214,7 @@ mod tests {
 
     fn curve(keys: Vec<Keyframe>, extrapolation: Extrapolation) -> FCurve {
         FCurve {
+            auto_smoothing: None,
             path: "transform.translation".to_owned(),
             index: 0,
             keyframes: keys,
@@ -1234,6 +1235,7 @@ mod tests {
 
     fn ocean_time_curve(start_value: f64, end_value: f64) -> FCurve {
         FCurve {
+            auto_smoothing: None,
             path: "modifiers[\"Ocean\"].time".to_owned(),
             index: 0,
             keyframes: vec![
@@ -1317,6 +1319,7 @@ mod tests {
             Action {
                 name: "Pose".to_owned(),
                 fcurves: vec![FCurve {
+                    auto_smoothing: None,
                     path: "pose.bone_arm.translation".to_owned(),
                     index: 0,
                     keyframes: vec![

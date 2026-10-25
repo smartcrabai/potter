@@ -667,6 +667,7 @@ fn validation_reports_all_check_statuses_issue_severities_and_format_losses() {
         Action {
             name: "Invalid curve".to_owned(),
             fcurves: vec![FCurve {
+                auto_smoothing: None,
                 path: "location".to_owned(),
                 index: 0,
                 extrapolation: Extrapolation::Constant,
