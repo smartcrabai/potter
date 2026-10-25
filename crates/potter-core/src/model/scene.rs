@@ -203,11 +203,36 @@ impl SceneDoc {
         for clip in self.movie_clips.values() {
             clip.validate()?;
         }
-        for block in self.data_blocks.values() {
+        for (data_id, block) in &self.data_blocks {
             if let Some(mesh) = &block.mesh {
                 crate::geom::uv_layers::validate(mesh)?;
                 crate::geom::color_layers::validate(mesh)?;
                 crate::geom::clnor::validate(mesh)?;
+            }
+            if let Some(hair) = &block.hair_curves {
+                if !matches!(hair.selection_domain.as_str(), "POINT" | "CURVE") {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "hair Curves selection domain is invalid",
+                        json!({"data_id":data_id,"selection_domain":hair.selection_domain}),
+                    ));
+                }
+                if let Some(surface_id) = &hair.surface
+                    && !self.nodes.get(surface_id).is_some_and(|node| {
+                        node.kind == "mesh"
+                            && node
+                                .data
+                                .as_ref()
+                                .and_then(|data_id| self.data_blocks.get(data_id))
+                                .is_some_and(|data| data.mesh.is_some())
+                    })
+                {
+                    return Err(PotError::with_details(
+                        ErrorCode::SceneInvalid,
+                        "hair Curves surface must reference a mesh object",
+                        json!({"data_id":data_id,"surface":surface_id}),
+                    ));
+                }
             }
         }
         for (scene_id, scene) in &self.scenes {
@@ -3089,10 +3114,52 @@ impl Default for TextObjectData {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HairCurvesData {
     pub curves: Vec<HairCurve>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, HairCurveAttribute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<Id>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub surface_uv_map: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_mirror_x: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_mirror_y: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_mirror_z: bool,
+    #[serde(default = "default_hair_curves_selection_domain")]
+    pub selection_domain: String,
+}
+
+impl Default for HairCurvesData {
+    fn default() -> Self {
+        Self {
+            curves: Vec::new(),
+            attributes: BTreeMap::new(),
+            surface: None,
+            surface_uv_map: String::new(),
+            use_mirror_x: false,
+            use_mirror_y: false,
+            use_mirror_z: false,
+            selection_domain: default_hair_curves_selection_domain(),
+        }
+    }
+}
+
+fn default_hair_curves_selection_domain() -> String {
+    "POINT".to_owned()
+}
+
+/// A Blender Curves attribute stored in its native domain, data type, and array order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct HairCurveAttribute {
+    pub domain: String,
+    pub data_type: String,
+    pub values: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

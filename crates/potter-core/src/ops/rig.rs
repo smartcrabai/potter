@@ -2644,15 +2644,18 @@ fn validate_constraint_reference(
         }
     }
     if kind == ConstraintType::GeometryAttribute {
-        let target_is_mesh = target
+        let target_has_geometry = target
             .and_then(|target_id| engine.doc.nodes.get(target_id))
             .and_then(|node| node.data.as_ref())
             .and_then(|data_id| engine.doc.data_blocks.get(data_id))
-            .is_some_and(|data| data.mesh.is_some());
-        if !target_is_mesh {
+            .is_some_and(|data| {
+                data.mesh.is_some()
+                    || (data.data_type == "hair_curves" && data.hair_curves.is_some())
+            });
+        if !target_has_geometry {
             return Err(invalid(
                 engine,
-                "geometry_attribute requires a mesh target",
+                "geometry_attribute requires a mesh or hair-curves target",
                 target_field,
             ));
         }

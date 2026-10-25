@@ -1567,6 +1567,290 @@ print("POTTER_GEOMETRY_PARITY=" + json.dumps({{
     );
     Ok(())
 }
+
+fn import_hair_curves_project(blender: &Path, project: &Path, source: &Path) -> TestResult<Value> {
+    let init = pot().arg("init").arg(project).arg("--json").output()?;
+    assert!(
+        init.status.success(),
+        "pot init failed: {}",
+        String::from_utf8_lossy(&init.stdout)
+    );
+    let imported = pot()
+        .args(["import"])
+        .arg(project)
+        .args(["--file"])
+        .arg(source)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(blender)
+        .arg("--json")
+        .output()?;
+    assert!(
+        imported.status.success(),
+        "pot import failed: {}",
+        String::from_utf8_lossy(&imported.stdout)
+    );
+    Ok(serde_json::from_slice(&imported.stdout)?)
+}
+
+fn assert_hair_curves_inspect(project: &Path, oracle: &Value, cases: &[Value]) -> TestResult<f64> {
+    let inspected = pot()
+        .args(["inspect"])
+        .arg(project)
+        .arg("--json")
+        .output()?;
+    assert!(
+        inspected.status.success(),
+        "pot inspect failed: {}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
+    let inspected: Value = serde_json::from_slice(&inspected.stdout)?;
+    let items = inspected["result"]["items"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("pot inspect returned no node items"))?;
+    let target = items
+        .iter()
+        .find(|item| item["name"] == "GeometryAttributeTarget")
+        .ok_or_else(|| io::Error::other("Curves target is missing from pot inspect"))?;
+    let target_error = max_matrix_error(
+        blender_matrix(&target["transform"]["world"]["matrix"])?,
+        blender_matrix(&oracle["target_matrix"])?,
+    );
+    assert!(
+        target_error < 2.0e-4,
+        "Curves target matrix differs by {target_error:e}"
+    );
+    let mut maximum_error = 0.0_f64;
+    for case in cases {
+        let id = case["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("Geometry Attribute Curves owner ID is missing"))?;
+        let item = items
+            .iter()
+            .find(|item| item["name"].as_str() == Some(id))
+            .ok_or_else(|| io::Error::other(format!("pot inspect omitted owner {id}")))?;
+        let expected = blender_matrix(&oracle["matrices"][id])?;
+        let actual = blender_matrix(&item["transform"]["world"]["matrix"])?;
+        let error = max_matrix_error(actual, expected);
+        maximum_error = maximum_error.max(error);
+        assert!(
+            error < 2.0e-4,
+            "{id} Blender hair Curves Geometry Attribute matrix differs by {error:e}: Potter={actual:?}, Blender={expected:?}, case={case}"
+        );
+    }
+    Ok(maximum_error)
+}
+
+#[test]
+fn blender_geometry_attribute_hair_curve_domains_match_depsgraph() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping Geometry Attribute hair Curves parity test: Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/geometry_attribute_curve_domain.py");
+    let output = Command::new(&blender)
+        .args(["--background", "--factory-startup", "--python"])
+        .arg(fixture)
+        .arg("--")
+        .arg(root)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Blender Geometry Attribute Curves oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: Value = serde_json::from_slice(&fs::read(root.join("expected.json"))?)?;
+    let cases = oracle["cases"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("Geometry Attribute Curves oracle cases are missing"))?;
+    assert_eq!(cases.len(), 33);
+
+    let project = root.join("project");
+    let imported = import_hair_curves_project(
+        &blender,
+        &project,
+        &root.join("geometry_attribute_curves.blend"),
+    )?;
+    assert_eq!(imported["result"]["losses"], json!([]));
+    let maximum_error = assert_hair_curves_inspect(&project, &oracle, cases)?;
+
+    let roundtrip_blend = root.join("roundtrip.blend");
+    let exported = pot()
+        .args(["export"])
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&roundtrip_blend)
+        .args(["--blender"])
+        .arg(&blender)
+        .arg("--json")
+        .output()?;
+    assert!(
+        exported.status.success(),
+        "pot export failed: {}",
+        String::from_utf8_lossy(&exported.stdout)
+    );
+    let exported: Value = serde_json::from_slice(&exported.stdout)?;
+    assert_eq!(exported["result"]["losses"], json!([]));
+
+    let roundtrip_project = root.join("roundtrip_project");
+    let roundtrip_import =
+        import_hair_curves_project(&blender, &roundtrip_project, &roundtrip_blend)?;
+    assert_eq!(roundtrip_import["result"]["losses"], json!([]));
+    let roundtrip_error = assert_hair_curves_inspect(&roundtrip_project, &oracle, cases)?;
+    let roundtrip_scene: Value =
+        serde_json::from_slice(&fs::read(roundtrip_project.join("scene.json"))?)?;
+    let nodes = roundtrip_scene["nodes"]
+        .as_object()
+        .ok_or_else(|| io::Error::other("round-trip Curves scene has no nodes"))?;
+    let target_node = nodes
+        .values()
+        .find(|node| node["name"] == "GeometryAttributeTarget")
+        .ok_or_else(|| io::Error::other("round-trip Curves target is missing"))?;
+    let data_id = target_node["data"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("round-trip Curves target has no data ID"))?;
+    let hair = &roundtrip_scene["data_blocks"][data_id]["hair_curves"];
+    assert_eq!(
+        hair["attributes"]["radius"]["values"],
+        oracle["point_radii"]
+    );
+    assert!(hair["attributes"].get("radius.001").is_none());
+    assert_eq!(
+        hair["surface_uv_map"],
+        oracle["surface_binding"]["surface_uv_map"]
+    );
+    assert_eq!(
+        hair["use_mirror_x"],
+        oracle["surface_binding"]["use_mirror_x"]
+    );
+    assert!(!hair["use_mirror_y"].as_bool().unwrap_or(false));
+    assert_eq!(
+        hair["use_mirror_z"],
+        oracle["surface_binding"]["use_mirror_z"]
+    );
+    assert_eq!(
+        hair["selection_domain"],
+        oracle["surface_binding"]["selection_domain"]
+    );
+    let surface_id = hair["surface"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("round-trip Curves surface ID is missing"))?;
+    assert_eq!(
+        nodes[surface_id]["name"],
+        oracle["surface_binding"]["object"]
+    );
+    assert_hair_curves_surface_unlink(&blender, &project, root)?;
+    eprintln!(
+        "Blender 5.2.2 hair Curves Geometry Attribute CLI matrices: import max error {maximum_error:.6e}, .blend export/import max error {roundtrip_error:.6e} across 33 POINT/CURVE, type, index, mix-mode, and adapted-domain cases"
+    );
+    Ok(())
+}
+fn assert_hair_curves_surface_unlink(
+    blender: &Path,
+    project: &Path,
+    output_directory: &Path,
+) -> TestResult {
+    let scene_path = project.join("scene.json");
+    let scene: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let nodes = scene["nodes"]
+        .as_object()
+        .ok_or_else(|| io::Error::other("Geometry Attribute Curves scene has no nodes"))?;
+    let surface_id = nodes
+        .iter()
+        .find(|(_, node)| node["name"] == "GeometryAttributeSurface")
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| io::Error::other("Geometry Attribute surface mesh is missing"))?;
+    let hair_node = nodes
+        .values()
+        .find(|node| node["name"] == "GeometryAttributeTarget")
+        .ok_or_else(|| io::Error::other("Geometry Attribute Curves target is missing"))?;
+    let data_id = hair_node["data"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("Geometry Attribute Curves data ID is missing"))?
+        .to_owned();
+    assert_eq!(
+        scene["data_blocks"][&data_id]["hair_curves"]["surface"].as_str(),
+        Some(surface_id.as_str())
+    );
+
+    let operations_path = output_directory.join("delete_hair_surface.json");
+    let operations = json!({
+        "schema_version": 1,
+        "base_revision": scene["revision"],
+        "operations": [{"op":"node.delete","target":{"id":surface_id}}]
+    });
+    fs::write(&operations_path, serde_json::to_vec(&operations)?)?;
+    let applied = pot()
+        .args(["apply"])
+        .arg(project)
+        .args(["--file"])
+        .arg(&operations_path)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        applied.status.success(),
+        "deleting the hair Curves surface failed: {}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+    let applied: Value = serde_json::from_slice(&applied.stdout)?;
+    let updated_data_blocks = applied["result"]["changes"]["data_blocks"]["updated"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("node.delete returned no updated data blocks"))?;
+    assert!(
+        updated_data_blocks
+            .iter()
+            .any(|updated_id| updated_id.as_str() == Some(data_id.as_str())),
+        "node.delete did not report hair Curves data block {data_id} as updated: {updated_data_blocks:?}"
+    );
+
+    let doc: SceneDoc = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    doc.validate()?;
+    let hair_data_id = Id::new(data_id.clone())?;
+    assert!(
+        doc.data_blocks
+            .get(&hair_data_id)
+            .and_then(|block| block.hair_curves.as_ref())
+            .is_some_and(|hair| hair.surface.is_none()),
+        "node.delete retained the deleted mesh in the hair Curves surface binding"
+    );
+
+    let inspected = pot()
+        .args(["inspect"])
+        .arg(project)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        inspected.status.success(),
+        "pot inspect failed after deleting the hair Curves surface: {}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
+
+    let exported = pot()
+        .args(["export"])
+        .arg(project)
+        .args(["--format", "blend", "--out"])
+        .arg(output_directory.join("hair_surface_unlinked.blend"))
+        .args(["--blender"])
+        .arg(blender)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        exported.status.success(),
+        "pot .blend export failed after deleting the hair Curves surface: {}",
+        String::from_utf8_lossy(&exported.stdout)
+    );
+    Ok(())
+}
 #[test]
 #[expect(
     clippy::too_many_lines,

@@ -1520,12 +1520,31 @@ pub fn feature_catalog() -> Value {
             &[],
             "Evaluated geometry instances are not exposed by the current constraint evaluator.",
         ),
-        unsupported(
+        supported(
             "constraint.geometry_attribute.curve_domain",
-            "Geometry Attribute CURVE-domain sampling",
+            "Geometry Attribute POINT and CURVE-domain sampling on hair Curves data",
+            "GEOMETRY_ATTRIBUTE",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        unsupported(
+            "constraint.geometry_attribute.non_mesh_target",
+            "Geometry Attribute non-mesh geometry targets",
             "GEOMETRY_ATTRIBUTE",
             &[],
-            "The constraint target model currently samples mesh domains, not curve components.",
+            "Only mesh and hair Curves components are represented by the constraint evaluator; other target geometry components, including legacy curve and point-cloud components, are not.",
+        ),
+        unsupported(
+            "constraint.geometry_attribute.curve_domain.evaluated_modifiers",
+            "Geometry Attribute modifier-evaluated Curves targets",
+            "GEOMETRY_ATTRIBUTE",
+            &[],
+            "Active target modifiers can change the evaluated Curves component, which is not retained by the current curve-to-mesh evaluation path.",
         ),
         supported(
             "constraint.camera_solver",

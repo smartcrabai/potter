@@ -4859,6 +4859,68 @@ fn matrix_transform(matrix: DMat4) -> Result<Transform> {
     .map_err(|error| evaluation_error(error.message))
 }
 
+fn attribute_matrix_transform(matrix: DMat4) -> Result<(DVec3, DQuat, DVec3)> {
+    if !finite_matrix(matrix) {
+        return Err(evaluation_error("Geometry Attribute matrix is non-finite"));
+    }
+    let columns = [
+        matrix.x_axis.truncate(),
+        matrix.y_axis.truncate(),
+        matrix.z_axis.truncate(),
+    ];
+    let mut scale = DVec3::new(
+        columns[0].length(),
+        columns[1].length(),
+        columns[2].length(),
+    );
+    let mut rotation_basis = DMat3::from_cols(
+        columns[0].normalize_or_zero(),
+        columns[1].normalize_or_zero(),
+        columns[2].normalize_or_zero(),
+    );
+    if rotation_basis.determinant() < 0.0 {
+        rotation_basis = -rotation_basis;
+        scale = -scale;
+    }
+    let rotation = blender_euler_matrix_quaternion(rotation_basis)?;
+    Ok((matrix.w_axis.truncate(), rotation, scale))
+}
+
+fn blender_euler_matrix_quaternion(matrix: DMat3) -> Result<DQuat> {
+    let m00 = matrix.x_axis.x as f32;
+    let m01 = matrix.x_axis.y as f32;
+    let m02 = matrix.x_axis.z as f32;
+    let m11 = matrix.y_axis.y as f32;
+    let m12 = matrix.y_axis.z as f32;
+    let m21 = matrix.z_axis.y as f32;
+    let m22 = matrix.z_axis.z as f32;
+    let cy = m00.hypot(m01);
+    let (x, y, z) = if cy > 16.0 * f32::EPSILON {
+        let first = (m12.atan2(m22), (-m02).atan2(cy), m01.atan2(m00));
+        let second = ((-m12).atan2(-m22), (-m02).atan2(-cy), (-m01).atan2(-m00));
+        let first_length = first.0.abs() + first.1.abs() + first.2.abs();
+        let second_length = second.0.abs() + second.1.abs() + second.2.abs();
+        if first_length > second_length {
+            second
+        } else {
+            first
+        }
+    } else {
+        ((-m21).atan2(m11), (-m02).atan2(cy), 0.0)
+    };
+    let x = f64::from(x);
+    let y = f64::from(y);
+    let z = f64::from(z);
+    let rotation =
+        DQuat::from_rotation_z(z) * DQuat::from_rotation_y(y) * DQuat::from_rotation_x(x);
+    if !rotation.is_finite() {
+        return Err(evaluation_error(
+            "Geometry Attribute matrix rotation decomposition failed",
+        ));
+    }
+    Ok(rotation)
+}
+
 fn blend_transform(source: DMat4, target: DMat4, influence: f64) -> Result<DMat4> {
     let source = matrix_transform(source)?;
     let target = matrix_transform(target)?;
@@ -5352,6 +5414,222 @@ fn action_axis_angle(axis_angle: [f64; 4]) -> DQuat {
     }
 }
 
+fn hair_curve_attribute_value(
+    hair: &crate::model::HairCurvesData,
+    constraint: &Constraint,
+) -> Result<Value> {
+    let name = string_param(&constraint.params, "attribute_name")?;
+    let domain = string_param(&constraint.params, "domain")?;
+    let data_type = string_param(&constraint.params, "data_type")?;
+    let expected_type = match data_type {
+        "VECTOR" => "FLOAT_VECTOR",
+        "QUATERNION" => "QUATERNION",
+        "FLOAT4X4" => "FLOAT4X4",
+        _ => return Err(evaluation_error("Geometry Attribute data_type is invalid")),
+    };
+    let point_count = hair.curves.iter().try_fold(0_usize, |count, curve| {
+        count
+            .checked_add(curve.points.len())
+            .ok_or_else(|| evaluation_error("Geometry Attribute point count overflowed"))
+    })?;
+    let domain_count = match domain {
+        "POINT" => point_count,
+        "CURVE" => hair.curves.len(),
+        "INSTANCE" => {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Geometry Attribute INSTANCE-domain sampling is unsupported",
+                json!({
+                    "feature_id":"constraint.geometry_attribute.instances",
+                    "constraint_id":constraint.id,
+                }),
+            ));
+        }
+        _ => {
+            return Err(evaluation_error(
+                "Geometry Attribute domain is not present on Curves",
+            ));
+        }
+    };
+    if domain_count == 0 {
+        return Err(evaluation_error(
+            "Geometry Attribute domain has no sampleable elements",
+        ));
+    }
+    let sample_index = param_usize(&constraint.params, "sample_index")?
+        .unwrap_or(0)
+        .min(domain_count - 1);
+    let attribute = if name == "position" {
+        if data_type != "VECTOR" {
+            return Err(evaluation_error_with(
+                "Geometry Attribute domain or data type does not match the target attribute",
+                json!({"constraint_id":constraint.id,"domain":domain,"attribute_domain":"POINT","data_type":"FLOAT_VECTOR"}),
+            ));
+        }
+        None
+    } else {
+        Some(hair.attributes.get(name).ok_or_else(|| {
+            evaluation_error_with(
+                "Geometry Attribute target does not contain the requested attribute",
+                json!({"constraint_id":constraint.id,"attribute_name":name}),
+            )
+        })?)
+    };
+    let source_domain = attribute.map_or("POINT", |attribute| attribute.domain.as_str());
+    if let Some(attribute) = attribute
+        && attribute.data_type != expected_type
+    {
+        return Err(evaluation_error_with(
+            "Geometry Attribute data type does not match the target attribute",
+            json!({
+                "constraint_id":constraint.id,
+                "data_type":expected_type,
+                "attribute_data_type":attribute.data_type,
+            }),
+        ));
+    }
+    if !matches!(source_domain, "POINT" | "CURVE") {
+        return Err(evaluation_error(
+            "Geometry Attribute attribute domain is not present on Curves",
+        ));
+    }
+    let source_count = if source_domain == "POINT" {
+        point_count
+    } else {
+        hair.curves.len()
+    };
+    if let Some(attribute) = attribute
+        && attribute.values.len() != source_count
+    {
+        return Err(evaluation_error_with(
+            "Geometry Attribute value count does not match the Curves domain",
+            json!({
+                "constraint_id":constraint.id,
+                "domain":source_domain,
+                "domain_count":source_count,
+                "attribute_value_count":attribute.values.len(),
+            }),
+        ));
+    }
+    if source_domain == domain {
+        if source_domain == "POINT" && name == "position" {
+            let mut index = sample_index;
+            for curve in &hair.curves {
+                if let Some(position) = curve.points.get(index) {
+                    return Ok(json!(position));
+                }
+                index -= curve.points.len();
+            }
+            return Err(evaluation_error(
+                "Geometry Attribute point sample index is out of range",
+            ));
+        }
+        return attribute
+            .and_then(|attribute| attribute.values.get(sample_index))
+            .cloned()
+            .ok_or_else(|| {
+                evaluation_error_with(
+                    "Geometry Attribute sample index is out of range",
+                    json!({"constraint_id":constraint.id,"domain":domain,"sample_index":sample_index}),
+                )
+            });
+    }
+    if source_domain == "CURVE" {
+        let mut index = sample_index;
+        for (curve_index, curve) in hair.curves.iter().enumerate() {
+            if index < curve.points.len() {
+                return attribute
+                    .and_then(|attribute| attribute.values.get(curve_index))
+                    .cloned()
+                    .ok_or_else(|| {
+                        evaluation_error_with(
+                            "Geometry Attribute curve sample is missing",
+                            json!({"constraint_id":constraint.id,"sample_index":sample_index}),
+                        )
+                    });
+            }
+            index -= curve.points.len();
+        }
+        return Err(evaluation_error(
+            "Geometry Attribute point sample index is out of range",
+        ));
+    }
+
+    let curve = &hair.curves[sample_index];
+    if curve.points.is_empty() {
+        return Ok(match data_type {
+            "VECTOR" => json!([0.0, 0.0, 0.0]),
+            "QUATERNION" => json!([0.0, 0.0, 0.0, 1.0]),
+            "FLOAT4X4" => json!(DMat4::IDENTITY.to_cols_array()),
+            _ => return Err(evaluation_error("Geometry Attribute data_type is invalid")),
+        });
+    }
+    let point_start = hair.curves[..sample_index]
+        .iter()
+        .try_fold(0_usize, |count, curve| {
+            count
+                .checked_add(curve.points.len())
+                .ok_or_else(|| evaluation_error("Geometry Attribute point count overflowed"))
+        })?;
+    match data_type {
+        "VECTOR" => {
+            let mut total = DVec3::ZERO;
+            for point_index in point_start..point_start + curve.points.len() {
+                let vector = if name == "position" {
+                    DVec3::from_array(curve.points[point_index - point_start])
+                } else {
+                    attribute_vector3(
+                        attribute
+                            .and_then(|attribute| attribute.values.get(point_index))
+                            .ok_or_else(|| {
+                                evaluation_error("Geometry Attribute point sample is missing")
+                            })?,
+                    )?
+                };
+                total += vector;
+            }
+            Ok(json!((total / curve.points.len() as f64).to_array()))
+        }
+        "QUATERNION" => {
+            let mut total = DVec3::ZERO;
+            for point_index in point_start..point_start + curve.points.len() {
+                let value = attribute
+                    .and_then(|attribute| attribute.values.get(point_index))
+                    .ok_or_else(|| {
+                        evaluation_error("Geometry Attribute point sample is missing")
+                    })?;
+                total += attribute_quaternion(value)?.to_scaled_axis();
+            }
+            let rotation = DQuat::from_scaled_axis(total / curve.points.len() as f64);
+            Ok(json!([rotation.x, rotation.y, rotation.z, rotation.w]))
+        }
+        "FLOAT4X4" => {
+            let mut translation = DVec3::ZERO;
+            let mut rotation = DVec3::ZERO;
+            let mut scale = DVec3::ZERO;
+            for point_index in point_start..point_start + curve.points.len() {
+                let value = attribute
+                    .and_then(|attribute| attribute.values.get(point_index))
+                    .ok_or_else(|| {
+                        evaluation_error("Geometry Attribute point sample is missing")
+                    })?;
+                let (point_translation, point_rotation, point_scale) =
+                    attribute_matrix_transform(attribute_matrix(value)?)?;
+                translation += point_translation;
+                rotation += point_rotation.to_scaled_axis();
+                scale += point_scale;
+            }
+            let count = curve.points.len() as f64;
+            let matrix = DMat4::from_scale_rotation_translation(
+                scale / count,
+                DQuat::from_scaled_axis(rotation / count),
+                translation / count,
+            );
+            Ok(json!(matrix.to_cols_array()))
+        }
+        _ => Err(evaluation_error("Geometry Attribute data_type is invalid")),
+    }
+}
 fn geometry_attribute_value(
     doc: &SceneDoc,
     constraint: &Constraint,
@@ -5359,7 +5637,7 @@ fn geometry_attribute_value(
 ) -> Result<Value> {
     let target_id = constraint.target.as_ref().ok_or_else(|| {
         evaluation_error_with(
-            "Geometry Attribute constraint requires a target mesh object",
+            "Geometry Attribute constraint requires a target object",
             json!({"constraint_id":constraint.id}),
         )
     })?;
@@ -5371,14 +5649,53 @@ fn geometry_attribute_value(
     })?;
     let data_id = target_node.data.as_ref().ok_or_else(|| {
         evaluation_error_with(
-            "Geometry Attribute target has no mesh data",
+            "Geometry Attribute target has no data",
             json!({"constraint_id":constraint.id,"target":target_id}),
         )
     })?;
-    let base_mesh = doc
-        .data_blocks
-        .get(data_id)
-        .and_then(|data| data.mesh.as_ref());
+    let target_data = doc.data_blocks.get(data_id).ok_or_else(|| {
+        evaluation_error_with(
+            "Geometry Attribute target data does not exist",
+            json!({"constraint_id":constraint.id,"target":target_id,"data":data_id}),
+        )
+    })?;
+    if target_data.data_type == "hair_curves" {
+        if target_node
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.enabled && (modifier.show_viewport || modifier.show_render))
+        {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Geometry Attribute cannot sample modifier-evaluated Curves components",
+                json!({
+                    "feature_id":"constraint.geometry_attribute.curve_domain.evaluated_modifiers",
+                    "constraint_id":constraint.id,
+                    "target":target_id,
+                }),
+            ));
+        }
+        let hair = target_data.hair_curves.as_ref().ok_or_else(|| {
+            evaluation_error_with(
+                "Geometry Attribute target has no Curves geometry",
+                json!({"constraint_id":constraint.id,"target":target_id,"data":data_id}),
+            )
+        })?;
+        return hair_curve_attribute_value(hair, constraint);
+    }
+    if target_data.data_type != "mesh" {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Geometry Attribute target component is not represented by the current evaluator",
+            json!({
+                "feature_id":"constraint.geometry_attribute.non_mesh_target",
+                "constraint_id":constraint.id,
+                "target":target_id,
+                "data_type":target_data.data_type,
+            }),
+        ));
+    }
+    let base_mesh = target_data.mesh.as_ref();
     let mesh = evaluated_meshes
         .and_then(|meshes| meshes.get(target_id))
         .or(base_mesh)
@@ -5390,6 +5707,21 @@ fn geometry_attribute_value(
         })?;
     let name = string_param(&constraint.params, "attribute_name")?;
     let domain = string_param(&constraint.params, "domain")?;
+    if domain == "INSTANCE" {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Geometry Attribute INSTANCE-domain sampling is unsupported",
+            json!({
+                "feature_id":"constraint.geometry_attribute.instances",
+                "constraint_id":constraint.id,
+            }),
+        ));
+    }
+    if domain == "CURVE" {
+        return Err(evaluation_error(
+            "Geometry Attribute CURVE domain is not present on mesh targets",
+        ));
+    }
     if name == "position" && domain == "POINT" {
         let domain_count = mesh.vertices.len();
         if domain_count == 0 {
@@ -5455,21 +5787,6 @@ fn geometry_attribute_value(
                 json!({"constraint_id":constraint.id,"target":target_id,"attribute_name":name}),
             )
         })?;
-    if matches!(domain, "INSTANCE" | "CURVE") {
-        let feature_id = if domain == "INSTANCE" {
-            "constraint.geometry_attribute.instances"
-        } else {
-            "constraint.geometry_attribute.curve_domain"
-        };
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "Geometry Attribute domain is not represented by the current mesh evaluator",
-            json!({
-                "feature_id":feature_id,
-                "constraint_id":constraint.id,
-            }),
-        ));
-    }
     let domain_count = match domain {
         "POINT" => mesh.vertices.len(),
         "EDGE" => mesh.edges.len(),
@@ -5619,16 +5936,13 @@ fn attribute_quaternion(value: &Value) -> Result<DQuat> {
 
 fn attribute_matrix(value: &Value) -> Result<DMat4> {
     if let Some(components) = value.as_array().filter(|components| components.len() == 16) {
-        let values = components
-            .iter()
-            .map(Value::as_f64)
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| evaluation_error("Geometry Attribute matrix contains a non-number"))?;
-        return Ok(DMat4::from_cols_array(&[
-            values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7],
-            values[8], values[9], values[10], values[11], values[12], values[13], values[14],
-            values[15],
-        ]));
+        let mut columns = [0.0; 16];
+        for (index, component) in components.iter().enumerate() {
+            columns[index] = component.as_f64().ok_or_else(|| {
+                evaluation_error("Geometry Attribute matrix contains a non-number")
+            })?;
+        }
+        return Ok(DMat4::from_cols_array(&columns));
     }
     if let Some(rows) = value.as_array().filter(|rows| rows.len() == 4) {
         let mut columns = [0.0; 16];
