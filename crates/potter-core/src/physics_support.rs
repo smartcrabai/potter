@@ -127,7 +127,14 @@ pub(crate) fn honoured_properties(system: &str) -> &'static [&'static str] {
         "fluid_flow" => &["flow_type", "flow_behavior", "flow_source", "density"],
         "fluid_effector" => &["effector_type", "use_effector"],
         "point_cache" => &["frame_start", "frame_end"],
-        "dynamic_paint_surface" => &["surface_type", "surface_format", "frame_start", "frame_end"],
+        "dynamic_paint_surface" => &[
+            "surface_type",
+            "surface_format",
+            "frame_start",
+            "frame_end",
+            "output_name_a",
+            "use_output_a",
+        ],
         "dynamic_paint_brush" => &["paint_color", "paint_alpha", "paint_distance"],
         _ => &[],
     }

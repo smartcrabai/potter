@@ -235,6 +235,7 @@ fn multires_deformed_base(
         &node_ids,
         node_id,
         keep,
+        false,
         &driver_values,
     )?;
     let deformed = snapshot.meshes.remove(node_id).ok_or_else(|| {
