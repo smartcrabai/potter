@@ -2982,6 +2982,7 @@ fn validate_intermediate(raw: &Value) -> Result<()> {
         "collections",
         "objects",
         "meshes",
+        "hair_curves",
         "materials",
         "cameras",
         "lights",
@@ -3145,6 +3146,7 @@ fn build_imported_graph(
     let scenes = array(raw, "scenes")?;
     let objects = array(raw, "objects")?;
     let meshes = array(raw, "meshes")?;
+    let hair_curves = optional_array(raw, "hair_curves")?;
     let materials = array(raw, "materials")?;
     let cameras = array(raw, "cameras")?;
     let lights = array(raw, "lights")?;
@@ -3690,6 +3692,7 @@ fn build_imported_graph(
     }
 
     let curve_ids = import_curves(optional_array(raw, "curves")?, &mut doc, &mut mappings)?;
+    let hair_curve_ids = import_hair_curves(hair_curves, &mut doc, &mut mappings)?;
     let volume_ids = import_volumes(volumes, objects, &resource_ids, &mut doc, &mut mappings)?;
     let mut material_ids = BTreeMap::new();
     for item in materials {
@@ -3775,6 +3778,7 @@ fn build_imported_graph(
         &material_ids,
         &mut doc,
     )?;
+    import_data_material_slots(hair_curves, &hair_curve_ids, &material_ids, &mut doc)?;
     import_data_material_slots(grease_pencils, &grease_pencil_ids, &material_ids, &mut doc)?;
     import_data_material_slots(volumes, &volume_ids, &material_ids, &mut doc)?;
     let mut image_ids = BTreeMap::new();
@@ -4043,6 +4047,30 @@ fn build_imported_graph(
             "Object",
         )?;
     }
+    for item in hair_curves {
+        let surface_name = match item.get("surface") {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(name)) => name,
+            Some(_) => {
+                return Err(invalid_intermediate(
+                    "hair Curves surface is not an object name",
+                ));
+            }
+        };
+        let data_name = string_field(item, "name")?;
+        let data_id = hair_curve_ids.get(data_name).ok_or_else(|| {
+            invalid_intermediate("hair Curves surface owner has no Data-Block ID")
+        })?;
+        let surface_id = object_ids.get(surface_name).cloned().ok_or_else(|| {
+            invalid_intermediate("hair Curves surface references an unknown object")
+        })?;
+        let hair = doc
+            .data_blocks
+            .get_mut(data_id)
+            .and_then(|data| data.hair_curves.as_mut())
+            .ok_or_else(|| invalid_intermediate("hair Curves surface owner is missing"))?;
+        hair.surface = Some(surface_id);
+    }
     for (action_name, action_id) in &action_by_name {
         let mut slot_ids = BTreeMap::new();
         let mut slots = Vec::new();
@@ -4186,6 +4214,7 @@ fn build_imported_graph(
                 "LIGHT" => "light",
                 "ARMATURE" => "armature",
                 "GREASE_PENCIL" | "GREASE_PENCIL_V3" => "grease_pencil",
+                "CURVES" => "hair_curves",
                 "CURVE" => "curve",
                 "SURFACE" => "surface",
                 "FONT" => "text",
@@ -4203,6 +4232,7 @@ fn build_imported_graph(
                 data_name.and_then(|value| grease_pencil_ids.get(value))
             }
             "CURVE" | "SURFACE" | "FONT" => data_name.and_then(|value| curve_ids.get(value)),
+            "CURVES" => data_name.and_then(|value| hair_curve_ids.get(value)),
             "VOLUME" => data_name.and_then(|value| volume_ids.get(value)),
             _ => None,
         }
@@ -4239,6 +4269,7 @@ fn build_imported_graph(
                 | "ARMATURE"
                 | "GREASE_PENCIL"
                 | "GREASE_PENCIL_V3"
+                | "CURVES"
                 | "CURVE"
                 | "SURFACE"
                 | "FONT"
@@ -5008,6 +5039,7 @@ fn build_imported_graph(
     data_block_ids.extend(armature_ids.clone());
     data_block_ids.extend(grease_pencil_ids.clone());
     data_block_ids.extend(curve_ids.clone());
+    data_block_ids.extend(hair_curve_ids.clone());
     data_block_ids.extend(volume_ids.clone());
     library_registry_ids.insert("data_blocks".to_owned(), data_block_ids);
     let mut linked_resource_ids = BTreeMap::new();
@@ -6498,6 +6530,133 @@ fn import_curves(
     }
     Ok(data_ids)
 }
+fn import_hair_curves(
+    items: &[Value],
+    doc: &mut SceneDoc,
+    mappings: &mut BTreeMap<String, String>,
+) -> Result<BTreeMap<String, Id>> {
+    let mut data_ids = BTreeMap::new();
+    for item in items {
+        let name = string_field(item, "name")?;
+        let id = mapped_id(
+            item,
+            "potter_id",
+            "hair_curves",
+            name,
+            &mut data_ids,
+            mappings,
+            "Curves",
+        )?;
+        let raw_curves = optional_array(item, "curves")?;
+        let mut curves = Vec::with_capacity(raw_curves.len());
+        let mut point_count = 0_usize;
+        for raw_curve in raw_curves {
+            let points = array(raw_curve, "points")?
+                .iter()
+                .map(|point| {
+                    parse_vec3_value(point)
+                        .ok_or_else(|| invalid_intermediate("hair Curves point is invalid"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            point_count = point_count
+                .checked_add(points.len())
+                .ok_or_else(|| invalid_intermediate("hair Curves point count overflowed"))?;
+            curves.push(crate::model::HairCurve {
+                points,
+                radius: number_field(raw_curve, "radius", 0.0),
+            });
+        }
+        let curve_count = curves.len();
+        let mut attributes = BTreeMap::new();
+        for raw_attribute in optional_array(item, "attributes")? {
+            let attribute_name = string_field(raw_attribute, "name")?;
+            let domain = string_field(raw_attribute, "domain")?;
+            if !matches!(domain, "POINT" | "CURVE") {
+                return Err(invalid_intermediate(
+                    "hair Curves attribute has an unsupported domain",
+                ));
+            }
+            let data_type = string_field(raw_attribute, "data_type")?;
+            if data_type.is_empty() {
+                return Err(invalid_intermediate(
+                    "hair Curves attribute has an empty data type",
+                ));
+            }
+            let values = array(raw_attribute, "values")?;
+            let expected_count = if domain == "POINT" {
+                point_count
+            } else {
+                curve_count
+            };
+            if values.len() != expected_count {
+                return Err(invalid_intermediate(
+                    "hair Curves attribute value count does not match its domain",
+                ));
+            }
+            if attribute_name == "position" && domain == "POINT" {
+                continue;
+            }
+            if attributes
+                .insert(
+                    attribute_name.to_owned(),
+                    crate::model::HairCurveAttribute {
+                        domain: domain.to_owned(),
+                        data_type: data_type.to_owned(),
+                        values: values.to_vec(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(invalid_intermediate(
+                    "hair Curves contains a duplicate attribute name",
+                ));
+            }
+        }
+        let selection_domain = match item
+            .get("selection_domain")
+            .and_then(Value::as_str)
+            .unwrap_or("POINT")
+        {
+            domain @ ("POINT" | "CURVE") => domain.to_owned(),
+            _ => {
+                return Err(invalid_intermediate(
+                    "hair Curves selection domain is invalid",
+                ));
+            }
+        };
+        doc.data_blocks.insert(
+            id,
+            DataBlock {
+                data_type: "hair_curves".to_owned(),
+                hair_curves: Some(crate::model::HairCurvesData {
+                    curves,
+                    attributes,
+                    surface: None,
+                    surface_uv_map: item
+                        .get("surface_uv_map")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    use_mirror_x: item
+                        .get("use_mirror_x")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    use_mirror_y: item
+                        .get("use_mirror_y")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    use_mirror_z: item
+                        .get("use_mirror_z")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    selection_domain,
+                }),
+                ..DataBlock::default()
+            },
+        );
+    }
+    Ok(data_ids)
+}
 
 fn register_blend_libraries(
     raw: &Value,
@@ -6570,6 +6729,7 @@ fn register_blend_libraries(
         ("data_blocks", "armatures"),
         ("data_blocks", "grease_pencil"),
         ("data_blocks", "curves"),
+        ("data_blocks", "hair_curves"),
         ("data_blocks", "volumes"),
         ("data_blocks", "cameras"),
         ("data_blocks", "lights"),
@@ -9948,6 +10108,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 | "ARMATURE"
                 | "GREASE_PENCIL"
                 | "GREASE_PENCIL_V3"
+                | "CURVES"
                 | "CURVE"
                 | "SURFACE"
                 | "FONT"
@@ -10239,6 +10400,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     item.get("type").and_then(Value::as_str),
                     Some(
                         "meshes"
+                            | "hair_curves"
                             | "materials"
                             | "cameras"
                             | "lights"
@@ -10938,6 +11100,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 | "light"
                 | "armature"
                 | "grease_pencil"
+                | "hair_curves"
                 | "curve"
                 | "surface"
                 | "text"
@@ -11033,6 +11196,7 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 | "light"
                 | "armature"
                 | "grease_pencil"
+                | "hair_curves"
                 | "curve"
                 | "surface"
                 | "text"

@@ -223,6 +223,7 @@ fn hair_curves_evaluate_to_loose_line_edges() {
                 radius: 0.01,
             },
         ],
+        ..HairCurvesData::default()
     };
     let mesh = evaluate_hair_curves(&hair).unwrap();
     assert_eq!(mesh.vertices.len(), 5);
@@ -240,6 +241,7 @@ fn snapshot_evaluates_hair_curves_as_lines() {
             points: vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             radius: 0.02,
         }],
+        ..HairCurvesData::default()
     };
     doc.nodes.insert(
         node_id.clone(),

@@ -1284,6 +1284,23 @@ fn delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         }
         engine.mark("scenes", &scene_id, ChangeKind::Updated);
     }
+    // Blender's Curves ID walker unlinks `Curves.surface` when that object is deleted
+    // (curves.cc, curves_foreach_id).
+    let mut cleared_surfaces = Vec::new();
+    for (data_id, block) in &mut engine.doc.data_blocks {
+        if let Some(hair) = block.hair_curves.as_mut()
+            && hair
+                .surface
+                .as_ref()
+                .is_some_and(|surface| deletion.contains(surface))
+        {
+            hair.surface = None;
+            cleared_surfaces.push(data_id.clone());
+        }
+    }
+    for data_id in cleared_surfaces {
+        engine.mark("data_blocks", &data_id, ChangeKind::Updated);
+    }
     if cascade_data {
         // Blender's Curve ID walker includes taperobj in unlink traversal (curve.cc, curve_foreach_id).
 

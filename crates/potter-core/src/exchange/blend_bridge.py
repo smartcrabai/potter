@@ -1894,6 +1894,42 @@ def curve_dump(curve):
         }
     return result
 
+def hair_curves_dump(data):
+    curves = []
+    for curve in data.curves:
+        points = [plain(point.position) for point in curve.points]
+        radius = float(data.points[curve.first_point_index].radius) if curve.points_length else 0.0
+        curves.append({"points": points, "radius": radius})
+    attributes = []
+    for attribute in data.attributes:
+        if attribute.domain not in ("POINT", "CURVE"):
+            continue
+        if attribute.name == "position" and attribute.domain == "POINT":
+            continue
+        attributes.append({
+            "name": attribute.name,
+            "domain": attribute.domain,
+            "data_type": attribute.data_type,
+            "values": [_attribute_item_value(item, attribute.data_type) for item in attribute.data],
+        })
+    return {
+        "name": data.name_full,
+        "potter_id": data.get("potter.id"),
+        "library": library_reference(data),
+        "curves": curves,
+        "surface": data.surface.name_full if data.surface else None,
+        "surface_uv_map": data.surface_uv_map,
+        "use_mirror_x": bool(data.use_mirror_x),
+        "use_mirror_y": bool(data.use_mirror_y),
+        "use_mirror_z": bool(data.use_mirror_z),
+        "selection_domain": data.selection_domain,
+        "attributes": attributes,
+        "materials": _material_names(data),
+        "custom_properties": custom_props(data),
+        "fake_user": bool(data.use_fake_user),
+        "users": int(data.users),
+    }
+
 def _grease_attribute(drawing, name, color=False):
     groups = [getattr(drawing, "attributes", None)]
     if color:
@@ -2169,6 +2205,10 @@ def _set_attribute_item(item, data_type, value):
         item.color = value
     elif data_type == "QUATERNION":
         item.value = _quaternion_from_native(value)
+    elif data_type == "FLOAT4X4":
+        if len(value) == 16:
+            value = [[value[column * 4 + row] for column in range(4)] for row in range(4)]
+        item.value = Matrix(value)
     elif hasattr(item, "vector"):
         item.vector = value
     else:
@@ -3180,7 +3220,7 @@ def _startup_metadata_datablock(collection_name, block):
 
 def other_datablocks_dump():
     known = {"actions", "armatures", "cache_files", "cameras", "collections", "curves", "fonts",
-             "grease_pencils", "images", "libraries", "lights", "materials", "meshes",
+             "grease_pencils", "hair_curves", "images", "libraries", "lights", "materials", "meshes",
              "movieclips", "node_groups", "objects", "scenes", "texts", "textures", "volumes",
              "worlds"}
     result = []
@@ -3304,6 +3344,7 @@ def dump_all():
             "grease_pencil": [_grease_pencil_dump(item) for item in
                               getattr(bpy.data, "grease_pencils", ())],
             "curves": [curve_dump(item) for item in bpy.data.curves],
+            "hair_curves": [hair_curves_dump(item) for item in getattr(bpy.data, "hair_curves", ())],
             "volumes": [volume_dump(item) for item in getattr(bpy.data, "volumes", ())],
             "meshes": [mesh_dump(item) for item in bpy.data.meshes],
             "images": images_dump(),
@@ -3351,7 +3392,7 @@ def dump_all():
             "libraries": libraries_dump(),
             "node_groups": _node_groups_dump(),
             "other_datablocks": other_datablocks_dump(), "unused_datablocks": []}
-    for collection_name in ("meshes", "materials", "cameras", "lights", "actions",
+    for collection_name in ("meshes", "hair_curves", "materials", "cameras", "lights", "actions",
                             "node_groups", "volumes", "worlds"):
         for block in getattr(bpy.data, collection_name):
             if getattr(block, "users", 0) == 0 or getattr(block, "use_fake_user", False):
@@ -4569,6 +4610,7 @@ def _source_modifier_object_copies(doc, mesh_map):
 
     source_collections = (
         "actions", "armatures", "cameras", "collections", "curves",
+        "hair_curves",
         "grease_pencils", "images", "lights", "materials", "meshes",
         "node_groups", "objects", "shape_keys", "volumes", "worlds",
     )
@@ -4647,6 +4689,7 @@ def _source_modifier_object_copies(doc, mesh_map):
         bpy.data.objects.remove(source_obj, do_unlink=True)
     for collection_name in (
         "collections", "meshes", "curves", "armatures", "cameras", "lights",
+        "hair_curves",
         "grease_pencils", "volumes", "materials", "images", "node_groups",
         "shape_keys", "actions", "worlds",
     ):
@@ -5784,6 +5827,7 @@ def _load_blend_libraries(doc, target):
                     data_type = entry.get("type")
                     target_collection = {
                         "mesh": ("meshes", "Mesh"),
+                        "hair_curves": ("hair_curves", "Curves"),
                         "camera": ("cameras", "Camera"),
                         "light": ("lights", "Light"),
                         "armature": ("armatures", "Armature"),
@@ -6956,6 +7000,7 @@ def _cache_file_from_alembic(filepath, identity):
         return existing
     collection_names = (
         "objects", "collections", "actions", "armatures", "cameras", "curves",
+        "hair_curves",
         "grease_pencils", "lights", "materials", "meshes", "node_groups",
         "volumes", "worlds", "cache_files",
     )
@@ -7140,6 +7185,48 @@ def _curve_data_create(name, data_id, item, source, doc, target, pack):
     if source.get("fake_user"):
         curve.use_fake_user = True
     return curve
+
+
+def _hair_curves_create(name, data_id, raw, source):
+    data = bpy.data.hair_curves.new(name)
+    curves = raw.get("curves", [])
+    point_counts = [len(curve.get("points", [])) for curve in curves]
+    if point_counts:
+        data.add_curves(point_counts)
+    for curve, source_curve in zip(data.curves, curves):
+        points = source_curve.get("points", [])
+        radius = float(source_curve.get("radius", 0.0))
+        for point, position in zip(curve.points, points):
+            point.position = position
+            point.radius = radius
+    data.surface_uv_map = raw.get("surface_uv_map", "")
+    data.use_mirror_x = bool(raw.get("use_mirror_x", False))
+    data.use_mirror_y = bool(raw.get("use_mirror_y", False))
+    data.use_mirror_z = bool(raw.get("use_mirror_z", False))
+    data.selection_domain = raw.get("selection_domain", "POINT")
+    for name, source_attribute in raw.get("attributes", {}).items():
+        domain = source_attribute.get("domain")
+        data_type = source_attribute.get("data_type")
+        if name == "position" and domain == "POINT":
+            continue
+        if domain not in ("POINT", "CURVE") or not data_type:
+            raise ValueError("hair Curves attribute %s has an unsupported domain or type" % name)
+        attribute = data.attributes.get(name)
+        if attribute is None:
+            attribute = data.attributes.new(name=name, type=data_type, domain=domain)
+        elif attribute.domain != domain or attribute.data_type != data_type:
+            raise ValueError("hair Curves attribute %s conflicts with built-in domain or type" % name)
+        values = source_attribute.get("values", [])
+        if len(values) != len(attribute.data):
+            raise ValueError("hair Curves attribute %s has %d values for %d elements"
+                             % (name, len(values), len(attribute.data)))
+        for index, value in enumerate(values):
+            _set_attribute_item(attribute.data[index], data_type, value)
+    set_id(data, data_id)
+    set_props(data, source.get("custom_properties", {}))
+    if source.get("fake_user"):
+        data.use_fake_user = True
+    return data
 
 
 def _restore_constraints(obj, sources, id_lookup, doc, target):
@@ -8310,6 +8397,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             bpy.data.collections.remove(collection)
     for collection_name in (
         "actions", "armatures", "cameras", "curves", "grease_pencils",
+        "hair_curves",
         "images", "lights", "materials", "meshes", "node_groups", "textures", "volumes", "worlds",
     ):
         collection = getattr(bpy.data, collection_name, None)
@@ -8537,6 +8625,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                  if data_raw[identifier].get("type") == "light"}
     curve_map = {identifier: block for identifier, block in linked_data_blocks.items()
                  if data_raw[identifier].get("type") in ("curve", "surface", "text")}
+    hair_curves_map = {identifier: block for identifier, block in linked_data_blocks.items()
+                       if data_raw[identifier].get("type") == "hair_curves"}
     volume_map = {identifier: block for identifier, block in linked_data_blocks.items()
                   if data_raw[identifier].get("type") == "volume"}
     for data_id, item in data_raw.items():
@@ -8583,6 +8673,11 @@ def export_doc(doc, target, pack, scene_hash, context):
             name = compatibility_name(doc, "Curve", data_id, source.get("name", data_id))
             curve_map[data_id] = _curve_data_create(
                 name, data_id, item, source, doc, target, pack)
+        elif item.get("type") == "hair_curves":
+            source = compatibility_block(doc, "hair_curves", "Curves", data_id)
+            name = compatibility_name(doc, "Curves", data_id, source.get("name", data_id))
+            hair_curves_map[data_id] = _hair_curves_create(
+                name, data_id, item.get("hair_curves") or {}, source)
         elif item.get("type") == "volume":
             source = compatibility_block(doc, "volumes", "Volume", data_id)
             name = compatibility_name(doc, "Volume", data_id, source.get("name", data_id))
@@ -8741,7 +8836,7 @@ def export_doc(doc, target, pack, scene_hash, context):
             mat.use_fake_user = True
         material_map[material_id] = mat
     data_blocks_by_id = {
-        **mesh_map, **curve_map, **grease_pencil_map, **volume_map
+        **mesh_map, **curve_map, **hair_curves_map, **grease_pencil_map, **volume_map
     }
     _restore_data_materials(data_raw, data_blocks_by_id, material_map, linked_data_blocks)
     materials_by_name = {material.name_full: material for material in material_map.values()}
@@ -8788,6 +8883,10 @@ def export_doc(doc, target, pack, scene_hash, context):
             obj_data = curve_map.get(data_id)
             if obj_data is None:
                 raise ValueError("curve object references missing curve data %s" % data_id)
+        elif kind == "hair_curves" or native_type == "CURVES":
+            obj_data = hair_curves_map.get(data_id)
+            if obj_data is None:
+                raise ValueError("hair Curves object references missing data %s" % data_id)
         elif kind == "volume" or native_type == "VOLUME":
             obj_data = volume_map.get(data_id)
             if obj_data is None:
@@ -8910,6 +9009,16 @@ def export_doc(doc, target, pack, scene_hash, context):
                     mesh_source["shape_keys"] = {}
                 _restore_shape_keys(obj, mesh_source)
                 shape_key_meshes.add(data_id)
+    for data_id, item in data_raw.items():
+        if item.get("type") != "hair_curves" or data_id in linked_data_blocks:
+            continue
+        surface_id = (item.get("hair_curves") or {}).get("surface")
+        if surface_id is None:
+            continue
+        surface = object_map.get(surface_id)
+        if surface is None or surface.type != "MESH":
+            raise ValueError("hair Curves surface references missing mesh object %s" % surface_id)
+        hair_curves_map[data_id].surface = surface
     taper_objects_by_data = {}
     for node_id, item in doc.get("nodes", {}).items():
         data_id = item.get("data")
@@ -8941,7 +9050,7 @@ def export_doc(doc, target, pack, scene_hash, context):
     object_lookup = {obj.name_full: obj for obj in object_map.values()}
     id_lookup = {}
     for collection in (mesh_map, camera_map, light_map, armature_map, grease_pencil_map,
-                       world_map, material_map, collection_map):
+                       hair_curves_map, world_map, material_map, collection_map):
         id_lookup.update({block.name_full: block for block in collection.values()})
     # Objects override same-named data blocks: compatibility references with
     # id_type "Object" must resolve to the Object, not identically-named data.
