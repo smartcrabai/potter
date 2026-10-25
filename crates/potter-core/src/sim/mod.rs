@@ -11,7 +11,10 @@ pub mod particles;
 pub mod softbody;
 mod solver;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use glam::{DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
@@ -413,12 +416,14 @@ fn scene_members(doc: &SceneDoc, scene_id: &Id) -> Result<BTreeSet<Id>> {
 pub(crate) fn evaluate_stack_modifier(
     doc: &SceneDoc,
     scene_id: &Id,
+    view_layer: Option<&Id>,
     node_id: &Id,
     modifier: &Modifier,
     input_mesh: Mesh,
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
     scene_hash: &str,
+    dynamic_paint_holds: &mut DynamicPaintHoldCache,
     gate: ModifierGate<'_>,
 ) -> Result<StackModifierResult> {
     let cache_directory = gate.context.cache_directory;
@@ -547,7 +552,7 @@ pub(crate) fn evaluate_stack_modifier(
         )
     })?;
     let members = scene_members(doc, scene_id)?;
-    let context = FrameContext::new(doc, scene_id, frame, matrices, &members, gate)?;
+    let context = FrameContext::new(doc, scene_id, view_layer, frame, matrices, &members, gate)?;
     let mut mesh = input_mesh;
     let mut particles = None;
     match system {
@@ -610,28 +615,67 @@ pub(crate) fn evaluate_stack_modifier(
             }
         }
         "dynamic_paint" if setting_string(settings, "role").unwrap_or("canvas") == "canvas" => {
-            let colors = paint_canvas(&context, node_id, &mesh, settings)?;
-            let values = mesh
-                .vertices
+            let modifier_prefix = node
+                .modifiers
                 .iter()
-                .zip(&colors)
-                .map(|(vertex, color)| (format!("v{}", vertex.id), json!(color)))
-                .collect::<serde_json::Map<_, _>>();
-            mesh.attributes.insert(
-                "color".to_owned(),
-                json!({"domain":"vertices","values":values}),
-            );
+                .position(|candidate| candidate.id == modifier.id)
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::InternalError,
+                        "dynamic-paint modifier is missing from its owner stack",
+                        json!({"node_id":node_id,"modifier_id":modifier.id}),
+                    )
+                })?;
+            let output = paint_canvas(
+                &context,
+                node_id,
+                &mesh,
+                settings,
+                DynamicPaintEvaluation {
+                    scene_hash,
+                    modifier_prefix,
+                    stack_mesh_is_current: true,
+                    hold_cache: dynamic_paint_holds,
+                },
+            )?;
             if setting_string(settings, "surface_format") == Some("weight") {
-                let values = mesh
+                let color_values = mesh
                     .vertices
                     .iter()
-                    .zip(&colors)
+                    .zip(output.colors.iter())
+                    .map(|(vertex, color)| (format!("v{}", vertex.id), json!(color)))
+                    .collect::<serde_json::Map<_, _>>();
+                mesh.attributes.insert(
+                    "color".to_owned(),
+                    json!({"domain":"vertices","values":color_values}),
+                );
+                let weight_values = mesh
+                    .vertices
+                    .iter()
+                    .zip(output.colors.iter())
                     .map(|(vertex, color)| (format!("v{}", vertex.id), json!(color[3])))
                     .collect::<serde_json::Map<_, _>>();
                 mesh.attributes.insert(
                     "weight".to_owned(),
-                    json!({"domain":"vertices","type":"float","values":values}),
+                    json!({"domain":"vertices","type":"float","values":weight_values}),
                 );
+            } else if let Some(name) = output.output_name {
+                let domain = if settings
+                    .get("canvas_surfaces")
+                    .and_then(Value::as_array)
+                    .and_then(|surfaces| surfaces.first())
+                    .is_some()
+                {
+                    crate::geom::color_layers::ColorDomain::Corner
+                } else {
+                    crate::geom::color_layers::ColorDomain::Point
+                };
+                write_dynamic_paint_color_layer(
+                    &mut mesh,
+                    &name,
+                    output.colors.as_slice(),
+                    domain,
+                )?;
             }
         }
         "dynamic_paint" | "collision" => {}
@@ -739,9 +783,11 @@ fn set_vertex_positions(mesh: &mut Mesh, positions: Vec<DVec3>, node_id: &Id) ->
 pub(crate) fn evaluate(
     doc: &SceneDoc,
     scene_id: &Id,
+    view_layer: Option<&Id>,
     frame: f64,
     base_world_matrices: &BTreeMap<Id, DMat4>,
     scene_hash: &str,
+    dynamic_paint_holds: &mut DynamicPaintHoldCache,
     gate: ModifierGate<'_>,
 ) -> Result<Option<SimulationResult>> {
     let cache_directory = gate.context.cache_directory;
@@ -797,7 +843,17 @@ pub(crate) fn evaluate(
     }) {
         return Ok(result);
     }
-    let physics = evaluate_physics(doc, scene_id, frame, base_world_matrices, &members, gate)?;
+    let physics = evaluate_physics(
+        doc,
+        scene_id,
+        view_layer,
+        frame,
+        base_world_matrices,
+        &members,
+        scene_hash,
+        dynamic_paint_holds,
+        gate,
+    )?;
     let mut result = result.unwrap_or_else(|| empty_result(key.clone()));
     result.cache_key.clone_from(&key);
     result.deformed_vertices = physics.deformed_vertices;
@@ -850,12 +906,15 @@ fn empty_result(key: String) -> SimulationResult {
 fn evaluate_physics(
     doc: &SceneDoc,
     scene_id: &Id,
+    view_layer: Option<&Id>,
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
     members: &BTreeSet<Id>,
+    scene_hash: &str,
+    dynamic_paint_holds: &mut DynamicPaintHoldCache,
     gate: ModifierGate<'_>,
 ) -> Result<PhysicsResult> {
-    let context = FrameContext::new(doc, scene_id, frame, matrices, members, gate)?;
+    let context = FrameContext::new(doc, scene_id, view_layer, frame, matrices, members, gate)?;
     let force_fields = force_field_inputs(doc, matrices, members)?;
     let mut result = PhysicsResult {
         fluid_warnings: Vec::new(),
@@ -987,12 +1046,37 @@ fn evaluate_physics(
         if let Some(settings) = node.properties.get("physics_dynamic_paint")
             && gate.is_property_active(id, node, "physics_dynamic_paint", "dynamic_paint")
             && setting_string(settings, "role").unwrap_or("canvas") == "canvas"
-            && active_modifier(id, node, "dynamic_paint", gate).is_some()
+            && let Some(modifier) = active_modifier(id, node, "dynamic_paint", gate)
         {
+            let modifier_prefix = node
+                .modifiers
+                .iter()
+                .position(|candidate| candidate.id == modifier.id)
+                .ok_or_else(|| {
+                    PotError::with_details(
+                        ErrorCode::InternalError,
+                        "dynamic-paint modifier is missing from its owner stack",
+                        json!({"node_id":id,"modifier_id":modifier.id}),
+                    )
+                })?;
             let canvas = mesh_for_node(doc, node, id)?;
-            let colors = paint_canvas(&context, id, canvas, settings)?;
-            if colors.len() != canvas.vertices.len()
-                || colors.iter().flatten().any(|value| !value.is_finite())
+            let output = paint_canvas(
+                &context,
+                id,
+                canvas,
+                settings,
+                DynamicPaintEvaluation {
+                    scene_hash,
+                    modifier_prefix,
+                    stack_mesh_is_current: false,
+                    hold_cache: dynamic_paint_holds,
+                },
+            )?;
+            if output
+                .colors
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite())
             {
                 return Err(PotError::new(
                     ErrorCode::EvaluationFailed,
@@ -1001,12 +1085,15 @@ fn evaluate_physics(
             }
             match setting_string(settings, "surface_format").unwrap_or("color") {
                 "color" => {
-                    result.paint_colors.insert(id.clone(), colors);
+                    result
+                        .paint_colors
+                        .insert(id.clone(), output.colors.as_ref().clone());
                 }
                 "weight" => {
-                    result
-                        .paint_weights
-                        .insert(id.clone(), colors.iter().map(|color| color[3]).collect());
+                    result.paint_weights.insert(
+                        id.clone(),
+                        output.colors.iter().map(|color| color[3]).collect(),
+                    );
                 }
                 _ => {
                     return Err(PotError::with_details(
@@ -1521,6 +1608,8 @@ fn effective_scene_gravity(scene: &crate::model::Scene) -> DVec3 {
 #[derive(Clone, Copy)]
 struct FrameContext<'a> {
     doc: &'a SceneDoc,
+    scene_id: &'a Id,
+    view_layer: Option<&'a Id>,
     matrices: &'a BTreeMap<Id, DMat4>,
     members: &'a BTreeSet<Id>,
     gate: ModifierGate<'a>,
@@ -1533,7 +1622,8 @@ struct FrameContext<'a> {
 impl<'a> FrameContext<'a> {
     fn new(
         doc: &'a SceneDoc,
-        scene_id: &Id,
+        scene_id: &'a Id,
+        view_layer: Option<&'a Id>,
         frame: f64,
         matrices: &'a BTreeMap<Id, DMat4>,
         members: &'a BTreeSet<Id>,
@@ -1558,6 +1648,8 @@ impl<'a> FrameContext<'a> {
             .map_or(0, |world| world.seed);
         Ok(Self {
             doc,
+            scene_id,
+            view_layer,
             matrices,
             members,
             gate,
@@ -1893,6 +1985,22 @@ struct DynamicPaintBrush {
     color: [f64; 4],
     strength: f64,
 }
+#[derive(Debug, Default)]
+pub(crate) struct DynamicPaintHoldCache {
+    entries: BTreeMap<String, DynamicPaintHold>,
+}
+
+#[derive(Debug)]
+struct DynamicPaintHold {
+    vertex_ids: Vec<u32>,
+    output: DynamicPaintOutput,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicPaintOutput {
+    output_name: Option<String>,
+    colors: Arc<Vec<[f64; 4]>>,
+}
 
 /// Brushes that paint a canvas: its explicit `brushes` list, or every scene brush.
 ///
@@ -2008,49 +2116,63 @@ fn dynamic_paint_brush_settings(
     Ok(brushes)
 }
 
-/// The frame a canvas paints at, or `None` before it paints. Blender's dynamic paint does not evaluate
-/// a surface before its `frame_start` (`dynamicPaint_frameUpdate` reads the cache there), so the canvas
-/// keeps its geometry and is unpainted. After `frame_end` Blender holds the surface's end state, which
-/// Potter reproduces by evaluating the brushes at `frame_end`. A canvas paints when any of its surfaces
-/// has started; the first started surface in order sets the frame.
-fn canvas_paint_frame(canvas: &Value, frame: f64) -> Result<Option<f64>> {
-    let Some(surfaces) = canvas.get("canvas_surfaces") else {
-        return Ok(Some(frame));
-    };
-    let surfaces = surfaces.as_array().ok_or_else(|| {
-        PotError::invalid_argument("dynamic-paint canvas_surfaces must be an array")
-    })?;
-    if surfaces.is_empty() {
-        return Ok(Some(frame));
+fn surface_paint_frame(surface: &Value, frame: f64) -> Result<Option<f64>> {
+    let start = setting_number(
+        surface,
+        "frame_start",
+        1.0,
+        "dynamic-paint surface",
+        "a finite number",
+    )?;
+    let end = setting_number(
+        surface,
+        "frame_end",
+        250.0,
+        "dynamic-paint surface",
+        "a finite number",
+    )?;
+    if start > end || frame < start {
+        Ok(None)
+    } else {
+        Ok(Some(frame.min(end)))
     }
-    for surface in surfaces {
-        let start = setting_number(
-            surface,
-            "frame_start",
-            1.0,
-            "dynamic-paint surface",
-            "a finite number",
-        )?;
-        let end = setting_number(
-            surface,
-            "frame_end",
-            250.0,
-            "dynamic-paint surface",
-            "a finite number",
-        )?;
-        if frame >= start {
-            return Ok(Some(frame.min(end)));
-        }
-    }
-    Ok(None)
 }
 
-/// World matrices of the scene at `frame`, with the drivers evaluated there (as `ops/node.rs` does).
-/// Brush transforms are evaluated without evaluated meshes, so a brush whose constraint depends on a
-/// mesh uses its transform without that mesh.
-fn scene_world_matrices_at(doc: &SceneDoc, frame: f64) -> Result<BTreeMap<Id, DMat4>> {
-    let drivers = crate::eval::rig::evaluate_drivers(doc, frame)?;
-    crate::eval::rig::evaluate_world_matrices_with_drivers(doc, frame, &drivers)
+fn validate_dynamic_paint_point_cache(surface: &Value) -> Result<()> {
+    let Some(cache) = surface.get("point_cache") else {
+        return Ok(());
+    };
+    if !cache.is_object() {
+        return Err(PotError::invalid_argument(
+            "dynamic-paint point_cache must be an object",
+        ));
+    }
+    physics_support::reject_unhonoured(
+        "point_cache",
+        cache,
+        physics_support::honoured_properties("point_cache"),
+    )
+}
+
+/// World matrices at a held paint frame, using the same resources and scene timing as its outer evaluation.
+fn scene_world_matrices_at(context: &FrameContext<'_>, frame: f64) -> Result<BTreeMap<Id, DMat4>> {
+    let drivers = crate::eval::rig::evaluate_drivers(context.doc, frame)?;
+    let scene = context.doc.scenes.get(context.scene_id).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneNotFound,
+            format!("scene `{}` was not found", context.scene_id),
+        )
+    })?;
+    let mut session = crate::eval::EvaluationSession::default();
+    crate::eval::rig::evaluate_world_matrices_with_resources(
+        context.doc,
+        frame,
+        &drivers,
+        context.gate.context.project_root,
+        scene.fps,
+        scene.fps_base,
+        &mut session,
+    )
 }
 
 fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
@@ -2060,6 +2182,12 @@ fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
     let surfaces = surfaces.as_array().ok_or_else(|| {
         PotError::invalid_argument("dynamic-paint canvas_surfaces must be an array")
     })?;
+    if surfaces.len() > 1 {
+        return Err(unsupported_feature(
+            "physics.dynamic_paint_canvas.canvas_surfaces",
+            "multiple Blender dynamic-paint surfaces have independent frame caches and output layers; Potter can evaluate only one surface per canvas",
+        ));
+    }
     for surface in surfaces {
         physics_support::reject_unhonoured(
             "dynamic_paint_surface",
@@ -2078,33 +2206,303 @@ fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
                 "surface_format",
             ));
         }
-        point_cache_window(surface)?;
+        validate_dynamic_paint_point_cache(surface)?;
     }
     Ok(())
 }
 
-/// Per-vertex RGBA colours that the canvas's dynamic-paint settings produce at the context frame, or at
-/// the surface's `frame_end` once the context frame has passed it.
+fn validate_dynamic_paint_wet_output(
+    context: &FrameContext<'_>,
+    canvas_id: &Id,
+    canvas: &Mesh,
+    settings: &Value,
+) -> Result<()> {
+    let Some(surface) = settings
+        .get("canvas_surfaces")
+        .and_then(Value::as_array)
+        .and_then(|surfaces| surfaces.first())
+    else {
+        return Ok(());
+    };
+    let output_name = setting_string(surface, "output_name_b").unwrap_or("dp_wetmap");
+    if output_name.is_empty() {
+        return Ok(());
+    }
+    let has_layer = |mesh: &Mesh| {
+        crate::geom::color_layers::read(mesh)
+            .layers
+            .iter()
+            .any(|layer| layer.name == output_name)
+    };
+    let source_has_layer = context
+        .doc
+        .nodes
+        .get(canvas_id)
+        .and_then(|node| node.data.as_ref())
+        .and_then(|data_id| context.doc.data_blocks.get(data_id))
+        .and_then(|data| data.mesh.as_ref())
+        .is_some_and(has_layer);
+    if has_layer(canvas) || source_has_layer {
+        return Err(physics_support::unsupported_property(
+            "dynamic_paint_surface",
+            "output_name_b",
+        ));
+    }
+    Ok(())
+}
+
+fn dynamic_paint_output_name(settings: &Value) -> Option<String> {
+    let surface = settings
+        .get("canvas_surfaces")
+        .and_then(Value::as_array)
+        .and_then(|surfaces| surfaces.first());
+    let name = match surface {
+        Some(surface) => setting_string(surface, "output_name_a").unwrap_or("dp_paintmap"),
+        None if setting_string(settings, "surface_format") == Some("weight") => "weight",
+        None => "color",
+    };
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn dynamic_paint_canvas_snapshot(
+    context: &FrameContext<'_>,
+    canvas_id: &Id,
+    frame: f64,
+    modifier_prefix: usize,
+) -> Result<crate::eval::Snapshot> {
+    let driver_values = crate::eval::rig::evaluate_drivers(context.doc, frame)?;
+    let nodes = BTreeSet::from([canvas_id.clone()]);
+    crate::eval::Snapshot::evaluate_nodes_with_modifier_prefix_with_cache(
+        context.doc,
+        &crate::eval::EvaluationContext {
+            scene_id: Some(context.scene_id.clone()),
+            view_layer: context.view_layer.cloned(),
+            frame: Some(frame),
+            purpose: context.gate.context.purpose,
+            ..crate::eval::EvaluationContext::default()
+        },
+        context.gate.context.project_root,
+        context.gate.context.cache_directory,
+        &nodes,
+        canvas_id,
+        modifier_prefix,
+        true,
+        &driver_values,
+    )
+}
+
+fn dynamic_paint_canvas_with_shape_keys(
+    context: &FrameContext<'_>,
+    canvas_id: &Id,
+    canvas: &Mesh,
+) -> Result<Option<Mesh>> {
+    let node = context.doc.nodes.get(canvas_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::TargetNotFound,
+            "dynamic-paint canvas Object was not found",
+            json!({"node_id":canvas_id}),
+        )
+    })?;
+    let data_id = node.data.as_ref().ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "dynamic-paint canvas Data-Block is missing",
+            json!({"node_id":canvas_id}),
+        )
+    })?;
+    let data_block = context.doc.data_blocks.get(data_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "dynamic-paint canvas Data-Block was not found",
+            json!({"node_id":canvas_id,"data_id":data_id}),
+        )
+    })?;
+    let Some(shape_keys) = data_block.shape_keys.as_ref() else {
+        return Ok(None);
+    };
+    let drivers = crate::eval::rig::evaluate_drivers(context.doc, context.frame)?;
+    let values = crate::eval::rig::evaluate_shape_key_values(
+        canvas_id,
+        node,
+        shape_keys,
+        context.doc,
+        context.frame,
+        &drivers,
+    )?;
+    let mut mesh = canvas.clone();
+    crate::eval::rig::apply_shape_keys_with_values(&mut mesh, shape_keys, data_block, &values)?;
+    Ok(Some(mesh))
+}
+
+fn same_vertex_layout(left: &Mesh, right: &Mesh) -> bool {
+    left.vertices.len() == right.vertices.len()
+        && left
+            .vertices
+            .iter()
+            .zip(&right.vertices)
+            .all(|(left, right)| left.id == right.id)
+}
+
+fn same_vertex_ids(mesh: &Mesh, vertex_ids: &[u32]) -> bool {
+    mesh.vertices.len() == vertex_ids.len()
+        && mesh
+            .vertices
+            .iter()
+            .zip(vertex_ids)
+            .all(|(vertex, id)| vertex.id == *id)
+}
+
+fn dynamic_paint_topology_error() -> PotError {
+    unsupported_feature(
+        "physics.dynamic_paint_surface.topology",
+        "the canvas topology changes between frame_end and the requested frame, so held paint values cannot be mapped to vertices",
+    )
+}
+
+fn validate_dynamic_paint_held_mesh(current: &Mesh, held: &Mesh) -> Result<()> {
+    if same_vertex_layout(current, held) {
+        Ok(())
+    } else {
+        Err(dynamic_paint_topology_error())
+    }
+}
+
+fn validate_dynamic_paint_held_layout(current: &Mesh, held_vertex_ids: &[u32]) -> Result<()> {
+    if same_vertex_ids(current, held_vertex_ids) {
+        Ok(())
+    } else {
+        Err(dynamic_paint_topology_error())
+    }
+}
+
+fn dynamic_paint_hold_cache_key(
+    context: &FrameContext<'_>,
+    canvas_id: &Id,
+    scene_hash: &str,
+    frame_end: f64,
+    modifier_prefix: usize,
+) -> Result<String> {
+    let input = json!({
+        "build_identity": crate::BUILD_IDENTITY,
+        "scene_hash": scene_hash,
+        "scene_id": context.scene_id,
+        "view_layer": context.view_layer,
+        "purpose": context.gate.context.purpose,
+        "suppressed_nodes": context.gate.suppressed,
+        "project_root": context.gate.context.project_root.map(|path| path.to_string_lossy().into_owned()),
+        "cache_directory": context.gate.context.cache_directory.map(|path| path.to_string_lossy().into_owned()),
+        "canvas_id": canvas_id,
+        "frame_end": frame_end,
+        "modifier_prefix": modifier_prefix,
+        "suppress_dynamic_paint": true,
+    });
+    Ok(crate::hash::sha256(&crate::hash::canonicalize(&input)?))
+}
+
+struct DynamicPaintEvaluation<'a> {
+    scene_hash: &'a str,
+    modifier_prefix: usize,
+    stack_mesh_is_current: bool,
+    hold_cache: &'a mut DynamicPaintHoldCache,
+}
+
+/// Colors use the canvas mesh and brushes at the surface's clamped frame. Blender holds the
+/// per-vertex result at `frame_end`, even when upstream modifiers keep deforming the stack mesh.
 fn paint_canvas(
     context: &FrameContext<'_>,
     canvas_id: &Id,
     canvas: &Mesh,
     settings: &Value,
-) -> Result<Vec<[f64; 4]>> {
+    evaluation: DynamicPaintEvaluation<'_>,
+) -> Result<DynamicPaintOutput> {
     validate_dynamic_paint_canvas(settings)?;
-    let Some(paint_frame) = canvas_paint_frame(settings, context.frame)? else {
-        return Ok(vec![[0.0; 4]; canvas.vertices.len()]);
+    validate_dynamic_paint_wet_output(context, canvas_id, canvas, settings)?;
+    let DynamicPaintEvaluation {
+        scene_hash,
+        modifier_prefix,
+        stack_mesh_is_current,
+        hold_cache,
+    } = evaluation;
+    let surface = settings
+        .get("canvas_surfaces")
+        .and_then(Value::as_array)
+        .and_then(|surfaces| surfaces.first());
+    let paint_frame = match surface {
+        Some(surface) => surface_paint_frame(surface, context.frame)?,
+        None => Some(context.frame),
+    };
+    let geometry_frame = paint_frame.unwrap_or(context.frame);
+    let frame_end = surface
+        .map(|surface| {
+            setting_number(
+                surface,
+                "frame_end",
+                250.0,
+                "dynamic-paint surface",
+                "a finite number",
+            )
+        })
+        .transpose()?;
+    let cache_key = match (paint_frame, frame_end) {
+        (Some(paint_frame), Some(frame_end)) if paint_frame < context.frame => {
+            Some(dynamic_paint_hold_cache_key(
+                context,
+                canvas_id,
+                scene_hash,
+                frame_end,
+                modifier_prefix,
+            )?)
+        }
+        _ => None,
+    };
+    if let Some(held) = cache_key
+        .as_ref()
+        .and_then(|key| hold_cache.entries.get(key))
+    {
+        if stack_mesh_is_current {
+            validate_dynamic_paint_held_layout(canvas, &held.vertex_ids)?;
+        }
+        return Ok(held.output.clone());
+    }
+    let held_frame = paint_frame.is_some_and(|frame| frame < context.frame);
+    let needs_frame_mesh =
+        paint_frame.is_some() && (held_frame || (!stack_mesh_is_current && modifier_prefix > 0));
+    let frame_mesh = if needs_frame_mesh {
+        let mut snapshot =
+            dynamic_paint_canvas_snapshot(context, canvas_id, geometry_frame, modifier_prefix)?;
+        Some(snapshot.meshes.remove(canvas_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint canvas mesh is missing at its paint frame",
+                json!({"node_id":canvas_id,"frame":geometry_frame}),
+            )
+        })?)
+    } else if paint_frame == Some(context.frame) && !stack_mesh_is_current && modifier_prefix == 0 {
+        dynamic_paint_canvas_with_shape_keys(context, canvas_id, canvas)?
+    } else {
+        None
+    };
+    let paint_mesh = frame_mesh.as_ref().unwrap_or(canvas);
+    if stack_mesh_is_current && paint_frame.is_some_and(|frame| frame < context.frame) {
+        validate_dynamic_paint_held_mesh(canvas, paint_mesh)?;
+    }
+    let output_name = dynamic_paint_output_name(settings);
+    let Some(paint_frame) = paint_frame else {
+        return Ok(DynamicPaintOutput {
+            output_name,
+            colors: Arc::new(vec![[0.0; 4]; paint_mesh.vertices.len()]),
+        });
     };
     let paint_matrices;
-    let paint_context = if paint_frame >= context.frame {
-        *context
-    } else {
-        paint_matrices = scene_world_matrices_at(context.doc, paint_frame)?;
+    let paint_context = if paint_frame < context.frame {
+        paint_matrices = scene_world_matrices_at(context, paint_frame)?;
         FrameContext {
             frame: paint_frame,
             matrices: &paint_matrices,
             ..*context
         }
+    } else {
+        *context
     };
     let matrix = paint_context
         .matrices
@@ -2117,64 +2515,170 @@ fn paint_canvas(
                 json!({"node_id":canvas_id}),
             )
         })?;
-    let context = &paint_context;
-    let brushes = dynamic_paint_brush_settings(context, settings)?;
-    if brushes.is_empty() {
-        return dynamic_paint::paint(
-            canvas,
+    let brushes = dynamic_paint_brush_settings(&paint_context, settings)?;
+    let colors = if brushes.is_empty() {
+        dynamic_paint::paint(
+            paint_mesh,
             matrix,
             &[],
             setting_f64(settings, "radius").unwrap_or(1.0),
             setting_color(settings).unwrap_or([1.0, 0.0, 0.0, 1.0]),
             setting_f64(settings, "strength").unwrap_or(1.0),
-        );
-    }
-    let mut colors = vec![[0.0; 4]; canvas.vertices.len()];
-    for brush in &brushes {
-        let painted = dynamic_paint::paint(
-            canvas,
-            matrix,
-            &[brush.position],
-            brush.radius,
-            brush.color,
-            brush.strength,
-        )?;
-        for (current, candidate) in colors.iter_mut().zip(painted) {
-            if candidate[3] > current[3] {
-                *current = candidate;
+        )?
+    } else {
+        let mut colors = vec![[0.0; 4]; paint_mesh.vertices.len()];
+        for brush in &brushes {
+            let painted = dynamic_paint::paint(
+                paint_mesh,
+                matrix,
+                &[brush.position],
+                brush.radius,
+                brush.color,
+                brush.strength,
+            )?;
+            for (current, candidate) in colors.iter_mut().zip(painted) {
+                if candidate[3] > current[3] {
+                    *current = candidate;
+                }
             }
         }
+        colors
+    };
+    let output = DynamicPaintOutput {
+        output_name,
+        colors: Arc::new(colors),
+    };
+    if let Some(key) = cache_key {
+        hold_cache.entries.insert(
+            key,
+            DynamicPaintHold {
+                vertex_ids: paint_mesh.vertices.iter().map(|vertex| vertex.id).collect(),
+                output: output.clone(),
+            },
+        );
     }
-    Ok(colors)
+    Ok(output)
+}
+
+fn write_dynamic_paint_color_layer(
+    mesh: &mut Mesh,
+    name: &str,
+    colors: &[[f64; 4]],
+    default_domain: crate::geom::color_layers::ColorDomain,
+) -> Result<()> {
+    if colors.len() != mesh.vertices.len() {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "dynamic-paint color count does not match canvas vertices",
+        ));
+    }
+    let mut store = crate::geom::color_layers::read(mesh);
+    let domain = store
+        .layers
+        .iter()
+        .find(|layer| layer.name == name)
+        .map_or(default_domain, |layer| layer.domain);
+    let values = match domain {
+        crate::geom::color_layers::ColorDomain::Point => colors.to_vec(),
+        crate::geom::color_layers::ColorDomain::Corner => {
+            let mut vertex_indices = std::collections::HashMap::with_capacity(mesh.vertices.len());
+            for (index, vertex) in mesh.vertices.iter().enumerate() {
+                vertex_indices.insert(vertex.id, index);
+            }
+            let corner_count = mesh
+                .faces
+                .iter()
+                .try_fold(0_usize, |count, face| {
+                    count.checked_add(face.vertices.len())
+                })
+                .ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "dynamic-paint corner count overflows",
+                    )
+                })?;
+            let mut corner_colors = Vec::with_capacity(corner_count);
+            for face in &mesh.faces {
+                for vertex_id in &face.vertices {
+                    let index = vertex_indices.get(vertex_id).copied().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::SceneInvalid,
+                            "dynamic-paint face references a missing vertex",
+                        )
+                    })?;
+                    corner_colors.push(colors[index]);
+                }
+            }
+            corner_colors
+        }
+    };
+    store.layers.retain(|layer| layer.name != name);
+    store.layers.push(crate::geom::color_layers::ColorLayer {
+        name: name.to_owned(),
+        domain,
+        values,
+    });
+    store.active = Some(name.to_owned());
+    store.render = Some(name.to_owned());
+    crate::geom::color_layers::write(mesh, &store);
+    Ok(())
 }
 
 #[cfg(test)]
 mod dynamic_paint_frame_tests {
     use serde_json::json;
 
-    use super::canvas_paint_frame;
-    use crate::error::Result;
+    use super::{surface_paint_frame, validate_dynamic_paint_canvas};
+    use crate::error::{ErrorCode, Result};
 
     /// The paint frame, as an exact integer-valued frame, for comparisons without float equality.
-    fn paint_frame_in_tenths(canvas: &serde_json::Value, frame: f64) -> Result<Option<i64>> {
-        Ok(canvas_paint_frame(canvas, frame)?.map(|paint| (paint * 10.0).round() as i64))
+    fn paint_frame_in_tenths(surface: &serde_json::Value, frame: f64) -> Result<Option<i64>> {
+        Ok(surface_paint_frame(surface, frame)?.map(|paint| (paint * 10.0).round() as i64))
     }
 
     #[test]
-    fn canvas_is_unpainted_before_frame_start_and_paints_at_the_frame_inside_the_range()
-    -> Result<()> {
-        let canvas = json!({"canvas_surfaces": [{"frame_start": 5, "frame_end": 20}]});
-        assert_eq!(paint_frame_in_tenths(&canvas, 4.0)?, None);
-        assert_eq!(paint_frame_in_tenths(&canvas, 5.0)?, Some(50));
-        assert_eq!(paint_frame_in_tenths(&canvas, 20.0)?, Some(200));
+    fn surface_stays_unpainted_before_start_and_holds_end_afterward() -> Result<()> {
+        let surface = json!({"frame_start": 5, "frame_end": 20});
+        assert_eq!(paint_frame_in_tenths(&surface, 4.0)?, None);
+        assert_eq!(paint_frame_in_tenths(&surface, 5.0)?, Some(50));
+        assert_eq!(paint_frame_in_tenths(&surface, 20.0)?, Some(200));
+        assert_eq!(paint_frame_in_tenths(&surface, 21.0)?, Some(200));
+        assert_eq!(paint_frame_in_tenths(&surface, 300.0)?, Some(200));
         Ok(())
     }
 
     #[test]
-    fn frame_after_frame_end_paints_at_frame_end_as_blender_holds_its_end_state() -> Result<()> {
-        let canvas = json!({"canvas_surfaces": [{"frame_start": 1, "frame_end": 20}]});
-        assert_eq!(paint_frame_in_tenths(&canvas, 21.0)?, Some(200));
-        assert_eq!(paint_frame_in_tenths(&canvas, 300.0)?, Some(200));
+    fn inverted_surface_range_never_paints() -> Result<()> {
+        let surface = json!({"frame_start": 10, "frame_end": 5});
+        assert_eq!(paint_frame_in_tenths(&surface, 1.0)?, None);
+        assert_eq!(paint_frame_in_tenths(&surface, 5.0)?, None);
+        assert_eq!(paint_frame_in_tenths(&surface, 10.0)?, None);
+        assert_eq!(paint_frame_in_tenths(&surface, 20.0)?, None);
+        validate_dynamic_paint_canvas(&json!({
+            "canvas_surfaces": [{
+                "frame_start":10,
+                "frame_end":5,
+                "point_cache":{"frame_start":10,"frame_end":5}
+            }]
+        }))?;
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_surfaces_are_refused_with_the_catalog_feature() -> Result<()> {
+        let error = validate_dynamic_paint_canvas(&json!({"canvas_surfaces":[{},{}]}))
+            .err()
+            .ok_or_else(|| {
+                crate::error::PotError::new(
+                    ErrorCode::InternalError,
+                    "multiple surfaces unexpectedly validated",
+                )
+            })?;
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            "physics.dynamic_paint_canvas.canvas_surfaces"
+        );
         Ok(())
     }
 }

@@ -1021,6 +1021,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "shape_key.absolute",
         "curve.taper_object",
         "curve.fill.multiple_contours",
+        "physics.dynamic_paint_surface.frame_start",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1036,6 +1037,19 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         }),
         "legacy IK X/Z Swing ellipse limits must be reported as unsupported"
     );
+    for feature_id in [
+        "physics.dynamic_paint_canvas.canvas_surfaces",
+        "physics.dynamic_paint_surface.topology",
+        "physics.dynamic_paint_surface.output_name_b",
+        "physics.dynamic_paint_surface.use_output_b",
+    ] {
+        assert!(
+            features.iter().any(|feature| {
+                feature["feature_id"] == feature_id && feature["status"] == "not_supported"
+            }),
+            "{feature_id} must be reported as unsupported"
+        );
+    }
     assert!(
         features.iter().any(|feature| {
             feature["feature_id"] == "rig.rigify.full" && feature["status"] == "not_supported"

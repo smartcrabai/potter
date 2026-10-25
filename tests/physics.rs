@@ -806,6 +806,133 @@ fn dynamic_paint_colors_only_vertices_inside_brush_radius() {
     assert!(colors[1][3] > 0.0);
     assert!(colors[2].iter().all(|component| component.abs() <= 1.0e-12));
 }
+
+#[test]
+fn dynamic_paint_surface_frame_range_holds_the_end_brush_pose() {
+    let directory = tempdir().unwrap();
+    let scene = directory.path().join("dynamic_paint_range_scene");
+    let out = directory.path().join("dynamic_paint_range_bake");
+    init_scene(&scene);
+    apply(
+        &scene,
+        &json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[
+                {"op":"node.create","id":"canvas","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}},
+                {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1}},
+                {"op":"action.create","id":"brush_action","name":"Brush movement"},
+                {"op":"node.update","target":{"id":"brush"},"set":{"action":"brush_action"}},
+                {"op":"keyframe.insert","target":{"id":"brush"},"path":"transform.translation","index":0,"frame":1.0,"value":0.0,"interpolation":"linear"},
+                {"op":"keyframe.insert","target":{"id":"brush"},"path":"transform.translation","index":0,"frame":3.0,"value":0.0,"interpolation":"linear"},
+                {"op":"keyframe.insert","target":{"id":"brush"},"path":"transform.translation","index":0,"frame":4.0,"value":100.0,"interpolation":"linear"},
+                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_distance":4.0,"paint_alpha":1.0,"paint_color":[0.1,0.8,0.3]}},
+                {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"],"canvas_surfaces":[{"frame_start":2,"frame_end":3}]}}
+            ]
+        }),
+    );
+
+    let (output, response) = bake(&scene, &out, "1:4");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(response["result"]["frame_count"], 4);
+    let read_frame = |index: usize| -> Value {
+        serde_json::from_slice(&fs::read(out.join(format!("frame_{index:08}.json"))).unwrap())
+            .unwrap()
+    };
+    let before_start = read_frame(0);
+    let start = read_frame(1);
+    let end = read_frame(2);
+    let after_end = read_frame(3);
+    assert!(
+        before_start["paint_colors"]["canvas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|color| color[3].as_f64().unwrap() == 0.0),
+        "the surface must remain unpainted before frame_start"
+    );
+    assert!(
+        start["paint_colors"]["canvas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|color| color[3].as_f64().unwrap() > 0.0),
+        "the surface must paint at frame_start"
+    );
+    assert!(
+        end["paint_colors"]["canvas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|color| color[3].as_f64().unwrap() > 0.0),
+        "the surface must be painted at frame_end before the hold is compared"
+    );
+    assert_eq!(
+        after_end["paint_colors"]["canvas"], end["paint_colors"]["canvas"],
+        "frames after frame_end must evaluate the brush at the held end pose"
+    );
+    let fresh_out = directory.path().join("dynamic_paint_range_fresh_frame");
+    let (output, response) = bake(&scene, &fresh_out, "4:4");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(response["result"]["frame_count"], 1);
+    let fresh_frame: Value =
+        serde_json::from_slice(&fs::read(fresh_out.join("frame_00000000.json")).unwrap()).unwrap();
+    assert_eq!(
+        fresh_frame["paint_colors"]["canvas"], after_end["paint_colors"]["canvas"],
+        "a held frame must paint identically after sequence evaluation and fresh single-frame evaluation"
+    );
+}
+
+#[test]
+fn dynamic_paint_inverted_surface_range_stays_unpainted() {
+    let directory = tempdir().unwrap();
+    let scene = directory.path().join("dynamic_paint_inverted_range_scene");
+    let out = directory.path().join("dynamic_paint_inverted_range_bake");
+    init_scene(&scene);
+    apply(
+        &scene,
+        &json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[
+                {"op":"node.create","id":"canvas","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}},
+                {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1}},
+                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_distance":4.0,"paint_alpha":1.0}},
+                {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"],"canvas_surfaces":[{"frame_start":3,"frame_end":2}]}}
+            ]
+        }),
+    );
+    let (output, response) = bake(&scene, &out, "1:4");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(response["result"]["frame_count"], 4);
+    for index in 0..4 {
+        let frame: Value =
+            serde_json::from_slice(&fs::read(out.join(format!("frame_{index:08}.json"))).unwrap())
+                .unwrap();
+        assert!(
+            frame["paint_colors"]["canvas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|color| color[3].as_f64().unwrap() == 0.0),
+            "inverted surface range painted frame {}",
+            index + 1
+        );
+    }
+}
+
 #[test]
 fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
     let directory = tempdir().unwrap();

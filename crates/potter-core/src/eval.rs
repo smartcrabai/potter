@@ -117,6 +117,7 @@ pub struct EvaluationContext {
 #[derive(Debug, Default)]
 pub struct EvaluationSession {
     pub(crate) cache_file_archives: BTreeMap<Id, SelectedCacheFileArchive>,
+    pub(crate) dynamic_paint_holds: crate::sim::DynamicPaintHoldCache,
 }
 impl EvaluationSession {
     fn cache_file_archive_identity(&self) -> Value {
@@ -518,6 +519,7 @@ impl Snapshot {
     }
 
     /// Evaluate selected nodes with one node's modifier stack limited to a prefix.
+    /// `suppress_dynamic_paint` disables paint modifiers while the prefix is sampled for a canvas frame.
     #[expect(
         clippy::too_many_arguments,
         reason = "bounded Snapshot evaluation keeps its inputs explicit"
@@ -530,6 +532,7 @@ impl Snapshot {
         node_ids: &BTreeSet<Id>,
         prefix_node_id: &Id,
         keep: usize,
+        suppress_dynamic_paint: bool,
         driver_values: &BTreeMap<(Id, String, u32), f64>,
     ) -> Result<Self> {
         for node_id in node_ids {
@@ -560,6 +563,7 @@ impl Snapshot {
                 node_id: prefix_node_id,
                 modifiers: &prefix_node.modifiers,
                 keep,
+                suppress_dynamic_paint,
             }),
             Some(driver_values),
             None,
@@ -872,7 +876,7 @@ impl Snapshot {
         let simulation_scene_hash = if let Some(prefix) = modifier_prefix {
             hash::sha256(&hash::canonicalize(&json!({
                 "scene_hash": scene_hash,
-                "modifier_prefix": {"node_id":prefix.node_id,"keep":prefix.keep},
+                "modifier_prefix": {"node_id":prefix.node_id,"keep":prefix.keep,"suppress_dynamic_paint":prefix.suppress_dynamic_paint},
             }))?)
         } else {
             scene_hash.clone()
@@ -1049,9 +1053,11 @@ impl Snapshot {
         let simulation = crate::sim::evaluate(
             doc,
             &scene_id,
+            view_layer.as_ref(),
             frame,
             &matrices,
             simulation_scene_hash,
+            &mut session.dynamic_paint_holds,
             gate,
         )?;
         let mut simulated_velocities = BTreeMap::new();
@@ -1296,7 +1302,17 @@ impl Snapshot {
                                 json!({"node_id":id}),
                             ));
                         }
-                        inject_dynamic_paint_colors(&mut rigged_source, colors);
+                        let output_name = node
+                            .properties
+                            .get("physics_dynamic_paint")
+                            .and_then(|settings| settings.get("canvas_surfaces"))
+                            .and_then(Value::as_array)
+                            .and_then(|surfaces| surfaces.first())
+                            .and_then(|surface| surface.get("output_name_a"))
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("color");
+                        inject_dynamic_paint_colors(&mut rigged_source, output_name, colors);
                     }
                     if !has_stack_modifier(gate, id, node, "dynamic_paint")
                         && let Some(weights) = paint_weights.get(id)
@@ -1464,8 +1480,10 @@ impl Snapshot {
                                         id,
                                         doc,
                                         simulation_scene_hash,
+                                        &mut session.dynamic_paint_holds,
                                         gate,
                                         &scene_id,
+                                        view_layer.as_ref(),
                                         frame,
                                         &matrices,
                                         &mut simulated_particles,
@@ -1800,8 +1818,10 @@ impl Snapshot {
                                         id,
                                         doc,
                                         simulation_scene_hash,
+                                        &mut session.dynamic_paint_holds,
                                         gate,
                                         &scene_id,
+                                        view_layer.as_ref(),
                                         frame,
                                         &matrices,
                                         &mut simulated_particles,
@@ -2485,6 +2505,7 @@ struct ModifierPrefix<'a> {
     node_id: &'a Id,
     modifiers: &'a [Modifier],
     keep: usize,
+    suppress_dynamic_paint: bool,
 }
 
 /// Modifier state for one evaluation. `purpose` selects the viewport or render stack, and
@@ -2527,7 +2548,14 @@ impl<'a> ModifierGate<'a> {
                 .is_some_and(|index| index < prefix.keep),
             _ => true,
         };
-        in_prefix && !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
+        let dynamic_paint_enabled = !self
+            .modifier_prefix
+            .is_some_and(|prefix| prefix.suppress_dynamic_paint)
+            || modifier.modifier_type != "dynamic_paint";
+        in_prefix
+            && dynamic_paint_enabled
+            && !self.suppressed.contains(node_id)
+            && modifier.is_active(self.context.purpose)
     }
 
     /// Whether the modifier at stack `index` on `node_id` takes part in this evaluation (F's index form).
@@ -2535,7 +2563,14 @@ impl<'a> ModifierGate<'a> {
         let in_prefix = self
             .modifier_prefix
             .is_none_or(|prefix| prefix.node_id != node_id || index < prefix.keep);
-        in_prefix && !self.suppressed.contains(node_id) && modifier.is_active(self.context.purpose)
+        let dynamic_paint_enabled = !self
+            .modifier_prefix
+            .is_some_and(|prefix| prefix.suppress_dynamic_paint)
+            || modifier.modifier_type != "dynamic_paint";
+        in_prefix
+            && dynamic_paint_enabled
+            && !self.suppressed.contains(node_id)
+            && modifier.is_active(self.context.purpose)
     }
 
     /// Whether a legacy physics property has an active stack modifier linked to its settings.
@@ -2546,7 +2581,12 @@ impl<'a> ModifierGate<'a> {
         property_name: &str,
         modifier_type: &str,
     ) -> bool {
-        if self.suppressed.contains(node_id) {
+        if self.suppressed.contains(node_id)
+            || (modifier_type == "dynamic_paint"
+                && self
+                    .modifier_prefix
+                    .is_some_and(|prefix| prefix.suppress_dynamic_paint))
+        {
             return false;
         }
         let linked_modifier = if property_name == "physics_particle_emitter" {
@@ -4883,8 +4923,10 @@ fn apply_stack_physics_modifier(
     node_id: &Id,
     doc: &SceneDoc,
     scene_hash: &str,
+    dynamic_paint_holds: &mut crate::sim::DynamicPaintHoldCache,
     gate: ModifierGate<'_>,
     scene_id: &Id,
+    view_layer: Option<&Id>,
     frame: f64,
     matrices: &BTreeMap<Id, DMat4>,
     particles: &mut BTreeMap<Id, Vec<crate::sim::ParticleState>>,
@@ -4892,12 +4934,14 @@ fn apply_stack_physics_modifier(
     let result = crate::sim::evaluate_stack_modifier(
         doc,
         scene_id,
+        view_layer,
         node_id,
         modifier,
         std::mem::replace(mesh, Mesh::new()),
         frame,
         matrices,
         scene_hash,
+        dynamic_paint_holds,
         gate,
     )?;
     if let Some(mut states) = result.particles {
@@ -7071,18 +7115,17 @@ fn append_collection_geometry<'a>(
     Ok(())
 }
 
-/// Injects the dynamic-paint colors of one canvas (one per vertex, in storage order) into the evaluation
-/// copy as the point color layer `color`, and renders that layer. A `color` layer already on the mesh is
-/// replaced. Other color layers are kept.
-fn inject_dynamic_paint_colors(mesh: &mut Mesh, colors: &[[f64; 4]]) {
+/// Injects one dynamic-paint color layer (one color per vertex, in storage order) into the
+/// evaluation copy and makes that named layer the render color layer.
+fn inject_dynamic_paint_colors(mesh: &mut Mesh, name: &str, colors: &[[f64; 4]]) {
     let mut store = crate::geom::color_layers::read(mesh);
-    store.layers.retain(|layer| layer.name != "color");
+    store.layers.retain(|layer| layer.name != name);
     store.layers.push(crate::geom::color_layers::ColorLayer {
-        name: "color".to_owned(),
+        name: name.to_owned(),
         domain: crate::geom::color_layers::ColorDomain::Point,
         values: colors.to_vec(),
     });
-    store.render = Some("color".to_owned());
+    store.render = Some(name.to_owned());
     crate::geom::color_layers::write(mesh, &store);
 }
 
@@ -8563,7 +8606,7 @@ mod tests {
             .map(|index| [index as f64 / 10.0, 0.25, 0.0, 1.0])
             .collect();
 
-        super::inject_dynamic_paint_colors(&mut mesh, &colors);
+        super::inject_dynamic_paint_colors(&mut mesh, "color", &colors);
 
         let store = color_layers::read(&mesh);
         assert_eq!(store.render.as_deref(), Some("color"));

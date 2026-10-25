@@ -4475,8 +4475,14 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
                 for index, surface_values in enumerate(canvas_surfaces):
                     surface_values = dict(surface_values)
                     surface_cache = surface_values.pop("point_cache", None)
+                    surface_output_values = {}
+                    for key in ("use_output_a", "use_output_b", "output_name_a", "output_name_b"):
+                        if key in surface_values:
+                            surface_output_values[key] = surface_values.pop(key)
                     surface = canvas_settings.canvas_surfaces[index]
                     set_rna(surface, _rna_writable(surface, surface_values), id_lookup)
+                    # Setting the surface type or format resets Blender's output names to defaults.
+                    set_rna(surface, _rna_writable(surface, surface_output_values), id_lookup)
                     if surface_cache:
                         cache_block = getattr(surface, "point_cache", None)
                         set_rna(cache_block, _rna_writable(cache_block, surface_cache), id_lookup)

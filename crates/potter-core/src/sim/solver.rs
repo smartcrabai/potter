@@ -15,7 +15,7 @@ use crate::{
 use super::{SimulationResult, cache};
 
 /// Bump whenever solver behavior or its deterministic output contract changes.
-pub const SOLVER_VERSION: &str = "potter-physics-3";
+pub const SOLVER_VERSION: &str = "potter-physics-5";
 
 const CONTACT_SLOP: f64 = 1.0e-8;
 const POSITION_CORRECTION: f64 = 0.8;

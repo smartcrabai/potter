@@ -1760,7 +1760,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint",
-            "Brush-proximity dynamic-paint canvas writing Potter vertex colours or weights; Blender PAINT surfaces in VERTEX format evaluate within their frame range, and baked caches are refused",
+            "Brush-proximity Dynamic Paint writes Potter color/weight output; Blender PAINT/VERTEX surfaces support one named primary color layer per canvas with per-surface frame bounds, while wetness output and baked caches are refused",
             "DynamicPaint",
             &[
                 "physics.dynamic_paint.create",
@@ -1809,14 +1809,45 @@ pub fn feature_catalog() -> Value {
             "Dynamic paint surface formats other than VERTEX",
             "DynamicPaintSurface",
             &[],
-            "Only VERTEX colour surfaces are evaluated; IMAGE surfaces are refused with physics.dynamic_paint_surface.surface_format.",
+            "Only VERTEX PAINT surfaces are evaluated; IMAGE surfaces are refused with physics.dynamic_paint_surface.surface_format.",
         ),
         unsupported(
-            "physics.dynamic_paint_surface.frame_start",
-            "Dynamic paint surfaces outside their frame range",
+            "physics.dynamic_paint_surface.output_name_b",
+            "Dynamic-paint secondary wetness output layers",
             "DynamicPaintSurface",
             &[],
-            "A frame before a surface's frame_start leaves the canvas unpainted, as Blender does; a frame after frame_end paints with the brushes at frame_end, which is Blender's held end state.",
+            "Potter writes only the primary named paint color output; secondary wetness layers are refused with physics.dynamic_paint_surface.output_name_b.",
+        ),
+        unsupported(
+            "physics.dynamic_paint_surface.use_output_b",
+            "Dynamic-paint wetness output",
+            "DynamicPaintSurface",
+            &[],
+            "The secondary wetness output layer is not evaluated; use_output_b=true is refused with physics.dynamic_paint_surface.use_output_b.",
+        ),
+        supported(
+            "physics.dynamic_paint_surface.frame_start",
+            "A single PAINT/VERTEX surface stays unpainted before frame_start and for start>end; after frame_end its color output is held from the frame_end canvas and brush evaluation.",
+            "DynamicPaintSurface",
+            &[
+                "physics.dynamic_paint.create",
+                "physics.dynamic_paint.update",
+            ],
+            [true, true, true, true, false, true, true],
+        ),
+        unsupported(
+            "physics.dynamic_paint_canvas.canvas_surfaces",
+            "Dynamic-paint canvases with multiple surfaces",
+            "DynamicPaintCanvas",
+            &[],
+            "Blender evaluates each surface with its own point-cache range and output layer; Potter's result model supports only one surface per canvas and refuses multiple surfaces.",
+        ),
+        unsupported(
+            "physics.dynamic_paint_surface.topology",
+            "Dynamic-paint canvas topology changes across a held range",
+            "DynamicPaintSurface",
+            &[],
+            "Held per-vertex colors can only be mapped when vertex count and order remain stable from frame_end to the requested frame; topology-changing ranges are refused.",
         ),
         unsupported(
             "physics.point_cache.is_baked",
@@ -1844,7 +1875,7 @@ pub fn feature_catalog() -> Value {
             "Dynamic paint surface types and stateful canvas evolution",
             "DynamicPaint",
             &[],
-            "Potter's dynamic paint is a brush-proximity evaluator at the stack position; Blender's per-frame canvas state, point-cache history, and surface types other than PAINT are not modelled. Non-default settings are reported on import and refused at evaluation (physics.dynamic_paint_surface.*, physics.point_cache.is_baked).",
+            "Potter models the primary PAINT/VERTEX brush-proximity color output and a frame_end hold for stable topology, but not Blender's arbitrary point-cache history, wetness/drying/dissolve layers, or surface types other than PAINT. Baked caches and multiple surfaces per canvas are refused.",
         ),
         unsupported(
             "physics.collision.blender_collision_model",

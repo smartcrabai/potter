@@ -3,7 +3,7 @@
     reason = "Blender round-trip fixtures use fixed valid test data"
 )]
 
-use std::{error::Error, fs, path::Path, process::Command};
+use std::{collections::BTreeMap, error::Error, fs, path::Path, process::Command};
 
 use serde_json::{Map, Value, json};
 use tempfile::tempdir;
@@ -241,10 +241,12 @@ if len(canvas.canvas_surfaces) == 0:
     bpy.ops.dpaint.surface_slot_add()
 surface = canvas.canvas_surfaces[0]
 surface_fields = ['surface_format', 'surface_type', 'is_active', 'use_dissolve',
-                  'dissolve_speed', 'use_drying', 'dry_speed', 'frame_start', 'frame_end']
+                  'dissolve_speed', 'use_drying', 'dry_speed', 'frame_start', 'frame_end',
+                  'output_name_a']
 for key, value in {'surface_format':'VERTEX', 'surface_type':'PAINT', 'is_active':True,
                    'use_dissolve':True, 'dissolve_speed':3, 'use_drying':True,
-                   'dry_speed':2, 'frame_start':2, 'frame_end':4}.items():
+                   'dry_speed':2, 'frame_start':2, 'frame_end':4,
+                   'output_name_a':'PaintMapFixture'}.items():
     setattr(surface, key, value)
 expected['settings']['dynamic_paint_canvas'] = {
     'settings':{}, 'canvas_surfaces':[fields(surface, surface_fields)], 'role':'canvas'}
@@ -474,7 +476,7 @@ brush_mod = bpy.data.objects['DynamicPaintBrush'].modifiers['BrushSettingsFixtur
 checks['dynamic_paint_brush'] = {'settings':fields(brush_mod.brush_settings, ['paint_color','paint_alpha','use_absolute_alpha','paint_wetness','use_paint_erase','wave_type','wave_factor','wave_clamp','use_smudge','smudge_strength','velocity_max','use_velocity_alpha']), 'canvas_surfaces':[], 'role':'brush', 'ui_type':brush_mod.ui_type}
 canvas_mod = bpy.data.objects['DynamicPaintCanvas'].modifiers['CanvasSettingsFixture']
 canvas_surfaces = canvas_mod.canvas_settings.canvas_surfaces
-checks['dynamic_paint_canvas'] = {'settings':{}, 'canvas_surfaces':[fields(canvas_surfaces[0], ['surface_format','surface_type','is_active','use_dissolve','dissolve_speed','use_drying','dry_speed','frame_start','frame_end'])], 'role':'canvas', 'ui_type':canvas_mod.ui_type}
+checks['dynamic_paint_canvas'] = {'settings':{}, 'canvas_surfaces':[fields(canvas_surfaces[0], ['surface_format','surface_type','is_active','use_dissolve','dissolve_speed','use_drying','dry_speed','frame_start','frame_end','output_name_a'])], 'role':'canvas', 'ui_type':canvas_mod.ui_type}
 domain_mod = bpy.data.objects['FluidDomain'].modifiers['FluidDomainSettingsFixture']
 checks['fluid_domain'] = {'settings':fields(domain_mod.domain_settings, ['domain_type','resolution_max','use_adaptive_domain','cache_frame_start','cache_frame_end','cache_frame_offset','cache_data_format','cache_mesh_format','cache_directory','time_scale']), 'role':'DOMAIN', 'fluid_type':domain_mod.fluid_type, 'show_viewport':bool(domain_mod.show_viewport), 'show_render':bool(domain_mod.show_render)}
 flow_mod = bpy.data.objects['FluidFlow'].modifiers['FluidFlowSettingsFixture']
@@ -715,6 +717,355 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
         &same_role_scene,
     )?;
     Ok(())
+}
+
+#[test]
+fn dynamic_paint_frame_end_matches_blender_and_multiple_surfaces_are_refused()
+-> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender() else {
+        eprintln!("skipping Blender Dynamic Paint range oracle; Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    run_blender_script(
+        &blender,
+        "generate_dynamic_paint_frame_range.py",
+        include_str!("fixtures/dynamic_paint_frame_range/generate.py"),
+        root,
+        &[],
+        "Blender Dynamic Paint range oracle failed",
+        run_guarded,
+    )?;
+    let generated: Value = serde_json::from_slice(&fs::read(root.join("blender_expected.json"))?)?;
+    let oracle: Value = serde_json::from_str(include_str!(
+        "fixtures/dynamic_paint_frame_range/blender_expected.json"
+    ))?;
+    assert_subset(&generated, &oracle, "Blender Dynamic Paint oracle");
+    assert_eq!(oracle["blender_version"], "5.2.2 LTS");
+    let held = &oracle["held_deformation"];
+    let end_colors = &held["frames"]["2"]["colors"]["HeldPaint"];
+    let held_colors = &held["frames"]["3"]["colors"]["HeldPaint"];
+    assert_eq!(
+        end_colors, held_colors,
+        "Blender must hold the end-frame colors"
+    );
+    assert!(
+        (held["frames"]["2"]["positions"][4][2].as_f64().unwrap()
+            - held["frames"]["3"]["positions"][4][2].as_f64().unwrap())
+        .abs()
+            > 0.5,
+        "the Blender oracle canvas must continue deforming after frame_end"
+    );
+
+    let held_project = root.join("held_project");
+    pot_json(&["init", held_project.to_str().unwrap()])?;
+    pot_json(&[
+        "import",
+        held_project.to_str().unwrap(),
+        "--file",
+        root.join("HeldDynamicPaint.blend").to_str().unwrap(),
+        "--format",
+        "blend",
+        "--allow-lossy",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let held_scene: Value = serde_json::from_slice(&fs::read(held_project.join("scene.json"))?)?;
+    let (held_canvas_id, held_canvas) = dynamic_paint_canvas(&held_scene);
+    assert_eq!(
+        held_canvas["properties"]["physics_dynamic_paint"]["canvas_surfaces"][0]["output_name_a"],
+        "HeldPaint"
+    );
+    let held_bake = root.join("held_bake");
+    let bake = pot_json(&[
+        "bake",
+        held_project.to_str().unwrap(),
+        "--kind",
+        "simulation",
+        "--frames",
+        "1:4",
+        "--out",
+        held_bake.to_str().unwrap(),
+    ])?;
+    assert_eq!(bake["result"]["frame_count"], 4);
+    let mut evaluated_frames = Vec::new();
+    for (index, blender_frame) in [(1, "2"), (2, "3")] {
+        let frame: Value =
+            serde_json::from_slice(&fs::read(held_bake.join(format!("frame_{index:08}.json")))?)?;
+        if blender_frame == "3" {
+            assert_subset(
+                &frame["paint_colors"][held_canvas_id.as_str()],
+                &held["frames"][blender_frame]["colors"]["HeldPaint"],
+                &format!("physics paint colors at Blender frame {blender_frame}"),
+            );
+        }
+        let mesh = &frame["deformed_meshes"][held_canvas_id.as_str()];
+        assert_dynamic_paint_corner_layer(
+            mesh,
+            "HeldPaint",
+            &held["frames"][blender_frame]["colors"]["HeldPaint"],
+            &format!("stack color layer at Blender frame {blender_frame}"),
+        );
+        evaluated_frames.push(frame);
+    }
+    let fresh_held_bake = root.join("held_frame_3_bake");
+    let fresh_bake = pot_json(&[
+        "bake",
+        held_project.to_str().unwrap(),
+        "--kind",
+        "simulation",
+        "--frames",
+        "3:3",
+        "--out",
+        fresh_held_bake.to_str().unwrap(),
+    ])?;
+    assert_eq!(fresh_bake["result"]["frame_count"], 1);
+    let fresh_held_frame: Value =
+        serde_json::from_slice(&fs::read(fresh_held_bake.join("frame_00000000.json"))?)?;
+    assert_eq!(
+        fresh_held_frame["paint_colors"][held_canvas_id.as_str()],
+        evaluated_frames[1]["paint_colors"][held_canvas_id.as_str()],
+        "held-frame paint must not depend on whether frame 3 followed a sequence or was evaluated alone"
+    );
+    let center_z = |frame: &Value| {
+        frame["deformed_meshes"][held_canvas_id.as_str()]["vertices"][4]["co"][2]
+            .as_f64()
+            .unwrap()
+    };
+    assert!(
+        (center_z(&evaluated_frames[0]) - center_z(&evaluated_frames[1])).abs() > 0.5,
+        "Potter's upstream Wave must deform the canvas after frame_end"
+    );
+    let shape_key = &oracle["animated_shape_key"];
+    let shape_key_end_colors = &shape_key["frames"]["2"]["colors"]["ShapeKeyPaint"];
+    let shape_key_held_colors = &shape_key["frames"]["3"]["colors"]["ShapeKeyPaint"];
+    assert_eq!(
+        shape_key_end_colors, shape_key_held_colors,
+        "Blender must hold the shape-key canvas colors after frame_end"
+    );
+    assert!(
+        (shape_key["frames"]["2"]["positions"][4][2]
+            .as_f64()
+            .unwrap()
+            - shape_key["frames"]["3"]["positions"][4][2]
+                .as_f64()
+                .unwrap())
+        .abs()
+            > 0.5,
+        "the Blender oracle shape key must continue deforming after frame_end"
+    );
+
+    let shape_key_project = root.join("shape_key_project");
+    pot_json(&["init", shape_key_project.to_str().unwrap()])?;
+    pot_json(&[
+        "import",
+        shape_key_project.to_str().unwrap(),
+        "--file",
+        root.join("ShapeKeyDynamicPaint.blend").to_str().unwrap(),
+        "--format",
+        "blend",
+        "--allow-lossy",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let shape_key_scene: Value =
+        serde_json::from_slice(&fs::read(shape_key_project.join("scene.json"))?)?;
+    let (shape_key_canvas_id, shape_key_canvas) = dynamic_paint_canvas(&shape_key_scene);
+    assert_eq!(
+        shape_key_canvas["properties"]["physics_dynamic_paint"]["canvas_surfaces"][0]["output_name_a"],
+        "ShapeKeyPaint"
+    );
+    let shape_key_bake = root.join("shape_key_bake");
+    let bake = pot_json(&[
+        "bake",
+        shape_key_project.to_str().unwrap(),
+        "--kind",
+        "simulation",
+        "--frames",
+        "1:4",
+        "--out",
+        shape_key_bake.to_str().unwrap(),
+    ])?;
+    assert_eq!(bake["result"]["frame_count"], 4);
+    let mut shape_key_frames = Vec::new();
+    for (index, blender_frame) in [(1, "2"), (2, "3")] {
+        let frame: Value = serde_json::from_slice(&fs::read(
+            shape_key_bake.join(format!("frame_{index:08}.json")),
+        )?)?;
+        let expected_colors = &shape_key["frames"][blender_frame]["colors"]["ShapeKeyPaint"];
+        assert_subset(
+            &frame["paint_colors"][shape_key_canvas_id.as_str()],
+            expected_colors,
+            &format!("shape-key physics paint colors at Blender frame {blender_frame}"),
+        );
+        assert_dynamic_paint_corner_layer(
+            &frame["deformed_meshes"][shape_key_canvas_id.as_str()],
+            "ShapeKeyPaint",
+            expected_colors,
+            &format!("shape-key stack color layer at Blender frame {blender_frame}"),
+        );
+        assert_dynamic_paint_physics_matches_corner_layer(
+            &frame["paint_colors"][shape_key_canvas_id.as_str()],
+            &frame["deformed_meshes"][shape_key_canvas_id.as_str()],
+            "ShapeKeyPaint",
+            &format!("shape-key physics/stack color agreement at Blender frame {blender_frame}"),
+        );
+        shape_key_frames.push(frame);
+    }
+    let shape_key_center_z = |frame: &Value| {
+        frame["deformed_meshes"][shape_key_canvas_id.as_str()]["vertices"][4]["co"][2]
+            .as_f64()
+            .unwrap()
+    };
+    assert!(
+        (shape_key_center_z(&shape_key_frames[0]) - shape_key_center_z(&shape_key_frames[1])).abs()
+            > 0.5,
+        "Potter's shape-key canvas must deform after Dynamic Paint frame_end"
+    );
+
+    let multiple = &oracle["multiple_surfaces"];
+    assert_eq!(
+        multiple["frames"]["2"]["colors"]["EarlyPaint"][4][3], 1.0,
+        "the early surface must paint at its frame_end"
+    );
+    assert_eq!(
+        multiple["frames"]["2"]["colors"]["LatePaint"][4][3], 0.0,
+        "the late surface must remain unpainted before its frame_start"
+    );
+    assert_eq!(multiple["frames"]["3"]["colors"]["EarlyPaint"][4][3], 1.0);
+    assert_eq!(multiple["frames"]["3"]["colors"]["LatePaint"][4][3], 1.0);
+
+    let multiple_project = root.join("multiple_project");
+    pot_json(&["init", multiple_project.to_str().unwrap()])?;
+    pot_json(&[
+        "import",
+        multiple_project.to_str().unwrap(),
+        "--file",
+        root.join("MultipleDynamicPaint.blend").to_str().unwrap(),
+        "--format",
+        "blend",
+        "--allow-lossy",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let multiple_scene: Value =
+        serde_json::from_slice(&fs::read(multiple_project.join("scene.json"))?)?;
+    let (_, multiple_canvas) = dynamic_paint_canvas(&multiple_scene);
+    let surfaces = multiple_canvas["properties"]["physics_dynamic_paint"]["canvas_surfaces"]
+        .as_array()
+        .unwrap();
+    assert_eq!(surfaces.len(), 2);
+    assert_eq!(surfaces[0]["output_name_a"], "EarlyPaint");
+    assert_eq!(surfaces[1]["output_name_a"], "LatePaint");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+    command.args([
+        "bake",
+        multiple_project.to_str().unwrap(),
+        "--kind",
+        "simulation",
+        "--frames",
+        "3:3",
+        "--out",
+        root.join("multiple_bake").to_str().unwrap(),
+        "--json",
+    ]);
+    let failure = run_guarded(command)?;
+    assert!(
+        !failure.status.success(),
+        "multiple surfaces must be refused"
+    );
+    let failure: Value = serde_json::from_slice(&failure.stdout)?;
+    assert_eq!(failure["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        failure["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_canvas.canvas_surfaces"
+    );
+    Ok(())
+}
+
+fn dynamic_paint_canvas(scene: &Value) -> (String, Value) {
+    let (id, node) = scene["nodes"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, node)| node["properties"]["physics_dynamic_paint"]["role"] == "canvas")
+        .unwrap();
+    (id.clone(), node.clone())
+}
+
+fn assert_dynamic_paint_corner_layer(mesh: &Value, name: &str, expected: &Value, context: &str) {
+    let vertices = mesh["vertices"].as_array().unwrap();
+    let vertex_indices: BTreeMap<u64, usize> = vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex["id"].as_u64().unwrap(), index))
+        .collect();
+    let attribute = &mesh["attributes"][name];
+    assert_eq!(attribute["domain"], "corner", "{context}: domain");
+    let values = attribute["values"].as_object().unwrap();
+    let expected = expected.as_array().unwrap();
+    for face in mesh["faces"].as_array().unwrap() {
+        let face_id = face["id"].as_u64().unwrap();
+        let face_key = format!("f{face_id}");
+        let corners = values[&face_key].as_array().unwrap();
+        for (corner, vertex_id) in face["v"].as_array().unwrap().iter().enumerate() {
+            let vertex_index = vertex_indices[&vertex_id.as_u64().unwrap()];
+            assert_subset(
+                &corners[corner],
+                &expected[vertex_index],
+                &format!("{context}, face {face_id}, corner {corner}"),
+            );
+        }
+    }
+}
+
+fn assert_dynamic_paint_physics_matches_corner_layer(
+    paint_colors: &Value,
+    mesh: &Value,
+    name: &str,
+    context: &str,
+) {
+    let vertices = mesh["vertices"].as_array().unwrap();
+    let vertex_indices: BTreeMap<u64, usize> = vertices
+        .iter()
+        .enumerate()
+        .map(|(index, vertex)| (vertex["id"].as_u64().unwrap(), index))
+        .collect();
+    let paint_colors = paint_colors.as_array().unwrap();
+    assert_eq!(
+        paint_colors.len(),
+        vertices.len(),
+        "{context}: vertex count"
+    );
+    let attribute = &mesh["attributes"][name];
+    assert_eq!(attribute["domain"], "corner", "{context}: domain");
+    let values = attribute["values"].as_object().unwrap();
+    for face in mesh["faces"].as_array().unwrap() {
+        let face_id = face["id"].as_u64().unwrap();
+        let face_key = format!("f{face_id}");
+        let corners = values[&face_key].as_array().unwrap();
+        for (corner, vertex_id) in face["v"].as_array().unwrap().iter().enumerate() {
+            let vertex_index = vertex_indices[&vertex_id.as_u64().unwrap()];
+            assert_subset(
+                &corners[corner],
+                &paint_colors[vertex_index],
+                &format!("{context}, face {face_id}, corner {corner}"),
+            );
+        }
+    }
 }
 
 fn assert_imported_physics(expected: &Value, mappings: &Map<String, Value>, scene: &Value) {
