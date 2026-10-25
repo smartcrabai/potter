@@ -26,17 +26,17 @@ use crate::{
         Constraint, ConstraintType, CurveData, CurveDimensions, CurveFillMode, CurveFillRule,
         CurveFillSolver, CurveHandleType, CurvePoint, CurveSpline, CurveSplineType,
         CurveTaperRadiusMode, DEFAULT_FILTER_WIDTH, DataBlock, Driver, DriverType, DriverVariable,
-        DriverVariableType, Extrapolation, FCurve, FCurveModifier, ForceField, ForceFieldType,
-        GreasePencilData, GreasePencilFrame, GreasePencilLayer, GreasePencilPoint,
-        GreasePencilStroke, Id, Image, ImageAlphaMode, ImageColorspace, ImageSource, ImageTile,
-        Interpolation, Keyframe, Library, LibraryKind, LibraryOverride, LibraryOverrideProperty,
-        LibraryStatus, LightData, LightType, Material, MaterialLink, Modifier,
-        ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType, NlaExtrapolation,
-        NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind, RayVisibility,
-        Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType, RigidBodyWorld, Scene,
-        SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint, TextObjectData,
-        TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer, ViewportDisplay,
-        VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
+        DriverVariableType, Extrapolation, FCurve, FCurveAutoSmoothing, FCurveHandleType,
+        FCurveModifier, ForceField, ForceFieldType, GreasePencilData, GreasePencilFrame,
+        GreasePencilLayer, GreasePencilPoint, GreasePencilStroke, Id, Image, ImageAlphaMode,
+        ImageColorspace, ImageSource, ImageTile, Interpolation, Keyframe, Library, LibraryKind,
+        LibraryOverride, LibraryOverrideProperty, LibraryStatus, LightData, LightType, Material,
+        MaterialLink, Modifier, ModifierParameterBinding, MovieClip, MovieTracking, NlaBlendType,
+        NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind,
+        RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
+        RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint,
+        TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer,
+        ViewportDisplay, VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, SequencerColorSpace, Strip as SequenceStrip,
@@ -8530,6 +8530,47 @@ fn fcurve_handle(value: &Value, field: &str) -> Result<Option<[f64; 2]>> {
     Ok(Some([x, y]))
 }
 
+fn fcurve_handle_type(value: &Value, field: &str) -> Result<Option<FCurveHandleType>> {
+    let Some(value) = value.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let handle_type = value.as_str().ok_or_else(|| {
+        invalid_intermediate(&format!("F-Curve `{field}` handle type is invalid"))
+    })?;
+    match handle_type {
+        "AUTO" => Ok(Some(FCurveHandleType::Auto)),
+        "AUTO_CLAMPED" => Ok(Some(FCurveHandleType::AutoClamped)),
+        "VECTOR" => Ok(Some(FCurveHandleType::Vector)),
+        "ALIGNED" => Ok(Some(FCurveHandleType::Aligned)),
+        "FREE" => Ok(Some(FCurveHandleType::Free)),
+        _ => Err(invalid_intermediate(&format!(
+            "F-Curve `{field}` handle type `{handle_type}` is unsupported"
+        ))),
+    }
+}
+
+fn fcurve_auto_smoothing(value: &Value) -> Result<Option<FCurveAutoSmoothing>> {
+    let Some(value) = value.get("auto_smoothing") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let mode = value
+        .as_str()
+        .ok_or_else(|| invalid_intermediate("F-Curve auto smoothing mode is invalid"))?;
+    match mode {
+        "NONE" => Ok(Some(FCurveAutoSmoothing::None)),
+        "CONT_ACCEL" => Ok(Some(FCurveAutoSmoothing::ContAccel)),
+        mode => Err(invalid_intermediate(&format!(
+            "F-Curve auto smoothing mode `{mode}` is unsupported"
+        ))),
+    }
+}
+
 fn convert_fcurve(value: &Value, mappings: &BTreeMap<String, String>) -> Result<FCurve> {
     let path = potter_fcurve_path(string_field(value, "path")?, mappings);
     let blender_index = integer_field(value, "index", 0);
@@ -8569,6 +8610,8 @@ fn convert_fcurve(value: &Value, mappings: &BTreeMap<String, String>) -> Result<
                 interpolation,
                 handle_left: fcurve_handle(item, "handle_left")?,
                 handle_right: fcurve_handle(item, "handle_right")?,
+                handle_left_type: fcurve_handle_type(item, "handle_left_type")?,
+                handle_right_type: fcurve_handle_type(item, "handle_right_type")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -8580,6 +8623,7 @@ fn convert_fcurve(value: &Value, mappings: &BTreeMap<String, String>) -> Result<
         "LINEAR" => Extrapolation::Linear,
         _ => Extrapolation::Constant,
     };
+    let auto_smoothing = fcurve_auto_smoothing(value)?;
     let modifiers = serde_json::from_value::<Vec<FCurveModifier>>(
         value.get("modifiers").cloned().unwrap_or_else(|| json!([])),
     )
@@ -8589,6 +8633,7 @@ fn convert_fcurve(value: &Value, mappings: &BTreeMap<String, String>) -> Result<
         index,
         keyframes,
         extrapolation,
+        auto_smoothing,
         modifiers,
     })
 }
@@ -10059,20 +10104,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                         action_name,
                         "this keyframe interpolation mode is not representable",
                     ));
-                }
-                if !matches!(
-                    key.get("handle_left_type").and_then(Value::as_str),
-                    None | Some("AUTO" | "AUTO_CLAMPED")
-                ) || !matches!(
-                    key.get("handle_right_type").and_then(Value::as_str),
-                    None | Some("AUTO" | "AUTO_CLAMPED")
-                ) {
-                    losses.push(loss(
-                        "blender.animation.keyframe_handles",
-                        action_name,
-                        "custom Bézier handle modes are retained only in compatibility data",
-                    ));
-                    break;
                 }
             }
         }
@@ -13228,6 +13259,7 @@ mod tests {
                         },
                     ],
                     extrapolation: Extrapolation::Constant,
+                    auto_smoothing: None,
                     modifiers: Vec::new(),
                 }],
                 slots: Vec::new(),
@@ -17582,6 +17614,7 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
                         },
                     ],
                     extrapolation: Extrapolation::Constant,
+                    auto_smoothing: None,
                     modifiers: Vec::new(),
                 }],
                 slots: Vec::new(),

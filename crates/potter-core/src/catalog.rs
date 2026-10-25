@@ -1245,12 +1245,24 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "animation.keyframe",
-            "Advanced keyframe and NLA controls",
+            "Bezier keyframe handle calculation",
             "Keyframe",
+            &[
+                "action.update",
+                "keyframe.insert",
+                "keyframe.delete",
+                "fcurve.update",
+            ],
+            [false, true, true, true, true, true, true],
+        ),
+        unsupported(
+            "animation.nla_advanced",
+            "Advanced NLA retiming and blending",
+            "Action/NLA",
             &[],
-            "Bezier handle editing and Blender-specific retiming/blend semantics are not implemented.",
+            "Blender-specific NLA retiming and blend semantics beyond the supported basic NLA subset are not implemented.",
         ),
         supported(
             "animation.fcurve_modifiers",

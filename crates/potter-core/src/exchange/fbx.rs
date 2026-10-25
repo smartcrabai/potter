@@ -3788,6 +3788,7 @@ fn import_animations(
             ..Action::default()
         });
         action.fcurves.push(FCurve {
+            auto_smoothing: None,
             path: path.to_owned(),
             index: component,
             keyframes,

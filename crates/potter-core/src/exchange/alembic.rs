@@ -4314,6 +4314,7 @@ fn create_transform_action(
                 })
                 .collect();
             curves.push(FCurve {
+                auto_smoothing: None,
                 path: path.to_owned(),
                 index: u32::try_from(index).map_err(|_| {
                     PotError::new(
@@ -4592,6 +4593,7 @@ mod tests {
             Action {
                 name: "Box move".to_owned(),
                 fcurves: vec![FCurve {
+                    auto_smoothing: None,
                     path: "transform.translation".to_owned(),
                     index: 0,
                     keyframes: vec![

@@ -1,4 +1,5 @@
 mod animation;
+mod animation_handles;
 mod asset;
 mod avatar;
 mod camera;

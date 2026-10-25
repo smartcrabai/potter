@@ -9454,6 +9454,7 @@ fn import_animations(
                     })
                     .collect::<Vec<_>>();
                 action.fcurves.push(FCurve {
+                    auto_smoothing: None,
                     path: internal_path.clone(),
                     index: u32::try_from(component)
                         .map_err(|_| import_error("animation component index exceeds u32 range"))?,
