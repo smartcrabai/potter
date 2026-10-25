@@ -15,14 +15,15 @@
 //! - `node_shader_bsdf_principled.cc`: the default distribution is `SHD_GLOSSY_MULTI_GGX`, so
 //!   energy preservation is enabled for the specular and metallic lobes.
 //!
-//! Estimator contract: `evaluate_masked` is the continuous BSDF times reflectance: the diffuse, specular,
-//! sheen and coat lobes above the surface, and the glass lobe on both sides (its reflection above,
-//! its transmission below). `continuous_density` is the density of one closure's continuous directions, its lobe
-//! mixture, so `evaluate / density` is unbiased for that closure over its sampler's domain. `path.rs` mixes the closures
-//! of a hit by selection weight. The glass lobe's eval and density follow Cycles' `bsdf_microfacet_eval`, which also covers
-//! half vectors the VNDF sampler never draws, so MIS on glass matches Cycles' eval/pdf and is not an
-//! exact density. A singular glass lobe (roughness zero) is a delta that `sample_glass` draws; light
-//! sampling cannot reach it.
+//! Estimator contract: `evaluate_masked` is the continuous BSDF times reflectance: diffuse, specular,
+//! sheen and coat above the surface, with glass reflection above and glass transmission below it.
+//! Thin Wall's glass split uses Cycles' two-interface Fresnel weights and the transmission lobe's
+//! GGX mirror model with a flipped normal; its smooth transmitted ray continues straight through.
+//! `continuous_density` uses the same lobe probabilities as sampling, so `evaluate / density` is
+//! unbiased for each closure. `path.rs` mixes closures by selection weight. Thick glass follows
+//! Cycles' `bsdf_microfacet_eval` eval/pdf, which also covers half vectors the VNDF sampler never
+//! draws, so MIS on that lobe matches Cycles' eval/pdf but is not an exact density. Singular glass
+//! lobes are delta samples and cannot be reached by light sampling.
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
@@ -63,12 +64,15 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     // full diffuse. The diffuse branch is chosen with the channel average of that share, so it is never starved.
     let diffuse_share = subsurface_share(params).element_sum() / 3.0;
     let diffuse_weight = ((1.0 - metallic) * (1.0 - transmission) * diffuse_share).max(0.0);
-    // The subsurface closure's sample weight is its mean channel weight times the channels it covers
-    // (`bssrdf_setup`, `sample_weight = |average(weight)| * channels`).
-    let covered_channels = channel_mask(raw_radius(params))
-        .iter()
-        .filter(|&&on| on)
-        .count() as f64;
+    // Thin Wall ignores the radius and splits the entire subsurface closure into reflection and transmission.
+    let covered_channels = if params.thin_wall {
+        1.0
+    } else {
+        channel_mask(raw_radius(params))
+            .iter()
+            .filter(|&&on| on)
+            .count() as f64
+    };
     let subsurface_weight = subsurface_closure_weight(
         params,
         layers.energy_roughness,
@@ -82,13 +86,11 @@ pub(crate) fn lobe_probabilities(params: &BsdfParams, layers: &Layers) -> LobePr
     // Each layer's selection weight is its layering albedo: Cycles' sample weight of the closure.
     let sheen_weight = layers.sheen.selection_weight();
     let coat_weight = layers.coat.map_or(0.0, |coat| coat.albedo);
-    // The glass closure is weighted `(1 - metallic) · transmission`: Cycles takes the metallic weight
-    // first (`kernel/svm/closure.h`). A view below the surface has no glass lobe.
-    let glass_weight = if layers.glass.is_some() {
-        (1.0 - metallic) * transmission
-    } else {
-        0.0
-    };
+    // A thin glass material creates two closures; their mean spectral weights determine the glass branch's selection
+    // weight and the conditional reflection/transmission choice.
+    let glass_weight = layers.glass.map_or(0.0, |glass| {
+        (1.0 - metallic) * transmission * glass.selection_weight()
+    });
     // The dielectric specular layer is weighted `(1 - metallic) · (1 - transmission)`, as `specular_lobe`
     // evaluates it.
     let specular_weight = (metallic
@@ -134,15 +136,14 @@ fn microfacet_roughness_squared(roughness: f64) -> f64 {
     }
 }
 
-/// The continuous lobes (diffuse, sheen, coat, specular and glass) at `light`, in that order. Each lobe's density
-/// is the one [`continuous_density`] sums: the diffuse lobe is cosine-distributed, the sheen lobe is the LTC
-/// distribution, the coat and specular lobes are the GGX half-vector distribution, and the glass lobe's density is
-/// its reflection above the surface and its refraction below it.
+/// The continuous lobes (diffuse, thin translucent, sheen, coat, specular and glass) at `light`, in that order. Each
+/// lobe's density is the one [`continuous_density`] sums: diffuse and thin translucent are cosine-distributed, sheen
+/// uses LTC, coat and specular use GGX half-vector sampling, and glass is reflection above or transmission below.
 pub(crate) fn continuous_lobes(
     params: &BsdfParams,
     layers: &Layers,
     light: DVec3,
-) -> [LobeDensity; 5] {
+) -> [LobeDensity; 6] {
     let (normal, view) = (layers.normal, layers.view);
     let probabilities = lobe_probabilities(params, layers);
     let absent = LobeDensity {
@@ -152,6 +153,14 @@ pub(crate) fn continuous_lobes(
     let diffuse = LobeDensity {
         weight: probabilities.diffuse * normal.dot(light).max(0.0) / PI,
         roughness_squared: 1.0,
+    };
+    let thin_subsurface = if params.thin_wall {
+        LobeDensity {
+            weight: probabilities.subsurface * (-normal.dot(light)).max(0.0) / PI,
+            roughness_squared: 1.0,
+        }
+    } else {
+        absent
     };
     let sheen = LobeDensity {
         weight: probabilities.sheen * layers.sheen.density(light),
@@ -172,16 +181,29 @@ pub(crate) fn continuous_lobes(
             * visible_half_vector_pdf(layers.specular, layers.specular_microfacet, view, light),
         roughness_squared: layers.specular_microfacet.roughness_squared(),
     };
-    let glass = layers.glass.as_ref().map_or(absent, |glass| LobeDensity {
-        weight: probabilities.transmission * glass_eval(glass, layers.specular, view, light).1,
-        // A singular glass lobe has no roughness, and Cycles' singular closure evaluates to zero.
-        roughness_squared: if glass.singular {
-            0.0
+    let glass = layers.glass.as_ref().map_or(absent, |glass| {
+        if glass.thin.is_some() {
+            thin_glass_density(
+                glass,
+                layers.specular,
+                view,
+                light,
+                probabilities.transmission,
+            )
         } else {
-            glass.alpha * glass.alpha
-        },
+            LobeDensity {
+                weight: probabilities.transmission
+                    * glass_eval(glass, layers.specular, view, light).1,
+                // A singular glass lobe has no roughness, and Cycles' singular closure evaluates to zero.
+                roughness_squared: if glass.singular {
+                    0.0
+                } else {
+                    glass.alpha * glass.alpha
+                },
+            }
+        }
     });
-    [diffuse, sheen, coat, specular, glass]
+    [diffuse, thin_subsurface, sheen, coat, specular, glass]
 }
 
 /// Density of the continuous (diffuse, sheen, coat and specular) directions drawn by `path.rs`, in solid
@@ -296,7 +318,7 @@ fn diffuse_layer_weight(
 }
 
 /// The share of the diffuse base that the subsurface closures leave to diffuse, as Cycles' `closure` setup does
-/// (`svm/closure.h`). The diffuse closure keeps `1 - Subsurface Weight` for every method. A Thin Wall adds its thin
+/// (`svm/closure.h`). The diffuse closure keeps `1 - Subsurface Weight` for every method. Thin Wall adds its thin
 /// reflection (`bsdf_thin_subsurface_setup`), a Lambert of weight `sat(0.5 (1 - anisotropy)) × subsurface weight`, to
 /// the same diffuse. Otherwise `bssrdf_setup` moves a channel whose raw radius is below `BSSRDF_MIN_RADIUS` into a
 /// diffuse BSDF of its closure weight, so that channel keeps its full diffuse; the other channels keep `1 - Subsurface
@@ -304,8 +326,7 @@ fn diffuse_layer_weight(
 fn subsurface_share(params: &BsdfParams) -> DVec3 {
     let sss = params.subsurface_weight.clamp(0.0, 1.0);
     if params.thin_wall {
-        let reflection = (0.5 * (1.0 - params.subsurface_anisotropy)).clamp(0.0, 1.0);
-        return DVec3::splat(1.0 - sss + sss * reflection);
+        return DVec3::splat(1.0 - sss + sss * thin_subsurface_reflection_share(params));
     }
     if !subsurface_evaluated(params) {
         return DVec3::ONE;
@@ -317,9 +338,17 @@ fn subsurface_share(params: &BsdfParams) -> DVec3 {
     }))
 }
 
+fn thin_subsurface_reflection_share(params: &BsdfParams) -> f64 {
+    f64::midpoint(1.0, -params.subsurface_anisotropy).clamp(0.0, 1.0)
+}
+
+fn thin_subsurface_transmission_share(params: &BsdfParams) -> f64 {
+    f64::midpoint(1.0, params.subsurface_anisotropy).clamp(0.0, 1.0)
+}
+
 /// The subsurface closure's weight per channel, `clamped base × subsurface weight × diffuse layer weight × reflectance
-/// × lower`, zero on channels without a radius (Cycles' `closure_weight` of the BSSRDF, `svm/closure.h`). It is the
-/// weight the path tracer divides by the branch's probability to enter the surface.
+/// × lower`, zero on channels without a radius (Cycles' `closure_weight`, `svm/closure.h`). For Thin Wall this is the
+/// translucent closure's share, which does not depend on radius.
 pub(crate) fn subsurface_closure_weight(
     params: &BsdfParams,
     energy_roughness: f64,
@@ -327,17 +356,21 @@ pub(crate) fn subsurface_closure_weight(
     view: DVec3,
     lower: DVec3,
 ) -> DVec3 {
-    if !subsurface_evaluated(params) || params.thin_wall || normal.dot(view) <= 0.0 {
+    if !subsurface_evaluated(params) || normal.dot(view) <= 0.0 {
         return DVec3::ZERO;
+    }
+    let layer = diffuse_layer_weight(params, energy_roughness, normal, view, true)
+        * params.reflectance.clamp(0.0, 1.0)
+        * lower;
+    if params.thin_wall {
+        return base_color(params)
+            * (params.subsurface_weight.clamp(0.0, 1.0)
+                * thin_subsurface_transmission_share(params)
+                * layer);
     }
     let mask = channel_mask(raw_radius(params));
     let covered = DVec3::from_array(mask.map(|on| if on { 1.0 } else { 0.0 }));
-    base_color(params)
-        * covered
-        * (params.subsurface_weight.clamp(0.0, 1.0)
-            * diffuse_layer_weight(params, energy_roughness, normal, view, true)
-            * params.reflectance.clamp(0.0, 1.0))
-        * lower
+    base_color(params) * covered * (params.subsurface_weight.clamp(0.0, 1.0) * layer)
 }
 
 /// The diffuse lobe, given the coat's lower-layer factor (set up once by the caller).
@@ -355,16 +388,19 @@ fn diffuse_lobe(
     if n_dot_v <= 0.0 {
         return DVec3::ZERO;
     }
-    let weight = diffuse_layer_weight(params, energy_roughness, normal, view, apply_thin_film);
-    let brdf = oren_nayar_brdf(base_color(params), diffuse_roughness, normal, view, light);
-    diffuse_albedo(params)
-        * subsurface_share(params)
-        * brdf
-        * weight
+    let diffuse_color = if params.thin_wall {
+        let sss = params.subsurface_weight.clamp(0.0, 1.0);
+        diffuse_albedo(params) * (1.0 - sss)
+            + base_color(params) * (sss * thin_subsurface_reflection_share(params))
+    } else {
+        diffuse_albedo(params) * subsurface_share(params)
+    };
+    diffuse_color
+        * oren_nayar_brdf(base_color(params), diffuse_roughness, normal, view, light)
+        * diffuse_layer_weight(params, energy_roughness, normal, view, apply_thin_film)
         * params.reflectance.clamp(0.0, 1.0)
         * lower
 }
-
 fn oren_nayar_brdf(
     color: DVec3,
     roughness: f64,
@@ -513,11 +549,75 @@ fn specular_lobe(
 /// Cycles' `CLOSURE_WEIGHT_CUTOFF`: a coat weight at or below it is not set up.
 const COAT_WEIGHT_CUTOFF: f64 = 1.0e-5;
 
+/// Cycles' Thin Wall translucent closure's lobe weight before its Oren-Nayar evaluation.
+pub(crate) fn thin_subsurface_transmission_weight(
+    params: &BsdfParams,
+    layers: &Layers,
+    apply_thin_film: bool,
+) -> DVec3 {
+    let (normal, view) = (layers.normal, layers.view);
+    if !params.thin_wall || !subsurface_evaluated(params) || normal.dot(view) <= 0.0 {
+        return DVec3::ZERO;
+    }
+    DVec3::splat(
+        params.subsurface_weight.clamp(0.0, 1.0)
+            * thin_subsurface_transmission_share(params)
+            * diffuse_layer_weight(
+                params,
+                layers.energy_roughness,
+                normal,
+                view,
+                apply_thin_film,
+            )
+            * params.reflectance.clamp(0.0, 1.0),
+    ) * layers.lower
+}
+
+/// Cycles' thin-subsurface translucent closure on the transmitted hemisphere.
+pub(crate) fn thin_subsurface_transmission_coefficient(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+    diffuse_roughness: f64,
+    apply_thin_film: bool,
+) -> DVec3 {
+    let (normal, view) = (layers.normal, layers.view);
+    if normal.dot(light) >= 0.0 {
+        return DVec3::ZERO;
+    }
+    let virtual_view = view - normal * (2.0 * normal.dot(view));
+    base_color(params)
+        * thin_subsurface_transmission_weight(params, layers, apply_thin_film)
+        * oren_nayar_brdf(
+            base_color(params),
+            diffuse_roughness,
+            -normal,
+            virtual_view,
+            light,
+        )
+}
+
+/// EEVEE's `ClosureTranslucent` uses the unclamped color and ignores Diffuse Roughness.
+fn eevee_thin_subsurface_transmission_coefficient(
+    params: &BsdfParams,
+    layers: &Layers,
+    light: DVec3,
+) -> DVec3 {
+    let (normal, view) = (layers.normal, layers.view);
+    if normal.dot(light) >= 0.0 {
+        return DVec3::ZERO;
+    }
+    let virtual_view = view - normal * (2.0 * normal.dot(view));
+    diffuse_albedo(params)
+        * thin_subsurface_transmission_weight(params, layers, false)
+        * oren_nayar_brdf(base_color(params), 0.0, -normal, virtual_view, light)
+}
+
 /// Continuous Principled BSDF times reflectance, the `evaluate / density` estimator's numerator, keeping only the lobes
 /// that a light's ray mask admits. Cycles drops a closure from a light's direct lighting when that light excludes its
 /// ray kind (`surface_shader.h`, `_surface_shader_exclude`). The diffuse, sheen and coat lobes sit above the shading
-/// normal, so they are gated on it. The specular lobe checks its own, bent normal, so it is not gated by the shading
-/// normal, and the glass lobe takes both sides. With every kind admitted (`RayKind::ALL_MASK`) this is the whole BSDF.
+/// normal, so they are gated on it. The specular lobe checks its own, bent normal, and thin subsurface adds a
+/// transmission-only lobe below it.
 pub(crate) fn evaluate_masked(
     params: &BsdfParams,
     layers: &Layers,
@@ -534,7 +634,21 @@ pub(crate) fn evaluate_masked(
     } else {
         DVec3::ZERO
     };
-    above_shading + specular + glass_lobes_coefficient(params, layers, light, ray_mask)
+    let thin_subsurface = if ray_mask & RayKind::Diffuse.bit() != 0 {
+        thin_subsurface_transmission_coefficient(
+            params,
+            layers,
+            light,
+            params.diffuse_roughness,
+            true,
+        )
+    } else {
+        DVec3::ZERO
+    };
+    above_shading
+        + specular
+        + glass_lobes_coefficient(params, layers, light, ray_mask)
+        + thin_subsurface
 }
 
 /// The sheen lobe along `light`, times reflectance. It depends on the light, so an area light is
@@ -791,6 +905,9 @@ impl Layers {
         if let Some(glass) = &mut layers.glass {
             glass.alpha = glass.alpha.max(blur_alpha);
             glass.singular = glass.alpha * glass.alpha <= GLASS_SINGULAR_ALPHA_SQUARED;
+            if let Some(thin) = &mut glass.thin {
+                thin.transmission_alpha = thin.transmission_alpha.max(blur_alpha);
+            }
         }
         layers
     }
@@ -1047,19 +1164,32 @@ pub(crate) fn reflected_lobes_coefficient(
     } else {
         DVec3::ZERO
     };
-    diffuse + coat + specular
+    let translucent = if ray_mask & RayKind::Diffuse.bit() != 0 {
+        eevee_thin_subsurface_transmission_coefficient(params, &layers, light)
+    } else {
+        DVec3::ZERO
+    };
+    diffuse + coat + specular + translucent
 }
 
-/// The glass lobe towards `light`, kept where the light's ray mask admits glossy or transmission. A glass closure is
-/// both glossy and transmissive, so it is dropped only when the light excludes both kinds (`exclude_glass`). It takes
-/// both sides of the surface.
+/// Glass closure ray masks: thick glass is both glossy and transmissive, while Thin Wall's two closures have separate
+/// masks (reflection above, transmission below).
 pub(crate) fn glass_lobes_coefficient(
     params: &BsdfParams,
     layers: &Layers,
     light: DVec3,
     ray_mask: u8,
 ) -> DVec3 {
-    if ray_mask & (RayKind::Glossy.bit() | RayKind::Transmission.bit()) != 0 {
+    let mask = if layers.glass.is_some_and(|glass| glass.thin.is_some()) {
+        if layers.specular.dot(light) < 0.0 {
+            RayKind::Transmission.bit()
+        } else {
+            RayKind::Glossy.bit()
+        }
+    } else {
+        RayKind::Glossy.bit() | RayKind::Transmission.bit()
+    };
+    if ray_mask & mask != 0 {
         glass_coefficient(params, layers, light)
     } else {
         DVec3::ZERO
@@ -1337,10 +1467,8 @@ fn f82_fss(f0: DVec3, b: DVec3) -> DVec3 {
 /// (`roughness_is_almost_specular`, `kernel/closure/bsdf_microfacet.h`).
 const GLASS_SINGULAR_ALPHA_SQUARED: f64 = 2.0e-10;
 
-/// Cycles' GGX glass closure: one closure with a reflection lobe and a transmission lobe, set up as
-/// `bsdf_microfacet_ggx_glass_setup` and `generalized_schlick_setup` (`kernel/closure/bsdf_microfacet.h`),
-/// with the multiscatter energy compensation of `microfacet_ggx_preserve_energy`. The Principled BSDF's
-/// Transmission Weight (`kernel/svm/closure.h`) and the Glass BSDF node both build it.
+/// Cycles' GGX glass model. Thick glass uses one generalized-Schlick reflection/refraction closure; Thin Wall uses
+/// the two-interface Fresnel weights and separate rough reflection/transmission closures (`ThinGlass`).
 #[derive(Clone, Copy, Debug)]
 struct GlassLobe {
     /// Thin-film coating in nanometers, with its IOR adjusted for a back-facing surface.
@@ -1354,14 +1482,21 @@ struct GlassLobe {
     f0: DVec3,
     reflection_tint: DVec3,
     transmission_tint: DVec3,
-    /// Multiscatter gain `1 + Fms · (1 - E) / E` per channel, from the view. It scales the eval and not
-    /// the density, as Cycles' `energy_scale` and the darkening of the weight together do.
+    /// Multiscatter gain `1 + Fms · (1 - E) / E` per channel, from the view.
     gain: DVec3,
-    /// Roughness below Cycles' almost-specular threshold: the eval is zero and `sample_glass` draws a delta.
     singular: bool,
-    /// An IOR of 1. Cycles' `bsdf_microfacet_sample` makes a refraction there a delta (the straight-through
-    /// direction), while `bsdf_microfacet_eval` keeps the roughness-only flag, so the eval stays rough.
     straight: bool,
+    thin: Option<ThinGlass>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ThinGlass {
+    reflectance: DVec3,
+    transmittance: DVec3,
+    transmission_alpha: f64,
+    reflection_gain: DVec3,
+    transmission_gain: DVec3,
+    transmission_enabled: bool,
 }
 
 /// The glass lobe at a shading point with normal `normal` seen along `view`, or `None` when its weight
@@ -1373,12 +1508,7 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
     if (1.0 - metallic) * transmission <= 0.0 || cos_ni <= 0.0 {
         return None;
     }
-    // Thin Wall's two-interface thin-glass Fresnel remains unsupported.
-    let thin_film_thickness = if params.thin_wall {
-        0.0
-    } else {
-        params.thin_film_thickness
-    };
+    let thin_film_thickness = params.thin_film_thickness;
     let roughness = params.roughness.clamp(0.0, 1.0);
     let alpha = roughness * roughness;
     let input_ior = params.ior.max(1.0e-5);
@@ -1401,6 +1531,23 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
     let transmission_tint = DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
     let singular = alpha * alpha <= GLASS_SINGULAR_ALPHA_SQUARED;
     let straight = (ior - 1.0).abs() < 1.0e-4;
+
+    if params.thin_wall {
+        let thin = thin_glass_setup(params, cos_ni, input_ior, roughness, alpha);
+        return Some(GlassLobe {
+            thin_film_thickness,
+            thin_film_ior: params.thin_film_ior.max(1.0e-5),
+            ior: input_ior,
+            alpha,
+            f0,
+            reflection_tint,
+            transmission_tint,
+            gain: thin.reflection_gain,
+            singular,
+            straight: false,
+            thin: Some(thin),
+        });
+    }
 
     // `microfacet_ggx_preserve_energy`: the GGX_GLASS tables at the view, the inverse ones below an IOR of 1.
     let inverse = ior < 1.0;
@@ -1440,7 +1587,118 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3) -> Option<GlassLo
         gain,
         singular,
         straight,
+        thin: None,
     })
+}
+
+fn thin_glass_setup(
+    params: &BsdfParams,
+    cosine_incident: f64,
+    ior: f64,
+    roughness: f64,
+    alpha: f64,
+) -> ThinGlass {
+    let reflection_tint = DVec3::from_array(params.specular_tint).max(DVec3::ZERO);
+    let f0 = reflection_tint * dielectric_f0(ior, 0.5);
+    let has_film = params.thin_film_thickness > THICKNESS_CUTOFF;
+    let film_ior = params.thin_film_ior.max(1.0e-5);
+    let (r1, cos_theta_t) = if has_film {
+        thin_film_dielectric_fresnel(
+            cosine_incident,
+            params.thin_film_thickness,
+            film_ior,
+            ior,
+            f0,
+        )
+    } else {
+        let (real, cos_theta_t) = dielectric_fresnel(cosine_incident, ior);
+        (remapped_fresnel(f0, ior, real), cos_theta_t)
+    };
+    let t1 = DVec3::ONE - r1;
+    let (r2, t2) = if has_film {
+        let back_fresnel = thin_film_dielectric_fresnel(
+            -cos_theta_t,
+            params.thin_film_thickness,
+            film_ior / ior,
+            1.0 / ior,
+            f0,
+        )
+        .0;
+        (back_fresnel, DVec3::ONE - back_fresnel)
+    } else {
+        (r1, t1)
+    };
+    let attenuation = if cos_theta_t == 0.0 {
+        DVec3::ZERO
+    } else {
+        base_color(params).powf(-1.0 / cos_theta_t)
+    };
+    let back_reflection = r2 * attenuation;
+    let numerator = attenuation * t1 * t2;
+    let denominator = DVec3::ONE - back_reflection * back_reflection;
+    let transmittance = DVec3::from_array(std::array::from_fn(|channel| {
+        if denominator[channel] == 0.0 {
+            0.0
+        } else {
+            numerator[channel] / denominator[channel]
+        }
+    }));
+    let reflectance = r1 + transmittance * back_reflection;
+
+    let energy = ggx_energy(roughness.clamp(MIN_ROUGHNESS, 1.0), cosine_incident).max(1.0e-6);
+    let missing = (1.0 - energy) / energy;
+    let reflection_gain = multiscatter_gain(
+        reflection_tint,
+        ggx_energy_average(roughness.clamp(MIN_ROUGHNESS, 1.0)),
+        missing,
+    );
+    let roughness_factor = 3.4 * (ior - 1.0) * (ior - 0.5).powi(2) / (ior * ior * ior);
+    let transmission_alpha = (alpha * roughness_factor.max(0.0).sqrt()).clamp(0.0, 1.0);
+    let transmission_roughness = transmission_alpha.sqrt().clamp(MIN_ROUGHNESS, 1.0);
+    let transmission_energy = ggx_energy(transmission_roughness, cosine_incident).max(1.0e-6);
+    let transmission_gain = multiscatter_gain(
+        DVec3::ONE,
+        ggx_energy_average(transmission_roughness),
+        (1.0 - transmission_energy) / transmission_energy,
+    );
+    ThinGlass {
+        reflectance,
+        transmittance,
+        transmission_alpha,
+        reflection_gain,
+        transmission_gain,
+        transmission_enabled: !params.thin_glass_transparent,
+    }
+}
+
+impl GlassLobe {
+    fn selection_weight(self) -> f64 {
+        self.thin.map_or(1.0, ThinGlass::selection_weight)
+    }
+}
+
+impl ThinGlass {
+    fn selection_weight(self) -> f64 {
+        (self.reflectance.element_sum()
+            + if self.transmission_enabled {
+                self.transmittance.element_sum()
+            } else {
+                0.0
+            })
+            / 3.0
+    }
+
+    fn reflection_probability(self) -> f64 {
+        if !self.transmission_enabled {
+            return 1.0;
+        }
+        let total = self.selection_weight();
+        if total > 0.0 {
+            self.reflectance.element_sum() / 3.0 / total
+        } else {
+            0.0
+        }
+    }
 }
 
 impl GlassLobe {
@@ -1519,6 +1777,143 @@ fn glass_eval(lobe: &GlassLobe, normal: DVec3, view: DVec3, light: DVec3) -> (DV
     }
 }
 
+fn thin_glass_density(
+    lobe: &GlassLobe,
+    normal: DVec3,
+    view: DVec3,
+    light: DVec3,
+    branch: f64,
+) -> LobeDensity {
+    let Some(thin) = lobe.thin else {
+        return LobeDensity {
+            weight: 0.0,
+            roughness_squared: 0.0,
+        };
+    };
+    let reflection_probability = thin.reflection_probability();
+    if normal.dot(light) > 0.0 {
+        if lobe.alpha * lobe.alpha <= GLASS_SINGULAR_ALPHA_SQUARED {
+            return LobeDensity {
+                weight: 0.0,
+                roughness_squared: 0.0,
+            };
+        }
+        LobeDensity {
+            weight: branch
+                * reflection_probability
+                * visible_half_vector_pdf(
+                    normal,
+                    isotropic_microfacet(lobe.alpha.sqrt()),
+                    view,
+                    light,
+                ),
+            roughness_squared: lobe.alpha * lobe.alpha,
+        }
+    } else if normal.dot(light) < 0.0 {
+        if !thin.transmission_enabled {
+            return LobeDensity {
+                weight: 0.0,
+                roughness_squared: 0.0,
+            };
+        }
+        let alpha = thin.transmission_alpha;
+        if alpha * alpha <= GLASS_SINGULAR_ALPHA_SQUARED {
+            return LobeDensity {
+                weight: 0.0,
+                roughness_squared: 0.0,
+            };
+        }
+        let virtual_view = view - normal * (2.0 * normal.dot(view));
+        LobeDensity {
+            weight: branch
+                * (1.0 - reflection_probability)
+                * visible_half_vector_pdf(
+                    -normal,
+                    isotropic_microfacet(alpha.sqrt()),
+                    virtual_view,
+                    light,
+                ),
+            roughness_squared: alpha * alpha,
+        }
+    } else {
+        LobeDensity {
+            weight: 0.0,
+            roughness_squared: 0.0,
+        }
+    }
+}
+
+fn thin_microfacet_eval(
+    normal: DVec3,
+    view: DVec3,
+    light: DVec3,
+    alpha: f64,
+    color: DVec3,
+    gain: DVec3,
+) -> (DVec3, f64) {
+    let cos_ni = normal.dot(view);
+    let cos_no = normal.dot(light);
+    if alpha * alpha <= GLASS_SINGULAR_ALPHA_SQUARED || cos_ni <= 0.0 || cos_no <= 0.0 {
+        return (DVec3::ZERO, 0.0);
+    }
+    let half = (view + light).normalize_or_zero();
+    let n_dot_h = normal.dot(half);
+    if n_dot_h <= 0.0 {
+        return (DVec3::ZERO, 0.0);
+    }
+    let alpha_squared = alpha * alpha;
+    let distribution = ggx_distribution(alpha_squared, n_dot_h);
+    let lambda_i = ggx_lambda(alpha_squared, cos_ni);
+    let lambda_o = ggx_lambda(alpha_squared, cos_no);
+    let common = 0.25 * distribution / cos_ni;
+    let value = color * (common / (1.0 + lambda_i + lambda_o)) * gain;
+    let pdf = visible_half_vector_pdf(normal, isotropic_microfacet(alpha.sqrt()), view, light);
+    (value, pdf)
+}
+
+fn thin_glass_eval(lobe: &GlassLobe, normal: DVec3, view: DVec3, light: DVec3) -> (DVec3, f64) {
+    let Some(thin) = lobe.thin else {
+        return (DVec3::ZERO, 0.0);
+    };
+    if normal.dot(light) > 0.0 {
+        thin_microfacet_eval(
+            normal,
+            view,
+            light,
+            lobe.alpha,
+            thin.reflectance,
+            thin.reflection_gain,
+        )
+    } else if normal.dot(light) < 0.0 && thin.transmission_enabled {
+        let virtual_view = view - normal * (2.0 * normal.dot(view));
+        thin_microfacet_eval(
+            -normal,
+            virtual_view,
+            light,
+            thin.transmission_alpha,
+            thin.transmittance,
+            thin.transmission_gain,
+        )
+    } else {
+        (DVec3::ZERO, 0.0)
+    }
+}
+
+/// The thin-glass transmission share Cycles turns into a transparent closure for non-camera rays when it is singular.
+pub(crate) fn thin_glass_shadow_transparency(params: &BsdfParams, layers: &Layers) -> DVec3 {
+    let Some(lobe) = layers.glass else {
+        return DVec3::ZERO;
+    };
+    let Some(thin) = lobe.thin else {
+        return DVec3::ZERO;
+    };
+    if thin.transmission_alpha * thin.transmission_alpha > GLASS_SINGULAR_ALPHA_SQUARED {
+        return DVec3::ZERO;
+    }
+    let amount = (1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0);
+    thin.transmittance * (amount * params.reflectance.clamp(0.0, 1.0)) * layers.lower
+}
+
 /// The glass lobe along `light`, times reflectance and the layers above it: its reflection above the
 /// surface and its transmission below. A delta lobe is zero here, since `sample_glass` draws it.
 pub(crate) fn glass_coefficient(params: &BsdfParams, layers: &Layers, light: DVec3) -> DVec3 {
@@ -1529,19 +1924,22 @@ pub(crate) fn glass_coefficient(params: &BsdfParams, layers: &Layers, light: DVe
     if cosine <= 0.0 {
         return DVec3::ZERO;
     }
-    let (value, _) = glass_eval(lobe, layers.specular, layers.view, light);
+    let value = if lobe.thin.is_some() {
+        let (value, _) = thin_glass_eval(lobe, layers.specular, layers.view, light);
+        value * ((1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0))
+    } else {
+        glass_eval(lobe, layers.specular, layers.view, light).0
+    };
     value / cosine * (params.reflectance.clamp(0.0, 1.0) * layers.lower)
 }
 
 /// Cycles' `1e6` for a singular draw's pdf (`bsdf_microfacet_sample`: `*pdf *= 1e6f` when `m_singular`).
 pub(crate) const SINGULAR_MIS_WEIGHT: f64 = 1.0e6;
 
-/// A draw from the glass closure, as Cycles' `bsdf_microfacet_sample` makes it.
+/// A glass draw: thick glass samples its combined Fresnel closure; Thin Wall samples one of its two closures.
 pub(crate) enum GlassSample {
-    /// A delta reflection or refraction. `weight` is the Fresnel share over the branch probability (`branch`,
-    /// the glass probability in the lobe mixture), times the energy gain, the reflectance and the layers.
-    /// `mis_weight` is Cycles' singular pdf for the widening average, `SINGULAR_MIS_WEIGHT · branch · share`
-    /// (`bsdf_microfacet_sample`: `*pdf *= 1e6f` when `m_singular`, with the Fresnel share as the pick probability).
+    /// A delta reflection or transmission. `weight` is the selected spectral closure share over the branch probability,
+    /// times its energy gain, reflectance and layers. `mis_weight` is `SINGULAR_MIS_WEIGHT × branch × share`.
     Singular {
         direction: DVec3,
         weight: DVec3,
@@ -1553,8 +1951,8 @@ pub(crate) enum GlassSample {
     Absorbed,
 }
 
-/// Draws the glass closure from three uniform numbers: a visible-normal half vector (the normal for a
-/// delta lobe), then reflection or refraction, refraction with probability `1 - reflectance`.
+/// Draws the thick glass closure by sampling a visible normal and Fresnel reflection/refraction. Thin Wall selects its
+/// reflection or flipped-normal mirror-transmission closure before sampling that closure's GGX normal.
 pub(crate) fn sample_glass(
     params: &BsdfParams,
     layers: &Layers,
@@ -1566,6 +1964,9 @@ pub(crate) fn sample_glass(
         return GlassSample::Absorbed;
     };
     let (normal, view) = (layers.specular, layers.view);
+    if lobe.thin.is_some() {
+        return sample_thin_glass(params, layers, lobe, geometric, branch, rands);
+    }
     let half = if lobe.singular {
         normal
     } else {
@@ -1604,6 +2005,76 @@ pub(crate) fn sample_glass(
     GlassSample::Singular {
         direction,
         weight: value * lobe.gain * scale / (branch * share),
+        mis_weight: SINGULAR_MIS_WEIGHT * branch * share,
+    }
+}
+
+fn sample_thin_glass(
+    params: &BsdfParams,
+    layers: &Layers,
+    lobe: &GlassLobe,
+    geometric: DVec3,
+    branch: f64,
+    rands: [f64; 3],
+) -> GlassSample {
+    let Some(thin) = lobe.thin else {
+        return GlassSample::Absorbed;
+    };
+    let normal = layers.specular;
+    let view = layers.view;
+    let reflection_probability = thin.reflection_probability();
+    let reflects = !thin.transmission_enabled || rands[2] < reflection_probability;
+    let (sample_normal, sample_view, alpha, color, gain, share) = if reflects {
+        (
+            normal,
+            view,
+            lobe.alpha,
+            thin.reflectance,
+            thin.reflection_gain,
+            reflection_probability,
+        )
+    } else {
+        (
+            -normal,
+            view - normal * (2.0 * normal.dot(view)),
+            thin.transmission_alpha,
+            thin.transmittance,
+            thin.transmission_gain,
+            1.0 - reflection_probability,
+        )
+    };
+    if share <= 0.0 {
+        return GlassSample::Absorbed;
+    }
+    let half = if alpha * alpha <= GLASS_SINGULAR_ALPHA_SQUARED {
+        sample_normal
+    } else {
+        let (tangent, bitangent) = make_orthonormals(sample_normal);
+        let local_view = DVec3::new(
+            sample_view.dot(tangent),
+            sample_view.dot(bitangent),
+            sample_normal.dot(sample_view),
+        );
+        let local_half = sample_visible_normal(local_view, alpha, rands[0], rands[1]);
+        tangent * local_half.x + bitangent * local_half.y + sample_normal * local_half.z
+    };
+    let incoming = -sample_view;
+    let direction = (incoming - half * (2.0 * half.dot(incoming))).normalize_or_zero();
+    if if reflects {
+        geometric.dot(direction) <= 0.0
+    } else {
+        geometric.dot(direction) >= 0.0
+    } {
+        return GlassSample::Absorbed;
+    }
+    if alpha * alpha > GLASS_SINGULAR_ALPHA_SQUARED {
+        return GlassSample::Rough { direction };
+    }
+    let amount = (1.0 - params.metallic.clamp(0.0, 1.0)) * params.transmission.clamp(0.0, 1.0);
+    GlassSample::Singular {
+        direction,
+        weight: color * gain * (amount * params.reflectance.clamp(0.0, 1.0)) * layers.lower
+            / (branch * share),
         mis_weight: SINGULAR_MIS_WEIGHT * branch * share,
     }
 }
@@ -2063,6 +2534,7 @@ mod glass_tests {
             gain: DVec3::ONE,
             singular: false,
             straight: false,
+            thin: None,
         };
         let back = GlassLobe {
             ior: 1.0 / ior,
@@ -2777,6 +3249,24 @@ mod subsurface_tests {
         for channel in subsurface_share(&params).to_array() {
             assert!((channel - expected).abs() < 1e-12, "{channel}");
         }
+    }
+
+    #[test]
+    fn smooth_thin_glass_has_shadow_transparency_but_rough_thin_glass_does_not() {
+        let mut params = principled(SubsurfaceMethod::Burley, 0.0);
+        params.transmission = 1.0;
+        params.ior = 1.5;
+        params.roughness = 0.0;
+        params.base_color = [1.0; 4];
+        params.glass_transmission_tint = [1.0; 3];
+        params.thin_wall = true;
+        let smooth = layers(&params, DVec3::Z, DVec3::Z);
+        let transmittance = thin_glass_shadow_transparency(&params, &smooth);
+        assert!(transmittance.x > 0.9, "{transmittance:?}");
+
+        params.roughness = 0.2;
+        let rough = layers(&params, DVec3::Z, DVec3::Z);
+        assert_eq!(thin_glass_shadow_transparency(&params, &rough), DVec3::ZERO);
     }
 
     #[test]

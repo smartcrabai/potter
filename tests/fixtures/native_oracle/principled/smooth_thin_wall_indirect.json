@@ -1,0 +1,45 @@
+{
+  "provenance": {
+    "blender": "5.2.2 LTS",
+    "engine": "CYCLES",
+    "device": "CPU",
+    "threads": 1,
+    "samples_per_pixel": 4096,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "resolution": [
+      16,
+      16
+    ],
+    "patch": "central 8x8 pixel mean",
+    "generator": "tests/fixtures/native_oracle/principled/smooth_thin_wall_indirect.py",
+    "geometry": "diffuse floor, smooth transmissive Thin Wall panel between floor and small area light; camera sees only floor",
+    "stderr": "standard error across 16 independent Blender seeds"
+  },
+  "mean": [
+    2.2369481270434335,
+    2.2369481270434335,
+    2.2369481270434335
+  ],
+  "stderr": [
+    0.0003269974050915813,
+    0.0003269974050915813,
+    0.0003269974050915813
+  ]
+}

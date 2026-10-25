@@ -27,7 +27,7 @@ use crate::{
 use super::principled_bsdf::{
     GlassSample, Layers, base_color, continuous_density, continuous_lobes, diffuse_coefficient,
     evaluate_masked, layers_at, lobe_probabilities, sample_glass, sample_specular_ggx_half,
-    sheen_coefficient, specular_eta, subsurface_closure_weight,
+    sheen_coefficient, specular_eta, subsurface_closure_weight, thin_glass_shadow_transparency,
 };
 use super::subsurface::{
     MAX_HITS, ProbeHits, SubsurfaceExit, burley_radius, channel_mask, eval as burley_eval,
@@ -210,6 +210,7 @@ struct HitClosure {
     weight: f64,
     params: BsdfParams,
     layers: Layers,
+    pass_tint: DVec3,
 }
 
 impl HitClosure {
@@ -225,6 +226,7 @@ impl HitClosure {
             weight,
             params: *params,
             layers: closure_layers,
+            pass_tint: transparent_tint(params) * (1.0 - params.alpha),
         }
     }
 
@@ -238,10 +240,9 @@ impl HitClosure {
         }
     }
 
-    /// Selection weight of the pass-through share, `w · (1 − α) · mean(tint)` (Cycles' sample weight of its Transparent
-    /// closure, `bsdf_transparent_setup`).
+    /// Selection weight of the transparent closure(s) on this surface, the weight times mean tint.
     fn pass_weight(&self) -> f64 {
-        self.weight * (1.0 - self.params.alpha) * transparent_tint(&self.params).element_sum() / 3.0
+        self.weight * self.pass_tint.element_sum() / 3.0
     }
 }
 
@@ -416,10 +417,9 @@ impl Closures {
         picked
     }
 
-    /// The throughput of a pass through `closure`: its tint times `S / mean(tint)`. The pick probability
-    /// `w·(1−α)·mean(tint) / S` then leaves the expected throughput `w·(1−α)·tint`.
+    /// The throughput of this closure's pass share: its tint times `S / mean(tint)`, so the pick leaves `w · tint`.
     fn pass_multiplier(&self, closure: &HitClosure) -> DVec3 {
-        let tint = transparent_tint(&closure.params);
+        let tint = closure.pass_tint;
         tint * (self.selection_total / (tint.element_sum() / 3.0))
     }
 
@@ -560,6 +560,7 @@ impl Closures {
                     weight: closure.weight,
                     params,
                     layers: closure.layers.blurred(blur_alpha),
+                    pass_tint: closure.pass_tint,
                 }
             })
             .collect();
@@ -593,6 +594,7 @@ impl Closures {
     fn disable_burley_subsurface(&mut self) {
         let burley = |closure: &HitClosure| {
             closure.params.subsurface_method == SubsurfaceMethod::Burley
+                && !closure.params.thin_wall
                 && closure.params.subsurface_weight > 0.0
         };
         if !self.items.iter().any(burley) {
@@ -603,16 +605,18 @@ impl Closures {
             .iter()
             .map(|closure| {
                 let mut params = closure.params;
-                if params.subsurface_method == SubsurfaceMethod::Burley {
+                if params.subsurface_method == SubsurfaceMethod::Burley && !params.thin_wall {
                     params.subsurface_weight = 0.0;
                 }
-                HitClosure::new(
+                let mut item = HitClosure::new(
                     closure.weight,
                     &params,
                     closure.layers.view,
                     self.geometric,
                     self.bump_correction,
-                )
+                );
+                item.pass_tint = closure.pass_tint;
+                item
             })
             .collect();
         *self = Closures::new(items, self.smooth, self.geometric, self.bump_correction);
@@ -1293,10 +1297,9 @@ fn band_rows(height: usize, band_count: usize) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// Appends one worker's shading warnings to `sink`, dropping those the serial render would not have recorded. A
-/// Principled input is recorded once per (material, input) (`record_unevaluated_inputs`); the layer warnings once per
-/// equal warning (`layer_index`, `color_layer_missing`). Workers record into their own sinks, so a duplicate across
-/// workers is caught here, against the workers that came before in pixel order.
+/// Appends one worker's shader warnings to `sink`, dropping duplicates already recorded by the serial render. Warnings
+/// with a material and input are unique per pair; other warnings are unique by value. Workers record into their own
+/// sinks, so duplicates across workers are caught in pixel order.
 fn merge_shader_warnings(sink: &RefCell<Vec<serde_json::Value>>, warnings: Vec<serde_json::Value>) {
     let mut recorded = sink.borrow_mut();
     for warning in warnings {
@@ -3742,6 +3745,7 @@ fn prepare_realtime_mesh_sample(
                 ray.direction,
                 transport.images,
                 Some(ray.footprint.at_distance(distance)),
+                RayKind::Camera,
                 hit_media,
                 Some(&mut *froxel_hit_media),
                 evaluator_workspace,
@@ -5002,6 +5006,7 @@ fn trace_path(
             direction,
             images,
             footprint_here,
+            ray,
             evaluator_workspace,
         )?;
         // Cycles' glossy blur (`surface_shader_prepare_closures`) runs before the hit is shaded, so the direct light, the
@@ -5317,6 +5322,7 @@ fn write_center_passes(
                 direction,
                 images,
                 footprint.at_distance(hit.distance),
+                RayKind::Camera,
                 evaluator_workspace,
             )?;
             if surface.closures.coverage <= 0.0 {
@@ -6018,6 +6024,7 @@ fn make_surface(
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
     footprint: f64,
+    ray_kind: RayKind,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
     let triangle_index = hit.triangle_index;
@@ -6090,13 +6097,29 @@ fn make_surface(
                     normal = -normal;
                 }
                 params.normal = normal;
-                items.push(HitClosure::new(
+                let mut item = HitClosure::new(
                     closure.weight,
                     &params,
                     -direction,
                     frame.geometric_normal,
                     frame.material.use_bump_map_correction,
-                ));
+                );
+                if ray_kind != RayKind::Camera && params.thin_wall {
+                    let transparent =
+                        thin_glass_shadow_transparency(&params, &item.layers) * params.alpha;
+                    if transparent.max_element() > 0.0 {
+                        item.pass_tint += transparent;
+                        item.params.thin_glass_transparent = true;
+                        item.layers = layers_at(
+                            &item.params,
+                            normal,
+                            -direction,
+                            frame.geometric_normal,
+                            frame.material.use_bump_map_correction,
+                        );
+                    }
+                }
+                items.push(item);
             }
             // The dominant closure's normal is the surface's reference normal, for light sampling and the normal pass.
             let normal = heaviest(&items, |closure| closure.weight)
@@ -6124,8 +6147,8 @@ fn make_surface(
 }
 
 /// The media and shadow transparency of one hit, which is all a shadow ray or the camera's medium probe reads from it.
-/// Neither depends on the normal, so the displacement gradient is not evaluated here. Consequently a warning, or an error,
-/// that only the gradient's samples produce is not raised from a shadow ray; path and camera hits still raise it.
+/// Displacement gradients are not evaluated here; smooth Thin Wall transmission uses its Principled shading normal.
+/// Consequently a warning or error produced only by gradient samples is still raised on path and camera hits.
 fn shadow_hit(
     doc: &SceneDoc,
     geometry: &TraceGeometry<'_>,
@@ -6145,6 +6168,7 @@ fn shadow_hit(
         direction,
         images,
         footprint,
+        RayKind::Shadow,
         &mut media,
         None,
         evaluator_workspace,
@@ -6160,6 +6184,7 @@ fn shadow_hit_into(
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
     footprint: Option<f64>,
+    ray_kind: RayKind,
     media: &mut Vec<MeshMedium>,
     froxel_media: Option<&mut Vec<FroxelMeshMedium>>,
     evaluator_workspace: &mut EvaluatorWorkspace,
@@ -6181,7 +6206,7 @@ fn shadow_hit_into(
             )?;
             // The closures `make_surface` keeps (weight above zero), with alpha after the material's alpha mode, as `Closures::new`
             // reads them.
-            let transparency = shadow_transparency(
+            let mut transparency = shadow_transparency(
                 shading
                     .closures
                     .iter()
@@ -6192,6 +6217,32 @@ fn shadow_hit_into(
                         (closure.weight, params.alpha, transparent_tint(&params))
                     }),
             );
+            if ray_kind == RayKind::Shadow {
+                let view = -direction;
+                for closure in &shading.closures {
+                    if closure.weight <= 0.0 || !closure.params.thin_wall {
+                        continue;
+                    }
+                    let mut params = closure.params;
+                    apply_hit_alpha(frame.material, &mut params);
+                    params.back_facing = frame.back_facing;
+                    let normal = if params.normal.dot(view) < 0.0 {
+                        -params.normal
+                    } else {
+                        params.normal
+                    };
+                    params.normal = normal;
+                    let layers = layers_at(
+                        &params,
+                        normal,
+                        view,
+                        frame.geometric_normal,
+                        frame.material.use_bump_map_correction,
+                    );
+                    transparency += thin_glass_shadow_transparency(&params, &layers)
+                        * (closure.weight * params.alpha);
+                }
+            }
             let volume_boundary = frame.prepared.is_volume_only();
             surface_media_into(frame.triangle.object_index, &shading.volume, media);
             if let Some(froxel_media) = froxel_media {
@@ -6709,10 +6760,9 @@ fn shadow_transmittance_with_volumetric_shadows(
                 blocked = true;
                 return false;
             }
-            // Cycles' shadow transparency is the closures' transparent extinction, `Σ w · (1 − α) · tint`
-            // (`kernel/integrator/surface_shader.h`, `surface_shader_transparency`). A glass or other transmissive
-            // closure has none, so it blocks the shadow ray: its shader lacks `SD_HAS_TRANSPARENT_SHADOW`
-            // (`scene/shader.cpp`, `kernel/bvh/intersect_filter.h`).
+            // Shadow transparency is the closures' transparent share (`surface_shader_transparency`); ordinary glass
+            // blocks, while Cycles' smooth Thin Wall transmission becomes a transparent closure for non-camera rays
+            // (`bsdf_thin_glass_transmission_setup`), which `shadow_hit` adds here.
             transmittance *= transparency;
             if transmittance.max_element() <= 1.0e-5 {
                 blocked = true;
@@ -7197,9 +7247,18 @@ fn sample_lobes(
     let view = layers.view;
     let probabilities = lobe_probabilities(params, layers);
     let choice = rng.next_f64();
-    // The subsurface lobe's probability is zero for a closure with no Subsurface Weight, so `choice` never reaches the
-    // branch without one. Every method is evaluated, so the branch needs no method check.
+    // Thin Wall replaces a BSSRDF with diffuse reflection and cosine-sampled translucent transmission.
     if choice < probabilities.subsurface {
+        if params.thin_wall {
+            let direction = sample_cosine_hemisphere(-normal, rng).0;
+            if direction.dot(geometric) >= 0.0 {
+                return LobeDraw::Absorbed;
+            }
+            return LobeDraw::Continuous {
+                direction,
+                ray: RayKind::Diffuse,
+            };
+        }
         let method = params.subsurface_method;
         let weight =
             subsurface_closure_weight(params, layers.energy_roughness, normal, view, layers.lower)
@@ -8201,6 +8260,7 @@ fn camera_media(
                 probe,
                 images,
                 Some(footprint.at_distance(hit.distance)),
+                RayKind::Camera,
                 hit_media,
                 froxel_hit_media.as_deref_mut(),
                 evaluator_workspace,
@@ -9918,8 +9978,8 @@ mod band_tests {
 
     use super::{band_rows, merge_shader_warnings};
 
-    /// Records one warning as a worker's sink does: a Principled input once per (material, input)
-    /// (`record_unevaluated_inputs`), any other warning once per equal value (`layer_index`, `color_layer_missing`).
+    /// Records a warning as a worker's sink does: a warning with a material/input once per pair, any other warning once
+    /// per equal value (`layer_index`, `color_layer_missing`).
     fn record(sink: &mut Vec<Value>, warning: Value) {
         let duplicate = match warning["input"].as_str() {
             Some(input) => sink.iter().any(|existing| {
@@ -9955,10 +10015,10 @@ mod band_tests {
         // A pixel-ordered stream in which each warning recurs in every band, as a shared material does.
         let stream: Vec<Value> = (0..48)
             .map(|index| match index % 4 {
-                0 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.thin_wall",
-                    "material": "a", "input": "Thin Wall", "message": "a"}),
-                1 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.principled.thin_wall",
-                    "material": "b", "input": "Thin Wall", "message": "b"}),
+                0 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.advanced",
+                    "material": "a", "input": "Unsupported Node", "message": "a"}),
+                1 => json!({"code": "UNSUPPORTED_FEATURE", "feature_id": "shader.advanced",
+                    "material": "b", "input": "Unsupported Node", "message": "b"}),
                 2 => json!({"code": "uv.layer_missing", "layer": "UV2",
                     "message": "UV layer `UV2` is not on this mesh; the render layer was used"}),
                 _ => json!({"code": "mesh.color_layer_missing", "layer": "Col",

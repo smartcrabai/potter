@@ -188,6 +188,69 @@ pub(crate) fn glass_split(
     }
 }
 
+/// EEVEE's `slab_transmittance_at_angle` for a clamped Principled base colour.
+fn slab_transmittance_at_angle(base_color: DVec3, n_dot_v: f64, ior: f64) -> DVec3 {
+    let color = base_color.clamp(DVec3::ZERO, DVec3::ONE);
+    let path_length = ior / (ior * ior - (1.0 - n_dot_v * n_dot_v)).sqrt();
+    DVec3::new(
+        color.x.powf(path_length),
+        color.y.powf(path_length),
+        color.z.powf(path_length),
+    )
+}
+
+/// EEVEE's thin-wall split: a colour-attenuated slab with infinitely many internal reflections.
+fn thin_glass_split(
+    ior: f64,
+    roughness: f64,
+    n_dot_v: f64,
+    f0: DVec3,
+    base_color: DVec3,
+) -> GlassSplit {
+    let split = glass_split(ior, roughness, n_dot_v, f0, DVec3::ONE);
+    let c = slab_transmittance_at_angle(base_color, n_dot_v, ior);
+    let round_trip = split.reflectance * c;
+    let denominator = DVec3::ONE - round_trip * round_trip;
+    let numerator = c * split.transmittance * split.transmittance;
+    let transmittance = DVec3::new(
+        if denominator.x == 0.0 {
+            0.0
+        } else {
+            numerator.x / denominator.x
+        },
+        if denominator.y == 0.0 {
+            0.0
+        } else {
+            numerator.y / denominator.y
+        },
+        if denominator.z == 0.0 {
+            0.0
+        } else {
+            numerator.z / denominator.z
+        },
+    );
+    GlassSplit {
+        reflectance: split.reflectance * (DVec3::ONE + transmittance * c),
+        transmittance,
+    }
+}
+
+/// EEVEE's thin-glass closure roughness.
+fn thin_glass_transmission_roughness(roughness: f64, ior: f64) -> f64 {
+    let ior_delta = ior - 0.5;
+    (roughness
+        * (3.4 * (ior - 1.0) * ior_delta * ior_delta / (ior * ior * ior))
+            .sqrt()
+            .sqrt())
+    .clamp(0.0, 1.0)
+}
+
+/// EEVEE's `bxdf_ggx_lightprobe_thin_glass_transmission`: one thin refraction event, not a thick
+/// refraction through an object-thickness exit normal.
+fn thin_glass_transmission_direction(normal: DVec3, view: DVec3, roughness: f64) -> DVec3 {
+    reflection_direction(-normal, reflect(view, normal), roughness)
+}
+
 /// The mix weight of EEVEE's `bxdf_ggx_dominant_direction_*`: the probe direction leaves the normal for the specular
 /// direction as the roughness grows.
 fn dominant_mix(roughness: f64) -> f64 {
@@ -343,7 +406,7 @@ pub(crate) struct GlassClosures {
     pub(crate) reflection: DVec3,
     pub(crate) reflection_direction: DVec3,
     pub(crate) reflection_roughness: f64,
-    /// The transmission's weight times its colour, squared when the object has a thickness (two events).
+    /// The transmission's weight times its colour, squared only for thick refraction with object thickness.
     pub(crate) transmission: DVec3,
     pub(crate) transmission_direction: DVec3,
     pub(crate) transmission_roughness: f64,
@@ -360,7 +423,7 @@ pub(crate) struct GlassLight {
     pub(crate) reflection: DVec3,
     /// The reflection's inverse LTC matrix, sampled at `N · V` and the roughness (`bxdf_ggx_light_reflection`).
     pub(crate) reflection_matrix: PackedMatrix,
-    /// The transmission closure's colour, squared with a thickness (two events; `eevee_deferred_combine.bsl.hh`).
+    /// The transmission closure's colour, squared only for thick refraction with object thickness.
     pub(crate) transmission: DVec3,
     /// The normal the transmission lobe integrates around (`light.N`): `-N`, or the exit normal of a thickness.
     pub(crate) transmission_normal: DVec3,
@@ -374,6 +437,7 @@ struct GlassLobe {
     normal: DVec3,
     ior: f64,
     roughness: f64,
+    thin_wall: bool,
     split: GlassSplit,
     reflection_tint: DVec3,
     lobe_weight: DVec3,
@@ -397,13 +461,29 @@ fn glass_lobe(params: &BsdfParams, normal: DVec3, view: DVec3, lower: DVec3) -> 
     // EEVEE's `F0 = F0_from_ior(ior) * reflection_tint` for a Principled, where the Glass node's Color is the tint.
     let f0 = (DVec3::from_array(params.specular_tint).max(DVec3::ZERO) * amplitude * amplitude)
         .clamp(DVec3::ZERO, DVec3::ONE);
-    let transmission_tint = DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
     let reflection_tint = DVec3::from_array(params.glass_reflection_tint).max(DVec3::ZERO);
     Some(GlassLobe {
         normal,
         ior,
         roughness,
-        split: glass_split(ior, roughness, normal.dot(view), f0, transmission_tint),
+        thin_wall: params.thin_wall,
+        split: if params.thin_wall {
+            thin_glass_split(
+                ior,
+                roughness,
+                normal.dot(view),
+                f0,
+                DVec3::new(
+                    params.base_color[0],
+                    params.base_color[1],
+                    params.base_color[2],
+                ),
+            )
+        } else {
+            let transmission_tint =
+                DVec3::from_array(params.glass_transmission_tint).max(DVec3::ZERO);
+            glass_split(ior, roughness, normal.dot(view), f0, transmission_tint)
+        },
         reflection_tint,
         lobe_weight: lower * weight,
     })
@@ -423,22 +503,28 @@ pub(crate) fn glass_closures(
     let lobe = glass_lobe(params, normal, view, lower)?;
     let reflection = lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight;
     let mut transmission = lobe.split.transmittance * lobe.lobe_weight;
-    if thickness != Thickness::None {
+    if !lobe.thin_wall && thickness != Thickness::None {
         transmission *= transmission;
     }
+    let (direction, perceived_roughness) = if lobe.thin_wall {
+        let perceived_roughness = thin_glass_transmission_roughness(lobe.roughness, lobe.ior);
+        (
+            thin_glass_transmission_direction(lobe.normal, view, perceived_roughness),
+            perceived_roughness,
+        )
+    } else {
+        (
+            transmission_direction(lobe.normal, view, lobe.ior, lobe.roughness, thickness),
+            transmission_roughness(lobe.roughness, lobe.ior),
+        )
+    };
     Some(GlassClosures {
         reflection,
         reflection_direction: reflection_direction(lobe.normal, view, lobe.roughness),
         reflection_roughness: lobe.roughness,
         transmission,
-        transmission_direction: transmission_direction(
-            lobe.normal,
-            view,
-            lobe.ior,
-            lobe.roughness,
-            thickness,
-        ),
-        transmission_roughness: transmission_roughness(lobe.roughness, lobe.ior),
+        transmission_direction: direction,
+        transmission_roughness: perceived_roughness,
     })
 }
 
@@ -453,21 +539,26 @@ pub(crate) fn glass_light(
 ) -> Option<GlassLight> {
     let lobe = glass_lobe(params, normal, view, lower)?;
     let mut transmission = lobe.split.transmittance * lobe.lobe_weight;
-    if thickness != Thickness::None {
+    if !lobe.thin_wall && thickness != Thickness::None {
         transmission *= transmission;
     }
-    let (transmission_normal, cos_theta) =
-        transmission_light_normal(lobe.normal, view, lobe.ior, lobe.roughness, thickness);
+    let (transmission_normal, cos_theta) = if lobe.thin_wall {
+        (-lobe.normal, lobe.normal.dot(view))
+    } else {
+        transmission_light_normal(lobe.normal, view, lobe.ior, lobe.roughness, thickness)
+    };
+    let transmission_roughness = if lobe.thin_wall {
+        thin_glass_transmission_roughness(lobe.roughness, lobe.ior)
+    } else {
+        transmission_roughness(lobe.roughness, lobe.ior)
+    };
     Some(GlassLight {
         oriented_normal: lobe.normal,
         reflection: lobe.split.reflectance * lobe.reflection_tint * lobe.lobe_weight,
         reflection_matrix: sample_matrix(lobe.normal.dot(view), lobe.roughness),
         transmission,
         transmission_normal,
-        transmission_matrix: sample_matrix(
-            cos_theta,
-            transmission_roughness(lobe.roughness, lobe.ior),
-        ),
+        transmission_matrix: sample_matrix(cos_theta, transmission_roughness),
     })
 }
 
@@ -564,6 +655,90 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn thin_glass_split_matches_slab_attenuation_and_internal_reflections() {
+        let ior = 1.5;
+        let roughness = 0.3;
+        let n_dot_v = 0.8;
+        let base_color = DVec3::new(0.25, 0.5, 0.75);
+        let amplitude = (ior - 1.0) / (ior + 1.0);
+        let f0 = DVec3::splat(amplitude * amplitude);
+        let one_pass = glass_split(ior, roughness, n_dot_v, f0, DVec3::ONE);
+        let thin = thin_glass_split(ior, roughness, n_dot_v, f0, base_color);
+        let path_length = ior / (ior * ior - (1.0 - n_dot_v * n_dot_v)).sqrt();
+        let c = DVec3::new(
+            base_color.x.powf(path_length),
+            base_color.y.powf(path_length),
+            base_color.z.powf(path_length),
+        );
+        let round_trip = one_pass.reflectance * c;
+        let expected_transmittance = c * one_pass.transmittance * one_pass.transmittance
+            / (DVec3::ONE - round_trip * round_trip);
+        let expected_reflectance = one_pass.reflectance * (DVec3::ONE + expected_transmittance * c);
+        assert!(
+            (thin.transmittance - expected_transmittance)
+                .abs()
+                .max_element()
+                < 1.0e-12
+        );
+        assert!(
+            (thin.reflectance - expected_reflectance)
+                .abs()
+                .max_element()
+                < 1.0e-12
+        );
+    }
+
+    #[test]
+    fn thin_wall_uses_one_sheet_refraction_independent_of_object_thickness() -> Result<(), String> {
+        let mut params = glass(0.0);
+        params.thin_wall = true;
+        let view = DVec3::new(0.6, 0.0, 0.8);
+        let thin = glass_closures(&params, DVec3::Z, view, DVec3::ONE, Thickness::None)
+            .ok_or_else(|| "thin glass has a transmission lobe".to_owned())?;
+        let with_object_thickness =
+            glass_closures(&params, DVec3::Z, view, DVec3::ONE, Thickness::Sphere(2.0))
+                .ok_or_else(|| {
+                    "thin glass keeps its transmission lobe with thickness".to_owned()
+                })?;
+        assert_eq!(thin.transmission, with_object_thickness.transmission);
+        assert_eq!(
+            thin.transmission_direction,
+            with_object_thickness.transmission_direction
+        );
+        assert!((thin.transmission_direction + view).length() < 1.0e-9);
+        assert_eq!(thin.transmission_roughness, 0.0);
+
+        let thin_light = glass_light(&params, DVec3::Z, view, DVec3::ONE, Thickness::None)
+            .ok_or_else(|| "thin glass has a direct transmission lobe".to_owned())?;
+        let light_with_object_thickness =
+            glass_light(&params, DVec3::Z, view, DVec3::ONE, Thickness::Sphere(2.0))
+                .ok_or_else(|| "thin glass keeps its direct lobe with thickness".to_owned())?;
+        assert_eq!(
+            thin_light.transmission,
+            light_with_object_thickness.transmission
+        );
+        assert_eq!(thin_light.transmission_normal, -DVec3::Z);
+        assert_eq!(
+            thin_light.transmission_matrix,
+            light_with_object_thickness.transmission_matrix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thin_glass_roughness_uses_eevee_mapping() {
+        let roughness = 0.8;
+        let ior: f64 = 1.5;
+        let ior_delta = ior - 0.5;
+        let expected = (roughness
+            * (3.4 * (ior - 1.0) * ior_delta * ior_delta / (ior * ior * ior))
+                .sqrt()
+                .sqrt())
+        .clamp(0.0, 1.0);
+        assert!((thin_glass_transmission_roughness(roughness, ior) - expected).abs() < 1.0e-12);
     }
 
     #[test]

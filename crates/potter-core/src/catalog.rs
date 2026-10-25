@@ -96,12 +96,12 @@ pub fn feature_catalog() -> Value {
             &["material.create", "material.update"],
             [true, true, true, true, true, true, true],
         ),
-        unsupported(
+        supported(
             "shader.principled.thin_wall",
-            "Principled thin wall",
+            "Principled thin glass and Cycles thin subsurface",
             "ShaderNodeBsdfPrincipled",
             &["material.create", "material.update"],
-            "Potter does not evaluate Thin Wall; a render with Thin Wall enabled reports UNSUPPORTED_FEATURE.",
+            [true, true, true, true, true, true, true],
         ),
         unsupported(
             "shader.advanced",

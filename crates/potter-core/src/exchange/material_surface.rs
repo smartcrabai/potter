@@ -2271,10 +2271,14 @@ impl GraphReducer<'_> {
                 None,
             );
         }
-        if node.inputs.get("Thin Wall").and_then(Value::as_bool) == Some(true) {
+        if self.link_into(node_id, "Thin Wall").is_some()
+            || node.inputs.get("Thin Wall").is_some_and(|value| {
+                value.as_bool() == Some(true) || value.as_f64().is_some_and(|value| value > 0.5)
+            })
+        {
             self.loss(
                 feature_id::UNSUPPORTED_INPUT,
-                format!("Principled `{node_id}` has Thin Wall enabled, which glTF cannot express; it is ignored"),
+                format!("Principled `{node_id}` has Thin Wall enabled or linked, which glTF cannot express; it is ignored"),
                 None,
             );
         }
@@ -2975,6 +2979,25 @@ mod tests {
         assert!(!surface.unlit);
         let fields = resolve_fields_surface(&doc, &id("mat")).unwrap();
         assert_eq!(fields, surface);
+    }
+
+    #[test]
+    fn thin_wall_integer_socket_reports_gltf_loss() {
+        let (_, losses) = resolved(&document(Some(principled_graph(&json!({"Thin Wall": 1})))));
+        assert!(
+            losses.iter().any(|loss| {
+                loss.feature_id == feature_id::UNSUPPORTED_INPUT
+                    && loss.reason.contains("Thin Wall")
+            }),
+            "{losses:?}"
+        );
+        let (_, no_loss) = resolved(&document(Some(principled_graph(&json!({"Thin Wall": 0})))));
+        assert!(
+            no_loss
+                .iter()
+                .all(|loss| loss.feature_id != feature_id::UNSUPPORTED_INPUT),
+            "{no_loss:?}"
+        );
     }
     #[test]
     fn clip_texture_field_reports_sampler_loss() {
