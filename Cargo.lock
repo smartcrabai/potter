@@ -1494,9 +1494,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.59.0"
+version = "0.60.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b320ad34c177093d21622edc9215bb608294c2333ff296672c0c8265a5ee60c"
+checksum = "7e7305938cac5ee144352ceb71583ffc6cfeac7d20fcb20ef865a4d5c314e499"
 dependencies = [
  "ahash",
  "bytecount",
@@ -1507,12 +1507,12 @@ dependencies = [
  "getrandom 0.3.4",
  "idna",
  "itoa",
- "jsonschema-regex 0.59.0",
- "jsonschema-value 0.59.0",
+ "jsonschema-regex 0.60.1",
+ "jsonschema-value 0.60.1",
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing 0.59.0",
+ "referencing 0.60.1",
  "regex",
  "reqwest",
  "rustls",
@@ -1534,9 +1534,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.59.0"
+version = "0.60.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1472f7be79026f79e01a9b172263311e829d7c210d57b39cb57037abc0ce0500"
+checksum = "6f8a848331614144c03e815fb931f238c9e342bd7ab501b29e35d647e7cd5688"
 dependencies = [
  "regex-syntax",
 ]
@@ -1557,14 +1557,15 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-value"
-version = "0.59.0"
+version = "0.60.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5a7550a7a84787e715ead0b47e01fa8c6bb7c3413630f91a8f2094c06c2078a"
+checksum = "5a5a947ef798eeacacb43edf29b1d0ab64bdf5e2c9fbcaad10ee8663d922b544"
 dependencies = [
  "ahash",
  "bytecount",
  "fraction 0.17.0",
  "getrandom 0.3.4",
+ "memchr",
  "num-cmp",
  "num-traits",
  "serde_json",
@@ -1891,7 +1892,7 @@ dependencies = [
  "glam 0.34.1",
  "hex",
  "image",
- "jsonschema 0.59.0",
+ "jsonschema 0.60.0",
  "png",
  "potter-core",
  "potter-workflow",
@@ -1942,7 +1943,7 @@ dependencies = [
  "clap",
  "image",
  "jcode-sdk",
- "jsonschema 0.59.0",
+ "jsonschema 0.60.0",
  "potter-core",
  "serde",
  "serde_json",
@@ -2175,9 +2176,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.59.0"
+version = "0.60.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "473f4dcca28ead7ee0f8e5b5d0bbae2549f4fc4c958fb20af328961b6c174be3"
+checksum = "922268812b6f9e20b4ab0f1efe8e07036958eed7346ceddb31c777b5531fd11f"
 dependencies = [
  "ahash",
  "fluent-uri",
