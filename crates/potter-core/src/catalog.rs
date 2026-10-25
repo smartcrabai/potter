@@ -1798,7 +1798,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint",
-            "Brush-proximity Dynamic Paint writes Potter color/weight output; Blender PAINT/VERTEX surfaces support one named primary color layer per canvas with per-surface frame bounds, while wetness output and baked caches are refused",
+            "Blender PAINT/VERTEX surfaces write one named primary color layer; WEIGHT/VERTEX surfaces accumulate point-brush influence into an existing named vertex group across integer frames and optionally dissolve it. Multiple surfaces, wetness output, unsupported brush sources, substeps, and baked caches remain refused.",
             "DynamicPaint",
             &[
                 "physics.dynamic_paint.create",
@@ -1835,19 +1835,22 @@ pub fn feature_catalog() -> Value {
             &[],
             "Only COLLISION fluid effectors are evaluated; GUIDE effectors are refused with physics.fluid_effector.effector_type.",
         ),
-        unsupported(
+        supported(
             "physics.dynamic_paint_surface.surface_type",
-            "Dynamic paint surface types other than PAINT",
+            "PAINT and WEIGHT dynamic-paint surfaces",
             "DynamicPaintSurface",
-            &[],
-            "Only PAINT surfaces are evaluated; DISPLACE, WAVE, and WEIGHT surfaces are refused with physics.dynamic_paint_surface.surface_type.",
+            &[
+                "physics.dynamic_paint.create",
+                "physics.dynamic_paint.update",
+            ],
+            [true, true, true, true, false, true, true],
         ),
         unsupported(
             "physics.dynamic_paint_surface.surface_format",
             "Dynamic paint surface formats other than VERTEX",
             "DynamicPaintSurface",
             &[],
-            "Only VERTEX PAINT surfaces are evaluated; IMAGE surfaces are refused with physics.dynamic_paint_surface.surface_format.",
+            "Only VERTEX PAINT and WEIGHT surfaces are evaluated; IMAGE surfaces are refused with physics.dynamic_paint_surface.surface_format.",
         ),
         unsupported(
             "physics.dynamic_paint_surface.output_name_b",
@@ -1865,7 +1868,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint_surface.frame_start",
-            "A single PAINT/VERTEX surface stays unpainted before frame_start and for start>end; after frame_end its color output is held from the frame_end canvas and brush evaluation.",
+            "A single PAINT/VERTEX surface stays unpainted before frame_start and for start>end; WEIGHT/VERTEX accumulates its point-brush weights and dissolve over integer frames in range. Both outputs are held from frame_end after the range.",
             "DynamicPaintSurface",
             &[
                 "physics.dynamic_paint.create",
@@ -1885,7 +1888,7 @@ pub fn feature_catalog() -> Value {
             "Dynamic-paint canvas topology changes across a held range",
             "DynamicPaintSurface",
             &[],
-            "Held per-vertex colors can only be mapped when vertex count and order remain stable from frame_end to the requested frame; topology-changing ranges are refused.",
+            "Per-vertex color and weight history can only be mapped when vertex count and order remain stable from frame_start through the requested frame; topology-changing ranges are refused.",
         ),
         unsupported(
             "physics.point_cache.is_baked",
@@ -1913,7 +1916,7 @@ pub fn feature_catalog() -> Value {
             "Dynamic paint surface types and stateful canvas evolution",
             "DynamicPaint",
             &[],
-            "Potter models the primary PAINT/VERTEX brush-proximity color output and a frame_end hold for stable topology, but not Blender's arbitrary point-cache history, wetness/drying/dissolve layers, or surface types other than PAINT. Baked caches and multiple surfaces per canvas are refused.",
+            "Potter evaluates PAINT/VERTEX color proximity and WEIGHT/VERTEX point-brush accumulation/dissolve, but not arbitrary point-cache history, wetness or PAINT drying/dissolve, non-POINT WEIGHT brush sources, ramp falloff, nonzero surface substeps, or DISPLACE/WAVE. Baked caches and multiple surfaces per canvas are refused.",
         ),
         unsupported(
             "physics.collision.blender_collision_model",

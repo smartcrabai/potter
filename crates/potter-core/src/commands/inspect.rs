@@ -400,6 +400,33 @@ fn node_item(
             .enumerate()
             .map(|(index, vertex)| (vertex.id, index))
             .collect();
+        let vertex_groups = mesh
+            .attributes
+            .get("vertex_groups")
+            .and_then(Value::as_object)
+            .map(|groups| {
+                let mut evaluated = serde_json::Map::new();
+                for (name, assignments) in groups {
+                    let mut weights = vec![0.0; mesh.vertices.len()];
+                    if let Some(assignments) = assignments.as_object() {
+                        for (vertex_key, weight) in assignments {
+                            let Some(vertex_id) = vertex_key
+                                .strip_prefix('v')
+                                .and_then(|id| id.parse::<u32>().ok())
+                            else {
+                                continue;
+                            };
+                            if let (Some(index), Some(weight)) =
+                                (vertex_indices.get(&vertex_id), weight.as_f64())
+                            {
+                                weights[*index] = weight;
+                            }
+                        }
+                    }
+                    evaluated.insert(name.clone(), json!(weights));
+                }
+                Value::Object(evaluated)
+            });
         json!({
             "vertex_count": mesh.vertices.len(),
             "edge_count": mesh.edges.len(),
@@ -407,6 +434,7 @@ fn node_item(
             "triangle_count": mesh.faces.iter().map(|face| face.vertices.len().saturating_sub(2)).sum::<usize>(),
             "positions": mesh.vertices.iter().map(|vertex| vertex.co.to_array()).collect::<Vec<_>>(),
             "faces": mesh.faces.iter().map(|face| face.vertices.iter().map(|id| vertex_indices.get(id).copied()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            "vertex_groups": vertex_groups,
         })
     });
     let camera_data = node

@@ -9334,7 +9334,7 @@ fn transform_channel(
     values.get(usize::try_from(index).ok()?).copied()
 }
 
-fn apply_transform_drivers(
+pub(crate) fn apply_transform_drivers(
     node_id: &Id,
     rotation_mode: &str,
     mut transform: Transform,

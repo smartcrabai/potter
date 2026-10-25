@@ -1565,7 +1565,7 @@ fn validate_dynamic_paint_settings_role(
         physics_support::reject_unhonoured(
             "dynamic_paint_brush",
             &Value::Object(settings.clone()),
-            physics_support::honoured_properties("dynamic_paint_brush"),
+            physics_support::DYNAMIC_PAINT_WEIGHT_BRUSH_PROPERTIES,
         )?;
     }
     Ok(())
@@ -1712,6 +1712,12 @@ fn blender_setting_valid(field: &str, value: &Value) -> bool {
         | "density"
         | "paint_distance"
         | "paint_alpha" => number.is_some_and(|number| number >= 0.0),
+        "paint_source" => value
+            .as_str()
+            .is_some_and(|source| matches!(source, "POINT" | "VOLUME")),
+        "proximity_falloff" => value
+            .as_str()
+            .is_some_and(|falloff| matches!(falloff, "SMOOTH" | "CONSTANT")),
         "goal_min" | "goal_max" | "cache_frame_start" | "cache_frame_end" => number.is_some(),
         "goal_spring" | "goal_default" => {
             number.is_some_and(|number| (0.0..=1.0).contains(&number))
@@ -1721,8 +1727,8 @@ fn blender_setting_valid(field: &str, value: &Value) -> bool {
             .as_u64()
             .is_some_and(|quality| (1..=32).contains(&quality)),
         "resolution_max" => value.as_u64().is_some_and(|resolution| resolution >= 1),
-        "use_goal" | "use_edges" | "use_collision" | "use_self_collision" | "use_culling"
-        | "use_normal" | "use_effector" => value.is_boolean(),
+        "use_paint_erase" | "use_goal" | "use_edges" | "use_collision" | "use_self_collision"
+        | "use_culling" | "use_normal" | "use_effector" => value.is_boolean(),
         "bending_model" => value
             .as_str()
             .is_some_and(|model| matches!(model, "ANGULAR" | "LINEAR")),
