@@ -33,9 +33,11 @@
 //! them, and the flip shows only when the codes decode on the flipped face's fan (probe
 //! `flip.json`).
 //!
-//! Native generic attributes (`{"domain","type","values"}` stores keyed by element ID) join every
-//! operand's values per element, as Blender's `join_meshes` concatenates each domain. Other stores
-//! that are neither gathered nor structured (shading and metadata keys) are copied from operand A.
+//! Native generic attributes (`{"domain","type","values"}` stores keyed by element ID) join each
+//! operand's values per element, as Blender's `join_meshes` does. EXACT output drops STRING on
+//! POINT/FACE/EDGE during native gathering but keeps CORNER strings through loop interpolation.
+//! Other stores that are neither gathered nor structured (shading and metadata keys) are copied
+//! from operand A.
 //!
 //! # Deviations
 //!
@@ -1015,8 +1017,8 @@ fn joined_color_data_types(operands: &[Operand<'_>]) -> Map<String, Value> {
     types
 }
 
-/// The `blender_attributes` entries of `J`: POINT, FACE, and CORNER entries joined per element,
-/// and entries of other domains as they are. EDGE entries are gathered by [`merge_blender_attributes`].
+/// The generic Blender attributes of `J`, excluding STRING on POINT/FACE/EDGE as Blender's
+/// `gather_attributes_with_check` does. EDGE entries are gathered by [`merge_blender_attributes`].
 fn joined_blender_attributes(operands: &[Operand<'_>]) -> Option<Value> {
     if operands
         .iter()
@@ -1095,7 +1097,7 @@ fn concat_elements(
 }
 
 /// Merges the joined `blender_attributes` entries from the generic remap with the EDGE entries,
-/// in the order of the first operand that declares each entry.
+/// in Blender's EXACT gather order (POINT, FACE, CORNER, then EDGE).
 fn merge_blender_attributes(
     mesh: &mut Mesh,
     operands: &[Operand<'_>],
@@ -1311,6 +1313,10 @@ fn attribute_templates<'a>(operands: &[Operand<'a>]) -> Vec<AttributeTemplate<'a
         for entry in array_of(mesh, "blender_attributes").unwrap_or_default() {
             let name = text_field(entry, "name");
             let domain = text_field(entry, "domain");
+            let data_type = text_field(entry, "data_type");
+            if data_type == "STRING" && domain != "CORNER" {
+                continue;
+            }
             if !templates
                 .iter()
                 .any(|template| template.name == name && template.domain == domain)
@@ -1319,11 +1325,19 @@ fn attribute_templates<'a>(operands: &[Operand<'a>]) -> Vec<AttributeTemplate<'a
                     entry,
                     name,
                     domain,
-                    data_type: text_field(entry, "data_type"),
+                    data_type,
                 });
             }
         }
     }
+    // Blender's Boolean output gathers Point, Face, Corner, then Edge attributes.
+    templates.sort_by_key(|template| match template.domain {
+        "POINT" => 0,
+        "FACE" => 1,
+        "CORNER" => 2,
+        "EDGE" => 3,
+        _ => 4,
+    });
     templates
 }
 

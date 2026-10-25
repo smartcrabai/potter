@@ -219,12 +219,22 @@ pub(crate) fn remap_attributes_skipping(
     skipped: &[&str],
 ) -> Result<()> {
     remap_attributes_internal(
-        source, output, origin, None, None, skipped, None, false, None,
+        source,
+        output,
+        origin,
+        None,
+        None,
+        skipped,
+        None,
+        false,
+        None,
+        [0.0, 0.0, 0.0, 1.0],
     )
 }
 
 /// Interpolated corner booleans use Blender's weighted `DefaultMixer<bool>`; ordinary topology group
 /// merges continue to OR only positive-weight sources.
+/// Boolean points without an origin use zero-initialized color attributes, as Blender's exact gather does.
 pub(crate) fn remap_interpolated_corners_skipping(
     source: &Mesh,
     output: &mut Mesh,
@@ -232,7 +242,16 @@ pub(crate) fn remap_interpolated_corners_skipping(
     skipped: &[&str],
 ) -> Result<()> {
     remap_attributes_internal(
-        source, output, origin, None, None, skipped, None, true, None,
+        source,
+        output,
+        origin,
+        None,
+        None,
+        skipped,
+        None,
+        true,
+        None,
+        [0.0, 0.0, 0.0, 0.0],
     )
 }
 
@@ -261,6 +280,7 @@ pub(crate) fn remap_attributes_staged(
         None,
         false,
         None,
+        [0.0, 0.0, 0.0, 1.0],
     )
 }
 
@@ -288,6 +308,7 @@ pub(crate) fn remap_attributes_with_basis(
         corner_order,
         false,
         None,
+        [0.0, 0.0, 0.0, 1.0],
     )
 }
 
@@ -314,6 +335,7 @@ pub(crate) fn remap_attributes_with_edges(
         None,
         false,
         None,
+        [0.0, 0.0, 0.0, 1.0],
     )
 }
 
@@ -342,6 +364,7 @@ pub(crate) fn remap_attributes_with_edge_identity(
         None,
         false,
         edge_identity,
+        [0.0, 0.0, 0.0, 1.0],
     )
 }
 
@@ -355,6 +378,7 @@ fn remap_attributes_internal(
     corner_order: Option<&[usize]>,
     weighted_corner_booleans: bool,
     edge_identity: Option<&[usize]>,
+    color_default: [f64; 4],
 ) -> Result<()> {
     let corner_count: usize = output.faces.iter().map(|face| face.vertices.len()).sum();
     if staged.is_some_and(|staged| {
@@ -481,6 +505,7 @@ fn remap_attributes_internal(
         edge_origin: &edge_origin,
         corner_origin,
         weighted_corner_booleans,
+        color_default,
     };
     let color_store = has(color_layers::ATTRIBUTE).then(|| {
         let mut store = color_layers::read(source);
@@ -934,6 +959,7 @@ struct Sources<'a> {
     edge_origin: &'a [Vec<(usize, f64)>],
     corner_origin: &'a [Vec<(usize, f64)>],
     weighted_corner_booleans: bool,
+    color_default: [f64; 4],
 }
 
 impl Sources<'_> {
@@ -1454,7 +1480,11 @@ impl Sources<'_> {
         let data_type = self.color_data_type(&layer.name);
         let mix = |sources: &[(usize, f64)]| {
             if data_type == "BYTE_COLOR" {
-                color_layers::mix_byte_color(&layer.values, sources)
+                if sources.is_empty() {
+                    self.color_default
+                } else {
+                    color_layers::mix_byte_color(&layer.values, sources)
+                }
             } else {
                 blend_rgba(
                     sources
@@ -1462,7 +1492,7 @@ impl Sources<'_> {
                         .filter_map(|(index, weight)| Some((*layer.values.get(*index)?, *weight))),
                     data_type,
                 )
-                .unwrap_or([0.0, 0.0, 0.0, 1.0])
+                .unwrap_or(self.color_default)
             }
         };
         let values = match layer.domain {

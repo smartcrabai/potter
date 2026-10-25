@@ -162,6 +162,7 @@ pub struct Canonical {
     data_materials: Option<Vec<Option<String>>>,
     material_links: Option<Vec<MaterialLink>>,
     volume: f64,
+    blender_attribute_order: Option<Vec<(String, String, String)>>,
 }
 
 thread_local! {
@@ -1029,6 +1030,40 @@ fn potter_canonical(
             vertex_groups.insert(name.clone(), entries);
         }
     }
+    let blender_attribute_order = if let Some(entries) = mesh
+        .attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)
+    {
+        Some(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.starts_with("probe_"))
+                })
+                .map(|entry| {
+                    let domain = entry
+                        .get("domain")
+                        .and_then(Value::as_str)
+                        .ok_or("Potter Blender attribute domain is missing")?;
+                    let name = entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or("Potter Blender attribute name is missing")?;
+                    let data_type = entry
+                        .get("data_type")
+                        .and_then(Value::as_str)
+                        .ok_or("Potter Blender attribute type is missing")?;
+                    Ok((domain.to_owned(), name.to_owned(), data_type.to_owned()))
+                })
+                .collect::<TestResult<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
 
     Ok(Canonical {
         vertices: mesh.vertices.len(),
@@ -1043,6 +1078,7 @@ fn potter_canonical(
         effective_materials: Some(effective_materials),
         data_materials: Some(data_materials),
         material_links: Some(material_links),
+        blender_attribute_order,
         point_attributes,
         edge_attributes,
         color_layers: potter_color_layers(mesh)?,
@@ -1529,6 +1565,7 @@ fn expected_with_schema(expected: &Value, schema: Schema) -> TestResult<Canonica
         effective_materials: None,
         data_materials: None,
         material_links: None,
+        blender_attribute_order: None,
         volume: required(expected, "volume")?
             .as_f64()
             .ok_or("Boolean volume is not a number")?,
@@ -1566,7 +1603,37 @@ fn expected_with_schema(expected: &Value, schema: Schema) -> TestResult<Canonica
             "material_links",
         )?)?);
     }
+    if let Some(order) = expected.get("blender_attribute_order") {
+        canonical.blender_attribute_order = Some(expected_blender_attribute_order(order)?);
+    }
     Ok(canonical)
+}
+fn expected_blender_attribute_order(value: &Value) -> TestResult<Vec<(String, String, String)>> {
+    value
+        .as_array()
+        .ok_or("Blender attribute order must be an array")?
+        .iter()
+        .map(|entry| {
+            let values = entry
+                .as_array()
+                .filter(|values| values.len() == 3)
+                .ok_or("Blender attribute order entries must have three fields")?;
+            Ok((
+                values[0]
+                    .as_str()
+                    .ok_or("Blender attribute domain must be a string")?
+                    .to_owned(),
+                values[1]
+                    .as_str()
+                    .ok_or("Blender attribute name must be a string")?
+                    .to_owned(),
+                values[2]
+                    .as_str()
+                    .ok_or("Blender attribute type must be a string")?
+                    .to_owned(),
+            ))
+        })
+        .collect()
 }
 
 fn volume_matches(actual: f64, expected: f64) -> bool {
@@ -2677,6 +2744,19 @@ pub fn mismatches(actual: &Canonical, expected: &Canonical) -> Vec<String> {
             "face count {} differs from Blender {}",
             actual.face_count, expected.face_count
         ));
+    }
+    match (
+        &actual.blender_attribute_order,
+        &expected.blender_attribute_order,
+    ) {
+        (_, None) => {}
+        (Some(actual), Some(expected)) if actual == expected => {}
+        (Some(actual), Some(expected)) => differences.push(format!(
+            "Blender attribute order {actual:?} differs from Blender {expected:?}"
+        )),
+        (None, Some(expected)) => differences.push(format!(
+            "Potter Blender attribute order is missing; Blender has {expected:?}"
+        )),
     }
     if actual.face_sizes != expected.face_sizes {
         differences.push(format!(
