@@ -9825,6 +9825,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         .flatten()
         .filter_map(|item| item.get("bridge_id").and_then(Value::as_str))
         .collect();
+    let (weight_brush_objects, other_brush_objects) = dynamic_paint_brush_objects(raw);
     // Particle texture slots (`psys_get_texture`) that Potter cannot apply are reported. Potter applies
     // the time, life, density, and size channels with GLOBAL or OBJECT coordinates; a texture without a
     // Potter record is not applied. A slot that maps no channel does nothing and is not reported.
@@ -10181,9 +10182,12 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             }
             if let Some(settings) = modifier.get("physics_settings") {
                 losses.extend(physics_import_losses(
+                    object.get("name").and_then(Value::as_str),
                     modifier.get("name").and_then(Value::as_str),
                     kind,
                     settings,
+                    &weight_brush_objects,
+                    &other_brush_objects,
                     &collection_bridge_ids,
                 ));
             }
@@ -10537,6 +10541,149 @@ fn collection_pointer_bridge_id(value: &Value) -> Option<&str> {
         .flatten()
 }
 
+/// Blender collection members, including members of nested child collections.
+fn collection_object_names<'a>(
+    root: &'a str,
+    collections: &BTreeMap<&'a str, &'a Value>,
+) -> BTreeSet<&'a str> {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    let mut objects = BTreeSet::new();
+    while let Some(bridge_id) = pending.pop() {
+        if !visited.insert(bridge_id) {
+            continue;
+        }
+        let Some(collection) = collections.get(bridge_id) else {
+            continue;
+        };
+        objects.extend(
+            collection
+                .get("objects")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        );
+        pending.extend(
+            collection
+                .get("children")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        );
+    }
+    objects
+}
+
+/// Dynamic Paint brush objects selected by WEIGHT or other canvas surfaces in their scene.
+fn dynamic_paint_brush_objects(raw: &Value) -> (BTreeSet<&str>, BTreeSet<&str>) {
+    let objects = raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let collections: BTreeMap<&str, &Value> = raw
+        .get("collections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|collection| Some((collection.get("bridge_id")?.as_str()?, collection)))
+        .collect();
+    let brush_names: BTreeSet<&str> = objects
+        .iter()
+        .filter_map(|object| {
+            let name = object.get("name")?.as_str()?;
+            let is_brush = object
+                .get("modifiers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|modifier| {
+                    modifier.get("type").and_then(Value::as_str) == Some("DYNAMIC_PAINT")
+                        && modifier
+                            .get("physics_settings")
+                            .and_then(|settings| settings.get("role"))
+                            .and_then(Value::as_str)
+                            == Some("brush")
+                });
+            is_brush.then_some(name)
+        })
+        .collect();
+    let scenes = raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut weight_used = BTreeSet::new();
+    let mut other_used = BTreeSet::new();
+    for canvas in objects {
+        let Some(canvas_name) = canvas.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        for modifier in canvas
+            .get("modifiers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|modifier| {
+                modifier.get("type").and_then(Value::as_str) == Some("DYNAMIC_PAINT")
+                    && modifier
+                        .get("physics_settings")
+                        .and_then(|settings| settings.get("role"))
+                        .and_then(Value::as_str)
+                        == Some("canvas")
+            })
+        {
+            let surfaces = modifier
+                .get("physics_settings")
+                .and_then(|settings| settings.get("canvas_surfaces"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten();
+            for surface in surfaces {
+                let brush_collection = match surface.get("brush_collection") {
+                    None | Some(Value::Null) => None,
+                    Some(reference) => {
+                        let Some(bridge_id) = collection_pointer_bridge_id(reference) else {
+                            continue;
+                        };
+                        if !collections.contains_key(bridge_id) {
+                            continue;
+                        }
+                        Some(bridge_id)
+                    }
+                };
+                let brush_collection_members = brush_collection
+                    .map(|bridge_id| collection_object_names(bridge_id, &collections));
+                let surface_type = surface
+                    .get("surface_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("PAINT");
+                let used_brushes = if surface_type == "WEIGHT" {
+                    &mut weight_used
+                } else {
+                    &mut other_used
+                };
+                for scene in scenes {
+                    let Some(root) = scene.get("root_collection").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let scene_members = collection_object_names(root, &collections);
+                    if !scene_members.contains(canvas_name) {
+                        continue;
+                    }
+                    used_brushes.extend(brush_names.iter().copied().filter(|name| {
+                        scene_members.contains(name)
+                            && brush_collection_members
+                                .as_ref()
+                                .is_none_or(|members| members.contains(name))
+                    }));
+                }
+            }
+        }
+    }
+    (weight_used, other_used)
+}
+
 /// Maps imported Blender Collection references in a physics block to Potter collection IDs. Every other pointer is cleared;
 /// `collect_physics_import_losses` reports it.
 fn resolve_physics_collection_references(
@@ -10572,19 +10719,34 @@ fn resolve_physics_collection_references(
 
 /// Blender physics settings that Potter keeps but does not evaluate. `settings` is the bridge dump of one modifier's physics
 /// block, scoped by `blender_physics_system`. Each property that the block holds away from its Blender default, and that Potter
-/// does not evaluate, is a loss. `collections` contains imported bridge identities.
+/// does not evaluate, is a loss. `weight_brush_objects` contains brushes selected by WEIGHT surfaces; `collections` contains
+/// imported bridge identities.
 fn physics_import_losses(
+    object_name: Option<&str>,
     modifier_name: Option<&str>,
     modifier_type: &str,
     settings: &Value,
+    weight_brush_objects: &BTreeSet<&str>,
+    other_brush_objects: &BTreeSet<&str>,
     collections: &BTreeSet<&str>,
 ) -> Vec<Loss> {
     let Some(system) = blender_physics_system(modifier_type, settings) else {
         return Vec::new();
     };
+    let weight_brush_used = system == "dynamic_paint_brush"
+        && object_name.is_some_and(|name| {
+            weight_brush_objects.contains(name) && !other_brush_objects.contains(name)
+        });
     let mut losses = Vec::new();
     if let Some(block) = settings.as_object() {
-        collect_physics_import_losses(system, block, modifier_name, collections, &mut losses);
+        collect_physics_import_losses(
+            system,
+            block,
+            modifier_name,
+            weight_brush_used,
+            collections,
+            &mut losses,
+        );
     }
     losses
 }
@@ -10593,10 +10755,10 @@ fn collect_physics_import_losses(
     system: &str,
     block: &Map<String, Value>,
     owner: Option<&str>,
+    weight_brush_used: bool,
     collections: &BTreeSet<&str>,
     losses: &mut Vec<Loss>,
 ) {
-    let honoured = crate::physics_support::honoured_properties(system);
     for (key, value) in block {
         if key == "role" {
             continue;
@@ -10608,7 +10770,14 @@ fn collect_physics_import_losses(
         if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
             match value {
                 Value::Object(nested_block) => {
-                    collect_physics_import_losses(nested, nested_block, owner, collections, losses);
+                    collect_physics_import_losses(
+                        nested,
+                        nested_block,
+                        owner,
+                        weight_brush_used,
+                        collections,
+                        losses,
+                    );
                 }
                 Value::Array(items) => {
                     for nested_block in items.iter().filter_map(Value::as_object) {
@@ -10616,6 +10785,7 @@ fn collect_physics_import_losses(
                             nested,
                             nested_block,
                             owner,
+                            weight_brush_used,
                             collections,
                             losses,
                         );
@@ -10628,7 +10798,8 @@ fn collect_physics_import_losses(
         if !crate::physics_support::is_semantic_when(system, key, block) {
             continue;
         }
-        let consumed = honoured.contains(&key.as_str());
+        let consumed =
+            crate::physics_support::is_honoured_property(system, key, block, weight_brush_used);
         if let Some(bridge_id) = collection_pointer_bridge_id(value) {
             // A consumed pointer to an imported collection is mapped on import; every other pointer is cleared there.
             if !(consumed && collections.contains(bridge_id)) {
@@ -20560,6 +20731,113 @@ mod volume_and_physics_loss_tests {
         assert_eq!(
             features(&raw),
             ["blender.physics.dynamic_paint_surface.brush_collection"]
+        );
+    }
+
+    #[test]
+    fn dynamic_paint_brush_erase_and_constant_falloff_only_skip_losses_when_used_by_weight() {
+        let brush = |name: &str| {
+            json!({
+                "name": name,
+                "type": "MESH",
+                "modifiers": [{
+                    "name": "Dynamic Paint Brush",
+                    "type": "DYNAMIC_PAINT",
+                    "physics_settings": {
+                        "role": "brush",
+                        "paint_source": "POINT",
+                        "use_paint_erase": true,
+                        "proximity_falloff": "CONSTANT"
+                    }
+                }]
+            })
+        };
+        let raw = json!({
+            "scenes": [{"name": "Scene", "root_collection": "scene-root:Scene"}],
+            "collections": [
+                {
+                    "bridge_id": "scene-root:Scene",
+                    "objects": [],
+                    "children": [
+                        "collection:Canvases",
+                        "collection:WeightBrushes",
+                        "collection:PaintBrushes"
+                    ]
+                },
+                {
+                    "bridge_id": "collection:Canvases",
+                    "objects": ["WeightCanvas", "PaintCanvas"],
+                    "children": []
+                },
+                {
+                    "bridge_id": "collection:WeightBrushes",
+                    "objects": [],
+                    "children": ["collection:NestedWeightBrushes"]
+                },
+                {
+                    "bridge_id": "collection:NestedWeightBrushes",
+                    "objects": ["WeightBrush", "PaintBrush"],
+                    "children": []
+                },
+                {
+                    "bridge_id": "collection:PaintBrushes",
+                    "objects": ["PaintBrush"],
+                    "children": []
+                }
+            ],
+            "objects": [
+                {
+                    "name": "WeightCanvas",
+                    "type": "MESH",
+                    "modifiers": [{
+                        "name": "Weight Canvas",
+                        "type": "DYNAMIC_PAINT",
+                        "physics_settings": {
+                            "role": "canvas",
+                            "canvas_surfaces": [{
+                                "surface_type": "WEIGHT",
+                                "brush_collection": {
+                                    "id_type": "Collection",
+                                    "name": "WeightBrushes",
+                                    "bridge_id": "collection:WeightBrushes"
+                                }
+                            }]
+                        }
+                    }]
+                },
+                {
+                    "name": "PaintCanvas",
+                    "type": "MESH",
+                    "modifiers": [{
+                        "name": "Paint Canvas",
+                        "type": "DYNAMIC_PAINT",
+                        "physics_settings": {
+                            "role": "canvas",
+                            "canvas_surfaces": [{
+                                "surface_type": "PAINT",
+                                "brush_collection": {
+                                    "id_type": "Collection",
+                                    "name": "PaintBrushes",
+                                    "bridge_id": "collection:PaintBrushes"
+                                }
+                            }]
+                        }
+                    }]
+                },
+                brush("WeightBrush"),
+                brush("PaintBrush")
+            ]
+        });
+        let brush_losses: Vec<String> = features(&raw)
+            .into_iter()
+            .filter(|feature| feature.starts_with("blender.physics.dynamic_paint_brush."))
+            .collect();
+        assert_eq!(
+            brush_losses,
+            [
+                "blender.physics.dynamic_paint_brush.proximity_falloff",
+                "blender.physics.dynamic_paint_brush.use_paint_erase"
+            ]
         );
     }
 

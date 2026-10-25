@@ -104,6 +104,76 @@ pub fn paint(
     }
     Ok(output)
 }
+/// Apply one Blender WEIGHT frame's point-brush updates to the persistent vertex weights.
+pub(crate) fn paint_weight_step(
+    canvas: &Mesh,
+    canvas_world: DMat4,
+    brushes: &[super::DynamicPaintBrush],
+    weights: &mut [f64],
+    influence_scale: f64,
+) -> Result<()> {
+    if !canvas_world.is_finite()
+        || !influence_scale.is_finite()
+        || influence_scale < 0.0
+        || weights.len() != canvas.vertices.len()
+    {
+        return Err(invalid("dynamic-paint weight inputs are invalid"));
+    }
+    if canvas.vertices.len() > MAX_PAINT_VERTICES || brushes.len() > MAX_BRUSH_POSITIONS {
+        return Err(limit("dynamic paint input exceeds limits"));
+    }
+    let checks = canvas
+        .vertices
+        .len()
+        .checked_mul(brushes.len())
+        .ok_or_else(|| limit("dynamic paint distance work exceeds limits"))?;
+    if checks > MAX_DISTANCE_CHECKS {
+        return Err(limit("dynamic paint distance work exceeds limits"));
+    }
+    if brushes.iter().any(|brush| {
+        !brush.position.is_finite()
+            || !brush.radius.is_finite()
+            || brush.radius < 0.0
+            || !brush.strength.is_finite()
+            || !(0.0..=1.0).contains(&brush.strength)
+    }) || weights
+        .iter()
+        .any(|weight| !weight.is_finite() || !(0.0..=1.0).contains(weight))
+    {
+        return Err(invalid("dynamic-paint weight values are invalid"));
+    }
+
+    for (vertex, weight) in canvas.vertices.iter().zip(weights) {
+        let point = canvas_world.transform_point3(vertex.co);
+        if !point.is_finite() {
+            return Err(invalid("dynamic-paint canvas points must be finite"));
+        }
+        for brush in brushes {
+            if brush.radius == 0.0 {
+                continue;
+            }
+            let distance = point.distance(brush.position);
+            if distance > brush.radius {
+                continue;
+            }
+            let influence = if brush.constant_falloff {
+                1.0
+            } else {
+                1.0 - distance / brush.radius
+            };
+            if influence < 0.001 {
+                continue;
+            }
+            let strength = (influence * brush.strength * influence_scale).clamp(0.0, 1.0);
+            if brush.erase {
+                *weight = (*weight * (1.0 - strength)).max(0.0);
+            } else {
+                *weight = weight.max(strength);
+            }
+        }
+    }
+    Ok(())
+}
 
 fn invalid(message: &str) -> PotError {
     PotError::new(ErrorCode::InvalidArgument, message)
@@ -118,9 +188,12 @@ mod tests {
     #![expect(clippy::expect_used, reason = "solver tests use valid fixture inputs")]
     use glam::{DMat4, DVec3};
 
-    use crate::geom::{Mesh, Vertex};
+    use crate::{
+        geom::{Mesh, Vertex},
+        sim::DynamicPaintBrush,
+    };
 
-    use super::paint;
+    use super::{paint, paint_weight_step};
 
     #[test]
     fn world_space_brush_falloff_is_storage_ordered_and_bounded() {
@@ -166,5 +239,52 @@ mod tests {
             .expect("painting without brushes succeeds"),
             vec![[0.0; 4]; 3]
         );
+    }
+    #[test]
+    fn weight_brush_accumulates_clamps_and_erases_with_linear_falloff() {
+        let canvas = Mesh {
+            vertices: vec![
+                Vertex {
+                    id: 0,
+                    co: DVec3::ZERO,
+                },
+                Vertex {
+                    id: 1,
+                    co: DVec3::X,
+                },
+                Vertex {
+                    id: 2,
+                    co: DVec3::new(2.0, 0.0, 0.0),
+                },
+            ],
+            ..Mesh::default()
+        };
+        let brush = DynamicPaintBrush {
+            position: DVec3::ZERO,
+            radius: 2.0,
+            color: [0.0; 4],
+            strength: 0.8,
+            erase: false,
+            constant_falloff: false,
+        };
+        let mut weights = vec![0.0; 3];
+        paint_weight_step(&canvas, DMat4::IDENTITY, &[brush], &mut weights, 1.0)
+            .expect("painting weights succeeds");
+        assert_eq!(weights, [0.8, 0.4, 0.0]);
+
+        let eraser = DynamicPaintBrush {
+            strength: 0.5,
+            erase: true,
+            ..brush
+        };
+        paint_weight_step(&canvas, DMat4::IDENTITY, &[eraser], &mut weights, 1.0)
+            .expect("erasing weights succeeds");
+        assert!((weights[0] - 0.4).abs() < 1.0e-12);
+        assert!((weights[1] - 0.3).abs() < 1.0e-12);
+        assert_eq!(weights[2], 0.0);
+
+        paint_weight_step(&canvas, DMat4::IDENTITY, &[brush], &mut weights, 4.0)
+            .expect("influence scale succeeds");
+        assert_eq!(weights, [1.0, 1.0, 0.0]);
     }
 }

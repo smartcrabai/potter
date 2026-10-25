@@ -1022,6 +1022,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "curve.taper_object",
         "curve.fill.multiple_contours",
         "physics.dynamic_paint_surface.frame_start",
+        "physics.dynamic_paint_surface.surface_type",
         "constraint.ik.swing_ellipse_limit",
         "modifier.boolean.exact_point_attribute_local_index",
     ] {
