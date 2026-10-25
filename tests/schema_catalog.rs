@@ -1022,6 +1022,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "curve.taper_object",
         "curve.fill.multiple_contours",
         "physics.dynamic_paint_surface.frame_start",
+        "constraint.ik.swing_ellipse_limit",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1030,13 +1031,6 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "{feature_id} must be reported as supported"
         );
     }
-    assert!(
-        features.iter().any(|feature| {
-            feature["feature_id"] == "constraint.ik.swing_ellipse_limit"
-                && feature["status"] == "not_supported"
-        }),
-        "legacy IK X/Z Swing ellipse limits must be reported as unsupported"
-    );
     for feature_id in [
         "physics.dynamic_paint_canvas.canvas_surfaces",
         "physics.dynamic_paint_surface.topology",

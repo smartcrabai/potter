@@ -1362,12 +1362,17 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "constraint.ik.swing_ellipse_limit",
             "Legacy IK X/Z Swing ellipse limits",
             "IK",
-            &[],
-            "Strict Blender parity for simultaneous X/Z Swing ellipse limits with lock re-solves is not reliable across stretch and pole-influence combinations.",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
         ),
         supported(
             "constraint.extended_transform",
