@@ -1,6 +1,6 @@
 use std::{error::Error, fs, io, path::Path, process::Command};
 
-use glam::{DMat4, DVec3};
+use glam::{DMat4, DQuat, DVec3};
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
     model::{Id, SceneDoc},
@@ -1127,6 +1127,26 @@ fn pose_bone_keyframes_evaluate_at_a_fractional_frame() -> IntegrationResult {
 
     let evaluated = snapshot(&project, Some(1.5))?;
     assert!((bone_matrix(&evaluated, "arm", "root")?.w_axis.x - 1.0).abs() < 1.0e-12);
+    Ok(())
+}
+#[test]
+fn pose_bone_axis_angle_curve_defaults_to_the_blender_y_axis() -> IntegrationResult {
+    let (_directory, project) = new_project(&json!([
+        {"op":"node.create","id":"arm","kind":"armature"},
+        {"op":"bone.create","target":{"id":"arm"},"id":"root","name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]},
+        {"op":"pose.set","target":{"id":"arm"},"bone_id":"root","set":{"rotation_mode":"AXIS_ANGLE"}},
+        {"op":"action.create","id":"pose_action","name":"Pose"},
+        {"op":"node.update","target":{"id":"arm"},"set":{"action":"pose_action"}},
+        {"op":"keyframe.insert","target":{"id":"arm"},"path":"pose.root.rotation_axis_angle","index":0,"frame":1.0,"value":0.0,"interpolation":"linear"},
+        {"op":"keyframe.insert","target":{"id":"arm"},"path":"pose.root.rotation_axis_angle","index":0,"frame":2.0,"value":std::f64::consts::FRAC_PI_2,"interpolation":"linear"}
+    ]))?;
+    let start = bone_matrix(&snapshot(&project, Some(1.0))?, "arm", "root")?;
+    let end = bone_matrix(&snapshot(&project, Some(2.0))?, "arm", "root")?;
+    assert_matrix_close(
+        start.inverse() * end,
+        DMat4::from_quat(DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2)),
+        1.0e-12,
+    );
     Ok(())
 }
 

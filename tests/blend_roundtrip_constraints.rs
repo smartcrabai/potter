@@ -565,6 +565,9 @@ for kind in constraint_types:
     pose_bone = rig.pose.bones[pose_names[kind]]
     pose_constraint = pose_bone.constraints["Pose_" + stem]
     expected["settings"]["Pose_" + stem] = settings(pose_constraint)
+expected["pose_rotation_modes"] = {
+    kind: rig.pose.bones[pose_names[kind]].rotation_mode for kind in constraint_types
+}
 scene.frame_set(2)
 curve_depsgraph = bpy.context.evaluated_depsgraph_get()
 curve_depsgraph.update()
@@ -743,6 +746,9 @@ for kind in constraint_types:
     pose_bone = rig.pose.bones["Tip_" + stem]
     pose_constraint = pose_bone.constraints["Pose_" + stem]
     expected["settings"]["Pose_" + stem] = settings(pose_constraint)
+expected["pose_rotation_modes"] = {
+    kind: rig.pose.bones["Tip_" + kind.upper()].rotation_mode for kind in constraint_types
+}
 expected["clip"] = {
     "name": clip.name if clip else None,
     "filepath_exists": bool(clip and os.path.isfile(bpy.path.abspath(clip.filepath))),
@@ -2202,6 +2208,10 @@ fn round_trip_constraint(kind: &str) -> TestResult {
         after["settings"], before["settings"],
         "constraint RNA settings changed on reopen"
     );
+    assert_eq!(
+        after["pose_rotation_modes"], before["pose_rotation_modes"],
+        "pose rotation mode changed on Blender export/reopen"
+    );
     let mut before_clip = before["clip"]
         .as_object()
         .ok_or("source MovieClip summary is missing")?
@@ -3139,5 +3149,216 @@ fn blender_target_project_boundary_edge_fallback_roundtrip() -> TestResult {
     );
     assert_open_boundary_edge(&after, "reopened Blender mesh")?;
     println!("Blender TARGET_PROJECT boundary fallback: import=ok export=ok reopen=ok");
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "legacy pose migration checks old-schema evaluation and source-preserving .blend export in one path"
+)]
+#[test]
+fn legacy_pose_rotation_mode_keeps_euler_animation_and_blend_source_mode() -> TestResult {
+    // Fixture follows the pre-field PoseBone schema at main commit 80a4358.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/legacy_pose_rotation_mode/scene.json");
+    let legacy_json: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+    assert!(
+        legacy_json["nodes"]["legacy_rig"]["pose"]["legacy_bone"]
+            .get("rotation_mode")
+            .is_none(),
+        "main-era PoseBone fixture must not contain rotation_mode"
+    );
+    let legacy_doc: SceneDoc = serde_json::from_value(legacy_json)?;
+    let legacy_rig_id = Id::new("legacy_rig")?;
+    let legacy_bone_id = Id::new("legacy_bone")?;
+    let start = Snapshot::evaluate(
+        &legacy_doc,
+        &EvaluationContext {
+            frame: Some(1.0),
+            ..EvaluationContext::default()
+        },
+    )?;
+    let end = Snapshot::evaluate(
+        &legacy_doc,
+        &EvaluationContext {
+            frame: Some(3.0),
+            ..EvaluationContext::default()
+        },
+    )?;
+    let start_matrix = start
+        .bone_matrices
+        .get(&legacy_rig_id)
+        .and_then(|bones| bones.get(&legacy_bone_id))
+        .ok_or("legacy pose fixture start matrix is missing")?;
+    let end_matrix = end
+        .bone_matrices
+        .get(&legacy_rig_id)
+        .and_then(|bones| bones.get(&legacy_bone_id))
+        .ok_or("legacy pose fixture end matrix is missing")?;
+    let max_pose_delta = start_matrix
+        .iter()
+        .zip(end_matrix)
+        .fold(0.0_f64, |maximum, (start, end)| {
+            maximum.max((*start - *end).abs())
+        });
+    assert!(
+        max_pose_delta > 0.1,
+        "legacy Euler bone curves must affect evaluated pose, got matrix delta {max_pose_delta}"
+    );
+
+    let _guard = BLENDER_CONSTRAINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(blender) = blender() else {
+        eprintln!("skipping Blender 5.2.2 legacy pose export check: Blender is unavailable");
+        return Ok(());
+    };
+    let mut version_command = Command::new(&blender);
+    version_command.arg("--version");
+    let version = run_guarded(version_command)?;
+    if !version.status.success()
+        || !String::from_utf8_lossy(&version.stdout).contains("Blender 5.2.2")
+    {
+        eprintln!("skipping Blender 5.2.2 legacy pose export check: Blender 5.2.2 is unavailable");
+        return Ok(());
+    }
+
+    let directory = tempdir()?;
+    let root = directory.path();
+    run_blender_script(
+        &blender,
+        "generate_legacy_pose_source.py",
+        include_str!("fixtures/legacy_pose_rotation_mode/generate_source.py"),
+        root,
+        &[],
+        "Blender legacy pose source generation failed",
+        run_guarded,
+    )?;
+    let project = root.join("project");
+    pot_json(&["init", project.to_str().ok_or("project path is not UTF-8")?])?;
+    let source = root.join("legacy_pose_source.blend");
+    let imported_result = pot_json(&[
+        "import",
+        project.to_str().ok_or("project path is not UTF-8")?,
+        "--file",
+        source.to_str().ok_or("source blend path is not UTF-8")?,
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().ok_or("Blender path is not UTF-8")?,
+    ])?;
+    assert_eq!(
+        imported_result["result"]["losses"],
+        json!([]),
+        "legacy Euler rig import losses: {imported_result}"
+    );
+
+    let scene_path = project.join("scene.json");
+    let mut imported_json: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    let imported_doc: SceneDoc = serde_json::from_value(imported_json.clone())?;
+    let (rig_id, rig) = node_named(&imported_doc, "LegacyPoseRig")?;
+    let bone_id = rig
+        .pose
+        .keys()
+        .next()
+        .ok_or("imported rig pose is missing")?;
+    assert_eq!(rig.pose.len(), 1, "unexpected imported pose-bone count");
+    let source_compatibility = imported_json["compatibility"].clone();
+    let source_properties = imported_json["nodes"][rig_id.as_str()]["properties"].clone();
+    let pose = imported_json["nodes"][rig_id.as_str()]["pose"][bone_id.as_str()]
+        .as_object_mut()
+        .ok_or("imported pose-bone JSON is missing")?;
+    assert_eq!(
+        pose.get("rotation_mode").and_then(Value::as_str),
+        Some("xyz"),
+        "source Euler mode was not imported into the model"
+    );
+    assert_eq!(
+        pose.remove("rotation_mode"),
+        Some(json!("xyz")),
+        "failed to remove only the new model pose-mode field"
+    );
+    assert_eq!(
+        imported_json["compatibility"], source_compatibility,
+        "omitting the model pose mode must retain Blender compatibility data"
+    );
+    assert_eq!(
+        imported_json["nodes"][rig_id.as_str()]["properties"],
+        source_properties,
+        "omitting the model pose mode must retain node compatibility data"
+    );
+    fs::write(&scene_path, serde_json::to_vec_pretty(&imported_json)?)?;
+
+    let exported = root.join("legacy_pose_roundtrip.blend");
+    let export_result = pot_json(&[
+        "export",
+        project.to_str().ok_or("project path is not UTF-8")?,
+        "--format",
+        "blend",
+        "--out",
+        exported.to_str().ok_or("export path is not UTF-8")?,
+        "--blender",
+        blender.to_str().ok_or("Blender path is not UTF-8")?,
+    ])?;
+    assert_eq!(
+        export_result["result"]["losses"],
+        json!([]),
+        "legacy Euler rig export losses: {export_result}"
+    );
+
+    let script_path = root.join("inspect_legacy_pose_export.py");
+    fs::write(
+        &script_path,
+        include_str!("fixtures/legacy_pose_rotation_mode/inspect_export.py"),
+    )?;
+    let mut reopen = Command::new(&blender);
+    reopen
+        .args(["--background"])
+        .arg(&exported)
+        .arg("--python")
+        .arg(&script_path)
+        .arg("--")
+        .arg(root);
+    let output = run_guarded(reopen)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && !stdout.contains("Traceback") && !stderr.contains("Traceback"),
+        "legacy pose Blender reopen failed: stdout={stdout} stderr={stderr}"
+    );
+    let reopened: Value =
+        serde_json::from_slice(&fs::read(root.join("legacy_pose_reopened.json"))?)?;
+    assert_eq!(
+        reopened["rotation_mode"],
+        json!("XYZ"),
+        "source pose rotation mode changed after export/reopen"
+    );
+    assert_eq!(reopened["action_present"], json!(true));
+    let start = reopened["frame_1"]
+        .as_array()
+        .ok_or("reopened start-frame Euler rotation is missing")?;
+    let end = reopened["frame_9"]
+        .as_array()
+        .ok_or("reopened end-frame Euler rotation is missing")?;
+    let mut animation_delta = 0.0_f64;
+    for (start, end) in start.iter().zip(end) {
+        let start = start
+            .as_f64()
+            .ok_or("reopened start-frame Euler component is not numeric")?;
+        let end = end
+            .as_f64()
+            .ok_or("reopened end-frame Euler component is not numeric")?;
+        animation_delta = animation_delta.max((start - end).abs());
+    }
+    assert_eq!(start.len(), 3);
+    assert_eq!(end.len(), 3);
+    assert!(
+        animation_delta > 0.5,
+        "reopened Euler animation must remain effective, got delta {animation_delta}"
+    );
     Ok(())
 }

@@ -57,6 +57,7 @@ MULTIRES_HIDDEN_MESHES = set()
 POTTER_TO_BLENDER_ANIMATION_PATH = {
     "transform.translation": "location",
     "transform.rotation_euler": "rotation_euler",
+    "transform.rotation_axis_angle": "rotation_axis_angle",
     "transform.rotation_quaternion": "rotation_quaternion",
     "transform.rotation": "rotation_quaternion",
     "transform.scale": "scale",
@@ -6183,10 +6184,11 @@ def _constraint_is_graph_editable(source):
     if kind != "ACTION":
         return True
     properties = source.get("properties") or {}
-    return all(
-        isinstance(properties.get(key), dict) and properties[key].get("name")
-        for key in ("action", "target")
-    )
+    action = properties.get("action")
+    target = properties.get("target")
+    has_action = isinstance(action, dict) and action.get("name")
+    has_target = isinstance(target, dict) and target.get("name")
+    return has_action and (has_target or properties.get("use_eval_time", False))
 
 
 def _canonical_pose(doc, node, source_pose):
@@ -6206,12 +6208,12 @@ def _canonical_pose(doc, node, source_pose):
         # The imported Blender rotation, kept beside the model rotation so _restore_pose can compare exactly.
         merged["source_rotation_quaternion"] = source.get("rotation_quaternion")
         merged.update({key: model_item[key] for key in
-                       ("location", "rotation_quaternion", "scale", "lock_ik",
+                       ("location", "rotation_quaternion", "rotation_mode", "scale", "lock_ik",
                         "use_ik_limit", "ik_min", "ik_max", "ik_stiffness",
                         "ik_stretch", "bbone_curveinx", "bbone_curveinz",
                         "bbone_curveoutx", "bbone_curveoutz", "bbone_rollin",
                         "bbone_rollout", "bbone_scalein", "bbone_scaleout",
-                        "bbone_easein", "bbone_easeout")})
+                        "bbone_easein", "bbone_easeout") if key in model_item})
         source_constraints = {item.get("name"): item
                               for item in source.get("constraints", [])}
         constraints = []
@@ -6501,7 +6503,7 @@ def _pose_from_model(doc, node):
                 pose_constraint = dict(constraint)
                 pose_constraint.pop("owner_bone", None)
                 constraints.append(pose_constraint)
-        result.append({
+        model_item = {
             "bone": bone.get("name", bone_id),
             "location": pose.get("translation", [0.0, 0.0, 0.0]),
             "rotation_quaternion": list(_quaternion_from_native(rotation)),
@@ -6523,7 +6525,10 @@ def _pose_from_model(doc, node):
             "bbone_easein": pose.get("bbone_easein", 0.0),
             "bbone_easeout": pose.get("bbone_easeout", 0.0),
             "constraints": constraints,
-        })
+        }
+        if "rotation_mode" in pose:
+            model_item["rotation_mode"] = pose["rotation_mode"].upper()
+        result.append(model_item)
     return result
 
 

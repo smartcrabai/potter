@@ -1,0 +1,169 @@
+{
+  "schema_version": 9,
+  "scene_id": "00000000-0000-4000-8000-000000000000",
+  "revision": 0,
+  "active_scene": "scene_main",
+  "profile": {"blender": "5.2.2"},
+  "scenes": {
+    "scene_main": {
+      "name": "Scene",
+      "root_collection": "collection_root",
+      "view_layers": {"view_main": {"name": "View Layer", "excluded_collections": []}},
+      "frame_current": 1.0,
+      "frame_start": 1,
+      "frame_end": 3,
+      "use_custom_simulation_range": false,
+      "simulation_frame_start": 1,
+      "simulation_frame_end": 250,
+      "fps": 24,
+      "fps_base": 1.0,
+      "use_gravity": true,
+      "camera": null,
+      "world": null,
+      "active_clip": null,
+      "unit": {"system": "NONE", "scale_length": 1.0},
+      "render": {},
+      "use_compositing": false,
+      "compositor": null,
+      "color_management": {},
+      "markers": [],
+      "rigid_body_world": null,
+      "sequencer": {}
+    }
+  },
+  "collections": {
+    "collection_root": {"name": "Collection", "children": [], "objects": ["legacy_rig"]}
+  },
+  "nodes": {
+    "legacy_rig": {
+      "name": "LegacyPoseRig",
+      "kind": "armature",
+      "primitive": null,
+      "tags": [],
+      "parent": null,
+      "parent_inverse": null,
+      "transform": {
+        "translation": [0.0, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0, 1.0],
+        "scale": [1.0, 1.0, 1.0],
+        "rotation_mode": "quaternion"
+      },
+      "data": "legacy_armature_data",
+      "materials": [],
+      "modifiers": [],
+      "visible": true,
+      "render_visible": true,
+      "selectable": true,
+      "action": "legacy_euler_action",
+      "nla_tracks": [],
+      "properties": {},
+      "rigid_body": null,
+      "force_field": null,
+      "parent_type": "object",
+      "parent_bone": null,
+      "pose": {
+        "legacy_bone": {
+          "translation": [0.0, 0.0, 0.0],
+          "rotation": [0.0, 0.0, 0.0, 1.0],
+          "scale": [1.0, 1.0, 1.0],
+          "lock_ik": [false, false, false],
+          "use_ik_limit": [false, false, false],
+          "ik_min": [-3.141592653589793, -3.141592653589793, -3.141592653589793],
+          "ik_max": [3.141592653589793, 3.141592653589793, 3.141592653589793],
+          "ik_stiffness": [0.0, 0.0, 0.0],
+          "ik_stretch": 0.0
+        }
+      },
+      "constraints": [],
+      "drivers": []
+    }
+  },
+  "data_blocks": {
+    "legacy_armature_data": {
+      "type": "armature",
+      "descriptor": null,
+      "mesh": null,
+      "materials": [],
+      "camera": null,
+      "light": null,
+      "grease_pencil": null,
+      "armature": {
+        "bones": {
+          "legacy_bone": {
+            "name": "LegacyBone",
+            "parent": null,
+            "head": [0.0, 0.0, 0.0],
+            "tail": [0.0, 1.0, 0.0],
+            "roll": 0.0,
+            "deform": true,
+            "inherit_rotation": true,
+            "use_connect": false,
+            "custom_shape": null,
+            "envelope_distance": 0.25,
+            "envelope_weight": 1.0,
+            "head_radius": 0.1,
+            "tail_radius": 0.1
+          }
+        },
+        "bone_collections": {}
+      },
+      "shape_keys": null,
+      "vertex_groups": [],
+      "vertex_weights": {},
+      "curve": null,
+      "surface": null,
+      "text": null,
+      "hair_curves": null,
+      "metaball": null,
+      "lattice": null,
+      "pointcloud": null,
+      "volume": null
+    }
+  },
+  "materials": {},
+  "images": {},
+  "movie_clips": {},
+  "masks": {},
+  "worlds": {},
+  "node_groups": {},
+  "actions": {
+    "legacy_euler_action": {
+      "name": "LegacyEulerAction",
+      "fcurves": [
+        {
+          "path": "pose.bones[\"legacy_bone\"].rotation_euler",
+          "index": 0,
+          "keyframes": [
+            {"frame": 1.0, "value": 0.0, "interpolation": "linear"},
+            {"frame": 3.0, "value": 0.25, "interpolation": "linear"}
+          ],
+          "extrapolation": "constant"
+        },
+        {
+          "path": "pose.bones[\"legacy_bone\"].rotation_euler",
+          "index": 1,
+          "keyframes": [
+            {"frame": 1.0, "value": 0.0, "interpolation": "linear"},
+            {"frame": 3.0, "value": -0.18, "interpolation": "linear"}
+          ],
+          "extrapolation": "constant"
+        },
+        {
+          "path": "pose.bones[\"legacy_bone\"].rotation_euler",
+          "index": 2,
+          "keyframes": [
+            {"frame": 1.0, "value": 0.0, "interpolation": "linear"},
+            {"frame": 3.0, "value": 0.8, "interpolation": "linear"}
+          ],
+          "extrapolation": "constant"
+        }
+      ],
+      "slots": []
+    }
+  },
+  "resources": {},
+  "libraries": {},
+  "compatibility": {},
+  "accepted_losses": [],
+  "history": {}
+}

@@ -375,7 +375,7 @@ pub(crate) fn export_with_root_allow_lossy(
                 json!({ "node_id": node_id }),
             ));
         }
-        let (rx, ry, rz) = rotation.to_euler(EulerRot::XYZ);
+        let (rx, ry, rz) = rotation.to_euler(EulerRot::XYZEx);
         let armature_metadata = node
             .data
             .as_ref()
@@ -1357,7 +1357,7 @@ fn write_bone_model(output: &mut String, bone: &BoneExport) -> Result<()> {
             json!({"feature_id":"format.fbx.skin_bone_transform","bone_id":bone.bone_id}),
         ));
     }
-    let (rx, ry, rz) = rotation.to_euler(EulerRot::XYZ);
+    let (rx, ry, rz) = rotation.to_euler(EulerRot::XYZEx);
     writeln!(
         output,
         "\tModel: {}, \"{}\", \"LimbNode\" {{\n\t\tVersion: 232\n\t\tProperties70:  {{\n\t\t\tP: \"Lcl Translation\", \"Lcl Translation\", \"\",\"A\",{},{},{}\n\t\t\tP: \"Lcl Rotation\", \"Lcl Rotation\", \"\",\"A\",{},{},{}\n\t\t\tP: \"Lcl Scaling\", \"Lcl Scaling\", \"\",\"A\",{},{},{}\n\t\t\tP: \"Size\", \"double\", \"Number\", \"\",{}\n\t\t}}\n\t\tShading: T\n\t\tCulling: \"CullingOff\"\n\t}}",
@@ -2868,13 +2868,13 @@ fn parse_model(node: &FbxNode, numeric_id: i64) -> Result<ImportedModel> {
             json!({ "feature_id": "format.fbx.rotation_order", "rotation_order": rotation_order }),
         ));
     }
-    let rotation_order = match rotation_order as u32 {
-        0 => EulerRot::XYZ,
-        1 => EulerRot::XZY,
-        2 => EulerRot::YZX,
-        3 => EulerRot::YXZ,
-        4 => EulerRot::ZXY,
-        5 => EulerRot::ZYX,
+    let (rotation_order, euler_component_order) = match rotation_order as u32 {
+        0 => (EulerRot::XYZEx, [0, 1, 2]),
+        1 => (EulerRot::XZYEx, [0, 2, 1]),
+        2 => (EulerRot::YZXEx, [1, 2, 0]),
+        3 => (EulerRot::YXZEx, [1, 0, 2]),
+        4 => (EulerRot::ZXYEx, [2, 0, 1]),
+        5 => (EulerRot::ZYXEx, [2, 1, 0]),
         _ => {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedFeature,
@@ -2910,11 +2910,12 @@ fn parse_model(node: &FbxNode, numeric_id: i64) -> Result<ImportedModel> {
             ));
         }
     }
+    let radians = rotation_degrees.map(f64::to_radians);
     let rotation = DQuat::from_euler(
         rotation_order,
-        rotation_degrees[0].to_radians(),
-        rotation_degrees[1].to_radians(),
-        rotation_degrees[2].to_radians(),
+        radians[euler_component_order[0]],
+        radians[euler_component_order[1]],
+        radians[euler_component_order[2]],
     )
     .normalize();
     let visible = read_scalar_property(properties, "Visibility", 1.0)? != 0.0;
@@ -2939,7 +2940,7 @@ fn parse_model(node: &FbxNode, numeric_id: i64) -> Result<ImportedModel> {
             translation,
             rotation: [rotation.x, rotation.y, rotation.z, rotation.w],
             scale,
-            rotation_mode: "quaternion".to_owned(),
+            rotation_mode: "XYZ".to_owned(),
         },
         visible,
         armature,
@@ -3856,17 +3857,48 @@ fn parse_animation_curve(node: &FbxNode, _numeric_id: i64) -> Result<ImportedCur
             "FBX animation key times must be strictly increasing",
         ));
     }
-    let flags = if let Some(array) = node.child("KeyAttrFlags") {
-        let flags = integer_array(array)?;
-        if flags.len() != time_values.len() {
+    let mut flags = if let Some(array) = node.child("KeyAttrFlags") {
+        integer_array(array)?
+    } else {
+        vec![4; time_values.len()]
+    };
+    if flags.len() != time_values.len() {
+        let ref_counts = node
+            .child("KeyAttrRefCount")
+            .map(integer_array)
+            .transpose()?
+            .ok_or_else(|| {
+                import_error("FBX animation interpolation flag count does not match key count")
+            })?;
+        if ref_counts.len() != flags.len() {
             return Err(import_error(
                 "FBX animation interpolation flag count does not match key count",
             ));
         }
-        flags
-    } else {
-        vec![4; time_values.len()]
-    };
+        let mut expanded = Vec::with_capacity(time_values.len());
+        for (flag, count) in flags.into_iter().zip(ref_counts) {
+            let count = usize::try_from(count).map_err(|_| {
+                import_error("FBX animation interpolation reference count is invalid")
+            })?;
+            let Some(next_len) = expanded.len().checked_add(count) else {
+                return Err(import_error(
+                    "FBX animation interpolation reference count overflows",
+                ));
+            };
+            if next_len > time_values.len() {
+                return Err(import_error(
+                    "FBX animation interpolation flag count does not match key count",
+                ));
+            }
+            expanded.extend(std::iter::repeat_n(flag, count));
+        }
+        if expanded.len() != time_values.len() {
+            return Err(import_error(
+                "FBX animation interpolation flag count does not match key count",
+            ));
+        }
+        flags = expanded;
+    }
     let interpolations = flags
         .into_iter()
         .map(|flag| {

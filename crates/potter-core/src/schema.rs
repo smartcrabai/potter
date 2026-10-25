@@ -282,6 +282,14 @@ fn complete_scene_schema(root: &mut Value) {
     root["properties"]["movie_clips"] = registry_schema("movie_clip");
     root["properties"]["masks"] = registry_schema("mask");
     let defs = &mut root["$defs"];
+    defs["pose_bone"] = json!({
+        "type":"object",
+        "properties":{
+            "rotation_mode":{"enum":["quaternion","axis_angle","xyz","xzy","yxz","yzx","zxy","zyx"]}
+        }
+    });
+    defs["node"]["properties"]["pose"]["additionalProperties"] =
+        json!({"$ref":"#/$defs/pose_bone"});
     defs["legacy_texture_resource"]["properties"]["texture_type"]["enum"] = json!([
         "CLOUDS",
         "MARBLE",
@@ -2833,6 +2841,22 @@ fn set_schema(operation: &str) -> Value {
             "frame":{"type":"number"},
             "evaluation_time":{"type":"number"},
             "absolute":{"type":"boolean"}
+        }),
+        "pose.set" => json!({
+            "translation":vec_schema(3),
+            "rotation":vec_schema(4),
+            "rotation_mode":{"enum":["quaternion","axis_angle","xyz","xzy","yxz","yzx","zxy","zyx"]},
+            "scale":vec_schema(3),
+            "bbone_curveinx":{"type":"number"},
+            "bbone_curveinz":{"type":"number"},
+            "bbone_curveoutx":{"type":"number"},
+            "bbone_curveoutz":{"type":"number"},
+            "bbone_rollin":{"type":"number"},
+            "bbone_rollout":{"type":"number"},
+            "bbone_scalein":vec_schema(3),
+            "bbone_scaleout":vec_schema(3),
+            "bbone_easein":{"type":"number"},
+            "bbone_easeout":{"type":"number"}
         }),
         "bone.update" => json!({
             "name":{"type":"string"},

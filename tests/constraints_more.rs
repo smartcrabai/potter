@@ -86,6 +86,28 @@ fn max_matrix_error(left: DMat4, right: DMat4) -> f64 {
         .map(|(left, right)| (left - right).abs())
         .fold(0.0_f64, f64::max)
 }
+fn inspected_bone_matrix(project: &Path, rig: &str, bone: &str, frame: &str) -> TestResult<DMat4> {
+    let output = pot()
+        .arg("inspect")
+        .arg(project)
+        .arg("--id")
+        .arg(rig)
+        .arg("--frame")
+        .arg(frame)
+        .arg("--json")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "pot inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inspected: Value = serde_json::from_slice(&output.stdout)?;
+    let item = inspected["result"]["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == rig))
+        .ok_or_else(|| io::Error::other("inspect omitted the armature node"))?;
+    blender_matrix(&item["evaluated_bones"][bone])
+}
 
 fn assert_mesh_positions_match(mesh: &potter_core::geom::Mesh, expected: &Value) -> TestResult {
     let expected: Vec<[f64; 3]> = serde_json::from_value(expected.clone())?;
@@ -192,6 +214,52 @@ fn object_reprojection_errors(
             Ok((frame, (squared_error / f64::from(count)).sqrt()))
         })
         .collect()
+}
+
+#[test]
+fn action_constraint_legacy_pose_mode_keeps_euler_curves() -> TestResult {
+    let directory = tempdir()?;
+    let project = directory.path().join("legacy-pose");
+    let initialized = pot().arg("init").arg(&project).arg("--json").output()?;
+    assert!(
+        initialized.status.success(),
+        "pot init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/legacy_pose_rotation_mode/scene.json");
+    fs::write(project.join("scene.json"), fs::read(fixture)?)?;
+
+    let before = inspected_bone_matrix(&project, "legacy_rig", "legacy_bone", "3")?;
+    apply(
+        &project,
+        &json!([{
+            "op":"constraint.create",
+            "target":{"id":"legacy_rig"},
+            "id":"legacy_euler_constraint",
+            "type":"action",
+            "owner_bone":"legacy_bone",
+            "params":{
+                "action":"legacy_euler_action",
+                "transform_channel":"LOCATION_X",
+                "target_space":"WORLD",
+                "min":0.0,
+                "max":1.0,
+                "frame_start":1,
+                "frame_end":3,
+                "mix_mode":"REPLACE",
+                "use_eval_time":true,
+                "eval_time":1.0,
+                "use_bone_object_action":false
+            }
+        }]),
+    )?;
+    let after = inspected_bone_matrix(&project, "legacy_rig", "legacy_bone", "3")?;
+    assert!(
+        max_matrix_error(after, before) < 1.0e-5,
+        "Action constraint dropped the legacy pose bone's Euler curves: before={before:?}, after={after:?}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -607,7 +675,7 @@ fn blender_action_constraint_channels_mix_modes_and_spaces_match_depsgraph() -> 
             "transform":{
                 "translation":[1.2,-0.7,2.0],
                 "rotation":[owner_rotation.x,owner_rotation.y,owner_rotation.z,owner_rotation.w],
-                "scale":[1.0,1.0,1.0]
+                "scale":[1.0,1.0,1.0],
             }
         }));
         let mut constraint = json!({
@@ -754,8 +822,7 @@ for case in cases:
     owner = bpy.data.objects.new(case["id"], None)
     scene.collection.objects.link(owner)
     owner.location = (1.2,-0.7,2.0)
-    owner.rotation_mode = "XYZ"
-    owner.rotation_euler = (0.0,0.0,0.0)
+    set_rotation(owner, rotations["owner"])
     owner.scale = (1.0,1.0,1.0)
     owners[case["id"]] = owner
 bpy.context.view_layer.update()
@@ -880,6 +947,318 @@ print("POTTER_ACTION_PARITY=" + json.dumps(result))
     );
     eprintln!(
         "Blender Action constraint matrix max error across 9 channels, 7 mix modes, and 4 target spaces: {maximum_error:.6e}"
+    );
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the committed Action-space oracle keeps the full Blender capture coverage auditable"
+)]
+fn committed_action_target_space_oracle_matches_snapshot() -> TestResult {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/action_constraint_target_space/oracle.json"
+    ))?;
+    assert!(
+        fixture["blender_version"]
+            .as_str()
+            .is_some_and(|version| version.starts_with("5.2.2"))
+    );
+    let cases = fixture["cases"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("Action oracle cases are missing"))?;
+    assert_eq!(cases.len(), 55);
+    let default_space_case = cases
+        .iter()
+        .find(|case| case["id"] == "parented_object_default_owner_space")
+        .ok_or_else(|| {
+            io::Error::other("Action oracle is missing the parented default owner-space case")
+        })?;
+    assert_eq!(default_space_case["owner_kind"], "object");
+    assert_eq!(
+        default_space_case["owner_space_omitted"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(default_space_case["mix_mode"], "AFTER");
+    assert_eq!(
+        default_space_case["blender_mix_mode_omitted"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        default_space_case["owner_parent"],
+        "owner_default_space_parent"
+    );
+    let operations = fixture["operations"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("Action oracle operations are missing"))?;
+    let action_operation = operations
+        .iter()
+        .find(|operation| operation["id"] == "action_parented_object_default_owner_space")
+        .ok_or_else(|| {
+            io::Error::other("Action oracle default owner-space constraint is missing")
+        })?;
+    assert!(
+        action_operation["params"].get("owner_space").is_none(),
+        "default owner-space regression must omit params.owner_space"
+    );
+    assert_eq!(action_operation["params"]["mix_mode"], "AFTER");
+
+    let owner_operation = operations
+        .iter()
+        .find(|operation| operation["id"] == "owner_default_space")
+        .ok_or_else(|| io::Error::other("Action oracle parented owner is missing"))?;
+    assert_eq!(
+        owner_operation["parent"],
+        default_space_case["owner_parent"]
+    );
+
+    let (_directory, project) = project(&fixture["operations"])?;
+    let document: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let snapshot = Snapshot::evaluate(&document, &EvaluationContext::default())?;
+    for case in cases {
+        let id = case["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("Action oracle case ID is missing"))?;
+        let owner = case["owner"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("Action oracle owner is missing"))?;
+        let actual = if case["owner_kind"] == "pose" {
+            let owner_id = Id::new(owner.to_owned())?;
+            let bone_id = Id::new(
+                case["owner_bone"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("Action oracle owner bone is missing"))?
+                    .to_owned(),
+            )?;
+            snapshot
+                .bone_matrices
+                .get(&owner_id)
+                .and_then(|bones| bones.get(&bone_id))
+                .map(DMat4::from_cols_array)
+                .ok_or_else(|| {
+                    io::Error::other(format!("Action oracle bone {owner}/{bone_id} is missing"))
+                })?
+        } else {
+            let owner_id = Id::new(owner.to_owned())?;
+            snapshot
+                .nodes
+                .get(&owner_id)
+                .map(|node| DMat4::from_cols_array(&node.world_matrix))
+                .ok_or_else(|| io::Error::other(format!("Action oracle node {owner} is missing")))?
+        };
+        let expected = blender_matrix(&fixture["expected"][id]["matrix"])?;
+        let baseline = blender_matrix(&fixture["expected"][id]["baseline"])?;
+        let error = max_matrix_error(actual, expected);
+        assert!(
+            error < 2.0e-4,
+            "{id} Blender Action matrix differs by {error:.6e}: Potter={actual:?}, Blender={expected:?}, case={case}"
+        );
+        assert!(
+            max_matrix_error(expected, baseline) > 1.0e-2,
+            "{id} Action constraint had no material effect over its Blender baseline"
+        );
+    }
+
+    for space in [
+        "WORLD",
+        "POSE",
+        "LOCAL_WITH_PARENT",
+        "LOCAL",
+        "LOCAL_OWNER_ORIENT",
+        "CUSTOM",
+    ] {
+        for channel in [
+            "LOCATION_X",
+            "LOCATION_Y",
+            "LOCATION_Z",
+            "ROTATION_X",
+            "ROTATION_Y",
+            "ROTATION_Z",
+            "SCALE_X",
+            "SCALE_Y",
+            "SCALE_Z",
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|case| { case["target_space"] == space && case["channel"] == channel }),
+                "Action oracle is missing {space}/{channel}"
+            );
+        }
+    }
+    for mode in [
+        "REPLACE",
+        "BEFORE_FULL",
+        "BEFORE",
+        "BEFORE_SPLIT",
+        "AFTER_FULL",
+        "AFTER",
+        "AFTER_SPLIT",
+    ] {
+        assert!(
+            cases.iter().any(|case| case["mix_mode"] == mode),
+            "Action oracle is missing mix mode {mode}"
+        );
+    }
+    for owner_kind in ["object", "pose"] {
+        for target_kind in ["object", "bone"] {
+            assert!(
+                cases.iter().any(|case| {
+                    case["owner_kind"] == owner_kind && case["target_kind"] == target_kind
+                }),
+                "Action oracle is missing {owner_kind} owner / {target_kind} target"
+            );
+        }
+    }
+    for owner_kind in ["object", "pose"] {
+        for rotation_mode in ["quaternion", "XYZ", "AXIS_ANGLE"] {
+            assert!(
+                cases.iter().any(|case| {
+                    case["owner_kind"] == owner_kind && case["rotation_mode"] == rotation_mode
+                }),
+                "Action oracle is missing {owner_kind} owner rotation mode {rotation_mode}"
+            );
+        }
+    }
+    assert!(
+        cases
+            .iter()
+            .any(|case| case["use_eval_time"].as_bool() == Some(true))
+    );
+    assert!(
+        cases
+            .iter()
+            .any(|case| case["use_bone_object_action"].as_bool() == Some(true))
+    );
+    assert!(
+        cases.iter().any(|case| {
+            case["target_space"] == "CUSTOM" && case["space_object"] == "space_ref"
+        })
+    );
+    assert!(cases.iter().any(|case| {
+        case["target_space"] == "CUSTOM"
+            && case["space_object"] == "space_arm"
+            && case["space_subtarget"] == "SpaceBone"
+    }));
+    Ok(())
+}
+
+#[test]
+fn action_constraint_uses_eval_time_without_a_target() -> TestResult {
+    let mut operations = json!([
+        {"op":"node.create","id":"owner","kind":"empty"},
+        {"op":"action.create","id":"drive","name":"Drive"},
+        {"op":"action.update","target":{"id":"drive"},"set":{"fcurves":[
+            {"path":"transform.translation","index":0,"keyframes":[
+                {"frame":1.0,"value":0.0,"interpolation":"linear"},
+                {"frame":11.0,"value":10.0,"interpolation":"linear"}
+            ]}
+        ]}},
+        {"op":"constraint.create","target":{"id":"owner"},"id":"action_constraint","type":"action","params":{
+            "action":"drive",
+            "transform_channel":"LOCATION_X",
+            "target_space":"WORLD",
+            "min":0.0,
+            "max":1.0,
+            "frame_start":1,
+            "frame_end":11,
+            "mix_mode":"REPLACE",
+            "owner_space":"WORLD",
+            "use_eval_time":true,
+            "eval_time":0.25,
+            "use_bone_object_action":false
+        }}
+    ]);
+    let (_directory, project) = project(&operations)?;
+    let matrix = evaluated_matrix(&project, "owner")?;
+    let expected = DMat4::from_translation(DVec3::new(2.5, 0.0, 0.0));
+    assert!(
+        max_matrix_error(matrix, expected) < 1.0e-5,
+        "targetless Action eval-time matrix differs: Potter={matrix:?}, expected={expected:?}"
+    );
+
+    operations[3]["params"]["use_eval_time"] = json!(false);
+    let rejected = ops::apply_batch(
+        &SceneDoc::new("00000000-0000-4000-8000-000000000003".to_owned()),
+        &json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":operations
+        }),
+    );
+    assert!(
+        rejected.is_err(),
+        "Action constraint without a target was accepted when use_eval_time is false"
+    );
+    Ok(())
+}
+
+#[test]
+fn omitted_action_owner_space_uses_world_on_a_parented_object() -> TestResult {
+    let identity = [0.0, 0.0, 0.0, 1.0];
+    let operations = json!([
+        {"op":"node.create","id":"parent","kind":"empty","transform":{
+            "translation":[2.0,-1.0,0.5],"rotation":[0.0,0.0,std::f64::consts::FRAC_1_SQRT_2,std::f64::consts::FRAC_1_SQRT_2],"scale":[1.5,1.0,0.8]}},
+        {"op":"node.create","id":"default_owner","kind":"empty","parent":"parent","transform":{"rotation":identity}},
+        {"op":"node.create","id":"world_owner","kind":"empty","parent":"parent","transform":{"rotation":identity}},
+        {"op":"node.create","id":"local_owner","kind":"empty","parent":"parent","transform":{"rotation":identity}},
+        {"op":"action.create","id":"drive","name":"Drive"},
+        {"op":"action.update","target":{"id":"drive"},"set":{"fcurves":[
+            {"path":"transform.translation","index":0,"keyframes":[
+                {"frame":1.0,"value":0.0,"interpolation":"linear"},
+                {"frame":11.0,"value":10.0,"interpolation":"linear"}
+            ]}
+        ]}},
+        {"op":"constraint.create","target":{"id":"default_owner"},"id":"action","type":"action","params":{
+            "action":"drive","transform_channel":"LOCATION_X","target_space":"WORLD",
+            "min":0.0,"max":1.0,"frame_start":1,"frame_end":11,"mix_mode":"REPLACE",
+            "use_eval_time":true,"eval_time":0.25,"use_bone_object_action":false}},
+        {"op":"constraint.create","target":{"id":"world_owner"},"id":"action","type":"action","params":{
+            "action":"drive","transform_channel":"LOCATION_X","target_space":"WORLD",
+            "min":0.0,"max":1.0,"frame_start":1,"frame_end":11,"mix_mode":"REPLACE",
+            "owner_space":"WORLD","use_eval_time":true,"eval_time":0.25,"use_bone_object_action":false}},
+        {"op":"constraint.create","target":{"id":"local_owner"},"id":"action","type":"action","params":{
+            "action":"drive","transform_channel":"LOCATION_X","target_space":"WORLD",
+            "min":0.0,"max":1.0,"frame_start":1,"frame_end":11,"mix_mode":"REPLACE",
+            "owner_space":"LOCAL","use_eval_time":true,"eval_time":0.25,"use_bone_object_action":false}}
+    ]);
+    let (_directory, project) = project(&operations)?;
+    let default = evaluated_matrix(&project, "default_owner")?;
+    let world = evaluated_matrix(&project, "world_owner")?;
+    let local = evaluated_matrix(&project, "local_owner")?;
+    assert!(
+        max_matrix_error(default, world) < 1.0e-12,
+        "omitted owner_space differs from WORLD: default={default:?}, world={world:?}"
+    );
+    assert!(
+        max_matrix_error(default, local) > 1.0e-2,
+        "parented fixture did not distinguish WORLD and LOCAL: default={default:?}, local={local:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn action_object_axis_angle_angle_only_keeps_the_zero_workob_axis() -> TestResult {
+    let operations = json!([
+        {"op":"node.create","id":"owner","kind":"empty","transform":{"rotation_mode":"AXIS_ANGLE"}},
+        {"op":"action.create","id":"drive","name":"Drive"},
+        {"op":"action.update","target":{"id":"drive"},"set":{"fcurves":[
+            {"path":"transform.rotation_axis_angle","index":0,"keyframes":[
+                {"frame":1.0,"value":0.0,"interpolation":"linear"},
+                {"frame":11.0,"value":std::f64::consts::FRAC_PI_2,"interpolation":"linear"}
+            ]}
+        ]}},
+        {"op":"constraint.create","target":{"id":"owner"},"id":"action_constraint","type":"action","params":{
+            "action":"drive","transform_channel":"LOCATION_X","target_space":"WORLD",
+            "min":0.0,"max":1.0,"frame_start":1,"frame_end":11,"mix_mode":"REPLACE",
+            "owner_space":"WORLD","use_eval_time":true,"eval_time":1.0,"use_bone_object_action":false}}
+    ]);
+    let (_directory, project) = project(&operations)?;
+    let matrix = evaluated_matrix(&project, "owner")?;
+    assert!(
+        max_matrix_error(matrix, DMat4::IDENTITY) < 1.0e-12,
+        "Action object workob angle-only curve must retain its zero axis, got {matrix:?}"
     );
     Ok(())
 }
@@ -2555,6 +2934,102 @@ fn transform_cache_usd_reports_its_unsupported_feature_id() -> TestResult {
     assert_eq!(
         error.details.get("feature_id").and_then(Value::as_str),
         Some("constraint.transform_cache.usd")
+    );
+    Ok(())
+}
+
+#[test]
+fn blender_euler_curves_and_transform_drivers_share_rotation_mode() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping Blender Euler driver parity: Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let generator = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/action_constraint_target_space/generate_euler_driver_oracle.py");
+    let mut generate = Command::new(&blender);
+    generate
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "3",
+            "--python",
+        ])
+        .arg(generator)
+        .arg("--")
+        .arg(root);
+    let generated = process::run_guarded(generate)?;
+    assert!(
+        generated.status.success(),
+        "Blender Euler driver oracle failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr),
+    );
+    let expected: Value = serde_json::from_slice(&fs::read(root.join("driver_expected.json"))?)?;
+
+    assert!(root.join("driver_source.blend").is_file());
+    let (_project_directory, project) = project(&json!([
+        {"op":"node.create","id":"source","name":"EulerDriverSource","kind":"empty","transform":{"rotation_mode":"XZY"}},
+        {"op":"node.create","id":"probe","name":"EulerDriverProbe","kind":"empty","transform":{"rotation_mode":"XZY"}},
+        {"op":"action.create","id":"turn","name":"Turn"},
+        {"op":"action.update","target":{"id":"turn"},"set":{"fcurves":[
+            {"path":"transform.rotation_euler","index":0,"keyframes":[
+                {"frame":1.0,"value":0.5,"interpolation":"constant"},
+                {"frame":10.0,"value":0.5,"interpolation":"constant"}
+            ]},
+            {"path":"transform.rotation_euler","index":1,"keyframes":[
+                {"frame":1.0,"value":0.5,"interpolation":"constant"},
+                {"frame":10.0,"value":0.5,"interpolation":"constant"}
+            ]}
+        ]}},
+        {"op":"node.update","target":{"id":"source"},"set":{"action":"turn"}},
+        {"op":"node.update","target":{"id":"probe"},"set":{"action":"turn"}},
+        {"op":"driver.create","target":{"id":"probe"},"id":"euler_driver","path":"transform.rotation_euler","index":2,"type":"scripted_expression","variables":[{"name":"x","type":"transforms","target":"source","path":"transform.rotation_euler","index":0,"transform_space":"world"}],"expression":"x"}
+    ]))?;
+
+    let inspected = pot()
+        .arg("inspect")
+        .arg(&project)
+        .arg("--frame")
+        .arg(
+            expected["frame"]
+                .as_u64()
+                .ok_or("Blender frame is missing")?
+                .to_string(),
+        )
+        .arg("--json")
+        .output()?;
+    assert!(
+        inspected.status.success(),
+        "pot inspect failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&inspected.stdout),
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspected: Value = serde_json::from_slice(&inspected.stdout)?;
+    let probe = inspected["result"]["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["name"] == "EulerDriverProbe"))
+        .ok_or("imported EulerDriverProbe is missing")?;
+    let actual = blender_matrix(&probe["transform"]["world"]["matrix"])?;
+    let expected_matrix = blender_matrix(&expected["world_matrix"])?;
+    let matrix_error = max_matrix_error(actual, expected_matrix);
+    assert!(
+        matrix_error <= 1.0e-5,
+        "Potter Euler curve/driver world matrix differs from Blender: max error {matrix_error}, Potter={actual:?}, Blender={expected_matrix:?}"
+    );
+    let rotation: [f64; 4] =
+        serde_json::from_value(probe["transform"]["world"]["rotation"].clone())?;
+    let (_, driver_result, _) =
+        glam::DQuat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3])
+            .to_euler(glam::EulerRot::XZYEx);
+    let expected_driver_result = expected["driver_result"]
+        .as_f64()
+        .ok_or("Blender driver result is missing")?;
+    assert!(
+        (driver_result - expected_driver_result).abs() <= 1.0e-5,
+        "Potter Euler driver result differs from Blender: Potter={driver_result}, Blender={expected_driver_result}"
     );
     Ok(())
 }

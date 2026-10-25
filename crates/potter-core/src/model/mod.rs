@@ -28,7 +28,8 @@ pub use avatar::{
 pub use id::{Id, is_valid as is_valid_id};
 pub use rig::{
     ArmatureData, Bone, BoneCollection, Constraint, ConstraintType, Driver, DriverType,
-    DriverVariable, DriverVariableType, ParentType, PoseBone, ShapeKey, ShapeKeyData, VertexGroup,
+    DriverVariable, DriverVariableType, ParentType, PoseBone, PoseRotationMode, ShapeKey,
+    ShapeKeyData, VertexGroup,
 };
 pub use scene::{
     Action, ActionSlot, BLENDER_PI, BLENDER_RIGHT_ANGLE, BLENDER_TURN, CameraData,

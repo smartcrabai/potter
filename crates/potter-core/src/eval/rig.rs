@@ -23,8 +23,8 @@ use crate::{
     },
     model::{
         ArmatureData, Constraint, ConstraintType, CurveSplineType, DataBlock, Driver, DriverType,
-        DriverVariable, DriverVariableType, Id, Modifier, Node, ParentType, PoseBone, SceneDoc,
-        ShapeKeyData, Transform, VertexGroup,
+        DriverVariable, DriverVariableType, Id, Modifier, Node, ParentType, PoseBone,
+        PoseRotationMode, SceneDoc, ShapeKeyData, Transform, VertexGroup,
     },
 };
 
@@ -1153,7 +1153,6 @@ fn pose_constraint_requires_target(kind: ConstraintType) -> bool {
             | ConstraintType::FollowPath
             | ConstraintType::ClampTo
             | ConstraintType::Armature
-            | ConstraintType::Action
             | ConstraintType::FollowTrack
             | ConstraintType::ObjectSolver
             | ConstraintType::GeometryAttribute
@@ -1179,6 +1178,13 @@ fn constraint_camera_target_id(constraint: &Constraint) -> Result<Option<Id>> {
 }
 
 fn constraint_requires_target(constraint: &Constraint) -> bool {
+    if constraint.constraint_type == ConstraintType::Action {
+        return constraint
+            .params
+            .get("use_eval_time")
+            .and_then(Value::as_bool)
+            != Some(true);
+    }
     pose_constraint_requires_target(constraint.constraint_type)
 }
 
@@ -1261,6 +1267,7 @@ fn ik_target_matrices(
             doc,
             frame,
             world_matrices,
+            None,
             None,
         )?;
         target_world = checked_inverse(target_space_world, "IK target space")? * target_world;
@@ -1347,6 +1354,7 @@ fn ik_target_matrices(
                     doc,
                     frame,
                     world_matrices,
+                    None,
                     None,
                 )?;
                 Some(checked_inverse(pole_to_world, "IK pole target space")? * pole_world)
@@ -1528,6 +1536,7 @@ fn apply_pose_bone_constraints(
                 .clone()
                 .or(constraint_camera_target_id(constraint)?);
             let legacy_space = constraint.constraint_type == ConstraintType::TransformCache;
+            let mut target_bone_pose_matrices = None;
             let target_matrix = if constraint.constraint_type == ConstraintType::TransformCache {
                 let Some(matrix) = transform_cache_matrix(
                     doc,
@@ -1553,37 +1562,47 @@ fn apply_pose_bone_constraints(
                         )
                     })?
                 };
-                let target_world = if let Some(target_bone_id) = &constraint.subtarget {
-                    if target_id == armature_node_id {
-                        armature_world
-                            * matrices
-                                .get(target_bone_id)
-                                .copied()
-                                .ok_or_else(|| {
-                                    evaluation_error("pose constraint target bone is missing")
-                                })?
-                                .pose
+                let target_world =
+                    if let Some(target_bone_id) = &constraint.subtarget {
+                        if target_id == armature_node_id {
+                            armature_world
+                                * matrices
+                                    .get(target_bone_id)
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        evaluation_error("pose constraint target bone is missing")
+                                    })?
+                                    .pose
+                        } else {
+                            let target_space =
+                                string_param_default(&constraint.params, "target_space", "WORLD")?;
+                            let include_target_pose =
+                                matches!(target_space, "LOCAL" | "LOCAL_OWNER_ORIENT");
+                            let target_bones =
+                                evaluate_armature_bone_world_and_pose_matrices_with_meshes(
+                                    doc,
+                                    target_id,
+                                    frame,
+                                    target_world,
+                                    target_worlds,
+                                    driver_values,
+                                    project_root,
+                                    fps,
+                                    fps_base,
+                                    evaluated_meshes,
+                                    session,
+                                    include_target_pose,
+                                )?;
+                            let bone_world =
+                                target_bones.world.get(target_bone_id).copied().ok_or_else(
+                                    || evaluation_error("pose constraint target bone is missing"),
+                                )?;
+                            target_bone_pose_matrices = target_bones.pose;
+                            bone_world
+                        }
                     } else {
-                        evaluate_armature_bone_world_matrices_with_meshes(
-                            doc,
-                            target_id,
-                            frame,
-                            target_world,
-                            target_worlds,
-                            driver_values,
-                            project_root,
-                            fps,
-                            fps_base,
-                            evaluated_meshes,
-                            session,
-                        )?
-                        .get(target_bone_id)
-                        .copied()
-                        .ok_or_else(|| evaluation_error("pose constraint target bone is missing"))?
-                    }
-                } else {
-                    target_world
-                };
+                        target_world
+                    };
                 let target_node = doc.nodes.get(target_id).ok_or_else(|| {
                     evaluation_error_with(
                         "pose constraint target node does not exist",
@@ -1627,6 +1646,7 @@ fn apply_pose_bone_constraints(
                 armature_node_id,
                 armature_world,
                 Some(matrices),
+                target_bone_pose_matrices.as_ref(),
                 Some(constraint_world_to_owner),
             )?;
             let mut constrained_pose = if legacy_space {
@@ -4414,7 +4434,8 @@ fn evaluate_world_matrices_with_meshes(
             }
         }
         let animated = animated_transform(node, doc, frame)?;
-        let effective_transform = apply_transform_drivers(id, animated, driver_values)?;
+        let effective_transform =
+            apply_transform_drivers(id, &node.transform.rotation_mode, animated, driver_values)?;
         let captured_matrix_basis = node.captured_matrix_basis(&effective_transform)?;
         let local = captured_matrix_basis.map_or_else(
             || effective_transform.matrix(),
@@ -4592,6 +4613,7 @@ fn evaluate_world_matrices_with_meshes(
             ) {
                 continue;
             }
+            let mut target_bone_pose_matrices = None;
             let target_matrix = if constraint.constraint_type == ConstraintType::TransformCache {
                 let Some(matrix) = transform_cache_matrix(
                     doc,
@@ -4609,7 +4631,10 @@ fn evaluate_world_matrices_with_meshes(
             } else if let (Some(target_id), Some(bone_id)) =
                 (target_id.as_ref(), constraint.subtarget.as_ref())
             {
-                let bone_worlds = evaluate_armature_bone_world_matrices_with_meshes(
+                let target_space =
+                    string_param_default(&constraint.params, "target_space", "WORLD")?;
+                let include_target_pose = matches!(target_space, "LOCAL" | "LOCAL_OWNER_ORIENT");
+                let target_bones = evaluate_armature_bone_world_and_pose_matrices_with_meshes(
                     doc,
                     target_id,
                     frame,
@@ -4623,13 +4648,15 @@ fn evaluate_world_matrices_with_meshes(
                     fps_base,
                     evaluated_meshes,
                     session,
+                    include_target_pose,
                 )?;
-                let bone_world = bone_worlds.get(bone_id).copied().ok_or_else(|| {
+                let bone_world = target_bones.world.get(bone_id).copied().ok_or_else(|| {
                     evaluation_error_with(
                         "constraint target bone does not exist",
                         json!({ "target": target_id, "bone_id": bone_id }),
                     )
                 })?;
+                target_bone_pose_matrices = target_bones.pose;
                 let target_node = doc.nodes.get(target_id).ok_or_else(|| {
                     evaluation_error_with(
                         "constraint target armature does not exist",
@@ -4652,6 +4679,7 @@ fn evaluate_world_matrices_with_meshes(
                 id,
                 world,
                 None,
+                target_bone_pose_matrices.as_ref(),
                 None,
             )?;
         }
@@ -5030,7 +5058,7 @@ fn action_constraint_matrix(
     doc: &SceneDoc,
     _frame: f64,
     _world_matrices: &BTreeMap<Id, DMat4>,
-    _owner_node_id: Option<&Id>,
+    owner_node_id: Option<&Id>,
     _world_to_owner: Option<DMat4>,
 ) -> Result<DMat4> {
     let action_text = string_param(&constraint.params, "action")?;
@@ -5046,10 +5074,7 @@ fn action_constraint_matrix(
             json!({"constraint_id":constraint.id,"action":action_id}),
         )
     })?;
-    let target_matrix = target;
-    let target_transform = matrix_transform(target_matrix)?;
-    let channel = string_param(&constraint.params, "transform_channel")?;
-    let channel = match channel {
+    let channel = match string_param(&constraint.params, "transform_channel")? {
         "LOCATION_X" => "location_x",
         "LOCATION_Y" => "location_y",
         "LOCATION_Z" => "location_z",
@@ -5065,7 +5090,7 @@ fn action_constraint_matrix(
             ));
         }
     };
-    let mut target_value = constraint_channel(&target_transform, channel)?;
+    let mut target_value = constraint_channel(target, channel)?;
     if channel.starts_with("rotation_") {
         target_value = target_value.to_degrees();
     }
@@ -5092,7 +5117,25 @@ fn action_constraint_matrix(
         .owner_bone
         .as_ref()
         .filter(|_| !use_object_action);
-    let action_transform = sample_constraint_action(action, evaluation_frame, owner_bone)?;
+    let rotation_mode = owner_node_id
+        .and_then(|owner_id| doc.nodes.get(owner_id))
+        .map_or(Some(PoseRotationMode::default()), |node| {
+            owner_bone.map_or_else(
+                || {
+                    Some(
+                        PoseRotationMode::from_blender(&node.transform.rotation_mode)
+                            .unwrap_or_default(),
+                    )
+                },
+                |bone_id| {
+                    node.pose
+                        .get(bone_id)
+                        .map_or(Some(PoseRotationMode::default()), |pose| pose.rotation_mode)
+                },
+            )
+        });
+    let action_transform =
+        sample_constraint_action(action, evaluation_frame, owner_bone, rotation_mode)?;
     action_mix_matrix(
         source,
         action_transform.matrix(),
@@ -5114,53 +5157,108 @@ fn action_mix_matrix(source: DMat4, action: DMat4, mode: &str) -> Result<DMat4> 
 }
 
 fn aligned_action_mix(left: DMat4, right: DMat4) -> Result<DMat4> {
-    let left = matrix_transform(left)?;
-    let right = matrix_transform(right)?;
-    let translation = left
-        .matrix()
-        .transform_point3(DVec3::from_array(right.translation));
-    let rotation = left.rotation_quat() * right.rotation_quat();
-    Transform::from_rotation_quat(
-        translation.to_array(),
-        [rotation.x, rotation.y, rotation.z, rotation.w],
-        (DVec3::from_array(left.scale) * DVec3::from_array(right.scale)).to_array(),
+    let (_, left_rotation, left_scale) = blender_loc_rot_size(left)?;
+    let (right_location, right_rotation, right_scale) = blender_loc_rot_size(right)?;
+    action_loc_rot_size_matrix(
+        left.transform_point3(right_location),
+        left_rotation * right_rotation,
+        left_scale * right_scale,
     )
-    .map(|transform| transform.matrix())
-    .map_err(|error| evaluation_error(error.message))
 }
 
 fn split_action_mix(left: DMat4, right: DMat4) -> Result<DMat4> {
-    let left = matrix_transform(left)?;
-    let right = matrix_transform(right)?;
-    let rotation = left.rotation_quat() * right.rotation_quat();
-    Transform::from_rotation_quat(
-        (DVec3::from_array(left.translation) + DVec3::from_array(right.translation)).to_array(),
-        [rotation.x, rotation.y, rotation.z, rotation.w],
-        (DVec3::from_array(left.scale) * DVec3::from_array(right.scale)).to_array(),
+    let (left_location, left_rotation, left_scale) = blender_loc_rot_size(left)?;
+    let (right_location, right_rotation, right_scale) = blender_loc_rot_size(right)?;
+    action_loc_rot_size_matrix(
+        left_location + right_location,
+        left_rotation * right_rotation,
+        left_scale * right_scale,
     )
-    .map(|transform| transform.matrix())
-    .map_err(|error| evaluation_error(error.message))
+}
+
+/// Blender normalizes matrix columns without orthogonalizing shear before Action channel mixing.
+fn blender_loc_rot_size(matrix: DMat4) -> Result<(DVec3, DMat3, DVec3)> {
+    if !finite_matrix(matrix) {
+        return Err(evaluation_error("Action mix input matrix is non-finite"));
+    }
+    let x = matrix.x_axis.truncate();
+    let y = matrix.y_axis.truncate();
+    let z = matrix.z_axis.truncate();
+    let mut scale = DVec3::new(x.length(), y.length(), z.length());
+    let mut rotation = DMat3::from_cols(
+        x.normalize_or_zero(),
+        y.normalize_or_zero(),
+        z.normalize_or_zero(),
+    );
+    if rotation.determinant() < 0.0 {
+        rotation = -rotation;
+        scale = -scale;
+    }
+    Ok((matrix.w_axis.truncate(), rotation, scale))
+}
+
+fn action_loc_rot_size_matrix(location: DVec3, rotation: DMat3, scale: DVec3) -> Result<DMat4> {
+    let basis = rotation * DMat3::from_diagonal(scale);
+    let result = DMat4::from_cols(
+        basis.x_axis.extend(0.0),
+        basis.y_axis.extend(0.0),
+        basis.z_axis.extend(0.0),
+        location.extend(1.0),
+    );
+    if finite_matrix(result) {
+        Ok(result)
+    } else {
+        Err(evaluation_error("Action mix result is non-finite"))
+    }
 }
 
 fn sample_constraint_action(
     action: &crate::model::Action,
     frame: f64,
     owner_bone: Option<&Id>,
+    rotation_mode: Option<PoseRotationMode>,
 ) -> Result<Transform> {
     let mut transform = Transform::default();
-    let mut euler = None;
+    let mut euler = [0.0; 3];
     let mut quaternion = transform.rotation;
+    let mut axis_angle = if owner_bone.is_some() {
+        [0.0, 0.0, 1.0, 0.0]
+    } else {
+        [0.0; 4]
+    };
     let mut quaternion_modified = false;
+    let mut euler_modified = false;
+    let mut axis_angle_modified = false;
+    let euler_order = rotation_mode
+        .and_then(PoseRotationMode::euler_order)
+        .or_else(|| rotation_mode.is_none().then_some(EulerRot::XYZEx));
     let pose_prefix = owner_bone.map(|bone_id| format!("pose.{bone_id}."));
+    let pose_bones_prefix = owner_bone.map(|bone_id| format!("pose.bones[\"{bone_id}\"]."));
+    let pose_bones_single_quote_prefix =
+        owner_bone.map(|bone_id| format!("pose.bones['{bone_id}']."));
     for curve in &action.fcurves {
         let path = if let Some(prefix) = &pose_prefix {
-            let Some(channel) = curve.path.strip_prefix(prefix) else {
+            let Some(channel) = curve
+                .path
+                .strip_prefix(prefix)
+                .or_else(|| {
+                    pose_bones_prefix
+                        .as_ref()
+                        .and_then(|prefix| curve.path.strip_prefix(prefix))
+                })
+                .or_else(|| {
+                    pose_bones_single_quote_prefix
+                        .as_ref()
+                        .and_then(|prefix| curve.path.strip_prefix(prefix))
+                })
+            else {
                 continue;
             };
             match channel {
                 "location" | "translation" => "translation",
-                "rotation" => "rotation",
+                "rotation" | "rotation_quaternion" => "rotation",
                 "rotation_euler" => "rotation_euler",
+                "rotation_axis_angle" => "rotation_axis_angle",
                 "scale" => "scale",
                 _ => continue,
             }
@@ -5187,7 +5285,9 @@ fn sample_constraint_action(
                     .ok_or_else(|| evaluation_error("Action constraint scale index is invalid"))?;
                 transform.scale[component] = value;
             }
-            "transform.rotation_quaternion" | "transform.rotation" | "rotation" => {
+            "transform.rotation_quaternion" | "transform.rotation" | "rotation"
+                if matches!(rotation_mode, None | Some(PoseRotationMode::Quaternion)) =>
+            {
                 let component = usize::try_from(curve.index)
                     .ok()
                     .filter(|component| *component < 4)
@@ -5198,37 +5298,58 @@ fn sample_constraint_action(
                 quaternion[component] = value;
                 quaternion_modified = true;
             }
-            "transform.rotation_euler" | "rotation_euler" => {
+            "transform.rotation_euler" | "rotation_euler" if euler_order.is_some() => {
                 let component = usize::try_from(curve.index)
                     .ok()
                     .filter(|component| *component < 3)
                     .ok_or_else(|| evaluation_error("Action constraint Euler index is invalid"))?;
-                if euler.is_none() {
-                    let angles = transform.rotation_quat().to_euler(EulerRot::XYZ);
-                    euler = Some([angles.0, angles.1, angles.2]);
-                }
-                if let Some(angles) = &mut euler {
-                    angles[component] = value;
-                }
+                euler[component] = value;
+                euler_modified = true;
+            }
+            "transform.rotation_axis_angle" | "rotation_axis_angle"
+                if matches!(rotation_mode, None | Some(PoseRotationMode::AxisAngle)) =>
+            {
+                let component = usize::try_from(curve.index)
+                    .ok()
+                    .filter(|component| *component < 4)
+                    .ok_or_else(|| {
+                        evaluation_error("Action constraint axis-angle index is invalid")
+                    })?;
+                axis_angle[component] = value;
+                axis_angle_modified = true;
             }
             _ => {}
         }
     }
-    let euler_modified = euler.is_some();
-    if let Some(angles) = euler {
-        let rotation = DQuat::from_rotation_z(angles[2])
-            * DQuat::from_rotation_y(angles[1])
-            * DQuat::from_rotation_x(angles[0]);
-        transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
-    }
-    if quaternion_modified {
-        transform.rotation = quaternion;
-    }
-    if quaternion_modified || euler_modified {
-        let rotation = transform.rotation_quat().normalize();
+    let rotation = if quaternion_modified {
+        DQuat::from_xyzw(quaternion[0], quaternion[1], quaternion[2], quaternion[3]).normalize()
+    } else if euler_modified {
+        let order = euler_order
+            .ok_or_else(|| evaluation_error("Action constraint Euler rotation mode is invalid"))?;
+        DQuat::from_euler(order, euler[0], euler[1], euler[2])
+    } else if axis_angle_modified {
+        action_axis_angle(axis_angle)
+    } else {
+        DQuat::IDENTITY
+    };
+    let rotation = if owner_bone.is_none() && quaternion_modified {
+        DQuat::from_rotation_x(std::f64::consts::PI) * rotation
+    } else {
+        rotation
+    };
+    if quaternion_modified || euler_modified || axis_angle_modified {
         transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
     }
     Ok(transform)
+}
+
+fn action_axis_angle(axis_angle: [f64; 4]) -> DQuat {
+    let axis = DVec3::new(axis_angle[1], axis_angle[2], axis_angle[3]).normalize_or_zero();
+    if axis == DVec3::ZERO || axis_angle[0] == 0.0 {
+        DQuat::IDENTITY
+    } else {
+        DQuat::from_axis_angle(axis, axis_angle[0])
+    }
 }
 
 fn geometry_attribute_value(
@@ -5959,6 +6080,70 @@ fn follow_track_matrix(
     Ok(result)
 }
 
+fn evaluated_bone_rest_matrix(
+    doc: &SceneDoc,
+    node_id: &Id,
+    bone_id: &Id,
+    bone_matrices: Option<&BTreeMap<Id, BoneMatrices>>,
+) -> Result<DMat4> {
+    let node = doc.nodes.get(node_id).ok_or_else(|| {
+        evaluation_error_with(
+            "constraint bone space node does not exist",
+            json!({"node_id":node_id}),
+        )
+    })?;
+    let armature = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+        .and_then(|data| data.armature.as_ref())
+        .ok_or_else(|| evaluation_error("constraint bone space armature is unavailable"))?;
+    if let Some(rest) = bone_matrices
+        .and_then(|matrices| matrices.get(bone_id))
+        .map(|matrices| matrices.rest)
+    {
+        return Ok(rest);
+    }
+    evaluate_bone_matrices(armature, &node.pose)?
+        .get(bone_id)
+        .map(|matrices| matrices.rest)
+        .ok_or_else(|| evaluation_error("constraint bone space bone is unavailable"))
+}
+
+fn action_local_owner_orient_target(
+    target: DMat4,
+    constraint: &Constraint,
+    target_id: &Id,
+    target_local_to_world: DMat4,
+    owner_node_id: &Id,
+    doc: &SceneDoc,
+    owner_bone_matrices: Option<&BTreeMap<Id, BoneMatrices>>,
+) -> Result<DMat4> {
+    let Some(target_bone) = constraint.subtarget.as_ref() else {
+        return Ok(target);
+    };
+    let target_rest = evaluated_bone_rest_matrix(doc, target_id, target_bone, None)?;
+    let target_local =
+        checked_inverse(target_local_to_world, "Action target local space")? * target;
+    let mut orientation = if let Some(owner_bone) = constraint.owner_bone.as_ref() {
+        let owner_rest =
+            evaluated_bone_rest_matrix(doc, owner_node_id, owner_bone, owner_bone_matrices)?;
+        checked_inverse(owner_rest, "Action owner bone rest")? * target_rest
+    } else {
+        target_rest
+    };
+    orientation.w_axis = DVec3::ZERO.extend(1.0);
+    let orientation_inverse = checked_inverse(orientation, "Action owner-oriented target")?;
+    let result = orientation * target_local * orientation_inverse;
+    if finite_matrix(result) {
+        Ok(result)
+    } else {
+        Err(evaluation_error(
+            "Action owner-oriented target matrix is non-finite",
+        ))
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "space conversion uses evaluated owner, target, and bone context"
@@ -5973,6 +6158,7 @@ fn constraint_space_world_matrix(
     frame: f64,
     world_matrices: &BTreeMap<Id, DMat4>,
     bone_matrices: Option<&BTreeMap<Id, BoneMatrices>>,
+    bone_pose_matrices: Option<&BTreeMap<Id, DMat4>>,
 ) -> Result<DMat4> {
     let node = doc.nodes.get(node_id).ok_or_else(|| {
         evaluation_error_with(
@@ -5982,19 +6168,93 @@ fn constraint_space_world_matrix(
     })?;
     match space {
         "CUSTOM" => {
-            let space_object = string_param(&constraint.params, "space_object")?;
+            let space_object = match constraint.params.get("space_object") {
+                None | Some(Value::Null) => return Ok(DMat4::IDENTITY),
+                Some(Value::String(space_object)) if space_object.is_empty() => {
+                    return Ok(DMat4::IDENTITY);
+                }
+                Some(Value::String(space_object)) => space_object,
+                Some(_) => {
+                    return Err(evaluation_error(
+                        "constraint custom-space object ID is invalid",
+                    ));
+                }
+            };
             let space_id = Id::new(space_object.to_owned()).map_err(|error| {
                 evaluation_error_with(
                     "constraint custom-space object ID is invalid",
                     json!({"constraint_id":constraint.id,"space_object":space_object,"reason":error.message}),
                 )
             })?;
-            world_matrices.get(&space_id).copied().ok_or_else(|| {
-                evaluation_error_with(
-                    "constraint custom-space object transform is unavailable",
-                    json!({"constraint_id":constraint.id,"space_object":space_id}),
-                )
-            })
+            let mut custom_space = world_matrices
+                .get(&space_id)
+                .copied()
+                .or_else(|| (space_id == *node_id).then_some(node_world))
+                .ok_or_else(|| {
+                    evaluation_error_with(
+                        "constraint custom-space object transform is unavailable",
+                        json!({"constraint_id":constraint.id,"space_object":space_id}),
+                    )
+                })?;
+            if let Some(subtarget) = constraint
+                .params
+                .get("space_subtarget")
+                .and_then(Value::as_str)
+                .filter(|subtarget| !subtarget.is_empty())
+            {
+                let space_node = doc.nodes.get(&space_id).ok_or_else(|| {
+                    evaluation_error_with(
+                        "constraint custom-space armature is unavailable",
+                        json!({"constraint_id":constraint.id,"space_object":space_id}),
+                    )
+                })?;
+                let armature = space_node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id))
+                    .and_then(|data| data.armature.as_ref())
+                    .ok_or_else(|| {
+                        evaluation_error("constraint custom-space object is not an armature")
+                    })?;
+                let space_bone = Id::new(subtarget.to_owned())
+                    .ok()
+                    .filter(|id| armature.bones.contains_key(id))
+                    .or_else(|| {
+                        armature
+                            .bones
+                            .iter()
+                            .find(|(_, bone)| bone.name == subtarget)
+                            .map(|(id, _)| id.clone())
+                    })
+                    .ok_or_else(|| {
+                        evaluation_error_with(
+                            "constraint custom-space bone is unavailable",
+                            json!({"constraint_id":constraint.id,"space_object":space_id,"space_subtarget":subtarget}),
+                        )
+                    })?;
+                let bone_pose = bone_matrices
+                    .filter(|_| space_id == *node_id)
+                    .and_then(|matrices| matrices.get(&space_bone))
+                    .map(|matrices| matrices.pose)
+                    .map_or_else(
+                        || {
+                            let animated_pose = crate::eval::animation::animated_pose_bones(
+                                space_node, doc, frame,
+                            )?;
+                            evaluate_bone_matrices(armature, &animated_pose)?
+                                .get(&space_bone)
+                                .map(|matrices| matrices.pose)
+                                .ok_or_else(|| {
+                                    evaluation_error(
+                                        "constraint custom-space bone pose is unavailable",
+                                    )
+                                })
+                        },
+                        Ok,
+                    )?;
+                custom_space *= bone_pose;
+            }
+            Ok(custom_space)
         }
         "LOCAL" if node.kind == "armature" && bone_id.is_some() => {
             let data = node
@@ -6011,13 +6271,18 @@ fn constraint_space_world_matrix(
                 .ok_or_else(|| evaluation_error("constraint owner bone is unavailable"))?;
             let rest = bone_rest_matrix(bone_id, bone)?;
             let local = if let Some(parent_id) = &bone.parent {
-                if let Some(parent_matrices) =
-                    bone_matrices.and_then(|matrices| matrices.get(parent_id))
-                {
+                let parent_pose = bone_pose_matrices
+                    .and_then(|matrices| matrices.get(parent_id).copied())
+                    .or_else(|| {
+                        bone_matrices
+                            .and_then(|matrices| matrices.get(parent_id))
+                            .map(|matrices| matrices.pose)
+                    });
+                if let Some(parent_pose) = parent_pose {
                     let parent = data.bones.get(parent_id).ok_or_else(|| {
                         evaluation_error("constraint owner parent bone is unavailable")
                     })?;
-                    parent_matrices.pose
+                    parent_pose
                         * checked_inverse(
                             bone_rest_matrix(parent_id, parent)?,
                             "constraint owner parent rest",
@@ -6095,6 +6360,7 @@ fn apply_object_constraint(
     owner_space_node_id: &Id,
     owner_world: DMat4,
     owner_bone_matrices: Option<&BTreeMap<Id, BoneMatrices>>,
+    target_bone_pose_matrices: Option<&BTreeMap<Id, DMat4>>,
     world_to_owner: Option<DMat4>,
 ) -> Result<DMat4> {
     if constraint.constraint_type == ConstraintType::ClampTo
@@ -6125,6 +6391,7 @@ fn apply_object_constraint(
             frame,
             world_matrices,
             owner_bone_matrices,
+            None,
         )?;
         let world_from_owner = if let Some(world_to_owner) = world_to_owner {
             checked_inverse(world_to_owner, "Transform Cache owner")?
@@ -6178,6 +6445,7 @@ fn apply_object_constraint(
         frame,
         world_matrices,
         owner_bone_matrices,
+        None,
     )?;
     let source_in_space = checked_inverse(owner_to_world, "constraint owner space")? * source;
     let target_space = string_param_default(&constraint.params, "target_space", "WORLD")?;
@@ -6187,22 +6455,57 @@ fn apply_object_constraint(
         } else {
             world_matrices.get(target_id).copied().unwrap_or(target)
         };
-        let target_to_world = constraint_space_world_matrix(
-            constraint,
-            target_space,
-            target_id,
-            target_node_world,
-            constraint.subtarget.as_ref(),
-            doc,
-            frame,
-            world_matrices,
-            if target_id == owner_space_node_id {
-                owner_bone_matrices
-            } else {
-                None
-            },
-        )?;
-        checked_inverse(target_to_world, "constraint target space")? * target
+        if constraint.constraint_type == ConstraintType::Action
+            && target_space == "LOCAL_OWNER_ORIENT"
+        {
+            let target_local_to_world = constraint_space_world_matrix(
+                constraint,
+                "LOCAL",
+                target_id,
+                target_node_world,
+                constraint.subtarget.as_ref(),
+                doc,
+                frame,
+                world_matrices,
+                if target_id == owner_space_node_id {
+                    owner_bone_matrices
+                } else {
+                    None
+                },
+                target_bone_pose_matrices,
+            )?;
+            action_local_owner_orient_target(
+                target,
+                constraint,
+                target_id,
+                target_local_to_world,
+                owner_space_node_id,
+                doc,
+                if target_id == owner_space_node_id {
+                    owner_bone_matrices
+                } else {
+                    None
+                },
+            )?
+        } else {
+            let target_to_world = constraint_space_world_matrix(
+                constraint,
+                target_space,
+                target_id,
+                target_node_world,
+                constraint.subtarget.as_ref(),
+                doc,
+                frame,
+                world_matrices,
+                if target_id == owner_space_node_id {
+                    owner_bone_matrices
+                } else {
+                    None
+                },
+                target_bone_pose_matrices,
+            )?;
+            checked_inverse(target_to_world, "constraint target space")? * target
+        }
     } else {
         target
     };
@@ -7262,7 +7565,10 @@ fn number_array_param(
     }
     Ok(Some(result))
 }
-fn constraint_channel(transform: &Transform, channel: &str) -> Result<f64> {
+fn constraint_channel(matrix: DMat4, channel: &str) -> Result<f64> {
+    if !finite_matrix(matrix) {
+        return Err(evaluation_error("constraint input matrix is non-finite"));
+    }
     let index = match channel {
         "location_x" | "rotation_x" | "scale_x" => 0,
         "location_y" | "rotation_y" | "scale_y" => 1,
@@ -7270,11 +7576,39 @@ fn constraint_channel(transform: &Transform, channel: &str) -> Result<f64> {
         _ => return Err(evaluation_error("transformation channel is invalid")),
     };
     if channel.starts_with("location_") {
-        Ok(transform.translation[index])
+        Ok(matrix.w_axis.truncate()[index])
     } else if channel.starts_with("scale_") {
-        Ok(transform.scale[index])
+        let column = match index {
+            0 => matrix.x_axis,
+            1 => matrix.y_axis,
+            _ => matrix.z_axis,
+        };
+        Ok(column.truncate().length())
     } else {
-        Ok(blender_euler_xyz(transform.rotation_quat())[index])
+        Ok(blender_matrix_euler_xyz(matrix)[index])
+    }
+}
+
+/// Blender's `mat4_to_eul` normalizes each matrix column before extracting XYZ Euler angles.
+fn blender_matrix_euler_xyz(matrix: DMat4) -> [f64; 3] {
+    let x = matrix.x_axis.truncate().normalize_or_zero();
+    let y = matrix.y_axis.truncate().normalize_or_zero();
+    let z = matrix.z_axis.truncate().normalize_or_zero();
+    let cy = x.x.hypot(x.y);
+    let (first, second) = if cy > 0.000_037_5 {
+        (
+            [y.z.atan2(z.z), (-x.z).atan2(cy), x.y.atan2(x.x)],
+            [(-y.z).atan2(-z.z), (-x.z).atan2(-cy), (-x.y).atan2(-x.x)],
+        )
+    } else {
+        let euler = [(-z.y).atan2(y.y), (-x.z).atan2(cy), 0.0];
+        (euler, euler)
+    };
+    let score = |euler: [f64; 3]| euler.iter().map(|angle| angle.abs()).sum::<f64>();
+    if score(first) > score(second) {
+        second
+    } else {
+        first
     }
 }
 
@@ -8583,7 +8917,12 @@ fn variable_value(doc: &SceneDoc, frame: f64, variable: &DriverVariable) -> Resu
     if variable.variable_type == DriverVariableType::Transforms {
         let space = variable.transform_space.as_deref().unwrap_or("local");
         let transform = driver_target_transform(doc, frame, &variable.target, space)?;
-        if let Some(value) = transform_channel(&transform, &variable.path, variable.index) {
+        if let Some(value) = transform_channel(
+            &transform,
+            &node.transform.rotation_mode,
+            &variable.path,
+            variable.index,
+        ) {
             return Ok(value);
         }
         return animated_pose_channel(node, doc, frame, &variable.path, variable.index)?
@@ -8594,7 +8933,12 @@ fn variable_value(doc: &SceneDoc, frame: f64, variable: &DriverVariable) -> Resu
                 )
             });
     }
-    if let Some(value) = transform_channel(&node.transform, &variable.path, variable.index) {
+    if let Some(value) = transform_channel(
+        &node.transform,
+        &node.transform.rotation_mode,
+        &variable.path,
+        variable.index,
+    ) {
         return Ok(value);
     }
     if let Some(value) = animated_pose_channel(node, doc, frame, &variable.path, variable.index)? {
@@ -8650,7 +8994,12 @@ fn driver_target_transform(
     }
 }
 
-fn transform_channel(transform: &Transform, path: &str, index: u32) -> Option<f64> {
+fn transform_channel(
+    transform: &Transform,
+    rotation_mode: &str,
+    path: &str,
+    index: u32,
+) -> Option<f64> {
     let values = match path {
         "location" | "translation" | "transform.location" | "transform.translation" => {
             &transform.translation[..]
@@ -8659,16 +9008,12 @@ fn transform_channel(transform: &Transform, path: &str, index: u32) -> Option<f6
             &transform.rotation[..]
         }
         "rotation_euler" | "transform.rotation_euler" => {
-            let rotation = DQuat::from_xyzw(
-                transform.rotation[0],
-                transform.rotation[1],
-                transform.rotation[2],
-                transform.rotation[3],
+            let mode = PoseRotationMode::from_blender(rotation_mode).unwrap_or_default();
+            let euler = crate::eval::animation::euler_angles_from_quaternion(
+                transform.rotation_quat(),
+                mode,
             );
-            let euler = rotation.to_euler(EulerRot::XYZ);
-            return [euler.0, euler.1, euler.2]
-                .get(usize::try_from(index).ok()?)
-                .copied();
+            return euler.get(usize::try_from(index).ok()?).copied();
         }
         _ => return None,
     };
@@ -8677,12 +9022,14 @@ fn transform_channel(transform: &Transform, path: &str, index: u32) -> Option<f6
 
 fn apply_transform_drivers(
     node_id: &Id,
+    rotation_mode: &str,
     mut transform: Transform,
     drivers: &BTreeMap<(Id, String, u32), f64>,
 ) -> Result<Transform> {
     let mut euler = None;
     let mut euler_modified = false;
     let mut quaternion_modified = false;
+    let rotation_mode = PoseRotationMode::from_blender(rotation_mode).unwrap_or_default();
     for ((target_id, path, index), value) in drivers {
         if target_id != node_id {
             continue;
@@ -8706,9 +9053,10 @@ fn apply_transform_drivers(
             }
             "rotation_euler" | "transform.rotation_euler" => {
                 let angles = euler.get_or_insert_with(|| {
-                    let rotation = transform.rotation_quat();
-                    let (x, y, z) = rotation.to_euler(EulerRot::XYZ);
-                    [x, y, z]
+                    crate::eval::animation::euler_angles_from_quaternion(
+                        transform.rotation_quat(),
+                        rotation_mode,
+                    )
                 });
                 set_component(angles, *index, *value, path)?;
                 euler_modified = true;
@@ -8718,7 +9066,7 @@ fn apply_transform_drivers(
     }
     if euler_modified {
         let angles = euler.ok_or_else(|| evaluation_error("Euler driver channels are missing"))?;
-        let rotation = DQuat::from_euler(EulerRot::XYZ, angles[0], angles[1], angles[2]);
+        let rotation = crate::eval::animation::quaternion_from_euler_angles(angles, rotation_mode);
         transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
     }
     if quaternion_modified || euler_modified {

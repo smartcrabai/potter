@@ -1484,12 +1484,20 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "constraint.action.target_space",
-            "Action constraint custom target-space corrections",
+            "Action constraint target-space conversion",
             "ACTION",
-            &[],
-            "CUSTOM and LOCAL_OWNER_ORIENT target-space corrections require custom-space and rest-bone orientation inputs that are not modeled.",
+            &[
+                "action.create",
+                "action.update",
+                "keyframe.insert",
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
         ),
         supported(
             "constraint.geometry_attribute",

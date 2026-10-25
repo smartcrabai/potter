@@ -12,7 +12,8 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     model::{
         Action, Extrapolation, FCurve, Id, Interpolation, ModifierParameterBinding, NlaBlendType,
-        NlaExtrapolation, NlaStrip, Node, PoseBone, SceneDoc, Transform, normalize_rotation,
+        NlaExtrapolation, NlaStrip, Node, PoseBone, PoseRotationMode, SceneDoc, Transform,
+        normalize_rotation,
     },
 };
 
@@ -33,6 +34,7 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
         .iter()
         .any(|track| track.solo && !track.mute);
     let mut transform = node.transform.clone();
+    let rotation_mode_is_from_blender = node.properties.contains_key("blender_object_metadata");
     for track in &node.nla_tracks {
         if track.mute || (has_solo && !track.solo) {
             continue;
@@ -48,8 +50,13 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
                     json!({ "action": strip.action, "strip": strip.id }),
                 )
             })?;
-            let (sampled, channels) =
-                sample_action_transform(&transform, action, &strip.action, action_frame)?;
+            let (sampled, channels) = sample_action_transform(
+                &transform,
+                action,
+                &strip.action,
+                action_frame,
+                rotation_mode_is_from_blender,
+            )?;
             blend_transform(
                 &mut transform,
                 &sampled,
@@ -67,7 +74,13 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
                 json!({ "action": action_id }),
             )
         })?;
-        let (sampled, channels) = sample_action_transform(&transform, action, action_id, frame)?;
+        let (sampled, channels) = sample_action_transform(
+            &transform,
+            action,
+            action_id,
+            frame,
+            rotation_mode_is_from_blender,
+        )?;
         blend_transform(
             &mut transform,
             &sampled,
@@ -417,15 +430,51 @@ struct TransformChannels {
     rotation: bool,
 }
 
+pub(crate) fn euler_angles_from_quaternion(
+    rotation: DQuat,
+    rotation_mode: PoseRotationMode,
+) -> [f64; 3] {
+    let (first, second, third) =
+        rotation.to_euler(rotation_mode.euler_order().unwrap_or(EulerRot::XYZEx));
+    let mut angles = [0.0; 3];
+    for (component, angle) in rotation_mode
+        .euler_component_order()
+        .into_iter()
+        .zip([first, second, third])
+    {
+        angles[component] = angle;
+    }
+    angles
+}
+
+pub(crate) fn quaternion_from_euler_angles(
+    angles: [f64; 3],
+    rotation_mode: PoseRotationMode,
+) -> DQuat {
+    let component_order = rotation_mode.euler_component_order();
+    DQuat::from_euler(
+        rotation_mode.euler_order().unwrap_or(EulerRot::XYZEx),
+        angles[component_order[0]],
+        angles[component_order[1]],
+        angles[component_order[2]],
+    )
+}
+
 fn sample_action_transform(
     base: &Transform,
     action: &crate::model::Action,
     action_id: &Id,
     frame: f64,
+    rotation_mode_is_from_blender: bool,
 ) -> Result<(Transform, TransformChannels)> {
     let mut transform = base.clone();
     let mut channels = TransformChannels::default();
+    let rotation_mode =
+        PoseRotationMode::from_blender(&transform.rotation_mode).unwrap_or_default();
+    let euler_channels_enabled =
+        rotation_mode.euler_order().is_some() || !rotation_mode_is_from_blender;
     let mut euler = None;
+    let mut axis_angle = None;
     let mut quaternion = transform.rotation;
     let mut quaternion_modified = false;
     for (curve_index, curve) in action.fcurves.iter().enumerate() {
@@ -450,38 +499,54 @@ fn sample_action_transform(
             }
             "transform.rotation_quaternion" | "transform.rotation" => {
                 let component = component_index(curve, 4)?;
-                // Potter component order (x, y, z, w); importers map Blender's indices to it.
-                quaternion[component] = value;
-                quaternion_modified = true;
-                channels.rotation = true;
+                if !rotation_mode_is_from_blender || rotation_mode == PoseRotationMode::Quaternion {
+                    // Potter component order (x, y, z, w); importers map Blender's indices to it.
+                    quaternion[component] = value;
+                    quaternion_modified = true;
+                }
             }
             "transform.rotation_euler" => {
                 let component = component_index(curve, 3)?;
-                if euler.is_none() {
-                    let normalized = normalize_rotation(transform.rotation).map_err(|error| {
-                        PotError::with_details(
-                            ErrorCode::SceneInvalid,
-                            error.message,
-                            json!({ "action": action_id }),
+                if euler_channels_enabled {
+                    if euler.is_none() {
+                        let normalized =
+                            normalize_rotation(transform.rotation).map_err(|error| {
+                                PotError::with_details(
+                                    ErrorCode::SceneInvalid,
+                                    error.message,
+                                    json!({ "action": action_id }),
+                                )
+                            })?;
+                        let rotation = DQuat::from_xyzw(
+                            normalized[0],
+                            normalized[1],
+                            normalized[2],
+                            normalized[3],
+                        );
+                        euler = Some(euler_angles_from_quaternion(rotation, rotation_mode));
+                    }
+                    let angles = euler.as_mut().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "Euler channel initialization failed",
                         )
                     })?;
-                    let rotation = DQuat::from_xyzw(
-                        normalized[0],
-                        normalized[1],
-                        normalized[2],
-                        normalized[3],
-                    );
-                    let (angle_x, angle_y, angle_z) = rotation.to_euler(EulerRot::XYZ);
-                    euler = Some([angle_x, angle_y, angle_z]);
+                    angles[component] = value;
                 }
-                let angles = euler.as_mut().ok_or_else(|| {
-                    PotError::new(
-                        ErrorCode::InternalError,
-                        "Euler channel initialization failed",
-                    )
-                })?;
-                angles[component] = value;
-                channels.rotation = true;
+            }
+            "transform.rotation_axis_angle" => {
+                let component = component_index(curve, 4)?;
+                if !rotation_mode_is_from_blender || rotation_mode == PoseRotationMode::AxisAngle {
+                    if axis_angle.is_none() {
+                        axis_angle = Some(axis_angle_from_rotation(transform.rotation)?);
+                    }
+                    axis_angle.as_mut().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "axis-angle channel initialization failed",
+                        )
+                    })?[component] = value;
+                }
             }
             path => {
                 if let Some(component_count) = non_transform_component_count(path) {
@@ -498,13 +563,20 @@ fn sample_action_transform(
         }
     }
     if let Some([angle_x, angle_y, angle_z]) = euler {
-        let rotation = DQuat::from_euler(EulerRot::XYZ, angle_x, angle_y, angle_z);
+        let rotation = quaternion_from_euler_angles([angle_x, angle_y, angle_z], rotation_mode);
         transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
+        channels.rotation = true;
+    }
+    if let Some(axis_angle) = axis_angle {
+        let rotation = axis_angle_quaternion(axis_angle);
+        transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
+        channels.rotation = true;
     }
     if quaternion_modified {
         transform.rotation = quaternion;
+        channels.rotation = true;
     }
-    if euler.is_some() || quaternion_modified {
+    if channels.rotation {
         transform.rotation = normalize_rotation(transform.rotation).map_err(|error| {
             PotError::with_details(
                 ErrorCode::SceneInvalid,
@@ -514,6 +586,27 @@ fn sample_action_transform(
         })?;
     }
     Ok((transform, channels))
+}
+
+fn axis_angle_from_rotation(rotation: [f64; 4]) -> Result<[f64; 4]> {
+    let normalized = normalize_rotation(rotation)
+        .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))?;
+    let quaternion = DQuat::from_xyzw(normalized[0], normalized[1], normalized[2], normalized[3]);
+    let (axis, angle) = quaternion.to_axis_angle();
+    if angle.abs() <= f64::EPSILON {
+        Ok([0.0, 0.0, 1.0, 0.0])
+    } else {
+        Ok([angle, axis.x, axis.y, axis.z])
+    }
+}
+
+fn axis_angle_quaternion(axis_angle: [f64; 4]) -> DQuat {
+    let axis = glam::DVec3::new(axis_angle[1], axis_angle[2], axis_angle[3]).normalize_or_zero();
+    if axis == glam::DVec3::ZERO || axis_angle[0] == 0.0 {
+        DQuat::IDENTITY
+    } else {
+        DQuat::from_axis_angle(axis, axis_angle[0])
+    }
 }
 
 fn strip_action_frame(strip: &NlaStrip, frame: f64) -> Result<Option<f64>> {
@@ -734,6 +827,7 @@ enum PoseChannel {
     Translation,
     Rotation,
     RotationEuler,
+    RotationAxisAngle,
     Scale,
 }
 
@@ -758,14 +852,21 @@ fn pose_curve_path(path: &str) -> Option<(Id, PoseChannel)> {
     };
     let channel = match channel {
         "location" | "translation" => PoseChannel::Translation,
-        "rotation" => PoseChannel::Rotation,
+        "rotation" | "rotation_quaternion" => PoseChannel::Rotation,
         "rotation_euler" => PoseChannel::RotationEuler,
+        "rotation_axis_angle" => PoseChannel::RotationAxisAngle,
         "scale" => PoseChannel::Scale,
         _ => return None,
     };
     Some((Id::new(bone_key).ok()?, channel))
 }
 
+fn pose_euler_order(rotation_mode: Option<PoseRotationMode>) -> Option<EulerRot> {
+    match rotation_mode {
+        None => Some(EulerRot::XYZEx),
+        Some(mode) => mode.euler_order(),
+    }
+}
 fn sample_action_pose(
     base: &BTreeMap<Id, PoseBone>,
     action: &crate::model::Action,
@@ -775,13 +876,14 @@ fn sample_action_pose(
     let mut pose = base.clone();
     let mut channels = BTreeMap::<Id, PoseChannels>::new();
     let mut euler_rotations = BTreeMap::<Id, [f64; 3]>::new();
+    let mut axis_angle_rotations = BTreeMap::<Id, [f64; 4]>::new();
     for curve in &action.fcurves {
         let Some((bone_id, channel)) = pose_curve_path(&curve.path) else {
             continue;
         };
         let component_count = match channel {
             PoseChannel::Translation | PoseChannel::Scale | PoseChannel::RotationEuler => 3,
-            PoseChannel::Rotation => 4,
+            PoseChannel::Rotation | PoseChannel::RotationAxisAngle => 4,
         };
         let component = component_index(curve, component_count)?;
         let Some(value) = sample_curve(curve, frame)? else {
@@ -794,31 +896,69 @@ fn sample_action_pose(
                 pose_bone.translation[component] = value;
                 mask.translation[component] = true;
             }
-            PoseChannel::Rotation => {
+            PoseChannel::Rotation
+                if matches!(
+                    pose_bone.rotation_mode,
+                    None | Some(PoseRotationMode::Quaternion)
+                ) =>
+            {
                 pose_bone.rotation[component] = value;
                 mask.rotation[component] = true;
             }
             PoseChannel::RotationEuler => {
-                let angles = euler_rotations.entry(bone_id).or_insert_with(|| {
-                    let rotation = DQuat::from_xyzw(
-                        pose_bone.rotation[0],
-                        pose_bone.rotation[1],
-                        pose_bone.rotation[2],
-                        pose_bone.rotation[3],
+                if let Some(order) = pose_euler_order(pose_bone.rotation_mode) {
+                    let angles = euler_rotations.entry(bone_id.clone()).or_insert_with(|| {
+                        let rotation = DQuat::from_xyzw(
+                            pose_bone.rotation[0],
+                            pose_bone.rotation[1],
+                            pose_bone.rotation[2],
+                            pose_bone.rotation[3],
+                        );
+                        let (x, y, z) = rotation.to_euler(order);
+                        [x, y, z]
+                    });
+                    angles[component] = value;
+                }
+            }
+            PoseChannel::RotationAxisAngle
+                if matches!(
+                    pose_bone.rotation_mode,
+                    None | Some(PoseRotationMode::AxisAngle)
+                ) =>
+            {
+                if !axis_angle_rotations.contains_key(&bone_id) {
+                    axis_angle_rotations.insert(
+                        bone_id.clone(),
+                        axis_angle_from_rotation(pose_bone.rotation)?,
                     );
-                    let (x, y, z) = rotation.to_euler(EulerRot::XYZ);
-                    [x, y, z]
-                });
-                angles[component] = value;
+                }
+                let axis_angle = axis_angle_rotations.get_mut(&bone_id).ok_or_else(|| {
+                    PotError::new(
+                        ErrorCode::InternalError,
+                        "axis-angle channel initialization failed",
+                    )
+                })?;
+                axis_angle[component] = value;
             }
             PoseChannel::Scale => {
                 pose_bone.scale[component] = value;
                 mask.scale[component] = true;
             }
+            PoseChannel::Rotation | PoseChannel::RotationAxisAngle => {}
         }
     }
     for (bone_id, angles) in euler_rotations {
-        let rotation = DQuat::from_euler(EulerRot::XYZ, angles[0], angles[1], angles[2]);
+        let pose_bone = pose.get_mut(&bone_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "sampled pose bone is missing")
+        })?;
+        let order = pose_euler_order(pose_bone.rotation_mode)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Euler pose mode is missing"))?;
+        let rotation = DQuat::from_euler(order, angles[0], angles[1], angles[2]);
+        pose_bone.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
+        channels.entry(bone_id).or_default().rotation = [true; 4];
+    }
+    for (bone_id, axis_angle) in axis_angle_rotations {
+        let rotation = axis_angle_quaternion(axis_angle);
         pose.get_mut(&bone_id)
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "sampled pose bone is missing"))?
             .rotation = [rotation.x, rotation.y, rotation.z, rotation.w];

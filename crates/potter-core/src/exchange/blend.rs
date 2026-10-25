@@ -4664,11 +4664,20 @@ fn build_imported_graph(
                 continue;
             };
             let rotation = vec4_field(pose_item, "rotation_quaternion", [1.0, 0.0, 0.0, 0.0]);
+            let rotation_mode = match pose_item.get("rotation_mode").and_then(Value::as_str) {
+                Some(mode) => Some(
+                    crate::model::PoseRotationMode::from_blender(mode).ok_or_else(|| {
+                        invalid_intermediate("pose bone rotation mode is invalid")
+                    })?,
+                ),
+                None => None,
+            };
             pose.insert(
                 bone_id.clone(),
                 crate::model::PoseBone {
                     translation: vec3_field(pose_item, "location", [0.0; 3]),
                     rotation: [rotation[1], rotation[2], rotation[3], rotation[0]],
+                    rotation_mode,
                     scale: vec3_field(pose_item, "scale", [1.0; 3]),
                     lock_ik: bool3_field(pose_item, "lock_ik", [false; 3]),
                     use_ik_limit: bool3_field(pose_item, "use_ik_limit", [false; 3]),
@@ -8460,6 +8469,7 @@ fn potter_fcurve_path(path: &str, mappings: &BTreeMap<String, String>) -> String
         "location" => "transform.translation",
         "rotation_euler" => "transform.rotation_euler",
         "rotation_quaternion" => "transform.rotation_quaternion",
+        "rotation_axis_angle" => "transform.rotation_axis_angle",
         "scale" => "transform.scale",
         "lens" | "data.lens" => "camera.lens_mm",
         "energy" | "data.energy" => "light.energy",
@@ -8829,13 +8839,16 @@ fn blender_constraint_is_importable(item: &Value) -> bool {
     item.get("properties")
         .and_then(Value::as_object)
         .is_some_and(|properties| {
-            ["action", "target"].into_iter().all(|key| {
+            let has_reference = |key: &str| {
                 properties
                     .get(key)
                     .and_then(|value| value.get("name"))
                     .and_then(Value::as_str)
                     .is_some_and(|name| !name.is_empty())
-            })
+            };
+            has_reference("action")
+                && (has_reference("target")
+                    || properties.get("use_eval_time").and_then(Value::as_bool) == Some(true))
         })
 }
 fn supported_blender_constraint_type(kind: ConstraintType) -> bool {

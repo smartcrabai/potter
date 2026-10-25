@@ -1,0 +1,7980 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "cases": [
+    {
+      "channel": "LOCATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_location_x",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "REPLACE",
+      "owner": "owner_0",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": true
+    },
+    {
+      "channel": "LOCATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_location_y",
+      "max": 1.0,
+      "min": -1.0,
+      "mix_mode": "BEFORE_FULL",
+      "owner": "owner_arm_1",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "WORLD",
+      "use_bone_object_action": true,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_location_z",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "BEFORE",
+      "owner": "owner_2",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_rotation_x",
+      "max": 45.0,
+      "min": -45.0,
+      "mix_mode": "BEFORE_SPLIT",
+      "owner": "owner_arm_3",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_rotation_y",
+      "max": 60.0,
+      "min": -60.0,
+      "mix_mode": "AFTER_FULL",
+      "owner": "owner_4",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_rotation_z",
+      "max": 90.0,
+      "min": -90.0,
+      "mix_mode": "AFTER",
+      "owner": "owner_arm_5",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_scale_x",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "AFTER_SPLIT",
+      "owner": "owner_6",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_scale_y",
+      "max": 2.0,
+      "min": 0.2,
+      "mix_mode": "REPLACE",
+      "owner": "owner_arm_7",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "world_scale_z",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "BEFORE_FULL",
+      "owner": "owner_8",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_location_x",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "BEFORE",
+      "owner": "owner_arm_9",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_location_y",
+      "max": 1.0,
+      "min": -1.0,
+      "mix_mode": "BEFORE_SPLIT",
+      "owner": "owner_10",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_location_z",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "AFTER_FULL",
+      "owner": "owner_arm_11",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_rotation_x",
+      "max": 45.0,
+      "min": -45.0,
+      "mix_mode": "AFTER",
+      "owner": "owner_12",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_rotation_y",
+      "max": 60.0,
+      "min": -60.0,
+      "mix_mode": "AFTER_SPLIT",
+      "owner": "owner_arm_13",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_rotation_z",
+      "max": 90.0,
+      "min": -90.0,
+      "mix_mode": "REPLACE",
+      "owner": "owner_14",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_scale_x",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "BEFORE_FULL",
+      "owner": "owner_arm_15",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_scale_y",
+      "max": 2.0,
+      "min": 0.2,
+      "mix_mode": "BEFORE",
+      "owner": "owner_16",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "pose_scale_z",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "BEFORE_SPLIT",
+      "owner": "owner_arm_17",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "POSE",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_location_x",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "AFTER_FULL",
+      "owner": "owner_18",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_location_y",
+      "max": 1.0,
+      "min": -1.0,
+      "mix_mode": "AFTER",
+      "owner": "owner_arm_19",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_location_z",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "AFTER_SPLIT",
+      "owner": "owner_20",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_rotation_x",
+      "max": 45.0,
+      "min": -45.0,
+      "mix_mode": "REPLACE",
+      "owner": "owner_arm_21",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_rotation_y",
+      "max": 60.0,
+      "min": -60.0,
+      "mix_mode": "BEFORE_FULL",
+      "owner": "owner_22",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_rotation_z",
+      "max": 90.0,
+      "min": -90.0,
+      "mix_mode": "BEFORE",
+      "owner": "owner_arm_23",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_scale_x",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "BEFORE_SPLIT",
+      "owner": "owner_24",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_scale_y",
+      "max": 2.0,
+      "min": 0.2,
+      "mix_mode": "AFTER_FULL",
+      "owner": "owner_arm_25",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_with_parent_scale_z",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "AFTER",
+      "owner": "owner_26",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_WITH_PARENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_location_x",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "AFTER_SPLIT",
+      "owner": "owner_arm_27",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_location_y",
+      "max": 1.0,
+      "min": -1.0,
+      "mix_mode": "REPLACE",
+      "owner": "owner_28",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_location_z",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "BEFORE_FULL",
+      "owner": "owner_arm_29",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_rotation_x",
+      "max": 45.0,
+      "min": -45.0,
+      "mix_mode": "BEFORE",
+      "owner": "owner_30",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_rotation_y",
+      "max": 60.0,
+      "min": -60.0,
+      "mix_mode": "BEFORE_SPLIT",
+      "owner": "owner_arm_31",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_rotation_z",
+      "max": 90.0,
+      "min": -90.0,
+      "mix_mode": "AFTER_FULL",
+      "owner": "owner_32",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_scale_x",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "AFTER",
+      "owner": "owner_arm_33",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_scale_y",
+      "max": 2.0,
+      "min": 0.2,
+      "mix_mode": "AFTER_SPLIT",
+      "owner": "owner_34",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_scale_z",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "REPLACE",
+      "owner": "owner_arm_35",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_location_x",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "BEFORE_FULL",
+      "owner": "owner_36",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_location_y",
+      "max": 1.0,
+      "min": -1.0,
+      "mix_mode": "BEFORE",
+      "owner": "owner_arm_37",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_location_z",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "BEFORE_SPLIT",
+      "owner": "owner_38",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_rotation_x",
+      "max": 45.0,
+      "min": -45.0,
+      "mix_mode": "AFTER_FULL",
+      "owner": "owner_arm_39",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_rotation_y",
+      "max": 60.0,
+      "min": -60.0,
+      "mix_mode": "AFTER",
+      "owner": "owner_40",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_rotation_z",
+      "max": 90.0,
+      "min": -90.0,
+      "mix_mode": "AFTER_SPLIT",
+      "owner": "owner_arm_41",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_scale_x",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "REPLACE",
+      "owner": "owner_42",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_scale_y",
+      "max": 2.0,
+      "min": 0.2,
+      "mix_mode": "BEFORE_FULL",
+      "owner": "owner_arm_43",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "local_owner_orient_scale_z",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "BEFORE",
+      "owner": "owner_44",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "LOCAL_OWNER_ORIENT",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_location_x",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "BEFORE_SPLIT",
+      "owner": "owner_arm_45",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "space_object": "space_ref",
+      "space_subtarget": "",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_location_y",
+      "max": 1.0,
+      "min": -1.0,
+      "mix_mode": "AFTER_FULL",
+      "owner": "owner_46",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "space_object": "space_arm",
+      "space_subtarget": "SpaceBone",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "LOCATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_location_z",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "AFTER",
+      "owner": "owner_arm_47",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "space_object": "space_ref",
+      "space_subtarget": "",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_rotation_x",
+      "max": 45.0,
+      "min": -45.0,
+      "mix_mode": "AFTER_SPLIT",
+      "owner": "owner_48",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "quaternion",
+      "space_object": "space_ref",
+      "space_subtarget": "",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_rotation_y",
+      "max": 60.0,
+      "min": -60.0,
+      "mix_mode": "REPLACE",
+      "owner": "owner_arm_49",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "XYZ",
+      "space_object": "space_ref",
+      "space_subtarget": "",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "ROTATION_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_rotation_z",
+      "max": 90.0,
+      "min": -90.0,
+      "mix_mode": "BEFORE_FULL",
+      "owner": "owner_50",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "AXIS_ANGLE",
+      "space_object": "space_ref",
+      "space_subtarget": "",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_scale_x",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "BEFORE",
+      "owner": "owner_arm_51",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "quaternion",
+      "space_object": "space_ref",
+      "space_subtarget": "",
+      "subtarget": "target_bone",
+      "target": "target_arm",
+      "target_kind": "bone",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Y",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_scale_y",
+      "max": 2.0,
+      "min": 0.2,
+      "mix_mode": "BEFORE_SPLIT",
+      "owner": "owner_52",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "rotation_mode": "XYZ",
+      "space_object": "space_ref",
+      "space_subtarget": "",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "channel": "SCALE_Z",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "custom_scale_z",
+      "max": 2.5,
+      "min": 0.5,
+      "mix_mode": "AFTER_FULL",
+      "owner": "owner_arm_53",
+      "owner_bone": "owner_bone",
+      "owner_kind": "pose",
+      "rotation_mode": "AXIS_ANGLE",
+      "space_object": "space_ref",
+      "space_subtarget": "",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "CUSTOM",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    },
+    {
+      "blender_mix_mode_omitted": true,
+      "channel": "LOCATION_X",
+      "eval_time": 0.72,
+      "frame_end": 11,
+      "frame_start": 1,
+      "id": "parented_object_default_owner_space",
+      "max": 1.5,
+      "min": -0.5,
+      "mix_mode": "AFTER",
+      "owner": "owner_default_space",
+      "owner_bone": null,
+      "owner_kind": "object",
+      "owner_parent": "owner_default_space_parent",
+      "owner_parent_transform": {
+        "rotation": [
+          0.2467528134584427,
+          -0.07933316379785538,
+          0.3258287310600281,
+          0.9092056751251221
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          0.7,
+          1.35,
+          0.9
+        ],
+        "translation": [
+          2.1,
+          -1.4,
+          0.75
+        ]
+      },
+      "owner_space_omitted": true,
+      "owner_transform": {
+        "rotation": [
+          -0.09286385029554367,
+          0.25982949137687683,
+          -0.05627208948135376,
+          0.9595302939414978
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.2,
+          0.8,
+          1.45
+        ],
+        "translation": [
+          -0.55,
+          0.85,
+          1.25
+        ]
+      },
+      "rotation_mode": "quaternion",
+      "subtarget": null,
+      "target": "driver",
+      "target_kind": "object",
+      "target_space": "WORLD",
+      "use_bone_object_action": false,
+      "use_eval_time": false
+    }
+  ],
+  "expected": {
+    "custom_location_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.087915062904358,
+        2.712952136993408,
+        0.38001513481140137,
+        0.0,
+        -0.14695753157138824,
+        0.0712413638830185,
+        0.32037073373794556,
+        0.0,
+        1.8122732639312744,
+        -1.124781847000122,
+        1.2492073774337769,
+        0.0,
+        5.362379550933838,
+        -4.423233985900879,
+        9.921936988830566,
+        0.9999999403953552
+      ]
+    },
+    "custom_location_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        -1.0717570781707764,
+        0.7153197526931763,
+        2.5388588905334473,
+        0.0,
+        -0.09714283049106598,
+        -0.3580564856529236,
+        0.17658548057079315,
+        0.0,
+        1.8434786796569824,
+        0.05596153438091278,
+        0.9752416610717773,
+        0.0,
+        4.908934593200684,
+        -3.7984604835510254,
+        10.59379768371582,
+        1.0
+      ]
+    },
+    "custom_location_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        0.48422348499298096,
+        0.05644385516643524,
+        -0.3175516128540039,
+        0.0,
+        0.3424094617366791,
+        1.5149344205856323,
+        0.45413875579833984,
+        0.0,
+        0.4410141110420227,
+        -0.21660973131656647,
+        0.7372543811798096,
+        0.0,
+        0.7502198219299316,
+        0.07889405637979507,
+        4.328066825866699,
+        0.9999999403953552
+      ]
+    },
+    "custom_rotation_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        2.273590087890625,
+        -1.5009528398513794,
+        -0.8703609108924866,
+        0.0,
+        -0.17272628843784332,
+        -0.08528614044189453,
+        -0.3041248023509979,
+        0.0,
+        0.8464683890342712,
+        1.8641021251678467,
+        -1.0035008192062378,
+        0.0,
+        5.199999809265137,
+        -3.700000047683716,
+        9.0,
+        1.0
+      ]
+    },
+    "custom_rotation_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        0.764369785785675,
+        -0.15878576040267944,
+        -0.04095381498336792,
+        0.0,
+        0.3111439645290375,
+        1.562086820602417,
+        -0.24925965070724487,
+        0.0,
+        0.07074309885501862,
+        0.12145547568798065,
+        0.8494564890861511,
+        0.0,
+        -0.3291390836238861,
+        1.3291391134262085,
+        1.3721193075180054,
+        0.9999999403953552
+      ]
+    },
+    "custom_rotation_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.393434762954712,
+        1.1021320819854736,
+        -0.16797691583633423,
+        0.0,
+        -0.5953667759895325,
+        0.38074544072151184,
+        0.7159841656684875,
+        0.0,
+        0.6716455221176147,
+        -0.7404799461364746,
+        1.3029441833496094,
+        0.0,
+        5.062238693237305,
+        -0.9513978362083435,
+        5.448460578918457,
+        1.0
+      ]
+    },
+    "custom_scale_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.1045105457305908,
+        0.5663639307022095,
+        -0.7305617928504944,
+        0.0,
+        -0.011239636689424515,
+        1.0570814609527588,
+        0.46879667043685913,
+        0.0,
+        0.8206736445426941,
+        -0.4101142883300781,
+        1.165723204612732,
+        0.0,
+        4.09088659286499,
+        -1.2320094108581543,
+        5.096231460571289,
+        0.9999999403953552
+      ]
+    },
+    "custom_scale_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.024473786354065,
+        0.4426020681858063,
+        0.38029828667640686,
+        0.0,
+        -0.5667251348495483,
+        1.1229443550109863,
+        0.21976864337921143,
+        0.0,
+        -0.26990026235580444,
+        -0.3606528043746948,
+        1.146814227104187,
+        0.0,
+        1.5614986419677734,
+        -0.06149858236312866,
+        4.2699480056762695,
+        1.0
+      ]
+    },
+    "custom_scale_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.9490400552749634,
+        1.2672996520996094,
+        -0.21743521094322205,
+        0.0,
+        -0.263459712266922,
+        0.2478734403848648,
+        0.7183286547660828,
+        0.0,
+        0.8944528102874756,
+        -0.9519850015640259,
+        1.341213583946228,
+        0.0,
+        5.2923688888549805,
+        -4.778286457061768,
+        8.467204093933105,
+        0.9999999403953552
+      ]
+    },
+    "local_location_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.296622395515442,
+        0.6379269957542419,
+        -0.5573937892913818,
+        0.0,
+        -0.09112396836280823,
+        0.9146539568901062,
+        0.6361486911773682,
+        0.0,
+        0.6914253830909729,
+        -0.507719874382019,
+        1.15321683883667,
+        0.0,
+        2.237379312515259,
+        -1.298233985900879,
+        5.859436988830566,
+        0.9999999403953552
+      ]
+    },
+    "local_location_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.1061536073684692,
+        0.17851048707962036,
+        0.14648659527301788,
+        0.0,
+        -0.2340591996908188,
+        1.355035424232483,
+        0.1161702573299408,
+        0.0,
+        -0.1208299994468689,
+        -0.11065537482500076,
+        1.0472608804702759,
+        0.0,
+        0.5,
+        0.5,
+        2.450000047683716,
+        1.0
+      ]
+    },
+    "local_location_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.2534749507904053,
+        1.1058998107910156,
+        -0.9350994229316711,
+        0.0,
+        0.12117871642112732,
+        0.7742786407470703,
+        0.5617612600326538,
+        0.0,
+        1.279158115386963,
+        -0.4722357988357544,
+        1.1613565683364868,
+        0.0,
+        6.273043155670166,
+        -1.707874059677124,
+        6.2062883377075195,
+        0.9999999403953552
+      ]
+    },
+    "local_owner_orient_location_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.0651040077209473,
+        -0.7943369150161743,
+        0.050511136651039124,
+        0.0,
+        -0.5841689705848694,
+        -0.9169514775276184,
+        -0.4620358943939209,
+        0.0,
+        0.3456382751464844,
+        0.5057523846626282,
+        -1.1911005973815918,
+        0.0,
+        2.98537015914917,
+        0.8963595628738403,
+        1.2179018259048462,
+        1.0
+      ]
+    },
+    "local_owner_orient_location_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.371323823928833,
+        0.6839696764945984,
+        0.006730366498231888,
+        0.0,
+        -0.2703022360801697,
+        0.8994308114051819,
+        0.5873429775238037,
+        0.0,
+        0.2038181573152542,
+        -0.7092991471290588,
+        1.3560640811920166,
+        0.0,
+        2.977020740509033,
+        -1.950963020324707,
+        6.452051162719727,
+        0.9999999403953552
+      ]
+    },
+    "local_owner_orient_location_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.2154332399368286,
+        0.8510829210281372,
+        -0.2498117983341217,
+        0.0,
+        -0.43131670355796814,
+        0.7981615662574768,
+        0.6207271814346313,
+        0.0,
+        0.6313679814338684,
+        -0.5611096620559692,
+        1.1602129936218262,
+        0.0,
+        2.2663815021514893,
+        -0.7663814425468445,
+        5.186295986175537,
+        1.0
+      ]
+    },
+    "local_owner_orient_rotation_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.832949161529541,
+        1.2057005167007446,
+        -0.026856347918510437,
+        0.0,
+        -0.3280263841152191,
+        0.23271149396896362,
+        0.8058546781539917,
+        0.0,
+        0.8277561664581299,
+        -0.9544146060943604,
+        1.2620329856872559,
+        0.0,
+        4.987178802490234,
+        -4.45192813873291,
+        8.18908977508545,
+        0.9999999403953552
+      ]
+    },
+    "local_owner_orient_rotation_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.0407756567001343,
+        0.6307998895645142,
+        0.5575731992721558,
+        0.0,
+        -0.7053276300430298,
+        0.9164814949035645,
+        0.27973300218582153,
+        0.0,
+        -0.279700368642807,
+        -0.5722017884254456,
+        1.1694433689117432,
+        0.0,
+        1.3343358039855957,
+        -0.9637880325317383,
+        5.351718425750732,
+        1.0
+      ]
+    },
+    "local_owner_orient_rotation_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.744484305381775,
+        1.3362144231796265,
+        -0.5117207169532776,
+        0.0,
+        -0.14838850498199463,
+        0.45422083139419556,
+        0.6398595571517944,
+        0.0,
+        1.032637596130371,
+        -0.9039525389671326,
+        1.1457462310791016,
+        0.0,
+        3.59596586227417,
+        -2.65682053565979,
+        7.6255998611450195,
+        0.9999999403953552
+      ]
+    },
+    "local_owner_orient_scale_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.0120285749435425,
+        -0.3131714463233948,
+        0.3642313778400421,
+        0.0,
+        -0.346443235874176,
+        -1.330245852470398,
+        -0.18116115033626556,
+        0.0,
+        0.36743566393852234,
+        0.038800228387117386,
+        -0.9875707030296326,
+        0.0,
+        0.47676730155944824,
+        0.5232326984405518,
+        2.419797420501709,
+        1.0
+      ]
+    },
+    "local_owner_orient_scale_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.3648097515106201,
+        0.6553151607513428,
+        0.04416739568114281,
+        0.0,
+        -0.2430962175130844,
+        0.919135570526123,
+        0.5774176120758057,
+        0.0,
+        0.23802924156188965,
+        -0.704974889755249,
+        1.359520673751831,
+        0.0,
+        2.9485654830932617,
+        -1.9390599727630615,
+        6.426558494567871,
+        0.9999999403953552
+      ]
+    },
+    "local_owner_orient_scale_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.1490002870559692,
+        0.7110807299613953,
+        -0.27240097522735596,
+        0.0,
+        -0.41801050305366516,
+        0.9073585867881775,
+        0.6053978204727173,
+        0.0,
+        0.5708550810813904,
+        -0.4900549054145813,
+        1.1286444664001465,
+        0.0,
+        3.39730167388916,
+        -0.49073874950408936,
+        3.7948663234710693,
+        1.0
+      ]
+    },
+    "local_rotation_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.2673225402832031,
+        -1.5596773624420166,
+        -0.6648293733596802,
+        0.0,
+        -0.5377517938613892,
+        -0.22564302384853363,
+        -0.4957277476787567,
+        0.0,
+        0.6987450122833252,
+        1.1053235530853271,
+        -1.2610951662063599,
+        0.0,
+        5.5830841064453125,
+        -1.4461240768432617,
+        2.749082565307617,
+        1.0
+      ]
+    },
+    "local_rotation_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.3726170063018799,
+        0.7007873058319092,
+        0.013569146394729614,
+        0.0,
+        -0.2786025404930115,
+        0.8893550634384155,
+        0.5900694131851196,
+        0.0,
+        0.20895303785800934,
+        -0.7186182737350464,
+        1.3569400310516357,
+        0.0,
+        2.408787727355957,
+        -1.4696424007415771,
+        6.0822672843933105,
+        0.9999999403953552
+      ]
+    },
+    "local_rotation_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.180924415588379,
+        1.6699005365371704,
+        0.2831880748271942,
+        0.0,
+        -0.6448208093643188,
+        0.19466766715049744,
+        0.4678284823894501,
+        0.0,
+        0.6143921613693237,
+        -0.5790429711341858,
+        1.5991313457489014,
+        0.0,
+        3.4217545986175537,
+        -2.6191205978393555,
+        8.412877082824707,
+        1.0
+      ]
+    },
+    "local_scale_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.455153465270996,
+        0.8282418847084045,
+        -0.49564263224601746,
+        0.0,
+        -0.147062748670578,
+        0.7629930377006531,
+        0.6731063723564148,
+        0.0,
+        0.7222459316253662,
+        -0.6475297212600708,
+        1.1930383443832397,
+        0.0,
+        3.40909481048584,
+        -2.764392852783203,
+        6.751026153564453,
+        0.9999999403953552
+      ]
+    },
+    "local_scale_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.0333490371704102,
+        0.69049072265625,
+        0.6093686819076538,
+        0.0,
+        -0.7397246360778809,
+        0.8525887727737427,
+        0.28831353783607483,
+        0.0,
+        -0.2702729105949402,
+        -0.6314350366592407,
+        1.1738154888153076,
+        0.0,
+        2.0055556297302246,
+        -0.5055556893348694,
+        4.847222328186035,
+        1.0
+      ]
+    },
+    "local_scale_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.0630301237106323,
+        0.37841805815696716,
+        -0.6200183629989624,
+        0.0,
+        -0.24466516077518463,
+        1.2099605798721313,
+        0.31899774074554443,
+        0.0,
+        0.6101194024085999,
+        -0.13128861784934998,
+        0.9659281969070435,
+        0.0,
+        0.875,
+        0.12499991059303284,
+        2.937499761581421,
+        0.9999999403953552
+      ]
+    },
+    "local_with_parent_location_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.0591944456100464,
+        -0.027457498013973236,
+        0.6164121627807617,
+        0.0,
+        0.08284240961074829,
+        -1.176742672920227,
+        -0.48758363723754883,
+        0.0,
+        0.5451464653015137,
+        0.4196798801422119,
+        -1.0444337129592896,
+        0.0,
+        1.0769046545028687,
+        -0.7596440315246582,
+        4.974200248718262,
+        1.0
+      ]
+    },
+    "local_with_parent_location_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.3895381689071655,
+        0.2753421366214752,
+        0.0021966807544231415,
+        0.0,
+        -0.04992057755589485,
+        1.0067870616912842,
+        0.5614846348762512,
+        0.0,
+        -0.01401808112859726,
+        -0.6183528900146484,
+        1.313284993171692,
+        0.0,
+        2.779738426208496,
+        -2.091386318206787,
+        6.177511215209961,
+        0.9999999403953552
+      ]
+    },
+    "local_with_parent_location_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.086077094078064,
+        1.0714632272720337,
+        -0.31271839141845703,
+        0.0,
+        -0.6228890419006348,
+        0.756943941116333,
+        0.43020200729370117,
+        0.0,
+        0.6142843961715698,
+        -0.23988603055477142,
+        1.3115034103393555,
+        0.0,
+        2.380446434020996,
+        -0.8804463744163513,
+        5.334580421447754,
+        1.0
+      ]
+    },
+    "local_with_parent_rotation_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.4256757497787476,
+        1.4986921548843384,
+        0.07816433906555176,
+        0.0,
+        -0.4536868929862976,
+        0.40856441855430603,
+        0.4413542151451111,
+        0.0,
+        0.6447365283966064,
+        -0.6807579398155212,
+        1.2929338216781616,
+        0.0,
+        2.7380027770996094,
+        -1.7380027770996094,
+        5.359403133392334,
+        0.9999999403953552
+      ]
+    },
+    "local_with_parent_rotation_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        0.92829430103302,
+        1.045404314994812,
+        1.1064016819000244,
+        0.0,
+        -0.9584867358207703,
+        0.021779052913188934,
+        0.30642610788345337,
+        0.0,
+        0.04848167300224304,
+        -1.2553642988204956,
+        1.0560458898544312,
+        0.0,
+        3.7955610752105713,
+        -1.5433123111724854,
+        6.937415599822998,
+        1.0
+      ]
+    },
+    "local_with_parent_rotation_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.2217073440551758,
+        1.1853032112121582,
+        -0.9893819689750671,
+        0.0,
+        -0.046859562397003174,
+        0.7003669142723083,
+        0.525745689868927,
+        0.0,
+        1.287477970123291,
+        -0.6295763254165649,
+        1.1380388736724854,
+        0.0,
+        6.377568244934082,
+        -1.7328240871429443,
+        6.364238262176514,
+        0.9999999403953552
+      ]
+    },
+    "local_with_parent_scale_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.0577698945999146,
+        -0.6993185877799988,
+        0.0581253245472908,
+        0.0,
+        -0.6013466715812683,
+        -0.9504708051681519,
+        -0.4919632375240326,
+        0.0,
+        0.3301387131214142,
+        0.40136533975601196,
+        -1.1789782047271729,
+        0.0,
+        1.757079839706421,
+        -0.2570797801017761,
+        4.524203777313232,
+        1.0
+      ]
+    },
+    "local_with_parent_scale_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.405126929283142,
+        0.22314023971557617,
+        0.047624826431274414,
+        0.0,
+        -0.15827272832393646,
+        0.9531731605529785,
+        0.6810033917427063,
+        0.0,
+        0.019110172986984253,
+        -0.5668224692344666,
+        1.334788203239441,
+        0.0,
+        2.8500308990478516,
+        -2.1665539741516113,
+        6.241567134857178,
+        0.9999999403953552
+      ]
+    },
+    "local_with_parent_scale_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.028106927871704,
+        0.803751528263092,
+        -0.3285236060619354,
+        0.0,
+        -0.608100414276123,
+        0.938886821269989,
+        0.3940034508705139,
+        0.0,
+        0.5233070850372314,
+        -0.1718629151582718,
+        1.2172054052352905,
+        0.0,
+        1.3509118556976318,
+        -0.9769331812858582,
+        5.3760271072387695,
+        1.0
+      ]
+    },
+    "parented_object_default_owner_space": {
+      "baseline": [
+        0.7101998925209045,
+        0.4943746030330658,
+        -0.3368537127971649,
+        0.0,
+        -0.6426311731338501,
+        0.7954624891281128,
+        0.2995564341545105,
+        0.0,
+        0.23460273444652557,
+        -0.07348251342773438,
+        1.2310417890548706,
+        0.0,
+        1.095388650894165,
+        -1.4118640422821045,
+        2.06195330619812,
+        1.0
+      ],
+      "matrix": [
+        1.9902578592300415,
+        -0.7436029314994812,
+        -1.697339415550232,
+        0.0,
+        -0.23213694989681244,
+        -0.2049463987350464,
+        -0.20182065665721893,
+        0.0,
+        -0.2051851600408554,
+        1.7167892456054688,
+        -1.6067872047424316,
+        0.0,
+        7.506300926208496,
+        -2.3351306915283203,
+        8.433161735534668,
+        1.0
+      ]
+    },
+    "pose_location_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.087915062904358,
+        2.712952136993408,
+        0.38001513481140137,
+        0.0,
+        -0.14695753157138824,
+        0.0712413638830185,
+        0.32037073373794556,
+        0.0,
+        1.8122732639312744,
+        -1.124781847000122,
+        1.2492073774337769,
+        0.0,
+        8.960929870605469,
+        -3.3788323402404785,
+        11.35177993774414,
+        0.9999999403953552
+      ]
+    },
+    "pose_location_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        0.9076991677284241,
+        0.9909415245056152,
+        1.0039043426513672,
+        0.0,
+        -0.8435983657836914,
+        0.42513763904571533,
+        0.3431072533130646,
+        0.0,
+        -0.07943200320005417,
+        -1.060024619102478,
+        1.1181570291519165,
+        0.0,
+        2.6402831077575684,
+        -1.1402831077575684,
+        5.672368049621582,
+        1.0
+      ]
+    },
+    "pose_location_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.2040925025939941,
+        0.6532469391822815,
+        -0.9909082055091858,
+        0.0,
+        -0.02137690782546997,
+        0.806767463684082,
+        0.8147559762001038,
+        0.0,
+        0.89300537109375,
+        -0.47226032614707947,
+        1.0260497331619263,
+        0.0,
+        3.272981643676758,
+        -2.618840217590332,
+        6.626991271972656,
+        0.9999999403953552
+      ]
+    },
+    "pose_rotation_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        2.246034860610962,
+        -1.4361563920974731,
+        -0.6993981599807739,
+        0.0,
+        -0.18742233514785767,
+        -0.12189854681491852,
+        -0.3515762686729431,
+        0.0,
+        0.8095760941505432,
+        1.776200294494629,
+        -1.0474225282669067,
+        0.0,
+        4.66493034362793,
+        -3.6049644947052,
+        10.235970497131348,
+        1.0
+      ]
+    },
+    "pose_rotation_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.624607801437378,
+        0.8344050645828247,
+        0.6321746110916138,
+        0.0,
+        -0.45243215560913086,
+        0.44137635827064514,
+        0.6690258383750916,
+        0.0,
+        0.021865174174308777,
+        -1.2576733827590942,
+        1.1431684494018555,
+        0.0,
+        3.035768508911133,
+        -2.096623420715332,
+        6.897343158721924,
+        0.9999999403953552
+      ]
+    },
+    "pose_rotation_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.2713537216186523,
+        0.7882663607597351,
+        -0.6108037233352661,
+        0.0,
+        -0.34718748927116394,
+        0.8973726630210876,
+        0.43544360995292664,
+        0.0,
+        0.6986724734306335,
+        -0.2677067518234253,
+        1.1087615489959717,
+        0.0,
+        1.656649112701416,
+        -0.656649112701416,
+        3.953643798828125,
+        1.0
+      ]
+    },
+    "pose_scale_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.0299066305160522,
+        0.41303199529647827,
+        -0.6826803088188171,
+        0.0,
+        -0.011772414669394493,
+        1.1454437971115112,
+        0.35677921772003174,
+        0.0,
+        0.8018832206726074,
+        -0.4311533272266388,
+        1.0998584032058716,
+        0.0,
+        3.5745511054992676,
+        -1.0969774723052979,
+        4.670473575592041,
+        0.9999999403953552
+      ]
+    },
+    "pose_scale_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.0373064279556274,
+        0.6682031750679016,
+        0.5974553823471069,
+        0.0,
+        -0.7280102372169495,
+        0.8723239898681641,
+        0.28835615515708923,
+        0.0,
+        -0.2763117849826813,
+        -0.6174582839012146,
+        1.17030930519104,
+        0.0,
+        2.1628756523132324,
+        -0.6977899074554443,
+        5.12830924987793,
+        1.0
+      ]
+    },
+    "pose_scale_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        0.9373389482498169,
+        0.3958139717578888,
+        -0.9424712061882019,
+        0.0,
+        0.1968870609998703,
+        1.0970451831817627,
+        0.40137970447540283,
+        0.0,
+        0.9823818802833557,
+        -0.43684452772140503,
+        0.9706088900566101,
+        0.0,
+        2.0847055912017822,
+        -1.1455605030059814,
+        5.660961627960205,
+        0.9999999403953552
+      ]
+    },
+    "world_location_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.4221417903900146,
+        -1.4231210947036743,
+        -0.019574634730815887,
+        0.0,
+        -0.4643819034099579,
+        -0.4578809440135956,
+        -0.44939762353897095,
+        0.0,
+        0.6189092397689819,
+        0.6361958980560303,
+        -1.2877509593963623,
+        0.0,
+        2.6000003814697266,
+        -1.6000003814697266,
+        5.180000305175781,
+        1.0
+      ]
+    },
+    "world_location_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        0.4241960048675537,
+        0.06782080233097076,
+        0.39545610547065735,
+        0.0,
+        0.15914827585220337,
+        -1.503153920173645,
+        0.22464220225811005,
+        0.0,
+        0.4431525468826294,
+        0.41613221168518066,
+        -0.8705931901931763,
+        0.0,
+        0.4404612183570862,
+        4.130600929260254,
+        -1.6438367366790771,
+        0.9999999403953552
+      ]
+    },
+    "world_location_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        0.5225404500961304,
+        0.16421671211719513,
+        -0.06287973374128342,
+        0.0,
+        -0.4191623330116272,
+        1.501497507095337,
+        0.43800652027130127,
+        0.0,
+        0.1566663235425949,
+        -0.19073958694934845,
+        0.8037862181663513,
+        0.0,
+        0.04906553030014038,
+        0.7376586198806763,
+        1.61330246925354,
+        1.0
+      ]
+    },
+    "world_rotation_x": {
+      "baseline": [
+        1.0979851484298706,
+        0.013580985367298126,
+        -0.28189215064048767,
+        0.0,
+        0.19022740423679352,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.2107418328523636,
+        -0.3351028263568878,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.087915062904358,
+        2.712952136993408,
+        0.38001513481140137,
+        0.0,
+        -0.14695753157138824,
+        0.0712413638830185,
+        0.32037073373794556,
+        0.0,
+        1.8122732639312744,
+        -1.124781847000122,
+        1.2492073774337769,
+        0.0,
+        5.362379550933838,
+        -4.423233985900879,
+        9.921936988830566,
+        0.9999999403953552
+      ]
+    },
+    "world_rotation_y": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.0502970218658447,
+        0.47327131032943726,
+        0.46314537525177,
+        0.0,
+        -0.6724833846092224,
+        1.0200313329696655,
+        0.2801016867160797,
+        0.0,
+        -0.28289344906806946,
+        -0.41865476965904236,
+        1.1637362241744995,
+        0.0,
+        1.1139230728149414,
+        -0.7889999151229858,
+        5.028487682342529,
+        1.0
+      ]
+    },
+    "world_rotation_z": {
+      "baseline": [
+        1.0979852676391602,
+        0.013580895960330963,
+        -0.28189197182655334,
+        0.0,
+        0.19022752344608307,
+        0.8416302800178528,
+        0.25229930877685547,
+        0.0,
+        0.21074165403842926,
+        -0.335102915763855,
+        1.239278793334961,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.7294700145721436,
+        1.3211684226989746,
+        -0.5295189619064331,
+        0.0,
+        -0.1446845531463623,
+        0.46406683325767517,
+        0.6434447169303894,
+        0.0,
+        1.0349763631820679,
+        -0.8908261060714722,
+        1.1403095722198486,
+        0.0,
+        4.53404426574707,
+        -3.9673664569854736,
+        7.776162624359131,
+        0.9999999403953552
+      ]
+    },
+    "world_scale_x": {
+      "baseline": [
+        1.022317886352539,
+        0.3274765610694885,
+        0.24005259573459625,
+        0.0,
+        -0.30223968625068665,
+        0.834608256816864,
+        0.14859415590763092,
+        0.0,
+        -0.18386518955230713,
+        -0.27207744121551514,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.2599773406982422,
+        -0.2000865787267685,
+        0.5704778432846069,
+        0.0,
+        0.06028938293457031,
+        -1.042945146560669,
+        -0.49895453453063965,
+        0.0,
+        0.5876169800758362,
+        0.5607686638832092,
+        -1.101150393486023,
+        0.0,
+        2.034428596496582,
+        -0.5344285368919373,
+        4.884757041931152,
+        1.0
+      ]
+    },
+    "world_scale_y": {
+      "baseline": [
+        1.0979851484298706,
+        0.01358097791671753,
+        -0.2818920910358429,
+        0.0,
+        0.1902274340391159,
+        0.841630220413208,
+        0.2522992789745331,
+        0.0,
+        0.21074175834655762,
+        -0.33510279655456543,
+        1.2392785549163818,
+        0.0,
+        1.3623791933059692,
+        -1.423233985900879,
+        2.9219369888305664,
+        1.0
+      ],
+      "matrix": [
+        1.1915295124053955,
+        0.3973020315170288,
+        0.2689233720302582,
+        0.0,
+        -0.4448591470718384,
+        1.1731421947479248,
+        0.23787783086299896,
+        0.0,
+        -0.15469245612621307,
+        -0.2821667790412903,
+        1.102269172668457,
+        0.0,
+        0.867830216884613,
+        0.13216982781887054,
+        2.9281790256500244,
+        0.9999999403953552
+      ]
+    },
+    "world_scale_z": {
+      "baseline": [
+        1.022317886352539,
+        0.3274766206741333,
+        0.24005264043807983,
+        0.0,
+        -0.30223971605300903,
+        0.8346081972122192,
+        0.14859417080879211,
+        0.0,
+        -0.18386520445346832,
+        -0.2720775306224823,
+        1.1541956663131714,
+        0.0,
+        1.2000000476837158,
+        -0.699999988079071,
+        2.0,
+        1.0
+      ],
+      "matrix": [
+        1.6118820905685425,
+        1.4725055694580078,
+        0.3371107578277588,
+        0.0,
+        -0.7002146244049072,
+        -0.14035449922084808,
+        0.5669133067131042,
+        0.0,
+        0.5834269523620605,
+        -1.0838371515274048,
+        1.4770491123199463,
+        0.0,
+        6.296797752380371,
+        -1.6475882530212402,
+        7.790534019470215,
+        1.0
+      ]
+    }
+  },
+  "operations": [
+    {
+      "id": "driver_parent",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.11708933860063553,
+          0.18692120909690857,
+          -0.11708933860063553,
+          0.9683184623718262
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          0.8,
+          1.2,
+          1.1
+        ],
+        "translation": [
+          1.2,
+          -0.4,
+          0.7
+        ]
+      }
+    },
+    {
+      "id": "driver",
+      "kind": "empty",
+      "op": "node.create",
+      "parent": "driver_parent",
+      "transform": {
+        "rotation": [
+          0.25888174772262573,
+          -0.17327359318733215,
+          0.3753874897956848,
+          0.8729494214057922
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.4,
+          0.7,
+          1.8
+        ],
+        "translation": [
+          0.35,
+          -0.4,
+          0.65
+        ]
+      }
+    },
+    {
+      "id": "target_arm",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.07768171280622482,
+          0.15489190816879272,
+          -0.0652635395526886,
+          0.9827078580856323
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          0.4,
+          0.3,
+          -0.2
+        ]
+      }
+    },
+    {
+      "head": [
+        1.1,
+        -0.2,
+        0.3
+      ],
+      "id": "target_parent_bone",
+      "name": "TargetParent",
+      "op": "bone.create",
+      "tail": [
+        1.7,
+        0.5,
+        0.8
+      ],
+      "target": {
+        "id": "target_arm"
+      }
+    },
+    {
+      "head": [
+        2.0,
+        0.4,
+        0.1
+      ],
+      "id": "target_bone",
+      "name": "TargetBone",
+      "op": "bone.create",
+      "parent": "target_parent_bone",
+      "tail": [
+        2.2,
+        1.3,
+        0.4
+      ],
+      "target": {
+        "id": "target_arm"
+      }
+    },
+    {
+      "bone_id": "target_parent_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.06670321524143219,
+          0.1419941484928131,
+          -0.15071411430835724,
+          0.9760500192642212
+        ],
+        "scale": [
+          0.9,
+          1.1,
+          0.95
+        ],
+        "translation": [
+          -0.2,
+          0.1,
+          0.25
+        ]
+      },
+      "target": {
+        "id": "target_arm"
+      }
+    },
+    {
+      "bone_id": "target_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          0.15544253587722778,
+          -0.06290756911039352,
+          0.21843542158603668,
+          0.9613356590270996
+        ],
+        "scale": [
+          1.1,
+          0.85,
+          1.25
+        ],
+        "translation": [
+          0.25,
+          -0.3,
+          0.45
+        ]
+      },
+      "target": {
+        "id": "target_arm"
+      }
+    },
+    {
+      "id": "space_ref",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          -0.1430775672197342,
+          0.12181484699249268,
+          -0.07138534635305405,
+          0.9795887470245361
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "translation": [
+          -0.7,
+          1.3,
+          0.9
+        ]
+      }
+    },
+    {
+      "id": "space_arm",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.12759444117546082,
+          0.1828748732805252,
+          -0.10004522651433945,
+          0.9696738719940186
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "translation": [
+          0.5,
+          -1.1,
+          0.6
+        ]
+      }
+    },
+    {
+      "head": [
+        0.3,
+        -0.2,
+        0.5
+      ],
+      "id": "space_bone",
+      "name": "SpaceBone",
+      "op": "bone.create",
+      "tail": [
+        0.9,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "space_arm"
+      }
+    },
+    {
+      "id": "drive",
+      "name": "Action Constraint Oracle",
+      "op": "action.create"
+    },
+    {
+      "op": "action.update",
+      "set": {
+        "fcurves": [
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -1.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 4.0
+              }
+            ],
+            "path": "transform.translation"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -1.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 4.0
+              }
+            ],
+            "path": "pose.owner_bone.location"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 2.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": -3.0
+              }
+            ],
+            "path": "transform.translation"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 2.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": -3.0
+              }
+            ],
+            "path": "pose.owner_bone.location"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.5
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 7.0
+              }
+            ],
+            "path": "transform.translation"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.5
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 7.0
+              }
+            ],
+            "path": "pose.owner_bone.location"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -0.35
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 1.1
+              }
+            ],
+            "path": "transform.rotation_euler"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -0.35
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 1.1
+              }
+            ],
+            "path": "pose.owner_bone.rotation_euler"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.2
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": -0.9
+              }
+            ],
+            "path": "transform.rotation_euler"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.2
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": -0.9
+              }
+            ],
+            "path": "pose.owner_bone.rotation_euler"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -0.5
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 1.7
+              }
+            ],
+            "path": "transform.rotation_euler"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -0.5
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 1.7
+              }
+            ],
+            "path": "pose.owner_bone.rotation_euler"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.5
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 2.6
+              }
+            ],
+            "path": "transform.scale"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.5
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 2.6
+              }
+            ],
+            "path": "pose.owner_bone.scale"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 1.8
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.4
+              }
+            ],
+            "path": "transform.scale"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 1.8
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.4
+              }
+            ],
+            "path": "pose.owner_bone.scale"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.7
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 1.9
+              }
+            ],
+            "path": "transform.scale"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.7
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 1.9
+              }
+            ],
+            "path": "pose.owner_bone.scale"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -0.11218497902154922
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.4038982093334198
+              }
+            ],
+            "path": "transform.rotation_quaternion"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -0.11218497902154922
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.4038982093334198
+              }
+            ],
+            "path": "pose.owner_bone.rotation"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.20297983288764954
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.06380879133939743
+              }
+            ],
+            "path": "transform.rotation_quaternion"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.20297983288764954
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.06380879133939743
+              }
+            ],
+            "path": "pose.owner_bone.rotation"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -0.02386264130473137
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.4876917004585266
+              }
+            ],
+            "path": "transform.rotation_quaternion"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": -0.02386264130473137
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.4876917004585266
+              }
+            ],
+            "path": "pose.owner_bone.rotation"
+          },
+          {
+            "index": 3,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.9724424481391907
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.7713309526443481
+              }
+            ],
+            "path": "transform.rotation_quaternion"
+          },
+          {
+            "index": 3,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.9724424481391907
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.7713309526443481
+              }
+            ],
+            "path": "pose.owner_bone.rotation"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.35
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 1.1
+              }
+            ],
+            "path": "transform.rotation_axis_angle"
+          },
+          {
+            "index": 0,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.35
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 1.1
+              }
+            ],
+            "path": "pose.owner_bone.rotation_axis_angle"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.6
+              }
+            ],
+            "path": "transform.rotation_axis_angle"
+          },
+          {
+            "index": 1,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.6
+              }
+            ],
+            "path": "pose.owner_bone.rotation_axis_angle"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 1.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.0
+              }
+            ],
+            "path": "transform.rotation_axis_angle"
+          },
+          {
+            "index": 2,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 1.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.0
+              }
+            ],
+            "path": "pose.owner_bone.rotation_axis_angle"
+          },
+          {
+            "index": 3,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.8
+              }
+            ],
+            "path": "transform.rotation_axis_angle"
+          },
+          {
+            "index": 3,
+            "keyframes": [
+              {
+                "frame": 1.0,
+                "interpolation": "linear",
+                "value": 0.0
+              },
+              {
+                "frame": 11.0,
+                "interpolation": "linear",
+                "value": 0.8
+              }
+            ],
+            "path": "pose.owner_bone.rotation_axis_angle"
+          }
+        ]
+      },
+      "target": {
+        "id": "drive"
+      }
+    },
+    {
+      "id": "owner_0",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_world_location_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "REPLACE",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "WORLD",
+        "transform_channel": "LOCATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": true
+      },
+      "target": {
+        "id": "owner_0"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_1",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_1"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_1"
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_world_location_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.0,
+        "min": -1.0,
+        "mix_mode": "BEFORE_FULL",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "WORLD",
+        "transform_channel": "LOCATION_Y",
+        "use_bone_object_action": true,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_arm_1"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_2",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_world_location_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "BEFORE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "WORLD",
+        "transform_channel": "LOCATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_2"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_3",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_3"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_3"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_world_rotation_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 45.0,
+        "min": -45.0,
+        "mix_mode": "BEFORE_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "WORLD",
+        "transform_channel": "ROTATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_3"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_4",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_world_rotation_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 60.0,
+        "min": -60.0,
+        "mix_mode": "AFTER_FULL",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "WORLD",
+        "transform_channel": "ROTATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_4"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_5",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_5"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_5"
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_world_rotation_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 90.0,
+        "min": -90.0,
+        "mix_mode": "AFTER",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "WORLD",
+        "transform_channel": "ROTATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_arm_5"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_6",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_world_scale_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "AFTER_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "WORLD",
+        "transform_channel": "SCALE_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_6"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_7",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_7"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_7"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_world_scale_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.0,
+        "min": 0.2,
+        "mix_mode": "REPLACE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "WORLD",
+        "transform_channel": "SCALE_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_7"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_8",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_world_scale_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "BEFORE_FULL",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "WORLD",
+        "transform_channel": "SCALE_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_8"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_9",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_9"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_9"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_location_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "BEFORE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "LOCATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_9"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_10",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_location_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.0,
+        "min": -1.0,
+        "mix_mode": "BEFORE_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "LOCATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_10"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_11",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_11"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_11"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_location_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "AFTER_FULL",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "LOCATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_11"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_12",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_rotation_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 45.0,
+        "min": -45.0,
+        "mix_mode": "AFTER",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "ROTATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_12"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_13",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_13"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_13"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_rotation_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 60.0,
+        "min": -60.0,
+        "mix_mode": "AFTER_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "ROTATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_13"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_14",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_rotation_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 90.0,
+        "min": -90.0,
+        "mix_mode": "REPLACE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "ROTATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_14"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_15",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_15"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_15"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_scale_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "BEFORE_FULL",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "SCALE_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_15"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_16",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_scale_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.0,
+        "min": 0.2,
+        "mix_mode": "BEFORE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "SCALE_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_16"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_17",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_17"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_17"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_pose_scale_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "BEFORE_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "POSE",
+        "transform_channel": "SCALE_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_17"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_18",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_location_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "AFTER_FULL",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "LOCATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_18"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_19",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_19"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_19"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_location_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.0,
+        "min": -1.0,
+        "mix_mode": "AFTER",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "LOCATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_19"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_20",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_location_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "AFTER_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "LOCATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_20"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_21",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_21"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_21"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_rotation_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 45.0,
+        "min": -45.0,
+        "mix_mode": "REPLACE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "ROTATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_21"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_22",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_rotation_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 60.0,
+        "min": -60.0,
+        "mix_mode": "BEFORE_FULL",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "ROTATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_22"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_23",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_23"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_23"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_rotation_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 90.0,
+        "min": -90.0,
+        "mix_mode": "BEFORE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "ROTATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_23"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_24",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_scale_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "BEFORE_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "SCALE_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_24"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_25",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_25"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_25"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_scale_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.0,
+        "min": 0.2,
+        "mix_mode": "AFTER_FULL",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "SCALE_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_25"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_26",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_with_parent_scale_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "AFTER",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_WITH_PARENT",
+        "transform_channel": "SCALE_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_26"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_27",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_27"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_27"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_location_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "AFTER_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL",
+        "transform_channel": "LOCATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_27"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_28",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_local_location_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.0,
+        "min": -1.0,
+        "mix_mode": "REPLACE",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "LOCAL",
+        "transform_channel": "LOCATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_28"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_29",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_29"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_29"
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_local_location_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "BEFORE_FULL",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "LOCAL",
+        "transform_channel": "LOCATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_arm_29"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_30",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_rotation_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 45.0,
+        "min": -45.0,
+        "mix_mode": "BEFORE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL",
+        "transform_channel": "ROTATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_30"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_31",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_31"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_31"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_rotation_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 60.0,
+        "min": -60.0,
+        "mix_mode": "BEFORE_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL",
+        "transform_channel": "ROTATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_31"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_32",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_local_rotation_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 90.0,
+        "min": -90.0,
+        "mix_mode": "AFTER_FULL",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "LOCAL",
+        "transform_channel": "ROTATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_32"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_33",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_33"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_33"
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_local_scale_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "AFTER",
+        "owner_space": "WORLD",
+        "target": "driver",
+        "target_space": "LOCAL",
+        "transform_channel": "SCALE_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_arm_33"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_34",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_scale_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.0,
+        "min": 0.2,
+        "mix_mode": "AFTER_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL",
+        "transform_channel": "SCALE_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_34"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_35",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_35"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_35"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_scale_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "REPLACE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL",
+        "transform_channel": "SCALE_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_35"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_36",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_location_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "BEFORE_FULL",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "LOCATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_36"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_37",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_37"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_37"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_location_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.0,
+        "min": -1.0,
+        "mix_mode": "BEFORE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "LOCATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_37"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_38",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_location_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "BEFORE_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "LOCATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_38"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_39",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_39"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_39"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_rotation_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 45.0,
+        "min": -45.0,
+        "mix_mode": "AFTER_FULL",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "ROTATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_39"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_40",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_rotation_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 60.0,
+        "min": -60.0,
+        "mix_mode": "AFTER",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "ROTATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_40"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_41",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_41"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_41"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_rotation_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 90.0,
+        "min": -90.0,
+        "mix_mode": "AFTER_SPLIT",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "ROTATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_41"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_42",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_scale_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "REPLACE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "SCALE_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_42"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_43",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_43"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_43"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_scale_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.0,
+        "min": 0.2,
+        "mix_mode": "BEFORE_FULL",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "SCALE_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_43"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_44",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_local_owner_orient_scale_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "BEFORE",
+        "owner_space": "WORLD",
+        "target": "target_arm",
+        "target_space": "LOCAL_OWNER_ORIENT",
+        "transform_channel": "SCALE_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_44"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_45",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_45"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_45"
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_custom_location_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "BEFORE_SPLIT",
+        "owner_space": "WORLD",
+        "space_object": "space_ref",
+        "space_subtarget": "",
+        "target": "driver",
+        "target_space": "CUSTOM",
+        "transform_channel": "LOCATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_arm_45"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_46",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_custom_location_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.0,
+        "min": -1.0,
+        "mix_mode": "AFTER_FULL",
+        "owner_space": "WORLD",
+        "space_object": "space_arm",
+        "space_subtarget": "SpaceBone",
+        "target": "target_arm",
+        "target_space": "CUSTOM",
+        "transform_channel": "LOCATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_46"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_47",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_47"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_47"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_custom_location_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "AFTER",
+        "owner_space": "WORLD",
+        "space_object": "space_ref",
+        "space_subtarget": "",
+        "target": "target_arm",
+        "target_space": "CUSTOM",
+        "transform_channel": "LOCATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_47"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_48",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_custom_rotation_x",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 45.0,
+        "min": -45.0,
+        "mix_mode": "AFTER_SPLIT",
+        "owner_space": "WORLD",
+        "space_object": "space_ref",
+        "space_subtarget": "",
+        "target": "driver",
+        "target_space": "CUSTOM",
+        "transform_channel": "ROTATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_48"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_49",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_49"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_49"
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_custom_rotation_y",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 60.0,
+        "min": -60.0,
+        "mix_mode": "REPLACE",
+        "owner_space": "WORLD",
+        "space_object": "space_ref",
+        "space_subtarget": "",
+        "target": "driver",
+        "target_space": "CUSTOM",
+        "transform_channel": "ROTATION_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_arm_49"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_50",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_custom_rotation_z",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 90.0,
+        "min": -90.0,
+        "mix_mode": "BEFORE_FULL",
+        "owner_space": "WORLD",
+        "space_object": "space_ref",
+        "space_subtarget": "",
+        "target": "target_arm",
+        "target_space": "CUSTOM",
+        "transform_channel": "ROTATION_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_50"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_51",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_51"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_51"
+      }
+    },
+    {
+      "constraint_target": "target_arm",
+      "id": "action_custom_scale_x",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "BEFORE",
+        "owner_space": "WORLD",
+        "space_object": "space_ref",
+        "space_subtarget": "",
+        "target": "target_arm",
+        "target_space": "CUSTOM",
+        "transform_channel": "SCALE_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "subtarget": "target_bone",
+      "target": {
+        "id": "owner_arm_51"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_52",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "XYZ",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_custom_scale_y",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.0,
+        "min": 0.2,
+        "mix_mode": "BEFORE_SPLIT",
+        "owner_space": "WORLD",
+        "space_object": "space_ref",
+        "space_subtarget": "",
+        "target": "driver",
+        "target_space": "CUSTOM",
+        "transform_channel": "SCALE_Y",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_52"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_arm_53",
+      "kind": "armature",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.10025932639837265,
+          -0.09504334628582001,
+          0.16210123896598816,
+          0.9770557880401611
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.1,
+          0.9,
+          1.2
+        ],
+        "translation": [
+          1.2,
+          -0.7,
+          2.0
+        ]
+      }
+    },
+    {
+      "head": [
+        0.2,
+        -0.3,
+        0.5
+      ],
+      "id": "owner_bone",
+      "name": "OwnerBone",
+      "op": "bone.create",
+      "tail": [
+        1.2,
+        0.8,
+        0.7
+      ],
+      "target": {
+        "id": "owner_arm_53"
+      }
+    },
+    {
+      "bone_id": "owner_bone",
+      "op": "pose.set",
+      "set": {
+        "rotation": [
+          -0.08135940879583359,
+          0.16118575632572174,
+          0.11400679498910904,
+          0.9769351482391357
+        ],
+        "rotation_mode": "AXIS_ANGLE",
+        "scale": [
+          1.05,
+          0.95,
+          1.1
+        ],
+        "translation": [
+          0.15,
+          -0.25,
+          0.4
+        ]
+      },
+      "target": {
+        "id": "owner_arm_53"
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_custom_scale_z",
+      "op": "constraint.create",
+      "owner_bone": "owner_bone",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 2.5,
+        "min": 0.5,
+        "mix_mode": "AFTER_FULL",
+        "owner_space": "WORLD",
+        "space_object": "space_ref",
+        "space_subtarget": "",
+        "target": "driver",
+        "target_space": "CUSTOM",
+        "transform_channel": "SCALE_Z",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_arm_53"
+      },
+      "type": "action"
+    },
+    {
+      "id": "owner_default_space_parent",
+      "kind": "empty",
+      "op": "node.create",
+      "transform": {
+        "rotation": [
+          0.2467528134584427,
+          -0.07933316379785538,
+          0.3258287310600281,
+          0.9092056751251221
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          0.7,
+          1.35,
+          0.9
+        ],
+        "translation": [
+          2.1,
+          -1.4,
+          0.75
+        ]
+      }
+    },
+    {
+      "id": "owner_default_space",
+      "kind": "empty",
+      "op": "node.create",
+      "parent": "owner_default_space_parent",
+      "transform": {
+        "rotation": [
+          -0.09286385029554367,
+          0.25982949137687683,
+          -0.05627208948135376,
+          0.9595302939414978
+        ],
+        "rotation_mode": "quaternion",
+        "scale": [
+          1.2,
+          0.8,
+          1.45
+        ],
+        "translation": [
+          -0.55,
+          0.85,
+          1.25
+        ]
+      }
+    },
+    {
+      "constraint_target": "driver",
+      "id": "action_parented_object_default_owner_space",
+      "op": "constraint.create",
+      "params": {
+        "action": "drive",
+        "eval_time": 0.72,
+        "frame_end": 11,
+        "frame_start": 1,
+        "max": 1.5,
+        "min": -0.5,
+        "mix_mode": "AFTER",
+        "target": "driver",
+        "target_space": "WORLD",
+        "transform_channel": "LOCATION_X",
+        "use_bone_object_action": false,
+        "use_eval_time": false
+      },
+      "target": {
+        "id": "owner_default_space"
+      },
+      "type": "action"
+    }
+  ]
+}

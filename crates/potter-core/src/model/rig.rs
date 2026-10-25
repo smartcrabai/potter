@@ -1,3 +1,5 @@
+use glam::EulerRot;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +68,80 @@ pub struct Bone {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bbone_settings: BTreeMap<String, Value>,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoseRotationMode {
+    #[default]
+    Quaternion,
+    AxisAngle,
+    Xyz,
+    Xzy,
+    Yxz,
+    Yzx,
+    Zxy,
+    Zyx,
+}
+
+impl PoseRotationMode {
+    #[must_use]
+    pub const fn is_quaternion(&self) -> bool {
+        matches!(self, Self::Quaternion)
+    }
+
+    #[must_use]
+    pub const fn as_blender_str(self) -> &'static str {
+        match self {
+            Self::Quaternion => "QUATERNION",
+            Self::AxisAngle => "AXIS_ANGLE",
+            Self::Xyz => "XYZ",
+            Self::Xzy => "XZY",
+            Self::Yxz => "YXZ",
+            Self::Yzx => "YZX",
+            Self::Zxy => "ZXY",
+            Self::Zyx => "ZYX",
+        }
+    }
+
+    #[must_use]
+    pub fn from_blender(mode: &str) -> Option<Self> {
+        Some(match mode {
+            "QUATERNION" | "quaternion" => Self::Quaternion,
+            "AXIS_ANGLE" | "axis_angle" => Self::AxisAngle,
+            "XYZ" | "xyz" => Self::Xyz,
+            "XZY" | "xzy" => Self::Xzy,
+            "YXZ" | "yxz" => Self::Yxz,
+            "YZX" | "yzx" => Self::Yzx,
+            "ZXY" | "zxy" => Self::Zxy,
+            "ZYX" | "zyx" => Self::Zyx,
+            _ => return None,
+        })
+    }
+    #[must_use]
+    pub const fn euler_order(self) -> Option<EulerRot> {
+        Some(match self {
+            Self::Xyz => EulerRot::XYZEx,
+            Self::Xzy => EulerRot::XZYEx,
+            Self::Yxz => EulerRot::YXZEx,
+            Self::Yzx => EulerRot::YZXEx,
+            Self::Zxy => EulerRot::ZXYEx,
+            Self::Zyx => EulerRot::ZYXEx,
+            Self::Quaternion | Self::AxisAngle => return None,
+        })
+    }
+
+    /// Component indexes in the Euler sequence passed to `glam`.
+    #[must_use]
+    pub const fn euler_component_order(self) -> [usize; 3] {
+        match self {
+            Self::Xyz | Self::Quaternion | Self::AxisAngle => [0, 1, 2],
+            Self::Xzy => [0, 2, 1],
+            Self::Yxz => [1, 0, 2],
+            Self::Yzx => [1, 2, 0],
+            Self::Zxy => [2, 0, 1],
+            Self::Zyx => [2, 1, 0],
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -73,6 +149,8 @@ pub struct PoseBone {
     pub translation: [f64; 3],
     pub rotation: [f64; 4],
     pub scale: [f64; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_mode: Option<PoseRotationMode>,
     pub lock_ik: [bool; 3],
     pub use_ik_limit: [bool; 3],
     pub ik_min: [f64; 3],
@@ -107,6 +185,7 @@ impl Default for PoseBone {
             translation: [0.0; 3],
             rotation: [0.0, 0.0, 0.0, 1.0],
             scale: [1.0; 3],
+            rotation_mode: None,
             lock_ik: [false; 3],
             use_ik_limit: [false; 3],
             ik_min: [-std::f64::consts::PI; 3],
