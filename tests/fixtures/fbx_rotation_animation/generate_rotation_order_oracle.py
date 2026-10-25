@@ -87,13 +87,18 @@ for order in orders:
         mesh.update()
         obj = bpy.data.objects.new(name, mesh)
         scene.collection.objects.link(obj)
-        obj.rotation_mode = order
-        if kind == "Static":
-            obj.rotation_euler = (0.31, -0.47, 0.73)
-        else:
-            for key_frame, angle in ((1, 0.2), (4, 0.4), (5, 0.4), (9, 0.8)):
-                obj.rotation_euler[0] = angle
+        obj.rotation_euler = (0.31, -0.47, 0.73)
+        if kind == "Animated":
+            for key_frame, x_angle, y_angle in (
+                (1, 0.2, -0.35),
+                (4, 0.4, 0.15),
+                (5, 0.4, 0.15),
+                (9, 0.8, -0.25),
+            ):
+                obj.rotation_euler[0] = x_angle
                 obj.keyframe_insert(data_path="rotation_euler", index=0, frame=key_frame)
+                obj.rotation_euler[1] = y_angle
+                obj.keyframe_insert(data_path="rotation_euler", index=1, frame=key_frame)
             for layer in obj.animation_data.action.layers:
                 for strip in layer.strips:
                     for slot in obj.animation_data.action.slots:
@@ -112,9 +117,7 @@ for order in orders:
         fbx_path = os.path.join(root_dir, f"{name}.fbx")
 
         def write_ordered_fbx(filepath, root, version):
-            rotation_degrees = [
-                math.degrees(angle) for angle in obj.rotation_euler
-            ]
+            rotation_degrees = [math.degrees(angle) for angle in (0.31, -0.47, 0.73)]
             return write_rotation_order(
                 filepath,
                 root,

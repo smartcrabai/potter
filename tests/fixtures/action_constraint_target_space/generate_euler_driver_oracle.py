@@ -19,6 +19,8 @@ def add_euler_curves(obj):
         obj.keyframe_insert(data_path="rotation_euler", index=0, frame=frame)
         obj.rotation_euler[1] = 0.5
         obj.keyframe_insert(data_path="rotation_euler", index=1, frame=frame)
+        obj.rotation_euler[2] = 0.3
+        obj.keyframe_insert(data_path="rotation_euler", index=2, frame=frame)
     for layer in obj.animation_data.action.layers:
         for strip in layer.strips:
             for slot in obj.animation_data.action.slots:

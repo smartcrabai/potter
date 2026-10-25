@@ -158,7 +158,7 @@ fn inspected_rotation(project: &Path, frame: u32) -> TestResult<[f64; 4]> {
 }
 
 #[test]
-fn potter_fbx_rotation_curve_roundtrip_preserves_multiaxis_xyz() -> TestResult {
+fn potter_fbx_rotation_curve_roundtrip_preserves_node_euler_mode() -> TestResult {
     let directory = tempdir()?;
     let root = directory.path();
     let project = root.join("project");
@@ -181,7 +181,7 @@ fn potter_fbx_rotation_curve_roundtrip_preserves_multiaxis_xyz() -> TestResult {
                 ]}
             ]}},
             {"op":"node.create","id":"probe","name":"MultiAxisProbe","kind":"empty",
-                "transform":{"rotation_deg":[15.0,-20.0,35.0],"rotation_mode":"quaternion"}},
+                "transform":{"rotation_deg":[15.0,-20.0,35.0],"rotation_mode":"XZY"}},
             {"op":"node.update","target":{"id":"probe"},"set":{"action":"turn"}}
         ]
     });
@@ -209,6 +209,9 @@ fn potter_fbx_rotation_curve_roundtrip_preserves_multiaxis_xyz() -> TestResult {
         .arg(&fbx)
         .arg("--json");
     checked_output(command, "pot export FBX Euler round trip")?;
+    let exported = fs::read_to_string(&fbx)?;
+    assert!(exported.contains("P: \"RotationOrder\", \"enum\", \"\", \"\",1"));
+    assert!(exported.contains("P: \"RotationActive\", \"bool\", \"\", \"\",1"));
     let imported_project = root.join("imported");
     let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
     command.arg("init").arg(&imported_project).arg("--json");

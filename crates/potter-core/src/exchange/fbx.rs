@@ -25,12 +25,24 @@ use crate::{
     },
     model::{
         Action, ArmatureData, Bone, DataBlock, Extrapolation, FCurve, Id, Image, ImageColorspace,
-        ImageSource, Interpolation, Keyframe, Material, Node, SceneDoc, TextureRef, Transform,
+        ImageSource, Interpolation, Keyframe, Material, Node, PoseRotationMode, SceneDoc,
+        TextureRef, Transform,
     },
 };
 
 const FBX_TICKS_PER_SECOND: f64 = 46_186_158_000.0;
 const DEFAULT_FPS: f64 = 24.0;
+
+fn fbx_rotation_order(mode: PoseRotationMode) -> i32 {
+    match mode {
+        PoseRotationMode::Xyz | PoseRotationMode::Quaternion | PoseRotationMode::AxisAngle => 0,
+        PoseRotationMode::Xzy => 1,
+        PoseRotationMode::Yzx => 2,
+        PoseRotationMode::Yxz => 3,
+        PoseRotationMode::Zxy => 4,
+        PoseRotationMode::Zyx => 5,
+    }
+}
 #[derive(Clone, Copy, Debug)]
 struct ObjectIds {
     model: i64,
@@ -375,7 +387,17 @@ pub(crate) fn export_with_root_allow_lossy(
                 json!({ "node_id": node_id }),
             ));
         }
-        let (rx, ry, rz) = rotation.to_euler(EulerRot::XYZEx);
+        let rotation_mode = PoseRotationMode::from_blender(&node.transform.rotation_mode)
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::ExportFailed,
+                    "node rotation mode is unsupported for FBX export",
+                    json!({"node_id":node_id,"rotation_mode":node.transform.rotation_mode}),
+                )
+            })?;
+        let rotation_order = fbx_rotation_order(rotation_mode);
+        let [rx, ry, rz] =
+            crate::eval::animation::euler_angles_from_quaternion(rotation, rotation_mode);
         let armature_metadata = node
             .data
             .as_ref()
@@ -393,7 +415,7 @@ pub(crate) fn export_with_root_allow_lossy(
             .unwrap_or_default();
         writeln!(
             output,
-            "\tModel: {}, \"{}\", \"{}\" {{\n\t\tVersion: 232\n\t\tProperties70:  {{\n\t\t\tP: \"Lcl Translation\", \"Lcl Translation\", \"\",\"A\",{},{},{}\n\t\t\tP: \"Lcl Rotation\", \"Lcl Rotation\", \"\",\"A\",{},{},{}\n\t\t\tP: \"Lcl Scaling\", \"Lcl Scaling\", \"\",\"A\",{},{},{}\n\t\t\tP: \"Visibility\", \"Visibility\", \"\",\"A\",{}\n\t\t\tP: \"potter:id\", \"KString\", \"\", \"\", \"{}\"\n\t\t\tP: \"potter:armature\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}\n\t\tShading: T\n\t\tCulling: \"CullingOff\"\n\t}}",
+            "\tModel: {}, \"{}\", \"{}\" {{\n\t\tVersion: 232\n\t\tProperties70:  {{\n\t\t\tP: \"Lcl Translation\", \"Lcl Translation\", \"\",\"A\",{},{},{}\n\t\t\tP: \"Lcl Rotation\", \"Lcl Rotation\", \"\",\"A\",{},{},{}\n\t\t\tP: \"RotationOrder\", \"enum\", \"\", \"\",{}\n\t\t\tP: \"RotationActive\", \"bool\", \"\", \"\",{}\n\t\t\tP: \"Lcl Scaling\", \"Lcl Scaling\", \"\",\"A\",{},{},{}\n\t\t\tP: \"Visibility\", \"Visibility\", \"\",\"A\",{}\n\t\t\tP: \"potter:id\", \"KString\", \"\", \"\", \"{}\"\n\t\t\tP: \"potter:armature\", \"KString\", \"\", \"\", \"{}\"\n\t\t}}\n\t\tShading: T\n\t\tCulling: \"CullingOff\"\n\t}}",
             object_ids.model,
             quote(&format!("Model::{}", node.name)),
             if mesh_model { "Mesh" } else { "Null" },
@@ -403,6 +425,8 @@ pub(crate) fn export_with_root_allow_lossy(
             fmt_num(rx.to_degrees()),
             fmt_num(ry.to_degrees()),
             fmt_num(rz.to_degrees()),
+            rotation_order,
+            i32::from(rotation_order != 0),
             fmt_num(node.transform.scale[0]),
             fmt_num(node.transform.scale[1]),
             fmt_num(node.transform.scale[2]),
@@ -2857,29 +2881,34 @@ fn parse_model(node: &FbxNode, numeric_id: i64) -> Result<ImportedModel> {
     let translation = read_vec3_property(properties, "Lcl Translation", [0.0; 3])?;
     let rotation_degrees = read_vec3_property(properties, "Lcl Rotation", [0.0; 3])?;
     let scale = read_vec3_property(properties, "Lcl Scaling", [1.0; 3])?;
-    let rotation_order = read_scalar_property(properties, "RotationOrder", 0.0)?;
-    if !rotation_order.is_finite()
-        || rotation_order.fract() != 0.0
-        || !(0.0..=5.0).contains(&rotation_order)
+    let rotation_active = read_scalar_property(properties, "RotationActive", 0.0)? != 0.0;
+    let rotation_order_code = if rotation_active {
+        read_scalar_property(properties, "RotationOrder", 0.0)?
+    } else {
+        0.0
+    };
+    if !rotation_order_code.is_finite()
+        || rotation_order_code.fract() != 0.0
+        || !(0.0..=5.0).contains(&rotation_order_code)
     {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
             "FBX Euler rotation order is unsupported",
-            json!({ "feature_id": "format.fbx.rotation_order", "rotation_order": rotation_order }),
+            json!({ "feature_id": "format.fbx.rotation_order", "rotation_order": rotation_order_code }),
         ));
     }
-    let (rotation_order, euler_component_order) = match rotation_order as u32 {
-        0 => (EulerRot::XYZEx, [0, 1, 2]),
-        1 => (EulerRot::XZYEx, [0, 2, 1]),
-        2 => (EulerRot::YZXEx, [1, 2, 0]),
-        3 => (EulerRot::YXZEx, [1, 0, 2]),
-        4 => (EulerRot::ZXYEx, [2, 0, 1]),
-        5 => (EulerRot::ZYXEx, [2, 1, 0]),
+    let (rotation_order, euler_component_order, rotation_mode) = match rotation_order_code as u32 {
+        0 => (EulerRot::XYZEx, [0, 1, 2], "XYZ"),
+        1 => (EulerRot::XZYEx, [0, 2, 1], "XZY"),
+        2 => (EulerRot::YZXEx, [1, 2, 0], "YZX"),
+        3 => (EulerRot::YXZEx, [1, 0, 2], "YXZ"),
+        4 => (EulerRot::ZXYEx, [2, 0, 1], "ZXY"),
+        5 => (EulerRot::ZYXEx, [2, 1, 0], "ZYX"),
         _ => {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedFeature,
                 "FBX Euler rotation order is unsupported",
-                json!({ "feature_id": "format.fbx.rotation_order", "rotation_order": rotation_order }),
+                json!({"feature_id":"format.fbx.rotation_order","rotation_order":rotation_order_code}),
             ));
         }
     };
@@ -2940,7 +2969,7 @@ fn parse_model(node: &FbxNode, numeric_id: i64) -> Result<ImportedModel> {
             translation,
             rotation: [rotation.x, rotation.y, rotation.z, rotation.w],
             scale,
-            rotation_mode: "XYZ".to_owned(),
+            rotation_mode: rotation_mode.to_owned(),
         },
         visible,
         armature,

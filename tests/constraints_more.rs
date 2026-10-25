@@ -2982,6 +2982,10 @@ fn blender_euler_curves_and_transform_drivers_share_rotation_mode() -> TestResul
             {"path":"transform.rotation_euler","index":1,"keyframes":[
                 {"frame":1.0,"value":0.5,"interpolation":"constant"},
                 {"frame":10.0,"value":0.5,"interpolation":"constant"}
+            ]},
+            {"path":"transform.rotation_euler","index":2,"keyframes":[
+                {"frame":1.0,"value":0.3,"interpolation":"constant"},
+                {"frame":10.0,"value":0.3,"interpolation":"constant"}
             ]}
         ]}},
         {"op":"node.update","target":{"id":"source"},"set":{"action":"turn"}},
