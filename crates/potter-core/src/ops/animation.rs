@@ -675,7 +675,9 @@ fn validate_path(engine: &Engine<'_>, path: &str, index: u32, field: &str) -> Re
 fn animation_path_component_count(path: &str) -> Option<usize> {
     match path {
         "transform.translation" | "transform.rotation_euler" | "transform.scale" => Some(3),
-        "transform.rotation_quaternion" | "transform.rotation" => Some(4),
+        "transform.rotation_quaternion"
+        | "transform.rotation_axis_angle"
+        | "transform.rotation" => Some(4),
         "visible"
         | "camera.lens_mm"
         | "light.energy"
@@ -696,8 +698,8 @@ fn animation_path_component_count(path: &str) -> Option<usize> {
                 && !channel.contains('.')
             {
                 return match channel {
-                    "translation" | "scale" => Some(3),
-                    "rotation" => Some(4),
+                    "location" | "translation" | "scale" | "rotation_euler" => Some(3),
+                    "rotation" | "rotation_quaternion" | "rotation_axis_angle" => Some(4),
                     _ => None,
                 };
             }

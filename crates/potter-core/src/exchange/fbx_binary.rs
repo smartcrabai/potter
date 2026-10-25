@@ -500,8 +500,9 @@ fn property_kind(node: &Node, index: usize, parent: Option<&str>) -> Result<char
             'S'
         } else {
             match node.args.get(1).map(|arg| arg.value.as_str()) {
-                Some("int" | "Integer") => 'I',
-                Some("bool" | "Boolean") => 'C',
+                // Blender's writer stores p_bool and p_enum as int32 (`export_fbx_bin.py`
+                // FBX_PROPERTIES_DEFINITIONS), and its importer asserts that type.
+                Some("int" | "Integer" | "bool" | "Boolean" | "enum") => 'I',
                 _ => 'D',
             }
         });

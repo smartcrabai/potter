@@ -175,3 +175,93 @@ fn a_single_quaternion_channel_uses_unkeyed_static_components() -> Result<(), Bo
     }
     Ok(())
 }
+
+fn assert_rotation(rotation: &Value, expected: [f64; 4]) -> Result<(), Box<dyn Error>> {
+    let rotation = rotation.as_array().ok_or("evaluated rotation missing")?;
+    assert_eq!(rotation.len(), expected.len());
+    for (actual, expected) in rotation.iter().zip(expected) {
+        let actual = actual.as_f64().ok_or("rotation component missing")?;
+        assert!(
+            (actual - expected).abs() < 1.0e-12,
+            "expected {expected}, got {actual}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn default_node_euler_action_is_visible_through_inspect() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    init(&scene)?;
+    apply(
+        &scene,
+        &json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op":"node.create", "id":"animated", "kind":"empty"},
+                {"op":"action.create", "id":"turn_action", "name":"Turn"},
+                {"op":"node.update", "target":{"id":"animated"}, "set":{"action":"turn_action"}},
+                {"op":"keyframe.insert", "target":{"id":"animated"}, "path":"transform.rotation_euler", "index":2, "frame":1.0, "value":0.0},
+                {"op":"keyframe.insert", "target":{"id":"animated"}, "path":"transform.rotation_euler", "index":2, "frame":3.0, "value":std::f64::consts::FRAC_PI_2}
+            ]
+        }),
+    )?;
+
+    let inspected = inspect(&scene, "3.0")?;
+    let animated = inspected["result"]["items"]
+        .as_array()
+        .ok_or("items missing")?
+        .iter()
+        .find(|item| item["id"] == "animated")
+        .ok_or("animated node missing")?;
+    assert_rotation(
+        &animated["transform"]["evaluated"]["rotation"],
+        [
+            0.0,
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        ],
+    )
+}
+
+#[test]
+fn axis_angle_animation_with_only_angle_keyed_uses_the_default_y_axis() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    init(&scene)?;
+    apply(
+        &scene,
+        &json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op":"node.create", "id":"animated", "kind":"empty"},
+                {"op":"action.create", "id":"turn_action", "name":"Turn"},
+                {"op":"node.update", "target":{"id":"animated"}, "set":{"action":"turn_action"}},
+                {"op":"keyframe.insert", "target":{"id":"animated"}, "path":"transform.rotation_axis_angle", "index":0, "frame":1.0, "value":0.0},
+                {"op":"keyframe.insert", "target":{"id":"animated"}, "path":"transform.rotation_axis_angle", "index":0, "frame":3.0, "value":std::f64::consts::FRAC_PI_2}
+            ]
+        }),
+    )?;
+
+    let inspected = inspect(&scene, "3.0")?;
+    let animated = inspected["result"]["items"]
+        .as_array()
+        .ok_or("items missing")?
+        .iter()
+        .find(|item| item["id"] == "animated")
+        .ok_or("animated node missing")?;
+    assert_rotation(
+        &animated["transform"]["evaluated"]["rotation"],
+        [
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+        ],
+    )
+}

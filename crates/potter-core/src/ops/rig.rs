@@ -8,8 +8,8 @@ use crate::{
     geom::Vertex,
     model::{
         Bone, BoneCollection, Constraint, ConstraintType, Driver, DriverType, DriverVariable,
-        DriverVariableType, Id, Node, ParentType, ShapeKey, ShapeKeyData, VertexGroup,
-        normalize_rotation,
+        DriverVariableType, Id, Node, ParentType, PoseRotationMode, ShapeKey, ShapeKeyData,
+        VertexGroup, normalize_rotation,
     },
     params::{self, ParameterFamily},
 };
@@ -1047,6 +1047,7 @@ fn pose_set(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<b
         &[
             "translation",
             "rotation",
+            "rotation_mode",
             "scale",
             "bbone_curveinx",
             "bbone_curveinz",
@@ -1083,6 +1084,16 @@ fn pose_set(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<b
     }
     if let Some(value) = set.get("scale") {
         next.scale = read_vec3(engine, value, "set/scale")?;
+    }
+    if let Some(value) = set.get("rotation_mode") {
+        let mode = string_value(engine, value, "set/rotation_mode")?;
+        next.rotation_mode = Some(PoseRotationMode::from_blender(&mode).ok_or_else(|| {
+            invalid(
+                engine,
+                "rotation_mode is not a Blender rotation mode",
+                "set/rotation_mode",
+            )
+        })?);
     }
     if let Some(value) = set.get("bbone_curveinx") {
         next.bbone_curveinx = finite_value(engine, value, "set/bbone_curveinx")?;
@@ -2603,8 +2614,7 @@ fn validate_constraint_reference(
     }
     if matches!(
         kind,
-        ConstraintType::Action
-            | ConstraintType::Armature
+        ConstraintType::Armature
             | ConstraintType::ClampTo
             | ConstraintType::CopyTransforms
             | ConstraintType::FollowPath
@@ -3199,7 +3209,8 @@ fn validate_tracking_constraint_params(
     };
     match kind {
         ConstraintType::Action => {
-            node_param("target", true)?;
+            let use_eval_time = optional_bool("use_eval_time")?.unwrap_or(false);
+            node_param("target", !use_eval_time)?;
             let action_text = required_string("action")?;
             let action_id = Id::new(action_text).map_err(|_| {
                 invalid(
@@ -3309,7 +3320,6 @@ fn validate_tracking_constraint_params(
             if let Some(value) = params.get("eval_time") {
                 ranged_number(engine, value, 0.0, 1.0, &format!("{field}/eval_time"))?;
             }
-            optional_bool("use_eval_time")?;
             optional_bool("use_bone_object_action")?;
         }
         ConstraintType::GeometryAttribute => {

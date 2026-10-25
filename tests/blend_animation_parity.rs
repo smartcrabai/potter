@@ -239,3 +239,127 @@ fn blender_bezier_handles_drive_object_and_animated_path_evaluation() -> Result<
     }
     Ok(())
 }
+fn inspected_world_matrix(
+    project: &Path,
+    node: &str,
+    frame: u32,
+) -> Result<[f64; 16], Box<dyn Error>> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+    command
+        .args(["inspect"])
+        .arg(project)
+        .args(["--id", node, "--frame"])
+        .arg(frame.to_string())
+        .arg("--json");
+    let output = checked_output(command, "pot inspect native Euler rotation")?;
+    let inspected: Value = serde_json::from_slice(&output.stdout)?;
+    let item = inspected["result"]["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == node))
+        .ok_or_else(|| io::Error::other(format!("inspect omitted node `{node}`")))?;
+    let components = item["transform"]["world"]["matrix"]
+        .as_array()
+        .filter(|components| components.len() == 16)
+        .ok_or_else(|| io::Error::other(format!("world matrix for `{node}` is malformed")))?;
+    let mut matrix = [0.0; 16];
+    for (target, component) in matrix.iter_mut().zip(components) {
+        *target = component
+            .as_f64()
+            .ok_or_else(|| io::Error::other(format!("world matrix for `{node}` is nonnumeric")))?;
+    }
+    Ok(matrix)
+}
+
+#[test]
+fn native_multiaxis_euler_animation_matches_blender_and_xyz_mode() -> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping native Euler rotation parity: Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let project = root.join("project");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+    command.arg("init").arg(&project).arg("--json");
+    checked_output(command, "pot init native Euler rotation")?;
+    let operations = json!({
+        "schema_version": 1,
+        "base_revision": 0,
+        "operations": [
+            {"op":"action.create","id":"turn","name":"Turn"},
+            {"op":"action.update","target":{"id":"turn"},"set":{"fcurves":[
+                {"path":"transform.rotation_euler","index":0,"keyframes":[
+                    {"frame":1.0,"value":0.35,"interpolation":"linear"},
+                    {"frame":3.0,"value":0.65,"interpolation":"linear"}
+                ]},
+                {"path":"transform.rotation_euler","index":1,"keyframes":[
+                    {"frame":1.0,"value":-0.25,"interpolation":"linear"},
+                    {"frame":3.0,"value":-0.8,"interpolation":"linear"}
+                ]}
+            ]}},
+            {"op":"node.create","id":"euler_probe","name":"NativeEulerProbe","kind":"empty",
+                "transform":{"rotation_deg":[15.0,-20.0,35.0],"rotation_mode":"XYZ"}},
+            {"op":"node.update","target":{"id":"euler_probe"},"set":{"action":"turn"}},
+            {"op":"node.create","id":"euler_fallback","name":"NativeEulerFallback","kind":"empty",
+                "transform":{"rotation_deg":[15.0,-20.0,35.0],"rotation_mode":"quaternion"}},
+            {"op":"node.update","target":{"id":"euler_fallback"},"set":{"action":"turn"}}
+        ]
+    });
+    let operations_path = root.join("operations.json");
+    fs::write(&operations_path, serde_json::to_vec(&operations)?)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+    command
+        .arg("apply")
+        .arg(&project)
+        .arg("--file")
+        .arg(&operations_path)
+        .arg("--json");
+    checked_output(command, "pot apply native Euler rotation")?;
+
+    let blender_file = root.join("native_euler.blend");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+    command
+        .arg("export")
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&blender_file)
+        .args(["--blender"])
+        .arg(&blender)
+        .arg("--json");
+    checked_output(command, "pot export native Euler rotation")?;
+    let script = root.join("inspect_native_euler.py");
+    fs::write(
+        &script,
+        include_str!("fixtures/native_euler_rotation/inspect_export.py"),
+    )?;
+    let mut command = Command::new(&blender);
+    command
+        .args(["--background"])
+        .arg(&blender_file)
+        .arg("--python")
+        .arg(&script)
+        .arg("--")
+        .arg(root);
+    checked_output(command, "Blender native Euler rotation oracle")?;
+    let expected: Value = serde_json::from_slice(&fs::read(root.join("blender_expected.json"))?)?;
+    for frame in [1, 3] {
+        let actual = inspected_world_matrix(&project, "euler_probe", frame)?;
+        assert_matrix_matches_blender(
+            &actual,
+            &expected["frames"][frame.to_string()],
+            &format!("NativeEulerProbe at frame {frame}"),
+        )?;
+
+        let fallback = inspected_world_matrix(&project, "euler_fallback", frame)?;
+        let max_error = actual
+            .iter()
+            .zip(fallback)
+            .map(|(actual, fallback)| (actual - fallback).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_error <= 1.0e-5,
+            "native Euler fallback differs from explicit XYZ at frame {frame}: max matrix error {max_error}"
+        );
+    }
+    Ok(())
+}
