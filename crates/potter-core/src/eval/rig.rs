@@ -2042,27 +2042,6 @@ fn solve_legacy_ik(
             ik_stretch: f64::from(pose_settings.ik_stretch as f32),
         });
     }
-    if ((use_location && position_weight > 0.0) || (use_rotation && orientation_weight > 0.0))
-        && let Some((bone_id, _)) = chain.iter().zip(&segments).find(|(_, segment)| {
-            !segment.locked[0]
-                && segment.locked[1]
-                && !segment.locked[2]
-                && segment.use_limits[0]
-                && segment.use_limits[2]
-                && segment.limits_min[0] <= segment.limits_max[0]
-                && segment.limits_min[2] <= segment.limits_max[2]
-        })
-    {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "IK X/Z Swing ellipse limits are unsupported",
-            json!({
-                "feature_id":"constraint.ik.swing_ellipse_limit",
-                "status":"not_supported",
-                "bone_id":bone_id,
-            }),
-        ));
-    }
     let target_basis = normalized_ik_basis(target_matrix);
     let solver_goal = LegacyGoal {
         position: DVec3::new(

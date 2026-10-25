@@ -794,6 +794,8 @@ root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 fixture = json.load(open(os.path.join(root, "ik_chain.json"), encoding="utf-8"))
 chain_count = fixture["chain_count"]
 swing_ellipse_limit = fixture["swing_ellipse_limit"]
+swing_case = fixture["swing_case"]
+iterations = fixture["iterations"]
 scene = bpy.context.scene
 scene.frame_start = 1
 scene.frame_end = 3
@@ -831,23 +833,32 @@ pole = bpy.data.objects.new(prefix + "Pole", None)
 scene.collection.objects.link(target)
 scene.collection.objects.link(pole)
 pole.location = (0.2,0.4,1.5)
-for frame, location in (
-    (1,(0.25,1.4,0.45)),
-    (2,(0.55,1.8,0.7)),
-    (3,(0.1,1.6,0.35)),
-):
+if swing_case == "hit":
+    root_point = points[0]
+    target_locations = [(root_point[0]+0.12,root_point[1]+0.08,root_point[2]+0.12),
+                        (root_point[0]+0.16,root_point[1]+0.05,root_point[2]+0.14),
+                        (root_point[0]+0.121,root_point[1]+0.081,root_point[2]+0.121)]
+elif swing_case == "not_hit":
+    endpoint = points[-1]
+    target_locations = [(endpoint[0]+0.01,endpoint[1]+0.02,endpoint[2]+0.01),
+                        (endpoint[0]+0.02,endpoint[1]+0.01,endpoint[2]+0.02),
+                        (endpoint[0]+0.01,endpoint[1]+0.03,endpoint[2]+0.01)]
+else:
+    target_locations = [(0.25,1.4,0.45),(0.55,1.8,0.7),(0.1,1.6,0.35)]
+for frame, location in zip((1,2,3), target_locations):
     target.location = location
     target.keyframe_insert(data_path="location", frame=frame)
-
 for index, name in enumerate(bone_names):
     pose_bone = rig.pose.bones[name]
     if chain_count == 2:
         pose_bone.lock_ik_x = index == 0
         pose_bone.lock_ik_y = index == 1
         pose_bone.lock_ik_z = False
-        pose_bone.use_ik_limit_x = index != chain_count - 1 or swing_ellipse_limit
+        pose_bone.use_ik_limit_x = (
+            index == chain_count - 1 if swing_ellipse_limit else index != chain_count - 1)
         pose_bone.use_ik_limit_y = True
-        pose_bone.use_ik_limit_z = index != chain_count - 1 or swing_ellipse_limit
+        pose_bone.use_ik_limit_z = (
+            index == chain_count - 1 if swing_ellipse_limit else index != chain_count - 1)
         pose_bone.ik_min_x = -0.7 + 0.04 * index
         pose_bone.ik_max_x = 0.8 - 0.03 * index
         pose_bone.ik_min_y = -0.6 + 0.02 * index
@@ -862,9 +873,11 @@ for index, name in enumerate(bone_names):
         pose_bone.lock_ik_x = index == 0
         pose_bone.lock_ik_y = index == 2
         pose_bone.lock_ik_z = index == 1
-        pose_bone.use_ik_limit_x = index != chain_count - 1 or swing_ellipse_limit
+        pose_bone.use_ik_limit_x = (
+            index == chain_count - 1 if swing_ellipse_limit else index != chain_count - 1)
         pose_bone.use_ik_limit_y = True
-        pose_bone.use_ik_limit_z = index != chain_count - 1 or swing_ellipse_limit
+        pose_bone.use_ik_limit_z = (
+            index == chain_count - 1 if swing_ellipse_limit else index != chain_count - 1)
         pose_bone.ik_min_x = -0.7 + 0.04 * index
         pose_bone.ik_max_x = 0.8 - 0.03 * index
         pose_bone.ik_min_y = -0.6 + 0.02 * index
@@ -875,6 +888,13 @@ for index, name in enumerate(bone_names):
         pose_bone.ik_stiffness_y = 0.2 + 0.04 * index
         pose_bone.ik_stiffness_z = 0.3 + 0.03 * index
         pose_bone.ik_stretch = 0.15 + 0.12 * index
+    if swing_ellipse_limit and index == chain_count - 1:
+        if swing_case == "hit":
+            pose_bone.ik_min_x, pose_bone.ik_max_x = -0.08, 0.14
+            pose_bone.ik_min_z, pose_bone.ik_max_z = -0.11, 0.05
+        else:
+            pose_bone.ik_min_x, pose_bone.ik_max_x = -2.7, 2.9
+            pose_bone.ik_min_z, pose_bone.ik_max_z = -2.3, 2.8
 constraint = rig.pose.bones[bone_names[-1]].constraints.new("IK")
 constraint.name = prefix + "Constraint"
 constraint.influence = 0.65 if chain_count == 2 else 1.0
@@ -882,6 +902,7 @@ constraint.target = target
 constraint.pole_target = pole
 constraint.chain_count = chain_count
 constraint.pole_angle = 0.31
+constraint.iterations = iterations
 constraint.use_stretch = True
 constraint.use_location = True
 constraint.use_rotation = True
@@ -938,6 +959,7 @@ def collect(output_path):
         "target": constraint.target.name,
         "pole_target": constraint.pole_target.name if constraint.pole_target else None,
         "chain_count": int(constraint.chain_count),
+        "iterations": int(constraint.iterations),
         "pole_angle": float(constraint.pole_angle),
         "influence": float(constraint.influence),
         "use_stretch": bool(constraint.use_stretch),
@@ -1003,6 +1025,7 @@ result["constraint"] = {
     "target": constraint.target.name,
     "pole_target": constraint.pole_target.name if constraint.pole_target else None,
     "chain_count": int(constraint.chain_count),
+    "iterations": int(constraint.iterations),
     "pole_angle": float(constraint.pole_angle),
     "influence": float(constraint.influence),
     "use_stretch": bool(constraint.use_stretch),
@@ -2482,7 +2505,7 @@ fn assert_open_boundary_edge(summary: &Value, context: &str) -> TestResult {
     Ok(())
 }
 
-fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestResult {
+fn round_trip_ik_chain(chain_count: usize, swing_case: Option<&str>) -> TestResult {
     let _guard = BLENDER_CONSTRAINT_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2498,7 +2521,12 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
         root.join("ik_chain.json"),
         serde_json::to_vec(&json!({
             "chain_count": chain_count,
-            "swing_ellipse_limit": swing_ellipse_limit,
+            "swing_ellipse_limit": swing_case.is_some(),
+            "swing_case": swing_case,
+            "iterations": match swing_case {
+                Some("not_hit") => 17,
+                _ => 500,
+            },
         }))?,
     )?;
     run_blender_script(
@@ -2557,7 +2585,9 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
         );
         assert_eq!(
             settings["use_ik_limit"],
-            if !swing_ellipse_limit && name == bone_names.last().unwrap() {
+            if (swing_case.is_some() && name != bone_names.last().unwrap())
+                || (swing_case.is_none() && name == bone_names.last().unwrap())
+            {
                 json!([false, true, false])
             } else {
                 json!([true, true, true])
@@ -2645,6 +2675,43 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
         bone_ids.push(bone_id.clone());
     }
     let tip_id = bone_ids.last().ok_or("IK chain has no terminal bone")?;
+    if let Some(swing_case) = swing_case {
+        let inspected = pot_json(&[
+            "inspect",
+            project.to_str().unwrap(),
+            "--id",
+            rig_id.as_str(),
+            "--frame",
+            "1",
+        ])?;
+        let inspected_items = inspected["result"]["items"]
+            .as_array()
+            .ok_or("pot inspect omitted its items")?;
+        let inspected_bones = inspected_items
+            .first()
+            .and_then(|item| item["evaluated_bones"].as_object())
+            .ok_or("pot inspect omitted evaluated IK bone matrices")?;
+        let mut maximum_cli_error = 0.0_f64;
+        for (name, bone_id) in bone_names.iter().zip(&bone_ids) {
+            let actual = inspected_bones
+                .get(bone_id.as_str())
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("pot inspect omitted evaluated matrix for {name}"))?;
+            let expected = before["frames"]["1"][name.as_str()]
+                .as_array()
+                .ok_or_else(|| format!("Blender frame-one matrix for {name} is missing"))?;
+            let error = matrix_max_error(actual, expected)?;
+            maximum_cli_error = maximum_cli_error.max(error);
+            assert_blender_matrices(
+                actual,
+                expected,
+                &format!("pot inspect {prefix} {name} at frame 1"),
+            );
+        }
+        println!(
+            "pot inspect IK {chain_count}-bone swing {swing_case}: max bone-matrix error={maximum_cli_error:.3e}"
+        );
+    }
     let constraint = rig
         .constraints
         .iter()
@@ -2678,6 +2745,7 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
         "use_rotation",
         "weight",
         "orient_weight",
+        "iterations",
     ] {
         assert_eq!(
             constraint.params.get(key),
@@ -2691,33 +2759,6 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
             Some(&before["constraint"][key]),
             "{prefix} imported IK {key}"
         );
-    }
-    if swing_ellipse_limit {
-        let error = Snapshot::evaluate_with_cache(
-            &doc,
-            &EvaluationContext {
-                frame: Some(1.0),
-                ..EvaluationContext::default()
-            },
-            Some(&project),
-            Some(&project.join(".potter/cache")),
-        )
-        .err()
-        .ok_or("IK X/Z Swing ellipse limits unexpectedly evaluated")?;
-        assert_eq!(
-            error.code,
-            potter_core::error::ErrorCode::UnsupportedFeature
-        );
-        assert_eq!(
-            error.details["feature_id"],
-            json!("constraint.ik.swing_ellipse_limit")
-        );
-        assert_eq!(error.details["status"], json!("not_supported"));
-        assert_eq!(
-            error.details["bone_id"],
-            json!(bone_ids.last().unwrap().as_str())
-        );
-        return Ok(());
     }
 
     let mut rest_doc = doc.clone();
@@ -2808,6 +2849,73 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
             }
         }
     }
+    if let Some(swing_case) = swing_case {
+        let mut unconstrained_doc = doc.clone();
+        let unconstrained_rig = unconstrained_doc
+            .nodes
+            .get_mut(rig_id)
+            .ok_or("imported armature disappeared from unconstrained scene")?;
+        for bone_id in &bone_ids {
+            let pose = unconstrained_rig
+                .pose
+                .get_mut(bone_id)
+                .ok_or("imported IK pose-bone settings disappeared from unconstrained scene")?;
+            pose.use_ik_limit[0] = false;
+            pose.use_ik_limit[2] = false;
+        }
+        let mut maximum_swing_effect = 0.0_f64;
+        for frame in FRAMES {
+            let constrained = Snapshot::evaluate_with_cache(
+                &doc,
+                &EvaluationContext {
+                    frame: Some(f64::from(frame)),
+                    ..EvaluationContext::default()
+                },
+                Some(&project),
+                Some(&project.join(".potter/cache")),
+            )?;
+            let unconstrained = Snapshot::evaluate_with_cache(
+                &unconstrained_doc,
+                &EvaluationContext {
+                    frame: Some(f64::from(frame)),
+                    ..EvaluationContext::default()
+                },
+                Some(&project),
+                Some(&project.join(".potter/cache")),
+            )?;
+            for (name, bone_id) in bone_names.iter().zip(&bone_ids) {
+                let constrained = constrained
+                    .bone_matrices
+                    .get(rig_id)
+                    .and_then(|bones| bones.get(bone_id))
+                    .ok_or_else(|| format!("Potter constrained matrix omitted {name}"))?;
+                let unconstrained = unconstrained
+                    .bone_matrices
+                    .get(rig_id)
+                    .and_then(|bones| bones.get(bone_id))
+                    .ok_or_else(|| format!("Potter unconstrained matrix omitted {name}"))?;
+                let constrained: Vec<_> = constrained.iter().map(|value| json!(value)).collect();
+                let unconstrained: Vec<_> =
+                    unconstrained.iter().map(|value| json!(value)).collect();
+                maximum_swing_effect =
+                    maximum_swing_effect.max(matrix_max_error(&constrained, &unconstrained)?);
+            }
+        }
+        if swing_case == "hit" {
+            assert!(
+                maximum_swing_effect > 1.0e-5,
+                "{prefix} swing ellipse limits should change the solved pose"
+            );
+        } else {
+            assert!(
+                maximum_swing_effect <= 1.0e-5,
+                "{prefix} wide swing ellipse limits should not change the solved pose"
+            );
+        }
+        println!(
+            "Blender IK chain {chain_count}-bone swing {swing_case}: no-limit max pose delta={maximum_swing_effect:.3e}"
+        );
+    }
     println!(
         "Blender IK chain {chain_count}-bone parity: import=ok eval_max_error={maximum_error:.3e}"
     );
@@ -2878,18 +2986,18 @@ fn round_trip_ik_chain(chain_count: usize, swing_ellipse_limit: bool) -> TestRes
 
 #[test]
 fn blender_ik_chain_2_pose_settings_roundtrip() -> TestResult {
-    round_trip_ik_chain(2, false)
+    round_trip_ik_chain(2, None)
 }
 
 #[test]
 fn blender_ik_chain_3_pose_settings_roundtrip() -> TestResult {
-    round_trip_ik_chain(3, false)
+    round_trip_ik_chain(3, None)
 }
 
 #[test]
-fn blender_ik_chain_swing_ellipse_limits_are_gated() -> TestResult {
-    round_trip_ik_chain(2, true)?;
-    round_trip_ik_chain(3, true)
+fn blender_ik_chain_swing_ellipse_limits_match_pose_matrices() -> TestResult {
+    round_trip_ik_chain(2, Some("hit"))?;
+    round_trip_ik_chain(3, Some("not_hit"))
 }
 
 #[test]
