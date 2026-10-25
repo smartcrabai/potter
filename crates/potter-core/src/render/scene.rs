@@ -1,7 +1,7 @@
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use glam::{DMat3, DMat4, DVec3};
@@ -37,14 +37,14 @@ use super::{
         area_visibility_samples, emitter_radiance, local_light_influence, point_intensity,
         spot_cone, sun_disc_radius,
     },
-    path::{hit_params, object_for_index},
+    path::{TraceGeometry, hit_params, object_for_index},
     principled_bsdf::{
         Layers, layers as principled_layers, reflected_lobes_coefficient,
         thin_subsurface_transmission_weight, without_subsurface,
     },
     raster::{
-        AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, Triangle, ViewBasis,
-        ambient_visibility, blend_color, blend_corner_normals, blend_uv,
+        AlphaMode, Line, Mode, SurfaceHit, SurfaceSample, SurfaceShader, SurfaceShaderWorker,
+        Triangle, ViewBasis, ambient_visibility, blend_color, blend_corner_normals, blend_uv,
     },
     studio,
     wireframe::{PointSphere, WireEdge, WireEdgeBuilder, WirePoint},
@@ -248,7 +248,7 @@ fn transparent_shadow_pass(closures: &[ShaderClosure]) -> f64 {
 /// [`ShadowOccluders::finish`], because the light loops that ask for a pass return no `Result`.
 struct ShadowOccluders<'a> {
     doc: &'a SceneDoc,
-    geometry: &'a Geometry,
+    geometry: &'a TraceGeometry<'a>,
     images: &'a BTreeMap<String, ImageData>,
     workspace: &'a RefCell<EvaluatorWorkspace>,
     error: RefCell<Option<PotError>>,
@@ -257,7 +257,7 @@ struct ShadowOccluders<'a> {
 impl<'a> ShadowOccluders<'a> {
     fn new(
         doc: &'a SceneDoc,
-        geometry: &'a Geometry,
+        geometry: &'a TraceGeometry<'a>,
         images: &'a BTreeMap<String, ImageData>,
         workspace: &'a RefCell<EvaluatorWorkspace>,
     ) -> Self {
@@ -2121,16 +2121,25 @@ fn shading_params(material: Option<&Material>, base: [f64; 4], normal: DVec3) ->
 /// Beauty, which lights it in world space with the hit's own normal: the geometric normal on flat faces, so their
 /// shadows are decided per pixel as EEVEE decides them.
 pub(super) struct SceneShader<'a> {
+    core: SceneShaderCore<'a>,
+    warnings: &'a RefCell<Vec<serde_json::Value>>,
+}
+
+struct SceneShaderWorker<'a> {
+    core: SceneShaderCore<'a>,
+}
+
+struct SceneShaderCore<'a> {
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
     images: &'a BTreeMap<String, ImageData>,
-    geometry: &'a Geometry,
+    geometry: super::path::SharedGeometry<'a>,
     mode: Mode,
     /// The camera's view space, in which Solid's studio lights are fixed.
     view: ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
-    /// The render's world probe, built by the first Beauty shade that needs it (`world_probe`).
-    world_probe: OnceCell<Option<WorldProbe>>,
+    /// Lazily populated once per render and shared by the serial pass and all band workers.
+    world_probe: Arc<OnceLock<Result<Option<Arc<WorldProbe>>>>>,
 }
 
 /// The per-pixel shader for `mode`, or `None` when the raster outputs unlit or per-triangle colour.
@@ -2149,19 +2158,98 @@ pub(super) fn surface_shader<'a>(
         _ => return None,
     }
     Some(Box::new(SceneShader {
-        doc,
-        snapshot,
-        images,
-        geometry,
-        mode,
-        view,
-        evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
-        world_probe: OnceCell::new(),
+        core: SceneShaderCore {
+            doc,
+            snapshot,
+            images,
+            geometry: super::path::SharedGeometry::of(geometry),
+            mode,
+            view,
+            evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
+            world_probe: Arc::new(OnceLock::new()),
+        },
+        warnings: &geometry.shader_warnings,
     }))
 }
 
 impl SurfaceShader for SceneShader<'_> {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
+        self.core.shade(self.warnings, triangle, hit)
+    }
+
+    fn worker(&self) -> Result<Option<Box<dyn SurfaceShaderWorker + Send + '_>>> {
+        Ok(Some(Box::new(SceneShaderWorker {
+            core: self.core.worker(),
+        })))
+    }
+
+    fn merge_worker_warnings(&self, warnings: Vec<serde_json::Value>) {
+        super::path::merge_shader_warnings(self.warnings, warnings);
+    }
+}
+
+/// The transparent tint the Beauty composite applies to a surface. EEVEE keeps a Transparent closure's colour per channel
+/// only for a BLENDED material (`ForwardPipeline::use_colored_transparency`, `GPU_MATFLAG_TRANSPARENT_MAYBE_COLORED`).
+/// A DITHERED material stores one alpha, `1 - average(transmittance)` (`eevee_surf_deferred.bsl.hh`, `out_color.a`), so
+/// its tint is the channel mean. `alpha_mode` `blend` is BLENDED; `opaque` and `clip` are DITHERED
+/// (`blend_bridge.py`, `surface_render_method`).
+fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
+    // A transmittance is a fraction of the light: EEVEE clamps the Color at zero and saturates the result
+    // (`gpu_shader_material_transparent.glsl`, `eevee_surf_deferred.bsl.hh`), so a tint above one or below zero is cut to
+    // [0, 1] before it can amplify or invert the background.
+    let tint = tint.map(|channel| channel.clamp(0.0, 1.0));
+    match material {
+        Some(material) if material.alpha_mode != "blend" => {
+            let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
+            [mean; 3]
+        }
+        _ => tint,
+    }
+}
+
+impl SceneShaderCore<'_> {
+    fn worker(&self) -> Self {
+        Self {
+            doc: self.doc,
+            snapshot: self.snapshot,
+            images: self.images,
+            geometry: self.geometry,
+            mode: self.mode,
+            view: self.view,
+            evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
+            world_probe: Arc::clone(&self.world_probe),
+        }
+    }
+
+    /// The render's world probe holds radiance at every texel of a cube map. The first shade that needs it builds it
+    /// lazily, then all band workers share it because the world cannot change during a render
+    /// (`LightProbeModule::sync_world`, `eevee_lightprobe.cc`). `None` means the scene has no world.
+    fn world_probe(&self) -> Result<Option<&WorldProbe>> {
+        let cached = self.world_probe.get_or_init(|| {
+            let world = self
+                .doc
+                .scenes
+                .get(&self.snapshot.scene_id)
+                .and_then(|scene| scene.world.as_ref())
+                .and_then(|id| self.doc.worlds.get(id));
+            world
+                .map(|world| {
+                    WorldProbe::build(world, &self.doc.node_groups, self.images).map(Arc::new)
+                })
+                .transpose()
+        });
+        match cached {
+            Ok(probe) => Ok(probe.as_deref()),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    fn shade(
+        &self,
+        warnings: &RefCell<Vec<serde_json::Value>>,
+        triangle: &Triangle,
+        hit: &SurfaceHit,
+    ) -> Result<SurfaceSample> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
         if matches!(self.mode, Mode::Beauty)
@@ -2176,7 +2264,9 @@ impl SurfaceShader for SceneShader<'_> {
         let graph_shading = if triangle.lit_per_pixel {
             material
                 .zip(prepared)
-                .map(|(material, prepared)| self.graph_shading(triangle, material, prepared, hit))
+                .map(|(material, prepared)| {
+                    self.graph_shading(warnings, triangle, material, prepared, hit)
+                })
                 .transpose()?
         } else {
             None
@@ -2208,9 +2298,9 @@ impl SurfaceShader for SceneShader<'_> {
                 "feature_id": "shader.principled.thin_wall",
                 "message": "Realtime EEVEE Thin Wall subsurface lighting is approximate; Blender 5.2.2's diffuse/translucent closure and thickness-dependent direct/probe behavior are not fully matched",
             });
-            let mut warnings = self.geometry.shader_warnings.borrow_mut();
-            if !warnings.contains(&warning) {
-                warnings.push(warning);
+            let mut recorded = warnings.borrow_mut();
+            if !recorded.contains(&warning) {
+                recorded.push(warning);
             }
         }
         if matches!(self.mode, Mode::Solid) {
@@ -2221,9 +2311,9 @@ impl SurfaceShader for SceneShader<'_> {
             } else {
                 hit.normal
             };
-            // Workbench shades a material with its viewport display values when it has them; Potter-native
-            // materials have none and keep their own (`workbench_engine.cc` `get_material`).
             let viewport = material.and_then(|material| material.viewport_display.as_ref());
+            // Workbench shades a material with its viewport display values when present; Potter-native
+            // materials have none and keep their own (`workbench_engine.cc` `get_material`).
             let dominant =
                 heaviest(closures, |closure| closure.weight).map(|closure| &closure.params);
             let (albedo, roughness, metallic) = match viewport {
@@ -2240,8 +2330,8 @@ impl SurfaceShader for SceneShader<'_> {
                     (base_albedo(params), params.roughness, params.metallic)
                 }),
             };
-            // Workbench's transparency reads the viewport alpha (`workbench_private.hh`, `Material::is_transparent`),
-            // not the node tree's; a Potter-native material has no viewport values and keeps its opaque share.
+            // Workbench transparency reads viewport alpha (`workbench_private.hh`, `Material::is_transparent`), not the
+            // node tree's; a Potter-native material without viewport values keeps its opaque share.
             let alpha =
                 viewport.map_or(opaque_share(closures), |viewport| viewport.diffuse_color[3]);
             let lit = studio::shade(
@@ -2253,21 +2343,22 @@ impl SurfaceShader for SceneShader<'_> {
             );
             return Ok(SurfaceSample::opaque([lit.x, lit.y, lit.z, alpha]));
         }
+        let trace_geometry = TraceGeometry::with_warnings(self.geometry, warnings);
         let occluders = ShadowOccluders::new(
             self.doc,
-            self.geometry,
+            &trace_geometry,
             self.images,
             &self.evaluator_workspace,
         );
-        let shadow = self.geometry.shadows.as_ref().map(|shadows| ShadowScene {
+        let shadow = self.geometry.shadows.map(|shadows| ShadowScene {
             bvh: &shadows.bvh,
-            triangles: self.geometry.triangles.as_slice(),
-            prepared_materials: &self.geometry.prepared,
+            triangles: self.geometry.triangles,
+            prepared_materials: self.geometry.prepared,
             has_volume_only: shadows.has_volume_only,
             point_maps: &shadows.point_maps,
             occluders: shadows.transparent_casters.then_some(&occluders),
         });
-        let thickness = object_for_index(&self.geometry.objects, triangle.object_index)
+        let thickness = object_for_index(self.geometry.objects, triangle.object_index)
             .map_or(0.0, |object| object.thickness);
         let color = shade(
             self.doc,
@@ -2290,58 +2381,18 @@ impl SurfaceShader for SceneShader<'_> {
             transparent_tint: beauty_tint(material, surface_tint(closures)),
         })
     }
-}
-
-/// The transparent tint the Beauty composite applies to a surface. EEVEE keeps a Transparent closure's colour per channel
-/// only for a BLENDED material (`ForwardPipeline::use_colored_transparency`, `GPU_MATFLAG_TRANSPARENT_MAYBE_COLORED`).
-/// A DITHERED material stores one alpha, `1 - average(transmittance)` (`eevee_surf_deferred.bsl.hh`, `out_color.a`), so
-/// its tint is the channel mean. `alpha_mode` `blend` is BLENDED; `opaque` and `clip` are DITHERED
-/// (`blend_bridge.py`, `surface_render_method`).
-fn beauty_tint(material: Option<&Material>, tint: [f64; 3]) -> [f64; 3] {
-    // A transmittance is a fraction of the light: EEVEE clamps the Color at zero and saturates the result
-    // (`gpu_shader_material_transparent.glsl`, `eevee_surf_deferred.bsl.hh`), so a tint above one or below zero is cut to
-    // [0, 1] before it can amplify or invert the background.
-    let tint = tint.map(|channel| channel.clamp(0.0, 1.0));
-    match material {
-        Some(material) if material.alpha_mode != "blend" => {
-            let mean = (tint[0] + tint[1] + tint[2]) / 3.0;
-            [mean; 3]
-        }
-        _ => tint,
-    }
-}
-
-impl SceneShader<'_> {
-    /// The render's world probe: the world's radiance at every texel of a cube map. It is built once, by the first
-    /// shade that reads it, because the world does not change within a render (`LightProbeModule::sync_world`,
-    /// `eevee_lightprobe.cc`). `None` when the scene has no world.
-    fn world_probe(&self) -> Result<Option<&WorldProbe>> {
-        if self.world_probe.get().is_none() {
-            let world = self
-                .doc
-                .scenes
-                .get(&self.snapshot.scene_id)
-                .and_then(|scene| scene.world.as_ref())
-                .and_then(|id| self.doc.worlds.get(id));
-            let probe = world
-                .map(|world| WorldProbe::build(world, &self.doc.node_groups, self.images))
-                .transpose()?;
-            // The cell is empty here, so `set` cannot fail.
-            let _ = self.world_probe.set(probe);
-        }
-        Ok(self.world_probe.get().and_then(Option::as_ref))
-    }
 
     /// The material graph evaluated at `hit`, so vertex colors and textures shade the surface.
     fn graph_shading(
         &self,
+        warnings: &RefCell<Vec<serde_json::Value>>,
         triangle: &Triangle,
         material: &Material,
         prepared: &PreparedMaterial,
         hit: &SurfaceHit,
     ) -> Result<SurfaceShading> {
         let object =
-            object_for_index(&self.geometry.objects, triangle.object_index).ok_or_else(|| {
+            object_for_index(self.geometry.objects, triangle.object_index).ok_or_else(|| {
                 PotError::new(
                     ErrorCode::EvaluationFailed,
                     "triangle references an unmapped object",
@@ -2364,7 +2415,7 @@ impl SceneShader<'_> {
         let context = layered_context(
             self.doc,
             self.images,
-            &self.geometry.shader_warnings,
+            warnings,
             object,
             triangle,
             HitPose {
@@ -2380,6 +2431,17 @@ impl SceneShader<'_> {
         )?;
         let mut workspace = self.evaluator_workspace.borrow_mut();
         evaluate_surface_with_workspace(material, prepared, &context, &mut workspace)
+    }
+}
+
+impl SurfaceShaderWorker for SceneShaderWorker<'_> {
+    fn shade(
+        &self,
+        triangle: &Triangle,
+        hit: &SurfaceHit,
+        warnings: &RefCell<Vec<serde_json::Value>>,
+    ) -> Result<SurfaceSample> {
+        self.core.shade(warnings, triangle, hit)
     }
 }
 /// EEVEE's default refraction thickness of an object: the smallest dimension of its bounds, in world units. EEVEE takes

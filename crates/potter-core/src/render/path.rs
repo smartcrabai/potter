@@ -1024,26 +1024,28 @@ impl WorldImportanceSampler {
 }
 
 /// Stack size of a render worker, so recursive shader evaluation has the headroom of the main thread.
-const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// The read-only geometry a path trace reads. It has no interior mutability, so every worker shares it.
 #[derive(Clone, Copy)]
-struct SharedGeometry<'a> {
-    triangles: &'a [Triangle],
-    materials: &'a [Material],
-    prepared: &'a [PreparedMaterial],
-    objects: &'a [ObjectRecord],
-    elements: &'a [ElementRecord],
+pub(super) struct SharedGeometry<'a> {
+    pub(super) triangles: &'a [Triangle],
+    pub(super) materials: &'a [Material],
+    pub(super) prepared: &'a [PreparedMaterial],
+    pub(super) objects: &'a [ObjectRecord],
+    pub(super) elements: &'a [ElementRecord],
+    pub(super) shadows: Option<&'a super::scene::RealtimeShadows>,
 }
 
 impl<'a> SharedGeometry<'a> {
-    fn of(geometry: &'a Geometry) -> Self {
+    pub(super) fn of(geometry: &'a Geometry) -> Self {
         Self {
             triangles: geometry.triangles.as_slice(),
             materials: geometry.materials.as_slice(),
             prepared: geometry.prepared.as_slice(),
             objects: geometry.objects.as_slice(),
             elements: geometry.elements.as_slice(),
+            shadows: geometry.shadows.as_ref(),
         }
     }
 }
@@ -1051,17 +1053,21 @@ impl<'a> SharedGeometry<'a> {
 /// A trace's view of the geometry: the shared part, and the sink its shading warnings are recorded in. Each worker
 /// records into its own sink, and the sinks are merged in pixel order once the workers finish.
 #[derive(Clone, Copy)]
-struct TraceGeometry<'a> {
-    shared: SharedGeometry<'a>,
+pub(super) struct TraceGeometry<'a> {
+    pub(super) shared: SharedGeometry<'a>,
     warnings: &'a RefCell<Vec<serde_json::Value>>,
 }
 
 impl<'a> TraceGeometry<'a> {
     fn of(geometry: &'a Geometry) -> Self {
-        Self {
-            shared: SharedGeometry::of(geometry),
-            warnings: &geometry.shader_warnings,
-        }
+        Self::with_warnings(SharedGeometry::of(geometry), &geometry.shader_warnings)
+    }
+
+    pub(super) fn with_warnings(
+        shared: SharedGeometry<'a>,
+        warnings: &'a RefCell<Vec<serde_json::Value>>,
+    ) -> Self {
+        Self { shared, warnings }
     }
 }
 
@@ -1289,7 +1295,7 @@ fn render_rows(
 
 /// The contiguous row bands that split `height` rows across at most `band_count` workers, in row order. Each band has
 /// `ceil(height / band_count)` rows except the last, and no band is empty.
-fn band_rows(height: usize, band_count: usize) -> Vec<Range<usize>> {
+pub(super) fn band_rows(height: usize, band_count: usize) -> Vec<Range<usize>> {
     let rows_per_band = height.div_ceil(band_count.max(1)).max(1);
     (0..height)
         .step_by(rows_per_band)
@@ -1297,10 +1303,14 @@ fn band_rows(height: usize, band_count: usize) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// Appends one worker's shader warnings to `sink`, dropping duplicates already recorded by the serial render. Warnings
-/// with a material and input are unique per pair; other warnings are unique by value. Workers record into their own
-/// sinks, so duplicates across workers are caught in pixel order.
-fn merge_shader_warnings(sink: &RefCell<Vec<serde_json::Value>>, warnings: Vec<serde_json::Value>) {
+/// Appends one worker's shading warnings to `sink`, dropping those the serial render would not have recorded. A
+/// Principled input is recorded once per (material, input) (`record_unevaluated_inputs`); the layer warnings once per
+/// equal warning (`layer_index`, `color_layer_missing`). Workers record into their own sinks, so a duplicate across
+/// workers is caught here, against the workers that came before in pixel order.
+pub(super) fn merge_shader_warnings(
+    sink: &RefCell<Vec<serde_json::Value>>,
+    warnings: Vec<serde_json::Value>,
+) {
     let mut recorded = sink.borrow_mut();
     for warning in warnings {
         let duplicate = match warning["input"].as_str() {
@@ -2520,7 +2530,7 @@ fn geometry_has_volume_material(geometry: &Geometry) -> bool {
 }
 /// The view-depth extent of all camera-visible volume objects, matching EEVEE's object integration bounds.
 fn realtime_volume_depth_bounds(
-    geometry: &Geometry,
+    geometry: &SharedGeometry<'_>,
     volumes: &[VolumeInstance<'_>],
     camera: Camera,
 ) -> Option<(f64, f64)> {
@@ -2532,7 +2542,7 @@ fn realtime_volume_depth_bounds(
         depth_max = depth_max.max(depth);
     };
 
-    for triangle in &geometry.triangles {
+    for triangle in geometry.triangles {
         if triangle.ray_mask & RayKind::Camera.bit() == 0 {
             continue;
         }
@@ -2747,8 +2757,15 @@ impl RealtimeVolumeResolveCache {
 
 pub(super) struct RealtimeVolumePass<'pass, 'scene> {
     transport: &'pass RealtimeVolumeTransport<'scene>,
-    geometry: &'pass Geometry,
+    geometry: TraceGeometry<'pass>,
     scratch: &'pass mut RealtimeVolumeScratch,
+    seed: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RealtimeVolumePassTemplate<'pass, 'scene> {
+    transport: &'pass RealtimeVolumeTransport<'scene>,
+    geometry: SharedGeometry<'pass>,
     seed: u32,
 }
 
@@ -2770,7 +2787,7 @@ pub(super) struct RealtimeVolumeSampleInfo<'a> {
 
 pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
     transport: &'sample RealtimeVolumeTransport<'scene>,
-    geometry: &'sample Geometry,
+    geometry: TraceGeometry<'sample>,
     scratch: &'sample mut RealtimeVolumeScratch,
     camera: Camera,
     frame: CameraFrame,
@@ -2804,10 +2821,22 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
         scratch.froxel_resolve = [None, None];
         Self {
             transport,
-            geometry,
+            geometry: TraceGeometry::of(geometry),
             scratch,
             seed,
         }
+    }
+
+    pub(super) fn worker_template(&self) -> RealtimeVolumePassTemplate<'pass, 'scene> {
+        RealtimeVolumePassTemplate {
+            transport: self.transport,
+            geometry: self.geometry.shared,
+            seed: self.seed,
+        }
+    }
+
+    pub(super) fn merge_worker_warnings(&self, warnings: Vec<serde_json::Value>) {
+        merge_shader_warnings(self.geometry.warnings, warnings);
     }
 
     pub(super) fn begin_sample<'sample>(
@@ -2867,6 +2896,24 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
             ambient: None,
             mesh_prepared: false,
         })
+    }
+}
+
+impl<'pass, 'scene> RealtimeVolumePassTemplate<'pass, 'scene> {
+    pub(super) fn new_pass<'scratch>(
+        &self,
+        scratch: &'scratch mut RealtimeVolumeScratch,
+        warnings: &'scratch RefCell<Vec<serde_json::Value>>,
+    ) -> RealtimeVolumePass<'scratch, 'scene>
+    where
+        'pass: 'scratch,
+    {
+        RealtimeVolumePass {
+            transport: self.transport,
+            geometry: TraceGeometry::with_warnings(self.geometry, warnings),
+            scratch,
+            seed: self.seed,
+        }
     }
 }
 
@@ -3025,8 +3072,11 @@ impl RealtimeVolumeSample<'_, '_> {
             self.camera.far
         };
         if !scene_has_world_volume(self.transport.doc, &self.transport.snapshot.scene_id)
-            && let Some((object_depth_min, object_depth_max)) =
-                realtime_volume_depth_bounds(self.geometry, &self.transport.volumes, self.camera)
+            && let Some((object_depth_min, object_depth_max)) = realtime_volume_depth_bounds(
+                &self.geometry.shared,
+                &self.transport.volumes,
+                self.camera,
+            )
         {
             depth_start = depth_start.max(object_depth_min);
             depth_end = depth_end.min(object_depth_max);
@@ -3115,7 +3165,7 @@ impl RealtimeVolumeSample<'_, '_> {
         if !self.transport.has_mesh_volumes || self.mesh_prepared {
             return Ok(());
         }
-        let trace_geometry = TraceGeometry::of(self.geometry);
+        let trace_geometry = self.geometry;
         let bvh = self.transport.bvh.ok_or_else(|| {
             PotError::new(
                 ErrorCode::InternalError,
@@ -3346,7 +3396,7 @@ impl RealtimeVolumeSample<'_, '_> {
         self.mesh_prepared = false;
         self.prepare_froxel_mesh_boundaries()?;
 
-        let trace_geometry = TraceGeometry::of(self.geometry);
+        let trace_geometry = self.geometry;
         self.scratch.froxel_boundaries.clear();
         if self.transport.has_mesh_volumes {
             for (distance, medium) in &self.scratch.froxel_mesh_boundary_hits {
@@ -3426,7 +3476,7 @@ impl RealtimeVolumeSample<'_, '_> {
             footprint: self.footprint,
         };
         if transport.has_mesh_volumes {
-            let trace_geometry = TraceGeometry::of(self.geometry);
+            let trace_geometry = self.geometry;
             let bvh = transport.bvh.ok_or_else(|| {
                 PotError::new(
                     ErrorCode::InternalError,
@@ -5785,7 +5835,7 @@ fn closest_hit(
 /// evaluation runs.
 pub(super) fn hit_params(
     doc: &SceneDoc,
-    geometry: &Geometry,
+    geometry: &TraceGeometry<'_>,
     hit: BvhHit,
     origin: DVec3,
     direction: DVec3,
@@ -5794,7 +5844,7 @@ pub(super) fn hit_params(
 ) -> Result<SurfaceShading> {
     with_hit_frame(
         doc,
-        &TraceGeometry::of(geometry),
+        geometry,
         hit,
         origin,
         direction,

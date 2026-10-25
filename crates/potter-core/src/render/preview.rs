@@ -418,6 +418,7 @@ pub(crate) fn render_camera_frame(
     } else {
         None
     };
+    // The raster derives band-local volume scratch from this pass's read-only transport context.
     let mut volume_scratch = super::path::RealtimeVolumeScratch::default();
     let mut volume_pass = realtime_volume_transport.as_ref().map(|transport| {
         super::path::RealtimeVolumePass::new(transport, &geometry, &mut volume_scratch, seed)

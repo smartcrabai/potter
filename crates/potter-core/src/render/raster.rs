@@ -365,6 +365,39 @@ impl SurfaceSample {
 /// Linear RGBA and the transparent tint at `hit` on `triangle`.
 pub(crate) trait SurfaceShader {
     fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample>;
+
+    fn worker(&self) -> Result<Option<Box<dyn SurfaceShaderWorker + Send + '_>>> {
+        Ok(None)
+    }
+
+    fn merge_worker_warnings(&self, _warnings: Vec<serde_json::Value>) {}
+}
+
+pub(crate) trait SurfaceShaderWorker: Send {
+    fn shade(
+        &self,
+        triangle: &Triangle,
+        hit: &SurfaceHit,
+        warnings: &std::cell::RefCell<Vec<serde_json::Value>>,
+    ) -> Result<SurfaceSample>;
+}
+
+#[derive(Clone, Copy)]
+enum RasterShader<'a> {
+    Main(&'a dyn SurfaceShader),
+    Worker(
+        &'a dyn SurfaceShaderWorker,
+        &'a std::cell::RefCell<Vec<serde_json::Value>>,
+    ),
+}
+
+impl RasterShader<'_> {
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
+        match self {
+            Self::Main(shader) => shader.shade(triangle, hit),
+            Self::Worker(shader, warnings) => shader.shade(triangle, hit, warnings),
+        }
+    }
 }
 
 /// The camera's view axes in world space, in Blender's view-space order: `right`, `up`, and
@@ -1327,7 +1360,7 @@ pub(crate) fn camera_eye(camera: &Camera, eye: f64) -> Camera {
 
 /// The scene world's radiance along a view ray. Realtime Beauty shows it where no surface covers a sample, as EEVEE
 /// shows its world, and modes without one show their constant background colour.
-pub(crate) type WorldRadiance<'a> = &'a dyn Fn(DVec3) -> Result<DVec3>;
+pub(crate) type WorldRadiance<'a> = &'a (dyn Fn(DVec3) -> Result<DVec3> + Send + Sync);
 
 /// The background a sample shows: the world's radiance along its ray when a world is given and the ray exists, else the
 /// constant background. The constant's alpha is the film's alpha either way.
@@ -1361,6 +1394,7 @@ struct RasterSamplesRequest<'scene, 'context, 'lights, 'volume, 'volume_scene, '
     prepared_materials: &'scene [crate::shader::PreparedMaterial],
     camera_lights: Option<super::path::RealtimeCameraLightView<'context, 'lights>>,
     view_index: usize,
+    band_count: usize,
     volume_pass: Option<&'borrow mut super::path::RealtimeVolumePass<'volume, 'volume_scene>>,
 }
 #[expect(
@@ -1399,6 +1433,7 @@ pub(super) fn rasterize_with_samples(
         prepared_materials,
         camera_lights: camera_lights.map(|lights| lights.view(0)),
         view_index: 0,
+        band_count: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         volume_pass,
     })
 }
@@ -1412,6 +1447,342 @@ struct RasterPixelSample {
     y: u32,
     sample_x: f64,
     sample_y: f64,
+}
+#[derive(Clone, Copy)]
+struct FilmSampleJitter {
+    index: u32,
+    x: f64,
+    y: f64,
+}
+
+struct FilmBandWorker<'a> {
+    candidates: Vec<usize>,
+    shader: Option<Box<dyn SurfaceShaderWorker + Send + 'a>>,
+    volume_scratch: super::path::RealtimeVolumeScratch,
+    warnings: std::cell::RefCell<Vec<serde_json::Value>>,
+    merged_warning_count: usize,
+}
+
+impl FilmBandWorker<'_> {
+    fn take_new_warnings(&mut self) -> Vec<serde_json::Value> {
+        let recorded = self.warnings.borrow();
+        let warnings = recorded[self.merged_warning_count..].to_vec();
+        self.merged_warning_count = recorded.len();
+        warnings
+    }
+}
+
+struct FilmCenterBandBuffers<'a> {
+    ids: &'a mut [u32],
+    depths: &'a mut [f32],
+    elements: &'a mut [u32],
+    normals: &'a mut [[f32; 3]],
+    albedo: &'a mut [[f32; 4]],
+    ambient_occlusion: &'a mut [f32],
+}
+
+struct FilmCenterRenderContext<'scene> {
+    triangles: &'scene [Triangle],
+    prepared: &'scene [PreparedTriangle],
+    visibility: &'scene super::bvh::Bvh,
+    ao_bvh: Option<&'scene super::bvh::Bvh>,
+    frame: &'scene CameraFrame,
+    camera: &'scene Camera,
+    width: u32,
+    height: u32,
+    width_usize: usize,
+    prepared_materials: &'scene [crate::shader::PreparedMaterial],
+    has_volume_only: bool,
+}
+
+impl FilmCenterRenderContext<'_> {
+    fn render_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        buffers: &mut FilmCenterBandBuffers<'_>,
+        candidates: &mut Vec<usize>,
+        shader: Option<RasterShader<'_>>,
+    ) -> Result<()> {
+        for row in rows.clone() {
+            let y = u32::try_from(row).map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "pixel row exceeds platform limits",
+                )
+            })?;
+            for x in 0..self.width {
+                let x_usize = usize::try_from(x).map_err(|_| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "pixel column exceeds platform limits",
+                    )
+                })?;
+                let pixel = (row - rows.start)
+                    .checked_mul(self.width_usize)
+                    .and_then(|index| index.checked_add(x_usize))
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "pixel index exceeds platform limits",
+                        )
+                    })?;
+                let center_ray = ray_for_pixel_in_frame(
+                    self.frame,
+                    self.camera.position,
+                    self.width,
+                    self.height,
+                    x,
+                    y,
+                )?;
+                let center_hit = match center_ray {
+                    Some(ray) => nearest_visible_hit(
+                        self.prepared,
+                        self.visibility,
+                        candidates,
+                        ray,
+                        self.frame,
+                        shader,
+                    )?,
+                    None => None,
+                };
+                if let Some(visible_hit) = center_hit {
+                    let triangle = &self.prepared[visible_hit.triangle_index];
+                    let hit = visible_hit.hit;
+                    buffers.ids[pixel] = triangle.source.object_index;
+                    buffers.depths[pixel] = depth_to_f32(hit.depth);
+                    buffers.elements[pixel] = triangle.source.element_index;
+                    buffers.normals[pixel] = shading_normal(triangle, hit)
+                        .to_array()
+                        .map(|value| value as f32);
+                    buffers.albedo[pixel] = linear_color_to_f32(triangle.source.color);
+                    if let (Some(bvh), Some(center_ray)) = (self.ao_bvh, center_ray) {
+                        let geometric = if triangle.normal.dot(hit.direction) > 0.0 {
+                            -triangle.normal
+                        } else {
+                            triangle.normal
+                        };
+                        let mut shading = shading_normal(triangle, hit);
+                        if shading.dot(geometric) < 0.0 {
+                            shading = -shading;
+                        }
+                        let point = center_ray.origin + center_ray.direction * hit.distance;
+                        let visibility = ambient_visibility(
+                            bvh,
+                            self.triangles,
+                            self.prepared_materials,
+                            point,
+                            geometric,
+                            shading,
+                            1.0,
+                            self.has_volume_only,
+                        );
+                        buffers.ambient_occlusion[pixel] =
+                            linear_color_to_f32([visibility, visibility, visibility, 1.0])[0];
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn make_film_band_workers(
+    count: usize,
+    shader: Option<&dyn SurfaceShader>,
+) -> Result<Vec<FilmBandWorker<'_>>> {
+    let mut workers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let worker_shader = if let Some(shader) = shader {
+            let Some(worker) = shader.worker()? else {
+                return Ok(Vec::new());
+            };
+            Some(worker)
+        } else {
+            None
+        };
+        workers.push(FilmBandWorker {
+            candidates: Vec::new(),
+            shader: worker_shader,
+            volume_scratch: super::path::RealtimeVolumeScratch::default(),
+            warnings: std::cell::RefCell::new(Vec::new()),
+            merged_warning_count: 0,
+        });
+    }
+    Ok(workers)
+}
+
+fn render_film_center_bands<'worker>(
+    context: &FilmCenterRenderContext<'_>,
+    bands: &[std::ops::Range<usize>],
+    workers: Vec<FilmBandWorker<'worker>>,
+    buffers: FilmCenterBandBuffers<'_>,
+) -> Result<Vec<FilmBandWorker<'worker>>> {
+    std::thread::scope(|scope| {
+        let mut ids_rest = buffers.ids;
+        let mut depths_rest = buffers.depths;
+        let mut elements_rest = buffers.elements;
+        let mut normals_rest = buffers.normals;
+        let mut albedo_rest = buffers.albedo;
+        let mut ambient_occlusion_rest = buffers.ambient_occlusion;
+        let mut handles = Vec::with_capacity(bands.len());
+        for (rows, mut worker) in bands.iter().cloned().zip(workers) {
+            let band_len = rows.len() * context.width_usize;
+            let (ids, ids_tail) = std::mem::take(&mut ids_rest).split_at_mut(band_len);
+            let (depths, depths_tail) = std::mem::take(&mut depths_rest).split_at_mut(band_len);
+            let (elements, elements_tail) =
+                std::mem::take(&mut elements_rest).split_at_mut(band_len);
+            let (normals, normals_tail) = std::mem::take(&mut normals_rest).split_at_mut(band_len);
+            let (albedo, albedo_tail) = std::mem::take(&mut albedo_rest).split_at_mut(band_len);
+            let (ambient_occlusion, ambient_occlusion_tail) =
+                std::mem::take(&mut ambient_occlusion_rest).split_at_mut(band_len);
+            ids_rest = ids_tail;
+            depths_rest = depths_tail;
+            elements_rest = elements_tail;
+            normals_rest = normals_tail;
+            albedo_rest = albedo_tail;
+            ambient_occlusion_rest = ambient_occlusion_tail;
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(super::path::WORKER_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        let shader = worker
+                            .shader
+                            .as_deref()
+                            .map(|shader| RasterShader::Worker(shader, &worker.warnings));
+                        let mut buffers = FilmCenterBandBuffers {
+                            ids,
+                            depths,
+                            elements,
+                            normals,
+                            albedo,
+                            ambient_occlusion,
+                        };
+                        let result =
+                            context.render_rows(rows, &mut buffers, &mut worker.candidates, shader);
+                        (result, worker)
+                    }),
+            );
+        }
+        let mut workers = Vec::with_capacity(handles.len());
+        let mut first_error = None;
+        for handle in handles {
+            match handle {
+                Ok(handle) => match handle.join() {
+                    Ok((Ok(()), worker)) => workers.push(worker),
+                    Ok((Err(error), worker)) => {
+                        workers.push(worker);
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(_) if first_error.is_none() => {
+                        first_error = Some(PotError::new(
+                            ErrorCode::InternalError,
+                            "render worker panicked",
+                        ));
+                    }
+                    Err(_) => {}
+                },
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(PotError::new(
+                            ErrorCode::InternalError,
+                            format!("cannot start a render worker: {error}"),
+                        ));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(workers),
+        }
+    })
+}
+
+struct FilmSampleRenderContext<'scene, 'light_context, 'lights> {
+    triangles: &'scene [PreparedTriangle],
+    visibility: &'scene super::bvh::Bvh,
+    frame: &'scene CameraFrame,
+    camera: &'scene Camera,
+    width: u32,
+    height: u32,
+    width_usize: usize,
+    mode: Mode,
+    background: [f64; 4],
+    world: Option<WorldRadiance<'scene>>,
+    camera_lights: Option<super::path::RealtimeCameraLightView<'light_context, 'lights>>,
+    camera_light_raster_samples: Option<&'scene super::path::CameraLightRasterSamples>,
+    view_index: usize,
+    sample_count: u32,
+    linear_rgba_associated: bool,
+}
+
+impl FilmSampleRenderContext<'_, '_, '_> {
+    fn render_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        sample_color: &mut [[f32; 4]],
+        sample: FilmSampleJitter,
+        candidates: &mut Vec<usize>,
+        shader: Option<RasterShader<'_>>,
+        volume_pass: &mut Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
+    ) -> Result<()> {
+        for row in rows.clone() {
+            let y = u32::try_from(row).map_err(|_| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "pixel row exceeds platform limits",
+                )
+            })?;
+            for x in 0..self.width {
+                let x_usize = usize::try_from(x).map_err(|_| {
+                    PotError::new(
+                        ErrorCode::LimitExceeded,
+                        "pixel column exceeds platform limits",
+                    )
+                })?;
+                let local_pixel = (row - rows.start)
+                    .checked_mul(self.width_usize)
+                    .and_then(|index| index.checked_add(x_usize))
+                    .ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::LimitExceeded,
+                            "pixel index exceeds platform limits",
+                        )
+                    })?;
+                let (_, sample_linear) = RasterSampleContext {
+                    triangles: self.triangles,
+                    visibility: self.visibility,
+                    candidates,
+                    frame: self.frame,
+                    camera: self.camera,
+                    width: self.width,
+                    height: self.height,
+                    mode: self.mode,
+                    background: self.background,
+                    world: self.world,
+                    shader,
+                    camera_lights: self.camera_lights,
+                    camera_light_raster_samples: self.camera_light_raster_samples,
+                    view_index: self.view_index,
+                    volume_pass,
+                    linear_rgba_associated: self.linear_rgba_associated,
+                }
+                .shade(RasterPixelSample {
+                    cached: None,
+                    index: sample.index,
+                    count: self.sample_count,
+                    x,
+                    y,
+                    sample_x: sample.x,
+                    sample_y: sample.y,
+                })?;
+                store_film_sample(sample_color, local_pixel, sample_linear);
+            }
+        }
+        Ok(())
+    }
 }
 
 struct RasterSampleContext<
@@ -1433,7 +1804,7 @@ struct RasterSampleContext<
     mode: Mode,
     background: [f64; 4],
     world: Option<WorldRadiance<'scene>>,
-    shader: Option<&'scene dyn SurfaceShader>,
+    shader: Option<RasterShader<'scene>>,
     camera_lights: Option<super::path::RealtimeCameraLightView<'light_context, 'lights>>,
     camera_light_raster_samples: Option<&'scene super::path::CameraLightRasterSamples>,
     view_index: usize,
@@ -1602,6 +1973,7 @@ fn rasterize_with_samples_for_eye(
         camera_lights,
         view_index,
         volume_pass,
+        band_count,
     } = request;
     if samples == 0 {
         return Err(PotError::invalid_argument(
@@ -1628,6 +2000,7 @@ fn rasterize_with_samples_for_eye(
             prepared_materials,
             camera_lights: camera_lights.map(|lights| lights.for_eye(0)),
             view_index: 0,
+            band_count,
             volume_pass: volume_pass.as_deref_mut(),
         })?;
         let right_output = rasterize_with_samples_for_eye(RasterSamplesRequest {
@@ -1646,6 +2019,7 @@ fn rasterize_with_samples_for_eye(
             prepared_materials,
             camera_lights: camera_lights.map(|lights| lights.for_eye(1)),
             view_index: 1,
+            band_count,
             volume_pass: volume_pass.as_deref_mut(),
         })?;
         let (left_pixels, _) = left_output.rgba.as_chunks_mut::<4>();
@@ -1742,8 +2116,53 @@ fn rasterize_with_samples_for_eye(
         _ => None,
     };
 
+    let bands = film.as_ref().map_or_else(Vec::new, |film| {
+        super::path::band_rows(film.height, band_count)
+    });
+    let worker_count = if pixel_count > 0 && bands.len() > 1 {
+        bands.len()
+    } else {
+        0
+    };
+    let mut band_workers = make_film_band_workers(worker_count, shader)?;
+    let parallel = pixel_count > 0 && band_workers.len() == bands.len() && bands.len() > 1;
+
     let mut candidates = Vec::new();
-    for y in 0..height {
+    if parallel {
+        let center_context = FilmCenterRenderContext {
+            triangles,
+            prepared: &prepared,
+            visibility: &visibility,
+            ao_bvh: ao_bvh.as_ref(),
+            frame: &frame,
+            camera,
+            width,
+            height,
+            width_usize,
+            prepared_materials,
+            has_volume_only,
+        };
+        band_workers = render_film_center_bands(
+            &center_context,
+            &bands,
+            band_workers,
+            FilmCenterBandBuffers {
+                ids: &mut ids,
+                depths: &mut depths,
+                elements: &mut elements,
+                normals: &mut normals,
+                albedo: &mut albedo,
+                ambient_occlusion: &mut ambient_occlusion,
+            },
+        )?;
+        if let Some(shader) = shader {
+            for worker in &mut band_workers {
+                shader.merge_worker_warnings(worker.take_new_warnings());
+            }
+        }
+    }
+    let center_rows = if parallel { 0..0 } else { 0..height };
+    for y in center_rows {
         for x in 0..width {
             let pixel_index = usize::try_from(y)
                 .ok()
@@ -1763,7 +2182,7 @@ fn rasterize_with_samples_for_eye(
                     &mut candidates,
                     ray,
                     &frame,
-                    shader,
+                    shader.map(RasterShader::Main),
                 )?,
                 None => None,
             };
@@ -1820,7 +2239,7 @@ fn rasterize_with_samples_for_eye(
                         mode,
                         background: background_linear,
                         world,
-                        shader,
+                        shader: shader.map(RasterShader::Main),
                         camera_lights,
                         camera_light_raster_samples: camera_light_raster_samples.as_ref(),
                         view_index,
@@ -1886,49 +2305,127 @@ fn rasterize_with_samples_for_eye(
 
     if let Some(film) = film.as_mut() {
         linear_rgba.fill([0.0; 4]);
+        let render_context = FilmSampleRenderContext {
+            triangles: &prepared,
+            visibility: &visibility,
+            frame: &frame,
+            camera,
+            width,
+            height,
+            width_usize,
+            mode,
+            background: background_linear,
+            world,
+            camera_lights,
+            camera_light_raster_samples: camera_light_raster_samples.as_ref(),
+            view_index,
+            sample_count: samples,
+            linear_rgba_associated,
+        };
+        let volume_template = if parallel {
+            volume_pass
+                .as_deref()
+                .map(super::path::RealtimeVolumePass::worker_template)
+        } else {
+            None
+        };
         for sample_index in 0..samples {
             let (sample_x, sample_y) = film.jitter(film_sample_offset(sample_index));
-            for y in 0..height {
-                for x in 0..width {
-                    let pixel_index = usize::try_from(y)
-                        .ok()
-                        .and_then(|row| row.checked_mul(width_usize))
-                        .and_then(|row| row.checked_add(usize::try_from(x).ok()?))
-                        .ok_or_else(|| {
-                            PotError::new(
-                                ErrorCode::LimitExceeded,
-                                "pixel index exceeds platform limits",
-                            )
-                        })?;
-                    let (_, sample_linear) = RasterSampleContext {
-                        triangles: &prepared,
-                        visibility: &visibility,
-                        candidates: &mut candidates,
-                        frame: &frame,
-                        camera,
-                        width,
-                        height,
-                        mode,
-                        background: background_linear,
-                        world,
-                        shader,
-                        camera_lights,
-                        camera_light_raster_samples: camera_light_raster_samples.as_ref(),
-                        view_index,
-                        volume_pass: &mut volume_pass,
-                        linear_rgba_associated,
+            if parallel {
+                let worker_outcomes = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(bands.len());
+                    let mut sample_rest = film.sample_color.as_mut_slice();
+                    for (rows, mut worker) in bands.iter().cloned().zip(band_workers) {
+                        let band_len = rows.len() * width_usize;
+                        let (sample_rows, sample_tail) =
+                            std::mem::take(&mut sample_rest).split_at_mut(band_len);
+                        sample_rest = sample_tail;
+                        let render_context = &render_context;
+                        handles.push(
+                            std::thread::Builder::new()
+                                .stack_size(super::path::WORKER_STACK_BYTES)
+                                .spawn_scoped(scope, move || {
+                                    let mut volume_owned = volume_template.map(|template| {
+                                        template
+                                            .new_pass(&mut worker.volume_scratch, &worker.warnings)
+                                    });
+                                    let mut volume_pass = volume_owned.as_mut();
+                                    let sample_shader = worker.shader.as_deref().map(|shader| {
+                                        RasterShader::Worker(shader, &worker.warnings)
+                                    });
+                                    let result = render_context.render_rows(
+                                        rows,
+                                        sample_rows,
+                                        FilmSampleJitter {
+                                            index: sample_index,
+                                            x: sample_x,
+                                            y: sample_y,
+                                        },
+                                        &mut worker.candidates,
+                                        sample_shader,
+                                        &mut volume_pass,
+                                    );
+                                    (result, worker)
+                                }),
+                        );
                     }
-                    .shade(RasterPixelSample {
-                        cached: None,
-                        index: sample_index,
-                        count: samples,
-                        x,
-                        y,
-                        sample_x,
-                        sample_y,
-                    })?;
-                    film.store_sample(pixel_index, sample_linear);
+                    let mut workers = Vec::with_capacity(handles.len());
+                    let mut first_error = None;
+                    for handle in handles {
+                        match handle {
+                            Ok(handle) => match handle.join() {
+                                Ok((Ok(()), worker)) => workers.push(worker),
+                                Ok((Err(error), worker)) => {
+                                    workers.push(worker);
+                                    if first_error.is_none() {
+                                        first_error = Some(error);
+                                    }
+                                }
+                                Err(_) if first_error.is_none() => {
+                                    first_error = Some(PotError::new(
+                                        ErrorCode::InternalError,
+                                        "render worker panicked",
+                                    ));
+                                }
+                                Err(_) => {}
+                            },
+                            Err(error) => {
+                                if first_error.is_none() {
+                                    first_error = Some(PotError::new(
+                                        ErrorCode::InternalError,
+                                        format!("cannot start a render worker: {error}"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    match first_error {
+                        Some(error) => Err(error),
+                        None => Ok(workers),
+                    }
+                })?;
+                band_workers = worker_outcomes;
+                for worker in &mut band_workers {
+                    let warnings = worker.take_new_warnings();
+                    if let Some(shader) = shader {
+                        shader.merge_worker_warnings(warnings);
+                    } else if let Some(pass) = volume_pass.as_deref() {
+                        pass.merge_worker_warnings(warnings);
+                    }
                 }
+            } else {
+                render_context.render_rows(
+                    0..film.height,
+                    &mut film.sample_color,
+                    FilmSampleJitter {
+                        index: sample_index,
+                        x: sample_x,
+                        y: sample_y,
+                    },
+                    &mut candidates,
+                    shader.map(RasterShader::Main),
+                    &mut volume_pass,
+                )?;
             }
             film.resolve_sample(sample_index, sample_x, sample_y, &mut linear_rgba);
         }
@@ -2001,6 +2498,7 @@ pub(super) fn rasterize_with_lines(
         prepared_materials,
         camera_lights: camera_lights.map(|lights| lights.view(0)),
         view_index: 0,
+        band_count: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         volume_pass,
     })?;
     if lines.is_empty() {
@@ -3110,35 +3608,12 @@ impl FilmFilter {
         })
     }
 
-    fn eye_columns(&self, x: u32) -> (i64, i64) {
-        let width = self.width as i64;
-        match self.eye_split {
-            Some(split) => {
-                let split = split as i64;
-                if i64::from(x) < split {
-                    (0, split)
-                } else {
-                    (split, width)
-                }
-            }
-            None => (0, width),
-        }
-    }
-
-    fn store_sample(&mut self, pixel: usize, color: [f64; 4]) {
-        let mut stored = color.map(|channel| store_film_f16_truncated(channel as f32));
-        stored[3] = store_film_f16_truncated(1.0_f32 - color[3] as f32);
-        self.sample_color[pixel] = stored;
-    }
-
-    /// Resolves one TAA sample into the float32 weight image and RGBA16F combined history.
-    fn resolve_sample(
-        &mut self,
+    fn sample_taps(
+        &self,
         sample_index: u32,
         sample_x: f64,
         sample_y: f64,
-        history: &mut [[f32; 4]],
-    ) {
+    ) -> ([FilmTap; MAX_FILM_TAPS], usize, f32) {
         let mut taps = [FilmTap::default(); MAX_FILM_TAPS];
         let mut sample_weight_total = 0.0_f32;
         let tap_count = if self.radius < LARGE_FILTER_RADIUS {
@@ -3200,11 +3675,32 @@ impl FilmFilter {
             }
             MAX_FILM_TAPS
         };
+        (taps, tap_count, sample_weight_total)
+    }
 
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let pixel = y * self.width + x;
-                let (column_start, column_end) = self.eye_columns(x as u32);
+    /// Resolves one TAA sample into the float32 weight image and RGBA16F combined history.
+    fn resolve_sample(
+        &mut self,
+        sample_index: u32,
+        sample_x: f64,
+        sample_y: f64,
+        history: &mut [[f32; 4]],
+    ) {
+        let (taps, tap_count, sample_weight_total) =
+            self.sample_taps(sample_index, sample_x, sample_y);
+        let (width, height, exposure_scale, eye_split) =
+            (self.width, self.height, self.exposure_scale, self.eye_split);
+        let sample_color = &self.sample_color;
+        let history_weight = &mut self.history_weight;
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = y * width + x;
+                let width_i64 = width as i64;
+                let (column_start, column_end) = match eye_split {
+                    Some(split) if x < split => (0, split as i64),
+                    Some(split) => (split as i64, width_i64),
+                    None => (0, width_i64),
+                };
                 let mut color_sum = [0.0_f32; 4];
                 let mut color_weight = 0.0_f32;
                 for tap in taps[..tap_count].iter().rev() {
@@ -3212,11 +3708,10 @@ impl FilmFilter {
                         continue;
                     }
                     let source_x = (x as i64 + tap.x).clamp(column_start, column_end - 1);
-                    let source_y = (y as i64 - tap.y).clamp(0, self.height as i64 - 1);
-                    let source =
-                        self.sample_color[source_y as usize * self.width + source_x as usize];
+                    let source_y = (y as i64 - tap.y).clamp(0, height as i64 - 1);
+                    let source = sample_color[source_y as usize * width + source_x as usize];
                     let color = ycocg_from_sample(source);
-                    let weight = tap.weight * film_luma_weight(color[0], self.exposure_scale);
+                    let weight = tap.weight * film_luma_weight(color[0], exposure_scale);
                     for channel in 0..4 {
                         color_sum[channel] += color[channel] * weight;
                     }
@@ -3225,9 +3720,9 @@ impl FilmFilter {
 
                 let previous = history[pixel];
                 let previous_ycocg = ycocg_from_scene_linear(previous);
-                let previous_weight = self.history_weight[pixel];
+                let previous_weight = history_weight[pixel];
                 let weight_dst =
-                    film_luma_weight(previous_ycocg[0], self.exposure_scale) * previous_weight;
+                    film_luma_weight(previous_ycocg[0], exposure_scale) * previous_weight;
                 let color_src = color_sum.map(|channel| channel / color_weight);
                 let weight_sum = weight_dst + color_weight;
                 let blended = std::array::from_fn(|channel| {
@@ -3247,10 +3742,16 @@ impl FilmFilter {
                     }
                 }
                 history[pixel] = color.map(store_film_history_f16);
-                self.history_weight[pixel] = previous_weight + sample_weight_total;
+                history_weight[pixel] = previous_weight + sample_weight_total;
             }
         }
     }
+}
+
+fn store_film_sample(destination: &mut [[f32; 4]], pixel: usize, color: [f64; 4]) {
+    let mut stored = color.map(|channel| store_film_f16_truncated(channel as f32));
+    stored[3] = store_film_f16_truncated(1.0_f32 - color[3] as f32);
+    destination[pixel] = stored;
 }
 
 fn ycocg_from_scene_linear(color: [f32; 4]) -> [f32; 4] {
@@ -3414,7 +3915,7 @@ fn hit_color(
     triangle: &PreparedTriangle,
     hit: Hit,
     ray: Ray,
-    shader: Option<&dyn SurfaceShader>,
+    shader: Option<RasterShader<'_>>,
 ) -> Result<SurfaceSample> {
     match shader {
         Some(shader) => {
@@ -3439,7 +3940,7 @@ fn nearest_visible_hit(
     candidates: &mut Vec<usize>,
     ray: Ray,
     frame: &CameraFrame,
-    shader: Option<&dyn SurfaceShader>,
+    shader: Option<RasterShader<'_>>,
 ) -> Result<Option<VisibleHit>> {
     let mut cursor = None;
     // The ray is fixed, so its candidates are too. The nearest is the least (depth, index) pair
@@ -3496,7 +3997,7 @@ fn composite_sample_with_association(
     camera: &Camera,
     background: [f64; 4],
     world: Option<WorldRadiance<'_>>,
-    shader: Option<&dyn SurfaceShader>,
+    shader: Option<RasterShader<'_>>,
     cached_hit: Option<VisibleHit>,
     camera_lights: Option<super::path::RealtimeCameraLightSample<'_, '_, '_>>,
     mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
@@ -5723,6 +6224,175 @@ mod composite_layer_tests {
     fn empty_stack_over_transparent_background_is_the_background() -> super::Result<()> {
         let actual = composite_layers(std::iter::empty(), [0.3, 0.4, 0.5, 0.0])?;
         assert_close(actual, [0.3, 0.4, 0.5, 0.0]);
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod film_band_tests {
+    use std::collections::BTreeMap;
+
+    use glam::DVec3;
+    use serde_json::json;
+
+    use super::{
+        Camera, DepthOfField, Mode, Projection, RasterOutput, RasterSamplesRequest, StereoMode,
+        ViewBasis, rasterize_with_samples_for_eye,
+    };
+    use crate::{
+        error::{ErrorCode, PotError, Result},
+        eval::{EvaluationContext, Snapshot},
+        model::SceneDoc,
+        render::path::{RealtimeVolumePass, RealtimeVolumeScratch},
+    };
+    const WIDTH: u32 = 12;
+    const HEIGHT: u32 = 8;
+    const SAMPLES: u32 = 4;
+
+    fn render(band_count: usize) -> Result<(RasterOutput, Vec<serde_json::Value>)> {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000001".to_owned());
+        let doc = crate::ops::apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [
+                    {
+                        "op":"material.create","id":"warning",
+                        "graph":{
+                            "kind":"shader",
+                            "nodes":{
+                                "surface":{"type":"ShaderNodeBsdfPrincipled","inputs":{
+                                    "Thin Wall":true,"Subsurface Weight":0.8
+                                }},
+                                "output":{"type":"OutputMaterial"}
+                            },
+                            "links":[{"from_node":"surface","from_socket":"BSDF",
+                                "to_node":"output","to_socket":"Surface"}]
+                        }
+                    },
+                    {
+                        "op":"material.create","id":"fog",
+                        "graph":{
+                            "kind":"shader",
+                            "nodes":{
+                                "volume":{"type":"ShaderNodeVolumePrincipled","inputs":{
+                                    "Color":[0.0,0.0,0.0,1.0],"Density":0.8
+                                }},
+                                "output":{"type":"OutputMaterial"}
+                            },
+                            "links":[{"from_node":"volume","from_socket":"Volume",
+                                "to_node":"output","to_socket":"Volume"}]
+                        }
+                    },
+                    {"op":"node.create","id":"warning_plane","kind":"plane",
+                        "params":{"size":2.5},"material":"warning"},
+                    {"op":"node.create","id":"fog_volume","kind":"sphere",
+                        "params":{"radius":0.7,"segments":12,"ring_count":8},
+                        "transform":{"translation":[0.0,0.0,1.2]},"material":"fog"},
+                    {"op":"light.create","id":"camera_light","light_type":"point","energy":100.0,
+                        "radius":0.2,"transform":{"translation":[0.0,0.0,3.5]}},
+                    {"op":"node.update","target":{"id":"camera_light"},
+                        "set":{"ray_visibility":{"camera":true}}}
+                ]
+            }),
+        )?
+        .doc;
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        let images = BTreeMap::new();
+        let geometry =
+            crate::render::scene::extract_geometry(&doc, &snapshot, Mode::Beauty, false, &images)?;
+        let camera = Camera {
+            position: DVec3::new(0.0, 0.0, 5.0),
+            target: DVec3::ZERO,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Orthographic { height: 2.5 },
+            shift: [0.0; 2],
+            depth_of_field: Some(DepthOfField {
+                focus_distance: 5.0,
+                aperture_radius: 0.05,
+                aperture_blades: 6,
+            }),
+            stereo_mode: StereoMode::SideBySide,
+            interocular_distance: 0.065,
+        };
+        let shader = crate::render::scene::surface_shader(
+            &doc,
+            &snapshot,
+            &images,
+            &geometry,
+            Mode::Beauty,
+            ViewBasis::from_camera(&camera)?,
+        );
+        let transport = crate::render::path::prepare_realtime_volume_transport(
+            &doc,
+            &snapshot,
+            &geometry,
+            &images,
+            &geometry.shader_warnings,
+        )?
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "test volume was not prepared"))?;
+        let camera_lights = crate::render::path::prepare_realtime_camera_light_context(
+            &doc,
+            &snapshot,
+            Some(&transport),
+            &camera,
+            WIDTH,
+            HEIGHT,
+        )?;
+        let mut scratch = RealtimeVolumeScratch::default();
+        let mut volume_pass = Some(RealtimeVolumePass::new(
+            &transport,
+            &geometry,
+            &mut scratch,
+            7,
+        ));
+        let output = rasterize_with_samples_for_eye(RasterSamplesRequest {
+            triangles: &geometry.triangles,
+            camera: &camera,
+            width: WIDTH,
+            height: HEIGHT,
+            mode: Mode::Beauty,
+            background: [0, 0, 0, 0],
+            world: None,
+            samples: SAMPLES,
+            seed: 7,
+            filter_size: 1.5,
+            exposure_scale: 1.0,
+            shader: shader.as_deref(),
+            prepared_materials: &geometry.prepared,
+            camera_lights: Some(camera_lights.view(0)),
+            view_index: 0,
+            band_count,
+            volume_pass: volume_pass.as_mut(),
+        })?;
+        let warnings = geometry.shader_warnings.borrow().clone();
+        Ok((output, warnings))
+    }
+
+    #[test]
+    fn beauty_film_pixels_and_warnings_match_across_band_counts() -> Result<()> {
+        let (serial, serial_warnings) = render(1)?;
+        let (banded, banded_warnings) = render(3)?;
+
+        assert_eq!(serial.linear_rgba, banded.linear_rgba);
+        assert_eq!(serial.rgba, banded.rgba);
+        assert_eq!(serial.linear_rgba_associated, banded.linear_rgba_associated);
+        assert_eq!(serial.ids, banded.ids);
+        assert_eq!(serial.depths, banded.depths);
+        assert_eq!(serial.elements, banded.elements);
+        assert_eq!(serial.normals, banded.normals);
+        assert_eq!(serial.albedo, banded.albedo);
+        assert_eq!(serial.emission, banded.emission);
+        assert_eq!(serial.ambient_occlusion, banded.ambient_occlusion);
+        assert_eq!(serial_warnings, banded_warnings);
+        assert!(
+            serial_warnings
+                .iter()
+                .any(|warning| warning["feature_id"] == "shader.principled.thin_wall"),
+            "warning-producing material did not emit its realtime warning: {serial_warnings:?}"
+        );
         Ok(())
     }
 }
