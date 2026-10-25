@@ -40,21 +40,24 @@ use tempfile::tempdir;
 
 const BLENDER_REQUIRED: &str = "Blender is required for the Boolean parity corpus: install Blender 5.2, or set POTTER_BLENDER to its executable";
 
-/// The six reviewer-verified EXACT cases (research §3.7). Each must be asserted.
-const REVIEWED_CASES: [&str; 6] = [
+/// EXACT attribute cases whose presence and Blender parity must be asserted.
+const REVIEWED_CASES: [&str; 10] = [
     "attributes_difference_exact",
     "attributes_union_exact",
     "attributes_intersect_exact",
     "vertex_group_difference_exact",
     "vertex_group_union_exact",
     "material_transfer_union_exact",
+    "point_attributes_union_exact",
+    "point_attributes_collection_union_exact",
+    "point_attributes_self_overlap_union_exact",
+    "point_attributes_hole_tolerant_union_exact",
 ];
 
 /// Corpus rows with `solver == "EXACT"`.
-const EXACT_ROWS: usize = 53;
+const EXACT_ROWS: usize = 57;
 /// Corpus rows with `solver == "FLOAT"`.
 const FLOAT_ROWS: usize = 11;
-
 #[test]
 fn boolean_matches_blender_parity_corpus() -> TestResult {
     let blender = blender_executable().ok_or(BLENDER_REQUIRED)?;
@@ -97,6 +100,24 @@ fn boolean_matches_blender_parity_corpus() -> TestResult {
             .as_str()
             .ok_or("Blender case name is missing")?
             .to_owned();
+        if case == "point_attributes_collection_union_exact" {
+            let order = expected_json["blender_attribute_order"]
+                .as_array()
+                .ok_or("collection Boolean attribute order is missing")?;
+            let names = order
+                .iter()
+                .map(|entry| {
+                    entry[1].as_str().ok_or_else(|| {
+                        std::io::Error::other("collection Boolean attribute name is missing")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(
+                names,
+                vec!["probe_face", "probe_edge"],
+                "Blender must keep native FACE-before-EDGE attribute order",
+            );
+        }
         let generated_path = root.join("expected").join(format!("{case}.json"));
         let generated_json: Value = serde_json::from_slice(&fs::read(&generated_path)?)?;
         if generated_json["case"].as_str() != Some(case.as_str()) {

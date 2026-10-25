@@ -85,6 +85,38 @@ def part(mesh, **options):
     return {"mesh": mesh, **options}
 
 
+def point_attributes(seed):
+    return {
+        "probe_float": ("FLOAT", lambda index: seed * 0.1 + index * 0.01),
+        "probe_int": ("INT", lambda index: seed * 100 + index),
+        "probe_vector": (
+            "FLOAT_VECTOR",
+            lambda index: (seed + index * 0.1, -seed - index * 0.2, index * 0.3),
+        ),
+        "probe_color": (
+            "FLOAT_COLOR",
+            lambda index: (
+                seed * 0.01 + index * 0.001,
+                seed * 0.005 + index * 0.002,
+                0.2 + index * 0.003,
+                0.4 + index * 0.01,
+            ),
+        ),
+        "probe_bool": ("BOOLEAN", lambda index: (int(seed) + index) % 2 == 0),
+        "probe_string": ("STRING", lambda index: f"{seed}:{index}"),
+    }
+
+
+# INT8 is intentionally generic in Potter for FACE/EDGE.
+def domain_attributes(seed):
+    return [
+        ("EDGE", "probe_edge", "INT8", lambda index: seed % 50 + index),
+        ("FACE", "probe_face", "INT8", lambda index: seed % 60 + index),
+        ("EDGE", "probe_edge_string", "STRING", lambda index: f"edge:{seed}:{index}"),
+        ("FACE", "probe_face_string", "STRING", lambda index: f"face:{seed}:{index}"),
+    ]
+
+
 def split_by_x(center):
     return 0 if center[0] < 0.0 else 1
 
@@ -119,7 +151,9 @@ def attribute_value(item, data_type):
         value = item.value
     if isinstance(value, bytes):
         return value.decode("utf-8")
-    if isinstance(value, (tuple, list)) or hasattr(value, "__iter__") and not isinstance(value, str):
+    if isinstance(value, (tuple, list)) or (
+        hasattr(value, "__getitem__") and not isinstance(value, str)
+    ):
         return list(value)
     return value
 
@@ -166,7 +200,8 @@ def cross(a, b):
 
 
 def case(family, section, solver, operation, host, operands, *, collection=False,
-         use_self=False, material_mode="INDEX", suffix="", hole_tolerant=None):
+         use_self=False, material_mode="INDEX", suffix="", hole_tolerant=None,
+         record_attribute_order=False):
     result = {
         "id": f"{family}_{operation.lower()}_{solver.lower()}{suffix}",
         "research_section": section,
@@ -180,6 +215,8 @@ def case(family, section, solver, operation, host, operands, *, collection=False
     }
     if hole_tolerant is not None:
         result["hole_tolerant"] = hole_tolerant
+    if record_attribute_order:
+        result["record_attribute_order"] = True
     return result
 
 
@@ -265,6 +302,49 @@ def specs():
         for op in ("DIFFERENCE", "UNION")
     ]
 
+    # EXACT generic POINT attributes use the source vertex's local index in joined storage.
+    point_host = part(box(-1, 1, -1, 1, -1, 1), point_attributes=point_attributes(11))
+    point_operand = part(box(0.5, 2.5, -0.5, 1.5, 0, 2), point_attributes=point_attributes(70))
+    cases.append(case("point_attributes", "3.7", "EXACT", "UNION", point_host, [point_operand]))
+
+    # Each member has 16 vertices while the host has 8: the second member's indices 8..15 read
+    # the first member's values from joined storage.
+    point_members = [
+        part(
+            join(box(0.5, 2.5, -0.5, 1.5, 0, 2), box(3.5, 4.5, -0.5, 1.5, 0, 2)),
+            point_attributes=point_attributes(70),
+            domain_attributes=domain_attributes(70),
+        ),
+        part(
+            join(box(1, 3, -0.5, 1.5, -0.5, 1), box(5, 6, -0.5, 1.5, -0.5, 1)),
+            point_attributes=point_attributes(90),
+            domain_attributes=domain_attributes(90),
+        ),
+    ]
+    cases.append(case(
+        "point_attributes_collection", "3.7", "EXACT", "UNION", point_host, point_members,
+        collection=True, record_attribute_order=True,
+    ))
+
+    point_self_operand = part(
+        join(box(0, 2, 0, 2, 0, 2), box(1, 3, 1, 3, 1, 3)),
+        point_attributes=point_attributes(70),
+    )
+    point_big_host = part(box(-2, 2, -2, 2, -2, 2), point_attributes=point_attributes(11))
+    cases.append(case(
+        "point_attributes_self_overlap", "3.7", "EXACT", "UNION", point_big_host,
+        [point_self_operand], use_self=True,
+    ))
+
+    point_open_operand = part(
+        remove_face(box(0.5, 2.5, -0.5, 1.5, 0, 2), 1),
+        point_attributes=point_attributes(70),
+    )
+    cases.append(case(
+        "point_attributes_hole_tolerant", "3.7", "EXACT", "UNION", point_host,
+        [point_open_operand], hole_tolerant=True,
+    ))
+
     # 3.7 materials: host split by x, operand split by z; INDEX and TRANSFER, EXACT.
     # The FLOAT INDEX row is recorded for PR17b.
     material_host = part(box(-1, 1, -1, 1, -1, 1), materials=split_by_x)
@@ -308,6 +388,25 @@ def make_object(name, collection, spec):
         group = obj.vertex_groups.new(name="G")
         for index in range(len(verts)):
             group.add([index], spec["weight"](index), "REPLACE")
+    if "point_attributes" in spec:
+        for name, (data_type, value_for_index) in spec["point_attributes"].items():
+            attribute = data.attributes.new(name, data_type, "POINT")
+            for index, item in enumerate(attribute.data):
+                value = value_for_index(index)
+                if data_type == "FLOAT_VECTOR":
+                    item.vector = value
+                elif data_type == "FLOAT_COLOR":
+                    item.color = value
+                elif data_type == "STRING":
+                    item.value = value.encode("utf-8")
+                else:
+                    item.value = value
+    if "domain_attributes" in spec:
+        for domain, name, data_type, value_for_index in spec["domain_attributes"]:
+            attribute = data.attributes.new(name, data_type, domain)
+            for index, item in enumerate(attribute.data):
+                value = value_for_index(index)
+                item.value = value.encode("utf-8") if data_type == "STRING" else value
     return obj
 
 
@@ -579,6 +678,12 @@ def describe_mesh(evaluated, mesh, spec):
     result["edge_attributes"] = edge_attributes if edge_values else None
     result["point_attributes"] = point_attributes if point_values else None
     result["color_layers"] = color_layers
+    if spec.get("record_attribute_order"):
+        result["blender_attribute_order"] = [
+            [attribute.domain, attribute.name, attribute.data_type]
+            for attribute in mesh.attributes
+            if attribute.name in {"probe_edge", "probe_face"}
+        ]
     if "hole_tolerant" in spec:
         result["hole_tolerant"] = spec["hole_tolerant"]
         result["input_geometry"] = {

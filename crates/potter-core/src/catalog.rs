@@ -570,13 +570,19 @@ pub fn feature_catalog() -> Value {
             );
             row
         },
-        unsupported(
-            "modifier.boolean.exact_point_attribute_local_index",
-            "Boolean EXACT point attributes read the local vertex index",
-            "BOOLEAN",
-            &["modifier.create", "modifier.apply"],
-            "Blender's EXACT solver reads each output point attribute at the operand's local vertex index in the joined operands, so operand B's vertex k takes operand A's value k. Potter reproduces this quirk, so operand B's own point data does not reach its vertices. Vertex groups follow the same rule; cut vertices take the default value.",
-        ),
+        {
+            let mut row = supported(
+                "modifier.boolean.exact_point_attribute_local_index",
+                "Boolean EXACT point attributes read joined storage by local index",
+                "BOOLEAN",
+                &["modifier.create", "modifier.apply"],
+                [true, true, true, true, true, false, false],
+            );
+            row["reason"] = json!(
+                "EXACT POINT attributes follow Blender 5.2.2's source-index map: `source/blender/geometry/intern/mesh_boolean.cc` (`meshes_to_imesh`, `imesh_to_mesh`) stores an operand-local vertex origin and gathers from the joined mesh at that index. Operand B's local vertex k therefore reads joined slot k (usually operand A's value); generated or intersection vertices take the type default. STRING attributes are omitted by Blender's `gather_attributes_with_check`. Blender-gated cases cover FLOAT, INT, FLOAT_VECTOR, FLOAT_COLOR, and BOOLEAN on object and collection operands, self-intersection, and hole_tolerant."
+            );
+            row
+        },
         supported(
             "modifier.shrinkwrap",
             "Shrinkwrap mesh modifier",
