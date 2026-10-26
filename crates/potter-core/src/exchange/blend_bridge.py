@@ -12,6 +12,7 @@ import ctypes
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import sys
@@ -8242,9 +8243,13 @@ def _set_alpha_mode(material, item):
     material.thickness_mode = "SLAB" if thickness_mode == "slab" else "SPHERE"
     material[ALPHA_MODE_PROPERTY] = mode
 
+# texts.load drops C0 controls except tab and newline (text.cc cleanup_textline); from_string keeps them.
+TEXT_LOAD_DROPPED_CHARACTERS = re.compile("[\x00-\x08\x0b-\x1f]")
+
+
 def _text_from_string(name, body):
     # Blender's Text.from_string is prohibitively slow for large one-line compatibility JSON.
-    if (len(body) <= 65536 or "\r" in body or "\x00" in body
+    if (len(body) <= 65536 or TEXT_LOAD_DROPPED_CHARACTERS.search(body)
             or body.startswith("\ufeff")):
         text = bpy.data.texts.new(name)
         text.from_string(body)
