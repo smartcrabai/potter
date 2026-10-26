@@ -11,7 +11,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SHARD_COUNT = 3
 DEFAULT_SECONDS = 10
-TARGET_SECONDS = {"blend_realistic_scene": 1590, "constraints_more": 957}
+TARGET_SECONDS = {
+    "blend_realistic_scene": 1591,
+    "workbench_studio_light": 274,
+    ("potter_core", "lib-unit"): 257,
+    "native_principled_thin_film": 231,
+    "native_principled_anisotropic": 231,
+    "potter_core": 223,
+    ("potter_workflow", "lib-unit"): 211,
+    "blend_roundtrip_constraints": 124,
+    "blend_modifiers_constraints": 108,
+    "native_principled_thin_wall_indirect": 79,
+    "blend_roundtrip_bbone": 52,
+    "realtime_volume_factor": 49,
+    "backface_culling": 30,
+    "closure_list_oracle": 29,
+    "blend_collection_instances": 29,
+    "blend_udim_tiles": 28,
+    "realtime_light_shapes_extra": 25,
+    "native_graph_transparent": 25,
+    "native_metal_sphere_lights": 21,
+}
 KNOWN_KINDS = {
     "lib",
     "proc-macro",
@@ -79,9 +99,25 @@ def discover_targets(metadata):
             seconds = TARGET_SECONDS.get(name, DEFAULT_SECONDS)
             if kinds.intersection({"lib", "proc-macro"}):
                 if test:
-                    targets.append((package_name, name, "lib-unit", ("--lib",), seconds))
+                    targets.append(
+                        (
+                            package_name,
+                            name,
+                            "lib-unit",
+                            ("--lib",),
+                            TARGET_SECONDS.get((name, "lib-unit"), seconds),
+                        )
+                    )
                 if doctest:
-                    targets.append((package_name, name, "lib-doc", ("--doc",), seconds))
+                    targets.append(
+                        (
+                            package_name,
+                            name,
+                            "lib-doc",
+                            ("--doc",),
+                            TARGET_SECONDS.get((name, "lib-doc"), seconds),
+                        )
+                    )
             elif "bin" in kinds and test and not doctest:
                 targets.append((package_name, name, "bin-unit", ("--bin", name), seconds))
             elif "test" in kinds and test and not doctest:

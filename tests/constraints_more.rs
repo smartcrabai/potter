@@ -17,6 +17,12 @@ use blender_checked::blender_executable;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+struct ActiveGuardTarget {
+    target_node: String,
+    modifier_id: String,
+    constraint: Option<(String, String)>,
+}
+
 fn pot() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pot"))
 }
@@ -2251,14 +2257,24 @@ fn blender_geometry_attribute_instance_domain_matches_depsgraph() -> TestResult 
         String::from_utf8_lossy(&roundtrip_inspected.stdout)
     );
     let roundtrip_inspected: Value = serde_json::from_slice(&roundtrip_inspected.stdout)?;
-    let roundtrip_item = roundtrip_inspected["result"]["items"]
+    let roundtrip_items = roundtrip_inspected["result"]["items"]
         .as_array()
-        .and_then(|items| {
-            items
+        .ok_or_else(|| io::Error::other("round-trip inspect returned no node items"))?;
+    for case in cases {
+        let id = case["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("Geometry Attribute INSTANCE owner ID is missing"))?;
+        assert!(
+            roundtrip_items
                 .iter()
-                .find(|item| item["name"].as_str() == Some(roundtrip_id))
-        })
-        .ok_or_else(|| io::Error::other("round-trip inspect omitted its owner"))?;
+                .any(|item| item["name"].as_str() == Some(id)),
+            "round-trip inspect omitted owner {id}"
+        );
+    }
+    let roundtrip_item = roundtrip_items
+        .iter()
+        .find(|item| item["name"].as_str() == Some(roundtrip_id))
+        .ok_or_else(|| io::Error::other("round-trip inspect omitted its Join owner"))?;
     let roundtrip_expected = blender_matrix(&oracle["matrices"][roundtrip_id])?;
     let roundtrip_actual = blender_matrix(&roundtrip_item["transform"]["world"]["matrix"])?;
     let roundtrip_error = max_matrix_error(roundtrip_actual, roundtrip_expected);
@@ -2279,9 +2295,11 @@ fn blender_geometry_attribute_instance_domain_matches_depsgraph() -> TestResult 
         .output()?;
     assert!(
         stable_export.status.success(),
-        "pot re-export of swapped Join links failed: {}",
+        "pot re-export of Geometry Nodes project failed: {}",
         String::from_utf8_lossy(&stable_export.stdout)
     );
+    let stable_export: Value = serde_json::from_slice(&stable_export.stdout)?;
+    assert_eq!(stable_export["result"]["losses"], json!([]));
     let stable_join_links = blender_join_link_oracle(&blender, &stable_blend)?;
     assert_eq!(
         stable_join_links, oracle["join_link_oracle"],
@@ -2297,17 +2315,27 @@ fn blender_geometry_attribute_instance_domain_matches_depsgraph() -> TestResult 
         .output()?;
     assert!(
         stable_inspected.status.success(),
-        "pot inspect after repeated Join link round-trip failed: {}",
+        "pot inspect after repeated Geometry Nodes round-trip failed: {}",
         String::from_utf8_lossy(&stable_inspected.stdout)
     );
     let stable_inspected: Value = serde_json::from_slice(&stable_inspected.stdout)?;
-    let stable_item = stable_inspected["result"]["items"]
+    let stable_items = stable_inspected["result"]["items"]
         .as_array()
-        .and_then(|items| {
-            items
+        .ok_or_else(|| io::Error::other("stable inspect returned no node items"))?;
+    for case in cases {
+        let id = case["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("Geometry Attribute INSTANCE owner ID is missing"))?;
+        assert!(
+            stable_items
                 .iter()
-                .find(|item| item["name"].as_str() == Some(roundtrip_id))
-        })
+                .any(|item| item["name"].as_str() == Some(id)),
+            "stable inspect omitted owner {id}"
+        );
+    }
+    let stable_item = stable_items
+        .iter()
+        .find(|item| item["name"].as_str() == Some(roundtrip_id))
         .ok_or_else(|| io::Error::other("stable round-trip inspect omitted Join owner"))?;
     let stable_matrix = blender_matrix(&stable_item["transform"]["world"]["matrix"])?;
     let stable_error = max_matrix_error(stable_matrix, roundtrip_expected);
@@ -2340,6 +2368,17 @@ fn blender_geometry_attribute_instance_domain_matches_depsgraph() -> TestResult 
             "INSTANCE fixture omitted guarded feature {feature_id}"
         );
     }
+    let guard_project = root.join("guard_project");
+    let guard_import = import_blend_project(
+        &blender,
+        &guard_project,
+        &root.join("geometry_attribute_instances_guards.blend"),
+    )?;
+    assert_eq!(guard_import["result"]["losses"], json!([]));
+    let guard_scene: Value = serde_json::from_slice(&fs::read(guard_project.join("scene.json"))?)?;
+    let guard_operations_path = root.join("instance_guard_operations.json");
+    // Inspect evaluates the whole document, so enable one guarded target stack at a time.
+    let mut active_guard_target: Option<ActiveGuardTarget> = None;
     for guard in guard_cases {
         let guard_name = guard["id"]
             .as_str()
@@ -2347,16 +2386,127 @@ fn blender_geometry_attribute_instance_domain_matches_depsgraph() -> TestResult 
         let feature_id = guard["feature_id"]
             .as_str()
             .ok_or_else(|| io::Error::other("guard fixture feature ID is missing"))?;
-        let inspect_name = guard["inspect_id"].as_str().unwrap_or("guard_owner");
-        let guard_project = root.join(format!("guard_{guard_name}_project"));
-        let source = root.join(format!("guard_{guard_name}.blend"));
-        let guard_import = import_blend_project(&blender, &guard_project, &source)?;
-        assert_eq!(guard_import["result"]["losses"], json!([]));
-        let inspect_id = imported_node_id(&guard_project, inspect_name)?;
+        let inspect_name = guard["inspect_id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("guard inspect name is missing"))?;
+        let node_id = imported_node_id(&guard_project, inspect_name)?;
+        let constraint = guard_scene["nodes"]
+            .get(node_id.as_str())
+            .and_then(|node| node["constraints"].as_array())
+            .and_then(|constraints| constraints.first());
+        let constraint_id = constraint
+            .and_then(|constraint| constraint["id"].as_str())
+            .map(str::to_owned);
+        let constraint_target = constraint
+            .and_then(|constraint| constraint["target"].as_str())
+            .map(str::to_owned);
+        let expects_constraint = !matches!(
+            guard_name,
+            "store_named_attribute_uncaptured" | "transform_matrix_plain_mesh"
+        );
+        assert_eq!(
+            constraint_id.is_some(),
+            expects_constraint,
+            "{guard_name} constraint fixture mismatch"
+        );
+        assert_eq!(
+            constraint_target.is_some(),
+            expects_constraint,
+            "{guard_name} constraint target mismatch"
+        );
+        let target_node_id = constraint_target.clone().unwrap_or_else(|| node_id.clone());
+        let target_modifier = guard_scene["nodes"]
+            .get(target_node_id.as_str())
+            .and_then(|node| node["modifiers"].as_array())
+            .and_then(|modifiers| {
+                modifiers
+                    .iter()
+                    .find(|modifier| modifier["type"] == "nodes")
+            })
+            .ok_or_else(|| io::Error::other("guard Geometry Nodes modifier is missing"))?;
+        let modifier_id = target_modifier["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("guard Geometry Nodes modifier ID is missing"))?
+            .to_owned();
+        assert_eq!(
+            target_modifier["show_viewport"], false,
+            "{guard_name} target modifier was not imported disabled"
+        );
+
+        let mut operations = Vec::with_capacity(4);
+        if let Some(previous) = active_guard_target.take() {
+            operations.push(json!({
+                "op":"modifier.update",
+                "target":{"id":previous.target_node},
+                "id":previous.modifier_id,
+                "set":{"show_viewport":false}
+            }));
+            if let Some((previous_owner, previous_id)) = previous.constraint {
+                operations.push(json!({
+                    "op":"constraint.update",
+                    "target":{"id":previous_owner},
+                    "id":previous_id,
+                    "set":{"enabled":false,"target":previous.target_node}
+                }));
+            }
+        }
+        operations.push(json!({
+            "op":"modifier.update",
+            "target":{"id":target_node_id},
+            "id":modifier_id,
+            "set":{"show_viewport":true}
+        }));
+        let active_constraint = if let Some(constraint_id) = constraint_id {
+            let constraint =
+                constraint.ok_or_else(|| io::Error::other("guard constraint is missing"))?;
+            assert_eq!(
+                constraint["enabled"], false,
+                "{guard_name} was not imported muted"
+            );
+            operations.push(json!({
+                "op":"constraint.update",
+                "target":{"id":node_id},
+                "id":constraint_id,
+                "set":{"enabled":true,"target":target_node_id}
+            }));
+            Some((node_id.clone(), constraint_id))
+        } else {
+            None
+        };
+        active_guard_target = Some(ActiveGuardTarget {
+            target_node: target_node_id,
+            modifier_id,
+            constraint: active_constraint,
+        });
+        let current_scene: Value =
+            serde_json::from_slice(&fs::read(guard_project.join("scene.json"))?)?;
+        let revision = current_scene["revision"]
+            .as_u64()
+            .ok_or_else(|| io::Error::other("guard project revision is missing"))?;
+        fs::write(
+            &guard_operations_path,
+            serde_json::to_vec(&json!({
+                "schema_version":1,
+                "base_revision":revision,
+                "operations":operations
+            }))?,
+        )?;
+        let applied = pot()
+            .arg("apply")
+            .arg(&guard_project)
+            .arg("--file")
+            .arg(&guard_operations_path)
+            .arg("--json")
+            .output()?;
+        assert!(
+            applied.status.success(),
+            "guard topology setup failed: {}",
+            String::from_utf8_lossy(&applied.stdout)
+        );
         let output = pot()
             .arg("inspect")
             .arg(&guard_project)
-            .args(["--id", inspect_id.as_str(), "--json"])
+            .args(["--id", node_id.as_str(), "--json"])
             .output()?;
         if guard_name == "transform_matrix_plain_mesh" && output.status.success() {
             let response: Value = serde_json::from_slice(&output.stdout)?;
@@ -2647,7 +2797,7 @@ fn blender_geometry_attribute_instance_domain_matches_depsgraph() -> TestResult 
         );
     }
     eprintln!(
-        "Blender 5.2.2 Geometry Attribute INSTANCE CLI matrices: import max error {maximum_error:.6e} across {} supported cases, {} separate guarded topologies, HALO particle matrix error {particle_error:.6e}",
+        "Blender 5.2.2 Geometry Attribute INSTANCE CLI matrices: import max error {maximum_error:.6e} across {} supported cases, {} guarded topologies, HALO particle matrix error {particle_error:.6e}",
         cases.len(),
         guard_cases.len()
     );

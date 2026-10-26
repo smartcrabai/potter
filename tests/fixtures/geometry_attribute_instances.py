@@ -572,6 +572,7 @@ expected = {
         ],
     },
 }
+
 os.makedirs(root, exist_ok=True)
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "geometry_attribute_instances.blend"))
 with open(os.path.join(root, "expected.json"), "w", encoding="utf-8") as handle:
@@ -587,6 +588,23 @@ def clear_generated_scene():
                 datablocks.remove(datablock)
 
 
+def save_combined_guards():
+    clear_generated_scene()
+    for guard in guards:
+        source = os.path.join(root, "guard_%s.blend" % guard["id"])
+        with bpy.data.libraries.load(source, link=False) as (data_from, data_to):
+            data_to.objects = list(data_from.objects)
+        for obj in data_to.objects:
+            if obj is not None:
+                scene.collection.objects.link(obj)
+    for obj in scene.objects:
+        for modifier in obj.modifiers:
+            modifier.show_viewport = False
+    bpy.ops.wm.save_as_mainfile(
+        filepath=os.path.join(root, "geometry_attribute_instances_guards.blend")
+    )
+
+
 def save_guard(
     name,
     feature_id,
@@ -597,7 +615,7 @@ def save_guard(
 ):
     clear_generated_scene()
     target, attribute, data_type, sample_index = build()
-    owner = bpy.data.objects.new("guard_owner", None)
+    owner = bpy.data.objects.new("guard_owner_" + name, None)
     scene.collection.objects.link(owner)
     constraint = owner.constraints.new("GEOMETRY_ATTRIBUTE")
     constraint.target = target
@@ -609,6 +627,7 @@ def save_guard(
     constraint.apply_target_transform = True
     constraint.mix_loc = True
     constraint.mix_rot = True
+    constraint.mute = True
     constraint.mix_scl = True
     scene.frame_set(1)
     bpy.context.view_layer.update()
@@ -853,6 +872,7 @@ save_plain_case(
     guard_transform_matrix_plain_mesh,
 )
 fresh_session_oracle = save_fresh_session_case()
+save_combined_guards()
 
 with open(os.path.join(root, "expected.json"), "r", encoding="utf-8") as handle:
     expected = json.load(handle)
