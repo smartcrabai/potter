@@ -499,6 +499,127 @@ fn physics_system_operations_persist_update_and_delete_settings() {
 }
 
 #[test]
+fn dynamic_paint_operations_create_layers_without_resurrecting_deleted_a() {
+    let directory = tempdir().unwrap();
+    let scene = directory.path().join("dynamic_paint_output_layers");
+    init_scene(&scene);
+    apply(
+        &scene,
+        &json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[
+                {"op":"node.create","id":"canvas","kind":"box","params":{"size":1.0}},
+                {
+                    "op":"physics.dynamic_paint.create",
+                    "target":{"id":"canvas"},
+                    "settings":{"role":"canvas","canvas_surfaces":[{
+                        "surface_type":"PAINT","surface_format":"VERTEX",
+                        "output_name_a":"PaintA","output_name_b":"PaintWetness",
+                        "use_output_a":true,"use_output_b":true
+                    }]}
+                }
+            ]
+        }),
+    );
+    let mut stored: Value =
+        serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let data_id = stored["nodes"]["canvas"]["data"].as_str().unwrap();
+    let mesh = &stored["data_blocks"][data_id]["mesh"];
+    for name in ["PaintA", "PaintWetness"] {
+        assert_eq!(mesh["attributes"][name]["type"], "color");
+        assert_eq!(mesh["attributes"][name]["domain"], "corner");
+        assert_eq!(
+            mesh["attributes"]["blender_metadata"]["color_data_types"][name],
+            "BYTE_COLOR"
+        );
+    }
+
+    apply(
+        &scene,
+        &json!({
+            "schema_version":1,
+            "base_revision":1,
+            "operations":[{
+                "op":"physics.dynamic_paint.update",
+                "target":{"id":"canvas"},
+                "set":{"canvas_surfaces":[{
+                    "surface_type":"PAINT","surface_format":"VERTEX",
+                    "output_name_a":"UpdatedA","output_name_b":"UpdatedB",
+                    "use_output_a":true,"use_output_b":true
+                }]}
+            }]
+        }),
+    );
+    stored = serde_json::from_slice(&fs::read(scene.join("scene.json")).unwrap()).unwrap();
+    let data_id = stored["nodes"]["canvas"]["data"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let attributes = stored["data_blocks"][data_id.as_str()]["mesh"]["attributes"]
+        .as_object()
+        .unwrap();
+    for name in ["UpdatedA", "UpdatedB"] {
+        assert_eq!(attributes[name]["domain"], "corner");
+        assert_eq!(
+            attributes["blender_metadata"]["color_data_types"][name],
+            "BYTE_COLOR"
+        );
+    }
+
+    let attributes = stored["data_blocks"][data_id.as_str()]["mesh"]["attributes"]
+        .as_object_mut()
+        .unwrap();
+    attributes.remove("UpdatedA");
+    let layer_store = attributes
+        .get_mut("color_layers")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    layer_store
+        .get_mut("layers")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .retain(|name| name.as_str() != Some("UpdatedA"));
+    if layer_store.get("active").and_then(Value::as_str) == Some("UpdatedA") {
+        layer_store.insert("active".to_owned(), json!("UpdatedB"));
+    }
+    let metadata = attributes
+        .get_mut("blender_metadata")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    metadata
+        .get_mut("color_data_types")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("UpdatedA");
+    if metadata.get("color_active_blender").and_then(Value::as_str) == Some("UpdatedA") {
+        metadata.insert("color_active_blender".to_owned(), json!("UpdatedB"));
+    }
+    fs::write(
+        scene.join("scene.json"),
+        serde_json::to_vec(&stored).unwrap(),
+    )
+    .unwrap();
+    let project = potter_core::store::Project::open(&scene).unwrap();
+    let data_id = potter_core::model::Id::new(data_id).unwrap();
+    let mesh = project.doc().data_blocks[&data_id].mesh.as_ref().unwrap();
+    assert!(
+        mesh.attributes.get("UpdatedA").is_none(),
+        "opening a current-schema project must not restore deleted output A"
+    );
+    assert_eq!(mesh.attributes["UpdatedB"]["domain"], "corner");
+    assert_eq!(mesh.attributes["UpdatedB"]["type"], "color");
+    assert_eq!(
+        mesh.attributes["blender_metadata"]["color_data_types"]["UpdatedB"],
+        "BYTE_COLOR"
+    );
+}
+
+#[test]
 fn fluid_smoke_and_fire_remain_honestly_unsupported() {
     let directory = tempdir().unwrap();
     let scene = directory.path().join("unsupported_smoke");
@@ -826,7 +947,7 @@ fn dynamic_paint_surface_frame_range_holds_the_end_brush_pose() {
                 {"op":"keyframe.insert","target":{"id":"brush"},"path":"transform.translation","index":0,"frame":1.0,"value":0.0,"interpolation":"linear"},
                 {"op":"keyframe.insert","target":{"id":"brush"},"path":"transform.translation","index":0,"frame":3.0,"value":0.0,"interpolation":"linear"},
                 {"op":"keyframe.insert","target":{"id":"brush"},"path":"transform.translation","index":0,"frame":4.0,"value":100.0,"interpolation":"linear"},
-                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_distance":4.0,"paint_alpha":1.0,"paint_color":[0.1,0.8,0.3]}},
+                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_source":"POINT","paint_distance":4.0,"paint_alpha":1.0,"paint_color":[0.1,0.8,0.3]}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"],"canvas_surfaces":[{"frame_start":2,"frame_end":3}]}}
             ]
         }),
@@ -905,7 +1026,7 @@ fn dynamic_paint_inverted_surface_range_stays_unpainted() {
             "operations":[
                 {"op":"node.create","id":"canvas","kind":"grid","params":{"size":2.0,"x_subdivisions":2,"y_subdivisions":2}},
                 {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1}},
-                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_distance":4.0,"paint_alpha":1.0}},
+                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_source":"POINT","paint_distance":4.0,"paint_alpha":1.0}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"],"canvas_surfaces":[{"frame_start":3,"frame_end":2}]}}
             ]
         }),
@@ -958,7 +1079,7 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
                 {"op":"physics.fluid.create","target":{"id":"flow"},"settings":{}},
                 {"op":"modifier.update","target":{"id":"flow"},"modifier_id":"physics_fluid","set":{"params":{"fluid_type":"FLOW"}}},
                 {"op":"physics.fluid.update","target":{"id":"flow"},"set":{"inflow_rate":2.0}},
-                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_distance":1.0,"paint_color":[0.1,0.8,0.3],"paint_alpha":1.0}},
+                {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_source":"POINT","paint_distance":1.0,"paint_color":[0.1,0.8,0.3],"paint_alpha":1.0}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"]}},
                 {"op":"physics.dynamic_paint.create","target":{"id":"weight_canvas"},"settings":{"role":"canvas","surface_format":"weight","brushes":["brush"]}}
             ]

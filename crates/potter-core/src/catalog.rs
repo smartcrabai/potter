@@ -1813,7 +1813,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint",
-            "Blender PAINT/VERTEX surfaces write one named primary color layer; WEIGHT/VERTEX surfaces accumulate point-brush influence into an existing named vertex group across integer frames and optionally dissolve it. Multiple surfaces, wetness output, unsupported brush sources, substeps, and baked caches remain refused.",
+            "Blender PAINT/VERTEX supports POINT proximity and VOLUME closed-mesh brushes with color and wetness replay, drying, dissolve, and named Corner BYTE_COLOR outputs; create/update ensures A and creates requested B layers, while schema 10 migrates missing A only for pre-10 native PAINT/VERTEX canvases and leaves Blender-imported canvases without toggled outputs untouched. Legacy native brushes without paint_source migrate to POINT using native radius or canvas radius only when their local Object.loc matches the old world origin; parented, constrained, or delta-transformed legacy brushes refuse migration. VOLUME requires an explicit PAINT/VERTEX surface; native radius and surface-less VOLUME use are refused. WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior influence into an existing named vertex group across integer frames and optionally dissolves it. Multiple surfaces, arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, and baked caches remain refused.",
             "DynamicPaint",
             &[
                 "physics.dynamic_paint.create",
@@ -1867,23 +1867,19 @@ pub fn feature_catalog() -> Value {
             &[],
             "Only VERTEX PAINT and WEIGHT surfaces are evaluated; IMAGE surfaces are refused with physics.dynamic_paint_surface.surface_format.",
         ),
-        unsupported(
+        supported(
             "physics.dynamic_paint_surface.output_name_b",
-            "Dynamic-paint secondary wetness output layers",
+            "Name of the PAINT/VERTEX secondary wetness output layer, written only when its Corner BYTE_COLOR layer exists",
             "DynamicPaintSurface",
-            &[],
-            "Potter writes only the primary named paint color output; secondary wetness layers are refused with physics.dynamic_paint_surface.output_name_b.",
-        ),
-        unsupported(
-            "physics.dynamic_paint_surface.use_output_b",
-            "Dynamic-paint wetness output",
-            "DynamicPaintSurface",
-            &[],
-            "The secondary wetness output layer is not evaluated; use_output_b=true is refused with physics.dynamic_paint_surface.use_output_b.",
+            &[
+                "physics.dynamic_paint.create",
+                "physics.dynamic_paint.update",
+            ],
+            [true, true, true, true, false, true, true],
         ),
         supported(
             "physics.dynamic_paint_surface.frame_start",
-            "A single PAINT/VERTEX surface stays unpainted before frame_start and for start>end; WEIGHT/VERTEX accumulates its point-brush weights and dissolve over integer frames in range. Both outputs are held from frame_end after the range.",
+            "A single PAINT/VERTEX surface replays color and wetness from frame_start and holds both outputs after frame_end; WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior weights and dissolve over integer frames in range. Start>end stays unpainted.",
             "DynamicPaintSurface",
             &[
                 "physics.dynamic_paint.create",
@@ -1897,6 +1893,27 @@ pub fn feature_catalog() -> Value {
             "DynamicPaintCanvas",
             &[],
             "Blender evaluates each surface with its own point-cache range and output layer; Potter's result model supports only one surface per canvas and refuses multiple surfaces.",
+        ),
+        unsupported(
+            "physics.dynamic_paint_brush.legacy_transform",
+            "Legacy native Dynamic Paint brushes with non-local transforms",
+            "DynamicPaintBrush",
+            &[],
+            "Schema 10 refuses to migrate no-source native brushes with parents, constraints, or nondefault delta transforms because POINT would move the old world-origin paint center.",
+        ),
+        unsupported(
+            "physics.dynamic_paint_canvas.volume_without_surface",
+            "VOLUME brushes on native canvases without an explicit surface",
+            "DynamicPaintCanvas",
+            &[],
+            "VOLUME requires a PAINT/VERTEX surface to construct its brush-mesh mask; surface-less native canvases refuse VOLUME instead of silently painting with radius zero.",
+        ),
+        unsupported(
+            "physics.dynamic_paint_brush.radius",
+            "Potter-native radius on VOLUME brushes",
+            "DynamicPaintBrush",
+            &[],
+            "Potter-native radius is used by POINT brushes; VOLUME brushes derive their paint region from the brush mesh and reject native radius.",
         ),
         unsupported(
             "physics.dynamic_paint_surface.topology",
@@ -1931,7 +1948,7 @@ pub fn feature_catalog() -> Value {
             "Dynamic paint surface types and stateful canvas evolution",
             "DynamicPaint",
             &[],
-            "Potter evaluates PAINT/VERTEX color proximity and WEIGHT/VERTEX point-brush accumulation/dissolve, but not arbitrary point-cache history, wetness or PAINT drying/dissolve, non-POINT WEIGHT brush sources, ramp falloff, nonzero surface substeps, or DISPLACE/WAVE. Baked caches and multiple surfaces per canvas are refused.",
+            "Potter replays PAINT/VERTEX POINT and VOLUME color/wetness and WEIGHT/VERTEX POINT and VOLUME weight brushes, but not arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, or DISPLACE/WAVE. Baked caches and multiple surfaces per canvas are refused.",
         ),
         unsupported(
             "physics.collision.blender_collision_model",

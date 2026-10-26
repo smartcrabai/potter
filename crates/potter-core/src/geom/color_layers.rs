@@ -260,6 +260,108 @@ pub(crate) fn read(mesh: &Mesh) -> ColorStore {
         render: name("render"),
     }
 }
+/// Blender Dynamic Paint VERTEX PAINT outputs exist only for named CORNER `BYTE_COLOR` layers.
+pub(crate) fn has_blender_byte_color_corner_layer(mesh: &Mesh, name: &str) -> bool {
+    let Some(attribute) = mesh
+        .attributes
+        .get(attribute_keys::storage_key(name).as_ref())
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    attribute.get("type").and_then(Value::as_str) == Some(COLOR_TYPE)
+        && attribute.get("domain").and_then(Value::as_str) == Some("corner")
+        && mesh
+            .attributes
+            .get("blender_metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("color_data_types"))
+            .and_then(Value::as_object)
+            .and_then(|types| types.get(name))
+            .and_then(Value::as_str)
+            == Some("BYTE_COLOR")
+}
+
+/// Ensures a Dynamic Paint PAINT output layer as Blender's `ED_mesh_color_add` does.
+pub(crate) fn ensure_byte_color_corner_layer(mesh: &mut Mesh, name: &str) -> Result<bool> {
+    if has_blender_byte_color_corner_layer(mesh, name) {
+        return Ok(false);
+    }
+    let storage_key = attribute_keys::storage_key(name);
+    if mesh.attributes.contains_key(storage_key.as_ref()) {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Dynamic Paint output name conflicts with a non-BYTE_COLOR attribute",
+            json!({"output_name":name}),
+        ));
+    }
+    let mut store = read(mesh);
+    if store.index_of(name).is_some() {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "Dynamic Paint output name conflicts with an incompatible color layer",
+            json!({"output_name":name}),
+        ));
+    }
+    let corner_count = mesh.faces.iter().try_fold(0_usize, |count, face| {
+        count.checked_add(face.vertices.len())
+    });
+    let corner_count = corner_count.ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "mesh corner count overflows usize",
+        )
+    })?;
+    let inherited = store.active.as_ref().and_then(|active| {
+        has_blender_byte_color_corner_layer(mesh, active)
+            .then(|| {
+                store
+                    .layers
+                    .iter()
+                    .find(|layer| layer.name == *active && layer.domain == ColorDomain::Corner)
+            })
+            .flatten()
+            .map(|layer| layer.values.clone())
+    });
+    let values = (0..corner_count)
+        .map(|index| {
+            inherited
+                .as_ref()
+                .and_then(|values| values.get(index))
+                .copied()
+                .unwrap_or([0.0; 4])
+        })
+        .collect();
+    store.layers.push(ColorLayer {
+        name: name.to_owned(),
+        domain: ColorDomain::Corner,
+        values,
+    });
+    store.active = Some(name.to_owned());
+    write(mesh, &store);
+    let metadata = mesh
+        .attributes
+        .entry("blender_metadata".to_owned())
+        .or_insert_with(|| json!({}));
+    let metadata = metadata.as_object_mut().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "blender_metadata must be an object",
+        )
+    })?;
+    let color_data_types = metadata
+        .entry("color_data_types".to_owned())
+        .or_insert_with(|| json!({}));
+    let color_data_types = color_data_types.as_object_mut().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "blender_metadata.color_data_types must be an object",
+        )
+    })?;
+    color_data_types.insert(name.to_owned(), json!("BYTE_COLOR"));
+    metadata.insert("color_active_blender".to_owned(), json!(name));
+    Ok(true)
+}
 
 fn read_layer(mesh: &Mesh, name: &str) -> Option<ColorLayer> {
     let attribute = mesh

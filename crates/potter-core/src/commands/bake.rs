@@ -195,6 +195,12 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                     .filter(|(id, _)| matches_target(id))
                     .map(|(id, colors)| (id.to_string(), json!(colors)))
                     .collect::<BTreeMap<_, _>>();
+                let paint_wetness = snapshot
+                    .paint_wetness
+                    .iter()
+                    .filter(|(id, _)| matches_target(id))
+                    .map(|(id, values)| (id.to_string(), json!(values)))
+                    .collect::<BTreeMap<_, _>>();
                 let paint_weights = snapshot
                     .paint_weights
                     .iter()
@@ -215,6 +221,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                         "particles":particles,
                         "fluid_particles":fluid_particles,
                         "paint_colors":paint_colors,
+                        "paint_wetness":paint_wetness,
                         "paint_weights":paint_weights
                     }),
                 )?;

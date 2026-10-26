@@ -9825,7 +9825,8 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         .flatten()
         .filter_map(|item| item.get("bridge_id").and_then(Value::as_str))
         .collect();
-    let (weight_brush_objects, other_brush_objects) = dynamic_paint_brush_objects(raw);
+    let (weight_brush_objects, paint_brush_objects, other_brush_objects) =
+        dynamic_paint_brush_objects(raw);
     // Particle texture slots (`psys_get_texture`) that Potter cannot apply are reported. Potter applies
     // the time, life, density, and size channels with GLOBAL or OBJECT coordinates; a texture without a
     // Potter record is not applied. A slot that maps no channel does nothing and is not reported.
@@ -10187,6 +10188,7 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     kind,
                     settings,
                     &weight_brush_objects,
+                    &paint_brush_objects,
                     &other_brush_objects,
                     &collection_bridge_ids,
                 ));
@@ -10576,8 +10578,8 @@ fn collection_object_names<'a>(
     objects
 }
 
-/// Dynamic Paint brush objects selected by WEIGHT or other canvas surfaces in their scene.
-fn dynamic_paint_brush_objects(raw: &Value) -> (BTreeSet<&str>, BTreeSet<&str>) {
+/// Dynamic Paint brush objects selected by WEIGHT, PAINT, or other canvas surfaces in their scene.
+fn dynamic_paint_brush_objects(raw: &Value) -> (BTreeSet<&str>, BTreeSet<&str>, BTreeSet<&str>) {
     let objects = raw
         .get("objects")
         .and_then(Value::as_array)
@@ -10614,6 +10616,7 @@ fn dynamic_paint_brush_objects(raw: &Value) -> (BTreeSet<&str>, BTreeSet<&str>) 
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
     let mut weight_used = BTreeSet::new();
+    let mut paint_used = BTreeSet::new();
     let mut other_used = BTreeSet::new();
     for canvas in objects {
         let Some(canvas_name) = canvas.get("name").and_then(Value::as_str) else {
@@ -10658,11 +10661,7 @@ fn dynamic_paint_brush_objects(raw: &Value) -> (BTreeSet<&str>, BTreeSet<&str>) 
                     .get("surface_type")
                     .and_then(Value::as_str)
                     .unwrap_or("PAINT");
-                let used_brushes = if surface_type == "WEIGHT" {
-                    &mut weight_used
-                } else {
-                    &mut other_used
-                };
+                let is_weight = surface_type == "WEIGHT";
                 for scene in scenes {
                     let Some(root) = scene.get("root_collection").and_then(Value::as_str) else {
                         continue;
@@ -10671,17 +10670,26 @@ fn dynamic_paint_brush_objects(raw: &Value) -> (BTreeSet<&str>, BTreeSet<&str>) 
                     if !scene_members.contains(canvas_name) {
                         continue;
                     }
-                    used_brushes.extend(brush_names.iter().copied().filter(|name| {
+                    for name in brush_names.iter().copied().filter(|name| {
                         scene_members.contains(name)
                             && brush_collection_members
                                 .as_ref()
                                 .is_none_or(|members| members.contains(name))
-                    }));
+                    }) {
+                        if is_weight {
+                            weight_used.insert(name);
+                        } else {
+                            other_used.insert(name);
+                            if surface_type == "PAINT" {
+                                paint_used.insert(name);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    (weight_used, other_used)
+    (weight_used, paint_used, other_used)
 }
 
 /// Maps imported Blender Collection references in a physics block to Potter collection IDs. Every other pointer is cleared;
@@ -10717,16 +10725,17 @@ fn resolve_physics_collection_references(
     }
 }
 
-/// Blender physics settings that Potter keeps but does not evaluate. `settings` is the bridge dump of one modifier's physics
-/// block, scoped by `blender_physics_system`. Each property that the block holds away from its Blender default, and that Potter
-/// does not evaluate, is a loss. `weight_brush_objects` contains brushes selected by WEIGHT surfaces; `collections` contains
-/// imported bridge identities.
+/// Blender physics settings retained but not evaluated. Each property away from its Blender
+/// default is a loss unless this setting block is consumed. Brush membership sets identify the
+/// WEIGHT and PAINT surfaces that select a brush; the non-WEIGHT set excludes shared brushes from
+/// the WEIGHT-only rule.
 fn physics_import_losses(
     object_name: Option<&str>,
     modifier_name: Option<&str>,
     modifier_type: &str,
     settings: &Value,
     weight_brush_objects: &BTreeSet<&str>,
+    paint_brush_objects: &BTreeSet<&str>,
     other_brush_objects: &BTreeSet<&str>,
     collections: &BTreeSet<&str>,
 ) -> Vec<Loss> {
@@ -10737,6 +10746,8 @@ fn physics_import_losses(
         && object_name.is_some_and(|name| {
             weight_brush_objects.contains(name) && !other_brush_objects.contains(name)
         });
+    let paint_brush_used = system == "dynamic_paint_brush"
+        && object_name.is_some_and(|name| paint_brush_objects.contains(name));
     let mut losses = Vec::new();
     if let Some(block) = settings.as_object() {
         collect_physics_import_losses(
@@ -10744,6 +10755,7 @@ fn physics_import_losses(
             block,
             modifier_name,
             weight_brush_used,
+            paint_brush_used,
             collections,
             &mut losses,
         );
@@ -10756,6 +10768,7 @@ fn collect_physics_import_losses(
     block: &Map<String, Value>,
     owner: Option<&str>,
     weight_brush_used: bool,
+    paint_brush_used: bool,
     collections: &BTreeSet<&str>,
     losses: &mut Vec<Loss>,
 ) {
@@ -10775,6 +10788,7 @@ fn collect_physics_import_losses(
                         nested_block,
                         owner,
                         weight_brush_used,
+                        paint_brush_used,
                         collections,
                         losses,
                     );
@@ -10786,6 +10800,7 @@ fn collect_physics_import_losses(
                             nested_block,
                             owner,
                             weight_brush_used,
+                            paint_brush_used,
                             collections,
                             losses,
                         );
@@ -10798,8 +10813,13 @@ fn collect_physics_import_losses(
         if !crate::physics_support::is_semantic_when(system, key, block) {
             continue;
         }
-        let consumed =
-            crate::physics_support::is_honoured_property(system, key, block, weight_brush_used);
+        let consumed = crate::physics_support::is_honoured_dynamic_paint_brush_property(
+            system,
+            key,
+            block,
+            weight_brush_used,
+            paint_brush_used,
+        );
         if let Some(bridge_id) = collection_pointer_bridge_id(value) {
             // A consumed pointer to an imported collection is mapped on import; every other pointer is cleared there.
             if !(consumed && collections.contains(bridge_id)) {
@@ -20735,7 +20755,7 @@ mod volume_and_physics_loss_tests {
     }
 
     #[test]
-    fn dynamic_paint_brush_erase_and_constant_falloff_only_skip_losses_when_used_by_weight() {
+    fn dynamic_paint_brush_falloff_is_honoured_when_used_by_paint_or_weight() {
         let brush = |name: &str| {
             json!({
                 "name": name,
@@ -20834,10 +20854,7 @@ mod volume_and_physics_loss_tests {
             .collect();
         assert_eq!(
             brush_losses,
-            [
-                "blender.physics.dynamic_paint_brush.proximity_falloff",
-                "blender.physics.dynamic_paint_brush.use_paint_erase"
-            ]
+            ["blender.physics.dynamic_paint_brush.use_paint_erase"]
         );
     }
 

@@ -1,4 +1,4 @@
-//! Deterministic vertex colors from world-space dynamic-paint brush proximity.
+//! Deterministic vertex colors from point-brush proximity and volume-mesh interior coverage.
 
 use glam::{DMat4, DVec3};
 
@@ -11,6 +11,264 @@ const MAX_DISTANCE_CHECKS: usize = 20_000_000;
 const MAX_PAINT_VERTICES: usize = 1_000_000;
 const MAX_BRUSH_POSITIONS: usize = 1_000_000;
 
+/// Persistent PAINT/VERTEX state for one canvas vertex.
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PaintPoint {
+    dry: [f32; 4],
+    wet: [f32; 4],
+    wetness: f32,
+    painted: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PaintSettings {
+    pub(crate) influence_scale: f32,
+    pub(crate) use_drying: bool,
+    pub(crate) dry_speed: f32,
+    pub(crate) dry_log: bool,
+    pub(crate) color_dry_threshold: f32,
+    pub(crate) use_dissolve: bool,
+    pub(crate) dissolve_speed: f32,
+    pub(crate) dissolve_log: bool,
+}
+
+/// Advance one Blender PAINT/VERTEX frame. Blender dries and dissolves old paint before brushes
+/// update the surface, then exposes the blended color and the independent wetness value.
+pub(crate) fn paint_step(
+    canvas: &Mesh,
+    canvas_world: DMat4,
+    brushes: &[super::DynamicPaintBrush],
+    points: &mut [PaintPoint],
+    settings: PaintSettings,
+) -> Result<()> {
+    if !canvas_world.is_finite()
+        || !settings.influence_scale.is_finite()
+        || settings.influence_scale < 0.0
+        || points.len() != canvas.vertices.len()
+        || (settings.use_drying && (!settings.dry_speed.is_finite() || settings.dry_speed <= 0.0))
+        || (settings.use_dissolve
+            && (!settings.dissolve_speed.is_finite() || settings.dissolve_speed <= 0.0))
+        || brushes.iter().any(|brush| {
+            brush
+                .volume_mask
+                .as_ref()
+                .is_some_and(|mask| mask.len() != canvas.vertices.len())
+        })
+    {
+        return Err(invalid("dynamic-paint paint inputs are invalid"));
+    }
+    if canvas.vertices.len() > MAX_PAINT_VERTICES || brushes.len() > MAX_BRUSH_POSITIONS {
+        return Err(limit("dynamic paint input exceeds limits"));
+    }
+    let checks = canvas
+        .vertices
+        .len()
+        .checked_mul(brushes.len())
+        .ok_or_else(|| limit("dynamic paint distance work exceeds limits"))?;
+    if checks > MAX_DISTANCE_CHECKS {
+        return Err(limit("dynamic paint distance work exceeds limits"));
+    }
+    if brushes.iter().any(|brush| {
+        !brush.position.is_finite()
+            || !brush.radius.is_finite()
+            || brush.radius < 0.0
+            || !brush.strength.is_finite()
+            || !brush.wetness.is_finite()
+            || !(0.0..=1.0).contains(&brush.strength)
+            || brush.color.iter().any(|component| !component.is_finite())
+            || !(brush.wetness as f32).is_finite()
+    }) || points.iter().any(|point| {
+        point
+            .dry
+            .iter()
+            .chain(&point.wet)
+            .any(|value| !value.is_finite())
+            || !point.wetness.is_finite()
+    }) {
+        return Err(invalid("dynamic-paint paint values must be finite"));
+    }
+    let has_point_brush = brushes.iter().any(|brush| brush.volume_mask.is_none());
+
+    for (vertex_index, (vertex, point)) in canvas.vertices.iter().zip(points.iter_mut()).enumerate()
+    {
+        if !vertex.co.is_finite() {
+            return Err(invalid("dynamic paint canvas contains a non-finite vertex"));
+        }
+        let position = if has_point_brush {
+            let position = canvas_world.transform_point3(vertex.co);
+            if !position.is_finite() {
+                return Err(invalid(
+                    "dynamic paint transform produced a non-finite vertex",
+                ));
+            }
+            position
+        } else {
+            DVec3::ZERO
+        };
+        if settings.use_drying {
+            if point.wetness >= 0.001 {
+                let previous_wetness = point.wetness;
+                point.wetness =
+                    dissolve_value(point.wetness, settings.dry_speed, settings.dry_log).max(0.0);
+                if point.wetness < settings.color_dry_threshold {
+                    let blended = blend_paint_colors(point.dry, point.wet);
+                    let dry_ratio = point.wetness / previous_wetness;
+                    point.wet[3] *= dry_ratio;
+                    point.dry[3] = (blended[3] - point.wet[3]) / (1.0 - point.wet[3]);
+                    if point.dry[3] != 0.0 {
+                        for component in 0..3 {
+                            point.dry[component] = (blended[component] * blended[3]
+                                - point.wet[component] * point.wet[3])
+                                / (point.dry[3] * (1.0 - point.wet[3]));
+                        }
+                    }
+                }
+            } else if point.painted {
+                point.dry = blend_paint_colors(point.dry, point.wet);
+                point.wetness = 0.0;
+                point.wet[3] = 0.0;
+            }
+        }
+        if settings.use_dissolve {
+            point.dry[3] =
+                dissolve_value(point.dry[3], settings.dissolve_speed, settings.dissolve_log)
+                    .max(0.0);
+            point.wet[3] =
+                dissolve_value(point.wet[3], settings.dissolve_speed, settings.dissolve_log)
+                    .max(0.0);
+        }
+
+        for brush in brushes {
+            let influence = if let Some(mask) = &brush.volume_mask {
+                if !mask[vertex_index] {
+                    continue;
+                }
+                1.0
+            } else {
+                if brush.radius == 0.0 {
+                    continue;
+                }
+                let distance = position.distance(brush.position);
+                if distance > brush.radius {
+                    continue;
+                }
+                if brush.constant_falloff {
+                    1.0
+                } else {
+                    1.0 - distance / brush.radius
+                }
+            };
+            if influence < 0.001 {
+                continue;
+            }
+            let strength = (influence * brush.strength * f64::from(settings.influence_scale))
+                .clamp(0.0, 1.0) as f32;
+            let source_alpha = strength;
+            let paint_wetness = brush.wetness as f32 * strength;
+            let previous_alpha = point.wet[3];
+            let mixed_alpha = previous_alpha * (1.0 - source_alpha) + source_alpha;
+            if mixed_alpha != 0.0 {
+                for component in 0..3 {
+                    point.wet[component] =
+                        (point.wet[component] * previous_alpha * (1.0 - source_alpha)
+                            + brush.color[component] as f32 * source_alpha)
+                            / mixed_alpha;
+                }
+            }
+            if brush.absolute_alpha {
+                point.wet[3] = previous_alpha.max(strength);
+                point.wetness = point.wetness.max(paint_wetness);
+            } else {
+                point.wet[3] = mixed_alpha;
+                let wetness = paint_wetness.clamp(0.0, 1.0);
+                point.wetness = point.wetness * (1.0 - wetness) + wetness;
+            }
+            point.wetness = point.wetness.max(0.001);
+            point.painted = true;
+        }
+    }
+    if points.iter().any(|point| {
+        point
+            .dry
+            .iter()
+            .chain(&point.wet)
+            .any(|value| !value.is_finite())
+            || !point.wetness.is_finite()
+    }) {
+        return Err(invalid("dynamic-paint paint output is not finite"));
+    }
+    Ok(())
+}
+
+pub(crate) fn paint_output(points: &[PaintPoint]) -> Vec<[f64; 4]> {
+    points
+        .iter()
+        .map(|point| vertex_color_attribute(blend_paint_colors(point.dry, point.wet)))
+        .collect()
+}
+
+pub(crate) fn paint_wetness_output(points: &[PaintPoint]) -> Vec<f64> {
+    points
+        .iter()
+        .map(|point| f64::from(point.wetness))
+        .collect()
+}
+pub(crate) fn wetness_color_attribute(wetness: f64) -> [f64; 4] {
+    let channel = srgb_byte_to_linear(wetness as f32);
+    [
+        f64::from(channel),
+        f64::from(channel),
+        f64::from(channel),
+        1.0,
+    ]
+}
+
+fn vertex_color_attribute(color: [f32; 4]) -> [f64; 4] {
+    [
+        f64::from(srgb_byte_to_linear(color[0])),
+        f64::from(srgb_byte_to_linear(color[1])),
+        f64::from(srgb_byte_to_linear(color[2])),
+        f64::from(unit_float_to_uchar_clamp(color[3])),
+    ]
+}
+
+fn srgb_byte_to_linear(value: f32) -> f32 {
+    let srgb = unit_float_to_uchar_clamp(value);
+    if srgb < 0.04045 {
+        srgb * (1.0 / 12.92)
+    } else {
+        ((srgb + 0.055) * (1.0 / 1.055)).powf(2.4)
+    }
+}
+
+fn unit_float_to_uchar_clamp(value: f32) -> f32 {
+    (value.clamp(0.0, 1.0) * 255.0).round() / 255.0
+}
+
+fn dissolve_value(value: f32, time: f32, is_log: bool) -> f32 {
+    if is_log {
+        value * 0.001_f32.powf(1.0 / (1.2 * time))
+    } else {
+        value - 1.0 / time
+    }
+}
+
+fn blend_paint_colors(dry: [f32; 4], wet: [f32; 4]) -> [f32; 4] {
+    let inverse_alpha = 1.0 - wet[3];
+    let alpha = dry[3] * inverse_alpha + wet[3];
+    let mut result = [0.0; 4];
+    if alpha == 0.0 {
+        result[..3].copy_from_slice(&dry[..3]);
+    } else {
+        for component in 0..3 {
+            result[component] =
+                (dry[component] * dry[3] * inverse_alpha + wet[component] * wet[3]) / alpha;
+        }
+    }
+    result[3] = alpha;
+    result
+}
 /// Paint vertex colors using the strongest brush influence at each mesh vertex.
 ///
 /// Results follow `canvas.vertices` storage order. Uncovered vertices are transparent
@@ -104,7 +362,7 @@ pub fn paint(
     }
     Ok(output)
 }
-/// Apply one Blender WEIGHT frame's point-brush updates to the persistent vertex weights.
+/// Apply one Blender WEIGHT frame's point- or volume-brush updates to persistent vertex weights.
 pub(crate) fn paint_weight_step(
     canvas: &Mesh,
     canvas_world: DMat4,
@@ -116,6 +374,12 @@ pub(crate) fn paint_weight_step(
         || !influence_scale.is_finite()
         || influence_scale < 0.0
         || weights.len() != canvas.vertices.len()
+        || brushes.iter().any(|brush| {
+            brush
+                .volume_mask
+                .as_ref()
+                .is_some_and(|mask| mask.len() != canvas.vertices.len())
+        })
     {
         return Err(invalid("dynamic-paint weight inputs are invalid"));
     }
@@ -142,24 +406,37 @@ pub(crate) fn paint_weight_step(
     {
         return Err(invalid("dynamic-paint weight values are invalid"));
     }
+    let has_point_brush = brushes.iter().any(|brush| brush.volume_mask.is_none());
 
-    for (vertex, weight) in canvas.vertices.iter().zip(weights) {
-        let point = canvas_world.transform_point3(vertex.co);
-        if !point.is_finite() {
-            return Err(invalid("dynamic-paint canvas points must be finite"));
-        }
+    for (vertex_index, (vertex, weight)) in canvas.vertices.iter().zip(weights).enumerate() {
+        let point = if has_point_brush {
+            let point = canvas_world.transform_point3(vertex.co);
+            if !point.is_finite() {
+                return Err(invalid("dynamic-paint canvas points must be finite"));
+            }
+            point
+        } else {
+            DVec3::ZERO
+        };
         for brush in brushes {
-            if brush.radius == 0.0 {
-                continue;
-            }
-            let distance = point.distance(brush.position);
-            if distance > brush.radius {
-                continue;
-            }
-            let influence = if brush.constant_falloff {
+            let influence = if let Some(mask) = &brush.volume_mask {
+                if !mask[vertex_index] {
+                    continue;
+                }
                 1.0
             } else {
-                1.0 - distance / brush.radius
+                if brush.radius == 0.0 {
+                    continue;
+                }
+                let distance = point.distance(brush.position);
+                if distance > brush.radius {
+                    continue;
+                }
+                if brush.constant_falloff {
+                    1.0
+                } else {
+                    1.0 - distance / brush.radius
+                }
             };
             if influence < 0.001 {
                 continue;
@@ -190,6 +467,7 @@ mod tests {
 
     use crate::{
         geom::{Mesh, Vertex},
+        model::Id,
         sim::DynamicPaintBrush,
     };
 
@@ -260,22 +538,32 @@ mod tests {
             ..Mesh::default()
         };
         let brush = DynamicPaintBrush {
+            node_id: Id::new("brush".to_owned()).expect("valid test brush ID"),
             position: DVec3::ZERO,
             radius: 2.0,
             color: [0.0; 4],
             strength: 0.8,
+            wetness: 1.0,
+            absolute_alpha: true,
             erase: false,
             constant_falloff: false,
+            volume_mask: None,
         };
         let mut weights = vec![0.0; 3];
-        paint_weight_step(&canvas, DMat4::IDENTITY, &[brush], &mut weights, 1.0)
-            .expect("painting weights succeeds");
+        paint_weight_step(
+            &canvas,
+            DMat4::IDENTITY,
+            std::slice::from_ref(&brush),
+            &mut weights,
+            1.0,
+        )
+        .expect("painting weights succeeds");
         assert_eq!(weights, [0.8, 0.4, 0.0]);
 
         let eraser = DynamicPaintBrush {
             strength: 0.5,
             erase: true,
-            ..brush
+            ..brush.clone()
         };
         paint_weight_step(&canvas, DMat4::IDENTITY, &[eraser], &mut weights, 1.0)
             .expect("erasing weights succeeds");

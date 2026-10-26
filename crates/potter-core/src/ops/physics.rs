@@ -636,6 +636,9 @@ fn apply_physics_system(
             node.properties
                 .insert(property.to_owned(), Value::Object(settings));
             ensure_physics_stack_modifier(engine, &target, canonical_system, "DOMAIN")?;
+            if canonical_system == "dynamic_paint" {
+                ensure_dynamic_paint_output_layers_for_node(engine, &target)?;
+            }
             engine.mark("nodes", &target, ChangeKind::Updated);
             Ok(true)
         }
@@ -734,6 +737,9 @@ fn apply_physics_system(
                     }
                 }
             }
+            if canonical_system == "dynamic_paint" {
+                changed |= ensure_dynamic_paint_output_layers_for_node(engine, &target)?;
+            }
             changed |= ensure_physics_stack_modifier(engine, &target, canonical_system, "NONE")?;
             if !changed {
                 return Ok(false);
@@ -771,6 +777,40 @@ fn apply_physics_system(
             &operation_pointer(engine.operation_index, "op"),
         )),
     }
+}
+
+fn ensure_dynamic_paint_output_layers_for_node(
+    engine: &mut Engine<'_>,
+    target: &Id,
+) -> Result<bool> {
+    let (data_id, settings) = {
+        let node =
+            engine.doc.nodes.get(target).ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "physics target disappeared")
+            })?;
+        let Some(settings) = node.properties.get("physics_dynamic_paint").cloned() else {
+            return Ok(false);
+        };
+        let Some(data_id) = node.data.clone() else {
+            return Ok(false);
+        };
+        (data_id, settings)
+    };
+    let changed = {
+        let Some(mesh) = engine
+            .doc
+            .data_blocks
+            .get_mut(&data_id)
+            .and_then(|data| data.mesh.as_mut())
+        else {
+            return Ok(false);
+        };
+        crate::sim::ensure_dynamic_paint_output_layers(mesh, &settings, true)?
+    };
+    if changed {
+        engine.mark("data_blocks", &data_id, ChangeKind::Updated);
+    }
+    Ok(changed)
 }
 
 fn physics_modifier_type(system: &str) -> &'static str {
@@ -1856,6 +1896,21 @@ fn validate_physics_settings(
     system: &str,
     settings: &Map<String, Value>,
 ) -> Result<()> {
+    if system == "dynamic_paint"
+        && settings.get("role").and_then(Value::as_str) == Some("brush")
+        && settings.get("radius").is_some()
+        && settings
+            .get("paint_source")
+            .and_then(Value::as_str)
+            .unwrap_or("VOLUME")
+            == "VOLUME"
+    {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "native radius is only supported for POINT Dynamic Paint brushes",
+            json!({"feature_id":"physics.dynamic_paint_brush.radius","property":"radius","status":"not_supported"}),
+        ));
+    }
     let (blender_system, native): (Option<&str>, &[&str]) = match system {
         "cloth" => (Some("cloth"), &["iterations", "collision_settings"]),
         "soft_body" => (Some("soft_body"), &["substeps", "iterations"]),
@@ -1886,7 +1941,21 @@ fn validate_physics_settings(
             ));
         }
         let valid = if blender {
-            blender_setting_valid(field, value)
+            if system == "dynamic_paint"
+                && field == "proximity_falloff"
+                && settings.get("role").and_then(Value::as_str) == Some("brush")
+                && settings
+                    .get("paint_source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("VOLUME")
+                    == "VOLUME"
+            {
+                value
+                    .as_str()
+                    .is_some_and(|falloff| matches!(falloff, "SMOOTH" | "CONSTANT" | "RAMP"))
+            } else {
+                blender_setting_valid(field, value)
+            }
         } else {
             native_setting_valid(field, value)
         };
