@@ -267,7 +267,7 @@ fn legacy_dynamic_paint_ui_mismatch_migrates_canvas_radius_without_rewriting_ui_
         &json!([{"op":"node.create","id":"migration_commit","kind":"empty","params":{}}]),
     );
     let after = scene_document(&scene);
-    assert_eq!(after["schema_version"], 10);
+    assert_eq!(after["schema_version"], 11);
     assert_eq!(
         after["nodes"]["brush"]["properties"]["physics_dynamic_paint"]["paint_source"],
         "POINT"

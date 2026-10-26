@@ -25,6 +25,8 @@ use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::evaluator::EvaluatedInstances;
+
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::Mesh,
@@ -54,6 +56,8 @@ pub enum NodeBakeValue {
         mesh: Mesh,
         #[serde(default)]
         instance_paths: Vec<Vec<Id>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_columns: Option<Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         material_refs: Vec<Id>,
     },
@@ -307,9 +311,13 @@ pub(crate) fn validate_node_bake_frame(frame: &NodeBakeFrame) -> Result<()> {
             NodeBakeValue::Geometry {
                 mesh,
                 instance_paths,
+                instance_columns,
                 material_refs,
             } => {
                 if mesh.validate().is_err()
+                    || instance_columns
+                        .as_ref()
+                        .is_some_and(|columns| !valid_bake_instance_columns(columns))
                     || instance_paths
                         .iter()
                         .flatten()
@@ -349,6 +357,23 @@ pub(crate) fn validate_node_bake_frame(frame: &NodeBakeFrame) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn valid_bake_instance_columns(value: &Value) -> bool {
+    let Ok(columns) = serde_json::from_value::<EvaluatedInstances>(value.clone()) else {
+        return false;
+    };
+    let instance_count = columns.transforms.len();
+    columns
+        .transforms
+        .iter()
+        .flatten()
+        .all(|component| component.is_finite())
+        && columns.attributes.iter().all(|(name, column)| {
+            !name.is_empty()
+                && !column.data_type.trim().is_empty()
+                && column.values.len() == instance_count
+        })
 }
 
 /// Keys of a settings-only bake entry: Blender bake settings with no baked data.
@@ -535,6 +560,7 @@ pub(crate) fn node_bake_frame_memory_bytes(frame: &NodeBakeFrame) -> usize {
                 NodeBakeValue::Geometry {
                     mesh,
                     instance_paths,
+                    instance_columns,
                     material_refs,
                 } => {
                     let mesh_bytes = mesh
@@ -579,14 +605,21 @@ pub(crate) fn node_bake_frame_memory_bytes(frame: &NodeBakeFrame) -> usize {
                             )
                         },
                     );
-                    mesh_bytes.saturating_add(paths_bytes).saturating_add(
-                        material_refs
-                            .capacity()
-                            .saturating_mul(size_of::<Id>())
-                            .saturating_add(material_refs.iter().fold(0_usize, |total, id| {
-                                total.saturating_add(id.as_str().len().saturating_add(16))
-                            })),
-                    )
+                    mesh_bytes
+                        .saturating_add(
+                            instance_columns
+                                .as_ref()
+                                .map_or(0, estimate_json_value_dynamic),
+                        )
+                        .saturating_add(paths_bytes)
+                        .saturating_add(
+                            material_refs
+                                .capacity()
+                                .saturating_mul(size_of::<Id>())
+                                .saturating_add(material_refs.iter().fold(0_usize, |total, id| {
+                                    total.saturating_add(id.as_str().len().saturating_add(16))
+                                })),
+                        )
                 }
                 NodeBakeValue::Scalar { value } => estimate_json_value_dynamic(value),
                 NodeBakeValue::Field { attribute_name } => attribute_name.len().saturating_add(16),
@@ -2032,5 +2065,28 @@ mod tests {
         assert!(validate_node_bake_config(&float_start).is_err());
         let missing_end = json!({"use_custom_simulation_frame_range": true, "frame_start": 1});
         assert!(validate_node_bake_config(&missing_end).is_err());
+    }
+
+    #[test]
+    fn geometry_bake_without_instance_columns_migrates_to_empty() {
+        let legacy = json!({
+            "type": "geometry",
+            "mesh": serde_json::to_value(crate::geom::Mesh::new()).unwrap(),
+            "instance_paths": [],
+            "material_refs": []
+        });
+        let baked: NodeBakeValue = serde_json::from_value(legacy).unwrap();
+        let NodeBakeValue::Geometry {
+            instance_columns, ..
+        } = baked
+        else {
+            panic!("legacy geometry bake changed type");
+        };
+        let columns = instance_columns
+            .map(serde_json::from_value::<crate::graph::EvaluatedInstances>)
+            .transpose()
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(columns, crate::graph::EvaluatedInstances::default());
     }
 }

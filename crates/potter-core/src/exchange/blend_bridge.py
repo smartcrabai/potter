@@ -1071,7 +1071,7 @@ def tree_dump(tree):
     for node in tree.nodes:
         sockets = []
         for socket in node.inputs:
-            if node.bl_idname == "GeometryNodeTransform" and socket.name in ("Mode", "Transform", "Rotation"):
+            if node.bl_idname == "GeometryNodeTransform" and socket.name == "Transform":
                 continue
             if not socket.name:
                 continue
@@ -1118,16 +1118,28 @@ def tree_dump(tree):
                       "type": potter_node_type(node.bl_idname, tree.bl_rna.identifier), "label": node.label,
                       "location": plain(node.location), "inputs": sockets,
                       "properties": properties, "custom_properties": custom_properties})
-    links = [{
-        "from_node": link.from_node.name,
-        "from_socket": (link.from_socket.name
-                        if link.from_node.bl_idname == "NodeGroupInput"
-                        else link.from_socket.identifier),
-        "to_node": link.to_node.name,
-        "to_socket": (link.to_socket.name
-                      if link.to_node.bl_idname == "NodeGroupOutput"
-                      else link.to_socket.identifier),
-    } for link in tree.links]
+    links = []
+    multi_input_positions = {}
+    for link in tree.links:
+        entry = {
+            "from_node": link.from_node.name,
+            "from_socket": (link.from_socket.name
+                            if link.from_node.bl_idname == "NodeGroupInput"
+                            else link.from_socket.identifier),
+            "to_node": link.to_node.name,
+            "to_socket": (link.to_socket.name
+                          if link.to_node.bl_idname == "NodeGroupOutput"
+                          else link.to_socket.identifier),
+        }
+        links.append(entry)
+        if link.to_socket.is_multi_input:
+            key = (link.to_node.name, link.to_socket.identifier)
+            multi_input_positions.setdefault(key, []).append(
+                (len(links) - 1, entry, link.multi_input_sort_id))
+    for entries in multi_input_positions.values():
+        ordered = sorted(entries, key=lambda item: item[2], reverse=True)
+        for (position, _, _), (_, entry, _) in zip(entries, ordered):
+            links[position] = entry
     result = {"name": tree.get("potter.graph_name", tree.name_full),
               "type": tree.bl_rna.identifier, "potter_id": tree.get("potter.id"),
               "nodes": nodes, "links": links}
@@ -5586,6 +5598,7 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
                 raise ValueError("%s cannot restore input %s on node %s" %
                                  (owner, socket_source.get("name"), node.name)) from error
         nodes[node.name] = node
+    multi_input_links = {}
     for source in raw.get("links", []):
         from_node = nodes.get(source.get("from_node"))
         to_node = nodes.get(source.get("to_node"))
@@ -5610,7 +5623,13 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
                 owner, source.get("from_node"), source.get("from_socket"), source.get("to_node"),
                 source.get("to_socket"), [s.identifier for s in from_node.outputs],
                 [s.identifier for s in to_node.inputs]))
-        tree.links.new(from_socket, to_socket)
+        link = tree.links.new(from_socket, to_socket)
+        if to_socket.is_multi_input:
+            key = (to_node.name, to_socket.identifier)
+            multi_input_links.setdefault(key, []).append(link)
+    for links in multi_input_links.values():
+        for index in range(len(links) // 2):
+            links[index].swap_multi_input_sort_id(links[-index - 1])
     return socket_map
 
 

@@ -142,11 +142,12 @@ pub(crate) fn blender_multiply_m4(left: [f32; 16], right: [f32; 16]) -> [f32; 16
     result
 }
 
-/// Result of evaluating a modifier stack, including realized graph instance paths and bake captures.
+/// Result of evaluating a modifier stack, retaining graph instance columns for later modifiers or constraints.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModifierEvaluation {
     pub mesh: Mesh,
     pub instance_paths: Vec<Vec<Id>>,
+    pub(crate) instances: graph::EvaluatedInstances,
     pub bake_captures: BTreeMap<(Id, String), graph::NodeBakeFrame>,
     pub bake_material_refs: BTreeMap<(Id, String), Vec<Id>>,
     pub warnings: Vec<PotError>,
@@ -357,6 +358,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context(
         evaluated_object_meshes,
         curve_path_lengths,
         context,
+        false,
         is_active,
         texture_seed,
         adaptive_render,
@@ -378,6 +380,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
     evaluated_object_meshes: &BTreeMap<Id, Mesh>,
     curve_path_lengths: &BTreeMap<Id, f64>,
     context: ModifierEvaluationContext<'_>,
+    collect_instance_attributes: bool,
     is_active: impl Fn(usize, &Modifier) -> bool,
     texture_seed: TextureSeed<'_>,
     adaptive_render: Option<&AdaptiveRenderContext<'_>>,
@@ -409,6 +412,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
         })
         .then(|| evaluated.clone());
     let mut context = context;
+    // Non-Geometry-Nodes modifiers operate on the mesh component; Blender preserves instances.
+    let mut instances = graph::EvaluatedInstances::default();
     let mut instance_paths = Vec::new();
     let mut adaptive_normals = None;
     let mut bake_captures = BTreeMap::new();
@@ -450,6 +455,13 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                 .and_then(Value::as_bool)
                 == Some(true)
     });
+    let last_geometry_nodes_modifier = modifiers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, modifier)| {
+            (is_active(index, modifier) && modifier.modifier_type == "nodes").then_some(index)
+        })
+        .last();
     for (modifier_index, modifier) in modifiers
         .iter()
         .enumerate()
@@ -617,9 +629,15 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                     ));
                 }
             };
-            let graph_result = graph::evaluate_at_frame_with_bakes(
+            let collect_graph_instance_attributes = collect_instance_attributes
+                || last_geometry_nodes_modifier.is_some_and(|last| modifier_index < last);
+            let graph_result = graph::evaluate_at_frame_with_bakes_and_instances(
                 group,
                 Some(&evaluated),
+                Some(&instances),
+                Some(&instance_paths),
+                collect_graph_instance_attributes,
+                collect_instance_attributes,
                 &overrides,
                 frame,
                 &modifier.runtime.node_bakes,
@@ -627,7 +645,12 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                 subject_name,
             )?;
             evaluated = graph_result.mesh;
-            instance_paths.extend(graph_result.instance_paths);
+            instances = if collect_graph_instance_attributes {
+                graph_result.instances
+            } else {
+                graph::EvaluatedInstances::default()
+            };
+            instance_paths = graph_result.instance_paths;
             bake_captures.extend(
                 graph_result
                     .bake_captures
@@ -803,6 +826,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
     Ok((
         ModifierEvaluation {
             mesh: evaluated,
+            instances,
             instance_paths,
             bake_captures,
             bake_material_refs,

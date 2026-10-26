@@ -118,6 +118,8 @@ pub struct EvaluationContext {
 pub struct EvaluationSession {
     pub(crate) cache_file_archives: BTreeMap<Id, SelectedCacheFileArchive>,
     pub(crate) dynamic_paint_holds: crate::sim::DynamicPaintHoldCache,
+    pub(crate) instance_attributes: BTreeMap<Id, crate::graph::EvaluatedInstances>,
+    pub(crate) skip_instance_geometry_attribute_constraints: bool,
 }
 impl EvaluationSession {
     fn cache_file_archive_identity(&self) -> Value {
@@ -999,6 +1001,20 @@ impl Snapshot {
             object_mesh_evaluation_order(doc, selected_nodes, gate, mesh_dependencies)?;
         let taper_profiles = curve_taper_profiles(doc, &mesh_evaluation_order)?;
         let evaluated_node_ids: BTreeSet<Id> = mesh_evaluation_order.iter().cloned().collect();
+        let mut instance_constraint_targets = BTreeSet::new();
+        let mut has_active_instance_constraint = false;
+        for constraint in doc.nodes.values().flat_map(|node| &node.constraints) {
+            if !active_instance_geometry_attribute_constraint(constraint) {
+                continue;
+            }
+            has_active_instance_constraint = true;
+            if let Some(target) = &constraint.target {
+                instance_constraint_targets.insert(target.clone());
+            }
+        }
+        if driver_values.is_none() && has_active_instance_constraint {
+            reject_snapshot_driver_instance_dependencies(doc)?;
+        }
 
         let computed_driver_values;
         let driver_values = if let Some(driver_values) = driver_values {
@@ -1007,7 +1023,7 @@ impl Snapshot {
             computed_driver_values = rig::evaluate_drivers(doc, frame)?;
             &computed_driver_values
         };
-        let mut matrices = rig::evaluate_world_matrices_with_resources(
+        let mut matrices = rig::evaluate_world_matrices_with_resources_pre_geometry(
             doc,
             frame,
             driver_values,
@@ -1213,6 +1229,7 @@ impl Snapshot {
         let mut adaptive_normals = BTreeMap::new();
         let mut generated_vertices = BTreeMap::new();
         let mut instance_paths = BTreeMap::new();
+        let mut instance_attributes = BTreeMap::new();
         let mut slot_bindings = BTreeMap::new();
         let mut strokes = BTreeMap::new();
         let mut node_bake_captures = BTreeMap::new();
@@ -1445,6 +1462,7 @@ impl Snapshot {
                             &meshes,
                             &curve_path_lengths,
                             stack_context,
+                            instance_constraint_targets.contains(id),
                             |_, modifier| gate.is_active(id, modifier),
                             texture_seed,
                             adaptive_render.as_ref(),
@@ -1640,6 +1658,9 @@ impl Snapshot {
                     if !evaluated.instance_paths.is_empty() {
                         instance_paths.insert(id.clone(), evaluated.instance_paths);
                     }
+                    if instance_constraint_targets.contains(id) {
+                        instance_attributes.insert(id.clone(), evaluated.instances);
+                    }
                     bounds
                 } else if matches!(
                     data_block.data_type.as_str(),
@@ -1783,6 +1804,7 @@ impl Snapshot {
                             &meshes,
                             &curve_path_lengths,
                             stack_context,
+                            instance_constraint_targets.contains(id),
                             |_, modifier| gate.is_active(id, modifier),
                             texture_seed,
                             adaptive_render.as_ref(),
@@ -1970,6 +1992,9 @@ impl Snapshot {
                     meshes.insert(id.clone(), evaluated.mesh);
                     if !evaluated.instance_paths.is_empty() {
                         instance_paths.insert(id.clone(), evaluated.instance_paths);
+                    }
+                    if instance_constraint_targets.contains(id) {
+                        instance_attributes.insert(id.clone(), evaluated.instances);
                     }
                     bounds
                 } else if data_block.data_type == "volume" {
@@ -2235,7 +2260,11 @@ impl Snapshot {
                 })
         });
         if has_mesh_dependent_constraints {
-            matrices = rig::evaluate_world_matrices_with_evaluated_meshes(
+            let prior_instances = std::mem::replace(
+                &mut session.instance_attributes,
+                std::mem::take(&mut instance_attributes),
+            );
+            let evaluated_matrices = rig::evaluate_world_matrices_with_evaluated_meshes(
                 doc,
                 frame,
                 driver_values,
@@ -2244,7 +2273,10 @@ impl Snapshot {
                 scene.fps_base,
                 &meshes,
                 session,
-            )?;
+            );
+            let evaluated_instances =
+                std::mem::replace(&mut session.instance_attributes, prior_instances);
+            matrices = evaluated_matrices?;
             for (id, evaluated_node) in &mut nodes {
                 let matrix = matrices.get(id).copied().ok_or_else(|| {
                     PotError::new(
@@ -2259,69 +2291,76 @@ impl Snapshot {
                         evaluated_node.bounds.map(|bounds| bounds.size().to_array());
                 }
             }
-            bone_matrices.clear();
-            bone_pose_matrices.clear();
-            for (id, node) in &doc.nodes {
-                if node.kind == "armature"
-                    && (evaluated_node_ids.contains(id) || modifier_pose_armatures.contains(id))
-                {
-                    let armature_world = matrices.get(id).copied().ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InternalError,
-                            "evaluated armature world matrix is missing",
-                        )
-                    })?;
-                    let (world, pose) = if modifier_pose_armatures.contains(id) {
-                        let evaluated =
-                            rig::evaluate_armature_bone_world_and_pose_matrices_with_evaluated_meshes(
-                                doc,
-                                id,
-                                frame,
-                                armature_world,
-                                &matrices,
-                                driver_values,
-                                modifier_context.project_root,
-                                scene.fps,
-                                scene.fps_base,
-                                &meshes,
-                                session,
-                            )?;
-                        (evaluated.world, evaluated.pose)
-                    } else {
-                        (
-                            rig::evaluate_armature_bone_world_matrices_with_evaluated_meshes(
-                                doc,
-                                id,
-                                frame,
-                                armature_world,
-                                &matrices,
-                                driver_values,
-                                modifier_context.project_root,
-                                scene.fps,
-                                scene.fps_base,
-                                &meshes,
-                                session,
-                            )?,
-                            None,
-                        )
-                    };
-                    bone_matrices.insert(
-                        id.clone(),
-                        world
-                            .into_iter()
-                            .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
-                            .collect(),
-                    );
-                    if let Some(pose) = pose {
-                        bone_pose_matrices.insert(
+            let prior_instances =
+                std::mem::replace(&mut session.instance_attributes, evaluated_instances);
+            let bone_evaluation = (|| -> Result<()> {
+                bone_matrices.clear();
+                bone_pose_matrices.clear();
+                for (id, node) in &doc.nodes {
+                    if node.kind == "armature"
+                        && (evaluated_node_ids.contains(id) || modifier_pose_armatures.contains(id))
+                    {
+                        let armature_world = matrices.get(id).copied().ok_or_else(|| {
+                            PotError::new(
+                                ErrorCode::InternalError,
+                                "evaluated armature world matrix is missing",
+                            )
+                        })?;
+                        let (world, pose) = if modifier_pose_armatures.contains(id) {
+                            let evaluated =
+                                rig::evaluate_armature_bone_world_and_pose_matrices_with_evaluated_meshes(
+                                    doc,
+                                    id,
+                                    frame,
+                                    armature_world,
+                                    &matrices,
+                                    driver_values,
+                                    modifier_context.project_root,
+                                    scene.fps,
+                                    scene.fps_base,
+                                    &meshes,
+                                    session,
+                                )?;
+                            (evaluated.world, evaluated.pose)
+                        } else {
+                            (
+                                rig::evaluate_armature_bone_world_matrices_with_evaluated_meshes(
+                                    doc,
+                                    id,
+                                    frame,
+                                    armature_world,
+                                    &matrices,
+                                    driver_values,
+                                    modifier_context.project_root,
+                                    scene.fps,
+                                    scene.fps_base,
+                                    &meshes,
+                                    session,
+                                )?,
+                                None,
+                            )
+                        };
+                        bone_matrices.insert(
                             id.clone(),
-                            pose.into_iter()
+                            world
+                                .into_iter()
                                 .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
                                 .collect(),
                         );
+                        if let Some(pose) = pose {
+                            bone_pose_matrices.insert(
+                                id.clone(),
+                                pose.into_iter()
+                                    .map(|(bone_id, matrix)| (bone_id, matrix.to_cols_array()))
+                                    .collect(),
+                            );
+                        }
                     }
                 }
-            }
+                Ok(())
+            })();
+            session.instance_attributes = prior_instances;
+            bone_evaluation?;
         }
         render_simulated_particles(
             doc,
@@ -3200,6 +3239,56 @@ fn constraint_mesh_dependency_id(constraint: &crate::model::Constraint) -> Optio
             .and_then(|id| Id::new(id.to_owned()).ok()),
         _ => None,
     }
+}
+
+fn active_instance_geometry_attribute_constraint(constraint: &crate::model::Constraint) -> bool {
+    constraint.enabled
+        && constraint.influence != 0.0
+        && constraint.constraint_type == ConstraintType::GeometryAttribute
+        && constraint.params.get("domain").and_then(Value::as_str) == Some("INSTANCE")
+}
+
+fn driver_variable_reads_evaluated_transforms(variable: &crate::model::DriverVariable) -> bool {
+    match variable.variable_type {
+        crate::model::DriverVariableType::Transforms => {
+            variable.transform_space.as_deref().unwrap_or("local") == "world"
+        }
+        crate::model::DriverVariableType::LocationDifference
+        | crate::model::DriverVariableType::RotationDifference => {
+            variable.transform_space.as_deref().unwrap_or("world") == "world"
+        }
+        crate::model::DriverVariableType::SingleProp
+        | crate::model::DriverVariableType::ContextProperty => false,
+    }
+}
+
+fn reject_snapshot_driver_instance_dependencies(doc: &SceneDoc) -> Result<()> {
+    for (driver_owner, node) in &doc.nodes {
+        for driver in &node.drivers {
+            if let Some(variable) = driver
+                .variables
+                .iter()
+                .find(|variable| driver_variable_reads_evaluated_transforms(variable))
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "drivers that read evaluated transforms are not supported with Geometry Attribute INSTANCE constraints",
+                    json!({
+                        "feature_id":"driver.geometry_attribute.instance_dependency",
+                        "status":"not_supported",
+                        "driver_id":driver.id,
+                        "driver_owner":driver_owner,
+                        "variable":variable.name,
+                        "variable_type":variable.variable_type,
+                        "variable_target":variable.target,
+                        "variable_path":variable.path,
+                        "transform_space":variable.transform_space,
+                    }),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn object_mesh_dependencies(

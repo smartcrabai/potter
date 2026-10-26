@@ -9,7 +9,11 @@
 //! EXR image's alpha as premultiplied (see [`upgrade_v3`]). Version 7 adds the optional captured Blender
 //! `matrix_basis` on a node; version 6 documents have none, so [`upgrade_v6`] changes nothing else.
 //! Version 10 gates native Dynamic Paint output-layer and brush-source migrations on the source schema.
-use std::{collections::BTreeSet, path::Path};
+//! Version 11 stores multi-input links in descending `multi_input_sort_id` order; version-10 links are reversed by `upgrade_v10`.
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use serde_json::{Map, Value, json};
 
@@ -324,6 +328,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(9) {
         upgrade_v9(value);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(10) {
+        upgrade_v10(value);
     }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
@@ -860,6 +867,81 @@ fn upgrade_v9(value: &mut Value) {
     value["schema_version"] = json!(10);
 }
 
+/// Upgrades a schema-version-10 scene document to version 11. Version 11 stores multi-input links in
+/// descending `multi_input_sort_id` order, so each version-10 subsequence must be reversed.
+/// Graph links do not record socket multiplicity, so repeated destination pairs identify the subsequences.
+fn upgrade_v10(value: &mut Value) {
+    if let Some(groups) = value.get_mut("node_groups").and_then(Value::as_object_mut) {
+        for group in groups.values_mut() {
+            if let Some(links) = group.get_mut("links").and_then(Value::as_array_mut) {
+                reverse_multi_input_link_subsequences(links);
+            }
+        }
+    }
+    if let Some(intermediate) = value
+        .get_mut("compatibility")
+        .and_then(|compatibility| compatibility.get_mut("blender_adapter"))
+        .and_then(|adapter| adapter.get_mut("intermediate"))
+    {
+        if let Some(groups) = intermediate
+            .get_mut("node_groups")
+            .and_then(Value::as_array_mut)
+        {
+            for group in groups {
+                reverse_tree_links(group.get_mut("tree"));
+            }
+        }
+        if let Some(materials) = intermediate
+            .get_mut("materials")
+            .and_then(Value::as_array_mut)
+        {
+            for material in materials {
+                reverse_tree_links(material.get_mut("nodes"));
+            }
+        }
+        if let Some(scenes) = intermediate.get_mut("scenes").and_then(Value::as_array_mut) {
+            for scene in scenes {
+                reverse_tree_links(
+                    scene
+                        .get_mut("world")
+                        .and_then(|world| world.get_mut("nodes")),
+                );
+            }
+        }
+    }
+    value["schema_version"] = json!(11);
+}
+
+fn reverse_tree_links(tree: Option<&mut Value>) {
+    let Some(links) = tree
+        .and_then(|tree| tree.get_mut("links"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    reverse_multi_input_link_subsequences(links);
+}
+
+fn reverse_multi_input_link_subsequences(links: &mut [Value]) {
+    let mut subsequences = BTreeMap::<(String, String), Vec<usize>>::new();
+    for (index, link) in links.iter().enumerate() {
+        let (Some(to_node), Some(to_socket)) = (
+            link.get("to_node").and_then(Value::as_str),
+            link.get("to_socket").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        subsequences
+            .entry((to_node.to_owned(), to_socket.to_owned()))
+            .or_default()
+            .push(index);
+    }
+    for indices in subsequences.values() {
+        for index in 0..indices.len() / 2 {
+            links.swap(indices[index], indices[indices.len() - index - 1]);
+        }
+    }
+}
 fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Some(curve) = color.get_mut("curve") else {
         return Ok(());
@@ -1949,7 +2031,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(10));
+        assert_eq!(scene["schema_version"], json!(11));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1971,7 +2053,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(10));
+        assert_eq!(scene["schema_version"], json!(11));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -1991,7 +2073,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(10));
+        assert_eq!(scene["schema_version"], json!(11));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -2015,15 +2097,128 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_ten_scenes_pass_through_untouched() {
+    fn version_nine_multi_input_links_reverse_each_destination_subsequence() {
+        let mut scene = json!({
+            "schema_version": 9,
+            "node_groups": {
+                "first": {"links": [
+                    {"from_node":"a","from_socket":"geometry","to_node":"join","to_socket":"Geometry"},
+                    {"from_node":"single","from_socket":"value","to_node":"sink","to_socket":"Value"},
+                    {"from_node":"b","from_socket":"geometry","to_node":"join","to_socket":"Geometry"},
+                    {"from_node":"other","from_socket":"value","to_node":"sink","to_socket":"Other"},
+                    {"from_node":"c","from_socket":"geometry","to_node":"join","to_socket":"Geometry"}
+                ]},
+                "second": {"links": [
+                    {"from_node":"d","from_socket":"geometry","to_node":"join","to_socket":"Geometry"},
+                    {"from_node":"e","from_socket":"geometry","to_node":"join","to_socket":"Geometry"},
+                    {"from_node":"f","from_socket":"geometry","to_node":"join","to_socket":"Geometry"}
+                ]}
+            },
+            "compatibility": {"blender_adapter": {"intermediate": {
+                "node_groups": [
+                    {"tree": {"links": [
+                        {"from_node":"a","from_socket":"geometry","to_node":"join","to_socket":"Geometry"},
+                        {"from_node":"single","from_socket":"value","to_node":"sink","to_socket":"Value"},
+                        {"from_node":"b","from_socket":"geometry","to_node":"join","to_socket":"Geometry"},
+                        {"from_node":"other","from_socket":"value","to_node":"sink","to_socket":"Other"},
+                        {"from_node":"c","from_socket":"geometry","to_node":"join","to_socket":"Geometry"}
+                    ]}},
+                    {"tree": {"links": [
+                        {"from_node":"d","from_socket":"image","to_node":"join","to_socket":"Image"},
+                        {"from_node":"e","from_socket":"image","to_node":"join","to_socket":"Image"},
+                        {"from_node":"f","from_socket":"image","to_node":"join","to_socket":"Image"}
+                    ]}}
+                ],
+                "materials": [{"nodes": {"links": [
+                    {"from_node":"a","from_socket":"color","to_node":"join","to_socket":"Color"},
+                    {"from_node":"b","from_socket":"color","to_node":"join","to_socket":"Color"},
+                    {"from_node":"c","from_socket":"color","to_node":"join","to_socket":"Color"}
+                ]}}],
+                "scenes": [{"world": {"nodes": {"links": [
+                    {"from_node":"a","from_socket":"color","to_node":"join","to_socket":"Color"},
+                    {"from_node":"b","from_socket":"color","to_node":"join","to_socket":"Color"},
+                    {"from_node":"c","from_socket":"color","to_node":"join","to_socket":"Color"}
+                ]}}}]
+            }}}
+        });
+
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+
+        assert_eq!(scene["schema_version"], json!(11));
+        let first: Vec<&str> = scene["node_groups"]["first"]["links"]
+            .as_array()
+            .expect("first links")
+            .iter()
+            .map(|link| link["from_node"].as_str().expect("source"))
+            .collect();
+        assert_eq!(first, ["c", "single", "b", "other", "a"]);
+        let second: Vec<&str> = scene["node_groups"]["second"]["links"]
+            .as_array()
+            .expect("second links")
+            .iter()
+            .map(|link| link["from_node"].as_str().expect("source"))
+            .collect();
+        assert_eq!(second, ["f", "e", "d"]);
+        let intermediate = &scene["compatibility"]["blender_adapter"]["intermediate"];
+        let raw_sources = |links: &Value| -> Vec<String> {
+            links
+                .as_array()
+                .expect("raw links")
+                .iter()
+                .map(|link| link["from_node"].as_str().expect("raw source").to_owned())
+                .collect()
+        };
+        assert_eq!(
+            raw_sources(&intermediate["node_groups"][0]["tree"]["links"]),
+            ["c", "single", "b", "other", "a"].map(String::from)
+        );
+        assert_eq!(
+            raw_sources(&intermediate["node_groups"][1]["tree"]["links"]),
+            ["f", "e", "d"].map(String::from)
+        );
+        assert_eq!(
+            raw_sources(&intermediate["materials"][0]["nodes"]["links"]),
+            ["c", "b", "a"].map(String::from)
+        );
+        assert_eq!(
+            raw_sources(&intermediate["scenes"][0]["world"]["nodes"]["links"]),
+            ["c", "b", "a"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn version_ten_multi_input_links_reverse_each_destination_subsequence() {
         let mut scene = json!({
             "schema_version": 10,
+            "node_groups": {"group": {"links": [
+                {"from_node":"a","to_node":"join","to_socket":"Geometry"},
+                {"from_node":"b","to_node":"join","to_socket":"Geometry"},
+                {"from_node":"single","to_node":"sink","to_socket":"Value"}
+            ]}}
+        });
+
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+
+        assert_eq!(scene["schema_version"], json!(11));
+        let sources: Vec<&str> = scene["node_groups"]["group"]["links"]
+            .as_array()
+            .expect("links")
+            .iter()
+            .map(|link| link["from_node"].as_str().expect("source"))
+            .collect();
+        assert_eq!(sources, ["b", "a", "single"]);
+    }
+
+    #[test]
+    fn current_schema_eleven_scenes_pass_through_untouched() {
+        let mut scene = json!({
+            "schema_version": 11,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(10));
-        assert_eq!(scene["materials"], before["materials"]);
+        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene, before);
     }
     fn dynamic_paint_canvas_scene(schema_version: u32, blender_imported: bool) -> SceneDoc {
         use glam::DVec3;
@@ -2188,7 +2383,7 @@ mod tests {
         )
         .expect("brush migration");
         assert!(migrated.legacy);
-        assert_eq!(migrated.doc.schema_version, 10);
+        assert_eq!(migrated.doc.schema_version, 11);
         let settings = &migrated.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")]
             .properties["physics_dynamic_paint"];
         assert_eq!(settings["paint_source"], json!("POINT"));
@@ -2360,7 +2555,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(10));
+        assert_eq!(scene["schema_version"], json!(11));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -2403,7 +2598,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(10));
+        assert_eq!(scene["schema_version"], json!(11));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -2451,7 +2646,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 10);
+        assert_eq!(parsed.doc.schema_version, 11);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -2497,7 +2692,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(10));
+        assert_eq!(scene["schema_version"], json!(11));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -2540,7 +2735,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(10);
+        expected["schema_version"] = json!(11);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -2578,7 +2773,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 10);
+        assert_eq!(migrated.schema_version, 11);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -3082,7 +3277,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 10);
+        assert_eq!(record.snapshot.schema_version, 11);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -3149,7 +3344,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 10);
+        assert_eq!(record.snapshot.schema_version, 11);
         let history_mesh = record
             .snapshot
             .data_blocks
