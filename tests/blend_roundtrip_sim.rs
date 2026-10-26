@@ -1546,3 +1546,84 @@ fn assert_dynamic_paint_role_transitions(
     );
     Ok(())
 }
+
+#[test]
+fn schema_nine_parented_dynamic_paint_brush_legacy_marker_export_is_refused()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let project = root.join("legacy_parented_brush");
+    pot_json(&["init", project.to_str().unwrap()])?;
+
+    let batch_path = root.join("create_parented_brush.json");
+    fs::write(
+        &batch_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op": "node.create", "id": "parent", "kind": "empty"},
+                {
+                    "op": "node.create",
+                    "id": "brush",
+                    "kind": "box",
+                    "parent": "parent",
+                    "params": {"size": 0.1}
+                },
+                {
+                    "op": "physics.dynamic_paint.create",
+                    "target": {"id": "brush"},
+                    "settings": {
+                        "role": "brush",
+                        "paint_source": "POINT",
+                        "paint_distance": 0.4,
+                        "proximity_falloff": "CONSTANT"
+                    }
+                }
+            ]
+        }))?,
+    )?;
+    pot_json(&[
+        "apply",
+        project.to_str().unwrap(),
+        "--file",
+        batch_path.to_str().unwrap(),
+    ])?;
+
+    let scene_path = project.join("scene.json");
+    let mut scene: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    assert_eq!(scene["nodes"]["brush"]["parent"], "parent");
+    let settings = scene["nodes"]["brush"]["properties"]["physics_dynamic_paint"]
+        .as_object_mut()
+        .unwrap();
+    assert_eq!(settings["paint_source"], "POINT");
+    settings.remove("paint_source");
+    settings.insert("radius".to_owned(), json!(0.4));
+    scene["schema_version"] = json!(9);
+    fs::write(&scene_path, serde_json::to_vec(&scene)?)?;
+
+    let output_path = root.join("legacy_parented_brush.blend");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+    command
+        .args([
+            "export",
+            project.to_str().unwrap(),
+            "--format",
+            "blend",
+            "--out",
+        ])
+        .arg(output_path)
+        .arg("--json");
+    let failure = run_guarded(command)?;
+    assert!(
+        !failure.status.success(),
+        "legacy parented Dynamic Paint brush export must be refused"
+    );
+    let failure: Value = serde_json::from_slice(&failure.stdout)?;
+    assert_eq!(failure["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        failure["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_brush.legacy_transform"
+    );
+    Ok(())
+}

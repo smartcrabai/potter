@@ -199,6 +199,7 @@ pub(crate) fn parse_history_record(
         serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut record.snapshot)?;
     if source_schema_version.is_some_and(|version| version < 10) {
+        crate::sim::migrate_dynamic_paint_output_layers(&mut record.snapshot)?;
         let (_, brush_warnings) =
             crate::sim::migrate_dynamic_paint_brush_source(&mut record.snapshot);
         warnings.extend(brush_warnings);
@@ -2087,6 +2088,25 @@ mod tests {
                     .mesh
                     .as_ref()
                     .expect("canvas mesh"),
+                "PaintColor"
+            )
+        );
+        let snapshot = serde_json::to_value(&native).expect("legacy history snapshot");
+        let (history, history_warnings) = parse_history_record(
+            &serde_json::to_vec(&history_record(&snapshot)).expect("history record"),
+            no_assets(),
+        )
+        .expect("schema-9 history snapshot loads");
+        assert_eq!(history_warnings, Vec::<Value>::new());
+        let history_mesh = history
+            .snapshot
+            .data_blocks
+            .get(&crate::model::Id::new("canvas_data").expect("data ID"))
+            .and_then(|data| data.mesh.as_ref())
+            .expect("history canvas mesh");
+        assert!(
+            crate::geom::color_layers::has_blender_byte_color_corner_layer(
+                history_mesh,
                 "PaintColor"
             )
         );

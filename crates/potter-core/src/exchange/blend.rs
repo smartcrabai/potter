@@ -122,6 +122,27 @@ pub fn export_blend(
     opts: &ExportOptions<'_>,
 ) -> Result<ExportReport> {
     doc.validate()?;
+    for (node_id, node) in &doc.nodes {
+        let Some(settings) = node
+            .properties
+            .get("physics_dynamic_paint")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        if settings.get("role").and_then(Value::as_str) == Some("brush")
+            && settings
+                .get("paint_source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| !matches!(source, "POINT" | "VOLUME"))
+        {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Potter's legacy Dynamic Paint world-origin brush has no lossless Blender paint_source; set paint_source to POINT or VOLUME before export",
+                json!({"feature_id":"physics.dynamic_paint_brush.legacy_transform","node_id":node_id,"status":"not_supported"}),
+            ));
+        }
+    }
     check_multires_export_memory(doc, 512 * 1024 * 1024)?;
     let blender = resolve_blender(opts.blender)?;
     check_blender_version(&blender)?;
