@@ -1548,8 +1548,7 @@ fn assert_dynamic_paint_role_transitions(
 }
 
 #[test]
-fn schema_nine_parented_dynamic_paint_brush_legacy_marker_export_is_refused()
--> Result<(), Box<dyn Error>> {
+fn dynamic_paint_export_refuses_only_the_legacy_brush_marker() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let root = directory.path();
     let project = root.join("legacy_parented_brush");
@@ -1612,7 +1611,7 @@ fn schema_nine_parented_dynamic_paint_brush_legacy_marker_export_is_refused()
             "blend",
             "--out",
         ])
-        .arg(output_path)
+        .arg(&output_path)
         .arg("--json");
     let failure = run_guarded(command)?;
     assert!(
@@ -1625,5 +1624,54 @@ fn schema_nine_parented_dynamic_paint_brush_legacy_marker_export_is_refused()
         failure["error"]["details"]["feature_id"],
         "physics.dynamic_paint_brush.legacy_transform"
     );
+
+    // Only the Potter marker is refused; Blender-only sources such as Proximity still round-trip.
+    let Some(blender) = blender() else {
+        eprintln!("skipping Dynamic Paint brush source round-trip; Blender is unavailable");
+        return Ok(());
+    };
+    let brush = scene["nodes"]["brush"]["properties"]["physics_dynamic_paint"]
+        .as_object_mut()
+        .unwrap();
+    brush.remove("radius");
+    brush.insert("paint_source".to_owned(), json!("DISTANCE"));
+    fs::write(&scene_path, serde_json::to_vec(&scene)?)?;
+    pot_json(&[
+        "export",
+        project.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--out",
+        output_path.to_str().unwrap(),
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let reopened = root.join("reopened");
+    pot_json(&["init", reopened.to_str().unwrap()])?;
+    pot_json(&[
+        "import",
+        reopened.to_str().unwrap(),
+        "--file",
+        output_path.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--allow-lossy",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let reopened_scene: Value = serde_json::from_slice(&fs::read(reopened.join("scene.json"))?)?;
+    let brush_source = reopened_scene["nodes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find_map(|node| {
+            let settings = &node["properties"]["physics_dynamic_paint"];
+            (settings["role"] == "brush").then(|| settings["paint_source"].clone())
+        });
+    assert_eq!(brush_source, Some(json!("DISTANCE")));
     Ok(())
 }

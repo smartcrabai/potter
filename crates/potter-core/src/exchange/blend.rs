@@ -131,10 +131,7 @@ pub fn export_blend(
             continue;
         };
         if settings.get("role").and_then(Value::as_str) == Some("brush")
-            && settings
-                .get("paint_source")
-                .and_then(Value::as_str)
-                .is_some_and(|source| !matches!(source, "POINT" | "VOLUME"))
+            && settings.get("paint_source").and_then(Value::as_str) == Some("LEGACY_WORLD_ORIGIN")
         {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedFeature,
