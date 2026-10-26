@@ -1794,10 +1794,16 @@ fn apply_pose_bone_constraints(
     matrices: &mut BTreeMap<Id, BoneMatrices>,
     session: &mut EvaluationSession,
 ) -> Result<()> {
+    let skip_instance_geometry_attribute_constraints =
+        session.skip_instance_geometry_attribute_constraints;
     if !constraints.iter().any(|constraint| {
         constraint.owner_bone.is_some()
             && constraint.enabled
             && constraint.influence != 0.0
+            && !skip_instance_geometry_attribute_constraint(
+                constraint,
+                skip_instance_geometry_attribute_constraints,
+            )
             && !matches!(
                 constraint.constraint_type,
                 ConstraintType::Ik | ConstraintType::SplineIk
@@ -1829,6 +1835,10 @@ fn apply_pose_bone_constraints(
         constraint.owner_bone.is_some()
             && constraint.enabled
             && constraint.influence != 0.0
+            && !skip_instance_geometry_attribute_constraint(
+                constraint,
+                skip_instance_geometry_attribute_constraints,
+            )
             && !matches!(
                 constraint.constraint_type,
                 ConstraintType::Ik | ConstraintType::SplineIk
@@ -1859,6 +1869,10 @@ fn apply_pose_bone_constraints(
             constraint.owner_bone.as_ref() == Some(owner_bone)
                 && constraint.enabled
                 && constraint.influence != 0.0
+                && !skip_instance_geometry_attribute_constraint(
+                    constraint,
+                    skip_instance_geometry_attribute_constraints,
+                )
                 && !matches!(
                     constraint.constraint_type,
                     ConstraintType::Ik | ConstraintType::SplineIk
@@ -2024,6 +2038,7 @@ fn apply_pose_bone_constraints(
                 frame,
                 target_worlds,
                 evaluated_meshes,
+                &session.instance_attributes,
                 Some(armature_node_id),
                 armature_node_id,
                 armature_world,
@@ -4938,8 +4953,34 @@ pub(crate) fn apply_armature_modifier_with_drivers(
     )
 }
 
-/// Evaluate all node world matrices, including hierarchy and enabled object constraints.
+/// Evaluate prerequisite world matrices before geometry is available.
 ///
+/// Snapshot skips INSTANCE Geometry Attribute constraints here; strict fresh-session entry points
+/// continue to refuse them.
+pub(crate) fn evaluate_world_matrices_with_resources_pre_geometry(
+    doc: &SceneDoc,
+    frame: f64,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
+    project_root: Option<&Path>,
+    fps: u32,
+    fps_base: f64,
+    session: &mut EvaluationSession,
+) -> Result<BTreeMap<Id, DMat4>> {
+    let skip = session.skip_instance_geometry_attribute_constraints;
+    session.skip_instance_geometry_attribute_constraints = true;
+    let result = evaluate_world_matrices_with_resources(
+        doc,
+        frame,
+        driver_values,
+        project_root,
+        fps,
+        fps_base,
+        session,
+    );
+    session.skip_instance_geometry_attribute_constraints = skip;
+    result
+}
+
 /// Parent and constraint-target dependencies are visited in stable ID order. Any dependency cycle
 /// is reported as `EVALUATION_FAILED` with its deterministic repeated-node witness.
 pub(crate) fn evaluate_world_matrices_with_drivers(
@@ -5207,8 +5248,16 @@ fn evaluate_world_matrices_with_meshes(
         } else {
             parent_inverse * local
         };
+        let skip_instance_geometry_attribute_constraints =
+            session.skip_instance_geometry_attribute_constraints;
         for constraint in node.constraints.iter().filter(|constraint| {
-            constraint.owner_bone.is_none() && constraint.enabled && constraint.influence != 0.0
+            constraint.owner_bone.is_none()
+                && constraint.enabled
+                && constraint.influence != 0.0
+                && !skip_instance_geometry_attribute_constraint(
+                    constraint,
+                    skip_instance_geometry_attribute_constraints,
+                )
         }) {
             let target_id = constraint
                 .target
@@ -5414,6 +5463,7 @@ fn evaluate_world_matrices_with_meshes(
                 frame,
                 output,
                 evaluated_meshes,
+                &session.instance_attributes,
                 Some(id),
                 id,
                 world,
@@ -5624,6 +5674,40 @@ fn attribute_matrix_transform(matrix: DMat4) -> Result<(DVec3, DQuat, DVec3)> {
     }
     let rotation = blender_euler_matrix_quaternion(rotation_basis)?;
     Ok((matrix.w_axis.truncate(), rotation, scale))
+}
+fn attribute_matrix_channels(matrix: DMat4) -> Result<(DVec3, DMat3, DVec3)> {
+    if !finite_matrix(matrix) {
+        return Err(evaluation_error("Geometry Attribute matrix is non-finite"));
+    }
+    let columns = [
+        matrix.x_axis.truncate(),
+        matrix.y_axis.truncate(),
+        matrix.z_axis.truncate(),
+    ];
+    let mut scale = DVec3::new(
+        columns[0].length(),
+        columns[1].length(),
+        columns[2].length(),
+    );
+    let mut rotation = DMat3::from_cols(
+        columns[0].normalize_or_zero(),
+        columns[1].normalize_or_zero(),
+        columns[2].normalize_or_zero(),
+    );
+    if rotation.determinant() < 0.0 {
+        rotation = -rotation;
+        scale = -scale;
+    }
+    Ok((matrix.w_axis.truncate(), rotation, scale))
+}
+
+fn attribute_matrix_from_channels(location: DVec3, rotation: DMat3, scale: DVec3) -> DMat4 {
+    DMat4::from_cols(
+        (rotation.x_axis * scale.x).extend(0.0),
+        (rotation.y_axis * scale.y).extend(0.0),
+        (rotation.z_axis * scale.z).extend(0.0),
+        location.extend(1.0),
+    )
 }
 
 fn blender_euler_matrix_quaternion(matrix: DMat3) -> Result<DQuat> {
@@ -6175,16 +6259,7 @@ fn hair_curve_attribute_value(
     let domain_count = match domain {
         "POINT" => point_count,
         "CURVE" => hair.curves.len(),
-        "INSTANCE" => {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                "Geometry Attribute INSTANCE-domain sampling is unsupported",
-                json!({
-                    "feature_id":"constraint.geometry_attribute.instances",
-                    "constraint_id":constraint.id,
-                }),
-            ));
-        }
+        "INSTANCE" => return instance_attribute_default(data_type),
         _ => {
             return Err(evaluation_error(
                 "Geometry Attribute domain is not present on Curves",
@@ -6370,10 +6445,240 @@ fn hair_curve_attribute_value(
         _ => Err(evaluation_error("Geometry Attribute data_type is invalid")),
     }
 }
+fn instance_attribute_default(data_type: &str) -> Result<Value> {
+    match data_type {
+        "VECTOR" => Ok(json!([0.0, 0.0, 0.0])),
+        "QUATERNION" => Ok(json!([0.0, 0.0, 0.0, 1.0])),
+        "FLOAT4X4" => Ok(json!(DMat4::IDENTITY.to_cols_array())),
+        _ => Err(evaluation_error("Geometry Attribute data_type is invalid")),
+    }
+}
+
+fn instance_attribute_components<const N: usize>(
+    value: &Value,
+    data_type: &str,
+) -> Result<[f64; N]> {
+    let components = value
+        .as_array()
+        .filter(|components| components.len() == N)
+        .ok_or_else(|| {
+            evaluation_error(format!("Geometry Attribute {data_type} value is invalid"))
+        })?;
+    let mut result = [0.0; N];
+    for (index, component) in components.iter().enumerate() {
+        result[index] = component.as_f64().ok_or_else(|| {
+            evaluation_error(format!("Geometry Attribute {data_type} value is invalid"))
+        })?;
+    }
+    Ok(result)
+}
+fn instance_attribute_integer_components<const N: usize>(
+    value: &Value,
+    data_type: &str,
+) -> Result<[i64; N]> {
+    let components = value
+        .as_array()
+        .filter(|components| components.len() == N)
+        .ok_or_else(|| {
+            evaluation_error(format!("Geometry Attribute {data_type} value is invalid"))
+        })?;
+    let mut result = [0; N];
+    for (index, component) in components.iter().enumerate() {
+        result[index] = component.as_i64().ok_or_else(|| {
+            evaluation_error(format!("Geometry Attribute {data_type} value is invalid"))
+        })?;
+    }
+    Ok(result)
+}
+
+fn instance_matrix_quaternion(matrix: DMat4) -> Result<DQuat> {
+    if !finite_matrix(matrix) {
+        return Err(evaluation_error("Geometry Attribute matrix is non-finite"));
+    }
+    let rotation_basis = DMat3::from_cols(
+        matrix.x_axis.truncate().normalize_or_zero(),
+        matrix.y_axis.truncate().normalize_or_zero(),
+        matrix.z_axis.truncate().normalize_or_zero(),
+    );
+    blender_euler_matrix_quaternion(rotation_basis)
+}
+
+fn unsupported_instance_attribute_conversion(
+    constraint: &Constraint,
+    name: &str,
+    source_data_type: &str,
+    requested_data_type: &str,
+) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!(
+            "Blender has no implicit Geometry Attribute INSTANCE conversion from {source_data_type} to {requested_data_type}"
+        ),
+        json!({
+            "feature_id":"constraint.geometry_attribute.instances.attribute_conversion",
+            "status":"not_supported",
+            "constraint_id":constraint.id,
+            "attribute":name,
+            "source_data_type":source_data_type,
+            "requested_data_type":requested_data_type,
+        }),
+    )
+}
+
+fn skip_instance_geometry_attribute_constraint(
+    constraint: &Constraint,
+    skip_instance_geometry_attribute_constraints: bool,
+) -> bool {
+    skip_instance_geometry_attribute_constraints
+        && constraint.constraint_type == ConstraintType::GeometryAttribute
+        && constraint.params.get("domain").and_then(Value::as_str) == Some("INSTANCE")
+}
+
+fn geometry_attribute_instance_value(
+    instances: Option<&crate::graph::EvaluatedInstances>,
+    constraint: &Constraint,
+) -> Result<Value> {
+    let Some(instances) = instances else {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Geometry Attribute INSTANCE sampling requires evaluated instance geometry",
+            json!({
+                "feature_id":"constraint.geometry_attribute.instances.no_evaluated_geometry",
+                "status":"not_supported",
+                "constraint_id":constraint.id,
+                "target":constraint.target,
+            }),
+        ));
+    };
+    let name = string_param(&constraint.params, "attribute_name")?;
+    let data_type = string_param(&constraint.params, "data_type")?;
+    let default = instance_attribute_default(data_type)?;
+    if instances.transforms.is_empty() {
+        return Ok(default);
+    }
+
+    let sample_index = param_usize(&constraint.params, "sample_index")?
+        .unwrap_or(0)
+        .min(instances.transforms.len() - 1);
+    let transform = DMat4::from_cols_array(&instances.transforms[sample_index]);
+    if name == "instance_transform" {
+        return match data_type {
+            "FLOAT4X4" => Ok(json!(transform.to_cols_array())),
+            "QUATERNION" => {
+                let rotation = instance_matrix_quaternion(transform)?;
+                Ok(json!([rotation.x, rotation.y, rotation.z, rotation.w]))
+            }
+            "VECTOR" => Err(unsupported_instance_attribute_conversion(
+                constraint, name, "FLOAT4X4", data_type,
+            )),
+            _ => Err(evaluation_error("Geometry Attribute data_type is invalid")),
+        };
+    }
+    let Some(attribute) = instances.attributes.get(name) else {
+        return Ok(default);
+    };
+    let value = attribute.values.get(sample_index).ok_or_else(|| {
+        evaluation_error("Geometry Attribute instance attribute column is invalid")
+    })?;
+    let converted = match (data_type, attribute.data_type.as_str()) {
+        ("VECTOR", "FLOAT_VECTOR") | ("QUATERNION", "QUATERNION") | ("FLOAT4X4", "FLOAT4X4") => {
+            value.clone()
+        }
+        ("VECTOR", "FLOAT") => {
+            let value = value
+                .as_f64()
+                .ok_or_else(|| evaluation_error("Geometry Attribute FLOAT value is invalid"))?;
+            json!([value, value, value])
+        }
+        ("VECTOR", "INT" | "INT8") => {
+            let value = value
+                .as_i64()
+                .ok_or_else(|| evaluation_error("Geometry Attribute integer value is invalid"))?
+                as f64;
+            json!([value, value, value])
+        }
+        ("VECTOR", "INT2" | "INT32_2D") => {
+            let [x, y] = instance_attribute_integer_components(value, "INT2")?;
+            json!([x as f64, y as f64, 0.0])
+        }
+        ("VECTOR", "INT3") => {
+            let [x, y, z] = instance_attribute_integer_components(value, "INT3")?;
+            json!([x as f64, y as f64, z as f64])
+        }
+        ("VECTOR", "FLOAT2") => {
+            let [x, y] = instance_attribute_components(value, "FLOAT2")?;
+            json!([x, y, 0.0])
+        }
+        ("VECTOR", "FLOAT4") => {
+            let [x, y, z, _] = instance_attribute_components(value, "FLOAT4")?;
+            json!([x, y, z])
+        }
+        ("VECTOR", "BOOLEAN") => {
+            let value = value
+                .as_bool()
+                .ok_or_else(|| evaluation_error("Geometry Attribute BOOLEAN value is invalid"))?;
+            let value = if value { 1.0 } else { 0.0 };
+            json!([value, value, value])
+        }
+        ("VECTOR", "BYTE_COLOR") => {
+            // Instance columns expose byte colors in the canonical linear RGBA representation.
+            let [x, y, z, _] = instance_attribute_components(value, "BYTE_COLOR")?;
+            json!([x, y, z])
+        }
+        ("VECTOR", "FLOAT_COLOR") => {
+            let [x, y, z, _] = instance_attribute_components(value, "FLOAT_COLOR")?;
+            json!([x, y, z])
+        }
+        ("VECTOR", "QUATERNION") => {
+            let [x, y, z, w] = instance_attribute_components(value, "QUATERNION")?;
+            json!(blender_euler_xyz(DQuat::from_xyzw(x, y, z, w)))
+        }
+        ("QUATERNION", "FLOAT_VECTOR") => {
+            let [x, y, z] = instance_attribute_components(value, "FLOAT_VECTOR")?;
+            let rotation = DQuat::from_euler(EulerRot::XYZEx, x, y, z);
+            json!([rotation.x, rotation.y, rotation.z, rotation.w])
+        }
+        ("QUATERNION", "FLOAT") => {
+            let value = value
+                .as_f64()
+                .ok_or_else(|| evaluation_error("Geometry Attribute FLOAT value is invalid"))?;
+            let rotation = DQuat::from_euler(EulerRot::XYZEx, value, value, value);
+            json!([rotation.x, rotation.y, rotation.z, rotation.w])
+        }
+        ("QUATERNION", "FLOAT2") => {
+            let [x, y] = instance_attribute_components(value, "FLOAT2")?;
+            let rotation = DQuat::from_euler(EulerRot::XYZEx, x, y, 0.0);
+            json!([rotation.x, rotation.y, rotation.z, rotation.w])
+        }
+        ("QUATERNION", "FLOAT4") => {
+            let [x, y, z, w] = instance_attribute_components(value, "FLOAT4")?;
+            json!([x, y, z, w])
+        }
+        ("QUATERNION", "FLOAT4X4") => {
+            let rotation = instance_matrix_quaternion(attribute_matrix(value)?)?;
+            json!([rotation.x, rotation.y, rotation.z, rotation.w])
+        }
+        ("FLOAT4X4", "QUATERNION") => {
+            let [x, y, z, w] = instance_attribute_components(value, "QUATERNION")?;
+            json!(DMat4::from_quat(DQuat::from_xyzw(x, y, z, w)).to_cols_array())
+        }
+        _ => {
+            return Err(unsupported_instance_attribute_conversion(
+                constraint,
+                name,
+                &attribute.data_type,
+                data_type,
+            ));
+        }
+    };
+    Ok(converted)
+}
+
 fn geometry_attribute_value(
     doc: &SceneDoc,
     constraint: &Constraint,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+    evaluated_instances: &BTreeMap<Id, crate::graph::EvaluatedInstances>,
 ) -> Result<Value> {
     let target_id = constraint.target.as_ref().ok_or_else(|| {
         evaluation_error_with(
@@ -6387,6 +6692,19 @@ fn geometry_attribute_value(
             json!({"constraint_id":constraint.id,"target":target_id}),
         )
     })?;
+    if string_param(&constraint.params, "domain")? == "INSTANCE"
+        && target_node.kind == "collection_instance"
+    {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Geometry Attribute INSTANCE sampling on collection instances is unsupported",
+            json!({
+                "feature_id":"constraint.geometry_attribute.instances.collection_instances",
+                "constraint_id":constraint.id,
+                "target":target_id,
+            }),
+        ));
+    }
     let data_id = target_node.data.as_ref().ok_or_else(|| {
         evaluation_error_with(
             "Geometry Attribute target has no data",
@@ -6435,6 +6753,11 @@ fn geometry_attribute_value(
             }),
         ));
     }
+    let name = string_param(&constraint.params, "attribute_name")?;
+    let domain = string_param(&constraint.params, "domain")?;
+    if domain == "INSTANCE" {
+        return geometry_attribute_instance_value(evaluated_instances.get(target_id), constraint);
+    }
     let base_mesh = target_data.mesh.as_ref();
     let mesh = evaluated_meshes
         .and_then(|meshes| meshes.get(target_id))
@@ -6445,18 +6768,6 @@ fn geometry_attribute_value(
                 json!({"constraint_id":constraint.id,"target":target_id}),
             )
         })?;
-    let name = string_param(&constraint.params, "attribute_name")?;
-    let domain = string_param(&constraint.params, "domain")?;
-    if domain == "INSTANCE" {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "Geometry Attribute INSTANCE-domain sampling is unsupported",
-            json!({
-                "feature_id":"constraint.geometry_attribute.instances",
-                "constraint_id":constraint.id,
-            }),
-        ));
-    }
     if domain == "CURVE" {
         return Err(evaluation_error(
             "Geometry Attribute CURVE domain is not present on mesh targets",
@@ -6710,8 +7021,9 @@ fn geometry_attribute_matrix(
     doc: &SceneDoc,
     constraint: &Constraint,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+    evaluated_instances: &BTreeMap<Id, crate::graph::EvaluatedInstances>,
 ) -> Result<DMat4> {
-    let value = geometry_attribute_value(doc, constraint, evaluated_meshes)?;
+    let value = geometry_attribute_value(doc, constraint, evaluated_meshes, evaluated_instances)?;
     let data_type = string_param(&constraint.params, "data_type")?;
     let mix_mode = string_param(&constraint.params, "mix_mode")?;
     let apply_target = param_bool(&constraint.params, "apply_target_transform", false)?;
@@ -6722,15 +7034,17 @@ fn geometry_attribute_matrix(
     };
     match data_type {
         "VECTOR" => {
-            let mut transform = matrix_transform(sampled_transform_matrix)?;
-            transform.translation = attribute_vector3(&value)?.to_array();
-            sampled_transform_matrix = transform.matrix();
+            let (_, rotation, scale) = attribute_matrix_channels(sampled_transform_matrix)?;
+            sampled_transform_matrix =
+                attribute_matrix_from_channels(attribute_vector3(&value)?, rotation, scale);
         }
         "QUATERNION" => {
-            let mut transform = matrix_transform(sampled_transform_matrix)?;
-            let rotation = attribute_quaternion(&value)?;
-            transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
-            sampled_transform_matrix = transform.matrix();
+            let (location, _, scale) = attribute_matrix_channels(sampled_transform_matrix)?;
+            sampled_transform_matrix = attribute_matrix_from_channels(
+                location,
+                DMat3::from_quat(attribute_quaternion(&value)?),
+                scale,
+            );
         }
         "FLOAT4X4" => {
             let sampled = attribute_matrix(&value)?;
@@ -6740,18 +7054,21 @@ fn geometry_attribute_matrix(
             if use_location && use_rotation && use_scale {
                 sampled_transform_matrix = sampled;
             } else {
-                let sampled_transform = matrix_transform(sampled)?;
-                let mut transform = matrix_transform(sampled_transform_matrix)?;
+                let (mut location, mut rotation, mut scale) =
+                    attribute_matrix_channels(sampled_transform_matrix)?;
+                let (sampled_location, sampled_rotation, sampled_scale) =
+                    attribute_matrix_channels(sampled)?;
                 if use_location {
-                    transform.translation = sampled_transform.translation;
+                    location = sampled_location;
                 }
                 if use_rotation {
-                    transform.rotation = sampled_transform.rotation;
+                    rotation = sampled_rotation;
                 }
                 if use_scale {
-                    transform.scale = sampled_transform.scale;
+                    scale = sampled_scale;
                 }
-                sampled_transform_matrix = transform.matrix();
+                sampled_transform_matrix =
+                    attribute_matrix_from_channels(location, rotation, scale);
             }
         }
         _ => return Err(evaluation_error("Geometry Attribute data_type is invalid")),
@@ -7410,6 +7727,7 @@ fn apply_object_constraint(
     frame: f64,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+    evaluated_instances: &BTreeMap<Id, crate::graph::EvaluatedInstances>,
     owner_node_id: Option<&Id>,
     owner_space_node_id: &Id,
     owner_world: DMat4,
@@ -7593,6 +7911,7 @@ fn apply_object_constraint(
         frame,
         world_matrices,
         evaluated_meshes,
+        evaluated_instances,
         owner_node_id,
         world_to_owner,
         Some(1.0),
@@ -7617,6 +7936,7 @@ fn apply_object_constraint_in_space(
     frame: f64,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
+    evaluated_instances: &BTreeMap<Id, crate::graph::EvaluatedInstances>,
     owner_node_id: Option<&Id>,
     world_to_owner: Option<DMat4>,
     influence_override: Option<f64>,
@@ -8361,8 +8681,14 @@ fn apply_object_constraint_in_space(
             return blend_transform(source, desired, influence);
         }
         ConstraintType::GeometryAttribute => {
-            let desired =
-                geometry_attribute_matrix(source, target, doc, constraint, evaluated_meshes)?;
+            let desired = geometry_attribute_matrix(
+                source,
+                target,
+                doc,
+                constraint,
+                evaluated_meshes,
+                evaluated_instances,
+            )?;
             return if influence >= 1.0 {
                 Ok(desired)
             } else {
@@ -9837,12 +10163,15 @@ pub(crate) fn evaluate_drivers(
         owner: &'a Id,
         driver: &'a Driver,
     }
+    struct DriverEvaluationContext<'a> {
+        doc: &'a SceneDoc,
+        frame: f64,
+    }
     fn visit(
         index: usize,
         entries: &[Entry<'_>],
         by_output: &BTreeMap<(Id, String, u32), usize>,
-        doc: &SceneDoc,
-        frame: f64,
+        context: &mut DriverEvaluationContext<'_>,
         outputs: &mut BTreeMap<(Id, String, u32), f64>,
         active: &mut BTreeSet<usize>,
     ) -> Result<f64> {
@@ -9875,9 +10204,9 @@ pub(crate) fn evaluate_drivers(
                 variable.index,
             );
             let value = if let Some(dependency) = by_output.get(&source_key) {
-                visit(*dependency, entries, by_output, doc, frame, outputs, active)?
+                visit(*dependency, entries, by_output, context, outputs, active)?
             } else {
-                variable_value(doc, frame, variable)?
+                variable_value(context.doc, context.frame, variable)?
             };
             variables.insert(variable.name.clone(), value);
         }
@@ -9950,13 +10279,13 @@ pub(crate) fn evaluate_drivers(
         }
     }
     let mut active = BTreeSet::new();
+    let mut context = DriverEvaluationContext { doc, frame };
     for index in 0..entries.len() {
         visit(
             index,
             &entries,
             &by_output,
-            doc,
-            frame,
+            &mut context,
             &mut outputs,
             &mut active,
         )?;
@@ -10061,8 +10390,10 @@ fn driver_target_transform(
             animated_transform(node, doc, frame)
         }
         "world" => {
-            let worlds = evaluate_world_matrices_with_drivers(doc, frame, &BTreeMap::new())?;
-            let matrix = worlds.get(target_id).copied().ok_or_else(|| {
+            let matrix = evaluate_world_matrices_with_drivers(doc, frame, &BTreeMap::new())?
+                .get(target_id)
+                .copied();
+            let matrix = matrix.ok_or_else(|| {
                 evaluation_error_with(
                     "driver world-space target is unavailable",
                     json!({ "target": target_id }),

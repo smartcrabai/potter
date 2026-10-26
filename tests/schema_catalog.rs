@@ -1026,6 +1026,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "physics.dynamic_paint_surface.surface_type",
         "constraint.ik.swing_ellipse_limit",
         "modifier.boolean.exact_point_attribute_local_index",
+        "constraint.geometry_attribute.instances",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1037,6 +1038,19 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
     for feature_id in [
         "physics.dynamic_paint_canvas.canvas_surfaces",
         "physics.dynamic_paint_surface.topology",
+        "constraint.geometry_attribute.instances.collection_instances",
+        "constraint.geometry_attribute.instances.attribute_conversion",
+        "constraint.geometry_attribute.instances.picked_instance",
+        "constraint.geometry_attribute.instances.realized_points",
+        "constraint.geometry_attribute.instances.non_point_attribute",
+        "constraint.geometry_attribute.instances.normal_field",
+        "constraint.geometry_attribute.instances.realize_settings",
+        "constraint.geometry_attribute.instances.transform_matrix_mode",
+        "graph.instance_component.realize_attribute_columns",
+        "graph.instance_component.store_named_attribute_uncaptured",
+        "graph.bake.legacy_instance_columns_missing",
+        "constraint.geometry_attribute.instances.no_evaluated_geometry",
+        "driver.geometry_attribute.instance_dependency",
     ] {
         assert!(
             features.iter().any(|feature| {

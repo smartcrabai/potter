@@ -207,6 +207,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         "GeometryNodeTransform" => (
             sockets(&[
                 ("Geometry", "geometry"),
+                ("Mode", "string"),
                 ("Translation", "vector"),
                 ("Rotation", "rotation"),
                 ("Scale", "vector"),
@@ -222,9 +223,18 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             ]),
             sockets(GEOMETRY_OUT),
         ),
-        "GeometryNodeJoinGeometry"
-        | "GeometryNodeRealizeInstances"
-        | "GeometryNodeRepeatOutput" => (sockets(GEOMETRY_IN), sockets(GEOMETRY_OUT)),
+        "GeometryNodeJoinGeometry" | "GeometryNodeRepeatOutput" => {
+            (sockets(GEOMETRY_IN), sockets(GEOMETRY_OUT))
+        }
+        "GeometryNodeRealizeInstances" => (
+            sockets(&[
+                ("Geometry", "geometry"),
+                ("Selection", "boolean"),
+                ("Realize All", "boolean"),
+                ("Depth", "integer"),
+            ]),
+            sockets(GEOMETRY_OUT),
+        ),
         "GeometryNodeInstanceOnPoints" => (
             sockets(&[
                 ("Points", "geometry"),
@@ -243,6 +253,8 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
                 ("Selection", "boolean"),
                 ("Distance Min", "float"),
                 ("Density", "float"),
+                ("Density Factor", "float"),
+                ("Density Max", "float"),
                 ("Seed", "integer"),
             ]),
             sockets(&[

@@ -11,6 +11,7 @@ pub(crate) use bake::{
     validate_node_bake_record, validate_node_bake_resource, validate_node_bake_settings,
 };
 pub use bake::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord, NodeBakeValue};
+pub(crate) use evaluator::{EvaluatedInstances, evaluate_at_frame_with_bakes_and_instances};
 pub use evaluator::{GraphEvaluation, evaluate, evaluate_at_frame, evaluate_at_frame_with_bakes};
 pub use model::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup};
 pub use sockets::validate_link;

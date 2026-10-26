@@ -32,10 +32,104 @@ type SimulationCache = Mutex<BTreeMap<(String, Id, i64), GeometryValue>>;
 
 static SIMULATION_CACHE: LazyLock<SimulationCache> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub(crate) struct EvaluatedInstances {
+    pub(crate) transforms: Vec<[f64; 16]>,
+    pub(crate) attributes: BTreeMap<String, InstanceAttributeColumn>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct InstanceAttributeColumn {
+    pub(crate) data_type: String,
+    pub(crate) values: Vec<Value>,
+}
+
+impl EvaluatedInstances {
+    fn len(&self) -> usize {
+        self.transforms.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.transforms.is_empty()
+    }
+
+    fn push_transform(&mut self, transform: [f64; 16]) {
+        for column in self.attributes.values_mut() {
+            column.values.push(Value::Null);
+        }
+        self.transforms.push(transform);
+    }
+    fn push_point_attributes(
+        &mut self,
+        transform: [f64; 16],
+        columns: &BTreeMap<String, PointAttributeColumn<'_>>,
+        mesh: &Mesh,
+        index: usize,
+    ) -> Result<()> {
+        let vertex = mesh
+            .vertices
+            .get(index)
+            .ok_or_else(|| evaluation("point attribute index is out of range"))?;
+        let prior_len = self.len();
+        self.push_transform(transform);
+        for (name, column) in columns {
+            let value = point_attribute_value(column, vertex.id, index)?;
+            let data_type = match &column.data_type {
+                Some(data_type) => data_type.clone(),
+                None => infer_instance_data_type(&value)?,
+            };
+            if let Some(existing) = self.attributes.get_mut(name) {
+                if existing.data_type != data_type {
+                    return Err(evaluation("instance attribute has inconsistent data types"));
+                }
+                existing.values[prior_len] = value;
+            } else {
+                let mut values = vec![Value::Null; prior_len];
+                values.push(value);
+                self.attributes
+                    .insert(name.clone(), InstanceAttributeColumn { data_type, values });
+            }
+        }
+        Ok(())
+    }
+
+    fn append(&mut self, other: &Self) -> Result<()> {
+        let self_len = self.len();
+        let other_len = other.len();
+        for (name, column) in &other.attributes {
+            if let Some(existing) = self.attributes.get_mut(name) {
+                if existing.data_type != column.data_type {
+                    return Err(evaluation("instance attribute has inconsistent data types"));
+                }
+                existing.values.extend(column.values.iter().cloned());
+            } else {
+                let mut values = vec![Value::Null; self_len];
+                values.extend(column.values.iter().cloned());
+                self.attributes.insert(
+                    name.clone(),
+                    InstanceAttributeColumn {
+                        data_type: column.data_type.clone(),
+                        values,
+                    },
+                );
+            }
+        }
+        for (name, column) in &mut self.attributes {
+            if !other.attributes.contains_key(name) {
+                column.values.resize(self_len + other_len, Value::Null);
+            }
+        }
+        self.transforms.extend_from_slice(&other.transforms);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GraphEvaluation {
     pub mesh: Mesh,
     pub instance_paths: Vec<Vec<Id>>,
+    pub(crate) instances: EvaluatedInstances,
     pub bake_captures: BTreeMap<String, NodeBakeFrame>,
     pub bake_material_refs: BTreeMap<String, Vec<Id>>,
 }
@@ -44,6 +138,7 @@ pub struct GraphEvaluation {
 struct GeometryValue {
     mesh: Mesh,
     instance_paths: Vec<Vec<Id>>,
+    instance_attributes: EvaluatedInstances,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +196,10 @@ struct Evaluator<'a> {
     group: &'a NodeGroup,
     subject_name: &'a str,
     input: Option<&'a Mesh>,
+    input_instances: Option<&'a EvaluatedInstances>,
+    input_instance_paths: Option<&'a [Vec<Id>]>,
+    capture_instance_attributes: bool,
+    require_instance_attributes: bool,
     overrides: &'a Map<String, Value>,
     frame: f64,
     simulation_signature: Option<String>,
@@ -172,6 +271,34 @@ pub fn evaluate_at_frame_with_bakes(
     capture_bake_nodes: &BTreeSet<String>,
     subject_name: &str,
 ) -> Result<GraphEvaluation> {
+    evaluate_at_frame_with_bakes_and_instances(
+        group,
+        input,
+        None,
+        None,
+        true,
+        true,
+        overrides,
+        frame,
+        bake_records,
+        capture_bake_nodes,
+        subject_name,
+    )
+}
+
+pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
+    group: &NodeGroup,
+    input: Option<&Mesh>,
+    input_instances: Option<&EvaluatedInstances>,
+    input_instance_paths: Option<&[Vec<Id>]>,
+    collect_instance_attributes: bool,
+    outer_instance_attributes_required: bool,
+    overrides: &Map<String, Value>,
+    frame: f64,
+    bake_records: &BTreeMap<String, NodeBakeRecord>,
+    capture_bake_nodes: &BTreeSet<String>,
+    subject_name: &str,
+) -> Result<GraphEvaluation> {
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "graph evaluation frame must be finite",
@@ -184,12 +311,29 @@ pub fn evaluate_at_frame_with_bakes(
         ));
     }
     validate_graph(group)?;
+    let capture_instance_attributes = collect_instance_attributes
+        || !capture_bake_nodes.is_empty()
+        || group
+            .nodes
+            .values()
+            .any(|node| node.node_type == "GeometryNodeInputNamedAttribute");
+    let require_instance_attributes = outer_instance_attributes_required;
     let simulation_signature = group
         .nodes
         .values()
         .any(|node| node.node_type == "GeometryNodeSimulationOutput")
         .then(|| {
-            serde_json::to_value((group, input, overrides))
+            let serialized = if capture_instance_attributes {
+                serde_json::to_value((group, input, input_instances, overrides))
+            } else {
+                serde_json::to_value((
+                    group,
+                    input,
+                    input_instances.map(|instances| &instances.transforms),
+                    overrides,
+                ))
+            };
+            serialized
                 .map_err(|error| {
                     PotError::new(
                         ErrorCode::InternalError,
@@ -267,8 +411,12 @@ pub fn evaluate_at_frame_with_bakes(
         group,
         subject_name,
         input,
-        overrides,
+        input_instances,
+        input_instance_paths,
         frame,
+        overrides,
+        capture_instance_attributes,
+        require_instance_attributes,
         simulation_signature,
         simulation_states: HashMap::new(),
         repeat_states: HashMap::new(),
@@ -280,12 +428,14 @@ pub fn evaluate_at_frame_with_bakes(
         bake_material_refs: BTreeMap::new(),
         bake_captures: BTreeMap::new(),
     };
+    let initial_instances = evaluator.input_instances_for_graph();
     let value = evaluator.input_value(
         &output_node,
         &output_socket,
         EvalValue::Geometry(GeometryValue {
             mesh: input.cloned().unwrap_or_default(),
-            instance_paths: Vec::new(),
+            instance_paths: evaluator.input_instance_paths_for_graph(),
+            instance_attributes: initial_instances,
         }),
     )?;
     let EvalValue::Geometry(geometry) = value else {
@@ -315,9 +465,14 @@ pub fn evaluate_at_frame_with_bakes(
             let _ = evaluator.output_value(&parsed_id, socket)?;
         }
     }
+    let mut instances = geometry.instance_attributes;
+    if !collect_instance_attributes {
+        instances.attributes.clear();
+    }
     Ok(GraphEvaluation {
         mesh: geometry.mesh,
         instance_paths: geometry.instance_paths,
+        instances,
         bake_captures: evaluator.bake_captures,
         bake_material_refs: evaluator.bake_material_refs,
     })
@@ -429,6 +584,7 @@ impl Evaluator<'_> {
                 EvalValue::Geometry(GeometryValue {
                     mesh: self.input.cloned().unwrap_or_default(),
                     instance_paths: Vec::new(),
+                    instance_attributes: EvaluatedInstances::default(),
                 }),
             ),
             "GeometryNodeMeshCube" => self.mesh_primitive(id, node, "box"),
@@ -443,7 +599,7 @@ impl Evaluator<'_> {
             "GeometryNodeSetPosition" => self.set_position_node(id, node),
             "GeometryNodeJoinGeometry" => self.join_node(id),
             "GeometryNodeInstanceOnPoints" => self.instance_on_points(id, node),
-            "GeometryNodeRealizeInstances" => self.geometry_input(id, node, "Geometry"),
+            "GeometryNodeRealizeInstances" => self.realize_instances(id, node),
             "GeometryNodeDistributePointsOnFaces" => self.distribute_points(id, node),
             "GeometryNodeMeshToPoints" => self.mesh_to_points(id, node),
             "GeometryNodeSubdivisionSurface" => self.subdivision(id, node),
@@ -482,7 +638,7 @@ impl Evaluator<'_> {
                     self.bake_material_refs
                         .insert(node_id.to_owned(), material_refs.clone());
                 }
-                return Ok(baked.into_eval_value());
+                return baked.into_eval_value(id, self.require_instance_attributes);
             }
         }
         let items = node
@@ -502,6 +658,7 @@ impl Evaluator<'_> {
             EvalValue::Geometry(GeometryValue {
                 mesh: self.input.cloned().unwrap_or_default(),
                 instance_paths: Vec::new(),
+                instance_attributes: self.input_instances_for_graph(),
             })
         } else {
             EvalValue::Scalar(Value::Null)
@@ -524,6 +681,7 @@ impl Evaluator<'_> {
                     EvalValue::Geometry(GeometryValue {
                         mesh: self.input.cloned().unwrap_or_default(),
                         instance_paths: Vec::new(),
+                        instance_attributes: self.input_instances_for_graph(),
                     })
                 } else {
                     EvalValue::Scalar(Value::Null)
@@ -547,6 +705,18 @@ impl Evaluator<'_> {
                     EvalValue::Geometry(geometry) => NodeBakeValue::Geometry {
                         mesh: geometry.mesh.clone(),
                         instance_paths: geometry.instance_paths.clone(),
+                        instance_columns: Some(
+                            serde_json::to_value(&geometry.instance_attributes).map_err(
+                                |error| {
+                                    PotError::new(
+                                        ErrorCode::InternalError,
+                                        format!(
+                                            "could not serialize bake instance columns: {error}"
+                                        ),
+                                    )
+                                },
+                            )?,
+                        ),
                         material_refs: Vec::new(),
                     },
                     EvalValue::Scalar(value) => NodeBakeValue::Scalar {
@@ -561,6 +731,13 @@ impl Evaluator<'_> {
                             .and_then(Value::as_str)
                             .unwrap_or("POINT")
                             .to_owned();
+                        if domain == "INSTANCE" && !geometry.instance_attributes.is_empty() {
+                            return Err(unsupported_instance_feature(
+                                id,
+                                "graph.instance_component.GeometryNodeBake",
+                                "Bake node field items on the INSTANCE domain are not implemented",
+                            ));
+                        }
                         let count = domain_element_count(&geometry.mesh, &domain)?;
                         let mut field_values = Vec::with_capacity(count);
                         for index in 0..count {
@@ -650,6 +827,7 @@ impl Evaluator<'_> {
             EvalValue::Geometry(GeometryValue {
                 mesh: self.input.cloned().unwrap_or_default(),
                 instance_paths: Vec::new(),
+                instance_attributes: EvaluatedInstances::default(),
             }),
         )?;
         let mut state = into_geometry(initial)?;
@@ -709,6 +887,7 @@ impl Evaluator<'_> {
             EvalValue::Geometry(GeometryValue {
                 mesh: self.input.cloned().unwrap_or_default(),
                 instance_paths: Vec::new(),
+                instance_attributes: EvaluatedInstances::default(),
             }),
         )?;
         let mut state = into_geometry(initial)?;
@@ -801,19 +980,60 @@ impl Evaluator<'_> {
         ))
     }
 
+    fn input_instances_for_graph(&self) -> EvaluatedInstances {
+        let Some(instances) = self.input_instances else {
+            return EvaluatedInstances::default();
+        };
+        if self.capture_instance_attributes {
+            instances.clone()
+        } else {
+            EvaluatedInstances {
+                transforms: instances.transforms.clone(),
+                attributes: BTreeMap::new(),
+            }
+        }
+    }
+
+    fn input_instance_paths_for_graph(&self) -> Vec<Vec<Id>> {
+        self.input_instance_paths
+            .map(<[Vec<Id>]>::to_vec)
+            .unwrap_or_default()
+    }
+
     fn group_input_value(&self, socket: &str) -> Result<EvalValue> {
-        let interface_socket = self
+        let Some((socket_index, interface_socket)) = self
             .group
             .interface
             .inputs
             .iter()
-            .find(|candidate| candidate.name == socket || candidate.id == socket)
-            .ok_or_else(|| {
-                PotError::new(
-                    ErrorCode::InvalidOperation,
-                    format!("unknown group input socket `{socket}`"),
-                )
-            })?;
+            .enumerate()
+            .find(|(_, candidate)| candidate.name == socket || candidate.id == socket)
+        else {
+            return Err(PotError::new(
+                ErrorCode::InvalidOperation,
+                format!("unknown group input socket `{socket}`"),
+            ));
+        };
+        if interface_socket.socket_type == "geometry" {
+            let has_object_geometry = socket_index == 0;
+            return Ok(EvalValue::Geometry(GeometryValue {
+                mesh: if has_object_geometry {
+                    self.input.cloned().unwrap_or_default()
+                } else {
+                    Mesh::new()
+                },
+                instance_paths: if has_object_geometry {
+                    self.input_instance_paths_for_graph()
+                } else {
+                    Vec::new()
+                },
+                instance_attributes: if has_object_geometry {
+                    self.input_instances_for_graph()
+                } else {
+                    EvaluatedInstances::default()
+                },
+            }));
+        }
         let value = self
             .overrides
             .get(&interface_socket.id)
@@ -867,6 +1087,9 @@ impl Evaluator<'_> {
         {
             return self.output_value(&link.from_node, &link.from_socket);
         }
+        if node.node_type == "GeometryNodeSetPosition" && socket == "Position" {
+            return Ok(EvalValue::Field(Field::Position));
+        }
         if let Some(value) = node.inputs.get(socket) {
             return Ok(EvalValue::Scalar(value.clone()));
         }
@@ -884,19 +1107,104 @@ impl Evaluator<'_> {
             EvalValue::Geometry(GeometryValue {
                 mesh: self.input.cloned().unwrap_or_default(),
                 instance_paths: Vec::new(),
+                instance_attributes: EvaluatedInstances::default(),
             }),
         )
     }
 
     fn geometry_input(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
-        let value = self.input_geometry(id, node, socket)?;
-        match value {
-            EvalValue::Geometry(_) => Ok(value),
+        match self.input_geometry(id, node, socket)? {
+            EvalValue::Geometry(geometry) => {
+                let instance_aware = matches!(
+                    node.node_type.as_str(),
+                    "GeometryNodeRealizeInstances"
+                        | "GeometryNodeTransform"
+                        | "GeometryNodeSetPosition"
+                        | "GeometryNodeMeshToPoints"
+                        | "GeometryNodeSubdivisionSurface"
+                        | "GeometryNodeStoreNamedAttribute"
+                );
+                if !geometry.instance_attributes.is_empty() && !instance_aware {
+                    return Err(unsupported_instance_feature(
+                        id,
+                        &format!("graph.instance_component.{}", node.node_type),
+                        format!(
+                            "node `{}` does not implement the Instances component",
+                            node.node_type
+                        ),
+                    ));
+                }
+                Ok(EvalValue::Geometry(geometry))
+            }
             _ => Err(PotError::new(
                 ErrorCode::EvaluationFailed,
                 format!("input `{socket}` on `{}` is not geometry", node.node_type),
             )),
         }
+    }
+
+    fn realize_instances(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
+        let mut geometry = into_geometry(self.geometry_input(id, node, "Geometry")?)?;
+        if !geometry.instance_attributes.is_empty() {
+            let selection = as_field(self.input_value_with_node(
+                id,
+                node,
+                "Selection",
+                EvalValue::Scalar(json!(true)),
+            )?);
+            let realize_all = as_field(self.input_value_with_node(
+                id,
+                node,
+                "Realize All",
+                EvalValue::Scalar(json!(true)),
+            )?);
+            let instance_count = geometry.instance_attributes.len();
+            let attributes = &geometry.instance_attributes.attributes;
+            for (index, transform) in geometry.instance_attributes.transforms.iter().enumerate() {
+                if !field_bool_for_instance(
+                    &selection,
+                    attributes,
+                    transform,
+                    index,
+                    instance_count,
+                    true,
+                )? {
+                    return Err(unsupported_instance_feature(
+                        id,
+                        "constraint.geometry_attribute.instances.realize_settings",
+                        "Realize Instances with a non-default Selection cannot be represented from flattened instance geometry",
+                    ));
+                }
+                if !field_bool_for_instance(
+                    &realize_all,
+                    attributes,
+                    transform,
+                    index,
+                    instance_count,
+                    true,
+                )? {
+                    return Err(unsupported_instance_feature(
+                        id,
+                        "constraint.geometry_attribute.instances.realize_settings",
+                        "Realize Instances with Realize All disabled or finite-depth realization is not implemented",
+                    ));
+                }
+            }
+            if geometry
+                .instance_attributes
+                .attributes
+                .values()
+                .any(|column| !column.values.is_empty())
+            {
+                return Err(unsupported_instance_feature(
+                    id,
+                    "graph.instance_component.realize_attribute_columns",
+                    "Realize Instances cannot propagate instance attribute columns to the realized mesh",
+                ));
+            }
+            geometry.instance_attributes = EvaluatedInstances::default();
+        }
+        Ok(EvalValue::Geometry(geometry))
     }
 
     fn mesh_primitive(&mut self, id: &Id, node: &GraphNode, kind: &str) -> Result<EvalValue> {
@@ -918,6 +1226,7 @@ impl Evaluator<'_> {
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: Vec::new(),
+            instance_attributes: EvaluatedInstances::default(),
         }))
     }
 
@@ -1116,12 +1425,23 @@ impl Evaluator<'_> {
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: Vec::new(),
+            instance_attributes: EvaluatedInstances::default(),
         }))
     }
 
     fn transform_node(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
         let geometry = self.geometry_input(id, node, "Geometry")?;
         let mut geometry = into_geometry(geometry)?;
+        let mode = self.string_input(id, node, "Mode", "Components")?;
+        if !mode.eq_ignore_ascii_case("Components") {
+            return Err(unsupported_instance_feature(
+                id,
+                "constraint.geometry_attribute.instances.transform_matrix_mode",
+                format!(
+                    "GeometryNodeTransform mode `{mode}` is not implemented; only Components mode is supported"
+                ),
+            ));
+        }
         let original = geometry.mesh.clone();
         let translation = as_field(self.input_value_with_node(
             id,
@@ -1148,6 +1468,38 @@ impl Evaluator<'_> {
             let matrix =
                 DMat4::from_scale_rotation_translation(local_scale, rotation, local_translation);
             vertex.co = matrix.transform_point3(vertex.co);
+        }
+        let instance_count = geometry.instance_attributes.len();
+        let attributes = &geometry.instance_attributes.attributes;
+        let transforms = &mut geometry.instance_attributes.transforms;
+        for (index, transform) in transforms.iter_mut().enumerate() {
+            let local_translation = field_vec3_for_instance(
+                &translation,
+                attributes,
+                transform,
+                index,
+                instance_count,
+                DVec3::ZERO,
+            )?;
+            let local_scale = field_vec3_for_instance(
+                &scale,
+                attributes,
+                transform,
+                index,
+                instance_count,
+                DVec3::ONE,
+            )?;
+            if !local_translation.is_finite() || !local_scale.is_finite() {
+                return Err(evaluation("transform fields must be finite"));
+            }
+            let matrix =
+                DMat4::from_scale_rotation_translation(local_scale, rotation, local_translation)
+                    * DMat4::from_cols_array(transform);
+            let values = matrix.to_cols_array();
+            if values.iter().any(|component| !component.is_finite()) {
+                return Err(evaluation("transformed instance matrix is not finite"));
+            }
+            *transform = values;
         }
         Ok(EvalValue::Geometry(geometry))
     }
@@ -1177,6 +1529,43 @@ impl Evaluator<'_> {
             let delta = field_vec3(&offset, &original, index, DVec3::ZERO)?;
             vertex.co = base + delta;
         }
+        let instance_count = geometry.instance_attributes.len();
+        let attributes = &geometry.instance_attributes.attributes;
+        let transforms = &mut geometry.instance_attributes.transforms;
+        for (index, transform) in transforms.iter_mut().enumerate() {
+            if !field_bool_for_instance(
+                &selection,
+                attributes,
+                transform,
+                index,
+                instance_count,
+                false,
+            )? {
+                continue;
+            }
+            let current = instance_position(transform)?;
+            let base = field_vec3_for_instance(
+                &position,
+                attributes,
+                transform,
+                index,
+                instance_count,
+                current,
+            )?;
+            let delta = field_vec3_for_instance(
+                &offset,
+                attributes,
+                transform,
+                index,
+                instance_count,
+                DVec3::ZERO,
+            )?;
+            let new_position = base + delta;
+            if !new_position.is_finite() {
+                return Err(evaluation("set position instance location is not finite"));
+            }
+            transform[12..15].copy_from_slice(&new_position.to_array());
+        }
         Ok(EvalValue::Geometry(geometry))
     }
 
@@ -1190,10 +1579,12 @@ impl Evaluator<'_> {
             .collect();
         let mut geometries = Vec::with_capacity(links.len());
         let mut paths = Vec::new();
+        let mut instances = EvaluatedInstances::default();
         for link in links {
             match self.output_value(&link.from_node, &link.from_socket)? {
                 EvalValue::Geometry(mut geometry) => {
                     paths.append(&mut geometry.instance_paths);
+                    instances.append(&geometry.instance_attributes)?;
                     geometries.push(geometry.mesh);
                 }
                 _ => return Err(evaluation("Join Geometry input is not geometry")),
@@ -1203,6 +1594,7 @@ impl Evaluator<'_> {
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: paths,
+            instance_attributes: instances,
         }))
     }
 
@@ -1214,6 +1606,7 @@ impl Evaluator<'_> {
             EvalValue::Geometry(GeometryValue {
                 mesh: Mesh::new(),
                 instance_paths: Vec::new(),
+                instance_attributes: EvaluatedInstances::default(),
             }),
         )?;
         let source_value = self.input_value_with_node(
@@ -1223,15 +1616,23 @@ impl Evaluator<'_> {
             EvalValue::Geometry(GeometryValue {
                 mesh: Mesh::new(),
                 instance_paths: Vec::new(),
+                instance_attributes: EvaluatedInstances::default(),
             }),
         )?;
         let points = into_geometry(points_value)?;
         let source = into_geometry(source_value)?;
+        let has_realized_point_geometry = !points.instance_attributes.is_empty();
         let selection = as_field(self.input_value_with_node(
             id,
             node,
             "Selection",
             EvalValue::Scalar(json!(true)),
+        )?);
+        let pick_instance = as_field(self.input_value_with_node(
+            id,
+            node,
+            "Pick Instance",
+            EvalValue::Scalar(json!(false)),
         )?);
         let scale = as_field(self.input_value_with_node(
             id,
@@ -1247,14 +1648,46 @@ impl Evaluator<'_> {
             .find(|link| &link.to_node == id && link.to_socket == "Instance")
             .map(|link| link.from_node.clone());
         let mut meshes = Vec::new();
-        let mut paths = source.instance_paths;
+        let mut paths = points.instance_paths;
+        let mut instances = points.instance_attributes;
+        let mut point_columns = None;
         for (index, point) in points.mesh.vertices.iter().enumerate() {
             if !field_bool(&selection, &points.mesh, index, "POINT", false)? {
                 continue;
             }
-            let mut instance_mesh = source.mesh.clone();
+            if has_realized_point_geometry {
+                return Err(unsupported_instance_feature(
+                    id,
+                    "constraint.geometry_attribute.instances.realized_points",
+                    "Instance on Points cannot distinguish realized instance geometry in its Points mesh",
+                ));
+            }
+            if field_bool(&pick_instance, &points.mesh, index, "POINT", false)? {
+                return Err(unsupported_instance_feature(
+                    id,
+                    "constraint.geometry_attribute.instances.picked_instance",
+                    "Instance on Points Pick Instance is not implemented",
+                ));
+            }
             let local_scale = field_vec3(&scale, &points.mesh, index, DVec3::ONE)?;
             let matrix = DMat4::from_scale_rotation_translation(local_scale, rotation, point.co);
+            if self.capture_instance_attributes {
+                if point_columns.is_none() {
+                    point_columns = Some(point_domain_attribute_columns(&points.mesh, id)?);
+                }
+                let point_columns = point_columns
+                    .as_ref()
+                    .ok_or_else(|| evaluation("point attribute columns were not initialized"))?;
+                instances.push_point_attributes(
+                    matrix.to_cols_array(),
+                    point_columns,
+                    &points.mesh,
+                    index,
+                )?;
+            } else {
+                instances.push_transform(matrix.to_cols_array());
+            }
+            let mut instance_mesh = source.mesh.clone();
             for vertex in &mut instance_mesh.vertices {
                 vertex.co = matrix.transform_point3(vertex.co);
             }
@@ -1268,6 +1701,7 @@ impl Evaluator<'_> {
         Ok(EvalValue::Geometry(GeometryValue {
             mesh: merge_meshes(&meshes)?,
             instance_paths: paths,
+            instance_attributes: instances,
         }))
     }
 
@@ -1279,9 +1713,14 @@ impl Evaluator<'_> {
             EvalValue::Geometry(GeometryValue {
                 mesh: self.input.cloned().unwrap_or_default(),
                 instance_paths: Vec::new(),
+                instance_attributes: EvaluatedInstances::default(),
             }),
         )?;
-        let surface = into_geometry(surface_value)?.mesh;
+        let GeometryValue {
+            mesh: surface,
+            instance_paths,
+            instance_attributes,
+        } = into_geometry(surface_value)?;
         let density = as_field(self.input_value_with_node(
             id,
             node,
@@ -1361,7 +1800,8 @@ impl Evaluator<'_> {
         if count == 0 || weighted.is_empty() {
             return Ok(EvalValue::Geometry(GeometryValue {
                 mesh: Mesh::new(),
-                instance_paths: Vec::new(),
+                instance_paths,
+                instance_attributes,
             }));
         }
         let mut random = u64::from_ne_bytes(seed.to_ne_bytes());
@@ -1417,7 +1857,8 @@ impl Evaluator<'_> {
         }
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
-            instance_paths: Vec::new(),
+            instance_paths,
+            instance_attributes,
         }))
     }
 
@@ -1509,6 +1950,7 @@ impl Evaluator<'_> {
         Ok(EvalValue::Geometry(GeometryValue {
             mesh: points,
             instance_paths: geometry.instance_paths,
+            instance_attributes: geometry.instance_attributes,
         }))
     }
 
@@ -1539,6 +1981,7 @@ impl Evaluator<'_> {
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: geometry.instance_paths,
+            instance_attributes: geometry.instance_attributes,
         }))
     }
 
@@ -1555,6 +1998,16 @@ impl Evaluator<'_> {
             .and_then(Value::as_str)
             .unwrap_or("POINT");
         let domain = if domain == "POINTS" { "POINT" } else { domain };
+        if domain == "INSTANCE" {
+            if !self.capture_instance_attributes {
+                return Err(unsupported_instance_feature(
+                    id,
+                    "graph.instance_component.store_named_attribute_uncaptured",
+                    "Store Named Attribute on the INSTANCE domain requires instance attribute capture",
+                ));
+            }
+            return self.store_instance_named_attribute(id, node, geometry, &name);
+        }
         let count = domain_element_count(&geometry.mesh, domain)?;
         let selection = as_field(self.input_value_with_node(
             id,
@@ -1604,6 +2057,104 @@ impl Evaluator<'_> {
             .mesh
             .attributes
             .insert(name, json!({"domain":domain,"data":values}));
+        Ok(EvalValue::Geometry(geometry))
+    }
+
+    fn store_instance_named_attribute(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        mut geometry: GeometryValue,
+        name: &str,
+    ) -> Result<EvalValue> {
+        if !geometry.instance_paths.is_empty() && geometry.instance_attributes.transforms.is_empty()
+        {
+            return Err(legacy_instance_columns_missing(id));
+        }
+        let selection = as_field(self.input_value_with_node(
+            id,
+            node,
+            "Selection",
+            EvalValue::Scalar(json!(true)),
+        )?);
+        let value = as_field(self.input_value_with_node(
+            id,
+            node,
+            "Value",
+            EvalValue::Scalar(Value::Null),
+        )?);
+        let declared_type = node
+            .properties
+            .get("data_type")
+            .and_then(Value::as_str)
+            .map(normalize_instance_data_type)
+            .filter(|data_type| !data_type.is_empty());
+        let previous = geometry.instance_attributes.attributes.get(name);
+        if previous.is_some_and(|column| column.values.len() != geometry.instance_attributes.len())
+        {
+            return Err(evaluation(
+                "stored instance attribute column length is invalid",
+            ));
+        }
+        let previous_type = previous.map(|column| normalize_instance_data_type(&column.data_type));
+        if declared_type
+            .as_ref()
+            .zip(previous_type.as_ref())
+            .is_some_and(|(declared, previous)| declared != previous)
+        {
+            return Err(evaluation(
+                "stored instance attribute data type differs from its existing type",
+            ));
+        }
+
+        let mut selected_values = Vec::with_capacity(geometry.instance_attributes.len());
+        for index in 0..geometry.instance_attributes.len() {
+            if field_bool_in_instances(&selection, &geometry.instance_attributes, index, false)? {
+                selected_values.push(Some(field_json_instances(
+                    &value,
+                    &geometry.instance_attributes,
+                    index,
+                )?));
+            } else {
+                selected_values.push(None);
+            }
+        }
+        let inferred_type = selected_values
+            .iter()
+            .flatten()
+            .find(|value| !value.is_null())
+            .map(infer_instance_data_type)
+            .transpose()?;
+        if previous_type
+            .as_ref()
+            .zip(inferred_type.as_ref())
+            .is_some_and(|(previous, inferred)| previous != inferred)
+            && declared_type.is_none()
+        {
+            return Err(evaluation(
+                "stored instance attribute data type differs from its existing type",
+            ));
+        }
+        let data_type = declared_type
+            .or(previous_type)
+            .or(inferred_type)
+            .unwrap_or_else(|| "FLOAT".to_owned());
+        let values = selected_values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.unwrap_or_else(|| {
+                    previous
+                        .and_then(|column| column.values.get(index))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                })
+            })
+            .collect();
+        geometry.instance_attributes.attributes.insert(
+            name.to_owned(),
+            InstanceAttributeColumn { data_type, values },
+        );
         Ok(EvalValue::Geometry(geometry))
     }
 
@@ -1899,7 +2450,7 @@ impl Evaluator<'_> {
             EvalValue::Scalar(value) => {
                 if let Some(vector) = json_vec3(&value) {
                     Ok(DQuat::from_euler(
-                        glam::EulerRot::XYZ,
+                        glam::EulerRot::XYZEx,
                         vector.x,
                         vector.y,
                         vector.z,
@@ -2545,6 +3096,7 @@ fn cache_simulation_state(
 
 fn default_input(node_type: &str, socket: &str) -> Option<Value> {
     let value = match (node_type, socket) {
+        ("GeometryNodeTransform", "Mode") => json!("Components"),
         ("GeometryNodeTransform", "Translation")
         | ("GeometryNodeSetPosition", "Offset")
         | ("ShaderNodeVectorMath", "Vector" | "Vector_001" | "Vector_002") => {
@@ -2559,14 +3111,17 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
         (
             "GeometryNodeSetPosition"
             | "GeometryNodeInstanceOnPoints"
+            | "GeometryNodeRealizeInstances"
             | "GeometryNodeDistributePointsOnFaces"
             | "GeometryNodeMeshToPoints",
             "Selection",
-        ) => json!(true),
+        )
+        | ("GeometryNodeRealizeInstances", "Realize All") => json!(true),
+        ("GeometryNodeRealizeInstances", "Depth")
+        | ("GeometryNodeDistributePointsOnFaces", "Seed") => json!(0),
         ("GeometryNodeDistributePointsOnFaces", "Density") | ("ShaderNodeVectorMath", "Scale") => {
             json!(1.0)
         }
-        ("GeometryNodeDistributePointsOnFaces", "Seed") => json!(0),
         ("GeometryNodeSimulationOutput", "Skip") => json!(false),
         ("GeometryNodeRepeatInput", "Iterations") => json!(1),
         ("ShaderNodeMath", "Value" | "Value_001" | "Value_002") => json!(0.5),
@@ -2591,36 +3146,145 @@ fn into_geometry(value: EvalValue) -> Result<GeometryValue> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FieldEvaluationContext<'a> {
+    Mesh(&'a Mesh),
+    Instance {
+        attributes: &'a BTreeMap<String, InstanceAttributeColumn>,
+        transform: &'a [f64; 16],
+        instance_count: usize,
+    },
+}
+
 fn field_json(field: &Field, mesh: &Mesh, index: usize, domain: &str) -> Result<Value> {
+    field_json_in_context(field, FieldEvaluationContext::Mesh(mesh), index, domain)
+}
+
+fn field_json_instances(
+    field: &Field,
+    instances: &EvaluatedInstances,
+    index: usize,
+) -> Result<Value> {
+    let transform = instances
+        .transforms
+        .get(index)
+        .ok_or_else(|| evaluation("instance transform index is out of range"))?;
+    field_json_for_instance(
+        field,
+        &instances.attributes,
+        transform,
+        index,
+        instances.len(),
+    )
+}
+
+fn field_json_for_instance(
+    field: &Field,
+    attributes: &BTreeMap<String, InstanceAttributeColumn>,
+    transform: &[f64; 16],
+    index: usize,
+    instance_count: usize,
+) -> Result<Value> {
+    field_json_in_context(
+        field,
+        FieldEvaluationContext::Instance {
+            attributes,
+            transform,
+            instance_count,
+        },
+        index,
+        "INSTANCE",
+    )
+}
+
+fn field_json_in_context(
+    field: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<Value> {
     let value = match field {
         Field::Constant(value) => value.clone(),
-        Field::Position => vector_json(domain_position(mesh, index, domain)?),
-        Field::Normal => vector_json(normal_at(mesh, index, domain)?),
-        Field::Index => json!(index),
-        Field::Attribute(name) => {
-            let attribute = mesh
-                .attributes
-                .get(name)
-                .ok_or_else(|| evaluation("named attribute does not exist"))?;
-            if attribute
-                .get("domain")
-                .and_then(Value::as_str)
-                .is_some_and(|attribute_domain| attribute_domain != domain)
-            {
+        Field::Position => match context {
+            FieldEvaluationContext::Mesh(mesh) => {
+                vector_json(domain_position(mesh, index, domain)?)
+            }
+            FieldEvaluationContext::Instance { transform, .. } if domain == "INSTANCE" => {
+                vector_json(instance_position(transform)?)
+            }
+            FieldEvaluationContext::Instance { .. } => {
                 return Err(evaluation(
-                    "named attribute field domain does not match its consumer domain",
+                    "instance field context has a non-INSTANCE domain",
                 ));
             }
-            let values = attribute
-                .get("data")
-                .and_then(Value::as_array)
-                .ok_or_else(|| evaluation("named attribute payload is malformed"))?;
-            values
-                .get(index)
-                .cloned()
-                .ok_or_else(|| evaluation("named attribute index is out of range"))?
-        }
-        Field::AttributeExists(name) => json!(mesh.attributes.contains_key(name)),
+        },
+        Field::Normal => match context {
+            FieldEvaluationContext::Mesh(mesh) => vector_json(normal_at(mesh, index, domain)?),
+            FieldEvaluationContext::Instance { .. } => {
+                return Err(unsupported_instance_field_feature(
+                    "constraint.geometry_attribute.instances.normal_field",
+                    "Blender does not evaluate Normal fields on the INSTANCE domain",
+                ));
+            }
+        },
+        Field::Index => json!(index),
+        Field::Attribute(name) => match context {
+            FieldEvaluationContext::Mesh(mesh) => {
+                let attribute = mesh
+                    .attributes
+                    .get(name)
+                    .ok_or_else(|| evaluation("named attribute does not exist"))?;
+                if attribute
+                    .get("domain")
+                    .and_then(Value::as_str)
+                    .is_some_and(|attribute_domain| attribute_domain != domain)
+                {
+                    return Err(evaluation(
+                        "named attribute field domain does not match its consumer domain",
+                    ));
+                }
+                let values = attribute
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| evaluation("named attribute payload is malformed"))?;
+                values
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| evaluation("named attribute index is out of range"))?
+            }
+            FieldEvaluationContext::Instance {
+                attributes,
+                transform,
+                instance_count,
+            } if domain == "INSTANCE" => {
+                if name == "instance_transform" {
+                    json!(transform)
+                } else {
+                    let column = attributes
+                        .get(name)
+                        .ok_or_else(|| evaluation("named instance attribute does not exist"))?;
+                    if column.values.len() != instance_count {
+                        return Err(evaluation(
+                            "named instance attribute column has an invalid length",
+                        ));
+                    }
+                    column.values.get(index).cloned().ok_or_else(|| {
+                        evaluation("named instance attribute index is out of range")
+                    })?
+                }
+            }
+            FieldEvaluationContext::Instance { .. } => {
+                return Err(evaluation(
+                    "instance field context has a non-INSTANCE domain",
+                ));
+            }
+        },
+        Field::AttributeExists(name) => match context {
+            FieldEvaluationContext::Mesh(mesh) => json!(mesh.attributes.contains_key(name)),
+            FieldEvaluationContext::Instance { attributes, .. } => {
+                json!(name == "instance_transform" || attributes.contains_key(name))
+            }
+        },
         Field::Captured {
             domain: captured_domain,
             values,
@@ -2641,9 +3305,9 @@ fn field_json(field: &Field, mesh: &Mesh, index: usize, domain: &str) -> Result<
             second,
             third,
         } => {
-            let a = numeric_field(first, mesh, index, domain, "math")?;
-            let b = numeric_field(second, mesh, index, domain, "math")?;
-            let c = numeric_field(third, mesh, index, domain, "math")?;
+            let a = numeric_field_in_context(first, context, index, domain, "math")?;
+            let b = numeric_field_in_context(second, context, index, domain, "math")?;
+            let c = numeric_field_in_context(third, context, index, domain, "math")?;
             json!(math_value(operation, a, b, c)?)
         }
         Field::VectorMath {
@@ -2654,20 +3318,21 @@ fn field_json(field: &Field, mesh: &Mesh, index: usize, domain: &str) -> Result<
             scale,
             output,
         } => {
-            let first = vector_field(first, mesh, index, domain, "vector math")?;
-            let second = vector_field(second, mesh, index, domain, "vector math")?;
-            let third = vector_field(third, mesh, index, domain, "vector math")?;
-            let scale = numeric_field(scale, mesh, index, domain, "vector math scale")?;
+            let first = vector_field_in_context(first, context, index, domain, "vector math")?;
+            let second = vector_field_in_context(second, context, index, domain, "vector math")?;
+            let third = vector_field_in_context(third, context, index, domain, "vector math")?;
+            let scale =
+                numeric_field_in_context(scale, context, index, domain, "vector math scale")?;
             vector_math_value(operation, output, first, second, third, scale)?
         }
         Field::CombineXYZ { x, y, z } => {
-            let x = numeric_field(x, mesh, index, domain, "Combine XYZ")?;
-            let y = numeric_field(y, mesh, index, domain, "Combine XYZ")?;
-            let z = numeric_field(z, mesh, index, domain, "Combine XYZ")?;
+            let x = numeric_field_in_context(x, context, index, domain, "Combine XYZ")?;
+            let y = numeric_field_in_context(y, context, index, domain, "Combine XYZ")?;
+            let z = numeric_field_in_context(z, context, index, domain, "Combine XYZ")?;
             vector_json(DVec3::new(x, y, z))
         }
         Field::SeparateXYZ { vector, axis } => {
-            let vector = vector_field(vector, mesh, index, domain, "Separate XYZ")?;
+            let vector = vector_field_in_context(vector, context, index, domain, "Separate XYZ")?;
             json!(vector[*axis])
         }
         Field::Random {
@@ -2677,10 +3342,10 @@ fn field_json(field: &Field, mesh: &Mesh, index: usize, domain: &str) -> Result<
             min,
             max,
         } => {
-            let id = integer_field(id, mesh, index, domain)?;
+            let id = integer_field_in_context(id, context, index, domain)?;
             let mut state = *seed ^ u64::from_ne_bytes(id.to_ne_bytes());
-            let min = field_json(min, mesh, index, domain)?;
-            let max = field_json(max, mesh, index, domain)?;
+            let min = field_json_in_context(min, context, index, domain)?;
+            let max = field_json_in_context(max, context, index, domain)?;
             if data_type == "VECTOR" || data_type == "FLOAT_VECTOR" {
                 let min = json_vec3(&min)
                     .ok_or_else(|| evaluation("random vector minimum is invalid"))?;
@@ -2733,6 +3398,369 @@ fn field_json(field: &Field, mesh: &Mesh, index: usize, domain: &str) -> Result<
     }
 }
 
+fn numeric_field_in_context(
+    field: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+    node: &str,
+) -> Result<f64> {
+    field_json_in_context(field, context, index, domain)?
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| evaluation(format!("{node} input is not a finite number")))
+}
+
+fn vector_field_in_context(
+    field: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+    node: &str,
+) -> Result<DVec3> {
+    json_vec3(&field_json_in_context(field, context, index, domain)?)
+        .ok_or_else(|| evaluation(format!("{node} input is not a finite vector")))
+}
+
+fn integer_field_in_context(
+    field: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<i64> {
+    field_json_in_context(field, context, index, domain)?
+        .as_i64()
+        .ok_or_else(|| evaluation("random ID field must produce an integer"))
+}
+
+fn instance_position(transform: &[f64; 16]) -> Result<DVec3> {
+    if transform.iter().any(|component| !component.is_finite()) {
+        return Err(evaluation("instance transform is not finite"));
+    }
+    let position = DMat4::from_cols_array(transform).transform_point3(DVec3::ZERO);
+    if !position.is_finite() {
+        return Err(evaluation("instance transform position is not finite"));
+    }
+    Ok(position)
+}
+
+enum PointAttributeValues<'a> {
+    Array(&'a [Value]),
+    NativePoint(&'a Map<String, Value>),
+    VertexGroup(&'a Map<String, Value>),
+    Owned(Vec<Value>),
+}
+
+struct PointAttributeColumn<'a> {
+    data_type: Option<String>,
+    values: PointAttributeValues<'a>,
+}
+
+fn point_domain_attribute_columns<'a>(
+    mesh: &'a Mesh,
+    node_id: &Id,
+) -> Result<BTreeMap<String, PointAttributeColumn<'a>>> {
+    let mut columns = BTreeMap::new();
+    if let Some(entries) = mesh.attributes.get("blender_attributes") {
+        let entries = entries
+            .as_array()
+            .ok_or_else(|| evaluation("Blender attribute list is malformed"))?;
+        for entry in entries {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| evaluation("point attribute name is malformed"))?;
+            if matches!(name, "position" | ".reference_index") || name.starts_with('.') {
+                continue;
+            }
+            let domain = entry
+                .get("domain")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !domain.eq_ignore_ascii_case("POINT") {
+                return Err(unsupported_instance_feature(
+                    node_id,
+                    "constraint.geometry_attribute.instances.non_point_attribute",
+                    format!("Instance on Points cannot adapt {domain} attribute `{name}` to POINT"),
+                ));
+            }
+            let data_type = entry
+                .get("data_type")
+                .and_then(Value::as_str)
+                .filter(|data_type| !data_type.is_empty())
+                .map(normalize_instance_data_type)
+                .ok_or_else(|| evaluation("point attribute data type is malformed"))?;
+            let values = entry
+                .get("values")
+                .and_then(Value::as_array)
+                .ok_or_else(|| evaluation("point attribute values are malformed"))?;
+            if values.len() != mesh.vertices.len() || data_type.is_empty() {
+                return Err(evaluation(
+                    "point attribute data does not match its domain or type",
+                ));
+            }
+            columns.insert(
+                name.to_owned(),
+                PointAttributeColumn {
+                    data_type: Some(data_type),
+                    values: PointAttributeValues::Array(values.as_slice()),
+                },
+            );
+        }
+    }
+
+    if mesh
+        .attributes
+        .get("uv_layers")
+        .and_then(|store| store.get("layers"))
+        .and_then(Value::as_array)
+        .is_some_and(|layers| !layers.is_empty())
+    {
+        return Err(unsupported_instance_feature(
+            node_id,
+            "constraint.geometry_attribute.instances.non_point_attribute",
+            "Instance on Points cannot adapt CORNER UV layers to POINT",
+        ));
+    }
+
+    let colors = crate::geom::color_layers::read(mesh);
+    for layer in colors.layers {
+        if layer.domain != crate::geom::color_layers::ColorDomain::Point {
+            return Err(unsupported_instance_feature(
+                node_id,
+                "constraint.geometry_attribute.instances.non_point_attribute",
+                format!(
+                    "Instance on Points cannot adapt CORNER color layer `{}` to POINT",
+                    layer.name
+                ),
+            ));
+        }
+        if layer.values.len() != mesh.vertices.len() {
+            return Err(evaluation(
+                "point color layer length does not match its domain",
+            ));
+        }
+        let data_type = mesh
+            .attributes
+            .get("blender_metadata")
+            .and_then(|metadata| metadata.get("color_data_types"))
+            .and_then(|types| types.get(&layer.name))
+            .and_then(Value::as_str)
+            .unwrap_or("FLOAT_COLOR");
+        columns.insert(
+            layer.name,
+            PointAttributeColumn {
+                data_type: Some(normalize_instance_data_type(data_type)),
+                values: PointAttributeValues::Owned(
+                    layer.values.into_iter().map(|color| json!(color)).collect(),
+                ),
+            },
+        );
+    }
+
+    for (name, attribute) in &mesh.attributes {
+        if name == "blender_attributes" || name == "uv_layers" || name == "color_layers" {
+            continue;
+        }
+        if crate::geom::attribute_keys::user_name(name).is_none() {
+            continue;
+        }
+        let domain = attribute.get("domain").and_then(Value::as_str);
+        if domain.is_some_and(|domain| {
+            matches!(
+                domain.to_ascii_uppercase().as_str(),
+                "FACE" | "EDGE" | "CORNER"
+            )
+        }) {
+            return Err(unsupported_instance_feature(
+                node_id,
+                "constraint.geometry_attribute.instances.non_point_attribute",
+                format!(
+                    "Instance on Points cannot adapt {} attribute `{name}` to POINT",
+                    domain.unwrap_or_default()
+                ),
+            ));
+        }
+        if domain == Some("point") {
+            if name.is_empty() {
+                return Err(evaluation("point attribute name is empty"));
+            }
+            let values = attribute
+                .get("values")
+                .and_then(Value::as_object)
+                .ok_or_else(|| evaluation("native point attribute values are malformed"))?;
+            if values.len() != mesh.vertices.len() {
+                return Err(evaluation(
+                    "native point attribute length does not match its domain",
+                ));
+            }
+            let data_type = attribute
+                .get("type")
+                .or_else(|| attribute.get("data_type"))
+                .and_then(Value::as_str)
+                .filter(|data_type| !data_type.is_empty())
+                .map(normalize_instance_data_type)
+                .ok_or_else(|| evaluation("native point attribute data type is malformed"))?;
+            if data_type.is_empty() {
+                return Err(evaluation("native point attribute data type is empty"));
+            }
+            for vertex in &mesh.vertices {
+                let _ = native_point_attribute_value(values, vertex.id)?;
+            }
+            columns.insert(
+                name.clone(),
+                PointAttributeColumn {
+                    data_type: Some(data_type),
+                    values: PointAttributeValues::NativePoint(values),
+                },
+            );
+            continue;
+        }
+        if !matches!(domain, Some("POINT" | "POINTS")) {
+            continue;
+        }
+        if name.is_empty() {
+            return Err(evaluation("point attribute name is empty"));
+        }
+        let values = attribute
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| evaluation("point attribute payload is malformed"))?;
+        if values.len() != mesh.vertices.len() {
+            return Err(evaluation(
+                "point attribute length does not match its domain",
+            ));
+        }
+        let data_type = attribute
+            .get("data_type")
+            .or_else(|| attribute.get("type"))
+            .and_then(Value::as_str)
+            .filter(|data_type| !data_type.is_empty())
+            .map(normalize_instance_data_type);
+        if data_type.as_ref().is_some_and(String::is_empty) {
+            return Err(evaluation("point attribute data type is empty"));
+        }
+        columns.insert(
+            name.clone(),
+            PointAttributeColumn {
+                data_type,
+                values: PointAttributeValues::Array(values.as_slice()),
+            },
+        );
+    }
+
+    if let Some(groups) = mesh
+        .attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+    {
+        for (name, weights) in groups {
+            if name.is_empty() {
+                return Err(evaluation("vertex group name is empty"));
+            }
+            let weights = weights
+                .as_object()
+                .ok_or_else(|| evaluation("vertex group weights are malformed"))?;
+            columns.insert(
+                name.clone(),
+                PointAttributeColumn {
+                    data_type: Some("FLOAT".to_owned()),
+                    values: PointAttributeValues::VertexGroup(weights),
+                },
+            );
+        }
+    }
+    Ok(columns)
+}
+
+fn point_attribute_value(
+    column: &PointAttributeColumn<'_>,
+    vertex_id: u32,
+    index: usize,
+) -> Result<Value> {
+    match &column.values {
+        PointAttributeValues::Array(values) => values
+            .get(index)
+            .cloned()
+            .ok_or_else(|| evaluation("point attribute index is out of range")),
+        PointAttributeValues::Owned(values) => values
+            .get(index)
+            .cloned()
+            .ok_or_else(|| evaluation("point attribute index is out of range")),
+        PointAttributeValues::NativePoint(values) => {
+            Ok(native_point_attribute_value(values, vertex_id)?.clone())
+        }
+        PointAttributeValues::VertexGroup(values) => {
+            Ok(vertex_group_attribute_value(values, vertex_id)
+                .cloned()
+                .unwrap_or(json!(0.0)))
+        }
+    }
+}
+
+fn native_point_attribute_value(values: &Map<String, Value>, vertex_id: u32) -> Result<&Value> {
+    vertex_attribute_value(values, vertex_id)
+        .ok_or_else(|| evaluation("native point attribute value is missing"))
+}
+
+fn vertex_group_attribute_value(values: &Map<String, Value>, vertex_id: u32) -> Option<&Value> {
+    vertex_attribute_value(values, vertex_id)
+}
+
+fn vertex_attribute_value(values: &Map<String, Value>, vertex_id: u32) -> Option<&Value> {
+    let mut digits = [0_u8; 10];
+    let mut number = vertex_id;
+    let mut digit_count = 0;
+    loop {
+        digits[digit_count] = b'0' + (number % 10) as u8;
+        digit_count += 1;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    let mut key = [0_u8; 11];
+    key[0] = b'v';
+    for (target, digit) in key[1..=digit_count]
+        .iter_mut()
+        .zip(digits[..digit_count].iter().rev())
+    {
+        *target = *digit;
+    }
+    let key = std::str::from_utf8(&key[..=digit_count]).ok()?;
+    values.get(key)
+}
+fn normalize_instance_data_type(data_type: &str) -> String {
+    match data_type.trim().to_ascii_uppercase().as_str() {
+        "FLOAT32" => "FLOAT".to_owned(),
+        "INT32" | "INTEGER" => "INT".to_owned(),
+        "BOOL" => "BOOLEAN".to_owned(),
+        "FLOAT3" | "VECTOR" => "FLOAT_VECTOR".to_owned(),
+        "COLOR" => "FLOAT_COLOR".to_owned(),
+        "ROTATION" => "QUATERNION".to_owned(),
+        "MATRIX" => "FLOAT4X4".to_owned(),
+        data_type => data_type.to_owned(),
+    }
+}
+
+fn infer_instance_data_type(value: &Value) -> Result<String> {
+    match value {
+        Value::Bool(_) => Ok("BOOLEAN".to_owned()),
+        Value::Number(number) if number.is_i64() || number.is_u64() => Ok("INT".to_owned()),
+        Value::Number(_) => Ok("FLOAT".to_owned()),
+        Value::String(_) => Ok("STRING".to_owned()),
+        Value::Array(values) => match values.len() {
+            2 => Ok("FLOAT2".to_owned()),
+            3 => Ok("FLOAT_VECTOR".to_owned()),
+            4 => Ok("FLOAT_COLOR".to_owned()),
+            16 => Ok("FLOAT4X4".to_owned()),
+            _ => Err(evaluation("cannot infer instance attribute data type")),
+        },
+        _ => Err(evaluation("cannot infer instance attribute data type")),
+    }
+}
+
 fn poisson_cell(point: DVec3, cell_size: f64) -> Result<[i64; 3]> {
     if !cell_size.is_finite() || cell_size <= 0.0 {
         return Err(evaluation(
@@ -2782,36 +3810,6 @@ fn separated_from_neighbors(
         }
     }
     Ok(true)
-}
-
-fn numeric_field(
-    field: &Field,
-    mesh: &Mesh,
-    index: usize,
-    domain: &str,
-    context: &str,
-) -> Result<f64> {
-    field_json(field, mesh, index, domain)?
-        .as_f64()
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| evaluation(format!("{context} input is not a finite number")))
-}
-
-fn vector_field(
-    field: &Field,
-    mesh: &Mesh,
-    index: usize,
-    domain: &str,
-    context: &str,
-) -> Result<DVec3> {
-    json_vec3(&field_json(field, mesh, index, domain)?)
-        .ok_or_else(|| evaluation(format!("{context} input is not a finite vector")))
-}
-
-fn integer_field(field: &Field, mesh: &Mesh, index: usize, domain: &str) -> Result<i64> {
-    field_json(field, mesh, index, domain)?
-        .as_i64()
-        .ok_or_else(|| evaluation("random ID field must produce an integer"))
 }
 
 fn json_is_finite(value: &Value) -> bool {
@@ -3141,6 +4139,57 @@ fn field_bool(
         .unwrap_or(fallback))
 }
 
+fn field_vec3_for_instance(
+    field: &Field,
+    attributes: &BTreeMap<String, InstanceAttributeColumn>,
+    transform: &[f64; 16],
+    index: usize,
+    instance_count: usize,
+    fallback: DVec3,
+) -> Result<DVec3> {
+    let value = field_json_for_instance(field, attributes, transform, index, instance_count)?;
+    if value.is_null() {
+        Ok(fallback)
+    } else {
+        json_vec3(&value).ok_or_else(|| evaluation("vector field did not produce a finite vec3"))
+    }
+}
+
+fn field_bool_for_instance(
+    field: &Field,
+    attributes: &BTreeMap<String, InstanceAttributeColumn>,
+    transform: &[f64; 16],
+    index: usize,
+    instance_count: usize,
+    fallback: bool,
+) -> Result<bool> {
+    Ok(
+        field_json_for_instance(field, attributes, transform, index, instance_count)?
+            .as_bool()
+            .unwrap_or(fallback),
+    )
+}
+
+fn field_bool_in_instances(
+    field: &Field,
+    instances: &EvaluatedInstances,
+    index: usize,
+    fallback: bool,
+) -> Result<bool> {
+    let transform = instances
+        .transforms
+        .get(index)
+        .ok_or_else(|| evaluation("instance transform index is out of range"))?;
+    field_bool_for_instance(
+        field,
+        &instances.attributes,
+        transform,
+        index,
+        instances.len(),
+        fallback,
+    )
+}
+
 fn domain_element_count(mesh: &Mesh, domain: &str) -> Result<usize> {
     match domain {
         "POINT" | "POINTS" => Ok(mesh.vertices.len()),
@@ -3161,7 +4210,7 @@ fn domain_element_count(mesh: &Mesh, domain: &str) -> Result<usize> {
 
 fn domain_position(mesh: &Mesh, index: usize, domain: &str) -> Result<DVec3> {
     match domain {
-        "POINT" | "POINTS" => mesh
+        "POINT" | "POINTS" | "INSTANCE" => mesh
             .vertices
             .get(index)
             .map(|vertex| vertex.co)
@@ -3238,7 +4287,7 @@ fn normal_at(mesh: &Mesh, index: usize, domain: &str) -> Result<DVec3> {
             Ok((first + second).normalize_or_zero())
         }
         "CORNER" => point_normal(mesh, corner_vertex_id(mesh, index)?),
-        "POINT" | "POINTS" => {
+        "POINT" | "POINTS" | "INSTANCE" => {
             let vertex = mesh
                 .vertices
                 .get(index)
@@ -3357,18 +4406,37 @@ fn merge_meshes(meshes: &[Mesh]) -> Result<Mesh> {
 }
 
 impl NodeBakeValue {
-    fn into_eval_value(self) -> EvalValue {
+    fn into_eval_value(self, node_id: &Id, require_instance_attributes: bool) -> Result<EvalValue> {
         match self {
             Self::Geometry {
                 mesh,
                 instance_paths,
+                instance_columns,
                 ..
-            } => EvalValue::Geometry(GeometryValue {
-                mesh,
-                instance_paths,
-            }),
-            Self::Scalar { value } => EvalValue::Scalar(value),
-            Self::Field { attribute_name } => EvalValue::Field(Field::Attribute(attribute_name)),
+            } => {
+                if require_instance_attributes
+                    && instance_columns.is_none()
+                    && !instance_paths.is_empty()
+                {
+                    return Err(legacy_instance_columns_missing(node_id));
+                }
+                let instance_attributes = instance_columns
+                    .map(serde_json::from_value::<EvaluatedInstances>)
+                    .transpose()
+                    .map_err(|error| {
+                        evaluation(format!("baked instance columns are invalid: {error}"))
+                    })?
+                    .unwrap_or_default();
+                Ok(EvalValue::Geometry(GeometryValue {
+                    mesh,
+                    instance_paths,
+                    instance_attributes,
+                }))
+            }
+            Self::Scalar { value } => Ok(EvalValue::Scalar(value)),
+            Self::Field { attribute_name } => {
+                Ok(EvalValue::Field(Field::Attribute(attribute_name)))
+            }
         }
     }
 }
@@ -3423,6 +4491,7 @@ fn mix_bake_values(first: &NodeBakeValue, second: &NodeBakeValue, factor: f64) -
             NodeBakeValue::Geometry {
                 mesh: first_mesh,
                 instance_paths,
+                instance_columns,
                 material_refs,
             },
             NodeBakeValue::Geometry {
@@ -3437,6 +4506,7 @@ fn mix_bake_values(first: &NodeBakeValue, second: &NodeBakeValue, factor: f64) -
             NodeBakeValue::Geometry {
                 mesh,
                 instance_paths: instance_paths.clone(),
+                instance_columns: instance_columns.clone(),
                 material_refs: material_refs.clone(),
             }
         }
@@ -3558,6 +4628,34 @@ fn mesh_evaluation_error(error: &MeshError) -> PotError {
 
 fn evaluation(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, message)
+}
+
+fn unsupported_instance_feature(
+    node_id: &Id,
+    feature_id: &str,
+    detail: impl Into<String>,
+) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        detail,
+        json!({"feature_id": feature_id, "node_id": node_id}),
+    )
+}
+
+fn legacy_instance_columns_missing(node_id: &Id) -> PotError {
+    unsupported_instance_feature(
+        node_id,
+        "graph.bake.legacy_instance_columns_missing",
+        "legacy geometry bake has instance paths but no instance attribute columns",
+    )
+}
+
+fn unsupported_instance_field_feature(feature_id: &str, detail: impl Into<String>) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        detail,
+        json!({"feature_id": feature_id}),
+    )
 }
 
 fn json_vec3(value: &Value) -> Option<DVec3> {
@@ -3745,6 +4843,7 @@ mod node_bake_tests {
         NodeBakeValue::Geometry {
             mesh,
             instance_paths: Vec::new(),
+            instance_columns: None,
             material_refs: Vec::new(),
         }
     }

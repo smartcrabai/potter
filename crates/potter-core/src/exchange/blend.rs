@@ -17238,6 +17238,185 @@ bpy.ops.wm.save_as_mainfile(filepath=path, check_existing=False)
         Ok(())
     }
 
+    #[test]
+    fn blender_multi_input_migration_preserves_source_order_through_export() -> Result<()> {
+        let Some(blender) = optional_blender() else {
+            return Ok(());
+        };
+        let directory = tempfile::tempdir().map_err(|error| PotError::io(&error))?;
+        let source = directory.path().join("multi-input-source.blend");
+        run_fixture_script(
+            &blender,
+            r#"
+import bpy, sys
+
+for obj in list(bpy.data.objects):
+    bpy.data.objects.remove(obj, do_unlink=True)
+
+group = bpy.data.node_groups.new("Ordered Geometry", "GeometryNodeTree")
+group.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+join = group.nodes.new("GeometryNodeJoinGeometry")
+join.name = "Join"
+group_output = group.nodes.new("NodeGroupOutput")
+group_output.is_active_output = True
+source_links = {}
+for name in ("Source A", "Source B", "Source C"):
+    node = group.nodes.new("GeometryNodeMeshCube")
+    node.name = name
+    node.label = name
+    source_links[name] = group.links.new(node.outputs["Mesh"], join.inputs["Geometry"])
+
+# Set the source .blend's semantic order explicitly by descending multi_input_sort_id.
+expected = ["Source A", "Source B", "Source C"]
+for index, name in enumerate(expected):
+    ordered = sorted(source_links.values(), key=lambda link: link.multi_input_sort_id, reverse=True)
+    if ordered[index].from_node.name != name:
+        ordered[index].swap_multi_input_sort_id(source_links[name])
+assert [link.from_node.name for link in sorted(
+    source_links.values(), key=lambda link: link.multi_input_sort_id, reverse=True
+)] == expected
+group.links.new(join.outputs["Geometry"], group_output.inputs["Geometry"])
+
+mesh = bpy.data.meshes.new("Host Mesh")
+obj = bpy.data.objects.new("Host", mesh)
+bpy.context.scene.collection.objects.link(obj)
+modifier = obj.modifiers.new(name="Ordered Geometry", type="NODES")
+modifier.node_group = group
+bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-1])
+"#,
+            &source,
+        )?;
+
+        let imported = import_blend(&source, Some(&blender))?;
+        let source_order = |doc: &SceneDoc| -> Vec<String> {
+            let group = doc
+                .node_groups
+                .values()
+                .find(|group| group.name == "Ordered Geometry")
+                .expect("ordered geometry group");
+            let join_id = group
+                .nodes
+                .iter()
+                .find_map(|(id, node)| (node.name == "Join").then_some(id))
+                .expect("join node");
+            group
+                .links
+                .iter()
+                .filter(|link| &link.to_node == join_id)
+                .map(|link| group.nodes[&link.from_node].name.clone())
+                .collect()
+        };
+        let expected = [
+            "Source A".to_owned(),
+            "Source B".to_owned(),
+            "Source C".to_owned(),
+        ];
+        assert_eq!(source_order(&imported.doc), expected);
+
+        // Recreate the schema-9 stored ordering in both typed and retained Blender graphs.
+        let group = imported
+            .doc
+            .node_groups
+            .values()
+            .find(|group| group.name == "Ordered Geometry")
+            .expect("ordered geometry group");
+        let group_id = imported
+            .doc
+            .node_groups
+            .iter()
+            .find_map(|(id, group)| (group.name == "Ordered Geometry").then_some(id.as_str()))
+            .expect("ordered geometry group id");
+        let join_id = group
+            .nodes
+            .iter()
+            .find_map(|(id, node)| (node.name == "Join").then_some(id.as_str()))
+            .expect("join node id");
+        let mut legacy = serde_json::to_value(&imported.doc).map_err(PotError::internal_json)?;
+        assert_eq!(
+            legacy["compatibility"]["blender_adapter"]["intermediate"]["blender_version"],
+            json!("5.2.2")
+        );
+        legacy["schema_version"] = json!(9);
+        let reverse_links_to = |links: &mut Vec<Value>, destination: &str| {
+            let positions: Vec<usize> = links
+                .iter()
+                .enumerate()
+                .filter_map(|(index, link)| {
+                    (link.get("to_node").and_then(Value::as_str) == Some(destination))
+                        .then_some(index)
+                })
+                .collect();
+            assert_eq!(positions.len(), 3);
+            for index in 0..positions.len() / 2 {
+                links.swap(positions[index], positions[positions.len() - index - 1]);
+            }
+        };
+        let typed_links = legacy["node_groups"][group_id]["links"]
+            .as_array_mut()
+            .expect("serialized group links");
+        reverse_links_to(typed_links, join_id);
+        let raw_group_index =
+            legacy["compatibility"]["blender_adapter"]["intermediate"]["node_groups"]
+                .as_array()
+                .expect("retained node groups")
+                .iter()
+                .position(|group| group["name"].as_str() == Some("Ordered Geometry"))
+                .expect("retained ordered geometry group");
+        let raw_links = legacy["compatibility"]["blender_adapter"]["intermediate"]["node_groups"]
+            [raw_group_index]["tree"]["links"]
+            .as_array_mut()
+            .expect("retained group links");
+        reverse_links_to(raw_links, "Join");
+        let raw_source_order = |links: &[Value]| -> Vec<String> {
+            links
+                .iter()
+                .filter(|link| link["to_node"].as_str() == Some("Join"))
+                .map(|link| link["from_node"].as_str().expect("raw source").to_owned())
+                .collect()
+        };
+        assert_eq!(
+            raw_source_order(
+                legacy["compatibility"]["blender_adapter"]["intermediate"]["node_groups"]
+                    [raw_group_index]["tree"]["links"]
+                    .as_array()
+                    .expect("retained group links")
+            ),
+            expected.iter().rev().cloned().collect::<Vec<_>>()
+        );
+        let warnings = crate::model::upgrade_scene(&mut legacy, Path::new("no-assets"))?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            raw_source_order(
+                legacy["compatibility"]["blender_adapter"]["intermediate"]["node_groups"]
+                    [raw_group_index]["tree"]["links"]
+                    .as_array()
+                    .expect("migrated retained group links")
+            ),
+            expected
+        );
+        let migrated: SceneDoc = serde_json::from_value(legacy).map_err(PotError::internal_json)?;
+        migrated.validate()?;
+        assert_eq!(source_order(&migrated), expected);
+
+        let output = directory.path().join("multi-input-roundtrip.blend");
+        let project = Project::init(directory.path().join("project"))?;
+        let context = export_context();
+        export_blend(
+            &migrated,
+            &project,
+            &output,
+            &ExportOptions {
+                allow_lossy: false,
+                pack: false,
+                blender: Some(&blender),
+                context: &context,
+            },
+        )?;
+        let roundtrip = import_blend(&output, Some(&blender))?;
+        assert_eq!(source_order(&roundtrip.doc), expected);
+        Ok(())
+    }
+
     fn primitive_scene() -> Result<SceneDoc> {
         let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
         doc.materials.insert(

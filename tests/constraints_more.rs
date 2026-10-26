@@ -137,6 +137,35 @@ fn assert_mesh_positions_match(mesh: &potter_core::geom::Mesh, expected: &Value)
     );
     Ok(())
 }
+
+fn assert_json_positions_match(actual: &Value, expected: &Value) -> TestResult {
+    let mut actual: Vec<[f64; 3]> = serde_json::from_value(actual.clone())?;
+    let expected: Vec<[f64; 3]> = serde_json::from_value(expected.clone())?;
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "evaluated vertex counts differ"
+    );
+    for expected in expected {
+        let Some(index) = actual.iter().position(|point| {
+            point
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-5)
+        }) else {
+            return Err(io::Error::other(format!(
+                "Blender oracle vertex {expected:?} was not present in {actual:?}"
+            ))
+            .into());
+        };
+        actual.swap_remove(index);
+    }
+    assert!(
+        actual.is_empty(),
+        "unexpected evaluated vertices: {actual:?}"
+    );
+    Ok(())
+}
 fn object_reprojection_errors(
     doc: &SceneDoc,
     clip_id: &Id,
@@ -296,6 +325,121 @@ fn geometry_attribute_constraint_reads_a_named_target_mesh_attribute() -> TestRe
     );
     Ok(())
 }
+
+fn instance_constraint_driver_operations() -> Value {
+    json!([
+        {"op":"node.create","id":"geometry_target","kind":"box","params":{}},
+        {"op":"node.create","id":"owner","kind":"empty"},
+        {"op":"node.create","id":"child","kind":"empty","parent":"owner"},
+        {"op":"node.create","id":"reference","kind":"empty"},
+        {"op":"node.create","id":"probe","kind":"box","params":{}},
+        {"op":"graph.create","id":"instances","kind":"geometry"},
+        {"op":"graph.node_add","graph":"instances","id":"points","type":"GeometryNodeMeshCube"},
+        {"op":"graph.node_add","graph":"instances","id":"instance","type":"GeometryNodeInstanceOnPoints"},
+        {"op":"graph.node_add","graph":"instances","id":"output","type":"NodeGroupOutput"},
+        {"op":"graph.link","graph":"instances","from_node":"points","from_socket":"Mesh","to_node":"instance","to_socket":"Points"},
+        {"op":"graph.link","graph":"instances","from_node":"points","from_socket":"Mesh","to_node":"instance","to_socket":"Instance"},
+        {"op":"graph.link","graph":"instances","from_node":"instance","from_socket":"Instances","to_node":"output","to_socket":"Geometry"},
+        {"op":"modifier.create","target":{"id":"geometry_target"},"id":"instances_modifier","type":"nodes","params":{"node_group":"instances"}},
+        {"op":"constraint.create","target":{"id":"owner"},"id":"geometry","type":"geometry_attribute","constraint_target":"geometry_target","params":{"target":"geometry_target","attribute_name":"instance_transform","data_type":"FLOAT4X4","domain":"INSTANCE","sample_index":0,"mix_mode":"REPLACE","apply_target_transform":false,"mix_loc":true,"mix_rot":true,"mix_scl":true}}
+    ])
+}
+
+#[test]
+fn snapshot_refuses_instance_geometry_with_evaluated_transform_drivers() -> TestResult {
+    let base_operations = instance_constraint_driver_operations();
+    for (driver_id, variable) in [
+        (
+            "world",
+            json!({"name":"x","type":"transforms","target":"child","path":"transform.translation","index":0,"transform_space":"world"}),
+        ),
+        (
+            "difference",
+            json!({"name":"x","type":"loc_diff","target":"child","target_2":"reference","transform_space":"world"}),
+        ),
+    ] {
+        let mut operations = base_operations
+            .as_array()
+            .ok_or_else(|| io::Error::other("base driver operations must be an array"))?
+            .clone();
+        operations.push(json!({
+            "op":"driver.create",
+            "target":{"id":"probe"},
+            "id":driver_id,
+            "path":"transform.translation",
+            "index":0,
+            "type":"scripted_expression",
+            "variables":[variable],
+            "expression":"x",
+        }));
+        let (_directory, project) = project(&Value::Array(operations))?;
+        let document: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+        let Err(error) = Snapshot::evaluate(&document, &EvaluationContext::default()) else {
+            return Err(io::Error::other("evaluated-transform driver was accepted").into());
+        };
+        assert_eq!(
+            error.code,
+            potter_core::error::ErrorCode::UnsupportedFeature
+        );
+        assert_eq!(
+            error.details.get("feature_id").and_then(Value::as_str),
+            Some("driver.geometry_attribute.instance_dependency")
+        );
+        assert_eq!(
+            error.details.get("driver_owner").and_then(Value::as_str),
+            Some("probe")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn instance_geometry_allows_local_transform_and_plain_property_drivers() -> TestResult {
+    let mut operations = instance_constraint_driver_operations()
+        .as_array()
+        .ok_or_else(|| io::Error::other("base driver operations must be an array"))?
+        .clone();
+    operations.extend([
+        json!({"op":"node.create","id":"property_probe","kind":"empty"}),
+        json!({"op":"driver.create","target":{"id":"probe"},"id":"local","path":"transform.translation","index":0,"type":"scripted_expression","variables":[{"name":"x","type":"transforms","target":"child","path":"transform.translation","index":0,"transform_space":"local"}],"expression":"x"}),
+        json!({"op":"driver.create","target":{"id":"property_probe"},"id":"property","path":"transform.translation","index":0,"type":"scripted_expression","variables":[{"name":"weight","type":"single_prop","target":"reference","path":"properties.weight"}],"expression":"weight"}),
+    ]);
+    let (_directory, project) = project(&Value::Array(operations))?;
+    let scene_file = project.join("scene.json");
+    let mut document: SceneDoc = serde_json::from_slice(&fs::read(&scene_file)?)?;
+    let reference = Id::new("reference".to_owned())?;
+    document
+        .nodes
+        .get_mut(&reference)
+        .ok_or_else(|| io::Error::other("driver property source is missing"))?
+        .properties
+        .insert("weight".to_owned(), json!(4.5));
+    fs::write(&scene_file, serde_json::to_vec(&document)?)?;
+
+    let snapshot = Snapshot::evaluate(&document, &EvaluationContext::default())?;
+    for (node_id, expected_x) in [("probe", 0.0), ("property_probe", 4.5)] {
+        let id = Id::new(node_id.to_owned())?;
+        let node = snapshot
+            .nodes
+            .get(&id)
+            .ok_or_else(|| io::Error::other("evaluated driver target is missing"))?;
+        let actual_x = DMat4::from_cols_array(&node.world_matrix).w_axis.x;
+        assert!((actual_x - expected_x).abs() < 1.0e-9);
+    }
+
+    let inspected = pot()
+        .args(["inspect"])
+        .arg(&project)
+        .args(["--id", "property_probe", "--json"])
+        .output()?;
+    assert!(
+        inspected.status.success(),
+        "inspect rejected safe INSTANCE-scene drivers: {}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
+    Ok(())
+}
+
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -1568,7 +1712,7 @@ print("POTTER_GEOMETRY_PARITY=" + json.dumps({{
     Ok(())
 }
 
-fn import_hair_curves_project(blender: &Path, project: &Path, source: &Path) -> TestResult<Value> {
+fn import_blend_project(blender: &Path, project: &Path, source: &Path) -> TestResult<Value> {
     let init = pot().arg("init").arg(project).arg("--json").output()?;
     assert!(
         init.status.success(),
@@ -1598,6 +1742,74 @@ fn import_hair_curves_project(blender: &Path, project: &Path, source: &Path) -> 
         String::from_utf8_lossy(&imported.stdout)
     );
     Ok(serde_json::from_slice(&imported.stdout)?)
+}
+
+fn imported_node_id(project: &Path, name: &str) -> TestResult<String> {
+    let scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    scene["nodes"]
+        .as_object()
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|(_, node)| node["name"].as_str() == Some(name))
+                .map(|(id, _)| id.clone())
+        })
+        .ok_or_else(|| io::Error::other(format!("imported node {name} is missing")).into())
+}
+
+fn blender_join_link_oracle(blender: &Path, blend: &Path) -> TestResult<Value> {
+    let script = r#"
+import bpy
+import json
+import sys
+
+blend = sys.argv[sys.argv.index("--") + 1]
+bpy.ops.wm.open_mainfile(filepath=blend)
+group = bpy.data.node_groups["JoinedInstanceGeometry"]
+join = next(node for node in group.nodes if node.bl_idname == "GeometryNodeJoinGeometry")
+multi = sorted(
+    [
+        {
+            "source_scale": [float(component) for component in link.from_node.inputs["Scale"].default_value],
+            "sort_id": int(link.multi_input_sort_id),
+        }
+        for link in group.links
+        if link.to_node == join
+    ],
+    key=lambda item: item["sort_id"],
+    reverse=True,
+)
+ordinary = [
+    [float(component) for component in link.to_node.inputs["Translation"].default_value]
+    for link in group.links
+    if link.to_node.bl_idname == "GeometryNodeTransform"
+]
+print("POTTER_JOIN_LINK_ORACLE=" + json.dumps({
+    "sorted_multi_input": multi,
+    "ordinary_transform_order": ordinary,
+}, sort_keys=True))
+"#;
+    let output = Command::new(blender)
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-expr",
+            script,
+            "--",
+        ])
+        .arg(blend)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Blender Join link oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let marker = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("POTTER_JOIN_LINK_ORACLE="))
+        .ok_or_else(|| io::Error::other("Blender Join link oracle output is missing"))?;
+    Ok(serde_json::from_str(marker)?)
 }
 
 fn assert_hair_curves_inspect(project: &Path, oracle: &Value, cases: &[Value]) -> TestResult<f64> {
@@ -1676,7 +1888,7 @@ fn blender_geometry_attribute_hair_curve_domains_match_depsgraph() -> TestResult
     assert_eq!(cases.len(), 33);
 
     let project = root.join("project");
-    let imported = import_hair_curves_project(
+    let imported = import_blend_project(
         &blender,
         &project,
         &root.join("geometry_attribute_curves.blend"),
@@ -1703,8 +1915,7 @@ fn blender_geometry_attribute_hair_curve_domains_match_depsgraph() -> TestResult
     assert_eq!(exported["result"]["losses"], json!([]));
 
     let roundtrip_project = root.join("roundtrip_project");
-    let roundtrip_import =
-        import_hair_curves_project(&blender, &roundtrip_project, &roundtrip_blend)?;
+    let roundtrip_import = import_blend_project(&blender, &roundtrip_project, &roundtrip_blend)?;
     assert_eq!(roundtrip_import["result"]["losses"], json!([]));
     let roundtrip_error = assert_hair_curves_inspect(&roundtrip_project, &oracle, cases)?;
     let roundtrip_scene: Value =
@@ -1755,6 +1966,694 @@ fn blender_geometry_attribute_hair_curve_domains_match_depsgraph() -> TestResult
     );
     Ok(())
 }
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the INSTANCE parity matrix keeps topology, conversion, and guard cases together"
+)]
+fn blender_geometry_attribute_instance_domain_matches_depsgraph() -> TestResult {
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping Geometry Attribute INSTANCE parity test: Blender is unavailable");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/geometry_attribute_instances.py");
+    let output = Command::new(&blender)
+        .args(["--background", "--factory-startup", "--python"])
+        .arg(fixture)
+        .arg("--")
+        .arg(root)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Blender Geometry Attribute INSTANCE oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let oracle: Value = serde_json::from_slice(&fs::read(root.join("expected.json"))?)?;
+    let cases = oracle["cases"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("Geometry Attribute INSTANCE oracle cases are missing"))?;
+    assert!(
+        cases.len() >= 90,
+        "Geometry Attribute INSTANCE oracle omitted its extended cases: {}",
+        cases.len()
+    );
+    for index in [0, 2, 999] {
+        assert!(
+            cases
+                .iter()
+                .any(|case| case["sample_index"] == json!(index)),
+            "Geometry Attribute INSTANCE fixture omitted sample index {index}"
+        );
+    }
+    for mix_mode in [
+        "REPLACE",
+        "BEFORE_FULL",
+        "BEFORE_SPLIT",
+        "AFTER_FULL",
+        "AFTER_SPLIT",
+    ] {
+        assert!(
+            cases.iter().any(|case| case["mix_mode"] == mix_mode),
+            "Geometry Attribute INSTANCE fixture omitted mix mode {mix_mode}"
+        );
+    }
+    assert!(cases.iter().all(|case| case["domain"] == "INSTANCE"));
+    for (data_type, attribute) in [
+        ("FLOAT4X4", "instance_transform"),
+        ("QUATERNION", "instance_transform"),
+        ("QUATERNION", "geometry_attribute_instance_quaternion"),
+        ("QUATERNION", "geometry_attribute_instance_vector"),
+        ("VECTOR", "geometry_attribute_instance_vector"),
+        ("VECTOR", "geometry_attribute_instance_float"),
+        ("VECTOR", "geometry_attribute_instance_quaternion"),
+        ("FLOAT4X4", "geometry_attribute_instance_quaternion"),
+        ("QUATERNION", "geometry_attribute_instance_float"),
+        ("QUATERNION", "geometry_attribute_instance_float2"),
+        ("VECTOR", "geometry_attribute_instance_int"),
+        ("VECTOR", "geometry_attribute_instance_boolean"),
+        ("VECTOR", "geometry_attribute_instance_float2"),
+        ("VECTOR", "geometry_attribute_instance_float_color"),
+        ("VECTOR", "geometry_attribute_instance_byte_color"),
+    ] {
+        for mix_mode in [
+            "REPLACE",
+            "BEFORE_FULL",
+            "BEFORE_SPLIT",
+            "AFTER_FULL",
+            "AFTER_SPLIT",
+        ] {
+            assert!(
+                cases.iter().any(|case| {
+                    case["data_type"] == data_type
+                        && case["attribute"] == attribute
+                        && case["mix_mode"] == mix_mode
+                }),
+                "Geometry Attribute INSTANCE fixture omitted {data_type}/{attribute}/{mix_mode}"
+            );
+        }
+        for index in [0, 2, 999] {
+            assert!(
+                cases.iter().any(|case| {
+                    case["data_type"] == data_type
+                        && case["attribute"] == attribute
+                        && case["sample_index"] == json!(index)
+                }),
+                "Geometry Attribute INSTANCE fixture omitted {data_type}/{attribute} index {index}"
+            );
+        }
+    }
+    let partial = cases
+        .iter()
+        .filter(|case| {
+            case["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("owner_partial_"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        partial.len(),
+        3,
+        "partial mix flags must cover each component"
+    );
+    for flag in ["mix_loc", "mix_rot", "mix_scl"] {
+        assert!(
+            partial.iter().any(|case| {
+                case[flag] == false
+                    && ["mix_loc", "mix_rot", "mix_scl"]
+                        .into_iter()
+                        .filter(|other| *other != flag)
+                        .all(|other| case[other] == true)
+            }),
+            "partial mix fixture omitted independent {flag}=false"
+        );
+    }
+    for finding in ["F1", "F2", "F3", "F4", "F5", "F6"] {
+        assert!(
+            cases.iter().any(|case| case["review_finding"] == finding),
+            "INSTANCE parity no longer exercises review finding {finding}"
+        );
+    }
+    for index in [0, 2, 999] {
+        assert!(
+            cases.iter().any(|case| {
+                case["review_finding"] == "F1"
+                    && case["target"].as_str() == Some("NestedInstancesTarget")
+                    && case["sample_index"] == json!(index)
+            }),
+            "nested-source INSTANCE coverage omitted index {index}"
+        );
+    }
+    for id in [
+        "owner_join_3",
+        "owner_realized_then_instance",
+        "owner_realized",
+        "owner_stacked_2",
+        "owner_set_position_2",
+        "owner_distribute_points_2",
+        "owner_distribute_control_2",
+        "owner_vertex_group_2",
+        "owner_second_geometry_input",
+        "owner_nested_source_2_replace",
+    ] {
+        assert!(
+            cases.iter().any(|case| case["id"].as_str() == Some(id)),
+            "Geometry Attribute INSTANCE fixture omitted {id}"
+        );
+    }
+
+    let project = root.join("project");
+    let imported = import_blend_project(
+        &blender,
+        &project,
+        &root.join("geometry_attribute_instances.blend"),
+    )?;
+    assert_eq!(imported["result"]["losses"], json!([]));
+    let inspected = pot()
+        .args(["inspect"])
+        .arg(&project)
+        .arg("--json")
+        .output()?;
+    assert!(
+        inspected.status.success(),
+        "pot inspect refused supported INSTANCE cases (including the old unconditional refusal): {}",
+        String::from_utf8_lossy(&inspected.stdout)
+    );
+    let inspected: Value = serde_json::from_slice(&inspected.stdout)?;
+    let items = inspected["result"]["items"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("pot inspect returned no node items"))?;
+    let mut maximum_error = 0.0_f64;
+    for case in cases {
+        let id = case["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("Geometry Attribute INSTANCE owner ID is missing"))?;
+        let item = items
+            .iter()
+            .find(|item| item["name"].as_str() == Some(id))
+            .ok_or_else(|| io::Error::other(format!("pot inspect omitted owner {id}")))?;
+        let expected = blender_matrix(&oracle["matrices"][id])?;
+        let actual = blender_matrix(&item["transform"]["world"]["matrix"])?;
+        let error = max_matrix_error(actual, expected);
+        maximum_error = maximum_error.max(error);
+        assert!(
+            error < 2.0e-4,
+            "{id} Blender Geometry Attribute INSTANCE matrix differs by {error:e}: Potter={actual:?}, Blender={expected:?}, case={case}"
+        );
+        let baseline = blender_matrix(&case["baseline"])?;
+        let effect = max_matrix_error(expected, baseline);
+        assert!(
+            effect > 1.0e-2,
+            "{id} Blender INSTANCE fixture did not materially change its owner transform"
+        );
+        if case["data_type"] == "FLOAT4X4" {
+            let expected_columns = expected.to_cols_array();
+            let baseline_columns = baseline.to_cols_array();
+            let linear_effect = [0, 1, 2, 4, 5, 6, 8, 9, 10]
+                .into_iter()
+                .map(|index| (expected_columns[index] - baseline_columns[index]).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                linear_effect > 1.0e-2,
+                "{id} FLOAT4X4 result did not change its rotation/scale basis"
+            );
+        }
+    }
+    for index in [0, 2, 999] {
+        let distributed = format!("owner_distribute_points_{index}");
+        let control = format!("owner_distribute_control_{index}");
+        let distributed_matrix = blender_matrix(&oracle["matrices"][distributed.as_str()])?;
+        let control_matrix = blender_matrix(&oracle["matrices"][control.as_str()])?;
+        let error = max_matrix_error(distributed_matrix, control_matrix);
+        assert!(
+            error < 2.0e-4,
+            "Distribute Points on Faces changed top-level instance {index} matrix by {error:e}"
+        );
+    }
+
+    // This specifically proves that only interface geometry input 0 is populated.
+    let second_input_case = cases
+        .iter()
+        .find(|case| case["review_finding"] == "F6")
+        .ok_or_else(|| io::Error::other("F6 geometry-input case is missing"))?;
+    let target_name = second_input_case["target"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("F6 target name is missing"))?;
+    let expected_geometry = &oracle["target_geometry"][target_name];
+    let target_item = items
+        .iter()
+        .find(|item| item["name"].as_str() == Some(target_name))
+        .ok_or_else(|| io::Error::other("pot inspect omitted the F6 geometry target"))?;
+    for key in ["vertex_count", "edge_count", "face_count"] {
+        assert_eq!(
+            target_item["evaluated_geometry"][key], expected_geometry[key],
+            "F6 second Geometry interface input was not empty for {key}"
+        );
+    }
+    let roundtrip_case = cases
+        .iter()
+        .find(|case| case["id"] == "owner_join_3")
+        .ok_or_else(|| io::Error::other("swapped Join INSTANCE case is missing"))?;
+    let roundtrip_id = roundtrip_case["id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("round-trip owner ID is missing"))?;
+    let roundtrip_blend = root.join("geometry_attribute_instances_roundtrip.blend");
+    let exported = pot()
+        .args(["export"])
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&roundtrip_blend)
+        .args(["--blender"])
+        .arg(&blender)
+        .arg("--json")
+        .output()?;
+    assert!(
+        exported.status.success(),
+        "pot export of INSTANCE Geometry Nodes failed: {}",
+        String::from_utf8_lossy(&exported.stdout)
+    );
+    let exported: Value = serde_json::from_slice(&exported.stdout)?;
+    assert_eq!(exported["result"]["losses"], json!([]));
+    let roundtrip_project = root.join("geometry_attribute_instances_roundtrip_project");
+    let roundtrip_import = import_blend_project(&blender, &roundtrip_project, &roundtrip_blend)?;
+    assert_eq!(roundtrip_import["result"]["losses"], json!([]));
+    let roundtrip_inspected = pot()
+        .args(["inspect"])
+        .arg(&roundtrip_project)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        roundtrip_inspected.status.success(),
+        "pot inspect after Geometry Nodes .blend round-trip failed: {}",
+        String::from_utf8_lossy(&roundtrip_inspected.stdout)
+    );
+    let roundtrip_inspected: Value = serde_json::from_slice(&roundtrip_inspected.stdout)?;
+    let roundtrip_item = roundtrip_inspected["result"]["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["name"].as_str() == Some(roundtrip_id))
+        })
+        .ok_or_else(|| io::Error::other("round-trip inspect omitted its owner"))?;
+    let roundtrip_expected = blender_matrix(&oracle["matrices"][roundtrip_id])?;
+    let roundtrip_actual = blender_matrix(&roundtrip_item["transform"]["world"]["matrix"])?;
+    let roundtrip_error = max_matrix_error(roundtrip_actual, roundtrip_expected);
+    assert!(
+        roundtrip_error < 2.0e-4,
+        "Geometry Nodes Rotation input changed across .blend export/reimport by {roundtrip_error:e}: Potter={roundtrip_actual:?}, Blender={roundtrip_expected:?}"
+    );
+
+    let stable_blend = root.join("geometry_attribute_instances_roundtrip_stable.blend");
+    let stable_export = pot()
+        .args(["export"])
+        .arg(&roundtrip_project)
+        .args(["--format", "blend", "--out"])
+        .arg(&stable_blend)
+        .args(["--blender"])
+        .arg(&blender)
+        .arg("--json")
+        .output()?;
+    assert!(
+        stable_export.status.success(),
+        "pot re-export of swapped Join links failed: {}",
+        String::from_utf8_lossy(&stable_export.stdout)
+    );
+    let stable_join_links = blender_join_link_oracle(&blender, &stable_blend)?;
+    assert_eq!(
+        stable_join_links, oracle["join_link_oracle"],
+        "swapped multi-input IDs or interleaved ordinary links changed across round-trips"
+    );
+    let stable_project = root.join("geometry_attribute_instances_stable_project");
+    let stable_import = import_blend_project(&blender, &stable_project, &stable_blend)?;
+    assert_eq!(stable_import["result"]["losses"], json!([]));
+    let stable_inspected = pot()
+        .args(["inspect"])
+        .arg(&stable_project)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        stable_inspected.status.success(),
+        "pot inspect after repeated Join link round-trip failed: {}",
+        String::from_utf8_lossy(&stable_inspected.stdout)
+    );
+    let stable_inspected: Value = serde_json::from_slice(&stable_inspected.stdout)?;
+    let stable_item = stable_inspected["result"]["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["name"].as_str() == Some(roundtrip_id))
+        })
+        .ok_or_else(|| io::Error::other("stable round-trip inspect omitted Join owner"))?;
+    let stable_matrix = blender_matrix(&stable_item["transform"]["world"]["matrix"])?;
+    let stable_error = max_matrix_error(stable_matrix, roundtrip_expected);
+    assert!(
+        stable_error < 2.0e-4,
+        "swapped Join source order changed across repeated export/import by {stable_error:e}"
+    );
+
+    let guard_cases = oracle["guards"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("Geometry Attribute INSTANCE guards are missing"))?;
+    assert_eq!(
+        guard_cases.len(),
+        8,
+        "each guarded topology needs its own fixture"
+    );
+    for feature_id in [
+        "constraint.geometry_attribute.instances.picked_instance",
+        "constraint.geometry_attribute.instances.realized_points",
+        "constraint.geometry_attribute.instances.non_point_attribute",
+        "constraint.geometry_attribute.instances.attribute_conversion",
+        "constraint.geometry_attribute.instances.transform_matrix_mode",
+        "graph.instance_component.realize_attribute_columns",
+        "graph.instance_component.store_named_attribute_uncaptured",
+    ] {
+        assert!(
+            guard_cases
+                .iter()
+                .any(|guard| guard["feature_id"] == feature_id),
+            "INSTANCE fixture omitted guarded feature {feature_id}"
+        );
+    }
+    for guard in guard_cases {
+        let guard_name = guard["id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("guard fixture ID is missing"))?;
+        let feature_id = guard["feature_id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("guard fixture feature ID is missing"))?;
+        let inspect_name = guard["inspect_id"].as_str().unwrap_or("guard_owner");
+        let guard_project = root.join(format!("guard_{guard_name}_project"));
+        let source = root.join(format!("guard_{guard_name}.blend"));
+        let guard_import = import_blend_project(&blender, &guard_project, &source)?;
+        assert_eq!(guard_import["result"]["losses"], json!([]));
+        let inspect_id = imported_node_id(&guard_project, inspect_name)?;
+        let output = pot()
+            .arg("inspect")
+            .arg(&guard_project)
+            .args(["--id", inspect_id.as_str(), "--json"])
+            .output()?;
+        if guard_name == "transform_matrix_plain_mesh" && output.status.success() {
+            let response: Value = serde_json::from_slice(&output.stdout)?;
+            let item = response["result"]["items"]
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item["name"].as_str() == Some(inspect_name))
+                })
+                .ok_or_else(|| io::Error::other("plain-mesh Matrix inspect omitted its target"))?;
+            assert_json_positions_match(
+                &item["evaluated_geometry"]["positions"],
+                &guard["oracle_positions"],
+            )?;
+            continue;
+        }
+        assert!(
+            !output.status.success(),
+            "{guard_name} guarded INSTANCE case unexpectedly evaluated"
+        );
+        let response: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(
+            response["error"]["code"], "UNSUPPORTED_FEATURE",
+            "{guard_name}: {response}"
+        );
+        assert_eq!(
+            response["error"]["details"]["feature_id"], feature_id,
+            "{guard_name}: {response}"
+        );
+        if matches!(
+            guard_name,
+            "store_named_attribute_uncaptured" | "realize_attribute_columns"
+        ) {
+            let values: Vec<[f64; 3]> =
+                serde_json::from_value(guard["oracle_attribute_values"].clone())?;
+            assert!(
+                !values.is_empty(),
+                "{guard_name} lacks Blender attribute oracle rows"
+            );
+            assert!(
+                values.iter().all(|value| {
+                    (value[0] - 0.5).abs() < 1.0e-5
+                        && (value[1] + 1.25).abs() < 1.0e-5
+                        && (value[2] - 2.0).abs() < 1.0e-5
+                }),
+                "{guard_name} Blender realized INSTANCE attribute differs: {values:?}"
+            );
+        }
+    }
+
+    let fresh_oracle = &oracle["fresh_session"];
+    let fresh_baseline = blender_matrix(&fresh_oracle["owner_baseline"])?;
+    let fresh_expected = blender_matrix(&fresh_oracle["owner_matrix"])?;
+    assert!(
+        max_matrix_error(fresh_baseline, fresh_expected) > 1.0e-2,
+        "Blender fresh-session owner constraint did not change the join input transform"
+    );
+    let fresh_project = root.join("fresh_session_project");
+    let fresh_import = import_blend_project(
+        &blender,
+        &fresh_project,
+        &root.join("geometry_attribute_instances_fresh_session.blend"),
+    )?;
+    assert_eq!(fresh_import["result"]["losses"], json!([]));
+    let fresh_scene: Value = serde_json::from_slice(&fs::read(fresh_project.join("scene.json"))?)?;
+    let revision = fresh_scene["revision"]
+        .as_u64()
+        .ok_or_else(|| io::Error::other("fresh-session project revision is missing"))?;
+    let join_batch = root.join("fresh_session_join.json");
+    fs::write(
+        &join_batch,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": revision,
+            "operations": [{
+                "op": "node.join",
+                "targets": [
+                    imported_node_id(&fresh_project, "FreshSessionJoinDestination")?,
+                    imported_node_id(&fresh_project, "FreshSessionConstraintOwner")?,
+                ]
+            }]
+        }))?,
+    )?;
+    let joined = pot()
+        .arg("apply")
+        .arg(&fresh_project)
+        .arg("--file")
+        .arg(&join_batch)
+        .arg("--json")
+        .output()?;
+    assert!(
+        !joined.status.success(),
+        "node.join silently used a default transform for an INSTANCE constraint target"
+    );
+    let joined: Value = serde_json::from_slice(&joined.stdout)?;
+    assert_eq!(joined["error"]["code"], "UNSUPPORTED_FEATURE", "{joined}");
+    assert_eq!(
+        joined["error"]["details"]["feature_id"],
+        "constraint.geometry_attribute.instances.no_evaluated_geometry",
+        "{joined}"
+    );
+    let particle_oracle = &oracle["particle_halo"];
+    assert_eq!(particle_oracle["render_type"], "HALO");
+    let particle_project = root.join("particle_halo_project");
+    let particle_import = import_blend_project(
+        &blender,
+        &particle_project,
+        &root.join("geometry_attribute_instances_particle_halo.blend"),
+    )?;
+    assert!(
+        particle_import["result"]["losses"].is_array(),
+        "separate HALO particle import must report its own loss list"
+    );
+    let particle_target_name = particle_oracle["target"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("HALO particle target name is missing"))?;
+    let particle_scene: SceneDoc =
+        serde_json::from_slice(&fs::read(particle_project.join("scene.json"))?)?;
+    let particle_target = particle_scene
+        .nodes
+        .values()
+        .find(|node| node.name.as_str() == particle_target_name)
+        .ok_or_else(|| io::Error::other("imported HALO particle target is missing"))?;
+    assert!(
+        particle_target.modifiers.iter().any(|modifier| {
+            modifier.modifier_type == "particle_system"
+                && modifier.enabled
+                && modifier.show_viewport
+                && modifier.show_render
+        }),
+        "HALO particle target did not retain an active legacy particle system"
+    );
+    let particle_settings = particle_target
+        .properties
+        .get("physics_particle_systems")
+        .and_then(Value::as_object)
+        .and_then(|systems| {
+            systems
+                .values()
+                .find(|settings| settings["render_type"] == "HALO")
+        })
+        .ok_or_else(|| io::Error::other("imported particle settings are not HALO"))?;
+    assert_eq!(particle_settings["render_type"], "HALO");
+    let particle_id = particle_oracle["id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("HALO particle owner ID is missing"))?;
+    let particle_inspected = pot()
+        .args(["inspect"])
+        .arg(&particle_project)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        particle_inspected.status.success(),
+        "HALO particles must not refuse Geometry Attribute INSTANCE sampling: {}",
+        String::from_utf8_lossy(&particle_inspected.stdout)
+    );
+    let particle_inspected: Value = serde_json::from_slice(&particle_inspected.stdout)?;
+    let particle_item = particle_inspected["result"]["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["name"].as_str() == Some(particle_id))
+        })
+        .ok_or_else(|| io::Error::other("HALO particle inspect omitted its owner"))?;
+    let particle_expected = blender_matrix(&particle_oracle["matrix"])?;
+    let particle_actual = blender_matrix(&particle_item["transform"]["world"]["matrix"])?;
+    let particle_error = max_matrix_error(particle_actual, particle_expected);
+    assert!(
+        particle_error < 2.0e-4,
+        "HALO particle Geometry Attribute INSTANCE matrix differs by {particle_error:e}: Potter={particle_actual:?}, Blender={particle_expected:?}"
+    );
+    assert!(
+        max_matrix_error(
+            particle_expected,
+            blender_matrix(&particle_oracle["baseline"])?
+        ) > 1.0e-2,
+        "HALO particle oracle did not materially exercise its INSTANCE constraint"
+    );
+    let owner_name = cases[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("INSTANCE driver owner is missing"))?;
+    let owner_id = imported_node_id(&project, owner_name)?;
+    let baseline_owner_inspect = pot()
+        .args(["inspect"])
+        .arg(&project)
+        .arg("--id")
+        .arg(&owner_id)
+        .arg("--json")
+        .output()?;
+    assert!(
+        baseline_owner_inspect.status.success(),
+        "baseline selected-owner inspect failed: {}",
+        String::from_utf8_lossy(&baseline_owner_inspect.stdout)
+    );
+    let imported_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let revision = imported_scene["revision"]
+        .as_u64()
+        .ok_or_else(|| io::Error::other("imported project revision is missing"))?;
+    let driver_batch = root.join("instance_driver_operations.json");
+    fs::write(
+        &driver_batch,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "base_revision":revision,
+            "operations":[
+                {"op":"node.create","id":"probe","kind":"empty"},
+                {"op":"driver.create","target":{"id":"probe"},"id":"world_instance_target","path":"transform.translation","index":0,"type":"scripted_expression","variables":[{"name":"x","type":"transforms","target":owner_id.clone(),"path":"transform.translation","index":0,"transform_space":"world"}],"expression":"x"}
+            ]
+        }))?,
+    )?;
+    let applied_driver = pot()
+        .arg("apply")
+        .arg(&project)
+        .arg("--file")
+        .arg(&driver_batch)
+        .arg("--json")
+        .output()?;
+    assert!(
+        applied_driver.status.success(),
+        "world-space driver setup failed: {}",
+        String::from_utf8_lossy(&applied_driver.stdout)
+    );
+    for id in [owner_id.as_str(), "probe"] {
+        let inspected = pot()
+            .args(["inspect"])
+            .arg(&project)
+            .args(["--id", id, "--json"])
+            .output()?;
+        assert!(
+            !inspected.status.success(),
+            "selected inspect of {id} accepted a world-space driver with an INSTANCE constraint"
+        );
+        let response: Value = serde_json::from_slice(&inspected.stdout)?;
+        assert_eq!(
+            response["error"]["code"], "UNSUPPORTED_FEATURE",
+            "{id}: {response}"
+        );
+        assert_eq!(
+            response["error"]["details"]["feature_id"],
+            "driver.geometry_attribute.instance_dependency",
+            "{id}: {response}"
+        );
+    }
+
+    let driven_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let driven_revision = driven_scene["revision"]
+        .as_u64()
+        .ok_or_else(|| io::Error::other("driven project revision is missing"))?;
+    let local_driver_batch = root.join("instance_local_driver_operations.json");
+    fs::write(
+        &local_driver_batch,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "base_revision":driven_revision,
+            "operations":[{
+                "op":"driver.update",
+                "target":{"id":"probe"},
+                "id":"world_instance_target",
+                "set":{"variables":[{"name":"x","type":"transforms","target":owner_id.clone(),"path":"transform.translation","index":0,"transform_space":"local"}]}
+            }]
+        }))?,
+    )?;
+    let updated_driver = pot()
+        .args(["apply"])
+        .arg(&project)
+        .args(["--file"])
+        .arg(&local_driver_batch)
+        .args(["--json"])
+        .output()?;
+    assert!(
+        updated_driver.status.success(),
+        "local-space driver update failed: {}",
+        String::from_utf8_lossy(&updated_driver.stdout)
+    );
+    for id in [owner_id.as_str(), "probe"] {
+        let inspected = pot()
+            .args(["inspect"])
+            .arg(&project)
+            .args(["--id", id, "--json"])
+            .output()?;
+        assert!(
+            inspected.status.success(),
+            "selected inspect of {id} failed with a local-space driver and an INSTANCE constraint: {}",
+            String::from_utf8_lossy(&inspected.stdout)
+        );
+    }
+    eprintln!(
+        "Blender 5.2.2 Geometry Attribute INSTANCE CLI matrices: import max error {maximum_error:.6e} across {} supported cases, {} separate guarded topologies, HALO particle matrix error {particle_error:.6e}",
+        cases.len(),
+        guard_cases.len()
+    );
+    Ok(())
+}
+
 fn assert_hair_curves_surface_unlink(
     blender: &Path,
     project: &Path,

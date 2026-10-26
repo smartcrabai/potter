@@ -467,6 +467,23 @@ fn bake_graph_operations(target: &str, bake_directory: &str, animation: bool) ->
     operations
 }
 
+fn instance_bake_graph_operations() -> Vec<Value> {
+    vec![
+        json!({"op":"node.create","id":"body","kind":"box","params":{"size":2.0}}),
+        json!({"op":"node.create","id":"owner","kind":"empty"}),
+        json!({"op":"graph.create","id":"geo","kind":"geometry"}),
+        json!({"op":"graph.node_add","graph":"geo","id":"cube","type":"GeometryNodeMeshCube","properties":{"size":[1.0,1.0,1.0]}}),
+        json!({"op":"graph.node_add","graph":"geo","id":"instances","type":"GeometryNodeInstanceOnPoints"}),
+        json!({"op":"graph.node_add","graph":"geo","id":"bake","type":"GeometryNodeBake","properties":{"bake_items":[{"id":"Item_0","name":"Geometry","socket_type":"geometry"}]}}),
+        json!({"op":"graph.node_add","graph":"geo","id":"output","type":"NodeGroupOutput"}),
+        json!({"op":"graph.link","graph":"geo","from_node":"cube","from_socket":"Mesh","to_node":"instances","to_socket":"Points"}),
+        json!({"op":"graph.link","graph":"geo","from_node":"cube","from_socket":"Mesh","to_node":"instances","to_socket":"Instance"}),
+        json!({"op":"graph.link","graph":"geo","from_node":"instances","from_socket":"Instances","to_node":"bake","to_socket":"Item_0"}),
+        json!({"op":"graph.link","graph":"geo","from_node":"bake","from_socket":"Item_0","to_node":"output","to_socket":"Geometry"}),
+        json!({"op":"modifier.create","target":{"id":"body"},"id":"geometry_modifier","type":"nodes","params":{"node_group":"geo","bake_target":"PACKED","bake_directory":""}}),
+    ]
+}
+
 fn scalar_bake_graph_operations() -> Vec<Value> {
     vec![
         json!({"op":"material.create","id":"surface","base_color":[0.2,0.3,0.4,1.0]}),
@@ -1703,6 +1720,152 @@ fn modifier_documents_without_bake_settings_have_no_bakes_key_and_load_unchanged
     assert!(params.get("bakes").is_none(), "{params}");
     let unbaked = inspect(&project, 1.0)?;
     assert_dimensions(&unbaked, [2.0, 2.0, 2.0])?;
+    Ok(())
+}
+
+#[test]
+fn new_empty_geometry_bake_serializes_empty_instance_columns() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let project = directory.path().join("empty-instance-columns");
+    let batch_file = directory.path().join("operations.json");
+    create_project(&project, &batch_file, "PACKED", "", false)?;
+    bake(&project, None, None, BakeAction::Bake)?;
+
+    let scene = document(&project)?;
+    let resource_id =
+        scene["nodes"]["body"]["modifiers"][0]["params"]["bakes"]["bake"]["resource_id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("packed Bake resource ID is missing"))?;
+    let instance_columns =
+        &scene["resources"][resource_id]["frames"][0]["values"]["Item_0"]["instance_columns"];
+    assert!(
+        instance_columns.is_object(),
+        "new empty geometry bake omitted instance_columns: {}",
+        scene["resources"][resource_id]["frames"][0]["values"]["Item_0"]
+    );
+    assert_eq!(instance_columns["transforms"], json!([]));
+    assert_eq!(instance_columns["attributes"], json!({}));
+    Ok(())
+}
+
+#[test]
+fn legacy_geometry_bake_without_instance_columns_refuses_only_when_instances_are_requested()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let project = directory.path().join("legacy-instance-columns");
+    let batch_file = directory.path().join("operations.json");
+    run_json(
+        pot().arg("init").arg(&project),
+        "initializing legacy-bake project",
+    )?;
+    apply(
+        &project,
+        &batch_file,
+        &json!(instance_bake_graph_operations()),
+    )?;
+    apply(
+        &project,
+        &batch_file,
+        &json!([{
+            "op":"graph.node_add",
+            "graph":"geo",
+            "id":"unused_attribute",
+            "type":"GeometryNodeInputNamedAttribute"
+        }]),
+    )?;
+    bake(&project, None, None, BakeAction::Bake)?;
+
+    let mut scene = document(&project)?;
+    let resource_id =
+        scene["nodes"]["body"]["modifiers"][0]["params"]["bakes"]["bake"]["resource_id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("packed Bake resource ID is missing"))?
+            .to_owned();
+    let baked_geometry = &mut scene["resources"][&resource_id]["frames"][0]["values"]["Item_0"];
+    assert_eq!(baked_geometry["type"], "geometry");
+    assert!(
+        baked_geometry["instance_paths"]
+            .as_array()
+            .is_some_and(|paths| !paths.is_empty()),
+        "fixture bake did not record nonempty instance paths"
+    );
+    assert!(
+        baked_geometry
+            .as_object_mut()
+            .ok_or_else(|| std::io::Error::other("baked geometry payload is not an object"))?
+            .remove("instance_columns")
+            .is_some(),
+        "the fresh bake did not carry its instance_columns field"
+    );
+    fs::write(project.join("scene.json"), serde_json::to_vec(&scene)?)?;
+    apply(
+        &project,
+        &batch_file,
+        &json!([
+            {"op":"graph.create","id":"identity","kind":"geometry"},
+            {"op":"graph.interface_update","graph":"identity","set":{"inputs":[{"id":"geometry","name":"Geometry","socket_type":"geometry"}],"outputs":[]}},
+            {"op":"graph.node_add","graph":"identity","id":"input","type":"NodeGroupInput"},
+            {"op":"graph.node_add","graph":"identity","id":"output","type":"NodeGroupOutput"},
+            {"op":"graph.link","graph":"identity","from_node":"input","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"},
+            {"op":"modifier.create","target":{"id":"body"},"id":"identity_modifier","type":"nodes","params":{"node_group":"identity"}}
+        ]),
+    )?;
+    assert_eq!(
+        document(&project)?["nodes"]["body"]["modifiers"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "legacy bake regression needs two Geometry Nodes modifiers"
+    );
+
+    let ordinary_geometry = inspect(&project, 1.0)?;
+    assert!(
+        ordinary_geometry["evaluated_geometry"]["face_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "ordinary legacy bake evaluation lost its geometry"
+    );
+    apply(
+        &project,
+        &batch_file,
+        &json!([{
+            "op":"constraint.create",
+            "target":{"id":"owner"},
+            "id":"geometry",
+            "type":"geometry_attribute",
+            "constraint_target":"body",
+            "params":{
+                "target":"body",
+                "attribute_name":"instance_transform",
+                "data_type":"FLOAT4X4",
+                "domain":"INSTANCE",
+                "sample_index":0,
+                "mix_mode":"REPLACE",
+                "apply_target_transform":false,
+                "mix_loc":true,
+                "mix_rot":true,
+                "mix_scl":true
+            }
+        }]),
+    )?;
+    let output = pot()
+        .arg("inspect")
+        .arg(&project)
+        .args(["--id", "owner", "--json"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "legacy bake silently returned default INSTANCE data"
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        response["error"]["code"], "UNSUPPORTED_FEATURE",
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["details"]["feature_id"], "graph.bake.legacy_instance_columns_missing",
+        "{response}"
+    );
     Ok(())
 }
 
