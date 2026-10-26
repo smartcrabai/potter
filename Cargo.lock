@@ -343,9 +343,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.9.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877bf67ac8e52449eb2f9e98a344ea163beb70dd1f9eebe3cc5357dcfeaee4df"
+checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1295,7 +1295,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jcode-applet-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "serde",
  "serde_json",
@@ -1304,7 +1304,7 @@ dependencies = [
 [[package]]
 name = "jcode-core"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "chrono",
  "libc",
@@ -1317,7 +1317,7 @@ dependencies = [
 [[package]]
 name = "jcode-harness-api"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "jcode-applet-types",
  "jcode-session-types",
@@ -1331,7 +1331,7 @@ dependencies = [
 [[package]]
 name = "jcode-message-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "chrono",
  "serde",
@@ -1341,7 +1341,7 @@ dependencies = [
 [[package]]
 name = "jcode-provider-metadata"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "url",
 ]
@@ -1349,7 +1349,7 @@ dependencies = [
 [[package]]
 name = "jcode-sdk"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "anyhow",
  "jcode-applet-types",
@@ -1370,7 +1370,7 @@ dependencies = [
 [[package]]
 name = "jcode-session-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "chrono",
  "jcode-message-types",
@@ -1381,7 +1381,7 @@ dependencies = [
 [[package]]
 name = "jcode-side-panel-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "serde",
 ]
@@ -1389,7 +1389,7 @@ dependencies = [
 [[package]]
 name = "jcode-storage"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1403,7 +1403,7 @@ dependencies = [
 [[package]]
 name = "jcode-task-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "chrono",
  "serde",
@@ -1413,7 +1413,7 @@ dependencies = [
 [[package]]
 name = "jcode-todo-policy"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "chrono",
  "jcode-storage",
@@ -1425,7 +1425,7 @@ dependencies = [
 [[package]]
 name = "jcode-transport"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -1436,7 +1436,7 @@ dependencies = [
 [[package]]
 name = "jcode-usage-types"
 version = "0.1.0"
-source = "git+https://github.com/1jehuang/jcode?rev=fe6545528c6122901082dc63abdccfb46afbbb8e#fe6545528c6122901082dc63abdccfb46afbbb8e"
+source = "git+https://github.com/1jehuang/jcode?rev=07d9354d077c04d3d4355f7c293b7a64b146b6ee#07d9354d077c04d3d4355f7c293b7a64b146b6ee"
 dependencies = [
  "serde",
  "serde_json",

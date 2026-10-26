@@ -71,7 +71,7 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
   "webp",
 ] }
-jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "fe6545528c6122901082dc63abdccfb46afbbb8e" }
+jcode-sdk = { git = "https://github.com/1jehuang/jcode", rev = "07d9354d077c04d3d4355f7c293b7a64b146b6ee" }
 jsonschema = "=0.60.0"
 lz4_flex = "0.14"
 mikktspace = { version = "0.3", default-features = false, features = ["glam"] }
