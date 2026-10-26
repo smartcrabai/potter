@@ -294,7 +294,7 @@ pub fn sample_density_checked_with(
             .density_grid()
             .ok_or_else(|| invalid_volume("VDB archive contains no density grid"))?;
         return Ok(match interpolation {
-            VolumeInterpolation::Linear => grid.sample_world(position),
+            VolumeInterpolation::Linear => grid.sample_world_affine(position),
             VolumeInterpolation::Cubic => grid.sample_world_cubic(position),
         });
     }
@@ -907,6 +907,7 @@ fn volume_to_mesh_for_grid(
             adaptivity,
             0.0,
             output,
+            None,
         )?
     } else {
         dual_contour_grid_to_mesh(
@@ -917,6 +918,7 @@ fn volume_to_mesh_for_grid(
             adaptivity,
             0.0,
             output,
+            None,
         )?
     };
     if boundary_crosses {
@@ -1101,6 +1103,7 @@ fn dual_contour_grid_to_mesh(
     adaptivity: f32,
     outside_value: f64,
     output: DMat4,
+    vdb_transform: Option<&crate::geom::vdb::VdbTransform>,
 ) -> Result<Mesh> {
     let nx = usize::try_from(grid.dims[0]).map_err(|_| resource_error())?;
     let ny = usize::try_from(grid.dims[1]).map_err(|_| resource_error())?;
@@ -1236,7 +1239,13 @@ fn dual_contour_grid_to_mesh(
                     }
                     let point = grouped_points[group] / f64::from(grouped_counts[group]);
                     let index_position = DVec3::new(x as f64, y as f64, z as f64) + point;
-                    let position = index_to_output.transform_point3(index_position);
+                    let local_position = index_to_local.transform_point3(index_position);
+                    let position = match vdb_transform {
+                        Some(transform) => {
+                            output.transform_point3(transform.index_to_world_point(local_position))
+                        }
+                        None => index_to_output.transform_point3(index_position),
+                    };
                     if !position.is_finite() || positions.len() >= u32::MAX as usize {
                         return Err(resource_error());
                     }
@@ -1886,6 +1895,22 @@ fn vdb_grid_to_mesh(
     let Some((active_min, active_max)) = grid.active_bbox else {
         return Ok(Mesh::default());
     };
+    if grid.transform.is_nonlinear() && !matches!(resolution, VolumeToMeshResolution::Grid) {
+        let resolution_mode = match resolution {
+            VolumeToMeshResolution::Grid => "GRID",
+            VolumeToMeshResolution::VoxelSize(_) => "VOXEL_SIZE",
+            VolumeToMeshResolution::VoxelAmount(_) => "VOXEL_AMOUNT",
+        };
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "frustum VDB grids cannot be resampled for Volume to Mesh",
+            serde_json::json!({
+                "feature_id":"volume.openvdb_evaluation.transform",
+                "transform":grid.transform.map_type,
+                "resolution_mode":resolution_mode
+            }),
+        ));
+    }
     let mut minimum = [0_i32; 3];
     let mut maximum = [0_i32; 3];
     for axis in 0..3 {
@@ -1985,13 +2010,14 @@ fn vdb_grid_to_mesh(
         blob_f32: None,
         content_ref: None,
     };
-    // The grid's voxels are absolute VDB indices, mapped to world by `index_to_world` and `output`.
-    let world_output = output * grid.transform.index_to_world;
+    // The dense and resampled layouts retain absolute source indices; apply the full VDB transform at each vertex.
     let (layout, layout_values) = if matches!(resolution, VolumeToMeshResolution::Grid) {
         (dense_grid, values)
     } else {
         let active = (active_min.map(i64::from), active_max.map(i64::from));
-        let Some(factor) = resolution_factor(world_output, active, resolution) else {
+        let Some(factor) =
+            resolution_factor(output * grid.transform.index_to_world, active, resolution)
+        else {
             return Ok(Mesh::default());
         };
         resample_dense_vdb(
@@ -2010,7 +2036,8 @@ fn vdb_grid_to_mesh(
         inside_is_low,
         adaptivity,
         outside_value,
-        world_output,
+        output,
+        Some(&grid.transform),
     )?;
     for vertex in &mut mesh.vertices {
         if !vertex.co.is_finite() {

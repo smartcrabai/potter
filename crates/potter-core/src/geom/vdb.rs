@@ -103,56 +103,206 @@ pub(crate) fn box_sample_trilinear<T: BoxScalar>(
     T::lerp(along_y(0), along_y(1), fraction.x)
 }
 
-/// Scalar or three-component values stored by a VDB tree.
+/// One value from an `OpenVDB` tree, preserving its serialized scalar/vector representation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VdbValue {
+    /// A scalar boolean value.
+    Bool(bool),
     /// A scalar single-precision floating-point value.
     Float(f32),
     /// A scalar double-precision floating-point value.
     Double(f64),
-    /// A three-component floating-point value.
+    /// A scalar signed 32-bit integer value.
+    Int32(i32),
+    /// A scalar signed 64-bit integer value.
+    Int64(i64),
+    /// A three-component single-precision floating-point value.
     Vec3([f32; 3]),
+    /// A three-component double-precision floating-point value.
+    Vec3d([f64; 3]),
+    /// A three-component signed 32-bit integer value.
+    Vec3i([i32; 3]),
 }
 
 impl VdbValue {
     fn magnitude(self) -> f32 {
         match self {
+            Self::Bool(value) => f32::from(u8::from(value)),
             Self::Float(value) => value,
             Self::Double(value) => value as f32,
+            Self::Int32(value) => value as f32,
+            Self::Int64(value) => value as f32,
             Self::Vec3(value) => value[0].hypot(value[1]).hypot(value[2]),
+            Self::Vec3d(value) => (value[0] as f32)
+                .hypot(value[1] as f32)
+                .hypot(value[2] as f32),
+            Self::Vec3i(value) => (value[0] as f32)
+                .hypot(value[1] as f32)
+                .hypot(value[2] as f32),
         }
     }
 
-    /// The value at full precision; a three-component value yields its magnitude.
+    /// The scalar value at full precision; a three-component value yields its magnitude.
     fn scalar(self) -> f64 {
         match self {
+            Self::Bool(value) => f64::from(u8::from(value)),
             Self::Float(value) => f64::from(value),
             Self::Double(value) => value,
+            Self::Int32(value) => f64::from(value),
+            Self::Int64(value) => value as f64,
             Self::Vec3(_) => f64::from(self.magnitude()),
+            Self::Vec3d(value) => value[0].hypot(value[1]).hypot(value[2]),
+            Self::Vec3i(value) => f64::from(value[0])
+                .hypot(f64::from(value[1]))
+                .hypot(f64::from(value[2])),
         }
     }
 
     fn component(self, component: usize) -> Option<f64> {
         match self {
+            Self::Bool(value) if component == 0 => Some(f64::from(u8::from(value))),
             Self::Float(value) if component == 0 => Some(f64::from(value)),
             Self::Double(value) if component == 0 => Some(value),
+            Self::Int32(value) if component == 0 => Some(f64::from(value)),
+            Self::Int64(value) if component == 0 => Some(value as f64),
             Self::Vec3(value) => value.get(component).copied().map(f64::from),
-            Self::Float(_) | Self::Double(_) => None,
+            Self::Vec3d(value) => value.get(component).copied(),
+            Self::Vec3i(value) => value.get(component).copied().map(f64::from),
+            Self::Bool(_) | Self::Float(_) | Self::Double(_) | Self::Int32(_) | Self::Int64(_) => {
+                None
+            }
         }
     }
 }
 
+/// Parameters for `OpenVDB`'s perspective frustum map.
+#[derive(Clone, Debug, PartialEq)]
+struct FrustumMap {
+    minimum: DVec3,
+    extent: DVec3,
+    gamma: f64,
+    depth: f64,
+}
+
+impl FrustumMap {
+    fn new(minimum: DVec3, maximum: DVec3, taper: f64, depth: f64) -> Result<Self> {
+        let extent = maximum - minimum;
+        let gamma = (1.0 / taper - 1.0) / depth;
+        if !minimum.is_finite()
+            || !maximum.is_finite()
+            || !extent.is_finite()
+            || extent.x <= 0.0
+            || extent.y <= 0.0
+            || extent.z <= 0.0
+            || !taper.is_finite()
+            || taper <= 0.0
+            || !depth.is_finite()
+            || depth <= 0.0
+            || !gamma.is_finite()
+        {
+            return Err(import_error("OpenVDB frustum transform is invalid"));
+        }
+        Ok(Self {
+            minimum,
+            extent,
+            gamma,
+            depth,
+        })
+    }
+
+    fn index_to_frustum(&self, index: DVec3) -> DVec3 {
+        let mut point = index - self.minimum;
+        point.x -= self.extent.x * 0.5;
+        point.y -= self.extent.y * 0.5;
+        point.z *= self.depth / self.extent.z;
+        let scale = (self.gamma * point.z + 1.0) / self.extent.x;
+        point.x *= scale;
+        point.y *= scale;
+        point
+    }
+
+    fn frustum_to_index(&self, point: DVec3) -> DVec3 {
+        let denominator = self.gamma * point.z + 1.0;
+        if !denominator.is_finite() || denominator.abs() <= f64::EPSILON {
+            return DVec3::splat(f64::NAN);
+        }
+        let mut index = point;
+        let inverse_scale = self.extent.x / denominator;
+        index.x *= inverse_scale;
+        index.y *= inverse_scale;
+        index.x += self.extent.x * 0.5;
+        index.y += self.extent.y * 0.5;
+        index.z *= self.extent.z / self.depth;
+        index + self.minimum
+    }
+}
+
 /// `OpenVDB` index-to-world transform supported by the reader.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VdbTransform {
-    /// Matrix mapping index coordinates to world coordinates.
+    /// Matrix mapping index coordinates to world coordinates. For a frustum this is its
+    /// affine second map, which Blender's Cycles volume loader also uses.
     pub index_to_world: DMat4,
-    /// Matrix mapping world coordinates to index coordinates.
+    /// Affine inverse; for a frustum this inverts only the second map.
     pub world_to_index: DMat4,
     /// Serialized map name.
     pub map_type: &'static str,
+    frustum: Option<FrustumMap>,
 }
 
+impl VdbTransform {
+    pub(crate) fn index_to_world_point(&self, index: DVec3) -> DVec3 {
+        match self.frustum.as_ref() {
+            Some(frustum) => self
+                .index_to_world
+                .transform_point3(frustum.index_to_frustum(index)),
+            None => self.index_to_world.transform_point3(index),
+        }
+    }
+
+    pub(crate) fn world_to_index_point(&self, world: DVec3) -> DVec3 {
+        match self.frustum.as_ref() {
+            Some(frustum) => frustum.frustum_to_index(self.world_to_index.transform_point3(world)),
+            None => self.world_to_index.transform_point3(world),
+        }
+    }
+
+    pub(crate) fn is_nonlinear(&self) -> bool {
+        self.frustum.is_some()
+    }
+
+    pub(crate) fn voxel_basis(&self) -> [DVec3; 3] {
+        let Some(frustum) = self.frustum.as_ref() else {
+            return [
+                self.index_to_world.transform_vector3(DVec3::X),
+                self.index_to_world.transform_vector3(DVec3::Y),
+                self.index_to_world.transform_vector3(DVec3::Z),
+            ];
+        };
+        let index =
+            frustum.minimum + DVec3::new(frustum.extent.x * 0.5, frustum.extent.y * 0.5, 0.0);
+        let world = self.index_to_world_point(index);
+        [
+            self.index_to_world_point(index + DVec3::X) - world,
+            self.index_to_world_point(index + DVec3::Y) - world,
+            self.index_to_world_point(index + DVec3::Z) - world,
+        ]
+    }
+
+    fn voxel_size(&self) -> DVec3 {
+        let [x, y, z] = self.voxel_basis();
+        DVec3::new(x.length(), y.length(), z.length())
+    }
+
+    /// Blender's renderers derive the ray-march step from the affine transform used by image sampling.
+    pub(crate) fn affine_voxel_size(&self) -> DVec3 {
+        DVec3::new(
+            self.index_to_world.transform_vector3(DVec3::X).length(),
+            self.index_to_world.transform_vector3(DVec3::Y).length(),
+            self.index_to_world.transform_vector3(DVec3::Z).length(),
+        )
+    }
+}
 /// A sparse VDB tree containing non-background voxels and tiles.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VdbTree {
@@ -275,8 +425,8 @@ pub struct VdbGrid {
 }
 
 impl VdbGrid {
-    /// Return the value at an integer index, with the background outside active data.
-    /// Double-precision values are rounded to `f32` here; [`VdbGrid::sample_world`] keeps full precision.
+    /// Return the scalar value or vector magnitude at an integer index as `f32`; world sampling
+    /// keeps the grid's full scalar precision.
     #[must_use]
     pub fn sample_index(&self, ijk: [i32; 3]) -> f32 {
         self.sample_value(IVec3::from_array(ijk)).magnitude()
@@ -305,9 +455,17 @@ impl VdbGrid {
         )
     }
 
-    /// Trilinearly sample the grid in world coordinates.
+    /// Trilinearly sample using the full `OpenVDB` grid map, including nonlinear transforms.
     #[must_use]
     pub fn sample_world(&self, position: DVec3) -> f64 {
+        let index = self.transform.world_to_index_point(position);
+        Self::trilinear_index(index, self.tree.background, |point| {
+            self.sample_value(IVec3::from_array(point)).scalar()
+        })
+    }
+
+    /// Linear volume-render sampling through the affine map, as Cycles and EEVEE do for VDB grids.
+    pub(crate) fn sample_world_affine(&self, position: DVec3) -> f64 {
         let index = self.transform.world_to_index.transform_point3(position);
         Self::trilinear_index(index, self.tree.background, |point| {
             self.sample_value(IVec3::from_array(point)).scalar()
@@ -317,7 +475,10 @@ impl VdbGrid {
     /// Whether the grid stores scalar rather than three-component values.
     #[must_use]
     pub(crate) fn is_scalar(&self) -> bool {
-        !matches!(self.tree.background_value, VdbValue::Vec3(_))
+        !matches!(
+            self.tree.background_value,
+            VdbValue::Vec3(_) | VdbValue::Vec3d(_) | VdbValue::Vec3i(_)
+        )
     }
 
     /// Trilinearly sample a scalar grid at an index-space position at full precision. Returns
@@ -376,6 +537,7 @@ impl VdbGrid {
         if !position.is_finite() {
             return self.tree.background;
         }
+        // Cycles calls getAffineMap; for frustums this is the second map without perspective.
         let index = self.transform.world_to_index.transform_point3(position);
         if !index.is_finite() {
             return self.tree.background;
@@ -415,11 +577,29 @@ impl VdbGrid {
         self.active_bbox_world_padded(DVec3::ZERO)
     }
 
-    /// Return the world-space AABB enclosing the active index-space bounds grown by `pad` index voxels on each axis.
-    /// A sample near the active bounds reads its neighbours, so each axis pads by its own count (Cycles pads a volume's
-    /// mesh by one voxel for linear and two for cubic interpolation, `scene/volume.cpp`).
+    /// Return active bounds padded in index space and transformed through `OpenVDB`'s full map.
     #[must_use]
     pub fn active_bbox_world_padded(&self, pad: DVec3) -> Option<(DVec3, DVec3)> {
+        self.active_bbox_world_padded_with(pad, |index| self.transform.index_to_world_point(index))
+    }
+
+    /// Renderers use the affine map from `getAffineMap` even for nonlinear frustum grids.
+    pub(crate) fn active_bbox_world_affine(&self) -> Option<(DVec3, DVec3)> {
+        self.active_bbox_world_padded_affine(DVec3::ZERO)
+    }
+
+    /// Return active bounds padded in index space through the renderer's affine-only map.
+    pub(crate) fn active_bbox_world_padded_affine(&self, pad: DVec3) -> Option<(DVec3, DVec3)> {
+        self.active_bbox_world_padded_with(pad, |index| {
+            self.transform.index_to_world.transform_point3(index)
+        })
+    }
+
+    fn active_bbox_world_padded_with(
+        &self,
+        pad: DVec3,
+        transform: impl Fn(DVec3) -> DVec3,
+    ) -> Option<(DVec3, DVec3)> {
         let (minimum, maximum) = self.active_bbox?;
         let low = DVec3::new(
             f64::from(minimum[0]),
@@ -439,7 +619,7 @@ impl VdbGrid {
                 if corner & 2 == 0 { low.y } else { high.y },
                 if corner & 4 == 0 { low.z } else { high.z },
             );
-            let world = self.transform.index_to_world.transform_point3(index);
+            let world = transform(index);
             if !world.is_finite() {
                 return None;
             }
@@ -452,20 +632,7 @@ impl VdbGrid {
     /// Return index-axis voxel spacing in grid-local world coordinates.
     #[must_use]
     pub fn voxel_size(&self) -> DVec3 {
-        DVec3::new(
-            self.transform
-                .index_to_world
-                .transform_vector3(DVec3::X)
-                .length(),
-            self.transform
-                .index_to_world
-                .transform_vector3(DVec3::Y)
-                .length(),
-            self.transform
-                .index_to_world
-                .transform_vector3(DVec3::Z)
-                .length(),
-        )
+        self.transform.voxel_size()
     }
 
     fn sample_value(&self, point: IVec3) -> VdbValue {
@@ -791,7 +958,42 @@ impl<'a> Parser<'a> {
 
     fn read_transform(&mut self) -> Result<VdbTransform> {
         let map_type = self.cursor.read_string()?;
-        let (matrix, feature_name) = match map_type.as_str() {
+        let (matrix, feature_name, map_name, frustum) = if map_type == "NonlinearFrustumMap" {
+            let minimum = self.cursor.read_dvec3()?;
+            let maximum = self.cursor.read_dvec3()?;
+            let taper = self.cursor.read_f64()?;
+            let depth = self.cursor.read_f64()?;
+            let second_map_type = self.cursor.read_string()?;
+            let (matrix, _, _) = self.read_linear_map(&second_map_type)?;
+            (
+                matrix,
+                "frustum map",
+                "NonlinearFrustumMap",
+                Some(FrustumMap::new(minimum, maximum, taper, depth)?),
+            )
+        } else {
+            let (matrix, feature_name, map_name) = self.read_linear_map(&map_type)?;
+            (matrix, feature_name, map_name, None)
+        };
+        let inverse = matrix.inverse();
+        if !matrix.is_finite() || !inverse.is_finite() || matrix.determinant().abs() <= f64::EPSILON
+        {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                format!("OpenVDB {feature_name} is singular or non-finite"),
+                json!({"feature_id":"volume.openvdb_evaluation.transform"}),
+            ));
+        }
+        Ok(VdbTransform {
+            index_to_world: matrix,
+            world_to_index: inverse,
+            map_type: map_name,
+            frustum,
+        })
+    }
+
+    fn read_linear_map(&mut self, map_type: &str) -> Result<(DMat4, &'static str, &'static str)> {
+        let (matrix, feature_name) = match map_type {
             "UniformScaleMap" | "ScaleMap" => {
                 let scale = self.cursor.read_dvec3()?;
                 self.cursor.read_dvec3()?;
@@ -816,30 +1018,19 @@ impl<'a> Parser<'a> {
                 DMat4::from_translation(self.cursor.read_dvec3()?),
                 "translation map",
             ),
-            "AffineMap" => {
+            "AffineMap" | "UnitaryMap" => {
                 let mut row_major = [0.0; 16];
                 for value in &mut row_major {
                     *value = self.cursor.read_f64()?;
                 }
-                let column_major = [
-                    row_major[0],
-                    row_major[4],
-                    row_major[8],
-                    row_major[12],
-                    row_major[1],
-                    row_major[5],
-                    row_major[9],
-                    row_major[13],
-                    row_major[2],
-                    row_major[6],
-                    row_major[10],
-                    row_major[14],
-                    row_major[3],
-                    row_major[7],
-                    row_major[11],
-                    row_major[15],
-                ];
-                (DMat4::from_cols_array(&column_major), "affine map")
+                (
+                    DMat4::from_cols_array(&row_major),
+                    if map_type == "UnitaryMap" {
+                        "unitary map"
+                    } else {
+                        "affine map"
+                    },
+                )
             }
             _ => {
                 return Err(PotError::with_details(
@@ -849,27 +1040,16 @@ impl<'a> Parser<'a> {
                 ));
             }
         };
-        let inverse = matrix.inverse();
-        if !matrix.is_finite() || !inverse.is_finite() || matrix.determinant().abs() <= f64::EPSILON
-        {
-            return Err(PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                format!("OpenVDB {feature_name} is singular or non-finite"),
-                json!({"feature_id":"volume.openvdb_evaluation.transform"}),
-            ));
-        }
-        Ok(VdbTransform {
-            index_to_world: matrix,
-            world_to_index: inverse,
-            map_type: match map_type.as_str() {
-                "UniformScaleMap" => "UniformScaleMap",
-                "ScaleMap" => "ScaleMap",
-                "UniformScaleTranslateMap" => "UniformScaleTranslateMap",
-                "ScaleTranslateMap" => "ScaleTranslateMap",
-                "TranslationMap" => "TranslationMap",
-                _ => "AffineMap",
-            },
-        })
+        let map_name = match map_type {
+            "UniformScaleMap" => "UniformScaleMap",
+            "ScaleMap" => "ScaleMap",
+            "UniformScaleTranslateMap" => "UniformScaleTranslateMap",
+            "ScaleTranslateMap" => "ScaleTranslateMap",
+            "TranslationMap" => "TranslationMap",
+            "UnitaryMap" => "UnitaryMap",
+            _ => "AffineMap",
+        };
+        Ok((matrix, feature_name, map_name))
     }
 
     fn read_grid_tree(
@@ -937,14 +1117,26 @@ impl<'a> Parser<'a> {
                 return Err(import_error("VDB leaf topology and value masks differ"));
             }
             self.add_voxels(512)?;
-            let values = self.read_compressed_values(
-                512,
-                &leaf.active,
-                value_type,
-                metadata.compression,
-                metadata.half_float,
-                background,
-            )?;
+            let values = if value_type == ValueKind::Bool {
+                if self.cursor.read_i32_vec3()? != leaf.origin {
+                    return Err(import_error(
+                        "VDB boolean leaf origin differs from its topology",
+                    ));
+                }
+                self.read_mask(512)?
+                    .into_iter()
+                    .map(VdbValue::Bool)
+                    .collect()
+            } else {
+                self.read_compressed_values(
+                    512,
+                    &leaf.active,
+                    value_type,
+                    metadata.compression,
+                    metadata.half_float,
+                    background,
+                )?
+            };
             for (offset, value) in values.into_iter().enumerate() {
                 let local = leaf_offset(offset);
                 let coordinate = add_coord(leaf.origin, local)?;
@@ -968,7 +1160,7 @@ impl<'a> Parser<'a> {
             name: descriptor.name.clone(),
             class: metadata.class,
             value_type: descriptor.grid_type.clone(),
-            transform: *transform,
+            transform: transform.clone(),
             tree: Arc::new(tree),
             active_bbox,
         })
@@ -1311,18 +1503,28 @@ impl<'a> Parser<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueKind {
+    Bool,
     Float,
     Double,
+    Int32,
+    Int64,
     Vec3,
+    Vec3d,
+    Vec3i,
 }
 
 impl ValueKind {
     fn byte_size(self, half: bool) -> Option<usize> {
         let bytes_per_component = if half { 2 } else { 4 };
         match self {
+            Self::Bool => (!half).then_some(1),
             Self::Float => Some(bytes_per_component),
-            Self::Double => (!half).then_some(8),
+            Self::Double => Some(if half { 2 } else { 8 }),
+            Self::Int32 => (!half).then_some(4),
+            Self::Int64 => (!half).then_some(8),
+            Self::Vec3i => (!half).then_some(12),
             Self::Vec3 => bytes_per_component.checked_mul(3),
+            Self::Vec3d => Some(if half { 6 } else { 24 }),
         }
     }
 }
@@ -1334,18 +1536,39 @@ enum MetadataValue {
 }
 
 fn grid_value_type(grid_type: &str) -> Result<ValueKind> {
-    let parts = grid_type.split('_').collect::<Vec<_>>();
-    if parts.first() != Some(&"Tree") || parts.get(2..5) != Some(["5", "4", "3"].as_slice()) {
+    let mut parts = grid_type.split('_');
+    if parts.next() != Some("Tree") {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
             format!("OpenVDB tree configuration `{grid_type}` is not supported"),
             json!({"feature_id":"volume.openvdb_evaluation.tree_buffers","grid_type":grid_type}),
         ));
     }
-    match parts.get(1).copied() {
+    let value_type = parts.next();
+    if parts.next() != Some("5") || parts.next() != Some("4") || parts.next() != Some("3") {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!("OpenVDB tree configuration `{grid_type}` is not supported"),
+            json!({"feature_id":"volume.openvdb_evaluation.tree_buffers","grid_type":grid_type}),
+        ));
+    }
+    let suffix = parts.next();
+    if suffix.is_some_and(|suffix| suffix != "HalfFloat") || parts.next().is_some() {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!("OpenVDB tree configuration `{grid_type}` is not supported"),
+            json!({"feature_id":"volume.openvdb_evaluation.tree_buffers","grid_type":grid_type}),
+        ));
+    }
+    match value_type {
+        Some("bool") => Ok(ValueKind::Bool),
         Some("float") => Ok(ValueKind::Float),
         Some("double") => Ok(ValueKind::Double),
+        Some("int32") => Ok(ValueKind::Int32),
+        Some("int64") => Ok(ValueKind::Int64),
         Some("vec3s") => Ok(ValueKind::Vec3),
+        Some("vec3d") => Ok(ValueKind::Vec3d),
+        Some("vec3i") => Ok(ValueKind::Vec3i),
         _ => Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
             format!("OpenVDB grid type `{grid_type}` is not supported"),
@@ -1643,7 +1866,7 @@ fn unsupported_blosc(feature: &str, message: String) -> PotError {
 }
 
 fn decode_value(bytes: &[u8], kind: ValueKind, half: bool) -> Result<VdbValue> {
-    let component = |offset: usize| -> Result<f32> {
+    let float_component = |offset: usize| -> Result<f32> {
         if half {
             let bits = u16::from_le_bytes(
                 bytes
@@ -1662,24 +1885,67 @@ fn decode_value(bytes: &[u8], kind: ValueKind, half: bool) -> Result<VdbValue> {
             Ok(f32::from_le_bytes(bits))
         }
     };
-    match kind {
-        ValueKind::Float => Ok(VdbValue::Float(component(0)?)),
-        ValueKind::Double => {
+    let double_component = |offset: usize| -> Result<f64> {
+        if half {
+            float_component(offset).map(f64::from)
+        } else {
             let bits: [u8; 8] = bytes
-                .get(..8)
+                .get(offset..offset + 8)
                 .ok_or_else(|| import_error("VDB double value is truncated"))?
                 .try_into()
                 .map_err(|_| import_error("VDB double value is truncated"))?;
-            Ok(VdbValue::Double(f64::from_le_bytes(bits)))
+            Ok(f64::from_le_bytes(bits))
         }
+    };
+    let int32_component = |offset: usize| -> Result<i32> {
+        let bits: [u8; 4] = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| import_error("VDB int32 value is truncated"))?
+            .try_into()
+            .map_err(|_| import_error("VDB int32 value is truncated"))?;
+        Ok(i32::from_le_bytes(bits))
+    };
+    let int64_component = || -> Result<i64> {
+        let bits: [u8; 8] = bytes
+            .get(..8)
+            .ok_or_else(|| import_error("VDB int64 value is truncated"))?
+            .try_into()
+            .map_err(|_| import_error("VDB int64 value is truncated"))?;
+        Ok(i64::from_le_bytes(bits))
+    };
+    match kind {
+        ValueKind::Bool => {
+            let value = bytes
+                .first()
+                .copied()
+                .ok_or_else(|| import_error("VDB boolean value is truncated"))?;
+            Ok(VdbValue::Bool(value != 0))
+        }
+        ValueKind::Float => Ok(VdbValue::Float(float_component(0)?)),
+        ValueKind::Double => Ok(VdbValue::Double(double_component(0)?)),
+        ValueKind::Int32 => Ok(VdbValue::Int32(int32_component(0)?)),
+        ValueKind::Int64 => Ok(VdbValue::Int64(int64_component()?)),
         ValueKind::Vec3 => {
             let size = if half { 2 } else { 4 };
             Ok(VdbValue::Vec3([
-                component(0)?,
-                component(size)?,
-                component(size * 2)?,
+                float_component(0)?,
+                float_component(size)?,
+                float_component(size * 2)?,
             ]))
         }
+        ValueKind::Vec3d => {
+            let size = if half { 2 } else { 8 };
+            Ok(VdbValue::Vec3d([
+                double_component(0)?,
+                double_component(size)?,
+                double_component(size * 2)?,
+            ]))
+        }
+        ValueKind::Vec3i => Ok(VdbValue::Vec3i([
+            int32_component(0)?,
+            int32_component(4)?,
+            int32_component(8)?,
+        ])),
     }
 }
 
@@ -1706,9 +1972,14 @@ fn f16_to_f32(bits: u16) -> f32 {
 
 fn negate_value(value: VdbValue) -> VdbValue {
     match value {
+        VdbValue::Bool(value) => VdbValue::Bool(!value),
         VdbValue::Float(value) => VdbValue::Float(-value),
         VdbValue::Double(value) => VdbValue::Double(-value),
+        VdbValue::Int32(value) => VdbValue::Int32(value.wrapping_neg()),
+        VdbValue::Int64(value) => VdbValue::Int64(value.wrapping_neg()),
         VdbValue::Vec3(value) => VdbValue::Vec3(value.map(|component| -component)),
+        VdbValue::Vec3d(value) => VdbValue::Vec3d(value.map(|component| -component)),
+        VdbValue::Vec3i(value) => VdbValue::Vec3i(value.map(i32::wrapping_neg)),
     }
 }
 
@@ -2160,7 +2431,8 @@ mod sampling_tests {
             transform: VdbTransform {
                 index_to_world: DMat4::IDENTITY,
                 world_to_index: DMat4::IDENTITY,
-                map_type: "UnitMap",
+                map_type: "AffineMap",
+                frustum: None,
             },
             tree,
             active_bbox: Some(([2, 2, 2], [13, 13, 13])),
