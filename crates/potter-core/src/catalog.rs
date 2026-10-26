@@ -1909,7 +1909,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint",
-            "Blender PAINT/VERTEX supports POINT proximity and VOLUME closed-mesh brushes with color and wetness replay, drying, dissolve, and named Corner BYTE_COLOR outputs; create/update ensures A and creates requested B layers, while schema 10 migrates missing A only for pre-10 native PAINT/VERTEX canvases and leaves Blender-imported canvases without toggled outputs untouched. Legacy native brushes without paint_source migrate to POINT using native radius or canvas radius only when local Object.loc matches the old world origin; parented or constrained native brushes retain a LEGACY_WORLD_ORIGIN marker with a load warning and fail only when evaluated until fixed. .blend export refuses the marker because Blender has no equivalent RNA source. VOLUME requires an explicit PAINT/VERTEX surface; native radius and surface-less VOLUME use are refused. WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior influence into an existing named vertex group across integer frames and optionally dissolves it. Multiple surfaces, arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, and baked caches remain refused.",
+            "Blender PAINT/VERTEX supports POINT proximity and VOLUME closed-mesh brushes with color and wetness replay, drying, dissolve, and named Corner BYTE_COLOR outputs; every active surface evaluates in collection order with its own frame range, brush collection, and outputs. Create/update ensures output A and creates requested B layers, while schema 10 migrates missing A only for pre-10 native PAINT/VERTEX canvases and leaves Blender-imported canvases without toggled outputs untouched. Legacy native brushes without paint_source migrate to POINT using native radius or canvas radius only when local Object.loc matches the old world origin; parented or constrained native brushes retain a LEGACY_WORLD_ORIGIN marker with a load warning and fail only when evaluated until fixed. .blend export refuses the marker because Blender has no equivalent RNA source. VOLUME requires an explicit PAINT/VERTEX surface; native radius and surface-less VOLUME use are refused. WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior influence into an existing named vertex group across integer frames and optionally dissolves it. Arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, baked caches, and DISPLACE/WAVE remain refused.",
             "DynamicPaint",
             &[
                 "physics.dynamic_paint.create",
@@ -1975,7 +1975,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint_surface.frame_start",
-            "A single PAINT/VERTEX surface replays color and wetness from frame_start and holds both outputs after frame_end; WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior weights and dissolve over integer frames in range. Start>end stays unpainted.",
+            "Each PAINT/VERTEX surface replays color and wetness from its own frame_start and holds both outputs after frame_end; WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior weights and dissolve over its own integer frame range. Start>end stays unpainted.",
             "DynamicPaintSurface",
             &[
                 "physics.dynamic_paint.create",
@@ -1983,12 +1983,15 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, false, true, true],
         ),
-        unsupported(
+        supported(
             "physics.dynamic_paint_canvas.canvas_surfaces",
-            "Dynamic-paint canvases with multiple surfaces",
+            "Multiple Dynamic Paint canvas surfaces",
             "DynamicPaintCanvas",
-            &[],
-            "Blender evaluates each surface with its own point-cache range and output layer; Potter's result model supports only one surface per canvas and refuses multiple surfaces.",
+            &[
+                "physics.dynamic_paint.create",
+                "physics.dynamic_paint.update",
+            ],
+            [true, true, true, true, false, true, true],
         ),
         unsupported(
             "physics.dynamic_paint_brush.legacy_transform",
@@ -2044,7 +2047,7 @@ pub fn feature_catalog() -> Value {
             "Dynamic paint surface types and stateful canvas evolution",
             "DynamicPaint",
             &[],
-            "Potter replays PAINT/VERTEX POINT and VOLUME color/wetness and WEIGHT/VERTEX POINT and VOLUME weight brushes, but not arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, or DISPLACE/WAVE. Baked caches and multiple surfaces per canvas are refused.",
+            "Potter replays ordered PAINT/VERTEX color/wetness and WEIGHT/VERTEX brush results, honoring each active surface's frame range, brush collection, and output layers. It does not replay arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, baked caches, or DISPLACE/WAVE.",
         ),
         unsupported(
             "physics.collision.blender_collision_model",

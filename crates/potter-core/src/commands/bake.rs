@@ -207,6 +207,17 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                     .filter(|(id, _)| matches_target(id))
                     .map(|(id, weights)| (id.to_string(), json!(weights)))
                     .collect::<BTreeMap<_, _>>();
+                let painted_objects = paint_colors
+                    .keys()
+                    .filter(|id| {
+                        !paint_wetness.contains_key(*id) && !paint_weights.contains_key(*id)
+                    })
+                    .count()
+                    + paint_wetness
+                        .keys()
+                        .filter(|id| !paint_weights.contains_key(*id))
+                        .count()
+                    + paint_weights.len();
                 let name = format!("frame_{frame_index:08}.json");
                 write_json(
                     &stage.path.join(&name),
@@ -234,7 +245,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                     "objects":transforms.len(),
                     "particle_count":particles.values().map(|items| items.as_array().map_or(0, Vec::len)).sum::<usize>(),
                     "fluid_particle_count":fluid_particles.values().map(|items| items.as_array().map_or(0, Vec::len)).sum::<usize>(),
-                    "painted_objects":paint_colors.len() + paint_weights.len(),
+                    "painted_objects":painted_objects,
                     "deformed_meshes":deformed_meshes.len()
                 }));
             }
@@ -254,7 +265,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
         .collect::<Vec<_>>();
     write_json(
         &stage.path.join("manifest.json"),
-        &json!({"schema_version":1,"kind":bake_kind_name(args.kind),"scene_id":doc.scene_id,"revision":doc.revision,"frames":baked_frames,"cache_keys":cache_keys,"files":files}),
+        &json!({"schema_version":if args.kind == BakeKind::Simulation {2} else {1},"kind":bake_kind_name(args.kind),"scene_id":doc.scene_id,"revision":doc.revision,"frames":baked_frames,"cache_keys":cache_keys,"files":files}),
     )?;
     files.push("manifest.json".to_owned());
     stage.publish(output, args.overwrite)?;

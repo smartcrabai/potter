@@ -448,7 +448,7 @@ fn paint_surface_drying_dissolve_and_wetness_output_match_blender_and_round_trip
             let wet_layer = &expected_frame["colors"][output_b];
             compare_colors(
                 primary,
-                &frame["paint_colors"][canvas_id],
+                &frame["paint_colors"][canvas_id]["0"],
                 OUTPUT_TOLERANCE,
                 &format!("{case_key} frame {frame_number} primary paint output"),
             )?;
@@ -458,7 +458,7 @@ fn paint_surface_drying_dissolve_and_wetness_output_match_blender_and_round_trip
                 .iter()
                 .map(|color| number(&color[0], "oracle wetness").map(linear_to_srgb))
                 .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-            let actual_wetness = frame["paint_wetness"][canvas_id]
+            let actual_wetness = frame["paint_wetness"][canvas_id]["0"]
                 .as_array()
                 .ok_or("Potter wetness values are missing")?;
             assert_eq!(
@@ -504,7 +504,7 @@ fn paint_surface_drying_dissolve_and_wetness_output_match_blender_and_round_trip
             let colors = &expected_case["frames"][frame_key.as_str()]["colors"][output_a];
             compare_colors(
                 colors,
-                &frame["paint_colors"][canvas_id],
+                &frame["paint_colors"][canvas_id]["0"],
                 OUTPUT_TOLERANCE,
                 &format!("{case_key} frame {frame_number} paint output"),
             )?;

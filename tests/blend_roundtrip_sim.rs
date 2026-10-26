@@ -716,7 +716,7 @@ fn simulation_modifiers_settings_caches_and_frame_ranges_round_trip() -> Result<
 }
 
 #[test]
-fn dynamic_paint_frame_end_matches_blender_and_multiple_surfaces_are_refused()
+fn dynamic_paint_frame_end_matches_blender_and_multiple_surfaces_match_outputs()
 -> Result<(), Box<dyn Error>> {
     let Some(blender) = blender() else {
         eprintln!("skipping Blender Dynamic Paint range oracle; Blender is unavailable");
@@ -795,7 +795,7 @@ fn dynamic_paint_frame_end_matches_blender_and_multiple_surfaces_are_refused()
             serde_json::from_slice(&fs::read(held_bake.join(format!("frame_{index:08}.json")))?)?;
         if blender_frame == "3" {
             assert_subset(
-                &frame["paint_colors"][held_canvas_id.as_str()],
+                &frame["paint_colors"][held_canvas_id.as_str()]["0"],
                 &held["frames"][blender_frame]["colors"]["HeldPaint"],
                 &format!("physics paint colors at Blender frame {blender_frame}"),
             );
@@ -824,8 +824,8 @@ fn dynamic_paint_frame_end_matches_blender_and_multiple_surfaces_are_refused()
     let fresh_held_frame: Value =
         serde_json::from_slice(&fs::read(fresh_held_bake.join("frame_00000000.json"))?)?;
     assert_eq!(
-        fresh_held_frame["paint_colors"][held_canvas_id.as_str()],
-        evaluated_frames[1]["paint_colors"][held_canvas_id.as_str()],
+        fresh_held_frame["paint_colors"][held_canvas_id.as_str()]["0"],
+        evaluated_frames[1]["paint_colors"][held_canvas_id.as_str()]["0"],
         "held-frame paint must not depend on whether frame 3 followed a sequence or was evaluated alone"
     );
     let center_z = |frame: &Value| {
@@ -899,7 +899,7 @@ fn dynamic_paint_frame_end_matches_blender_and_multiple_surfaces_are_refused()
         )?)?;
         let expected_colors = &shape_key["frames"][blender_frame]["colors"]["ShapeKeyPaint"];
         assert_subset(
-            &frame["paint_colors"][shape_key_canvas_id.as_str()],
+            &frame["paint_colors"][shape_key_canvas_id.as_str()]["0"],
             expected_colors,
             &format!("shape-key physics paint colors at Blender frame {blender_frame}"),
         );
@@ -910,7 +910,7 @@ fn dynamic_paint_frame_end_matches_blender_and_multiple_surfaces_are_refused()
             &format!("shape-key stack color layer at Blender frame {blender_frame}"),
         );
         assert_dynamic_paint_physics_matches_corner_layer(
-            &frame["paint_colors"][shape_key_canvas_id.as_str()],
+            &frame["paint_colors"][shape_key_canvas_id.as_str()]["0"],
             &frame["deformed_meshes"][shape_key_canvas_id.as_str()],
             "ShapeKeyPaint",
             &format!("shape-key physics/stack color agreement at Blender frame {blender_frame}"),
@@ -959,36 +959,45 @@ fn dynamic_paint_frame_end_matches_blender_and_multiple_surfaces_are_refused()
     ])?;
     let multiple_scene: Value =
         serde_json::from_slice(&fs::read(multiple_project.join("scene.json"))?)?;
-    let (_, multiple_canvas) = dynamic_paint_canvas(&multiple_scene);
+    let (multiple_canvas_id, multiple_canvas) = dynamic_paint_canvas(&multiple_scene);
     let surfaces = multiple_canvas["properties"]["physics_dynamic_paint"]["canvas_surfaces"]
         .as_array()
         .unwrap();
     assert_eq!(surfaces.len(), 2);
     assert_eq!(surfaces[0]["output_name_a"], "EarlyPaint");
     assert_eq!(surfaces[1]["output_name_a"], "LatePaint");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
-    command.args([
+    let multiple_bake = root.join("multiple_bake");
+    let bake = pot_json(&[
         "bake",
         multiple_project.to_str().unwrap(),
         "--kind",
         "simulation",
         "--frames",
-        "3:3",
+        "1:4",
         "--out",
-        root.join("multiple_bake").to_str().unwrap(),
-        "--json",
-    ]);
-    let failure = run_guarded(command)?;
-    assert!(
-        !failure.status.success(),
-        "multiple surfaces must be refused"
-    );
-    let failure: Value = serde_json::from_slice(&failure.stdout)?;
-    assert_eq!(failure["error"]["code"], "UNSUPPORTED_FEATURE");
-    assert_eq!(
-        failure["error"]["details"]["feature_id"],
-        "physics.dynamic_paint_canvas.canvas_surfaces"
-    );
+        multiple_bake.to_str().unwrap(),
+    ])?;
+    assert_eq!(bake["result"]["frame_count"], 4);
+    for frame_number in 1..=4 {
+        let frame: Value = serde_json::from_slice(&fs::read(
+            multiple_bake.join(format!("frame_{:08}.json", frame_number - 1)),
+        )?)?;
+        let blender_frame = frame_number.to_string();
+        for (surface_index, output_name) in [(0, "EarlyPaint"), (1, "LatePaint")] {
+            let expected = &multiple["frames"][&blender_frame]["colors"][output_name];
+            assert_subset(
+                &frame["paint_colors"][multiple_canvas_id.as_str()][surface_index.to_string()],
+                expected,
+                &format!("surface {surface_index} physics colors at frame {frame_number}"),
+            );
+            assert_dynamic_paint_corner_layer(
+                &frame["deformed_meshes"][multiple_canvas_id.as_str()],
+                output_name,
+                expected,
+                &format!("surface {surface_index} output layer at frame {frame_number}"),
+            );
+        }
+    }
     Ok(())
 }
 

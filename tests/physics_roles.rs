@@ -252,10 +252,10 @@ fn legacy_dynamic_paint_ui_mismatch_migrates_canvas_radius_without_rewriting_ui_
         "1:1",
         0,
     );
-    assert!(frame["paint_colors"]["canvas"].is_array());
+    assert!(frame["paint_colors"]["canvas"]["0"].is_array());
     assert!(frame["paint_colors"].get("brush").is_none());
     assert!(
-        frame["paint_colors"]["canvas"]
+        frame["paint_colors"]["canvas"]["0"]
             .as_array()
             .unwrap()
             .iter()
@@ -518,7 +518,7 @@ fn parented_legacy_brush_loads_then_refuses_bake_until_source_is_fixed() {
         "1:1",
         0,
     );
-    assert!(frame["paint_colors"]["canvas"].is_array());
+    assert!(frame["paint_colors"]["canvas"]["0"].is_array());
 }
 
 #[test]
