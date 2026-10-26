@@ -3168,7 +3168,8 @@ fn legacy_pose_rotation_mode_keeps_euler_animation_and_blend_source_mode() -> Te
             .is_none(),
         "main-era PoseBone fixture must not contain rotation_mode"
     );
-    let legacy_doc: SceneDoc = serde_json::from_value(legacy_json)?;
+    let legacy_doc =
+        potter_core::model::parse_scene(&serde_json::to_vec(&legacy_json)?, Path::new("."))?.doc;
     let legacy_rig_id = Id::new("legacy_rig")?;
     let legacy_bone_id = Id::new("legacy_bone")?;
     let start = Snapshot::evaluate(
