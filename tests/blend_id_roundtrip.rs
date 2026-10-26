@@ -397,6 +397,118 @@ fn blender_open_save_replace_preserves_all_represented_ids() -> Result<(), Box<d
     Ok(())
 }
 
+#[test]
+fn blender_large_text_datablocks_round_trip_without_losing_contents() -> Result<(), Box<dyn Error>>
+{
+    let Some(blender) = blender_executable() else {
+        eprintln!("skipping Blender large Text round-trip; no executable Blender was found");
+        return Ok(());
+    };
+
+    let directory = tempdir()?;
+    let root = directory.path();
+    let source = root.join("large-texts.blend");
+    let exported = root.join("large-texts-round-trip.blend");
+    let expected = json!({
+        "Large control text": format!("{}\na\u{000c}b\u{001b}c\td\u{00e9}\n", "x".repeat(70_000)),
+        "Large plain text": format!("{}é\tend\n", "plain-".repeat(11_000))
+    });
+    // Linux caps a single argument at 128 KiB, so the bodies travel through a file.
+    let expected_path = root.join("expected-texts.json");
+    fs::write(&expected_path, serde_json::to_vec(&expected)?)?;
+    let create_script = r#"
+import bpy, json, sys
+arguments = sys.argv[sys.argv.index("--") + 1:]
+with open(arguments[0], encoding="utf-8") as handle:
+    expected = json.load(handle)
+for name, body in expected.items():
+    text = bpy.data.texts.new(name)
+    text.from_string(body)
+bpy.ops.wm.save_as_mainfile(filepath=arguments[1])
+"#;
+    let mut create_source = Command::new(&blender);
+    create_source
+        .args([
+            "--background",
+            "--factory-startup",
+            "--disable-autoexec",
+            "--python-exit-code",
+            "1",
+            "--python-expr",
+            create_script,
+            "--",
+        ])
+        .arg(&expected_path)
+        .arg(&source);
+    run_ok(
+        &mut create_source,
+        "creating the large Blender Text datablocks",
+    )?;
+
+    let project = root.join("project");
+    let mut init = pot();
+    init.args(["init"]).arg(&project).arg("--json");
+    run_ok(&mut init, "initializing the large Text project")?;
+    let mut import = pot();
+    import
+        .args(["import"])
+        .arg(&project)
+        .args(["--file"])
+        .arg(&source)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json");
+    run_ok(&mut import, "strictly importing the large Text datablocks")?;
+
+    let mut export = pot();
+    export
+        .args(["export"])
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&exported)
+        .args(["--blender"])
+        .arg(&blender)
+        .arg("--json");
+    run_ok(&mut export, "strictly exporting the large Text datablocks")?;
+
+    let verify_script = r#"
+import bpy, json, sys
+with open(sys.argv[sys.argv.index("--") + 1], encoding="utf-8") as handle:
+    expected = json.load(handle)
+for name, body in expected.items():
+    text = bpy.data.texts.get(name)
+    assert text is not None, f"missing Text datablock {name!r}"
+    assert text.as_string() == body, f"Text datablock {name!r} changed contents"
+    assert text.is_in_memory is True, f"Text datablock {name!r} is not in memory"
+    assert text.filepath == "", f"Text datablock {name!r} has filepath {text.filepath!r}"
+"#;
+    let mut reopen = Command::new(&blender);
+    reopen
+        .args(["--background", "--disable-autoexec"])
+        .arg(&exported)
+        .args([
+            "--python-exit-code",
+            "1",
+            "--python-expr",
+            verify_script,
+            "--",
+        ])
+        .arg(&expected_path);
+    run_ok(
+        &mut reopen,
+        "reopening and verifying the large Text datablocks",
+    )?;
+    Ok(())
+}
+
 fn glb_json(path: &Path) -> Result<Value, Box<dyn Error>> {
     let bytes = fs::read(path)?;
     if bytes.get(0..4) != Some(&b"glTF"[..]) || bytes.get(16..20) != Some(&b"JSON"[..]) {
