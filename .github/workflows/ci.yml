@@ -5,26 +5,19 @@ on:
     branches: [ main ]
 
 
-# Blender 5.2.x: the .blend adapter (test job) and the VRM Add-on consumer (vrm-consumer job) both need it.
+# Blender 5.2.x: each test shard and the VRM Add-on consumer need it.
 env:
   BLENDER_VERSION: 5.2.2
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    env:
-      # Test artifacts stay optimized; DWARF is unnecessary for ~200 test executables.
-      CARGO_PROFILE_TEST_DEBUG: "0"
-    # About 50-75 minutes (build, clippy, then tests); tests/blend_realistic_scene.rs alone takes ~26-32 minutes.
-    # A hung Blender test should still not hold the runner for 6 hours.
-    timeout-minutes: 100
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-
-
 
       - name: Install taplo
         shell: bash
@@ -42,16 +35,46 @@ jobs:
         shell: bash
         run: taplo fmt --check --option reorder_keys=true Cargo.toml crates/*/Cargo.toml
 
+      - name: Check test shard coverage
+        shell: bash
+        run: python3 scripts/ci_test_shard.py --check
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-lint
 
       - name: Check formatting
         shell: bash
         run: cargo fmt --all -- --check
 
-      - name: Run cargo check
+      - name: Run clippy
         shell: bash
-        run: cargo check --workspace --all-features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test-shard:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    env:
+      # Test artifacts stay optimized; DWARF is unnecessary for ~200 test executables.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      POTTER_REQUIRE_BLENDER: "1"
+    # The Blender realistic-scene target takes about 27 minutes; leave time for the test build and other targets.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-test-shards
+          save-if: ${{ matrix.shard == 0 }}
 
       - name: Cache Blender
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -60,7 +83,6 @@ jobs:
           key: blender-${{ env.BLENDER_VERSION }}-linux-x64
 
       - name: Install Blender
-        id: install_blender
         shell: bash
         run: |
           sudo apt-get update
@@ -73,16 +95,23 @@ jobs:
           "$HOME/blender/blender" --version
           echo "POTTER_BLENDER=$HOME/blender/blender" >> "$GITHUB_ENV"
 
-      - name: Run clippy
+      - name: Run test shard
         shell: bash
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: python3 scripts/ci_test_shard.py --shard "${{ matrix.shard }}" --run
 
-      - name: Run tests
-        if: ${{ !cancelled() && steps.install_blender.outcome == 'success' }}
+  test:
+    runs-on: ubuntu-latest
+    needs: [lint, test-shard]
+    if: always()
+    steps:
+      - name: Require lint and every test shard to pass
         shell: bash
         env:
-          POTTER_REQUIRE_BLENDER: "1"
-        run: cargo test --workspace --all-features --no-fail-fast
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_SHARD_RESULT: ${{ needs.test-shard.result }}
+        run: |
+          printf 'lint: %s\ntest-shard: %s\n' "$LINT_RESULT" "$TEST_SHARD_RESULT"
+          [[ "$LINT_RESULT" == success && "$TEST_SHARD_RESULT" == success ]]
 
   vrm-consumer:
     runs-on: ubuntu-latest
