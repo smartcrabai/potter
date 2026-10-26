@@ -35,10 +35,13 @@ pub(crate) struct BoneMatrices {
     pub(crate) pose: DMat4,
     pub(crate) skin: DMat4,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct EvaluatedArmatureBoneMatrices {
     pub world: BTreeMap<Id, DMat4>,
     pub pose: Option<BTreeMap<Id, DMat4>>,
+    pub bbone_pose: Option<BTreeMap<Id, BbonePoseMatrices>>,
+    pub bone_matrices: Option<BTreeMap<Id, BoneMatrices>>,
+    pub bbone_segments: Option<BTreeMap<Id, BboneSegmentMatrices>>,
 }
 
 #[derive(Clone, Copy)]
@@ -274,11 +277,19 @@ fn evaluate_bone_matrices_with_ik_overrides(
     Ok(output)
 }
 
+fn constraint_bbone_shape_matrices_needed(constraint: &Constraint) -> Result<bool> {
+    Ok(param_bool(&constraint.params, "use_bbone_shape", false)?
+        && (constraint.constraint_type == ConstraintType::CopyTransforms
+            || number_param(&constraint.params, "head_tail")?.unwrap_or(0.0) >= 1.0e-6))
+}
+
 fn constraint_target_bone_matrix(
     constraint: &Constraint,
     target_node: &Node,
     doc: &SceneDoc,
     matrix: DMat4,
+    armature_world: DMat4,
+    bbone_pose: Option<&BTreeMap<Id, BbonePoseMatrices>>,
 ) -> Result<DMat4> {
     constraint_target_bone_matrix_for_id(
         constraint,
@@ -286,6 +297,8 @@ fn constraint_target_bone_matrix(
         doc,
         matrix,
         constraint.subtarget.as_ref(),
+        armature_world,
+        bbone_pose,
     )
 }
 
@@ -295,13 +308,16 @@ fn constraint_target_bone_matrix_for_id(
     doc: &SceneDoc,
     mut matrix: DMat4,
     bone_id: Option<&Id>,
+    armature_world: DMat4,
+    bbone_pose: Option<&BTreeMap<Id, BbonePoseMatrices>>,
 ) -> Result<DMat4> {
     let Some(bone_id) = bone_id else {
         return Ok(matrix);
     };
     let head_tail = number_param(&constraint.params, "head_tail")?.unwrap_or(0.0);
     let use_bbone_shape = param_bool(&constraint.params, "use_bbone_shape", false)?;
-    if head_tail == 0.0 {
+    let full_bbone = constraint.constraint_type == ConstraintType::CopyTransforms;
+    if head_tail < 1.0e-6 && !(full_bbone && use_bbone_shape) {
         return Ok(matrix);
     }
     let bone = target_node
@@ -316,134 +332,41 @@ fn constraint_target_bone_matrix_for_id(
                 json!({"constraint_id":constraint.id,"target_bone":bone_id}),
             )
         })?;
-    let bbone_segments = bone
-        .bbone_settings
-        .get("bbone_segments")
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-    if use_bbone_shape && bbone_segments > 1 && (1.0e-6..1.0 - 1.0e-6).contains(&head_tail) {
-        return Err(PotError::with_details(
-            ErrorCode::UnsupportedFeature,
-            "constraint target sampling along a segmented B-Bone shape is not evaluated",
-            json!({
-                "feature_id":"constraint.target_bbone_shape",
-                "constraint_id":constraint.id,
-                "target_bone":bone_id,
-                "bbone_segments":bbone_segments,
-                "head_tail":head_tail
-            }),
-        ));
-    }
-    let length = DVec3::from_array(bone.tail).distance(DVec3::from_array(bone.head));
-    let offset = DVec3::Y * (length * head_tail);
-    matrix.w_axis = matrix.transform_point3(offset).extend(1.0);
-    Ok(matrix)
-}
-fn armature_constraint_bbone_gate(doc: &SceneDoc, constraint: &Constraint) -> Result<()> {
-    let target_items = constraint.params.get("targets").and_then(Value::as_array);
-    let target_count = target_items.map_or(usize::from(constraint.target.is_some()), Vec::len);
-    let primary_target = constraint.target.as_ref().map(Id::as_str);
-    let primary_subtarget = constraint.subtarget.as_ref().map(Id::as_str);
-    for index in 0..target_count {
-        let target_item = target_items.and_then(|items| items.get(index));
-        let weight = target_item
-            .and_then(|item| item.get("weight"))
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-        if weight == 0.0 {
-            continue;
-        }
-        let target_text = target_item
-            .and_then(|item| item.get("target"))
-            .and_then(Value::as_str)
-            .or(primary_target);
-        let subtarget = target_item
-            .and_then(|item| item.get("subtarget"))
-            .and_then(Value::as_str)
-            .or(primary_subtarget);
-        let (Some(target_text), Some(subtarget)) = (target_text, subtarget) else {
-            continue;
-        };
-        let Some(target_id) = Id::new(target_text.to_owned()).ok() else {
-            continue;
-        };
-        let Some(armature) = doc
-            .nodes
-            .get(&target_id)
-            .and_then(|node| node.data.as_ref())
-            .and_then(|data_id| doc.data_blocks.get(data_id))
-            .and_then(|data| data.armature.as_ref())
-        else {
-            continue;
-        };
-        let bone = Id::new(subtarget.to_owned())
-            .ok()
-            .and_then(|bone_id| armature.bones.get(&bone_id))
-            .or_else(|| armature.bones.values().find(|bone| bone.name == subtarget));
-        let Some(bone) = bone else {
-            continue;
-        };
-        let bbone_segments = bone
-            .bbone_settings
-            .get("bbone_segments")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        if bbone_segments > 1 {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                "Armature constraint B-Bone segment deformation is not evaluated",
-                json!({
-                    "feature_id":"rig.bbone.segments",
-                    "constraint_id":constraint.id,
-                    "target":target_text,
-                    "target_bone":subtarget,
-                    "bbone_segments":bbone_segments
-                }),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn armature_envelope_weight(
-    point: DVec3,
-    bone_head: [f64; 3],
-    bone_tail: [f64; 3],
-    head_radius: f64,
-    tail_radius: f64,
-    falloff_distance: f64,
-) -> f64 {
-    let head = DVec3::from_array(bone_head);
-    let tail = DVec3::from_array(bone_tail);
-    let axis = tail - head;
-    let bone_length = axis.length();
-    let bone_axis = if bone_length > 0.0 {
-        axis / bone_length
-    } else {
-        DVec3::ZERO
-    };
-    let height = (point - head).dot(bone_axis);
-    let (distance_squared, closest_radius) = if height < 0.0 {
-        (point.distance_squared(head), head_radius)
-    } else if height > bone_length {
-        (point.distance_squared(tail), tail_radius)
-    } else {
-        let radius = if bone_length > 0.0 {
-            head_radius + (tail_radius - head_radius) * (height / bone_length)
+    let segments = bbone_segments(bone_id, bone)?;
+    let is_bbone = use_bbone_shape && segments > 1;
+    if is_bbone {
+        let matrices = bbone_pose
+            .and_then(|matrices| matrices.get(bone_id))
+            .ok_or_else(|| {
+                evaluation_error_with(
+                    "constraint target B-Bone segment matrices are unavailable",
+                    json!({"constraint_id":constraint.id,"target_bone":bone_id}),
+                )
+            })?;
+        let pre_blend = head_tail.clamp(0.0, 1.0) * matrices.segments as f64;
+        let index = (pre_blend.floor() as usize).min(matrices.segments - 1);
+        let blend = (pre_blend - index as f64).clamp(0.0, 1.0);
+        if full_bbone {
+            let segment = interpolate_bbone_segment_matrix(
+                matrices.pose_matrices[index],
+                matrices.pose_matrices[index + 1],
+                blend,
+            )?;
+            matrix = armature_world * matrices.bone_pose * segment;
         } else {
-            head_radius
-        };
-        (
-            (point.distance_squared(head) - height * height).max(0.0),
-            radius,
-        )
-    };
-    if falloff_distance == 0.0 || distance_squared >= (closest_radius + falloff_distance).powi(2) {
-        return 0.0;
+            let location = matrices.pose_matrices[index]
+                .w_axis
+                .truncate()
+                .lerp(matrices.pose_matrices[index + 1].w_axis.truncate(), blend);
+            let local = matrices.bone_pose.transform_point3(location);
+            matrix.w_axis = armature_world.transform_point3(local).extend(1.0);
+        }
+    } else {
+        let length = DVec3::from_array(bone.tail).distance(DVec3::from_array(bone.head));
+        let offset = DVec3::Y * (length * head_tail);
+        matrix.w_axis = matrix.transform_point3(offset).extend(1.0);
     }
-    let distance_from_envelope = distance_squared.sqrt() - closest_radius;
-    1.0 - distance_from_envelope.powi(2) / falloff_distance.powi(2)
+    Ok(matrix)
 }
 
 fn armature_constraint_has_zero_envelope_weight(
@@ -457,9 +380,10 @@ fn armature_constraint_has_zero_envelope_weight(
     if !param_bool(&constraint.params, "use_bone_envelopes", false)? {
         return Ok(false);
     }
-    let Some(targets) = constraint.params.get("targets").and_then(Value::as_array) else {
+    let targets = armature_constraint_target_specs(doc, constraint)?;
+    if targets.is_empty() {
         return Ok(true);
-    };
+    }
     let owner_point_world = if param_bool(&constraint.params, "use_current_location", false)? {
         source.w_axis.truncate()
     } else if let Some(owner_bone_id) = &constraint.owner_bone {
@@ -477,63 +401,355 @@ fn armature_constraint_has_zero_envelope_weight(
     } else {
         source.w_axis.truncate()
     };
-    for target in targets {
-        let target_weight = target
-            .get("weight")
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
-        if target_weight == 0.0 {
-            continue;
-        }
-        let Some(target_name) = target.get("target").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(subtarget) = target.get("subtarget").and_then(Value::as_str) else {
-            continue;
-        };
-        let Ok(target_id) = Id::new(target_name.to_owned()) else {
-            continue;
-        };
-        let Some(target_node) = doc.nodes.get(&target_id) else {
-            continue;
-        };
-        let Some(armature) = target_node
+    for target in &targets {
+        let target_node = doc.nodes.get(&target.target_id).ok_or_else(|| {
+            evaluation_error_with(
+                "Armature constraint target does not exist",
+                json!({"constraint_id":constraint.id,"target":target.target_id}),
+            )
+        })?;
+        let bone = target_node
             .data
             .as_ref()
             .and_then(|data_id| doc.data_blocks.get(data_id))
             .and_then(|data| data.armature.as_ref())
-        else {
-            continue;
+            .and_then(|armature| armature.bones.get(&target.bone_id))
+            .ok_or_else(|| {
+                evaluation_error_with(
+                    "Armature constraint target bone is unavailable",
+                    json!({"constraint_id":constraint.id,"target":target.target_id,"bone":target.bone_id}),
+                )
+            })?;
+        let target_world = if owner_node_id == Some(&target.target_id) {
+            owner_world
+        } else {
+            world_matrices
+                .get(&target.target_id)
+                .copied()
+                .ok_or_else(|| {
+                    evaluation_error_with(
+                        "Armature constraint target transform is unavailable",
+                        json!({"constraint_id":constraint.id,"target":target.target_id}),
+                    )
+                })?
         };
-        let target_bone = Id::new(subtarget.to_owned())
-            .ok()
-            .and_then(|bone_id| armature.bones.get(&bone_id))
-            .or_else(|| armature.bones.values().find(|bone| bone.name == subtarget));
-        let Some(target_bone) = target_bone else {
-            continue;
-        };
-        let target_world = world_matrices.get(&target_id).copied().ok_or_else(|| {
-            evaluation_error_with(
-                "Armature constraint target transform is unavailable",
-                json!({"constraint_id":constraint.id,"target":target_id}),
-            )
-        })?;
         let target_local_point = checked_inverse(target_world, "Armature constraint target")?
             .transform_point3(owner_point_world);
-        let envelope_weight = armature_envelope_weight(
-            target_local_point,
-            target_bone.head,
-            target_bone.tail,
-            target_bone.head_radius,
-            target_bone.tail_radius,
-            target_bone.envelope_distance,
-        );
-        if target_weight * envelope_weight > 0.0 {
+        if target.weight * envelope_factor(bone, target_local_point) > 0.0 {
             return Ok(false);
         }
     }
     Ok(true)
+}
+fn armature_constraint_target_specs(
+    doc: &SceneDoc,
+    constraint: &Constraint,
+) -> Result<Vec<ArmatureConstraintTarget>> {
+    let items = constraint.params.get("targets").and_then(Value::as_array);
+    let count = items.map_or(usize::from(constraint.target.is_some()), Vec::len);
+    let primary_target = constraint.target.as_ref().map(Id::as_str);
+    let primary_subtarget = constraint.subtarget.as_ref().map(Id::as_str);
+    let mut specs = Vec::with_capacity(count);
+    for index in 0..count {
+        let item = items.and_then(|items| items.get(index));
+        let weight = item
+            .and_then(|item| item.get("weight"))
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        if weight <= 0.0 {
+            continue;
+        }
+        let Some(target_text) = item
+            .and_then(|item| item.get("target"))
+            .and_then(Value::as_str)
+            .or(primary_target)
+        else {
+            continue;
+        };
+        let Some(subtarget) = item
+            .and_then(|item| item.get("subtarget"))
+            .and_then(Value::as_str)
+            .or(primary_subtarget)
+        else {
+            continue;
+        };
+        let target_id = Id::new(target_text.to_owned()).map_err(|error| {
+            evaluation_error_with(
+                "Armature constraint target ID is invalid",
+                json!({"constraint_id":constraint.id,"reason":error.message}),
+            )
+        })?;
+        let armature = doc
+            .nodes
+            .get(&target_id)
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|data| data.armature.as_ref())
+            .ok_or_else(|| {
+                evaluation_error_with(
+                    "Armature constraint target is not an armature",
+                    json!({"constraint_id":constraint.id,"target":target_id}),
+                )
+            })?;
+        let bone_id = Id::new(subtarget.to_owned())
+            .ok()
+            .filter(|bone_id| armature.bones.contains_key(bone_id))
+            .or_else(|| {
+                armature
+                    .bones
+                    .iter()
+                    .find(|(_, bone)| bone.name == subtarget)
+                    .map(|(bone_id, _)| bone_id.clone())
+            })
+            .ok_or_else(|| {
+                evaluation_error_with(
+                    "Armature constraint target bone does not exist",
+                    json!({"constraint_id":constraint.id,"target":target_id,"bone":subtarget}),
+                )
+            })?;
+        specs.push(ArmatureConstraintTarget {
+            target_id,
+            bone_id,
+            weight,
+        });
+    }
+    Ok(specs)
+}
+
+fn evaluate_armature_constraint_targets(
+    constraint: &Constraint,
+    context: &mut ArmatureConstraintEvaluationContext<'_>,
+) -> Result<Option<ArmatureConstraintTargets>> {
+    let specs = armature_constraint_target_specs(context.doc, constraint)?;
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut bones_by_armature: BTreeMap<Id, BTreeSet<Id>> = BTreeMap::new();
+    let mut has_segmented_target = false;
+    for spec in &specs {
+        let bone = context
+            .doc
+            .nodes
+            .get(&spec.target_id)
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| context.doc.data_blocks.get(data_id))
+            .and_then(|data| data.armature.as_ref())
+            .and_then(|armature| armature.bones.get(&spec.bone_id))
+            .ok_or_else(|| evaluation_error("Armature constraint target bone is unavailable"))?;
+        has_segmented_target |= bbone_segments(&spec.bone_id, bone)? > 1;
+        bones_by_armature
+            .entry(spec.target_id.clone())
+            .or_default()
+            .insert(spec.bone_id.clone());
+    }
+    if !has_segmented_target {
+        return Ok(None);
+    }
+    let preserve_volume = param_bool(&constraint.params, "use_deform_preserve_volume", false)?;
+    let mut by_armature = BTreeMap::new();
+    for (target_id, target_bones) in bones_by_armature {
+        let target_bones = target_bones.into_iter().collect::<Vec<_>>();
+        let (bone_matrices, bbone_segments) = if target_id == *context.owner_node_id
+            && let Some((armature, pose, bones)) = context.current_armature
+        {
+            let segments = build_bbone_segment_matrices(
+                armature,
+                pose,
+                bones,
+                None,
+                false,
+                preserve_volume,
+                Some(&target_bones),
+            )?;
+            (
+                target_bones
+                    .iter()
+                    .filter_map(|bone_id| {
+                        bones
+                            .get(bone_id)
+                            .copied()
+                            .map(|matrices| (bone_id.clone(), matrices))
+                    })
+                    .collect(),
+                segments,
+            )
+        } else {
+            let target_world = if target_id == *context.owner_node_id {
+                context.owner_world
+            } else {
+                context
+                    .world_matrices
+                    .get(&target_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        evaluation_error_with(
+                            "Armature constraint target transform is unavailable",
+                            json!({"constraint_id":constraint.id,"target":target_id}),
+                        )
+                    })?
+            };
+            let evaluated = evaluate_armature_bone_world_and_pose_matrices_with_meshes(
+                context.doc,
+                &target_id,
+                context.frame,
+                target_world,
+                context.world_matrices,
+                context.driver_values,
+                context.project_root,
+                context.fps,
+                context.fps_base,
+                context.evaluated_meshes,
+                context.session,
+                false,
+                None,
+                Some(&target_bones),
+                preserve_volume,
+            )?;
+            (
+                evaluated.bone_matrices.unwrap_or_default(),
+                evaluated.bbone_segments.unwrap_or_default(),
+            )
+        };
+        by_armature.insert(
+            target_id,
+            ArmatureConstraintTargetMatrices {
+                bone_matrices,
+                bbone_segments,
+            },
+        );
+    }
+    Ok(Some(ArmatureConstraintTargets {
+        specs,
+        by_armature,
+        preserve_volume,
+    }))
+}
+
+fn armature_constraint_bbone_transform(
+    source: DMat4,
+    constraint: &Constraint,
+    doc: &SceneDoc,
+    world_matrices: &BTreeMap<Id, DMat4>,
+    owner_space_node_id: &Id,
+    owner_world: DMat4,
+    targets: Option<&ArmatureConstraintTargets>,
+) -> Result<Option<DMat4>> {
+    let Some(targets) = targets else {
+        return Ok(None);
+    };
+    let owner_point_world = if param_bool(&constraint.params, "use_current_location", false)? {
+        source.w_axis.truncate()
+    } else if let Some(owner_bone_id) = &constraint.owner_bone {
+        let owner_bone = doc
+            .nodes
+            .get(owner_space_node_id)
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|data| data.armature.as_ref())
+            .and_then(|armature| armature.bones.get(owner_bone_id))
+            .ok_or_else(|| evaluation_error("Armature constraint owner bone is missing"))?;
+        owner_world.transform_point3(DVec3::from_array(owner_bone.head))
+    } else {
+        source.w_axis.truncate()
+    };
+    let use_envelopes = param_bool(&constraint.params, "use_bone_envelopes", false)?;
+    let mut matrix_sum = DMat4::ZERO;
+    let mut dual_quat_sum = DualQuatMatrixSum::default();
+    let mut total_weight = 0.0;
+    for target in &targets.specs {
+        let data = targets.by_armature.get(&target.target_id).ok_or_else(|| {
+            evaluation_error_with(
+                "Armature constraint target matrices are unavailable",
+                json!({"constraint_id":constraint.id,"target":target.target_id}),
+            )
+        })?;
+        let bone = doc
+            .nodes
+            .get(&target.target_id)
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|data| data.armature.as_ref())
+            .and_then(|armature| armature.bones.get(&target.bone_id))
+            .ok_or_else(|| {
+                evaluation_error_with(
+                    "Armature constraint target bone is unavailable",
+                    json!({"constraint_id":constraint.id,"target":target.target_id,"bone":target.bone_id}),
+                )
+            })?;
+        let mut weight = target.weight;
+        let envelope_multiply =
+            bbone_setting_bool(&target.bone_id, bone, "use_envelope_multiply", false)?;
+        let target_world = if target.target_id == *owner_space_node_id {
+            owner_world
+        } else {
+            world_matrices
+                .get(&target.target_id)
+                .copied()
+                .ok_or_else(|| {
+                    evaluation_error_with(
+                        "Armature constraint target transform is unavailable",
+                        json!({"constraint_id":constraint.id,"target":target.target_id}),
+                    )
+                })?
+        };
+        let target_inverse = checked_inverse(target_world, "Armature constraint target")?;
+        let target_point = target_inverse.transform_point3(owner_point_world);
+        if use_envelopes || envelope_multiply {
+            weight *= envelope_factor(bone, target_point);
+        }
+        if weight <= 0.0 {
+            continue;
+        }
+        if let Some(segments) = data.bbone_segments.get(&target.bone_id) {
+            let (index, blend) = segments.segment_index(target_point)?;
+            let deformation = segments.deform.as_ref().ok_or_else(|| {
+                evaluation_error("Armature constraint B-Bone deformation matrices are missing")
+            })?;
+            if targets.preserve_volume {
+                let rest = segments.segment_rests.as_ref().ok_or_else(|| {
+                    evaluation_error("Armature constraint B-Bone rest matrices are missing")
+                })?;
+                for (segment_index, segment_weight) in [(index, 1.0 - blend), (index + 1, blend)] {
+                    let segment_skin = target_world * deformation[segment_index] * target_inverse;
+                    let segment_rest = target_world * rest[segment_index];
+                    let dual_quat = BoneDualQuat::new(segment_rest, segment_skin);
+                    dual_quat_sum.add(&dual_quat, owner_point_world, weight * segment_weight);
+                }
+            } else {
+                for (segment_index, segment_weight) in [(index, 1.0 - blend), (index + 1, blend)] {
+                    let segment_skin = target_world * deformation[segment_index] * target_inverse;
+                    matrix_sum += segment_skin * (weight * segment_weight);
+                }
+            }
+        } else {
+            let matrices = data.bone_matrices.get(&target.bone_id).ok_or_else(|| {
+                evaluation_error_with(
+                    "Armature constraint bone matrices are missing",
+                    json!({"constraint_id":constraint.id,"target":target.target_id,"bone":target.bone_id}),
+                )
+            })?;
+            if targets.preserve_volume {
+                let rest = target_world * matrices.rest;
+                let skin = target_world * matrices.skin * target_inverse;
+                let dual_quat = BoneDualQuat::new(rest, skin);
+                dual_quat_sum.add(&dual_quat, owner_point_world, weight);
+            } else {
+                let skin = target_world * matrices.skin * target_inverse;
+                matrix_sum += skin * weight;
+            }
+        }
+        total_weight += weight;
+    }
+    if total_weight <= 0.0 {
+        return Ok(None);
+    }
+    let deformation = if targets.preserve_volume {
+        dual_quat_sum.matrix(total_weight)
+    } else {
+        matrix_sum * (1.0 / total_weight)
+    };
+    Ok(Some(deformation * source))
 }
 
 /// Evaluate an armature node's posed bones and return each bone's world-space head matrix.
@@ -615,6 +831,9 @@ pub(crate) fn evaluate_armature_bone_world_and_pose_matrices_with_resources(
         None,
         session,
         true,
+        None,
+        None,
+        false,
     )
 }
 
@@ -672,6 +891,9 @@ pub(crate) fn evaluate_armature_bone_world_and_pose_matrices_with_evaluated_mesh
         Some(evaluated_meshes),
         session,
         true,
+        None,
+        None,
+        false,
     )
 }
 
@@ -688,6 +910,9 @@ fn evaluate_armature_bone_world_and_pose_matrices_with_meshes(
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
     session: &mut EvaluationSession,
     include_pose: bool,
+    bbone_pose_bones: Option<&[Id]>,
+    bbone_segment_bones: Option<&[Id]>,
+    preserve_volume: bool,
 ) -> Result<EvaluatedArmatureBoneMatrices> {
     let node = doc.nodes.get(armature_node_id).ok_or_else(|| {
         evaluation_error_with(
@@ -757,7 +982,7 @@ fn evaluate_armature_bone_world_and_pose_matrices_with_meshes(
     )?;
     let mut pose_matrices = include_pose.then(BTreeMap::new);
     let mut world = BTreeMap::new();
-    for (bone_id, matrices) in bones {
+    for (bone_id, matrices) in &bones {
         let pose_matrix = matrices.pose;
         let world_matrix = armature_world * pose_matrix;
         if !finite_matrix(world_matrix) {
@@ -769,11 +994,45 @@ fn evaluate_armature_bone_world_and_pose_matrices_with_meshes(
         if let Some(pose_matrices) = &mut pose_matrices {
             pose_matrices.insert(bone_id.clone(), pose_matrix);
         }
-        world.insert(bone_id, world_matrix);
+        world.insert(bone_id.clone(), world_matrix);
     }
+    let bbone_pose = bbone_pose_bones
+        .map(|target_bones| build_bbone_pose_matrices(armature, &pose, &bones, target_bones))
+        .transpose()?;
+    let bbone_segments = bbone_segment_bones
+        .map(|target_bones| {
+            build_bbone_segment_matrices(
+                armature,
+                &pose,
+                &bones,
+                None,
+                false,
+                preserve_volume,
+                Some(target_bones),
+            )
+        })
+        .transpose()?;
+    let bone_matrices = if let Some(target_bone_ids) = bbone_segment_bones {
+        let mut selected = BTreeMap::new();
+        for bone_id in target_bone_ids {
+            let matrices = bones.get(bone_id).copied().ok_or_else(|| {
+                evaluation_error_with(
+                    "Armature constraint bone matrices are missing",
+                    json!({"node":armature_node_id,"bone_id":bone_id}),
+                )
+            })?;
+            selected.insert(bone_id.clone(), matrices);
+        }
+        Some(selected)
+    } else {
+        None
+    };
     Ok(EvaluatedArmatureBoneMatrices {
         world,
         pose: pose_matrices,
+        bbone_pose,
+        bone_matrices,
+        bbone_segments,
     })
 }
 
@@ -802,6 +1061,9 @@ fn evaluate_armature_bone_world_matrices_with_meshes(
         fps_base,
         evaluated_meshes,
         session,
+        false,
+        None,
+        None,
         false,
     )?;
     Ok(matrices.world)
@@ -1177,6 +1439,28 @@ fn constraint_camera_target_id(constraint: &Constraint) -> Result<Option<Id>> {
     })
 }
 
+fn constraint_primary_armature_target(constraint: &Constraint) -> Result<Option<Id>> {
+    if constraint.constraint_type != ConstraintType::Armature || constraint.target.is_some() {
+        return Ok(None);
+    }
+    let Some(target) = constraint
+        .params
+        .get("targets")
+        .and_then(Value::as_array)
+        .and_then(|targets| targets.first())
+        .and_then(|target| target.get("target"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    Id::new(target.to_owned()).map(Some).map_err(|error| {
+        evaluation_error_with(
+            "Armature constraint target ID is invalid",
+            json!({"constraint_id":constraint.id,"reason":error.message}),
+        )
+    })
+}
+
 fn constraint_requires_target(constraint: &Constraint) -> bool {
     if constraint.constraint_type == ConstraintType::Action {
         return constraint
@@ -1254,8 +1538,36 @@ fn ik_target_matrices(
                 fps_base,
                 session,
             )?;
-            target_world =
-                constraint_target_bone_matrix(constraint, target_node, doc, target_world)?;
+            let target_bbone_pose = if constraint_bbone_shape_matrices_needed(constraint)? {
+                evaluate_armature_bone_world_and_pose_matrices_with_meshes(
+                    doc,
+                    target_id,
+                    frame,
+                    target_object_world,
+                    world_matrices,
+                    driver_values,
+                    project_root,
+                    fps,
+                    fps_base,
+                    None,
+                    session,
+                    false,
+                    Some(std::slice::from_ref(bone_id)),
+                    None,
+                    false,
+                )?
+                .bbone_pose
+            } else {
+                None
+            };
+            target_world = constraint_target_bone_matrix(
+                constraint,
+                target_node,
+                doc,
+                target_world,
+                target_object_world,
+                target_bbone_pose.as_ref(),
+            )?;
         }
         let target_space = string_param_default(&constraint.params, "target_space", "WORLD")?;
         let target_space_world = constraint_space_world_matrix(
@@ -1335,12 +1647,36 @@ fn ik_target_matrices(
                         fps_base,
                         session,
                     )?;
+                    let pole_bbone_pose = if constraint_bbone_shape_matrices_needed(constraint)? {
+                        evaluate_armature_bone_world_and_pose_matrices_with_meshes(
+                            doc,
+                            &pole_id,
+                            frame,
+                            pole_object_world,
+                            world_matrices,
+                            driver_values,
+                            project_root,
+                            fps,
+                            fps_base,
+                            None,
+                            session,
+                            false,
+                            Some(std::slice::from_ref(pole_bone_id)),
+                            None,
+                            false,
+                        )?
+                        .bbone_pose
+                    } else {
+                        None
+                    };
                     constraint_target_bone_matrix_for_id(
                         constraint,
                         pole_node,
                         doc,
                         pole_world,
                         Some(pole_bone_id),
+                        pole_object_world,
+                        pole_bbone_pose.as_ref(),
                     )?
                 } else {
                     pole_object_world
@@ -1443,6 +1779,7 @@ fn ik_target_bone_matrix(
 fn apply_pose_bone_constraints(
     armature_node_id: &Id,
     armature: &ArmatureData,
+    pose: &BTreeMap<Id, PoseBone>,
     constraints: &[Constraint],
     doc: &SceneDoc,
     frame: f64,
@@ -1534,9 +1871,29 @@ fn apply_pose_bone_constraints(
             let constraint_target_id = constraint
                 .target
                 .clone()
+                .or(constraint_primary_armature_target(constraint)?)
                 .or(constraint_camera_target_id(constraint)?);
             let legacy_space = constraint.constraint_type == ConstraintType::TransformCache;
             let mut target_bone_pose_matrices = None;
+            let armature_targets = if constraint.constraint_type == ConstraintType::Armature {
+                let mut context = ArmatureConstraintEvaluationContext {
+                    doc,
+                    owner_node_id: armature_node_id,
+                    owner_world: armature_world,
+                    world_matrices: target_worlds,
+                    frame,
+                    driver_values,
+                    project_root,
+                    fps,
+                    fps_base,
+                    evaluated_meshes,
+                    session,
+                    current_armature: Some((armature, pose, &*matrices)),
+                };
+                evaluate_armature_constraint_targets(constraint, &mut context)?
+            } else {
+                None
+            };
             let target_matrix = if constraint.constraint_type == ConstraintType::TransformCache {
                 let Some(matrix) = transform_cache_matrix(
                     doc,
@@ -1551,8 +1908,10 @@ fn apply_pose_bone_constraints(
                     continue;
                 };
                 matrix
+            } else if armature_targets.is_some() {
+                DMat4::IDENTITY
             } else if let Some(target_id) = &constraint_target_id {
-                let target_world = if target_id == armature_node_id {
+                let target_armature_world = if target_id == armature_node_id {
                     armature_world
                 } else {
                     target_worlds.get(target_id).copied().ok_or_else(|| {
@@ -1562,9 +1921,18 @@ fn apply_pose_bone_constraints(
                         )
                     })?
                 };
+                let mut target_bbone_pose = None;
                 let target_world =
                     if let Some(target_bone_id) = &constraint.subtarget {
                         if target_id == armature_node_id {
+                            if constraint_bbone_shape_matrices_needed(constraint)? {
+                                target_bbone_pose = Some(build_bbone_pose_matrices(
+                                    armature,
+                                    pose,
+                                    matrices,
+                                    std::slice::from_ref(target_bone_id),
+                                )?);
+                            }
                             armature_world
                                 * matrices
                                     .get(target_bone_id)
@@ -1578,12 +1946,15 @@ fn apply_pose_bone_constraints(
                                 string_param_default(&constraint.params, "target_space", "WORLD")?;
                             let include_target_pose =
                                 matches!(target_space, "LOCAL" | "LOCAL_OWNER_ORIENT");
+                            let target_pose_bone_ids =
+                                constraint_bbone_shape_matrices_needed(constraint)?
+                                    .then(|| [target_bone_id.clone()]);
                             let target_bones =
                                 evaluate_armature_bone_world_and_pose_matrices_with_meshes(
                                     doc,
                                     target_id,
                                     frame,
-                                    target_world,
+                                    target_armature_world,
                                     target_worlds,
                                     driver_values,
                                     project_root,
@@ -1592,16 +1963,20 @@ fn apply_pose_bone_constraints(
                                     evaluated_meshes,
                                     session,
                                     include_target_pose,
+                                    target_pose_bone_ids.as_ref().map(<[Id; 1]>::as_slice),
+                                    None,
+                                    false,
                                 )?;
                             let bone_world =
                                 target_bones.world.get(target_bone_id).copied().ok_or_else(
                                     || evaluation_error("pose constraint target bone is missing"),
                                 )?;
                             target_bone_pose_matrices = target_bones.pose;
+                            target_bbone_pose = target_bones.bbone_pose;
                             bone_world
                         }
                     } else {
-                        target_world
+                        target_armature_world
                     };
                 let target_node = doc.nodes.get(target_id).ok_or_else(|| {
                     evaluation_error_with(
@@ -1609,8 +1984,14 @@ fn apply_pose_bone_constraints(
                         json!({"target":target_id,"constraint_id":constraint.id}),
                     )
                 })?;
-                let target_world =
-                    constraint_target_bone_matrix(constraint, target_node, doc, target_world)?;
+                let target_world = constraint_target_bone_matrix(
+                    constraint,
+                    target_node,
+                    doc,
+                    target_world,
+                    target_armature_world,
+                    target_bbone_pose.as_ref(),
+                )?;
                 if legacy_space && target_id != armature_node_id {
                     armature_inverse * target_world
                 } else {
@@ -1647,6 +2028,7 @@ fn apply_pose_bone_constraints(
                 armature_world,
                 Some(matrices),
                 target_bone_pose_matrices.as_ref(),
+                armature_targets.as_ref(),
                 Some(constraint_world_to_owner),
             )?;
             let mut constrained_pose = if legacy_space {
@@ -1781,6 +2163,7 @@ fn evaluate_pose_matrices(
     apply_pose_bone_constraints(
         armature_node_id,
         armature,
+        &result_pose,
         constraints,
         doc,
         frame,
@@ -2572,7 +2955,7 @@ struct BboneSplineParameters {
     curve_out_z: f64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct BboneBoundary {
     point: DVec3,
     normal: DVec3,
@@ -2580,15 +2963,64 @@ struct BboneBoundary {
     depth_scale: f64,
 }
 
-struct BboneSegmentMatrices {
+#[derive(Debug)]
+pub(crate) struct BbonePoseMatrices {
+    segments: usize,
+    bone_pose: DMat4,
+    pose_matrices: Vec<DMat4>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BboneSegmentMatrices {
     segments: usize,
     length: f64,
     inverse_rest: DMat4,
     deform: Option<Vec<DMat4>>,
     dual_quats: Option<Vec<BoneDualQuat>>,
+    segment_rests: Option<Vec<DMat4>>,
     curved: bool,
     boundaries: Vec<BboneBoundary>,
     arc_length_reciprocal: f64,
+}
+
+#[derive(Clone)]
+struct ArmatureConstraintTarget {
+    target_id: Id,
+    bone_id: Id,
+    weight: f64,
+}
+
+#[derive(Default)]
+struct ArmatureConstraintTargetMatrices {
+    bone_matrices: BTreeMap<Id, BoneMatrices>,
+    bbone_segments: BTreeMap<Id, BboneSegmentMatrices>,
+}
+
+struct ArmatureConstraintTargets {
+    specs: Vec<ArmatureConstraintTarget>,
+    by_armature: BTreeMap<Id, ArmatureConstraintTargetMatrices>,
+    preserve_volume: bool,
+}
+
+type CurrentArmatureMatrices<'a> = (
+    &'a ArmatureData,
+    &'a BTreeMap<Id, PoseBone>,
+    &'a BTreeMap<Id, BoneMatrices>,
+);
+
+struct ArmatureConstraintEvaluationContext<'a> {
+    doc: &'a SceneDoc,
+    owner_node_id: &'a Id,
+    owner_world: DMat4,
+    world_matrices: &'a BTreeMap<Id, DMat4>,
+    frame: f64,
+    driver_values: &'a BTreeMap<(Id, String, u32), f64>,
+    project_root: Option<&'a Path>,
+    fps: u32,
+    fps_base: f64,
+    evaluated_meshes: Option<&'a BTreeMap<Id, Mesh>>,
+    session: &'a mut EvaluationSession,
+    current_armature: Option<CurrentArmatureMatrices<'a>>,
 }
 
 fn bbone_setting_error(bone_id: &Id, key: &str) -> PotError {
@@ -3155,6 +3587,114 @@ fn bbone_rotation_matrix(axis: DVec3, roll: f64) -> Result<DMat3> {
     };
     Ok(DMat3::from_quat(DQuat::from_axis_angle(normal, roll)) * base)
 }
+fn polar_decompose_bbone_basis(matrix: DMat3) -> Result<(DMat3, DMat3)> {
+    let gram = matrix.transpose() * matrix;
+    let columns = gram.to_cols_array();
+    let mut values = [
+        [columns[0], columns[3], columns[6]],
+        [columns[1], columns[4], columns[7]],
+        [columns[2], columns[5], columns[8]],
+    ];
+    let mut vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..32 {
+        let mut pivot = (0, 1);
+        let mut largest = values[0][1].abs();
+        for (row, column) in [(0, 2), (1, 2)] {
+            let magnitude = values[row][column].abs();
+            if magnitude > largest {
+                pivot = (row, column);
+                largest = magnitude;
+            }
+        }
+        if largest <= 1.0e-15 {
+            break;
+        }
+        let (first, second) = pivot;
+        let off_diagonal = values[first][second];
+        let tau = (values[second][second] - values[first][first]) / (2.0 * off_diagonal);
+        let tangent = tau.signum() / (tau.abs() + (1.0 + tau * tau).sqrt());
+        let cosine = 1.0 / (1.0 + tangent * tangent).sqrt();
+        let sine = tangent * cosine;
+        let first_diagonal = values[first][first];
+        let second_diagonal = values[second][second];
+        values[first][first] = first_diagonal - tangent * off_diagonal;
+        values[second][second] = second_diagonal + tangent * off_diagonal;
+        values[first][second] = 0.0;
+        values[second][first] = 0.0;
+        for index in [0, 1, 2] {
+            if index == first || index == second {
+                continue;
+            }
+            let first_value = values[index][first];
+            let second_value = values[index][second];
+            values[index][first] = cosine * first_value - sine * second_value;
+            values[first][index] = values[index][first];
+            values[index][second] = sine * first_value + cosine * second_value;
+            values[second][index] = values[index][second];
+        }
+        for row in &mut vectors {
+            let first_value = row[first];
+            let second_value = row[second];
+            row[first] = cosine * first_value - sine * second_value;
+            row[second] = sine * first_value + cosine * second_value;
+        }
+    }
+    let singular_values = DVec3::new(
+        values[0][0].max(0.0).sqrt(),
+        values[1][1].max(0.0).sqrt(),
+        values[2][2].max(0.0).sqrt(),
+    );
+    if !singular_values.is_finite() || singular_values.min_element() <= f64::EPSILON {
+        return Err(evaluation_error("B-Bone segment matrix is singular"));
+    }
+    let basis = DMat3::from_cols(
+        DVec3::new(vectors[0][0], vectors[1][0], vectors[2][0]),
+        DVec3::new(vectors[0][1], vectors[1][1], vectors[2][1]),
+        DVec3::new(vectors[0][2], vectors[1][2], vectors[2][2]),
+    );
+    let inverse_singular_values = DMat3::from_diagonal(DVec3::ONE / singular_values);
+    let mut rotation = matrix * basis * inverse_singular_values * basis.transpose();
+    let mut stretch = basis * DMat3::from_diagonal(singular_values) * basis.transpose();
+    if rotation.determinant() < 0.0 {
+        rotation = -rotation;
+        stretch = -stretch;
+    }
+    Ok((rotation, stretch))
+}
+
+fn interpolate_bbone_segment_matrix(first: DMat4, second: DMat4, factor: f64) -> Result<DMat4> {
+    let first_basis = DMat3::from_cols(
+        first.x_axis.truncate(),
+        first.y_axis.truncate(),
+        first.z_axis.truncate(),
+    );
+    let second_basis = DMat3::from_cols(
+        second.x_axis.truncate(),
+        second.y_axis.truncate(),
+        second.z_axis.truncate(),
+    );
+    let (first_rotation, first_stretch) = polar_decompose_bbone_basis(first_basis)?;
+    let (second_rotation, second_stretch) = polar_decompose_bbone_basis(second_basis)?;
+    let rotation = DQuat::from_mat3(&first_rotation)
+        .slerp(DQuat::from_mat3(&second_rotation), factor)
+        .normalize();
+    let stretch = DMat3::from_cols(
+        first_stretch.x_axis.lerp(second_stretch.x_axis, factor),
+        first_stretch.y_axis.lerp(second_stretch.y_axis, factor),
+        first_stretch.z_axis.lerp(second_stretch.z_axis, factor),
+    );
+    let basis = DMat3::from_quat(rotation) * stretch;
+    let position = first
+        .w_axis
+        .truncate()
+        .lerp(second.w_axis.truncate(), factor);
+    Ok(DMat4::from_cols(
+        basis.x_axis.extend(0.0),
+        basis.y_axis.extend(0.0),
+        basis.z_axis.extend(0.0),
+        position.extend(1.0),
+    ))
+}
 
 fn ease_bbone_handle_axis(first: DVec3, second: DVec3) -> DVec3 {
     let len2 = second.length_squared();
@@ -3326,6 +3866,41 @@ fn bbone_spline_matrices(param: &BboneSplineParameters) -> Result<Vec<DMat4>> {
 
 type GroupWeights<'a> = Option<(&'a [VertexGroup], &'a [HashMap<u32, f64>])>;
 
+fn build_bbone_pose_matrices(
+    armature: &ArmatureData,
+    pose: &BTreeMap<Id, PoseBone>,
+    bones: &BTreeMap<Id, BoneMatrices>,
+    target_bones: &[Id],
+) -> Result<BTreeMap<Id, BbonePoseMatrices>> {
+    let mut result = BTreeMap::new();
+    for bone_id in target_bones {
+        let bone = armature.bones.get(bone_id).ok_or_else(|| {
+            evaluation_error_with("B-Bone target bone is missing", json!({"bone_id":bone_id}))
+        })?;
+        let segments = bbone_segments(bone_id, bone)?;
+        if segments <= 1 || result.contains_key(bone_id) {
+            continue;
+        }
+        let bone_matrices = bones.get(bone_id).ok_or_else(|| {
+            evaluation_error_with(
+                "B-Bone target matrices are missing",
+                json!({"bone_id":bone_id}),
+            )
+        })?;
+        result.insert(
+            bone_id.clone(),
+            BbonePoseMatrices {
+                segments,
+                bone_pose: bone_matrices.pose,
+                pose_matrices: bbone_spline_matrices(&bbone_spline_parameters(
+                    armature, bone_id, bone, pose, bones, false,
+                )?)?,
+            },
+        );
+    }
+    Ok(result)
+}
+
 fn build_bbone_segment_matrices(
     armature: &ArmatureData,
     pose: &BTreeMap<Id, PoseBone>,
@@ -3333,15 +3908,24 @@ fn build_bbone_segment_matrices(
     group_weights: GroupWeights<'_>,
     use_envelopes: bool,
     preserve_volume: bool,
+    target_bones: Option<&[Id]>,
 ) -> Result<BTreeMap<Id, BboneSegmentMatrices>> {
     let mut result = BTreeMap::new();
-    for (bone_id, bone) in armature.bones.iter().filter(|(_, bone)| bone.deform) {
+    for (bone_id, bone) in &armature.bones {
+        let selected = target_bones.is_some_and(|targets| targets.contains(bone_id));
+        if target_bones.is_some() {
+            if !selected {
+                continue;
+            }
+        } else if !bone.deform {
+            continue;
+        }
         let group_contributes = group_weights.is_some_and(|(groups, weights)| {
             groups.iter().zip(weights).any(|(group, weights)| {
                 group.name == bone.name && weights.values().any(|weight| *weight > 0.0)
             })
         });
-        if !use_envelopes && !group_contributes {
+        if target_bones.is_none() && !use_envelopes && !group_contributes {
             continue;
         }
         let segments = bbone_segments(bone_id, bone)?;
@@ -3361,8 +3945,12 @@ fn build_bbone_segment_matrices(
             )
         })?;
         let inverse_rest = checked_inverse(bone_matrices.rest, "B-Bone rest matrix")?;
-        let mut deform = (!preserve_volume).then(|| Vec::with_capacity(segments + 1));
-        let mut dual_quats = preserve_volume.then(|| Vec::with_capacity(segments + 1));
+        let mut deform =
+            (!preserve_volume || target_bones.is_some()).then(|| Vec::with_capacity(segments + 1));
+        let mut dual_quats =
+            (preserve_volume && target_bones.is_none()).then(|| Vec::with_capacity(segments + 1));
+        let mut segment_rests =
+            (preserve_volume && target_bones.is_some()).then(|| Vec::with_capacity(segments + 1));
         for index in 0..=segments {
             let inverse_segment_rest =
                 checked_inverse(rest_matrices[index], "B-Bone segment rest")?;
@@ -3377,12 +3965,17 @@ fn build_bbone_segment_matrices(
                     json!({"bone_id":bone_id,"segment":index}),
                 ));
             }
-            if let Some(dual_quats) = &mut dual_quats {
+            if preserve_volume {
                 let segment_rest = normalize_matrix_axes(
                     bone_matrices.rest * rest_matrices[index],
                     "B-Bone segment rest matrix",
                 )?;
-                dual_quats.push(BoneDualQuat::new(segment_rest, deformation));
+                if let Some(dual_quats) = &mut dual_quats {
+                    dual_quats.push(BoneDualQuat::new(segment_rest, deformation));
+                }
+                if let Some(segment_rests) = &mut segment_rests {
+                    segment_rests.push(segment_rest);
+                }
             }
             if let Some(deform) = &mut deform {
                 deform.push(deformation);
@@ -3445,6 +4038,7 @@ fn build_bbone_segment_matrices(
                 segments,
                 length: DVec3::from_array(bone.tail).distance(DVec3::from_array(bone.head)),
                 inverse_rest,
+                segment_rests,
                 deform,
                 dual_quats,
                 curved,
@@ -3620,6 +4214,7 @@ pub(crate) fn apply_armature_skinning(
             group_weights,
             use_envelopes,
             preserve_volume,
+            None,
         )?
     } else {
         BTreeMap::new()
@@ -3942,7 +4537,7 @@ fn mix_armature_point(
 /// Blender's `DualQuat` for one bone (`mat4_to_dquat`): rotation and translation as `quat` and
 /// `trans` in (w, x, y, z) order, plus the rest-space scale matrix when the pose has scale or
 /// shear.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct BoneDualQuat {
     quat: [f64; 4],
     trans: [f64; 4],
@@ -4078,6 +4673,56 @@ impl DualQuatSum {
             2.0 * (-t0 * z + x * t2 + w * t3 - t1 * y),
         );
         (rotation * point + translation) * inverse_norm
+    }
+
+    fn matrix(&self, total: f64) -> DMat4 {
+        let origin = self.transform(DVec3::ZERO, total);
+        DMat4::from_cols(
+            (self.transform(DVec3::X, total) - origin).extend(0.0),
+            (self.transform(DVec3::Y, total) - origin).extend(0.0),
+            (self.transform(DVec3::Z, total) - origin).extend(0.0),
+            origin.extend(1.0),
+        )
+    }
+}
+
+struct DualQuatMatrixSum {
+    rigid: DualQuatSum,
+    scale: DMat4,
+    scale_weight: f64,
+}
+
+impl Default for DualQuatMatrixSum {
+    fn default() -> Self {
+        Self {
+            rigid: DualQuatSum::default(),
+            scale: DMat4::ZERO,
+            scale_weight: 0.0,
+        }
+    }
+}
+
+impl DualQuatMatrixSum {
+    /// Blender `add_weighted_dq_dq_pivot` with `compute_scale_matrix = true`.
+    fn add(&mut self, bone: &BoneDualQuat, pivot: DVec3, weight: f64) {
+        self.rigid.add(bone, pivot, weight);
+        if let Some(mut scale) = bone.scale {
+            let pivot_offset = scale.transform_point3(pivot) - pivot;
+            scale.w_axis -= pivot_offset.extend(0.0);
+            self.scale += scale * weight;
+            self.scale_weight += weight;
+        }
+    }
+
+    /// Blender `normalize_dq` and `dquat_to_mat4` for the full-scale matrix blend.
+    fn matrix(&self, total: f64) -> DMat4 {
+        let mut matrix = self.rigid.matrix(total);
+        if self.scale_weight > 0.0 {
+            let missing_scale_weight = total - self.scale_weight;
+            let scale = self.scale + DMat4::IDENTITY * missing_scale_weight;
+            matrix *= scale * (1.0 / total);
+        }
+        matrix
     }
 }
 
@@ -4509,6 +5154,7 @@ fn evaluate_world_matrices_with_meshes(
             let target_id = constraint
                 .target
                 .clone()
+                .or(constraint_primary_armature_target(constraint)?)
                 .or(constraint_camera_target_id(constraint)?);
             if target_id.is_none() && constraint_requires_target(constraint) {
                 return Err(evaluation_error_with(
@@ -4614,6 +5260,25 @@ fn evaluate_world_matrices_with_meshes(
                 continue;
             }
             let mut target_bone_pose_matrices = None;
+            let armature_targets = if constraint.constraint_type == ConstraintType::Armature {
+                let mut context = ArmatureConstraintEvaluationContext {
+                    doc,
+                    owner_node_id: id,
+                    owner_world: world,
+                    world_matrices: output,
+                    frame,
+                    driver_values,
+                    project_root,
+                    fps,
+                    fps_base,
+                    evaluated_meshes,
+                    session,
+                    current_armature: None,
+                };
+                evaluate_armature_constraint_targets(constraint, &mut context)?
+            } else {
+                None
+            };
             let target_matrix = if constraint.constraint_type == ConstraintType::TransformCache {
                 let Some(matrix) = transform_cache_matrix(
                     doc,
@@ -4628,19 +5293,24 @@ fn evaluate_world_matrices_with_meshes(
                     continue;
                 };
                 matrix
+            } else if armature_targets.is_some() {
+                DMat4::IDENTITY
             } else if let (Some(target_id), Some(bone_id)) =
                 (target_id.as_ref(), constraint.subtarget.as_ref())
             {
                 let target_space =
                     string_param_default(&constraint.params, "target_space", "WORLD")?;
                 let include_target_pose = matches!(target_space, "LOCAL" | "LOCAL_OWNER_ORIENT");
+                let target_armature_world = target_world.ok_or_else(|| {
+                    evaluation_error("constraint target world transform is unavailable")
+                })?;
+                let target_pose_bone_ids =
+                    constraint_bbone_shape_matrices_needed(constraint)?.then(|| [bone_id.clone()]);
                 let target_bones = evaluate_armature_bone_world_and_pose_matrices_with_meshes(
                     doc,
                     target_id,
                     frame,
-                    target_world.ok_or_else(|| {
-                        evaluation_error("constraint target world transform is unavailable")
-                    })?,
+                    target_armature_world,
                     output,
                     driver_values,
                     project_root,
@@ -4649,6 +5319,9 @@ fn evaluate_world_matrices_with_meshes(
                     evaluated_meshes,
                     session,
                     include_target_pose,
+                    target_pose_bone_ids.as_ref().map(<[Id; 1]>::as_slice),
+                    None,
+                    false,
                 )?;
                 let bone_world = target_bones.world.get(bone_id).copied().ok_or_else(|| {
                     evaluation_error_with(
@@ -4663,7 +5336,14 @@ fn evaluate_world_matrices_with_meshes(
                         json!({"target": target_id}),
                     )
                 })?;
-                constraint_target_bone_matrix(constraint, target_node, doc, bone_world)?
+                constraint_target_bone_matrix(
+                    constraint,
+                    target_node,
+                    doc,
+                    bone_world,
+                    target_armature_world,
+                    target_bones.bbone_pose.as_ref(),
+                )?
             } else {
                 target_world.unwrap_or(DMat4::IDENTITY)
             };
@@ -4680,6 +5360,7 @@ fn evaluate_world_matrices_with_meshes(
                 world,
                 None,
                 target_bone_pose_matrices.as_ref(),
+                armature_targets.as_ref(),
                 None,
             )?;
         }
@@ -6675,6 +7356,7 @@ fn apply_object_constraint(
     owner_world: DMat4,
     owner_bone_matrices: Option<&BTreeMap<Id, BoneMatrices>>,
     target_bone_pose_matrices: Option<&BTreeMap<Id, DMat4>>,
+    armature_targets: Option<&ArmatureConstraintTargets>,
     world_to_owner: Option<DMat4>,
 ) -> Result<DMat4> {
     if constraint.constraint_type == ConstraintType::ClampTo
@@ -6736,7 +7418,6 @@ fn apply_object_constraint(
         return Ok(source);
     }
     if constraint.constraint_type == ConstraintType::Armature {
-        armature_constraint_bbone_gate(doc, constraint)?;
         if armature_constraint_has_zero_envelope_weight(
             doc,
             constraint,
@@ -6746,6 +7427,28 @@ fn apply_object_constraint(
             world_matrices,
         )? {
             return Ok(source);
+        }
+        if let Some(constrained) = armature_constraint_bbone_transform(
+            source,
+            constraint,
+            doc,
+            world_matrices,
+            owner_space_node_id,
+            owner_world,
+            armature_targets,
+        )? {
+            let result = if influence >= 1.0 {
+                constrained
+            } else {
+                blend_transform(source, constrained, influence)?
+            };
+            return if finite_matrix(result) {
+                Ok(result)
+            } else {
+                Err(evaluation_error(
+                    "Armature constraint B-Bone result is non-finite",
+                ))
+            };
         }
     }
     let owner_space = string_param_default(&constraint.params, "owner_space", "WORLD")?;
@@ -6864,6 +7567,13 @@ fn apply_object_constraint_in_space(
     } else {
         checked_influence(constraint)?
     };
+    if constraint.constraint_type == ConstraintType::CopyTransforms
+        && string_param_default(&constraint.params, "mix_mode", "REPLACE")? == "REPLACE"
+        && influence >= 1.0
+        && !param_bool(&constraint.params, "remove_target_shear", false)?
+    {
+        return Ok(target);
+    }
     let source_transform = matrix_transform(source)?;
     let target_transform = matrix_transform(target)?;
     let source_rotation = source_transform.rotation;

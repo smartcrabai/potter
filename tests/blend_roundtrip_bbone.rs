@@ -195,6 +195,8 @@ else:
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "source.blend"), check_existing=False)
 "#;
 
+const BLENDER_BBONE_ORACLE: &str = include_str!("fixtures/bbone_segments/generate_oracle.py");
+
 const BLENDER_REOPEN: &str = r#"
 import bpy
 import json
@@ -245,6 +247,17 @@ if case == "target_shape":
         "target": constraint.target.name if constraint.target else None,
         "subtarget": constraint.subtarget,
     }
+elif case == "armature_constraint":
+    constraint = bpy.data.objects["CaseOwner"].constraints["WeightedBboneTarget"]
+    result["targets"] = [
+        {
+            "target": target.target.name if target.target else None,
+            "subtarget": target.subtarget,
+            "weight": target.weight,
+        }
+        for target in constraint.targets
+    ]
+    result["use_deform_preserve_volume"] = constraint.use_deform_preserve_volume
 result["pose"] = {}
 for name in ("Root", "Bendy", "StartHandle", "EndHandle"):
     pose_bone = rig.pose.bones[name]
@@ -415,6 +428,22 @@ fn run_blender(blender: &Path, root: &Path, case: &str, mode: Option<&str>) -> T
     }
     assert_success(&run_guarded(command)?, "Blender fixture")
 }
+fn run_bbone_oracle(blender: &Path, root: &Path, case: &str) -> TestResult<Value> {
+    let script_path = root.join("bbone_oracle.py");
+    fs::write(&script_path, BLENDER_BBONE_ORACLE)?;
+    let root = fs::canonicalize(root)?;
+    let mut command = Command::new(blender);
+    command
+        .args(["--background", "--factory-startup", "--python"])
+        .arg(script_path)
+        .arg("--")
+        .arg(root.clone())
+        .arg(case);
+    assert_success(&run_guarded(command)?, "Blender B-Bone oracle")?;
+    Ok(serde_json::from_slice(&fs::read(
+        root.join("oracle.json"),
+    )?)?)
+}
 
 fn run_reopen(blender: &Path, root: &Path, exported: &Path, case: &str) -> TestResult<Value> {
     let script_path = root.join("reopen.py");
@@ -489,7 +518,33 @@ fn assert_imported_bbone_settings(doc: &SceneDoc, mapping_mode: &str) {
     }
 }
 
-fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
+fn assert_matrix_parity(actual: &Value, expected: &Value, context: &str) -> TestResult {
+    let actual = actual.as_array().ok_or("Potter world matrix is missing")?;
+    let expected = expected
+        .as_array()
+        .ok_or("Blender world matrix is missing")?;
+    assert_eq!(actual.len(), 16, "{context}: Potter matrix length");
+    assert_eq!(expected.len(), 16, "{context}: Blender matrix length");
+    let mut max_error = 0.0_f64;
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        let actual = actual
+            .as_f64()
+            .ok_or("Potter matrix value is not numeric")?;
+        let expected = expected
+            .as_f64()
+            .ok_or("Blender matrix value is not numeric")?;
+        let error = (actual - expected).abs();
+        max_error = max_error.max(error);
+        assert!(
+            error <= 1.0e-5,
+            "{context}: matrix[{index}] Potter {actual} != Blender {expected}"
+        );
+    }
+    eprintln!("{context}: pot inspect world-matrix max error {max_error:.6e}");
+    Ok(())
+}
+
+fn run_bbone_constraint_case(case: &str) -> TestResult {
     let _guard = BLENDER_BBONE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -499,8 +554,7 @@ fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
     };
     let directory = tempdir()?;
     let root = directory.path();
-    run_blender(&blender, root, case, None)?;
-
+    let oracle = run_bbone_oracle(&blender, root, case)?;
     let project = root.join("project");
     pot_json(&["init", project.to_str().unwrap()])?;
     let source = root.join("source.blend");
@@ -522,28 +576,49 @@ fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
         imported["result"]["losses"].as_array().unwrap().is_empty(),
         "B-Bone fixture import reported losses: {imported}"
     );
-    let owner_id = imported["result"]["id_mappings"]["Object:CaseOwner"]
-        .as_str()
-        .unwrap();
     let doc: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     assert_imported_bbone_settings(&doc, "CURVED");
+    if case == "armature_constraint" {
+        let blend = oracle["armature_target_blend"]
+            .as_f64()
+            .ok_or("Armature oracle segment blend is missing")?;
+        assert!(
+            (blend - 0.5).abs() <= 0.02,
+            "Armature oracle expected a curved B-Bone blend near 0.5, got {blend}"
+        );
+    }
 
-    let evaluation = pot_output(&["inspect", project.to_str().unwrap(), "--id", owner_id])?;
-    assert!(
-        !evaluation.status.success(),
-        "{case}: evaluation unexpectedly accepted unsupported B-Bone behavior"
-    );
-    let response: Value = serde_json::from_slice(&evaluation.stdout)?;
-    assert_eq!(
-        response["error"]["code"], "UNSUPPORTED_FEATURE",
-        "{case}: {response}"
-    );
-    assert_eq!(
-        response["error"]["details"]["feature_id"], expected_feature_id,
-        "{case}: {response}"
-    );
+    for (name, expected) in oracle["owners"]
+        .as_object()
+        .ok_or("oracle owners are missing")?
+    {
+        let mapping_key = format!("Object:{name}");
+        let owner_id = imported["result"]["id_mappings"][mapping_key.as_str()]
+            .as_str()
+            .ok_or_else(|| format!("import mapping for {name} is missing"))?;
+        let inspected = pot_json(&[
+            "inspect",
+            project.to_str().unwrap(),
+            "--id",
+            owner_id,
+            "--frame",
+            "1",
+        ])?;
+        let item = inspected["result"]["items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["id"].as_str() == Some(owner_id))
+            })
+            .ok_or_else(|| format!("inspect omitted B-Bone constraint owner {name}"))?;
+        assert_matrix_parity(
+            &item["transform"]["world"]["matrix"],
+            expected,
+            &format!("{case}: {name}"),
+        )?;
+    }
 
-    // Export/reopen only inspects source RNA and deliberately does not evaluate the gated path.
     let exported = root.join("roundtrip.blend");
     pot_json(&[
         "export",
@@ -572,17 +647,35 @@ fn run_case(case: &str, expected_feature_id: &str) -> TestResult {
             }),
             "shape-target constraint settings",
         );
+    } else if case == "armature_constraint" {
+        assert_json_approximately_equal(
+            &reopened["targets"],
+            &json!([
+                {"target":"Rig","subtarget":"Root","weight":0.35},
+                {"target":"Rig","subtarget":"Bendy","weight":0.65},
+            ]),
+            "armature constraint target settings",
+        );
+        assert!(
+            reopened["use_deform_preserve_volume"]
+                .as_bool()
+                .unwrap_or(false)
+        );
     }
     Ok(())
 }
 
 #[test]
-fn bbone_shape_target_gate_and_blend_round_trip() -> TestResult {
-    run_case("target_shape", "constraint.target_bbone_shape")
+fn bbone_shape_target_matches_blender_and_round_trips() -> TestResult {
+    run_bbone_constraint_case("target_shape")
 }
 
 #[test]
-fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
+fn armature_constraint_bbone_segments_match_blender_and_round_trip() -> TestResult {
+    run_bbone_constraint_case("armature_constraint")
+}
+#[test]
+fn armature_modifier_bbone_deformation_matches_blender_and_round_trips() -> TestResult {
     let _guard = BLENDER_BBONE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -699,9 +792,4 @@ fn armature_modifier_bbone_gate_and_blend_round_trip() -> TestResult {
         }
     }
     Ok(())
-}
-
-#[test]
-fn armature_constraint_bbone_gate_and_blend_round_trip() -> TestResult {
-    run_case("armature_constraint", "rig.bbone.segments")
 }
