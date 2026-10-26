@@ -1618,12 +1618,17 @@ pub fn feature_catalog() -> Value {
             &[],
             "Remaining Blender standard constraint types outside the supported transform, Transform Cache, spline IK, Action, Geometry Attribute, Camera Solver, Follow Track, and Object Solver subsets are not implemented.",
         ),
-        unsupported(
+        supported(
             "constraint.target_bbone_shape",
             "Constraint targets sampled along segmented B-Bone shapes",
             "Constraint",
-            &[],
-            "Sampling a target pose bone along its curved B-Bone segments requires Blender's evaluated B-Bone pose matrices.",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
         ),
         supported(
             "driver.safe_expression",
@@ -1674,12 +1679,17 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "rig.bbone.segments",
-            "Armature constraints weighted through B-Bone segments",
+            "Armature constraints with Blender B-Bone segment deformation",
             "Armature",
-            &[],
-            "Armature constraints targeting multi-segment B-Bones still require evaluated per-segment target matrices.",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
         ),
         supported(
             "physics.world",
