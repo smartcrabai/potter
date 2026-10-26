@@ -213,7 +213,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "volume.openvdb_evaluation",
-            "Read-only OpenVDB sampling, active bounds, and density mesh conversion for Blender float, double, and vec3s 5-4-3 trees",
+            "Read-only OpenVDB sampling, active bounds, and density mesh conversion for Blender bool, float, double, int32, int64, vec3s, vec3d, and vec3i 5-4-3 trees",
             "Volume",
             &[
                 "volume.create",
@@ -232,17 +232,22 @@ pub fn feature_catalog() -> Value {
         ),
         unsupported(
             "volume.openvdb_evaluation.transform",
-            "Nonlinear and compound OpenVDB transforms",
+            "Compound OpenVDB map compositions and nonlinear-frustum resampling",
             "Volume",
-            &["volume.create", "volume.update"],
-            "Uniform scale, scale, translation, scale-translation, and affine maps are supported.",
+            &[
+                "volume.create",
+                "volume.update",
+                "modifier.create",
+                "modifier.apply",
+            ],
+            "Uniform and non-uniform scale, translation, scale-translation, affine, unitary, and nonlinear frustum maps are decoded; compound map compositions and frustum Volume to Mesh resampling remain unsupported.",
         ),
         unsupported(
             "volume.openvdb_evaluation.value_type",
-            "OpenVDB grid value types other than float, double, and vec3s",
+            "OpenVDB grid value types outside Blender's supported scalar and vec3 trees",
             "Volume",
             &["volume.create", "volume.update"],
-            "Float, double, and vec3s values are decoded; vec3s density sampling uses magnitude. Displacement refuses double grids with modifier.volume_displace.vdb_grid_type.",
+            "Bool, float, double, int32, int64, vec3s, vec3d, and vec3i trees are decoded; vector density sampling uses magnitude and Blender renders integer/double grids as floats. Mask and point grids remain unsupported.",
         ),
         unsupported(
             "volume.openvdb_evaluation.compression",

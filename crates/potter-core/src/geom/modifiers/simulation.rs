@@ -404,7 +404,7 @@ fn displace_vdb_grid(grid: &VdbGrid, texture: &mut VolumeDisplacement<'_>) -> Re
         name: grid.name.clone(),
         class: grid.class.clone(),
         value_type: grid.value_type.clone(),
-        transform: grid.transform,
+        transform: grid.transform.clone(),
         active_bbox: tree.active_bbox,
         tree: Arc::new(tree),
     })

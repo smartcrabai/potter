@@ -7914,13 +7914,13 @@ fn collect_volumes<'a>(
                 let Some(grid) = decoded.density_grid() else {
                     continue;
                 };
-                let Some((bounds_min, bounds_max)) = grid.active_bbox_world() else {
+                let Some((bounds_min, bounds_max)) = grid.active_bbox_world_affine() else {
                     continue;
                 };
                 (
                     bounds_min,
                     bounds_max,
-                    grid.voxel_size().min_element(),
+                    grid.transform.affine_voxel_size().min_element(),
                     None,
                 )
             } else {
@@ -8057,7 +8057,8 @@ fn collect_volumes<'a>(
             let Some(grid) = decoded.density_grid() else {
                 continue;
             };
-            let Some(bounds) = grid.active_bbox_world_padded(DVec3::splat(pad_voxels)) else {
+            let Some(bounds) = grid.active_bbox_world_padded_affine(DVec3::splat(pad_voxels))
+            else {
                 continue;
             };
             bounds
@@ -8836,9 +8837,8 @@ fn instance_density_checked(instance: &VolumeInstance<'_>, local_position: DVec3
     }
 }
 
-/// The largest step, in meters along a volume-local direction, that moves the sampled index by at most half a voxel. The
-/// index speed is the norm of the local direction in index space, so an affine grid's skew and anisotropic scale count;
-/// a decoded VDB has no index matrix and steps by its voxel size.
+/// The ray-march step in meters along a volume-local direction. Inline grids use half-voxel steps; decoded VDBs use
+/// one affine voxel, as Blender's volume renderers do.
 fn volume_sampling_step(instance: &VolumeInstance<'_>, local_direction: DVec3) -> f64 {
     match instance.index_from_local {
         Some(index_from_local) => {
@@ -8848,7 +8848,7 @@ fn volume_sampling_step(instance: &VolumeInstance<'_>, local_direction: DVec3) -
                 .max(f64::MIN_POSITIVE);
             0.5 / index_speed
         }
-        None => instance.voxel_size / local_direction.length().max(f64::MIN_POSITIVE) * 0.5,
+        None => instance.voxel_size / local_direction.length().max(f64::MIN_POSITIVE),
     }
 }
 
