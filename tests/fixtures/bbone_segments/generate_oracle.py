@@ -123,7 +123,17 @@ if case == "target_shape":
         constraint.head_tail = head_tail
         constraint.use_bbone_shape = True
         owners[name] = owner
-elif case == "armature_constraint":
+elif case in (
+    "armature_constraint",
+    "armature_constraint_scale_2",
+    "armature_constraint_scale_0_01",
+):
+    scale = {
+        "armature_constraint_scale_2": 2.0,
+        "armature_constraint_scale_0_01": 0.01,
+    }.get(case)
+    if scale is not None:
+        rig.scale = (scale, scale, scale)
     scene.frame_set(1)
     bpy.context.view_layer.update()
     armature_point, armature_target_blend = armature_point_with_segment_blend(
@@ -156,6 +166,28 @@ elif case == "armature_constraint":
         segmented_target.subtarget = "Bendy"
         segmented_target.weight = 0.65
         owners[name] = owner
+elif case == "armature_constraint_zero_weight":
+    bone.use_envelope_multiply = True
+    bone.head_radius = 0.2
+    bone.tail_radius = 0.2
+    bone.envelope_distance = 0.2
+    bone.envelope_weight = 1.0
+    scene.frame_set(1)
+    bpy.context.view_layer.update()
+    owner = bpy.data.objects.new("CaseOwner", None)
+    scene.collection.objects.link(owner)
+    owner.location = (100.0, 100.0, 100.0)
+    owner.rotation_euler = (0.12, -0.17, 0.21)
+    owner.scale = (1.1, 0.9, 1.04)
+    constraint = owner.constraints.new("ARMATURE")
+    constraint.name = "WeightedBboneTarget"
+    constraint.use_bone_envelopes = False
+    constraint.use_deform_preserve_volume = True
+    target = constraint.targets.new()
+    target.target = rig
+    target.subtarget = "Bendy"
+    target.weight = 1.0
+    owners["CaseOwner"] = owner
 else:
     raise ValueError("unknown B-Bone oracle case: " + case)
 

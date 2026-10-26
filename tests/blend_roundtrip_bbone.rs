@@ -247,7 +247,7 @@ if case == "target_shape":
         "target": constraint.target.name if constraint.target else None,
         "subtarget": constraint.subtarget,
     }
-elif case == "armature_constraint":
+elif case.startswith("armature_constraint"):
     constraint = bpy.data.objects["CaseOwner"].constraints["WeightedBboneTarget"]
     result["targets"] = [
         {
@@ -578,7 +578,10 @@ fn run_bbone_constraint_case(case: &str) -> TestResult {
     );
     let doc: SceneDoc = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     assert_imported_bbone_settings(&doc, "CURVED");
-    if case == "armature_constraint" {
+    if matches!(
+        case,
+        "armature_constraint" | "armature_constraint_scale_2" | "armature_constraint_scale_0_01"
+    ) {
         let blend = oracle["armature_target_blend"]
             .as_f64()
             .ok_or("Armature oracle segment blend is missing")?;
@@ -647,13 +650,18 @@ fn run_bbone_constraint_case(case: &str) -> TestResult {
             }),
             "shape-target constraint settings",
         );
-    } else if case == "armature_constraint" {
-        assert_json_approximately_equal(
-            &reopened["targets"],
-            &json!([
+    } else if case.starts_with("armature_constraint") {
+        let expected_targets = if case == "armature_constraint_zero_weight" {
+            json!([{"target":"Rig","subtarget":"Bendy","weight":1.0}])
+        } else {
+            json!([
                 {"target":"Rig","subtarget":"Root","weight":0.35},
                 {"target":"Rig","subtarget":"Bendy","weight":0.65},
-            ]),
+            ])
+        };
+        assert_json_approximately_equal(
+            &reopened["targets"],
+            &expected_targets,
             "armature constraint target settings",
         );
         assert!(
@@ -673,6 +681,17 @@ fn bbone_shape_target_matches_blender_and_round_trips() -> TestResult {
 #[test]
 fn armature_constraint_bbone_segments_match_blender_and_round_trip() -> TestResult {
     run_bbone_constraint_case("armature_constraint")
+}
+
+#[test]
+fn scaled_armature_constraint_preserve_volume_matches_blender_and_round_trips() -> TestResult {
+    run_bbone_constraint_case("armature_constraint_scale_2")?;
+    run_bbone_constraint_case("armature_constraint_scale_0_01")
+}
+
+#[test]
+fn zero_envelope_weight_armature_constraint_leaves_owner_unchanged() -> TestResult {
+    run_bbone_constraint_case("armature_constraint_zero_weight")
 }
 #[test]
 fn armature_modifier_bbone_deformation_matches_blender_and_round_trips() -> TestResult {

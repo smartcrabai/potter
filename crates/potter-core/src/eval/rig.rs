@@ -712,7 +712,8 @@ fn armature_constraint_bbone_transform(
                 })?;
                 for (segment_index, segment_weight) in [(index, 1.0 - blend), (index + 1, blend)] {
                     let segment_skin = target_world * deformation[segment_index] * target_inverse;
-                    let segment_rest = target_world * rest[segment_index];
+                    let segment_rest =
+                        orthogonalize_m4_stable_axis1(target_world * rest[segment_index])?;
                     let dual_quat = BoneDualQuat::new(segment_rest, segment_skin);
                     dual_quat_sum.add(&dual_quat, owner_point_world, weight * segment_weight);
                 }
@@ -730,7 +731,7 @@ fn armature_constraint_bbone_transform(
                 )
             })?;
             if targets.preserve_volume {
-                let rest = target_world * matrices.rest;
+                let rest = orthogonalize_m4_stable_axis1(target_world * matrices.rest)?;
                 let skin = target_world * matrices.skin * target_inverse;
                 let dual_quat = BoneDualQuat::new(rest, skin);
                 dual_quat_sum.add(&dual_quat, owner_point_world, weight);
@@ -742,7 +743,7 @@ fn armature_constraint_bbone_transform(
         total_weight += weight;
     }
     if total_weight <= 0.0 {
-        return Ok(None);
+        return Ok(Some(source));
     }
     let deformation = if targets.preserve_volume {
         dual_quat_sum.matrix(total_weight)
@@ -3189,6 +3190,65 @@ fn normalize_matrix_axes(matrix: DMat4, what: &str) -> Result<DMat4> {
     ))
 }
 
+/// Blender `orthogonalize_m4_stable(matrix, 1, true)` on the basis columns.
+fn orthogonalize_m4_stable_axis1(matrix: DMat4) -> Result<DMat4> {
+    let mut x = matrix.x_axis.truncate();
+    let mut y = matrix.y_axis.truncate();
+    let mut z = matrix.z_axis.truncate();
+    let y_length_squared = y.length_squared();
+    if !y_length_squared.is_finite() || y_length_squared <= 0.0 {
+        return Err(evaluation_error(
+            "Armature constraint rest matrix has a zero or non-finite Y axis",
+        ));
+    }
+
+    x -= y * (x.dot(y) / y_length_squared);
+    z -= y * (z.dot(y) / y_length_squared);
+    y /= y_length_squared.sqrt();
+
+    let x_length = x.length();
+    let z_length = z.length();
+    if !x_length.is_finite() || !z_length.is_finite() || x_length <= 0.0 || z_length <= 0.0 {
+        return Err(evaluation_error(
+            "Armature constraint rest matrix has a zero or non-finite secondary axis",
+        ));
+    }
+    let mut x = x / x_length;
+    let mut z = z / z_length;
+    let cos_angle = x.dot(z);
+    let abs_cos_angle = cos_angle.abs();
+    if !cos_angle.is_finite() {
+        return Err(evaluation_error(
+            "Armature constraint rest matrix has a non-finite shear angle",
+        ));
+    }
+    if abs_cos_angle > 1.0e-4 && abs_cos_angle < 1.0 - f64::from(f32::EPSILON) {
+        let angle = cos_angle.acos();
+        let target_angle = angle + (std::f64::consts::FRAC_PI_2 - angle) * 0.5;
+        let projected_x = x - z * cos_angle;
+        let projected_length = projected_x.length();
+        if !projected_length.is_finite() || projected_length <= 0.0 {
+            return Err(evaluation_error(
+                "Armature constraint rest matrix has a degenerate shear angle",
+            ));
+        }
+        x = projected_x * (target_angle.sin() / projected_length) + z * target_angle.cos();
+        z = x.cross(z).cross(x).normalize();
+    }
+
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return Err(evaluation_error(
+            "Armature constraint rest matrix orthogonalization is non-finite",
+        ));
+    }
+    Ok(DMat4::from_cols(
+        x.extend(matrix.x_axis.w),
+        y.extend(matrix.y_axis.w),
+        z.extend(matrix.z_axis.w),
+        matrix.w_axis,
+    ))
+}
+
 fn bbone_spline_parameters(
     armature: &ArmatureData,
     bone_id: &Id,
@@ -3966,12 +4026,11 @@ fn build_bbone_segment_matrices(
                 ));
             }
             if preserve_volume {
-                let segment_rest = normalize_matrix_axes(
-                    bone_matrices.rest * rest_matrices[index],
-                    "B-Bone segment rest matrix",
-                )?;
+                let segment_rest = bone_matrices.rest * rest_matrices[index];
                 if let Some(dual_quats) = &mut dual_quats {
-                    dual_quats.push(BoneDualQuat::new(segment_rest, deformation));
+                    let normalized =
+                        normalize_matrix_axes(segment_rest, "B-Bone segment rest matrix")?;
+                    dual_quats.push(BoneDualQuat::new(normalized, deformation));
                 }
                 if let Some(segment_rests) = &mut segment_rests {
                     segment_rests.push(segment_rest);
