@@ -172,7 +172,7 @@ fn compare_bake_frame(
 ) -> TestResult<()> {
     assert_numeric_arrays(
         &oracle_frame["weights"],
-        &frame["paint_weights"][canvas_id],
+        &frame["paint_weights"][canvas_id]["0"],
         WEIGHT_TOLERANCE,
         &format!("frame {frame_number} paint_weights"),
     )?;
@@ -772,7 +772,7 @@ fn dynamic_paint_weight_ops_accept_supported_brush_settings() -> TestResult<()> 
         )?)?;
         assert_numeric_arrays(
             &canvas_oracle["frames"][frame_key.as_str()]["weights"],
-            &baked["paint_weights"]["canvas"],
+            &baked["paint_weights"]["canvas"]["0"],
             WEIGHT_TOLERANCE,
             &format!("ops-only WEIGHT frame {frame_number}"),
         )?;

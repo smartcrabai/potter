@@ -1024,6 +1024,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "physics.dynamic_paint_surface.frame_start",
         "physics.dynamic_paint_surface.output_name_b",
         "physics.dynamic_paint_surface.surface_type",
+        "physics.dynamic_paint_canvas.canvas_surfaces",
         "constraint.ik.swing_ellipse_limit",
         "modifier.boolean.exact_point_attribute_local_index",
         "constraint.geometry_attribute.instances",
@@ -1036,7 +1037,6 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         );
     }
     for feature_id in [
-        "physics.dynamic_paint_canvas.canvas_surfaces",
         "physics.dynamic_paint_surface.topology",
         "constraint.geometry_attribute.instances.collection_instances",
         "constraint.geometry_attribute.instances.attribute_conversion",

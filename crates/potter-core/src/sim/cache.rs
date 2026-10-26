@@ -231,14 +231,17 @@ fn valid_result(result: &SimulationResult, key: &str) -> bool {
         && result
             .paint_colors
             .values()
+            .flat_map(|surfaces| surfaces.values())
             .all(|colors| colors.iter().flatten().all(|value| value.is_finite()))
         && result
             .paint_wetness
             .values()
+            .flat_map(|surfaces| surfaces.values())
             .all(|values| values.iter().all(|value| value.is_finite()))
         && result
             .paint_weights
             .values()
+            .flat_map(|surfaces| surfaces.values())
             .all(|weights| weights.iter().all(|value| value.is_finite()))
         && result.particle_positions.iter().all(|(id, positions)| {
             result

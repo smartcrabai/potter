@@ -969,7 +969,7 @@ fn dynamic_paint_surface_frame_range_holds_the_end_brush_pose() {
     let end = read_frame(2);
     let after_end = read_frame(3);
     assert!(
-        before_start["paint_colors"]["canvas"]
+        before_start["paint_colors"]["canvas"]["0"]
             .as_array()
             .unwrap()
             .iter()
@@ -977,7 +977,7 @@ fn dynamic_paint_surface_frame_range_holds_the_end_brush_pose() {
         "the surface must remain unpainted before frame_start"
     );
     assert!(
-        start["paint_colors"]["canvas"]
+        start["paint_colors"]["canvas"]["0"]
             .as_array()
             .unwrap()
             .iter()
@@ -985,7 +985,7 @@ fn dynamic_paint_surface_frame_range_holds_the_end_brush_pose() {
         "the surface must paint at frame_start"
     );
     assert!(
-        end["paint_colors"]["canvas"]
+        end["paint_colors"]["canvas"]["0"]
             .as_array()
             .unwrap()
             .iter()
@@ -993,7 +993,7 @@ fn dynamic_paint_surface_frame_range_holds_the_end_brush_pose() {
         "the surface must be painted at frame_end before the hold is compared"
     );
     assert_eq!(
-        after_end["paint_colors"]["canvas"], end["paint_colors"]["canvas"],
+        after_end["paint_colors"]["canvas"]["0"], end["paint_colors"]["canvas"]["0"],
         "frames after frame_end must evaluate the brush at the held end pose"
     );
     let fresh_out = directory.path().join("dynamic_paint_range_fresh_frame");
@@ -1007,7 +1007,7 @@ fn dynamic_paint_surface_frame_range_holds_the_end_brush_pose() {
     let fresh_frame: Value =
         serde_json::from_slice(&fs::read(fresh_out.join("frame_00000000.json")).unwrap()).unwrap();
     assert_eq!(
-        fresh_frame["paint_colors"]["canvas"], after_end["paint_colors"]["canvas"],
+        fresh_frame["paint_colors"]["canvas"]["0"], after_end["paint_colors"]["canvas"]["0"],
         "a held frame must paint identically after sequence evaluation and fresh single-frame evaluation"
     );
 }
@@ -1043,7 +1043,7 @@ fn dynamic_paint_inverted_surface_range_stays_unpainted() {
             serde_json::from_slice(&fs::read(out.join(format!("frame_{index:08}.json"))).unwrap())
                 .unwrap();
         assert!(
-            frame["paint_colors"]["canvas"]
+            frame["paint_colors"]["canvas"]["0"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1133,9 +1133,11 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
             .len(),
         6
     );
-    let colors = frame["paint_colors"]["canvas"].as_array().unwrap();
+    let colors = frame["paint_colors"]["canvas"]["0"].as_array().unwrap();
     assert!(colors.iter().any(|color| color[3].as_f64().unwrap() > 0.0));
-    let weights = frame["paint_weights"]["weight_canvas"].as_array().unwrap();
+    let weights = frame["paint_weights"]["weight_canvas"]["0"]
+        .as_array()
+        .unwrap();
     assert!(weights.iter().any(|weight| weight.as_f64().unwrap() > 0.0));
     let weight_attribute = &frame["deformed_meshes"]["weight_canvas"]["attributes"]["weight"];
     assert_eq!(weight_attribute["domain"], "vertices");
@@ -1150,8 +1152,8 @@ fn simulation_bake_contains_deformed_meshes_particles_liquid_and_paint() {
         serde_json::from_slice(&fs::read(second_out.join("frame_00000000.json")).unwrap()).unwrap();
     assert_eq!(repeated["cache_key"], first_key);
     assert_eq!(
-        repeated["paint_weights"]["weight_canvas"],
-        frame["paint_weights"]["weight_canvas"]
+        repeated["paint_weights"]["weight_canvas"]["0"],
+        frame["paint_weights"]["weight_canvas"]["0"]
     );
 
     apply(
