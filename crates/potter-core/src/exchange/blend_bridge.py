@@ -8243,9 +8243,21 @@ def _set_alpha_mode(material, item):
     material[ALPHA_MODE_PROPERTY] = mode
 
 def _text_from_string(name, body):
-    text = bpy.data.texts.new(name)
-    text.from_string(body)
-    return text
+    # Blender's Text.from_string is prohibitively slow for large one-line compatibility JSON.
+    if (len(body) <= 65536 or "\r" in body or "\x00" in body
+            or body.startswith("\ufeff")):
+        text = bpy.data.texts.new(name)
+        text.from_string(body)
+        return text
+    descriptor, path = tempfile.mkstemp(suffix=".txt")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(body)
+        text = bpy.data.texts.load(path, internal=True)
+        text.name = name
+        return text
+    finally:
+        os.remove(path)
 
 
 def _restore_data_materials(data_raw, data_blocks, material_map, linked_data_blocks):
