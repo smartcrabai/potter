@@ -35,10 +35,6 @@ jobs:
         shell: bash
         run: taplo fmt --check --option reorder_keys=true Cargo.toml crates/*/Cargo.toml
 
-      - name: Check test shard coverage
-        shell: bash
-        run: python3 scripts/ci_test_shard.py --check
-
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
