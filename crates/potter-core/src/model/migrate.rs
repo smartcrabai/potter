@@ -8,6 +8,7 @@
 //! native keys, and user attributes to their storage keys (see [`upgrade_mesh_v2`]). Version 4 marks an
 //! EXR image's alpha as premultiplied (see [`upgrade_v3`]). Version 7 adds the optional captured Blender
 //! `matrix_basis` on a node; version 6 documents have none, so [`upgrade_v6`] changes nothing else.
+//! Version 10 gates native Dynamic Paint output-layer and brush-source migrations on the source schema.
 use std::{collections::BTreeSet, path::Path};
 
 use serde_json::{Map, Value, json};
@@ -58,15 +59,14 @@ pub struct ParsedScene {
     pub doc: SceneDoc,
     /// Diagnostics for legacy data the upgrade skipped or dropped.
     pub warnings: Vec<Value>,
-    /// Whether the upgrade changed bytes the store must keep: the original was schema version 1, or it held a
-    /// legacy Mesh Deform bind that the upgrade cleared.
+    /// Whether load-time migration changed scene data whose original bytes must be retained.
     pub legacy: bool,
-    /// Canonical hash of the original scene, before the upgrade changed it. Set with `legacy`.
+    /// Canonical hash of the original scene, before a load-time migration changed it.
     pub legacy_hash: Option<String>,
 }
 
 /// Parses a scene document, upgrading it through every schema version to the current one, then
-/// migrates its loaded-only legacy resource sentinels.
+/// migrates loaded-only resource sentinels and native Dynamic Paint settings from schema 9.
 pub fn parse_scene(bytes: &[u8], root: &Path) -> Result<ParsedScene> {
     parse_scene_inner(bytes, root, false)
 }
@@ -78,23 +78,102 @@ pub(crate) fn parse_scene_with_original_hash(bytes: &[u8], root: &Path) -> Resul
 
 fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
-    // The upgrade clears a legacy Mesh Deform bind, so the original bytes are kept like a schema-1 scene's.
-    let legacy = value.get("schema_version").and_then(Value::as_u64) == Some(1)
-        || has_legacy_mesh_deform_bind(&value);
-    let legacy_hash = if legacy && retain_original_hash {
+    let source_schema_version = value.get("schema_version").and_then(Value::as_u64);
+    // Load-time migrations preserve original bytes while the upgraded scene is first committed.
+    let mut legacy = source_schema_version == Some(1) || has_legacy_mesh_deform_bind(&value);
+    let source_hash = if retain_original_hash
+        && (legacy
+            || (source_schema_version.is_some_and(|version| version < 10)
+                && (has_dynamic_paint_canvas(&value)
+                    || has_dynamic_paint_brush_without_source(&value))))
+    {
         Some(crate::hash::sha256(&crate::hash::canonicalize(&value)?))
     } else {
         None
     };
-    let warnings = upgrade_scene(&mut value, root)?;
+    let mut legacy_hash = if legacy { source_hash.clone() } else { None };
+    let mut warnings = upgrade_scene(&mut value, root)?;
     let mut doc: SceneDoc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut doc)?;
+    if source_schema_version.is_some_and(|version| version < 10) {
+        let mut changed = crate::sim::migrate_dynamic_paint_output_layers(&mut doc)?;
+        let (brushes_changed, brush_warnings) =
+            crate::sim::migrate_dynamic_paint_brush_source(&mut doc);
+        changed |= brushes_changed;
+        warnings.extend(brush_warnings);
+        if changed {
+            legacy = true;
+            legacy_hash = source_hash;
+        }
+    }
     Ok(ParsedScene {
         doc,
         warnings,
         legacy,
         legacy_hash,
     })
+}
+
+fn has_dynamic_paint_canvas(value: &Value) -> bool {
+    let Some(nodes) = value.get("nodes").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(data_blocks) = value.get("data_blocks").and_then(Value::as_object) else {
+        return false;
+    };
+    nodes.values().any(|node| {
+        let Some(settings) = node
+            .get("properties")
+            .and_then(|properties| properties.get("physics_dynamic_paint"))
+        else {
+            return false;
+        };
+        if settings.get("role").and_then(Value::as_str) != Some("canvas") {
+            return false;
+        }
+        let Some(data_id) = node.get("data").and_then(Value::as_str) else {
+            return false;
+        };
+        let has_mesh = data_blocks
+            .get(data_id)
+            .and_then(|data| data.get("mesh"))
+            .is_some();
+        let has_paint_surface = settings
+            .get("canvas_surfaces")
+            .and_then(Value::as_array)
+            .is_some_and(|surfaces| {
+                surfaces.iter().any(|surface| {
+                    surface
+                        .get("surface_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("PAINT")
+                        == "PAINT"
+                        && surface
+                            .get("surface_format")
+                            .and_then(Value::as_str)
+                            .unwrap_or("VERTEX")
+                            == "VERTEX"
+                })
+            });
+        has_mesh && has_paint_surface
+    })
+}
+fn has_dynamic_paint_brush_without_source(value: &Value) -> bool {
+    value
+        .get("nodes")
+        .and_then(Value::as_object)
+        .is_some_and(|nodes| {
+            nodes.values().any(|node| {
+                let Some(settings) = node
+                    .get("properties")
+                    .and_then(|properties| properties.get("physics_dynamic_paint"))
+                else {
+                    return false;
+                };
+                settings.get("role").and_then(Value::as_str) == Some("brush")
+                    && settings.get("paint_source").is_none()
+            })
+        })
 }
 
 /// Parses a history record, upgrading its snapshot's schema version and retiring the removed operation
@@ -104,6 +183,10 @@ pub(crate) fn parse_history_record(
     root: &Path,
 ) -> Result<(HistoryRecord, Vec<Value>)> {
     let mut value = parse_value(bytes)?;
+    let source_schema_version = value
+        .get("snapshot")
+        .and_then(|snapshot| snapshot.get("schema_version"))
+        .and_then(Value::as_u64);
     let mut warnings = match value.get_mut("snapshot") {
         Some(snapshot) => upgrade_scene(snapshot, root)?,
         None => Vec::new(),
@@ -115,6 +198,12 @@ pub(crate) fn parse_history_record(
     let mut record: HistoryRecord =
         serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut record.snapshot)?;
+    if source_schema_version.is_some_and(|version| version < 10) {
+        crate::sim::migrate_dynamic_paint_output_layers(&mut record.snapshot)?;
+        let (_, brush_warnings) =
+            crate::sim::migrate_dynamic_paint_brush_source(&mut record.snapshot);
+        warnings.extend(brush_warnings);
+    }
     Ok((record, warnings))
 }
 
@@ -202,7 +291,7 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 9, converting superseded modifier binds on
+/// Upgrades a scene document in place through schema version 10, converting superseded modifier binds on
 /// the way. `root` is the project directory that holds the document's image blobs and linked sources,
 /// which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
@@ -232,6 +321,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(8) {
         upgrade_v8(value);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(9) {
+        upgrade_v9(value);
     }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
@@ -763,6 +855,11 @@ fn upgrade_v8(value: &mut Value) {
     }
     value["schema_version"] = json!(9);
 }
+/// Advances schema-version-9 scenes to version 10; load-time Dynamic Paint migrations use the source version.
+fn upgrade_v9(value: &mut Value) {
+    value["schema_version"] = json!(10);
+}
+
 fn upgrade_color_curve(color: &mut Value) -> Result<()> {
     let Some(curve) = color.get_mut("curve") else {
         return Ok(());
@@ -1852,7 +1949,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(9));
+        assert_eq!(scene["schema_version"], json!(10));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -1874,7 +1971,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(9));
+        assert_eq!(scene["schema_version"], json!(10));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -1894,7 +1991,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(9));
+        assert_eq!(scene["schema_version"], json!(10));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -1918,15 +2015,295 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_nine_scenes_pass_through_untouched() {
+    fn current_schema_ten_scenes_pass_through_untouched() {
         let mut scene = json!({
-            "schema_version": 9,
+            "schema_version": 10,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(9));
+        assert_eq!(scene["schema_version"], json!(10));
         assert_eq!(scene["materials"], before["materials"]);
+    }
+    fn dynamic_paint_canvas_scene(schema_version: u32, blender_imported: bool) -> SceneDoc {
+        use glam::DVec3;
+
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.schema_version = schema_version;
+        let mut mesh = crate::geom::Mesh::from_positions_and_faces(
+            vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            vec![vec![0, 1, 2]],
+        )
+        .expect("canvas mesh");
+        if blender_imported {
+            let _ = mesh
+                .attributes
+                .insert("blender_metadata".to_owned(), json!({}));
+        }
+        let data_id = crate::model::Id::new("canvas_data").expect("data ID");
+        let _ = doc.data_blocks.insert(
+            data_id.clone(),
+            crate::model::DataBlock {
+                mesh: Some(mesh),
+                ..crate::model::DataBlock::default()
+            },
+        );
+        let canvas = serde_json::from_value(json!({
+            "name": "Canvas",
+            "kind": "mesh",
+            "data": data_id,
+            "properties": {
+                "physics_dynamic_paint": {
+                    "role": "canvas",
+                    "canvas_surfaces": [{
+                        "surface_type": "PAINT",
+                        "surface_format": "VERTEX",
+                        "output_name_a": "PaintColor"
+                    }]
+                }
+            }
+        }))
+        .expect("canvas node");
+        let _ = doc
+            .nodes
+            .insert(crate::model::Id::new("canvas").expect("canvas ID"), canvas);
+        doc
+    }
+
+    #[test]
+    fn schema_nine_output_a_migration_is_native_once_and_preserves_blender_absence() {
+        let native = dynamic_paint_canvas_scene(9, false);
+        let migrated = parse_scene(
+            &serde_json::to_vec(&native).expect("native scene"),
+            no_assets(),
+        )
+        .expect("native migration");
+        assert!(
+            migrated.legacy,
+            "the native schema-9 migration must be committed"
+        );
+        assert!(
+            crate::geom::color_layers::has_blender_byte_color_corner_layer(
+                migrated.doc.data_blocks[&crate::model::Id::new("canvas_data").expect("data ID")]
+                    .mesh
+                    .as_ref()
+                    .expect("canvas mesh"),
+                "PaintColor"
+            )
+        );
+        let snapshot = serde_json::to_value(&native).expect("legacy history snapshot");
+        let (history, history_warnings) = parse_history_record(
+            &serde_json::to_vec(&history_record(&snapshot)).expect("history record"),
+            no_assets(),
+        )
+        .expect("schema-9 history snapshot loads");
+        assert_eq!(history_warnings, Vec::<Value>::new());
+        let history_mesh = history
+            .snapshot
+            .data_blocks
+            .get(&crate::model::Id::new("canvas_data").expect("data ID"))
+            .and_then(|data| data.mesh.as_ref())
+            .expect("history canvas mesh");
+        assert!(
+            crate::geom::color_layers::has_blender_byte_color_corner_layer(
+                history_mesh,
+                "PaintColor"
+            )
+        );
+
+        let mut saved = serde_json::to_value(migrated.doc).expect("migrated scene");
+        let attributes = saved["data_blocks"]["canvas_data"]["mesh"]["attributes"]
+            .as_object_mut()
+            .expect("mesh attributes");
+        let _ = attributes.remove("PaintColor");
+        let _ = attributes.remove("color_layers");
+        if let Some(types) = attributes
+            .get_mut("blender_metadata")
+            .and_then(Value::as_object_mut)
+            .and_then(|metadata| metadata.get_mut("color_data_types"))
+            .and_then(Value::as_object_mut)
+        {
+            let _ = types.remove("PaintColor");
+        }
+        let reread = parse_scene(
+            &serde_json::to_vec(&saved).expect("saved scene"),
+            no_assets(),
+        )
+        .expect("current scene");
+        assert!(
+            !crate::geom::color_layers::has_blender_byte_color_corner_layer(
+                reread.doc.data_blocks[&crate::model::Id::new("canvas_data").expect("data ID")]
+                    .mesh
+                    .as_ref()
+                    .expect("canvas mesh"),
+                "PaintColor"
+            ),
+            "schema 10 must not re-create a user-deleted output layer"
+        );
+
+        let imported = dynamic_paint_canvas_scene(9, true);
+        let imported = parse_scene(
+            &serde_json::to_vec(&imported).expect("Blender scene"),
+            no_assets(),
+        )
+        .expect("Blender scene load");
+        assert!(
+            !crate::geom::color_layers::has_blender_byte_color_corner_layer(
+                imported.doc.data_blocks[&crate::model::Id::new("canvas_data").expect("data ID")]
+                    .mesh
+                    .as_ref()
+                    .expect("canvas mesh"),
+                "PaintColor"
+            ),
+            "Blender-owned canvases without output A must remain without it"
+        );
+    }
+
+    #[test]
+    fn schema_nine_native_brushes_without_source_migrate_to_point_once() {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.schema_version = 9;
+        let brush = serde_json::from_value(json!({
+            "name": "Brush",
+            "kind": "mesh",
+            "properties": {"physics_dynamic_paint": {"role": "brush", "radius": 2.0}}
+        }))
+        .expect("brush node");
+        let radiusless = serde_json::from_value(json!({
+            "name": "Radiusless",
+            "kind": "mesh",
+            "properties": {"physics_dynamic_paint": {"role": "brush"}}
+        }))
+        .expect("radiusless brush node");
+        let _ = doc
+            .nodes
+            .insert(crate::model::Id::new("brush").expect("brush ID"), brush);
+        let _ = doc.nodes.insert(
+            crate::model::Id::new("radiusless").expect("radiusless ID"),
+            radiusless,
+        );
+        let migrated = parse_scene(
+            &serde_json::to_vec(&doc).expect("legacy scene"),
+            no_assets(),
+        )
+        .expect("brush migration");
+        assert!(migrated.legacy);
+        assert_eq!(migrated.doc.schema_version, 10);
+        let settings = &migrated.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")]
+            .properties["physics_dynamic_paint"];
+        assert_eq!(settings["paint_source"], json!("POINT"));
+        assert_eq!(settings["radius"], json!(2.0));
+        let radiusless = &migrated.doc.nodes
+            [&crate::model::Id::new("radiusless").expect("radiusless ID")]
+            .properties["physics_dynamic_paint"];
+        assert_eq!(radiusless["paint_source"], json!("POINT"));
+        assert!(radiusless.get("radius").is_none());
+
+        let reread = parse_scene(
+            &serde_json::to_vec(&migrated.doc).expect("current scene"),
+            no_assets(),
+        )
+        .expect("current scene load")
+        .doc;
+        for id in ["brush", "radiusless"] {
+            assert_eq!(
+                reread.nodes[&crate::model::Id::new(id).expect("brush ID")].properties["physics_dynamic_paint"]
+                    ["paint_source"],
+                json!("POINT")
+            );
+        }
+    }
+
+    #[test]
+    fn schema_nine_nonlocal_native_brushes_load_with_marker_and_history_warning() {
+        for transform in ["parent", "constraint"] {
+            let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+            doc.schema_version = 9;
+            let mut brush: crate::model::Node = serde_json::from_value(json!({
+                "name": "Brush",
+                "kind": "mesh",
+                "properties": {"physics_dynamic_paint": {"role": "brush"}}
+            }))
+            .expect("brush node");
+            match transform {
+                "parent" => {
+                    let parent_id = crate::model::Id::new("parent").expect("parent ID");
+                    let _ = doc
+                        .nodes
+                        .insert(parent_id.clone(), crate::model::Node::default());
+                    brush.parent = Some(parent_id);
+                }
+                "constraint" => brush.constraints.push(crate::model::Constraint::default()),
+                _ => unreachable!(),
+            }
+            let _ = doc
+                .nodes
+                .insert(crate::model::Id::new("brush").expect("brush ID"), brush);
+
+            let parsed = parse_scene(
+                &serde_json::to_vec(&doc).expect("legacy scene"),
+                no_assets(),
+            )
+            .expect("transformed legacy project still opens");
+            assert_eq!(
+                parsed.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")].properties["physics_dynamic_paint"]
+                    ["paint_source"],
+                json!("LEGACY_WORLD_ORIGIN"),
+                "{transform}"
+            );
+            assert_eq!(parsed.warnings.len(), 1, "{transform}");
+            assert_eq!(
+                parsed.warnings[0]["code"], "dynamic_paint.legacy_world_origin",
+                "{transform}"
+            );
+
+            let snapshot = serde_json::to_value(&doc).expect("legacy snapshot");
+            let (record, history_warnings) = parse_history_record(
+                &serde_json::to_vec(&history_record(&snapshot)).expect("history record"),
+                no_assets(),
+            )
+            .expect("legacy history remains readable");
+            assert_eq!(
+                record.snapshot.nodes[&crate::model::Id::new("brush").expect("brush ID")]
+                    .properties["physics_dynamic_paint"]["paint_source"],
+                json!("LEGACY_WORLD_ORIGIN"),
+                "{transform}"
+            );
+            assert_eq!(
+                history_warnings[0]["code"], "dynamic_paint.legacy_world_origin",
+                "{transform}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_nine_blender_metadata_brushes_are_not_native_source_migrations() {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.schema_version = 9;
+        let brush = serde_json::from_value(json!({
+            "name": "Brush",
+            "kind": "mesh",
+            "properties": {
+                "physics_dynamic_paint": {"role": "brush"},
+                "blender_object_metadata": {"delta_location": [1.0, 0.0, 0.0]}
+            }
+        }))
+        .expect("Blender brush node");
+        let _ = doc
+            .nodes
+            .insert(crate::model::Id::new("brush").expect("brush ID"), brush);
+        let parsed = parse_scene(
+            &serde_json::to_vec(&doc).expect("Blender scene"),
+            no_assets(),
+        )
+        .expect("Blender-owned brush loads unchanged");
+        assert!(
+            parsed.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")].properties
+                ["physics_dynamic_paint"]
+                .get("paint_source")
+                .is_none()
+        );
+        assert_eq!(parsed.warnings, Vec::<Value>::new());
     }
 
     #[test]
@@ -1983,7 +2360,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(9));
+        assert_eq!(scene["schema_version"], json!(10));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -2026,7 +2403,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(9));
+        assert_eq!(scene["schema_version"], json!(10));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -2074,7 +2451,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 9);
+        assert_eq!(parsed.doc.schema_version, 10);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -2120,7 +2497,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(9));
+        assert_eq!(scene["schema_version"], json!(10));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -2163,7 +2540,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(9);
+        expected["schema_version"] = json!(10);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -2201,7 +2578,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 9);
+        assert_eq!(migrated.schema_version, 10);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -2705,7 +3082,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 9);
+        assert_eq!(record.snapshot.schema_version, 10);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -2772,7 +3149,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 9);
+        assert_eq!(record.snapshot.schema_version, 10);
         let history_mesh = record
             .snapshot
             .data_blocks

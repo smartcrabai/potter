@@ -15,7 +15,7 @@ use crate::{
 use super::{SimulationResult, cache};
 
 /// Bump whenever solver behavior or its deterministic output contract changes.
-pub const SOLVER_VERSION: &str = "potter-physics-5";
+pub const SOLVER_VERSION: &str = "potter-physics-6";
 
 const CONTACT_SLOP: f64 = 1.0e-8;
 const POSITION_CORRECTION: f64 = 0.8;
@@ -1463,6 +1463,7 @@ fn make_result(bodies: Vec<Body>, key: String) -> Result<SimulationResult> {
         fluid_particles: BTreeMap::new(),
         fluid_surfaces: BTreeMap::new(),
         paint_colors: BTreeMap::new(),
+        paint_wetness: BTreeMap::new(),
         paint_weights: BTreeMap::new(),
         physics_cache_key: None,
     })

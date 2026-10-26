@@ -23,6 +23,7 @@ GROUPS = {
     "CanvasNoErase": "NoEraseWeight",
     "CanvasSmooth": "SmoothWeight",
     "CanvasUnitScale": "UnitScaleWeight",
+    "CanvasVolume": "VolumeWeight",
 }
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -53,8 +54,8 @@ def new_collection(name):
 constant_brushes = new_collection("ConstantBrushes")
 point_only_brushes = new_collection("PointOnlyBrushes")
 smooth_brushes = new_collection("SmoothBrushes")
+volume_brushes = new_collection("VolumeBrushes")
 history_brushes = new_collection("HistoryBrushes")
-
 
 def activate(obj):
     for candidate in bpy.context.selected_objects:
@@ -81,7 +82,38 @@ def make_brush(name, collection, distance, falloff, erase=False):
     settings.proximity_falloff = falloff
     settings.use_paint_erase = erase
     return obj, settings
+def make_volume_brush():
+    bpy.ops.mesh.primitive_cube_add(size=2.6)
+    obj = bpy.context.object
+    obj.name = "VolumeBrush"
+    for vertex in obj.data.vertices:
+        vertex.co.x += 1.5
+    obj.data.update()
+    for candidate in list(obj.users_collection):
+        candidate.objects.unlink(obj)
+    volume_brushes.objects.link(obj)
+    obj.modifiers.new("PrePaintBevel", "BEVEL").width = 0.05
+    modifier = obj.modifiers.new("Dynamic Paint Volume Brush", "DYNAMIC_PAINT")
+    modifier.ui_type = "BRUSH"
+    activate(obj)
+    if bpy.ops.dpaint.type_toggle(type="BRUSH") != {"FINISHED"}:
+        raise RuntimeError("Blender did not create a VOLUME Dynamic Paint brush")
+    # Blender paints from the modifier stack prefix; this later Mirror must not affect the brush.
+    mirror = obj.modifiers.new("PostPaintMirror", "MIRROR")
+    mirror.use_axis[0] = True
+    settings = modifier.brush_settings
+    settings.paint_source = "VOLUME"
+    settings.paint_distance = 0.001
+    settings.paint_alpha = 0.01
+    settings.proximity_falloff = "RAMP"
+    settings.use_paint_erase = False
+    for frame, x in enumerate((-2.0, -1.0, 0.0, 8.5, 8.5, 8.5, 8.5, 8.5), start=1):
+        obj.location = (x, 0.0, 0.0)
+        obj.keyframe_insert(data_path="location", frame=frame)
+    return obj, settings
 
+
+volume_brush, volume_settings = make_volume_brush()
 
 def animate_location(obj, keyframes):
     for frame, location in keyframes:
@@ -199,6 +231,14 @@ scenario_specs = {
         "radius_scale": 1.0,
         "influence_scale": 1.0,
     },
+    "CanvasVolume": {
+        "group": GROUPS["CanvasVolume"],
+        "collection": volume_brushes,
+        "use_log": False,
+        "radius_scale": 0.25,
+        "influence_scale": 0.65,
+        "use_dissolve": False,
+    },
 }
 
 
@@ -209,7 +249,7 @@ def make_canvas(name, spec):
     canvas = bpy.data.objects.new(name, canvas_mesh)
     scene.collection.objects.link(canvas)
     output_group = canvas.vertex_groups.new(name=group_name)
-    source_vertex = len(vertices) - 1
+    source_vertex = 0 if name == "CanvasVolume" else len(vertices) - 1
     output_group.add([source_vertex], 0.0, "REPLACE")
 
     modifier = canvas.modifiers.new("Dynamic Paint Canvas", "DYNAMIC_PAINT")
@@ -224,7 +264,7 @@ def make_canvas(name, spec):
     surface.frame_start = FRAME_START
     surface.frame_end = FRAME_END
     surface.frame_substeps = 0
-    surface.use_dissolve = True
+    surface.use_dissolve = spec.get("use_dissolve", True)
     surface.dissolve_speed = DISSOLVE_SPEED
     surface.use_dissolve_log = spec["use_log"]
     surface.brush_collection = spec["collection"]
@@ -299,6 +339,12 @@ for name, (canvas, output_group, _surface, _spec) in canvases.items():
         if assignment.group == output_group.index
     }
 
+volume_locations = {}
+for frame in range(FRAME_START, FRAME_END + 1):
+    scene.frame_set(frame)
+    bpy.context.view_layer.update()
+    volume_locations[str(frame)] = list(volume_brush.location)
+
 capture = {
     "blender_version": bpy.app.version_string,
     "frame_start": FRAME_START,
@@ -334,6 +380,15 @@ capture = {
             "distance": smooth_settings.paint_distance,
             "proximity_falloff": smooth_settings.proximity_falloff,
             "use_paint_erase": smooth_settings.use_paint_erase,
+        },
+        "volume": {
+            "name": volume_brush.name,
+            "source": volume_settings.paint_source,
+            "distance": volume_settings.paint_distance,
+            "paint_alpha": volume_settings.paint_alpha,
+            "proximity_falloff": volume_settings.proximity_falloff,
+            "use_paint_erase": volume_settings.use_paint_erase,
+            "locations": volume_locations,
         },
     },
     "canvases": {

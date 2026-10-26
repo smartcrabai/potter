@@ -12,11 +12,11 @@ pub mod softbody;
 mod solver;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
-use glam::{DMat4, DQuat, DVec3};
+use glam::{DMat4, DQuat, DVec3, Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -140,6 +140,9 @@ pub struct SimulationResult {
     /// Dynamic-paint colors in mesh vertex storage order.
     #[serde(default)]
     pub paint_colors: BTreeMap<Id, Vec<[f64; 4]>>,
+    /// Dynamic-paint wetness in mesh vertex storage order when the secondary output is enabled.
+    #[serde(default)]
+    pub paint_wetness: BTreeMap<Id, Vec<f64>>,
     /// Dynamic-paint weights in mesh vertex storage order.
     #[serde(default)]
     pub paint_weights: BTreeMap<Id, Vec<f64>>,
@@ -167,6 +170,8 @@ pub struct PhysicsResult {
     pub fluid_surfaces: BTreeMap<Id, crate::geom::Mesh>,
     /// Dynamic paint vertex colors by canvas object.
     pub paint_colors: BTreeMap<Id, Vec<[f64; 4]>>,
+    /// Dynamic-paint wetness by canvas object when its secondary output is enabled.
+    pub paint_wetness: BTreeMap<Id, Vec<f64>>,
     /// Dynamic-paint vertex weights by canvas object.
     pub paint_weights: BTreeMap<Id, Vec<f64>>,
 }
@@ -676,22 +681,33 @@ pub(crate) fn evaluate_stack_modifier(
                     );
                 }
                 DynamicPaintValues::Colors(colors) => {
+                    let domain = if settings
+                        .get("canvas_surfaces")
+                        .and_then(Value::as_array)
+                        .and_then(|surfaces| surfaces.first())
+                        .is_some()
+                    {
+                        crate::geom::color_layers::ColorDomain::Corner
+                    } else {
+                        crate::geom::color_layers::ColorDomain::Point
+                    };
                     if let Some(name) = output.output_name.as_deref() {
-                        let domain = if settings
-                            .get("canvas_surfaces")
-                            .and_then(Value::as_array)
-                            .and_then(|surfaces| surfaces.first())
-                            .is_some()
-                        {
-                            crate::geom::color_layers::ColorDomain::Corner
-                        } else {
-                            crate::geom::color_layers::ColorDomain::Point
-                        };
                         write_dynamic_paint_color_layer(
                             &mut mesh,
                             name,
                             colors.as_slice(),
                             domain,
+                            true,
+                        )?;
+                    }
+                    if let Some((name, wetness)) = &output.wetness_output {
+                        let wetness_colors = dynamic_paint_wetness_colors(wetness);
+                        write_dynamic_paint_color_layer(
+                            &mut mesh,
+                            name,
+                            &wetness_colors,
+                            domain,
+                            false,
                         )?;
                     }
                 }
@@ -880,6 +896,7 @@ pub(crate) fn evaluate(
     result.fluid_warnings = physics.fluid_warnings;
     result.fluid_surfaces = physics.fluid_surfaces;
     result.paint_colors = physics.paint_colors;
+    result.paint_wetness = physics.paint_wetness;
     result.paint_weights = physics.paint_weights;
     for (id, states) in physics.particles {
         result.particle_positions.insert(
@@ -916,6 +933,7 @@ fn empty_result(key: String) -> SimulationResult {
         fluid_particles: BTreeMap::new(),
         fluid_surfaces: BTreeMap::new(),
         paint_colors: BTreeMap::new(),
+        paint_wetness: BTreeMap::new(),
         paint_weights: BTreeMap::new(),
         physics_cache_key: None,
         fluid_warnings: Vec::new(),
@@ -942,6 +960,7 @@ fn evaluate_physics(
         fluid_particles: BTreeMap::new(),
         fluid_surfaces: BTreeMap::new(),
         paint_colors: BTreeMap::new(),
+        paint_wetness: BTreeMap::new(),
         paint_weights: BTreeMap::new(),
     };
     for (id, node) in &doc.nodes {
@@ -1110,12 +1129,24 @@ fn evaluate_physics(
                             format!("dynamic-paint colors for `{id}` are invalid"),
                         ));
                     }
+                    if let Some((_, wetness)) = &output.wetness_output {
+                        if wetness.iter().any(|value| !value.is_finite()) {
+                            return Err(PotError::new(
+                                ErrorCode::EvaluationFailed,
+                                format!("dynamic-paint wetness for `{id}` is invalid"),
+                            ));
+                        }
+                        result
+                            .paint_wetness
+                            .insert(id.clone(), wetness.as_ref().clone());
+                    }
                     match setting_string(settings, "surface_format").unwrap_or("color") {
-                        "color" => {
+                        "color" if output.output_name.is_some() => {
                             result
                                 .paint_colors
                                 .insert(id.clone(), colors.as_ref().clone());
                         }
+                        "color" => {}
                         "weight" => {
                             result
                                 .paint_weights
@@ -2032,25 +2063,38 @@ fn simulate_fluid_domain(
     Ok((positions, spawns_inside_effector))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct DynamicPaintBrush {
+    /// Brush object whose prefix mesh supplies VOLUME coverage.
+    pub(crate) node_id: Id,
     pub(crate) position: DVec3,
     pub(crate) radius: f64,
     pub(crate) color: [f64; 4],
     pub(crate) strength: f64,
+    pub(crate) wetness: f64,
+    pub(crate) absolute_alpha: bool,
     pub(crate) erase: bool,
     pub(crate) constant_falloff: bool,
+    /// Per-canvas-vertex inside mask; `None` selects POINT proximity.
+    pub(crate) volume_mask: Option<Vec<bool>>,
 }
 #[derive(Debug, Default)]
 pub(crate) struct DynamicPaintHoldCache {
     entries: BTreeMap<String, DynamicPaintHold>,
     weight_entries: BTreeMap<String, DynamicPaintWeightState>,
+    paint_entries: BTreeMap<String, DynamicPaintPaintState>,
 }
 #[derive(Debug)]
 struct DynamicPaintWeightState {
     frame: i64,
     vertex_ids: Vec<u32>,
     weights: Arc<Vec<f64>>,
+}
+#[derive(Debug)]
+struct DynamicPaintPaintState {
+    frame: i64,
+    vertex_ids: Vec<u32>,
+    points: Arc<Vec<dynamic_paint::PaintPoint>>,
 }
 #[derive(Debug)]
 struct DynamicPaintHold {
@@ -2066,13 +2110,14 @@ enum DynamicPaintValues {
 struct DynamicPaintOutput {
     output_name: Option<String>,
     values: DynamicPaintValues,
+    wetness_output: Option<(String, Arc<Vec<f64>>)>,
 }
 
 /// Brushes that paint a canvas: its explicit `brushes` list, or every scene brush.
 ///
-/// A brush reads Blender's `paint_distance`, `paint_color`, and `paint_alpha`. Missing values fall
-/// back to the canvas's Potter-native `radius`, `color`, and `strength`, which have no Blender
-/// counterpart and are not Blender defaults.
+/// POINT brushes read Blender's `paint_distance`, `paint_color`, and `paint_alpha`; missing values
+/// fall back to Potter-native canvas settings. VOLUME uses full inside influence before brush alpha,
+/// surface influence, and wetness are applied; point distance and falloff are ignored.
 fn dynamic_paint_brush_settings(
     context: &FrameContext<'_>,
     canvas_settings: &Value,
@@ -2082,7 +2127,6 @@ fn dynamic_paint_brush_settings(
         doc,
         scene_id,
         frame,
-        matrices,
         members,
         gate,
         ..
@@ -2091,15 +2135,6 @@ fn dynamic_paint_brush_settings(
         .get("canvas_surfaces")
         .and_then(Value::as_array)
         .and_then(|surfaces| surfaces.first());
-    let radius_scale = surface.map_or(Ok(1.0), |surface| {
-        setting_number(
-            surface,
-            "brush_radius_scale",
-            1.0,
-            "dynamic-paint surface",
-            "a finite nonnegative number",
-        )
-    })?;
     let brush_filter = match surface {
         Some(surface) => collection_filter(
             doc,
@@ -2187,17 +2222,29 @@ fn dynamic_paint_brush_settings(
             }
         }
     }
-    let driver_values = brush_ids
-        .iter()
-        .any(|id| {
-            doc.nodes
-                .get(id)
-                .and_then(|node| node.properties.get("physics_dynamic_paint"))
-                .and_then(|settings| setting_string(settings, "paint_source"))
-                == Some("POINT")
-        })
+    let has_point_source = brush_ids.iter().any(|id| {
+        doc.nodes
+            .get(id)
+            .and_then(|node| node.properties.get("physics_dynamic_paint"))
+            .and_then(|settings| setting_string(settings, "paint_source"))
+            .is_some_and(|source| matches!(source, "POINT" | "LEGACY_WORLD_ORIGIN"))
+    });
+    let driver_values = has_point_source
         .then(|| crate::eval::rig::evaluate_drivers(doc, frame))
         .transpose()?;
+    let radius_scale = if has_point_source {
+        surface.map_or(Ok(1.0), |surface| {
+            setting_number(
+                surface,
+                "brush_radius_scale",
+                1.0,
+                "dynamic-paint surface",
+                "a finite nonnegative number",
+            )
+        })?
+    } else {
+        1.0
+    };
     let canvas_radius = setting_f64(canvas_settings, "radius").unwrap_or(1.0);
     let canvas_color = setting_color(canvas_settings).unwrap_or([1.0, 0.0, 0.0, 1.0]);
     let canvas_strength = setting_f64(canvas_settings, "strength").unwrap_or(1.0);
@@ -2227,7 +2274,32 @@ fn dynamic_paint_brush_settings(
                 json!({"brush_id":id}),
             ));
         }
-        let constant_falloff = if weight_surface {
+        let stored_paint_source = setting_string(settings, "paint_source").unwrap_or("VOLUME");
+        let paint_source = if stored_paint_source == "LEGACY_WORLD_ORIGIN" {
+            if node.parent.is_some() || !node.constraints.is_empty() {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "legacy Dynamic Paint brush must be unparented or have paint_source set before evaluation",
+                    json!({"feature_id":"physics.dynamic_paint_brush.legacy_transform","brush_id":id,"status":"not_supported"}),
+                ));
+            }
+            "POINT"
+        } else if matches!(stored_paint_source, "POINT" | "VOLUME") {
+            stored_paint_source
+        } else {
+            return Err(physics_support::unsupported_property(
+                "dynamic_paint_brush",
+                "paint_source",
+            ));
+        };
+        if paint_source == "VOLUME" && settings.get("radius").is_some() {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "native radius is only supported for POINT Dynamic Paint brushes",
+                json!({"feature_id":"physics.dynamic_paint_brush.radius","property":"radius","status":"not_supported"}),
+            ));
+        }
+        let constant_falloff = if paint_source == "POINT" {
             match setting_string(settings, "proximity_falloff").unwrap_or("SMOOTH") {
                 "SMOOTH" => false,
                 "CONSTANT" => true,
@@ -2248,41 +2320,23 @@ fn dynamic_paint_brush_settings(
                 settings,
                 physics_support::DYNAMIC_PAINT_WEIGHT_BRUSH_PROPERTIES,
             )?;
-            if setting_string(settings, "paint_source").unwrap_or("VOLUME") != "POINT" {
-                return Err(physics_support::unsupported_property(
-                    "dynamic_paint_brush",
-                    "paint_source",
-                ));
-            }
         } else {
             const PAINT_BRUSH_PROPERTIES: &[&str] = &[
                 "paint_color",
                 "paint_alpha",
                 "paint_distance",
                 "paint_source",
+                "paint_wetness",
+                "use_absolute_alpha",
+                "proximity_falloff",
             ];
             physics_support::reject_unhonoured(
                 "dynamic_paint_brush",
                 settings,
                 PAINT_BRUSH_PROPERTIES,
             )?;
-            if setting_string(settings, "paint_source")
-                .is_some_and(|source| !matches!(source, "POINT" | "VOLUME"))
-            {
-                return Err(physics_support::unsupported_property(
-                    "dynamic_paint_brush",
-                    "paint_source",
-                ));
-            }
         }
-        let matrix = matrices.get(&id).copied().ok_or_else(|| {
-            PotError::with_details(
-                ErrorCode::EvaluationFailed,
-                "dynamic-paint brush transform is missing",
-                json!({"node_id":id}),
-            )
-        })?;
-        let position = if setting_string(settings, "paint_source") == Some("POINT") {
+        let position = if paint_source == "POINT" {
             // Blender's POINT source uses Object.loc, ignoring parenting, constraints and delta transforms.
             let animated = crate::eval::animation::animated_transform(node, doc, frame)?;
             let driver_values = driver_values.as_ref().ok_or_else(|| {
@@ -2303,21 +2357,34 @@ fn dynamic_paint_brush_settings(
                 transform.translation[2],
             )
         } else {
-            matrix.transform_point3(DVec3::ZERO)
+            DVec3::ZERO
         };
         brushes.push(DynamicPaintBrush {
+            node_id: id,
+            volume_mask: (paint_source == "VOLUME").then(Vec::new),
             position,
             // Blender's brush names take precedence; Potter-native keys fill in when they are absent.
-            radius: setting_f64(settings, "paint_distance")
-                .or_else(|| setting_f64(settings, "radius"))
-                .unwrap_or(canvas_radius)
-                * radius_scale,
+            radius: if paint_source == "POINT" {
+                setting_f64(settings, "paint_distance")
+                    .or_else(|| setting_f64(settings, "radius"))
+                    .unwrap_or(canvas_radius)
+                    * radius_scale
+            } else {
+                0.0
+            },
             color: color_setting(settings, "paint_color")
                 .or_else(|| color_setting(settings, "color"))
                 .unwrap_or(canvas_color),
             strength: setting_f64(settings, "paint_alpha")
                 .or_else(|| setting_f64(settings, "strength"))
                 .unwrap_or(canvas_strength),
+            wetness: setting_f64(settings, "paint_wetness").unwrap_or(1.0),
+            absolute_alpha: bool_setting(
+                settings,
+                "use_absolute_alpha",
+                true,
+                "dynamic-paint brush",
+            )?,
             erase: bool_setting(settings, "use_paint_erase", false, "dynamic-paint brush")?,
             constant_falloff,
         });
@@ -2405,7 +2472,6 @@ const DYNAMIC_PAINT_WEIGHT_SURFACE_PROPERTIES: &[&str] = &[
     "init_layername",
     "init_texture",
     "output_name_b",
-    "use_output_b",
 ];
 
 fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
@@ -2453,6 +2519,41 @@ fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
                 surface,
                 physics_support::honoured_properties("dynamic_paint_surface"),
             )?;
+            if bool_setting(surface, "use_drying", true, "dynamic-paint surface")? {
+                let dry_speed = setting_number(
+                    surface,
+                    "dry_speed",
+                    500.0,
+                    "dynamic-paint surface",
+                    "a positive finite number",
+                )?;
+                if dry_speed <= 0.0 {
+                    return Err(PotError::invalid_argument(
+                        "dynamic-paint surface dry_speed must be positive",
+                    ));
+                }
+                setting_number(
+                    surface,
+                    "color_dry_threshold",
+                    1.0,
+                    "dynamic-paint surface",
+                    "a finite number",
+                )?;
+            }
+            if bool_setting(surface, "use_dissolve", false, "dynamic-paint surface")? {
+                let dissolve_speed = setting_number(
+                    surface,
+                    "dissolve_speed",
+                    250.0,
+                    "dynamic-paint surface",
+                    "a positive finite number",
+                )?;
+                if dissolve_speed <= 0.0 {
+                    return Err(PotError::invalid_argument(
+                        "dynamic-paint surface dissolve_speed must be positive",
+                    ));
+                }
+            }
         }
         if setting_string(surface, "surface_format").is_some_and(|format| format != "VERTEX") {
             return Err(physics_support::unsupported_property(
@@ -2465,47 +2566,130 @@ fn validate_dynamic_paint_canvas(canvas: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_dynamic_paint_wet_output(
-    context: &FrameContext<'_>,
-    canvas_id: &Id,
-    canvas: &Mesh,
+/// Ensures primary output A and, for operations, requested output B. Load migration preserves an
+/// absent B layer because Blender's `use_output_b` flag alone does not enable its output.
+pub(crate) fn ensure_dynamic_paint_output_layers(
+    mesh: &mut Mesh,
     settings: &Value,
-) -> Result<()> {
-    let Some(surface) = settings
-        .get("canvas_surfaces")
-        .and_then(Value::as_array)
-        .and_then(|surfaces| surfaces.first())
-    else {
-        return Ok(());
-    };
-    if setting_string(surface, "surface_type") == Some("WEIGHT") {
-        return Ok(());
+    create_requested_output_b: bool,
+) -> Result<bool> {
+    if setting_string(settings, "role") != Some("canvas") {
+        return Ok(false);
     }
-    let output_name = setting_string(surface, "output_name_b").unwrap_or("dp_wetmap");
-    if output_name.is_empty() {
-        return Ok(());
-    }
-    let has_layer = |mesh: &Mesh| {
-        crate::geom::color_layers::read(mesh)
-            .layers
-            .iter()
-            .any(|layer| layer.name == output_name)
+    let Some(surfaces) = settings.get("canvas_surfaces").and_then(Value::as_array) else {
+        return Ok(false);
     };
-    let source_has_layer = context
-        .doc
+    let mut changed = false;
+    for surface in surfaces {
+        if setting_string(surface, "surface_type").unwrap_or("PAINT") != "PAINT"
+            || setting_string(surface, "surface_format").unwrap_or("VERTEX") != "VERTEX"
+        {
+            continue;
+        }
+        let output_a = setting_string(surface, "output_name_a").unwrap_or("dp_paintmap");
+        if !output_a.is_empty() {
+            changed |= crate::geom::color_layers::ensure_byte_color_corner_layer(mesh, output_a)?;
+        }
+        if create_requested_output_b
+            && bool_setting(surface, "use_output_b", false, "dynamic-paint surface")?
+        {
+            let output_b = setting_string(surface, "output_name_b").unwrap_or("dp_wetmap");
+            if !output_b.is_empty() {
+                changed |=
+                    crate::geom::color_layers::ensure_byte_color_corner_layer(mesh, output_b)?;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+pub(crate) fn migrate_dynamic_paint_output_layers(doc: &mut SceneDoc) -> Result<bool> {
+    let blender_owned_data: BTreeSet<Id> = doc
         .nodes
-        .get(canvas_id)
-        .and_then(|node| node.data.as_ref())
-        .and_then(|data_id| context.doc.data_blocks.get(data_id))
-        .and_then(|data| data.mesh.as_ref())
-        .is_some_and(has_layer);
-    if has_layer(canvas) || source_has_layer {
-        return Err(physics_support::unsupported_property(
-            "dynamic_paint_surface",
-            "output_name_b",
-        ));
+        .values()
+        .filter_map(|node| {
+            let settings = node.properties.get("physics_dynamic_paint")?;
+            if setting_string(settings, "role") != Some("canvas") {
+                return None;
+            }
+            let data_id = node.data.as_ref()?;
+            doc.data_blocks
+                .get(data_id)
+                .and_then(|data| data.mesh.as_ref())
+                .filter(|mesh| mesh.attributes.contains_key("blender_metadata"))
+                .map(|_| data_id.clone())
+        })
+        .collect();
+    let (nodes, data_blocks) = (&doc.nodes, &mut doc.data_blocks);
+    let mut changed = false;
+    for node in nodes.values() {
+        let Some(settings) = node.properties.get("physics_dynamic_paint") else {
+            continue;
+        };
+        if setting_string(settings, "role") != Some("canvas") {
+            continue;
+        }
+        let Some(data_id) = node.data.as_ref() else {
+            continue;
+        };
+        if blender_owned_data.contains(data_id) {
+            continue;
+        }
+        let Some(mesh) = data_blocks
+            .get_mut(data_id)
+            .and_then(|data| data.mesh.as_mut())
+        else {
+            continue;
+        };
+        // Migrate primary output A only; B still requires its own layer toggle.
+        changed |= ensure_dynamic_paint_output_layers(mesh, settings, false)?;
     }
-    Ok(())
+    Ok(changed)
+}
+pub(crate) fn migrate_dynamic_paint_brush_source(doc: &mut SceneDoc) -> (bool, Vec<Value>) {
+    let mut changed = false;
+    let mut warnings = Vec::new();
+    for (node_id, node) in &mut doc.nodes {
+        let legacy_brush_without_source =
+            node.properties
+                .get("physics_dynamic_paint")
+                .is_some_and(|settings| {
+                    setting_string(settings, "role") == Some("brush")
+                        && settings.get("paint_source").is_none()
+                });
+        if !legacy_brush_without_source {
+            continue;
+        }
+        if node
+            .properties
+            .get("blender_object_metadata")
+            .is_some_and(Value::is_object)
+        {
+            continue;
+        }
+        let legacy_world_origin = node.parent.is_some() || !node.constraints.is_empty();
+        let Some(settings) = node
+            .properties
+            .get_mut("physics_dynamic_paint")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let source = if legacy_world_origin {
+            warnings.push(json!({
+                "code": "dynamic_paint.legacy_world_origin",
+                "feature_id": "physics.dynamic_paint_brush.legacy_transform",
+                "message": "Legacy Dynamic Paint brush retains its world-origin behavior and cannot be evaluated until its transform is resolved",
+                "node_id": node_id
+            }));
+            "LEGACY_WORLD_ORIGIN"
+        } else {
+            "POINT"
+        };
+        let _ = settings.insert("paint_source".to_owned(), json!(source));
+        changed = true;
+    }
+    (changed, warnings)
 }
 
 fn dynamic_paint_output_name(settings: &Value) -> Option<String> {
@@ -2526,15 +2710,33 @@ fn dynamic_paint_output_name(settings: &Value) -> Option<String> {
     };
     (!name.is_empty()).then(|| name.to_owned())
 }
-
-fn dynamic_paint_canvas_snapshot(
+fn dynamic_paint_output_layer_exists(
     context: &FrameContext<'_>,
     canvas_id: &Id,
+    canvas: &Mesh,
+    name: &str,
+) -> bool {
+    crate::geom::color_layers::has_blender_byte_color_corner_layer(canvas, name)
+        || context
+            .doc
+            .nodes
+            .get(canvas_id)
+            .and_then(|node| node.data.as_ref())
+            .and_then(|data_id| context.doc.data_blocks.get(data_id))
+            .and_then(|data| data.mesh.as_ref())
+            .is_some_and(|mesh| {
+                crate::geom::color_layers::has_blender_byte_color_corner_layer(mesh, name)
+            })
+}
+
+fn dynamic_paint_mesh_snapshot(
+    context: &FrameContext<'_>,
+    node_id: &Id,
     frame: f64,
     modifier_prefix: usize,
 ) -> Result<crate::eval::Snapshot> {
     let driver_values = crate::eval::rig::evaluate_drivers(context.doc, frame)?;
-    let nodes = BTreeSet::from([canvas_id.clone()]);
+    let nodes = BTreeSet::from([node_id.clone()]);
     crate::eval::Snapshot::evaluate_nodes_with_modifier_prefix_with_cache(
         context.doc,
         &crate::eval::EvaluationContext {
@@ -2547,11 +2749,221 @@ fn dynamic_paint_canvas_snapshot(
         context.gate.context.project_root,
         context.gate.context.cache_directory,
         &nodes,
-        canvas_id,
+        node_id,
         modifier_prefix,
         true,
         &driver_values,
     )
+}
+fn prepare_dynamic_paint_volume_brushes(
+    context: &FrameContext<'_>,
+    canvas: &Mesh,
+    canvas_world: DMat4,
+    brushes: &mut [DynamicPaintBrush],
+) -> Result<()> {
+    if !brushes.iter().any(|brush| brush.volume_mask.is_some()) {
+        return Ok(());
+    }
+    let canvas_positions: Vec<DVec3> = canvas.vertices.iter().map(|vertex| vertex.co).collect();
+    let canvas_normals = crate::geom::normals::geometric_vertex_normals(canvas, &canvas_positions)?;
+    let canvas_matrix =
+        Mat4::from_cols_array(&canvas_world.to_cols_array().map(|value| value as f32));
+
+    for brush in brushes
+        .iter_mut()
+        .filter(|brush| brush.volume_mask.is_some())
+    {
+        let node = context.doc.nodes.get(&brush.node_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                "dynamic-paint brush Object was not found",
+                json!({"brush_id":brush.node_id}),
+            )
+        })?;
+        let modifier_prefix = node
+            .modifiers
+            .iter()
+            .position(|modifier| modifier.modifier_type == "dynamic_paint")
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "dynamic-paint brush modifier is missing",
+                    json!({"brush_id":brush.node_id}),
+                )
+            })?;
+        let mut snapshot =
+            dynamic_paint_mesh_snapshot(context, &brush.node_id, context.frame, modifier_prefix)?;
+        let brush_mesh = snapshot.meshes.remove(&brush.node_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint brush mesh is missing at its paint frame",
+                json!({"brush_id":brush.node_id,"frame":context.frame}),
+            )
+        })?;
+        let brush_world = context
+            .matrices
+            .get(&brush.node_id)
+            .copied()
+            .ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "dynamic-paint brush transform is missing at its paint frame",
+                    json!({"brush_id":brush.node_id,"frame":context.frame}),
+                )
+            })?;
+        if !brush_world.is_finite() || !canvas_world.is_finite() {
+            return Err(PotError::new(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint volume brush transforms must be finite",
+            ));
+        }
+        let brush_matrix =
+            Mat4::from_cols_array(&brush_world.to_cols_array().map(|value| value as f32));
+        let world_positions: Vec<[f32; 3]> = brush_mesh
+            .vertices
+            .iter()
+            .map(|vertex| {
+                brush_matrix
+                    .transform_point3(vertex.co.as_vec3())
+                    .to_array()
+            })
+            .collect();
+        if world_positions
+            .iter()
+            .flatten()
+            .any(|coordinate| !coordinate.is_finite())
+        {
+            return Err(PotError::new(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint volume brush vertices must be finite",
+            ));
+        }
+        let vertex_indices: HashMap<u32, usize> = brush_mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(index, vertex)| (vertex.id, index))
+            .collect();
+        let triangle_capacity = brush_mesh
+            .faces
+            .iter()
+            .try_fold(0_usize, |count, face| {
+                count.checked_add(face.vertices.len().saturating_sub(2))
+            })
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "dynamic-paint brush triangle count overflows usize",
+                )
+            })?;
+        let mut triangles = Vec::with_capacity(triangle_capacity);
+        let mut bounds = Vec::with_capacity(triangle_capacity);
+        let mut invalid_vertex = false;
+        brush_mesh
+            .for_each_triangle_with_face(|_, ids| {
+                let Some(first) = vertex_indices.get(&ids[0]).copied() else {
+                    invalid_vertex = true;
+                    return;
+                };
+                let Some(second) = vertex_indices.get(&ids[1]).copied() else {
+                    invalid_vertex = true;
+                    return;
+                };
+                let Some(third) = vertex_indices.get(&ids[2]).copied() else {
+                    invalid_vertex = true;
+                    return;
+                };
+                let triangle = [
+                    world_positions[first],
+                    world_positions[second],
+                    world_positions[third],
+                ];
+                bounds.push(crate::geom::bvh::kdop_bounds(&triangle, 0.0, 6));
+                triangles.push(triangle);
+            })
+            .map_err(|error| {
+                PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "dynamic-paint brush mesh triangulation failed",
+                    json!({"brush_id":brush.node_id,"reason":error.to_string()}),
+                )
+            })?;
+        if invalid_vertex {
+            return Err(PotError::new(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint brush triangle references a missing vertex",
+            ));
+        }
+        let tree = crate::geom::bvh::KdopTree::new(bounds, 8, 6);
+        let mut mask = Vec::with_capacity(canvas.vertices.len());
+        for (index, vertex) in canvas.vertices.iter().enumerate() {
+            let origin = canvas_matrix.transform_point3(vertex.co.as_vec3()) + Vec3::splat(0.001);
+            let world_normal = canvas_matrix.transform_vector3(canvas_normals[index].as_vec3());
+            let normal_length = world_normal.length();
+            if !origin.is_finite() || !normal_length.is_finite() {
+                return Err(PotError::new(
+                    ErrorCode::EvaluationFailed,
+                    "dynamic-paint canvas volume-ray data must be finite",
+                ));
+            }
+            if normal_length == 0.0 {
+                mask.push(false);
+                continue;
+            }
+            let direction = -world_normal / normal_length;
+            let Some((triangle_index, _)) = dynamic_paint_volume_ray_hit(
+                &tree,
+                &triangles,
+                origin.to_array(),
+                direction.to_array(),
+            ) else {
+                mask.push(false);
+                continue;
+            };
+            let triangle = triangles[triangle_index];
+            let normal = crate::geom::bvh::normalize(crate::geom::bvh::cross(
+                crate::geom::bvh::sub(triangle[1], triangle[0]),
+                crate::geom::bvh::sub(triangle[2], triangle[0]),
+            ))
+            .0;
+            if crate::geom::bvh::dot(direction.to_array(), normal) < 0.0 {
+                mask.push(false);
+                continue;
+            }
+            mask.push(
+                dynamic_paint_volume_ray_hit(
+                    &tree,
+                    &triangles,
+                    origin.to_array(),
+                    (-direction).to_array(),
+                )
+                .is_some(),
+            );
+        }
+        brush.volume_mask = Some(mask);
+    }
+    Ok(())
+}
+
+fn dynamic_paint_volume_ray_hit(
+    tree: &crate::geom::bvh::KdopTree,
+    triangles: &[[[f32; 3]; 3]],
+    origin: [f32; 3],
+    direction: [f32; 3],
+) -> Option<(usize, f32)> {
+    let mut hit = crate::geom::bvh::RayHit::open();
+    tree.ray_cast(origin, direction, &mut hit, &mut |index, ray, hit| {
+        let [first, second, third] = triangles[index];
+        if let Some(distance) = ray.watertight(first, second, third)
+            && distance >= 0.0
+            && distance < hit.dist
+            && let Ok(index) = isize::try_from(index)
+        {
+            hit.index = index;
+            hit.dist = distance;
+        }
+    });
+    hit.leaf().map(|index| (index, hit.dist))
 }
 
 fn dynamic_paint_canvas_with_shape_keys(
@@ -2669,7 +3081,7 @@ struct DynamicPaintEvaluation<'a> {
     hold_cache: &'a mut DynamicPaintHoldCache,
 }
 
-const MAX_DYNAMIC_PAINT_WEIGHT_FRAMES: u64 = 100_000;
+const MAX_DYNAMIC_PAINT_FRAMES: u64 = 100_000;
 
 fn dynamic_paint_integer_frame(value: f64, property: &str) -> Result<i64> {
     if !value.is_finite()
@@ -2701,6 +3113,7 @@ fn paint_dynamic_paint_weight(
         return Ok(DynamicPaintOutput {
             output_name,
             values: DynamicPaintValues::Weights(Arc::new(vec![0.0; canvas.vertices.len()])),
+            wetness_output: None,
         });
     };
     let start = dynamic_paint_integer_frame(
@@ -2728,6 +3141,7 @@ fn paint_dynamic_paint_weight(
         return Ok(DynamicPaintOutput {
             output_name,
             values: DynamicPaintValues::Weights(Arc::new(vec![0.0; canvas.vertices.len()])),
+            wetness_output: None,
         });
     }
     let frame_count = target
@@ -2741,7 +3155,7 @@ fn paint_dynamic_paint_weight(
                 "dynamic-paint frame range overflows",
             )
         })?;
-    if frame_count > MAX_DYNAMIC_PAINT_WEIGHT_FRAMES {
+    if frame_count > MAX_DYNAMIC_PAINT_FRAMES {
         return Err(PotError::new(
             ErrorCode::LimitExceeded,
             "dynamic-paint weight frame range exceeds limits",
@@ -2766,6 +3180,7 @@ fn paint_dynamic_paint_weight(
         return Ok(DynamicPaintOutput {
             output_name,
             values: DynamicPaintValues::Weights(Arc::clone(&state.weights)),
+            wetness_output: None,
         });
     }
 
@@ -2811,7 +3226,7 @@ fn paint_dynamic_paint_weight(
             ..*context
         };
         let mut snapshot =
-            dynamic_paint_canvas_snapshot(&paint_context, canvas_id, frame_value, modifier_prefix)?;
+            dynamic_paint_mesh_snapshot(&paint_context, canvas_id, frame_value, modifier_prefix)?;
         let paint_mesh = snapshot.meshes.remove(canvas_id).ok_or_else(|| {
             PotError::with_details(
                 ErrorCode::EvaluationFailed,
@@ -2844,7 +3259,7 @@ fn paint_dynamic_paint_weight(
                 .max(0.0);
             }
         }
-        let brushes = dynamic_paint_brush_settings(&paint_context, settings, true)?;
+        let mut brushes = dynamic_paint_brush_settings(&paint_context, settings, true)?;
         let canvas_matrix = matrices.get(canvas_id).copied().ok_or_else(|| {
             PotError::with_details(
                 ErrorCode::EvaluationFailed,
@@ -2852,6 +3267,12 @@ fn paint_dynamic_paint_weight(
                 json!({"node_id":canvas_id,"frame":frame_value}),
             )
         })?;
+        prepare_dynamic_paint_volume_brushes(
+            &paint_context,
+            &paint_mesh,
+            canvas_matrix,
+            &mut brushes,
+        )?;
         dynamic_paint::paint_weight_step(
             &paint_mesh,
             canvas_matrix,
@@ -2875,10 +3296,238 @@ fn paint_dynamic_paint_weight(
     Ok(DynamicPaintOutput {
         output_name,
         values: DynamicPaintValues::Weights(weights),
+        wetness_output: None,
     })
 }
-/// PAINT colors use the canvas mesh and brushes at the surface's clamped frame. WEIGHT surfaces
-/// replay each integer frame into persistent per-vertex values; both outputs hold after `frame_end`.
+fn dynamic_paint_wet_output_name(surface: &Value) -> Option<String> {
+    let name = setting_string(surface, "output_name_b").unwrap_or("dp_wetmap");
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn paint_dynamic_paint_paint(
+    context: &FrameContext<'_>,
+    canvas_id: &Id,
+    canvas: &Mesh,
+    settings: &Value,
+    surface: &Value,
+    paint_frame: Option<f64>,
+    scene_hash: &str,
+    modifier_prefix: usize,
+    stack_mesh_is_current: bool,
+    hold_cache: &mut DynamicPaintHoldCache,
+) -> Result<DynamicPaintOutput> {
+    let output_name = dynamic_paint_output_name(settings)
+        .filter(|name| dynamic_paint_output_layer_exists(context, canvas_id, canvas, name));
+    let wetness_name = dynamic_paint_wet_output_name(surface)
+        .filter(|name| dynamic_paint_output_layer_exists(context, canvas_id, canvas, name));
+    let Some(paint_frame) = paint_frame else {
+        return Ok(DynamicPaintOutput {
+            output_name,
+            values: DynamicPaintValues::Colors(Arc::new(vec![[0.0; 4]; canvas.vertices.len()])),
+            wetness_output: wetness_name
+                .map(|name| (name, Arc::new(vec![0.0; canvas.vertices.len()]))),
+        });
+    };
+    let start = dynamic_paint_integer_frame(
+        setting_number(
+            surface,
+            "frame_start",
+            1.0,
+            "dynamic-paint surface",
+            "an integer frame",
+        )?,
+        "frame_start",
+    )?;
+    let end = dynamic_paint_integer_frame(
+        setting_number(
+            surface,
+            "frame_end",
+            250.0,
+            "dynamic-paint surface",
+            "an integer frame",
+        )?,
+        "frame_end",
+    )?;
+    let target = dynamic_paint_integer_frame(paint_frame.floor(), "evaluation frame")?;
+    if start > end || target < start {
+        return Ok(DynamicPaintOutput {
+            output_name,
+            values: DynamicPaintValues::Colors(Arc::new(vec![[0.0; 4]; canvas.vertices.len()])),
+            wetness_output: wetness_name
+                .map(|name| (name, Arc::new(vec![0.0; canvas.vertices.len()]))),
+        });
+    }
+    let target = target.min(end);
+    let frame_count = target
+        .checked_sub(start)
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| u64::try_from(count).ok())
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::LimitExceeded,
+                "dynamic-paint frame range overflows",
+            )
+        })?;
+    if frame_count > MAX_DYNAMIC_PAINT_FRAMES {
+        return Err(PotError::new(
+            ErrorCode::LimitExceeded,
+            "dynamic-paint paint frame range exceeds limits",
+        ));
+    }
+    let cache_key =
+        dynamic_paint_hold_cache_key(context, canvas_id, scene_hash, end as f64, modifier_prefix)?;
+    if let Some(state) = hold_cache.paint_entries.get(&cache_key)
+        && state.frame == target
+    {
+        if stack_mesh_is_current && paint_frame < context.frame {
+            validate_dynamic_paint_held_layout(canvas, &state.vertex_ids)?;
+        }
+        let colors = dynamic_paint::paint_output(&state.points);
+        return Ok(DynamicPaintOutput {
+            output_name,
+            values: DynamicPaintValues::Colors(Arc::new(colors)),
+            wetness_output: wetness_name.map(|name| {
+                (
+                    name,
+                    Arc::new(dynamic_paint::paint_wetness_output(&state.points)),
+                )
+            }),
+        });
+    }
+    let previous = hold_cache
+        .paint_entries
+        .get(&cache_key)
+        .filter(|state| state.frame >= start && state.frame < target);
+    let mut points: Arc<Vec<dynamic_paint::PaintPoint>> = previous.map_or_else(
+        || {
+            Arc::new(vec![
+                dynamic_paint::PaintPoint::default();
+                canvas.vertices.len()
+            ])
+        },
+        |state| Arc::clone(&state.points),
+    );
+    let mut vertex_ids = previous.map(|state| state.vertex_ids.clone());
+    let first_frame = previous
+        .and_then(|state| state.frame.checked_add(1))
+        .unwrap_or(start);
+    let use_drying = bool_setting(surface, "use_drying", true, "dynamic-paint surface")?;
+    let dry_speed = setting_number(
+        surface,
+        "dry_speed",
+        500.0,
+        "dynamic-paint surface",
+        "a finite number",
+    )? as f32;
+    let dry_log = bool_setting(surface, "use_dry_log", true, "dynamic-paint surface")?;
+    let color_dry_threshold = setting_number(
+        surface,
+        "color_dry_threshold",
+        1.0,
+        "dynamic-paint surface",
+        "a finite number",
+    )? as f32;
+    let use_dissolve = bool_setting(surface, "use_dissolve", false, "dynamic-paint surface")?;
+    let dissolve_speed = setting_number(
+        surface,
+        "dissolve_speed",
+        250.0,
+        "dynamic-paint surface",
+        "a finite number",
+    )? as f32;
+    let dissolve_log = bool_setting(surface, "use_dissolve_log", true, "dynamic-paint surface")?;
+    let influence_scale = setting_number(
+        surface,
+        "brush_influence_scale",
+        1.0,
+        "dynamic-paint surface",
+        "a finite nonnegative number",
+    )? as f32;
+    for frame in first_frame..=target {
+        let frame_value = frame as f64;
+        let matrices = scene_world_matrices_at(context, frame_value)?;
+        let paint_context = FrameContext {
+            frame: frame_value,
+            matrices: &matrices,
+            ..*context
+        };
+        let mut snapshot =
+            dynamic_paint_mesh_snapshot(&paint_context, canvas_id, frame_value, modifier_prefix)?;
+        let paint_mesh = snapshot.meshes.remove(canvas_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint canvas mesh is missing at its paint frame",
+                json!({"node_id":canvas_id,"frame":frame_value}),
+            )
+        })?;
+        if let Some(expected_ids) = vertex_ids.as_deref() {
+            if !same_vertex_ids(&paint_mesh, expected_ids) {
+                return Err(dynamic_paint_topology_error());
+            }
+        } else {
+            vertex_ids = Some(paint_mesh.vertices.iter().map(|vertex| vertex.id).collect());
+            points = Arc::new(vec![
+                dynamic_paint::PaintPoint::default();
+                paint_mesh.vertices.len()
+            ]);
+        }
+        if points.len() != paint_mesh.vertices.len() {
+            return Err(dynamic_paint_topology_error());
+        }
+        let mut brushes = dynamic_paint_brush_settings(&paint_context, settings, false)?;
+        let canvas_matrix = matrices.get(canvas_id).copied().ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "dynamic-paint canvas transform is missing at its paint frame",
+                json!({"node_id":canvas_id,"frame":frame_value}),
+            )
+        })?;
+        prepare_dynamic_paint_volume_brushes(
+            &paint_context,
+            &paint_mesh,
+            canvas_matrix,
+            &mut brushes,
+        )?;
+        dynamic_paint::paint_step(
+            &paint_mesh,
+            canvas_matrix,
+            &brushes,
+            Arc::make_mut(&mut points).as_mut_slice(),
+            dynamic_paint::PaintSettings {
+                influence_scale,
+                use_drying,
+                dry_speed,
+                dry_log,
+                color_dry_threshold,
+                use_dissolve,
+                dissolve_speed,
+                dissolve_log,
+            },
+        )?;
+    }
+    let vertex_ids = vertex_ids.unwrap_or_default();
+    if stack_mesh_is_current && paint_frame < context.frame {
+        validate_dynamic_paint_held_layout(canvas, &vertex_ids)?;
+    }
+    hold_cache.paint_entries.insert(
+        cache_key,
+        DynamicPaintPaintState {
+            frame: target,
+            vertex_ids,
+            points: Arc::clone(&points),
+        },
+    );
+    let colors = dynamic_paint::paint_output(&points);
+    Ok(DynamicPaintOutput {
+        output_name,
+        values: DynamicPaintValues::Colors(Arc::new(colors)),
+        wetness_output: wetness_name
+            .map(|name| (name, Arc::new(dynamic_paint::paint_wetness_output(&points)))),
+    })
+}
+
+/// PAINT/VERTEX color and wetness and WEIGHT/VERTEX values replay each integer frame and hold after
+/// `frame_end`; PAINT drying and dissolve advance before each frame's brush updates.
 fn paint_canvas(
     context: &FrameContext<'_>,
     canvas_id: &Id,
@@ -2887,7 +3536,6 @@ fn paint_canvas(
     evaluation: DynamicPaintEvaluation<'_>,
 ) -> Result<DynamicPaintOutput> {
     validate_dynamic_paint_canvas(settings)?;
-    validate_dynamic_paint_wet_output(context, canvas_id, canvas, settings)?;
     let DynamicPaintEvaluation {
         scene_hash,
         modifier_prefix,
@@ -2930,6 +3578,22 @@ fn paint_canvas(
             hold_cache,
         );
     }
+    if let Some(paint_surface) = surface
+        .filter(|surface| setting_string(surface, "surface_type").unwrap_or("PAINT") == "PAINT")
+    {
+        return paint_dynamic_paint_paint(
+            context,
+            canvas_id,
+            canvas,
+            settings,
+            paint_surface,
+            paint_frame,
+            scene_hash,
+            modifier_prefix,
+            stack_mesh_is_current,
+            hold_cache,
+        );
+    }
     let cache_key = match (paint_frame, frame_end) {
         (Some(paint_frame), Some(frame_end)) if paint_frame < context.frame => {
             Some(dynamic_paint_hold_cache_key(
@@ -2956,7 +3620,7 @@ fn paint_canvas(
         paint_frame.is_some() && (held_frame || (!stack_mesh_is_current && modifier_prefix > 0));
     let frame_mesh = if needs_frame_mesh {
         let mut snapshot =
-            dynamic_paint_canvas_snapshot(context, canvas_id, geometry_frame, modifier_prefix)?;
+            dynamic_paint_mesh_snapshot(context, canvas_id, geometry_frame, modifier_prefix)?;
         Some(snapshot.meshes.remove(canvas_id).ok_or_else(|| {
             PotError::with_details(
                 ErrorCode::EvaluationFailed,
@@ -2978,6 +3642,7 @@ fn paint_canvas(
         return Ok(DynamicPaintOutput {
             output_name,
             values: DynamicPaintValues::Colors(Arc::new(vec![[0.0; 4]; paint_mesh.vertices.len()])),
+            wetness_output: None,
         });
     };
     let paint_matrices;
@@ -3007,6 +3672,13 @@ fn paint_canvas(
         .get("canvas_surfaces")
         .and_then(Value::as_array)
         .and_then(|surfaces| surfaces.first());
+    if surface.is_none() && brushes.iter().any(|brush| brush.volume_mask.is_some()) {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "VOLUME brush meshes require an explicit Dynamic Paint surface",
+            json!({"feature_id":"physics.dynamic_paint_canvas.volume_without_surface","status":"not_supported"}),
+        ));
+    }
     let radius_scale = surface
         .and_then(|surface| setting_f64(surface, "brush_radius_scale"))
         .unwrap_or(1.0);
@@ -3051,6 +3723,7 @@ fn paint_canvas(
     let output = DynamicPaintOutput {
         output_name,
         values: DynamicPaintValues::Colors(Arc::new(colors)),
+        wetness_output: None,
     };
     if let Some(key) = cache_key {
         hold_cache.entries.insert(
@@ -3064,11 +3737,12 @@ fn paint_canvas(
     Ok(output)
 }
 
-fn write_dynamic_paint_color_layer(
+pub(crate) fn write_dynamic_paint_color_layer(
     mesh: &mut Mesh,
     name: &str,
     colors: &[[f64; 4]],
     default_domain: crate::geom::color_layers::ColorDomain,
+    set_render: bool,
 ) -> Result<()> {
     if colors.len() != mesh.vertices.len() {
         return Err(PotError::new(
@@ -3122,10 +3796,18 @@ fn write_dynamic_paint_color_layer(
         domain,
         values,
     });
-    store.active = Some(name.to_owned());
-    store.render = Some(name.to_owned());
+    if set_render {
+        store.active = Some(name.to_owned());
+        store.render = Some(name.to_owned());
+    }
     crate::geom::color_layers::write(mesh, &store);
     Ok(())
+}
+pub(crate) fn dynamic_paint_wetness_colors(wetness: &[f64]) -> Vec<[f64; 4]> {
+    wetness
+        .iter()
+        .map(|value| dynamic_paint::wetness_color_attribute(*value))
+        .collect()
 }
 fn write_dynamic_paint_weight_group(mesh: &mut Mesh, name: &str, weights: &[f64]) -> Result<()> {
     if weights.len() != mesh.vertices.len()

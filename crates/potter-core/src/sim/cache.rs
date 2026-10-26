@@ -233,6 +233,10 @@ fn valid_result(result: &SimulationResult, key: &str) -> bool {
             .values()
             .all(|colors| colors.iter().flatten().all(|value| value.is_finite()))
         && result
+            .paint_wetness
+            .values()
+            .all(|values| values.iter().all(|value| value.is_finite()))
+        && result
             .paint_weights
             .values()
             .all(|weights| weights.iter().all(|value| value.is_finite()))

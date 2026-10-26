@@ -39,7 +39,6 @@ const EXPECTED_PHYSICS_LOSSES: &[&str] = &[
     "blender.physics.collision.friction_random",
     "blender.physics.collision.permeability",
     "blender.physics.collision.use_particle_kill",
-    "blender.physics.dynamic_paint_brush.paint_wetness",
     "blender.physics.dynamic_paint_brush.smudge_strength",
     "blender.physics.dynamic_paint_brush.use_paint_erase",
     "blender.physics.dynamic_paint_brush.use_smudge",
@@ -47,9 +46,6 @@ const EXPECTED_PHYSICS_LOSSES: &[&str] = &[
     "blender.physics.dynamic_paint_brush.velocity_max",
     "blender.physics.dynamic_paint_brush.wave_factor",
     "blender.physics.dynamic_paint_brush.wave_type",
-    "blender.physics.dynamic_paint_surface.dissolve_speed",
-    "blender.physics.dynamic_paint_surface.dry_speed",
-    "blender.physics.dynamic_paint_surface.use_dissolve",
     "blender.physics.fluid_domain_liquid.cache_data_format",
     "blender.physics.fluid_domain_liquid.cache_frame_offset",
     "blender.physics.fluid_domain_liquid.cache_mesh_format",
@@ -1548,5 +1544,134 @@ fn assert_dynamic_paint_role_transitions(
             .as_bool()
             .unwrap()
     );
+    Ok(())
+}
+
+#[test]
+fn dynamic_paint_export_refuses_only_the_legacy_brush_marker() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let project = root.join("legacy_parented_brush");
+    pot_json(&["init", project.to_str().unwrap()])?;
+
+    let batch_path = root.join("create_parented_brush.json");
+    fs::write(
+        &batch_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "base_revision": 0,
+            "operations": [
+                {"op": "node.create", "id": "parent", "kind": "empty"},
+                {
+                    "op": "node.create",
+                    "id": "brush",
+                    "kind": "box",
+                    "parent": "parent",
+                    "params": {"size": 0.1}
+                },
+                {
+                    "op": "physics.dynamic_paint.create",
+                    "target": {"id": "brush"},
+                    "settings": {
+                        "role": "brush",
+                        "paint_source": "POINT",
+                        "paint_distance": 0.4,
+                        "proximity_falloff": "CONSTANT"
+                    }
+                }
+            ]
+        }))?,
+    )?;
+    pot_json(&[
+        "apply",
+        project.to_str().unwrap(),
+        "--file",
+        batch_path.to_str().unwrap(),
+    ])?;
+
+    let scene_path = project.join("scene.json");
+    let mut scene: Value = serde_json::from_slice(&fs::read(&scene_path)?)?;
+    assert_eq!(scene["nodes"]["brush"]["parent"], "parent");
+    let settings = scene["nodes"]["brush"]["properties"]["physics_dynamic_paint"]
+        .as_object_mut()
+        .unwrap();
+    assert_eq!(settings["paint_source"], "POINT");
+    settings.remove("paint_source");
+    settings.insert("radius".to_owned(), json!(0.4));
+    scene["schema_version"] = json!(9);
+    fs::write(&scene_path, serde_json::to_vec(&scene)?)?;
+
+    let output_path = root.join("legacy_parented_brush.blend");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pot"));
+    command
+        .args([
+            "export",
+            project.to_str().unwrap(),
+            "--format",
+            "blend",
+            "--out",
+        ])
+        .arg(&output_path)
+        .arg("--json");
+    let failure = run_guarded(command)?;
+    assert!(
+        !failure.status.success(),
+        "legacy parented Dynamic Paint brush export must be refused"
+    );
+    let failure: Value = serde_json::from_slice(&failure.stdout)?;
+    assert_eq!(failure["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        failure["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_brush.legacy_transform"
+    );
+
+    // Only the Potter marker is refused; Blender-only sources such as Proximity still round-trip.
+    let Some(blender) = blender() else {
+        eprintln!("skipping Dynamic Paint brush source round-trip; Blender is unavailable");
+        return Ok(());
+    };
+    let brush = scene["nodes"]["brush"]["properties"]["physics_dynamic_paint"]
+        .as_object_mut()
+        .unwrap();
+    brush.remove("radius");
+    brush.insert("paint_source".to_owned(), json!("DISTANCE"));
+    fs::write(&scene_path, serde_json::to_vec(&scene)?)?;
+    pot_json(&[
+        "export",
+        project.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--out",
+        output_path.to_str().unwrap(),
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let reopened = root.join("reopened");
+    pot_json(&["init", reopened.to_str().unwrap()])?;
+    pot_json(&[
+        "import",
+        reopened.to_str().unwrap(),
+        "--file",
+        output_path.to_str().unwrap(),
+        "--format",
+        "blend",
+        "--allow-lossy",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().unwrap(),
+    ])?;
+    let reopened_scene: Value = serde_json::from_slice(&fs::read(reopened.join("scene.json"))?)?;
+    let brush_source = reopened_scene["nodes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find_map(|node| {
+            let settings = &node["properties"]["physics_dynamic_paint"];
+            (settings["role"] == "brush").then(|| settings["paint_source"].clone())
+        });
+    assert_eq!(brush_source, Some(json!("DISTANCE")));
     Ok(())
 }

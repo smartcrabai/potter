@@ -133,10 +133,18 @@ pub(crate) fn honoured_properties(system: &str) -> &'static [&'static str] {
             "frame_start",
             "frame_end",
             "output_name_a",
+            "output_name_b",
             "use_output_a",
             "brush_radius_scale",
             "brush_influence_scale",
             "brush_collection",
+            "use_dissolve",
+            "dissolve_speed",
+            "use_dissolve_log",
+            "use_drying",
+            "dry_speed",
+            "use_dry_log",
+            "color_dry_threshold",
         ],
         "dynamic_paint_brush" => &["paint_color", "paint_alpha", "paint_distance"],
         _ => &[],
@@ -175,7 +183,14 @@ pub(crate) fn is_honoured_property(
                 if setting
                     .get(property)
                     .and_then(Value::as_str)
-                    .is_some_and(|falloff| matches!(falloff, "SMOOTH" | "CONSTANT")) =>
+                    .is_some_and(|falloff| {
+                        matches!(falloff, "SMOOTH" | "CONSTANT")
+                            || setting
+                                .get("paint_source")
+                                .and_then(Value::as_str)
+                                .unwrap_or("VOLUME")
+                                == "VOLUME"
+                    }) =>
             {
                 return true;
             }
@@ -183,21 +198,109 @@ pub(crate) fn is_honoured_property(
         }
     }
     if system == "dynamic_paint_brush"
-        && property == "paint_source"
-        && setting.get(property).and_then(Value::as_str) == Some("POINT")
+        && property == "proximity_falloff"
+        && setting
+            .get("paint_source")
+            .and_then(Value::as_str)
+            .unwrap_or("VOLUME")
+            == "VOLUME"
+        && setting.get(property).and_then(Value::as_str).is_some()
     {
         return true;
     }
-    if system == "dynamic_paint_surface"
-        && setting.get("surface_type").and_then(Value::as_str) == Some("WEIGHT")
-        && matches!(
-            property,
-            "use_dissolve" | "dissolve_speed" | "use_dissolve_log"
-        )
+    if system == "dynamic_paint_brush"
+        && property == "paint_source"
+        && setting
+            .get(property)
+            .and_then(Value::as_str)
+            .is_some_and(|source| matches!(source, "POINT" | "VOLUME"))
     {
         return true;
+    }
+    if system == "dynamic_paint_surface" {
+        let surface_type = setting
+            .get("surface_type")
+            .and_then(Value::as_str)
+            .unwrap_or("PAINT");
+        if surface_type == "WEIGHT"
+            && matches!(
+                property,
+                "use_dissolve" | "dissolve_speed" | "use_dissolve_log"
+            )
+        {
+            return true;
+        }
+        if surface_type == "PAINT"
+            && matches!(
+                property,
+                "use_drying"
+                    | "dry_speed"
+                    | "use_dry_log"
+                    | "color_dry_threshold"
+                    | "use_dissolve"
+                    | "dissolve_speed"
+                    | "use_dissolve_log"
+            )
+        {
+            return true;
+        }
+        if surface_type == "PAINT" && property == "output_name_b" {
+            return true;
+        }
     }
     honoured_properties(system).contains(&property)
+}
+/// Dynamic Paint brush settings whose meaning depends on selecting the brush for a PAINT surface.
+pub(crate) fn is_honoured_dynamic_paint_brush_property(
+    system: &str,
+    property: &str,
+    setting: &Map<String, Value>,
+    weight_brush_used: bool,
+    paint_brush_used: bool,
+) -> bool {
+    if system == "dynamic_paint_brush" && paint_brush_used {
+        let paint_source = setting
+            .get("paint_source")
+            .and_then(Value::as_str)
+            .unwrap_or("VOLUME");
+        if paint_source == "VOLUME" {
+            match property {
+                "paint_wetness" if setting.get(property).and_then(Value::as_f64).is_some() => {
+                    return true;
+                }
+                "use_absolute_alpha"
+                    if setting.get(property).and_then(Value::as_bool).is_some() =>
+                {
+                    return true;
+                }
+                "proximity_falloff" if setting.get(property).and_then(Value::as_str).is_some() => {
+                    return true;
+                }
+                _ => {}
+            }
+        } else if paint_source == "POINT" {
+            match property {
+                "paint_wetness" if setting.get(property).and_then(Value::as_f64).is_some() => {
+                    return true;
+                }
+                "use_absolute_alpha"
+                    if setting.get(property).and_then(Value::as_bool).is_some() =>
+                {
+                    return true;
+                }
+                "proximity_falloff"
+                    if setting
+                        .get(property)
+                        .and_then(Value::as_str)
+                        .is_some_and(|falloff| matches!(falloff, "SMOOTH" | "CONSTANT")) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    is_honoured_property(system, property, setting, weight_brush_used)
 }
 
 /// Blender 5.2.2 default for `property` of `system`, as generated from a fresh instance.
@@ -260,6 +363,9 @@ pub(crate) fn is_semantic_when(system: &str, property: &str, setting: &Map<Strin
     if is_runtime_state(system, property) {
         return false;
     }
+    if system == "dynamic_paint_surface" && property == "use_output_b" {
+        return false;
+    }
     if system == "dynamic_paint_surface"
         && setting.get("surface_type").and_then(Value::as_str) == Some("WEIGHT")
         && matches!(
@@ -272,7 +378,6 @@ pub(crate) fn is_semantic_when(system: &str, property: &str, setting: &Map<Strin
                 | "init_layername"
                 | "init_texture"
                 | "output_name_b"
-                | "use_output_b"
         )
     {
         return false;
@@ -473,8 +578,9 @@ mod tests {
 
     use super::{
         PHYSICS_SYSTEMS, blender_default, fluid_domain_system, has_generated_defaults,
-        honoured_properties, is_blender_property, is_default_value, is_honoured_property,
-        is_runtime_state, is_semantic_when, reject_unhonoured,
+        honoured_properties, is_blender_property, is_default_value,
+        is_honoured_dynamic_paint_brush_property, is_honoured_property, is_runtime_state,
+        is_semantic_when, reject_unhonoured,
     };
 
     #[test]
@@ -554,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_paint_weight_honours_dissolve_but_not_paint_drying() {
+    fn dynamic_paint_surface_drying_dissolve_and_wetness_output_are_paint_features() {
         let weight = json!({
             "surface_type": "WEIGHT",
             "use_dissolve": true,
@@ -574,12 +680,99 @@ mod tests {
             "use_drying",
             &weight
         ));
-        let paint = json!({"surface_type": "PAINT", "use_dissolve": true});
+        let paint = json!({
+            "surface_type": "PAINT",
+            "use_dissolve": true,
+            "use_drying": true,
+            "use_output_b": true,
+            "output_name_b": "Wetness"
+        });
         let paint = paint.as_object().cloned().unwrap_or_default();
-        assert!(!is_honoured_property(
-            "dynamic_paint_surface",
+        for property in [
             "use_dissolve",
-            &paint,
+            "dissolve_speed",
+            "use_drying",
+            "dry_speed",
+            "color_dry_threshold",
+            "output_name_b",
+        ] {
+            assert!(is_honoured_property(
+                "dynamic_paint_surface",
+                property,
+                &paint,
+                false
+            ));
+        }
+        let unused_output = json!({
+            "surface_type":"PAINT",
+            "use_output_b":false,
+            "output_name_b":"Unused"
+        });
+        let unused_output = unused_output.as_object().cloned().unwrap_or_default();
+        assert!(!is_semantic_when(
+            "dynamic_paint_surface",
+            "use_output_b",
+            &unused_output
+        ));
+        assert!(is_semantic_when(
+            "dynamic_paint_surface",
+            "output_name_b",
+            &unused_output
+        ));
+    }
+
+    #[test]
+    fn dynamic_paint_volume_brush_honours_color_and_wetness_but_ignores_distance_and_falloff() {
+        let brush = json!({
+            "paint_source":"POINT",
+            "paint_wetness":0.4,
+            "use_absolute_alpha":false,
+            "proximity_falloff":"CONSTANT"
+        });
+        let brush = brush.as_object().cloned().unwrap_or_default();
+        for property in ["paint_wetness", "use_absolute_alpha", "proximity_falloff"] {
+            assert!(is_honoured_dynamic_paint_brush_property(
+                "dynamic_paint_brush",
+                property,
+                &brush,
+                false,
+                true
+            ));
+            assert!(!is_honoured_dynamic_paint_brush_property(
+                "dynamic_paint_brush",
+                property,
+                &brush,
+                false,
+                false
+            ));
+        }
+        let volume = json!({
+            "paint_source":"VOLUME",
+            "paint_wetness":0.4,
+            "use_absolute_alpha":false,
+            "proximity_falloff":"RAMP"
+        });
+        let volume = volume.as_object().cloned().unwrap_or_default();
+        for property in [
+            "paint_color",
+            "paint_alpha",
+            "paint_distance",
+            "paint_wetness",
+            "use_absolute_alpha",
+            "proximity_falloff",
+        ] {
+            assert!(is_honoured_dynamic_paint_brush_property(
+                "dynamic_paint_brush",
+                property,
+                &volume,
+                false,
+                true
+            ));
+        }
+        assert!(is_honoured_property(
+            "dynamic_paint_brush",
+            "proximity_falloff",
+            &volume,
             false
         ));
     }
@@ -595,7 +788,7 @@ mod tests {
         ));
         let volume = json!({"paint_source": "VOLUME"});
         let volume = volume.as_object().cloned().unwrap_or_default();
-        assert!(!is_honoured_property(
+        assert!(is_honoured_property(
             "dynamic_paint_brush",
             "paint_source",
             &volume,
@@ -605,6 +798,7 @@ mod tests {
     #[test]
     fn dynamic_paint_erase_and_constant_falloff_are_honoured_only_for_used_weight_brushes() {
         let brush = json!({
+            "paint_source":"POINT",
             "use_paint_erase": true,
             "proximity_falloff": "CONSTANT"
         });
@@ -623,7 +817,7 @@ mod tests {
                 false
             ));
         }
-        let smooth = json!({"proximity_falloff": "SMOOTH"});
+        let smooth = json!({"paint_source":"POINT","proximity_falloff":"SMOOTH"});
         let smooth = smooth.as_object().cloned().unwrap_or_default();
         assert!(is_honoured_property(
             "dynamic_paint_brush",

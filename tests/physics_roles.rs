@@ -218,7 +218,7 @@ fn dynamic_paint_role_and_ui_type_stay_consistent_on_every_write_path() {
 }
 
 #[test]
-fn legacy_dynamic_paint_ui_mismatch_evaluates_from_stored_role_without_rewriting() {
+fn legacy_dynamic_paint_ui_mismatch_migrates_canvas_radius_without_rewriting_ui_type() {
     let directory = tempdir().unwrap();
     let scene = directory.path().join("legacy-dynamic-paint");
     init(&scene);
@@ -229,12 +229,17 @@ fn legacy_dynamic_paint_ui_mismatch_evaluates_from_stored_role_without_rewriting
             {"op":"node.create","id":"canvas","kind":"grid","params":{"size":1.0,"x_subdivisions":2,"y_subdivisions":2}},
             {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1}},
             {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas"}},
-            {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush"}}
+            {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_source":"POINT"}}
         ]),
     );
     let mut document = scene_document(&scene);
     document["nodes"]["canvas"]["modifiers"][0]["params"]["ui_type"] = json!("BRUSH");
     document["nodes"]["brush"]["modifiers"][0]["params"]["ui_type"] = json!("CANVAS");
+    document["schema_version"] = json!(9);
+    let brush_settings = document["nodes"]["brush"]["properties"]["physics_dynamic_paint"]
+        .as_object_mut()
+        .unwrap();
+    let _ = brush_settings.remove("paint_source");
     fs::write(
         scene.join("scene.json"),
         serde_json::to_vec(&document).unwrap(),
@@ -256,7 +261,22 @@ fn legacy_dynamic_paint_ui_mismatch_evaluates_from_stored_role_without_rewriting
             .iter()
             .any(|color| color[3].as_f64().unwrap() > 0.0)
     );
+    apply_ok(
+        &scene,
+        1,
+        &json!([{"op":"node.create","id":"migration_commit","kind":"empty","params":{}}]),
+    );
     let after = scene_document(&scene);
+    assert_eq!(after["schema_version"], 10);
+    assert_eq!(
+        after["nodes"]["brush"]["properties"]["physics_dynamic_paint"]["paint_source"],
+        "POINT"
+    );
+    assert!(
+        after["nodes"]["brush"]["properties"]["physics_dynamic_paint"]
+            .get("radius")
+            .is_none()
+    );
     assert_eq!(
         after["nodes"]["canvas"]["properties"]["physics_dynamic_paint"]["role"],
         "canvas"
@@ -273,6 +293,232 @@ fn legacy_dynamic_paint_ui_mismatch_evaluates_from_stored_role_without_rewriting
         after["nodes"]["brush"]["modifiers"][0]["params"]["ui_type"],
         "CANVAS"
     );
+}
+#[test]
+fn volume_dynamic_paint_rejects_native_radius_in_operations_and_loaded_settings() {
+    let directory = tempdir().unwrap();
+    let operation_scene = directory.path().join("dynamic-paint-radius-operation");
+    init(&operation_scene);
+    apply_ok(
+        &operation_scene,
+        0,
+        &json!([{"op":"node.create","id":"brush","kind":"box","params":{"size":1.0}}]),
+    );
+    let rejected = apply(
+        &operation_scene,
+        1,
+        &json!([{
+            "op":"physics.dynamic_paint.create",
+            "target":{"id":"brush"},
+            "settings":{"role":"brush","paint_source":"VOLUME","radius":2.0}
+        }]),
+    );
+    assert!(!rejected.status.success());
+    assert_eq!(response(&rejected)["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        response(&rejected)["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_brush.radius"
+    );
+
+    let stored_scene = directory.path().join("dynamic-paint-radius-stored");
+    init(&stored_scene);
+    apply_ok(
+        &stored_scene,
+        0,
+        &json!([
+            {"op":"node.create","id":"canvas","kind":"grid","params":{"size":1.0,"x_subdivisions":2,"y_subdivisions":2}},
+            {"op":"node.create","id":"brush","kind":"box","params":{"size":1.0}},
+            {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_source":"VOLUME"}},
+            {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"],"radius":2.0}}
+        ]),
+    );
+    let mut document = scene_document(&stored_scene);
+    document["nodes"]["brush"]["properties"]["physics_dynamic_paint"]["radius"] = json!(2.0);
+    fs::write(
+        stored_scene.join("scene.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    let output = pot()
+        .arg("bake")
+        .arg(&stored_scene)
+        .arg("--kind")
+        .arg("simulation")
+        .arg("--frames")
+        .arg("1:1")
+        .arg("--out")
+        .arg(directory.path().join("dynamic-paint-radius-bake"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(response(&output)["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        response(&output)["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_brush.radius"
+    );
+}
+
+#[test]
+fn volume_dynamic_paint_without_canvas_surface_fails_bake_with_unsupported_feature() {
+    let directory = tempdir().unwrap();
+    let scene = directory
+        .path()
+        .join("dynamic-paint-volume-without-surface");
+    init(&scene);
+    apply_ok(
+        &scene,
+        0,
+        &json!([
+            {"op":"node.create","id":"canvas","kind":"grid","params":{"size":1.0,"x_subdivisions":2,"y_subdivisions":2}},
+            {"op":"node.create","id":"brush","kind":"box","params":{"size":1.0}},
+            {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_source":"VOLUME"}},
+            {"op":"physics.dynamic_paint.create","target":{"id":"canvas"},"settings":{"role":"canvas","brushes":["brush"]}}
+        ]),
+    );
+    let output = pot()
+        .arg("bake")
+        .arg(&scene)
+        .arg("--kind")
+        .arg("simulation")
+        .arg("--frames")
+        .arg("1:1")
+        .arg("--out")
+        .arg(
+            directory
+                .path()
+                .join("dynamic-paint-volume-without-surface-bake"),
+        )
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result = response(&output);
+    assert_eq!(result["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        result["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_canvas.volume_without_surface"
+    );
+    let mut document = scene_document(&scene);
+    document["nodes"]["brush"]["properties"]["physics_dynamic_paint"]["radius"] = json!(2.0);
+    fs::write(
+        scene.join("scene.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    let output = pot()
+        .arg("bake")
+        .arg(&scene)
+        .arg("--kind")
+        .arg("simulation")
+        .arg("--frames")
+        .arg("1:1")
+        .arg("--out")
+        .arg(
+            directory
+                .path()
+                .join("dynamic-paint-volume-with-native-radius-bake"),
+        )
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result = response(&output);
+    assert_eq!(result["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        result["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_brush.radius"
+    );
+}
+
+#[test]
+fn parented_legacy_brush_loads_then_refuses_bake_until_source_is_fixed() {
+    let directory = tempdir().unwrap();
+    let scene = directory.path().join("parented-legacy-dynamic-paint");
+    init(&scene);
+    apply_ok(
+        &scene,
+        0,
+        &json!([
+            {"op":"node.create","id":"parent","kind":"empty","params":{},"transform":{"translation":[3.0,0.0,0.0]}},
+            {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1},"parent":"parent"},
+            {"op":"node.create","id":"canvas","kind":"grid","params":{"size":1.0,"x_subdivisions":2,"y_subdivisions":2}},
+            {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_source":"POINT"}}
+        ]),
+    );
+    let mut document = scene_document(&scene);
+    document["schema_version"] = json!(9);
+    let brush_settings = document["nodes"]["brush"]["properties"]["physics_dynamic_paint"]
+        .as_object_mut()
+        .unwrap();
+    let _ = brush_settings.remove("paint_source");
+    let _ = brush_settings.insert("radius".to_owned(), json!(1.0));
+    fs::write(
+        scene.join("scene.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+
+    let inspection = pot()
+        .arg("inspect")
+        .arg(&scene)
+        .arg("--id")
+        .arg("brush")
+        .arg("--frame")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        inspection.status.success(),
+        "inspect should open the legacy project: {}",
+        String::from_utf8_lossy(&inspection.stdout)
+    );
+
+    apply_ok(
+        &scene,
+        1,
+        &json!([{
+            "op":"physics.dynamic_paint.create",
+            "target":{"id":"canvas"},
+            "settings":{"role":"canvas","brushes":["brush"]}
+        }]),
+    );
+    let rejected = pot()
+        .arg("bake")
+        .arg(&scene)
+        .arg("--kind")
+        .arg("simulation")
+        .arg("--frames")
+        .arg("1:1")
+        .arg("--out")
+        .arg(directory.path().join("parented-legacy-dynamic-paint-bake"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert_eq!(response(&rejected)["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        response(&rejected)["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_brush.legacy_transform"
+    );
+
+    apply_ok(
+        &scene,
+        2,
+        &json!([{
+            "op":"physics.dynamic_paint.update",
+            "target":{"id":"brush"},
+            "set":{"paint_source":"POINT"}
+        }]),
+    );
+    let frame = bake(
+        &scene,
+        &directory.path().join("fixed-parented-dynamic-paint-bake"),
+        "1:1",
+        0,
+    );
+    assert!(frame["paint_colors"]["canvas"].is_array());
 }
 
 #[test]

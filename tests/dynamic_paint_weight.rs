@@ -395,6 +395,49 @@ fn dynamic_paint_weight_bake_matches_blender_history_and_vertex_weight_edit_stac
             .any(|weight| weight.as_f64().is_some_and(|weight| weight > 0.0)),
         "the parented, delta-offset POINT brush must paint at its local location"
     );
+    let volume = &canvases["CanvasVolume"];
+    let volume_brush = &committed_oracle["brushes"]["volume"];
+    assert_eq!(volume_brush["source"], "VOLUME");
+    assert_eq!(volume_brush["proximity_falloff"], "RAMP");
+    assert_close(
+        0.001,
+        number(&volume_brush["distance"], "volume paint distance")?,
+        1.0e-6,
+        "volume paint distance is ignored",
+    );
+    assert_eq!(volume_brush["locations"]["1"], json!([-2.0, 0.0, 0.0]));
+    assert_eq!(volume_brush["locations"]["2"], json!([-1.0, 0.0, 0.0]));
+    let volume_frame1 = volume["frames"]["1"]["weights"]
+        .as_array()
+        .ok_or("volume frame 1 weights are missing")?;
+    assert!(
+        volume_frame1
+            .iter()
+            .any(|weight| weight.as_f64().is_some_and(|weight| weight > 0.0))
+            && volume_frame1.iter().any(|weight| weight
+                .as_f64()
+                .is_some_and(|weight| weight.abs() <= WEIGHT_TOLERANCE)),
+        "the VOLUME brush must cover only part of the WEIGHT canvas"
+    );
+    assert_ne!(
+        volume["frames"]["1"]["weights"], volume["frames"]["2"]["weights"],
+        "moving the VOLUME brush mesh must change its coverage"
+    );
+    let volume_max = volume_frame1
+        .iter()
+        .filter_map(Value::as_f64)
+        .fold(0.0_f64, f64::max);
+    let expected_volume_strength = number(&volume_brush["paint_alpha"], "volume brush alpha")?
+        * number(
+            &volume["surface"]["brush_influence_scale"],
+            "volume surface influence scale",
+        )?;
+    assert_close(
+        expected_volume_strength,
+        volume_max,
+        WEIGHT_TOLERANCE,
+        "VOLUME uses full inside influence before brush alpha and surface scaling",
+    );
 
     let point_brush = &committed_oracle["brushes"]["point"];
     let erase_brush = &committed_oracle["brushes"]["erase"];
@@ -407,7 +450,7 @@ fn dynamic_paint_weight_bake_matches_blender_history_and_vertex_weight_edit_stac
     assert_eq!(erase_brush["proximity_falloff"], "CONSTANT");
     let project = directory.path().join("dynamic-paint-weight-project");
     checked_output(pot().args(["init"]).arg(&project).arg("--json"), "pot init")?;
-    checked_output(
+    let imported = run_pot_json(
         pot()
             .args(["import"])
             .arg(&project)
@@ -426,6 +469,23 @@ fn dynamic_paint_weight_bake_matches_blender_history_and_vertex_weight_edit_stac
             .arg("--json"),
         "strict pot import Blender Dynamic Paint fixture",
     )?;
+    let volume_brush_losses = [
+        "blender.physics.dynamic_paint_brush.paint_source",
+        "blender.physics.dynamic_paint_brush.paint_alpha",
+        "blender.physics.dynamic_paint_brush.paint_distance",
+        "blender.physics.dynamic_paint_brush.proximity_falloff",
+    ];
+    for loss in imported["result"]["losses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let feature = loss["feature_id"].as_str().unwrap_or_default();
+        assert!(
+            !volume_brush_losses.contains(&feature),
+            "supported VOLUME brush loss: {loss}"
+        );
+    }
 
     let roundtrip_blend = directory
         .path()

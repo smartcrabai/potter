@@ -352,6 +352,9 @@ pub struct Snapshot {
     /// Dynamic-paint colors evaluated for each canvas vertex.
     #[serde(skip)]
     pub paint_colors: BTreeMap<Id, Vec<[f64; 4]>>,
+    /// Dynamic-paint wetness evaluated for each canvas vertex.
+    #[serde(skip)]
+    pub paint_wetness: BTreeMap<Id, Vec<f64>>,
     /// Dynamic-paint weights evaluated for each canvas vertex.
     #[serde(skip)]
     pub paint_weights: BTreeMap<Id, Vec<f64>>,
@@ -1066,6 +1069,7 @@ impl Snapshot {
         let mut simulated_particles = BTreeMap::new();
         let mut fluid_particles = BTreeMap::new();
         let mut paint_colors = BTreeMap::new();
+        let mut paint_wetness = BTreeMap::new();
         let mut paint_weights = BTreeMap::new();
         let simulation_cache_key = simulation.as_ref().map(|result| result.cache_key.clone());
         let mut simulation_warnings = Vec::new();
@@ -1090,6 +1094,7 @@ impl Snapshot {
             fluid_surfaces = simulation.fluid_surfaces;
             fluid_particles = simulation.fluid_particles;
             paint_colors = simulation.paint_colors;
+            paint_wetness = simulation.paint_wetness;
             paint_weights = simulation.paint_weights;
             for (id, states) in simulation.particle_states {
                 simulated_particles.insert(id, states);
@@ -1302,17 +1307,91 @@ impl Snapshot {
                                 json!({"node_id":id}),
                             ));
                         }
+                        let surface = node
+                            .properties
+                            .get("physics_dynamic_paint")
+                            .and_then(|settings| settings.get("canvas_surfaces"))
+                            .and_then(Value::as_array)
+                            .and_then(|surfaces| surfaces.first());
+                        let output_name = surface
+                            .and_then(|surface| surface.get("output_name_a"))
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or(if surface.is_some() {
+                                "dp_paintmap"
+                            } else {
+                                "color"
+                            });
+                        let source_has_output_layer =
+                            data_block.mesh.as_ref().is_some_and(|mesh| {
+                                crate::geom::color_layers::has_blender_byte_color_corner_layer(
+                                    mesh,
+                                    output_name,
+                                )
+                            });
+                        if surface.is_none()
+                            || crate::geom::color_layers::has_blender_byte_color_corner_layer(
+                                &rigged_source,
+                                output_name,
+                            )
+                            || source_has_output_layer
+                        {
+                            let default_domain = if surface.is_some() {
+                                crate::geom::color_layers::ColorDomain::Corner
+                            } else {
+                                crate::geom::color_layers::ColorDomain::Point
+                            };
+                            crate::sim::write_dynamic_paint_color_layer(
+                                &mut rigged_source,
+                                output_name,
+                                colors,
+                                default_domain,
+                                true,
+                            )?;
+                        }
+                    }
+                    if !has_stack_modifier(gate, id, node, "dynamic_paint")
+                        && let Some(wetness) = paint_wetness.get(id)
+                    {
+                        if wetness.len() != rigged_source.vertices.len()
+                            || wetness.iter().any(|value| !value.is_finite())
+                        {
+                            return Err(PotError::with_details(
+                                ErrorCode::EvaluationFailed,
+                                "dynamic-paint wetness count or value is invalid",
+                                json!({"node_id":id}),
+                            ));
+                        }
                         let output_name = node
                             .properties
                             .get("physics_dynamic_paint")
                             .and_then(|settings| settings.get("canvas_surfaces"))
                             .and_then(Value::as_array)
                             .and_then(|surfaces| surfaces.first())
-                            .and_then(|surface| surface.get("output_name_a"))
+                            .and_then(|surface| surface.get("output_name_b"))
                             .and_then(Value::as_str)
                             .filter(|name| !name.is_empty())
-                            .unwrap_or("color");
-                        inject_dynamic_paint_colors(&mut rigged_source, output_name, colors);
+                            .unwrap_or("dp_wetmap");
+                        let default_domain = if node
+                            .properties
+                            .get("physics_dynamic_paint")
+                            .and_then(|settings| settings.get("canvas_surfaces"))
+                            .and_then(Value::as_array)
+                            .and_then(|surfaces| surfaces.first())
+                            .is_some()
+                        {
+                            crate::geom::color_layers::ColorDomain::Corner
+                        } else {
+                            crate::geom::color_layers::ColorDomain::Point
+                        };
+                        let colors = crate::sim::dynamic_paint_wetness_colors(wetness);
+                        crate::sim::write_dynamic_paint_color_layer(
+                            &mut rigged_source,
+                            output_name,
+                            &colors,
+                            default_domain,
+                            false,
+                        )?;
                     }
                     if !has_stack_modifier(gate, id, node, "dynamic_paint")
                         && let Some(weights) = paint_weights.get(id)
@@ -2354,6 +2433,7 @@ impl Snapshot {
             simulated_particles,
             fluid_particles,
             paint_colors,
+            paint_wetness,
             paint_weights,
             warnings: simulation_warnings
                 .into_iter()
@@ -7115,20 +7195,6 @@ fn append_collection_geometry<'a>(
     Ok(())
 }
 
-/// Injects one dynamic-paint color layer (one color per vertex, in storage order) into the
-/// evaluation copy and makes that named layer the render color layer.
-fn inject_dynamic_paint_colors(mesh: &mut Mesh, name: &str, colors: &[[f64; 4]]) {
-    let mut store = crate::geom::color_layers::read(mesh);
-    store.layers.retain(|layer| layer.name != name);
-    store.layers.push(crate::geom::color_layers::ColorLayer {
-        name: name.to_owned(),
-        domain: crate::geom::color_layers::ColorDomain::Point,
-        values: colors.to_vec(),
-    });
-    store.render = Some(name.to_owned());
-    crate::geom::color_layers::write(mesh, &store);
-}
-
 /// Instances copy each source's attributes, remapping the face- and edge-keyed shading ones.
 /// Particle copies: each template's attributes, with its face- and edge-keyed shading remapped.
 fn append_transformed_mesh(output: &mut Mesh, source: &Mesh, matrix: DMat4) -> Result<()> {
@@ -8591,7 +8657,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_paint_colors_become_the_render_point_layer() {
+    fn dynamic_paint_colors_preserve_the_existing_corner_layer_domain() {
         use crate::geom::color_layers::{self, ColorDomain, ColorLayer};
         let mut mesh = Mesh::box_mesh(BoxParams::default()).unwrap();
         let corners: usize = mesh.faces.iter().map(|face| face.vertices.len()).sum();
@@ -8606,16 +8672,38 @@ mod tests {
             .map(|index| [index as f64 / 10.0, 0.25, 0.0, 1.0])
             .collect();
 
-        super::inject_dynamic_paint_colors(&mut mesh, "color", &colors);
+        crate::sim::write_dynamic_paint_color_layer(
+            &mut mesh,
+            "color",
+            &colors,
+            ColorDomain::Point,
+            true,
+        )
+        .unwrap();
 
         let store = color_layers::read(&mesh);
         assert_eq!(store.render.as_deref(), Some("color"));
         let layer = &store.layers[store.index_of("color").unwrap()];
-        assert_eq!(layer.domain, ColorDomain::Point);
-        assert_eq!(layer.values, colors);
+        assert_eq!(layer.domain, ColorDomain::Corner);
+        let colors_by_vertex: std::collections::HashMap<_, _> = mesh
+            .vertices
+            .iter()
+            .zip(&colors)
+            .map(|(vertex, color)| (vertex.id, *color))
+            .collect();
+        let expected = mesh
+            .faces
+            .iter()
+            .flat_map(|face| {
+                face.vertices
+                    .iter()
+                    .map(|vertex_id| colors_by_vertex[vertex_id])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(layer.values, expected);
         assert_eq!(
             mesh.attributes["color"]["domain"],
-            serde_json::json!("point")
+            serde_json::json!("corner")
         );
         assert!(color_layers::validate(&mesh).is_ok());
     }

@@ -54,6 +54,7 @@ def make_brush(name, location):
     if bpy.ops.dpaint.type_toggle(type="BRUSH") != {"FINISHED"}:
         raise RuntimeError("Blender did not create a dynamic-paint brush")
     settings = modifier.brush_settings
+    settings.paint_source = "POINT"
     settings.paint_color = (1.0, 0.0, 0.0)
     settings.paint_alpha = 1.0
     settings.paint_distance = 0.2

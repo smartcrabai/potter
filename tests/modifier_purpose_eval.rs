@@ -285,8 +285,8 @@ fn hidden_physics_sources_respect_purpose_and_legacy_properties() -> TestResult 
             json!({"op":"physics.particle_emitter.create","target":{"id":"collision_emitter_legacy"},"settings":particle_settings}),
             json!({"op":"physics.collision.create","target":{"id":"collider_hidden"}}),
             json!({"op":"physics.collision.create","target":{"id":"collider_legacy"}}),
-            json!({"op":"physics.dynamic_paint.create","target":{"id":"brush_hidden"},"settings":{"role":"brush","radius":2.0,"strength":1.0}}),
-            json!({"op":"physics.dynamic_paint.create","target":{"id":"brush_legacy"},"settings":{"role":"brush","radius":2.0,"strength":1.0}}),
+            json!({"op":"physics.dynamic_paint.create","target":{"id":"brush_hidden"},"settings":{"role":"brush","paint_source":"POINT","radius":2.0,"strength":1.0}}),
+            json!({"op":"physics.dynamic_paint.create","target":{"id":"brush_legacy"},"settings":{"role":"brush","paint_source":"POINT","radius":2.0,"strength":1.0}}),
             json!({"op":"physics.dynamic_paint.create","target":{"id":"canvas_hidden"},"settings":{"role":"canvas","brushes":["brush_hidden"],"radius":2.0,"strength":1.0}}),
             json!({"op":"physics.dynamic_paint.create","target":{"id":"canvas_legacy"},"settings":{"role":"canvas","brushes":["brush_legacy"],"radius":2.0,"strength":1.0}}),
         ],
@@ -323,6 +323,15 @@ fn hidden_physics_sources_respect_purpose_and_legacy_properties() -> TestResult 
         }
     }
 
+    let mut legacy_scene = serde_json::to_value(&doc)?;
+    legacy_scene["schema_version"] = json!(9);
+    let legacy_settings =
+        legacy_scene["nodes"]["brush_legacy"]["properties"]["physics_dynamic_paint"]
+            .as_object_mut()
+            .ok_or("legacy Dynamic Paint settings are missing")?;
+    let _ = legacy_settings.remove("paint_source");
+    let _ = legacy_settings.insert("radius".to_owned(), json!(2.0));
+    doc = potter_core::model::parse_scene(&serde_json::to_vec(&legacy_scene)?, Path::new("."))?.doc;
     let context = |purpose| EvaluationContext {
         purpose,
         frame: Some(5.0),
