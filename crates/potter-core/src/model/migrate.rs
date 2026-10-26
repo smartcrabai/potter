@@ -92,12 +92,15 @@ fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> R
         None
     };
     let mut legacy_hash = if legacy { source_hash.clone() } else { None };
-    let warnings = upgrade_scene(&mut value, root)?;
+    let mut warnings = upgrade_scene(&mut value, root)?;
     let mut doc: SceneDoc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut doc)?;
     if source_schema_version.is_some_and(|version| version < 10) {
         let mut changed = crate::sim::migrate_dynamic_paint_output_layers(&mut doc)?;
-        changed |= crate::sim::migrate_dynamic_paint_brush_source(&mut doc)?;
+        let (brushes_changed, brush_warnings) =
+            crate::sim::migrate_dynamic_paint_brush_source(&mut doc);
+        changed |= brushes_changed;
+        warnings.extend(brush_warnings);
         if changed {
             legacy = true;
             legacy_hash = source_hash;
@@ -196,8 +199,9 @@ pub(crate) fn parse_history_record(
         serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut record.snapshot)?;
     if source_schema_version.is_some_and(|version| version < 10) {
-        crate::sim::migrate_dynamic_paint_output_layers(&mut record.snapshot)?;
-        crate::sim::migrate_dynamic_paint_brush_source(&mut record.snapshot)?;
+        let (_, brush_warnings) =
+            crate::sim::migrate_dynamic_paint_brush_source(&mut record.snapshot);
+        warnings.extend(brush_warnings);
     }
     Ok((record, warnings))
 }
@@ -2191,8 +2195,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_nine_native_brushes_with_nonlocal_transforms_refuse_point_migration() {
-        for transform in ["parent", "constraint", "delta"] {
+    fn schema_nine_nonlocal_native_brushes_load_with_marker_and_history_warning() {
+        for transform in ["parent", "constraint"] {
             let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
             doc.schema_version = 9;
             let mut brush: crate::model::Node = serde_json::from_value(json!({
@@ -2210,28 +2214,76 @@ mod tests {
                     brush.parent = Some(parent_id);
                 }
                 "constraint" => brush.constraints.push(crate::model::Constraint::default()),
-                "delta" => {
-                    let _ = brush.properties.insert(
-                        "blender_object_metadata".to_owned(),
-                        json!({"delta_location":[1.0, 0.0, 0.0]}),
-                    );
-                }
                 _ => unreachable!(),
             }
             let _ = doc
                 .nodes
                 .insert(crate::model::Id::new("brush").expect("brush ID"), brush);
-            let error = parse_scene(
+
+            let parsed = parse_scene(
                 &serde_json::to_vec(&doc).expect("legacy scene"),
                 no_assets(),
             )
-            .expect_err("world-space legacy brush must not be silently moved to POINT");
-            assert_eq!(error.code, ErrorCode::UnsupportedFeature, "{transform}");
+            .expect("transformed legacy project still opens");
             assert_eq!(
-                error.details["feature_id"], "physics.dynamic_paint_brush.legacy_transform",
+                parsed.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")].properties["physics_dynamic_paint"]
+                    ["paint_source"],
+                json!("LEGACY_WORLD_ORIGIN"),
+                "{transform}"
+            );
+            assert_eq!(parsed.warnings.len(), 1, "{transform}");
+            assert_eq!(
+                parsed.warnings[0]["code"], "dynamic_paint.legacy_world_origin",
+                "{transform}"
+            );
+
+            let snapshot = serde_json::to_value(&doc).expect("legacy snapshot");
+            let (record, history_warnings) = parse_history_record(
+                &serde_json::to_vec(&history_record(&snapshot)).expect("history record"),
+                no_assets(),
+            )
+            .expect("legacy history remains readable");
+            assert_eq!(
+                record.snapshot.nodes[&crate::model::Id::new("brush").expect("brush ID")]
+                    .properties["physics_dynamic_paint"]["paint_source"],
+                json!("LEGACY_WORLD_ORIGIN"),
+                "{transform}"
+            );
+            assert_eq!(
+                history_warnings[0]["code"], "dynamic_paint.legacy_world_origin",
                 "{transform}"
             );
         }
+    }
+
+    #[test]
+    fn schema_nine_blender_metadata_brushes_are_not_native_source_migrations() {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.schema_version = 9;
+        let brush = serde_json::from_value(json!({
+            "name": "Brush",
+            "kind": "mesh",
+            "properties": {
+                "physics_dynamic_paint": {"role": "brush"},
+                "blender_object_metadata": {"delta_location": [1.0, 0.0, 0.0]}
+            }
+        }))
+        .expect("Blender brush node");
+        let _ = doc
+            .nodes
+            .insert(crate::model::Id::new("brush").expect("brush ID"), brush);
+        let parsed = parse_scene(
+            &serde_json::to_vec(&doc).expect("Blender scene"),
+            no_assets(),
+        )
+        .expect("Blender-owned brush loads unchanged");
+        assert!(
+            parsed.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")].properties
+                ["physics_dynamic_paint"]
+                .get("paint_source")
+                .is_none()
+        );
+        assert_eq!(parsed.warnings, Vec::<Value>::new());
     }
 
     #[test]

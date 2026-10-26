@@ -432,6 +432,96 @@ fn volume_dynamic_paint_without_canvas_surface_fails_bake_with_unsupported_featu
 }
 
 #[test]
+fn parented_legacy_brush_loads_then_refuses_bake_until_source_is_fixed() {
+    let directory = tempdir().unwrap();
+    let scene = directory.path().join("parented-legacy-dynamic-paint");
+    init(&scene);
+    apply_ok(
+        &scene,
+        0,
+        &json!([
+            {"op":"node.create","id":"parent","kind":"empty","params":{},"transform":{"translation":[3.0,0.0,0.0]}},
+            {"op":"node.create","id":"brush","kind":"box","params":{"size":0.1},"parent":"parent"},
+            {"op":"node.create","id":"canvas","kind":"grid","params":{"size":1.0,"x_subdivisions":2,"y_subdivisions":2}},
+            {"op":"physics.dynamic_paint.create","target":{"id":"brush"},"settings":{"role":"brush","paint_source":"POINT"}}
+        ]),
+    );
+    let mut document = scene_document(&scene);
+    document["schema_version"] = json!(9);
+    let brush_settings = document["nodes"]["brush"]["properties"]["physics_dynamic_paint"]
+        .as_object_mut()
+        .unwrap();
+    let _ = brush_settings.remove("paint_source");
+    let _ = brush_settings.insert("radius".to_owned(), json!(1.0));
+    fs::write(
+        scene.join("scene.json"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+
+    let inspection = pot()
+        .arg("inspect")
+        .arg(&scene)
+        .arg("--id")
+        .arg("brush")
+        .arg("--frame")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        inspection.status.success(),
+        "inspect should open the legacy project: {}",
+        String::from_utf8_lossy(&inspection.stdout)
+    );
+
+    apply_ok(
+        &scene,
+        1,
+        &json!([{
+            "op":"physics.dynamic_paint.create",
+            "target":{"id":"canvas"},
+            "settings":{"role":"canvas","brushes":["brush"]}
+        }]),
+    );
+    let rejected = pot()
+        .arg("bake")
+        .arg(&scene)
+        .arg("--kind")
+        .arg("simulation")
+        .arg("--frames")
+        .arg("1:1")
+        .arg("--out")
+        .arg(directory.path().join("parented-legacy-dynamic-paint-bake"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert_eq!(response(&rejected)["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        response(&rejected)["error"]["details"]["feature_id"],
+        "physics.dynamic_paint_brush.legacy_transform"
+    );
+
+    apply_ok(
+        &scene,
+        2,
+        &json!([{
+            "op":"physics.dynamic_paint.update",
+            "target":{"id":"brush"},
+            "set":{"paint_source":"POINT"}
+        }]),
+    );
+    let frame = bake(
+        &scene,
+        &directory.path().join("fixed-parented-dynamic-paint-bake"),
+        "1:1",
+        0,
+    );
+    assert!(frame["paint_colors"]["canvas"].is_array());
+}
+
+#[test]
 fn none_and_domain_without_flows_preserve_their_input_meshes() {
     let directory = tempdir().unwrap();
     let scene = directory.path().join("fluid-no-flow");

@@ -2227,7 +2227,7 @@ fn dynamic_paint_brush_settings(
             .get(id)
             .and_then(|node| node.properties.get("physics_dynamic_paint"))
             .and_then(|settings| setting_string(settings, "paint_source"))
-            == Some("POINT")
+            .is_some_and(|source| matches!(source, "POINT" | "LEGACY_WORLD_ORIGIN"))
     });
     let driver_values = has_point_source
         .then(|| crate::eval::rig::evaluate_drivers(doc, frame))
@@ -2274,13 +2274,24 @@ fn dynamic_paint_brush_settings(
                 json!({"brush_id":id}),
             ));
         }
-        let paint_source = setting_string(settings, "paint_source").unwrap_or("VOLUME");
-        if !matches!(paint_source, "POINT" | "VOLUME") {
+        let stored_paint_source = setting_string(settings, "paint_source").unwrap_or("VOLUME");
+        let paint_source = if stored_paint_source == "LEGACY_WORLD_ORIGIN" {
+            if node.parent.is_some() || !node.constraints.is_empty() {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "legacy Dynamic Paint brush must be unparented or have paint_source set before evaluation",
+                    json!({"feature_id":"physics.dynamic_paint_brush.legacy_transform","brush_id":id,"status":"not_supported"}),
+                ));
+            }
+            "POINT"
+        } else if matches!(stored_paint_source, "POINT" | "VOLUME") {
+            stored_paint_source
+        } else {
             return Err(physics_support::unsupported_property(
                 "dynamic_paint_brush",
                 "paint_source",
             ));
-        }
+        };
         if paint_source == "VOLUME" && settings.get("radius").is_some() {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedFeature,
@@ -2635,44 +2646,9 @@ pub(crate) fn migrate_dynamic_paint_output_layers(doc: &mut SceneDoc) -> Result<
     }
     Ok(changed)
 }
-fn delta_transform_is_nondefault(
-    metadata: &serde_json::Map<String, Value>,
-    property: &str,
-    defaults: &[f64],
-) -> bool {
-    let Some(value) = metadata.get(property).filter(|value| !value.is_null()) else {
-        return false;
-    };
-    let Some(values) = value.as_array() else {
-        return true;
-    };
-    values.len() != defaults.len()
-        || values
-            .iter()
-            .zip(defaults)
-            .any(|(value, default)| value.as_f64() != Some(*default))
-}
-
-fn has_legacy_brush_delta_transform(node: &Node) -> bool {
-    let Some(metadata) = node
-        .properties
-        .get("blender_object_metadata")
-        .and_then(Value::as_object)
-    else {
-        return false;
-    };
-    delta_transform_is_nondefault(metadata, "delta_location", &[0.0, 0.0, 0.0])
-        || delta_transform_is_nondefault(metadata, "delta_rotation_euler", &[0.0, 0.0, 0.0])
-        || delta_transform_is_nondefault(
-            metadata,
-            "delta_rotation_quaternion",
-            &[1.0, 0.0, 0.0, 0.0],
-        )
-        || delta_transform_is_nondefault(metadata, "delta_scale", &[1.0, 1.0, 1.0])
-}
-
-pub(crate) fn migrate_dynamic_paint_brush_source(doc: &mut SceneDoc) -> Result<bool> {
+pub(crate) fn migrate_dynamic_paint_brush_source(doc: &mut SceneDoc) -> (bool, Vec<Value>) {
     let mut changed = false;
+    let mut warnings = Vec::new();
     for (node_id, node) in &mut doc.nodes {
         let legacy_brush_without_source =
             node.properties
@@ -2684,17 +2660,6 @@ pub(crate) fn migrate_dynamic_paint_brush_source(doc: &mut SceneDoc) -> Result<b
         if !legacy_brush_without_source {
             continue;
         }
-        // The native brush solver used WORLD origin; POINT is equivalent only without these transforms.
-        if node.parent.is_some()
-            || !node.constraints.is_empty()
-            || has_legacy_brush_delta_transform(node)
-        {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                "legacy Dynamic Paint brush transforms cannot be migrated to POINT without changing its world-space origin",
-                json!({"feature_id":"physics.dynamic_paint_brush.legacy_transform","node_id":node_id,"status":"not_supported"}),
-            ));
-        }
         if node
             .properties
             .get("blender_object_metadata")
@@ -2702,6 +2667,7 @@ pub(crate) fn migrate_dynamic_paint_brush_source(doc: &mut SceneDoc) -> Result<b
         {
             continue;
         }
+        let legacy_world_origin = node.parent.is_some() || !node.constraints.is_empty();
         let Some(settings) = node
             .properties
             .get_mut("physics_dynamic_paint")
@@ -2709,10 +2675,21 @@ pub(crate) fn migrate_dynamic_paint_brush_source(doc: &mut SceneDoc) -> Result<b
         else {
             continue;
         };
-        let _ = settings.insert("paint_source".to_owned(), json!("POINT"));
+        let source = if legacy_world_origin {
+            warnings.push(json!({
+                "code": "dynamic_paint.legacy_world_origin",
+                "feature_id": "physics.dynamic_paint_brush.legacy_transform",
+                "message": "Legacy Dynamic Paint brush retains its world-origin behavior and cannot be evaluated until its transform is resolved",
+                "node_id": node_id
+            }));
+            "LEGACY_WORLD_ORIGIN"
+        } else {
+            "POINT"
+        };
+        let _ = settings.insert("paint_source".to_owned(), json!(source));
         changed = true;
     }
-    Ok(changed)
+    (changed, warnings)
 }
 
 fn dynamic_paint_output_name(settings: &Value) -> Option<String> {

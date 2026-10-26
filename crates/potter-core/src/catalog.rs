@@ -1813,7 +1813,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint",
-            "Blender PAINT/VERTEX supports POINT proximity and VOLUME closed-mesh brushes with color and wetness replay, drying, dissolve, and named Corner BYTE_COLOR outputs; create/update ensures A and creates requested B layers, while schema 10 migrates missing A only for pre-10 native PAINT/VERTEX canvases and leaves Blender-imported canvases without toggled outputs untouched. Legacy native brushes without paint_source migrate to POINT using native radius or canvas radius only when their local Object.loc matches the old world origin; parented, constrained, or delta-transformed legacy brushes refuse migration. VOLUME requires an explicit PAINT/VERTEX surface; native radius and surface-less VOLUME use are refused. WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior influence into an existing named vertex group across integer frames and optionally dissolves it. Multiple surfaces, arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, and baked caches remain refused.",
+            "Blender PAINT/VERTEX supports POINT proximity and VOLUME closed-mesh brushes with color and wetness replay, drying, dissolve, and named Corner BYTE_COLOR outputs; create/update ensures A and creates requested B layers, while schema 10 migrates missing A only for pre-10 native PAINT/VERTEX canvases and leaves Blender-imported canvases without toggled outputs untouched. Legacy native brushes without paint_source migrate to POINT using native radius or canvas radius only when local Object.loc matches the old world origin; parented or constrained native brushes retain a LEGACY_WORLD_ORIGIN marker with a load warning and fail only when evaluated until fixed. VOLUME requires an explicit PAINT/VERTEX surface; native radius and surface-less VOLUME use are refused. WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior influence into an existing named vertex group across integer frames and optionally dissolves it. Multiple surfaces, arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, and baked caches remain refused.",
             "DynamicPaint",
             &[
                 "physics.dynamic_paint.create",
@@ -1896,10 +1896,10 @@ pub fn feature_catalog() -> Value {
         ),
         unsupported(
             "physics.dynamic_paint_brush.legacy_transform",
-            "Legacy native Dynamic Paint brushes with non-local transforms",
+            "Legacy native Dynamic Paint brushes with unresolved WORLD-origin semantics",
             "DynamicPaintBrush",
             &[],
-            "Schema 10 refuses to migrate no-source native brushes with parents, constraints, or nondefault delta transforms because POINT would move the old world-origin paint center.",
+            "A marked legacy brush that remains parented or constrained returns UnsupportedFeature when a canvas evaluates it; load remains available so users can set paint_source or remove the transform.",
         ),
         unsupported(
             "physics.dynamic_paint_canvas.volume_without_surface",
