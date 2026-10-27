@@ -123,6 +123,289 @@ assert sample(host) == sample(baseline), "Blender non-curve taper must use facto
 bpy.ops.wm.save_as_mainfile(filepath=str(root / "noncurve_taper.blend"))
 "#;
 
+const BLENDER_MIXED_CURVES_SOURCE: &str = r#"
+import bpy
+import sys
+from pathlib import Path
+
+if bpy.app.version != (5, 2, 2):
+    raise RuntimeError(f"mixed Curves round-trip requires Blender 5.2.2, found {bpy.app.version_string}")
+root = Path(sys.argv[sys.argv.index("--") + 1])
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+legacy = bpy.data.curves.new("Mixed Catmull Bezier Data", "CURVE")
+legacy.dimensions = "3D"
+legacy.twist_mode = "Z_UP"
+curve_points = (
+    ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 1.0, 0.0)),
+    ((0.0, 0.0, 1.0), (1.0, 1.0, 1.0), (2.0, 1.0, 2.0)),
+)
+for curve_index, coordinates in enumerate(curve_points):
+    spline = legacy.splines.new("BEZIER")
+    spline.bezier_points.add(len(coordinates) - 1)
+    spline.resolution_u = (5, 7)[curve_index]
+    spline.use_cyclic_u = (False, True)[curve_index]
+    for point, coordinate in zip(spline.bezier_points, coordinates):
+        point.co = coordinate
+
+poly = legacy.splines.new("POLY")
+poly.points.add(2)
+poly.resolution_u = 6
+for point, coordinate in zip(
+    poly.points,
+    ((0.0, 0.0, 2.0), (1.0, 0.0, 2.0), (2.0, 1.0, 2.0)),
+):
+    point.co = (*coordinate, 1.0)
+obj = bpy.data.objects.new("Mixed Catmull Bezier", legacy)
+scene.collection.objects.link(obj)
+obj.select_set(True)
+bpy.context.view_layer.objects.active = obj
+bpy.ops.object.convert(target="CURVES")
+obj = bpy.context.view_layer.objects.active
+
+tree = bpy.data.node_groups.new("Make first spline Catmull", "GeometryNodeTree")
+tree.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+input_node = tree.nodes.new("NodeGroupInput")
+output_node = tree.nodes.new("NodeGroupOutput")
+set_type = tree.nodes.new("GeometryNodeCurveSplineType")
+set_type.spline_type = "CATMULL_ROM"
+index = tree.nodes.new("GeometryNodeInputIndex")
+compare = tree.nodes.new("FunctionNodeCompare")
+compare.data_type = "INT"
+compare.operation = "EQUAL"
+compare.inputs["B"].default_value = 0
+tree.links.new(input_node.outputs["Geometry"], set_type.inputs["Curve"])
+tree.links.new(index.outputs["Index"], compare.inputs["A"])
+tree.links.new(compare.outputs["Result"], set_type.inputs["Selection"])
+set_nurbs = tree.nodes.new("GeometryNodeCurveSplineType")
+set_nurbs.spline_type = "NURBS"
+compare_nurbs = tree.nodes.new("FunctionNodeCompare")
+compare_nurbs.data_type = "INT"
+compare_nurbs.operation = "EQUAL"
+compare_nurbs.inputs["B"].default_value = 2
+tree.links.new(index.outputs["Index"], compare_nurbs.inputs["A"])
+tree.links.new(compare_nurbs.outputs["Result"], set_nurbs.inputs["Selection"])
+tree.links.new(set_type.outputs["Curve"], set_nurbs.inputs["Curve"])
+tree.links.new(set_nurbs.outputs["Curve"], output_node.inputs["Geometry"])
+modifier = obj.modifiers.new("Set first spline to Catmull", "NODES")
+modifier.node_group = tree
+bpy.context.view_layer.update()
+bpy.ops.object.modifier_apply(modifier=modifier.name)
+data = obj.data
+assert [item.value for item in data.attributes["curve_type"].data] == [0, 2, 3]
+
+def set_attribute(name, data_type, domain, values):
+    attribute = data.attributes.get(name)
+    if attribute is None:
+        attribute = data.attributes.new(name=name, type=data_type, domain=domain)
+    assert (attribute.data_type, attribute.domain) == (data_type, domain), name
+    assert len(attribute.data) == len(values), name
+    for item, value in zip(attribute.data, values):
+        if hasattr(item, "vector"):
+            item.vector = value
+        else:
+            item.value = value
+
+set_attribute("cyclic", "BOOLEAN", "CURVE", [False, True, False])
+set_attribute("resolution", "INT", "CURVE", [5, 7, 6])
+set_attribute("nurbs_order", "INT8", "CURVE", [4, 4, 3])
+set_attribute("knots_mode", "INT8", "CURVE", [0, 0, 1])
+set_attribute("normal_mode", "INT8", "CURVE", [2, 1, 1])
+set_attribute("radius", "FLOAT", "POINT", [
+    0.125, 0.25, 0.5, 0.75, 1.0, 1.25, 0.25, 0.5, 0.75,
+])
+set_attribute("tilt", "FLOAT", "POINT", [
+    -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 0.25, 0.5, 0.75,
+])
+set_attribute("nurbs_weight", "FLOAT", "POINT", [
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.5, 2.0,
+])
+set_attribute("handle_left", "FLOAT_VECTOR", "POINT", [
+    (-0.25, 0.0, 0.0), (0.0, -0.25, 0.0), (0.25, 0.0, 0.0),
+    (0.0, 0.0, 0.75), (0.75, 0.75, 0.75), (1.75, 0.75, 1.75),
+    (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+])
+set_attribute("handle_right", "FLOAT_VECTOR", "POINT", [
+    (0.25, 0.0, 0.0), (1.0, 0.25, 0.0), (2.25, 1.0, 0.0),
+    (0.0, 0.0, 1.25), (1.25, 1.0, 1.0), (2.25, 1.0, 2.25),
+    (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+])
+set_attribute("handle_type_left", "INT8", "POINT", [0, 1, 2, 3, 1, 0, 0, 0, 0])
+set_attribute("handle_type_right", "INT8", "POINT", [1, 2, 3, 0, 2, 1, 0, 0, 0])
+bpy.context.view_layer.update()
+bpy.ops.wm.save_as_mainfile(filepath=str(root / "mixed_curves.blend"))
+"#;
+
+const BLENDER_MIXED_CURVES_READBACK: &str = r#"
+import bpy
+import sys
+from pathlib import Path
+
+if bpy.app.version != (5, 2, 2):
+    raise RuntimeError(f"mixed Curves round-trip requires Blender 5.2.2, found {bpy.app.version_string}")
+root = Path(sys.argv[sys.argv.index("--") + 1])
+bpy.ops.wm.open_mainfile(filepath=str(root / "potter_mixed_curves.blend"))
+obj = bpy.data.objects.get("Mixed Catmull Bezier")
+assert obj is not None and obj.type == "CURVES", "Potter did not restore the native Curves object"
+data = obj.data
+assert [curve.points_length for curve in data.curves] == [3, 3, 3]
+assert [
+    [tuple(float(value) for value in point.position) for point in curve.points]
+    for curve in data.curves
+] == [
+    [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 1.0, 0.0)],
+    [(0.0, 0.0, 1.0), (1.0, 1.0, 1.0), (2.0, 1.0, 2.0)],
+    [(0.0, 0.0, 2.0), (1.0, 0.0, 2.0), (2.0, 1.0, 2.0)],
+]
+
+def attribute_values(name):
+    attribute = data.attributes.get(name)
+    assert attribute is not None, f"Potter omitted Curves attribute {name!r}"
+    values = []
+    for item in attribute.data:
+        if hasattr(item, "vector"):
+            values.append(tuple(float(value) for value in item.vector))
+        else:
+            values.append(item.value)
+    return attribute.domain, attribute.data_type, values
+
+expected = {
+    "curve_type": ("CURVE", "INT8", [0, 2, 3]),
+    "cyclic": ("CURVE", "BOOLEAN", [False, True, False]),
+    "resolution": ("CURVE", "INT", [5, 7, 6]),
+    "nurbs_order": ("CURVE", "INT8", [4, 4, 3]),
+    "knots_mode": ("CURVE", "INT8", [0, 0, 1]),
+    "normal_mode": ("CURVE", "INT8", [2, 1, 1]),
+    "nurbs_weight": ("POINT", "FLOAT", [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.5, 2.0]),
+    "radius": ("POINT", "FLOAT", [0.125, 0.25, 0.5, 0.75, 1.0, 1.25, 0.25, 0.5, 0.75]),
+    "tilt": ("POINT", "FLOAT", [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 0.25, 0.5, 0.75]),
+    "handle_left": ("POINT", "FLOAT_VECTOR", [
+        (-0.25, 0.0, 0.0), (0.0, -0.25, 0.0), (0.25, 0.0, 0.0),
+        (0.0, 0.0, 0.75), (0.75, 0.75, 0.75), (1.75, 0.75, 1.75),
+        (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+    ]),
+    "handle_right": ("POINT", "FLOAT_VECTOR", [
+        (0.25, 0.0, 0.0), (1.0, 0.25, 0.0), (2.25, 1.0, 0.0),
+        (0.0, 0.0, 1.25), (1.25, 1.0, 1.0), (2.25, 1.0, 2.25),
+        (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+    ]),
+    "handle_type_left": ("POINT", "INT8", [0, 1, 2, 3, 1, 0, 0, 0, 0]),
+    "handle_type_right": ("POINT", "INT8", [1, 2, 3, 0, 2, 1, 0, 0, 0]),
+}
+for name, expected_value in expected.items():
+    assert attribute_values(name) == expected_value, (name, attribute_values(name))
+"#;
+
+const BLENDER_CUSTOM_KNOTS_SOURCE: &str = r#"
+import bpy
+import sys
+from pathlib import Path
+
+if bpy.app.version != (5, 2, 2):
+    raise RuntimeError(f"custom knot round-trip requires Blender 5.2.2, found {bpy.app.version_string}")
+root = Path(sys.argv[sys.argv.index("--") + 1])
+bpy.ops.wm.read_factory_settings(use_empty=True)
+data = bpy.data.hair_curves.new("Custom Knot Curves Data")
+data.add_curves([3])
+for point, position in zip(data.points, ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 1.0, 0.0))):
+    point.position = position
+
+def set_attribute(name, data_type, domain, values):
+    attribute = data.attributes.get(name)
+    if attribute is None:
+        attribute = data.attributes.new(name=name, type=data_type, domain=domain)
+    assert len(attribute.data) == len(values), name
+    for item, value in zip(attribute.data, values):
+        item.value = value
+
+set_attribute("curve_type", "INT8", "CURVE", [3])
+set_attribute("cyclic", "BOOLEAN", "CURVE", [False])
+set_attribute("resolution", "INT", "CURVE", [4])
+set_attribute("nurbs_order", "INT8", "CURVE", [3])
+set_attribute("knots_mode", "INT8", "CURVE", [4])
+set_attribute("normal_mode", "INT8", "CURVE", [0])
+set_attribute("nurbs_weight", "FLOAT", "POINT", [1.0, 0.5, 1.5])
+set_attribute("radius", "FLOAT", "POINT", [1.0, 0.75, 0.5])
+set_attribute("tilt", "FLOAT", "POINT", [0.0, 0.25, 0.5])
+data.use_fake_user = True
+obj = bpy.data.objects.new("Custom Knot Curves", data)
+obj.use_fake_user = True
+bpy.ops.wm.save_as_mainfile(filepath=str(root / "custom_knots.blend"))
+"#;
+
+const BLENDER_CUSTOM_KNOTS_READBACK: &str = r#"
+import bpy
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[sys.argv.index("--") + 1])
+bpy.ops.wm.open_mainfile(filepath=str(root / "potter_custom_knots.blend"))
+obj = bpy.data.objects.get("Custom Knot Curves")
+assert obj is not None and obj.type == "CURVES"
+data = obj.data
+assert [curve.points_length for curve in data.curves] == [3]
+assert [
+    [tuple(float(value) for value in point.position) for point in curve.points]
+    for curve in data.curves
+] == [[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 1.0, 0.0)]]
+assert [item.value for item in data.attributes["curve_type"].data] == [3]
+assert [item.value for item in data.attributes["knots_mode"].data] == [0]
+assert [item.value for item in data.attributes["nurbs_order"].data] == [3]
+assert [item.value for item in data.attributes["nurbs_weight"].data] == [1.0, 0.5, 1.5]
+"#;
+
+const BLENDER_LEGACY_CUSTOM_KNOTS_SOURCE: &str = r#"
+import bpy
+import ctypes
+import sys
+from pathlib import Path
+
+if bpy.app.version != (5, 2, 2):
+    raise RuntimeError(f"legacy custom knots require Blender 5.2.2, found {bpy.app.version_string}")
+root = Path(sys.argv[sys.argv.index("--") + 1])
+bpy.ops.wm.read_factory_settings(use_empty=True)
+data = bpy.data.curves.new("Legacy Custom Knot Curve Data", "CURVE")
+spline = data.splines.new("NURBS")
+spline.points.add(2)
+for point, coordinate, weight in zip(
+    spline.points,
+    ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 1.0, 0.0)),
+    (1.0, 0.5, 1.5),
+):
+    point.co = (*coordinate, weight)
+spline.order_u = 3
+spline.use_endpoint_u = True
+knot_flag = ctypes.c_uint16.from_address(
+    spline.as_pointer() + 2 * ctypes.sizeof(ctypes.c_void_p) + 28)
+knot_flag.value |= 1 << 3
+assert knot_flag.value & (1 << 3)
+data.use_fake_user = True
+obj = bpy.data.objects.new("Legacy Custom Knot Curve", data)
+obj.use_fake_user = True
+bpy.ops.wm.save_as_mainfile(filepath=str(root / "legacy_custom_knots.blend"))
+"#;
+
+const BLENDER_LEGACY_CUSTOM_KNOTS_READBACK: &str = r#"
+import bpy
+import ctypes
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[sys.argv.index("--") + 1])
+bpy.ops.wm.open_mainfile(filepath=str(root / "potter_legacy_custom_knots.blend"))
+obj = bpy.data.objects.get("Legacy Custom Knot Curve")
+assert obj is not None and obj.type == "CURVE"
+spline = obj.data.splines[0]
+knot_flag = ctypes.c_uint16.from_address(
+    spline.as_pointer() + 2 * ctypes.sizeof(ctypes.c_void_p) + 28)
+assert not knot_flag.value & (1 << 3), "lossy export retained the custom-knot flag"
+assert spline.use_endpoint_u
+assert [tuple(float(value) for value in point.co[:3]) for point in spline.points] == [
+    (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 1.0, 0.0)
+]
+"#;
+
 fn require_blender() -> bool {
     env::var_os("POTTER_REQUIRE_BLENDER").is_some_and(|value| !value.is_empty())
 }
@@ -414,5 +697,355 @@ fn non_curve_taper_blend_import_uses_blenders_unit_factor() -> TestResult {
             .collect::<Vec<_>>()
     );
     assert_eq!(host.faces, baseline.faces);
+    Ok(())
+}
+
+#[test]
+fn native_catmull_rom_bezier_and_nurbs_curves_round_trip_through_potter() -> TestResult {
+    let Some(blender) = blender_522()? else {
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    run_blender_script(
+        &blender,
+        "build_mixed_curves.py",
+        BLENDER_MIXED_CURVES_SOURCE,
+        root,
+        "Blender mixed Curves source generation failed",
+    )?;
+
+    let project = root.join("project");
+    let project_arg = project.to_str().ok_or("project path is not UTF-8")?;
+    let source = root.join("mixed_curves.blend");
+    let source_arg = source.to_str().ok_or("source blend path is not UTF-8")?;
+    let mut initialize = Command::new(env!("CARGO_BIN_EXE_pot"));
+    initialize.args(["init", project_arg, "--json"]);
+    let initialized = process::run_guarded(initialize)?;
+    assert!(
+        initialized.status.success(),
+        "pot init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    let mut import = Command::new(env!("CARGO_BIN_EXE_pot"));
+    import.args([
+        "import",
+        project_arg,
+        "--file",
+        source_arg,
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+    ]);
+    import.arg(&blender).arg("--json");
+    let imported = process::run_guarded(import)?;
+    assert!(
+        imported.status.success(),
+        "pot import failed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+
+    let exported = root.join("potter_mixed_curves.blend");
+    let exported_arg = exported.to_str().ok_or("export blend path is not UTF-8")?;
+    let mut export = Command::new(env!("CARGO_BIN_EXE_pot"));
+    export.args([
+        "export",
+        project_arg,
+        "--format",
+        "blend",
+        "--out",
+        exported_arg,
+        "--blender",
+    ]);
+    export.arg(&blender).arg("--json");
+    let exported_result = process::run_guarded(export)?;
+    assert!(
+        exported_result.status.success(),
+        "pot export failed: {}",
+        String::from_utf8_lossy(&exported_result.stderr)
+    );
+    run_blender_script(
+        &blender,
+        "read_mixed_curves.py",
+        BLENDER_MIXED_CURVES_READBACK,
+        root,
+        "Blender mixed Curves readback failed",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn custom_knot_nurbs_fallback_export_reports_loss_and_writes_standard_knots() -> TestResult {
+    let Some(blender) = blender_522()? else {
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    run_blender_script(
+        &blender,
+        "build_custom_knots.py",
+        BLENDER_CUSTOM_KNOTS_SOURCE,
+        root,
+        "Blender custom-knot Curves source generation failed",
+    )?;
+
+    let project = root.join("custom_knots_project");
+    let project_arg = project
+        .to_str()
+        .ok_or("custom-knot project path is not UTF-8")?;
+    let mut initialize = Command::new(env!("CARGO_BIN_EXE_pot"));
+    initialize.args(["init", project_arg, "--json"]);
+    let initialized = process::run_guarded(initialize)?;
+    assert!(initialized.status.success());
+    let source_arg = root
+        .join("custom_knots.blend")
+        .to_str()
+        .ok_or("custom-knot source path is not UTF-8")?
+        .to_owned();
+    let mut import = Command::new(env!("CARGO_BIN_EXE_pot"));
+    import
+        .args([
+            "import",
+            project_arg,
+            "--file",
+            &source_arg,
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--allow-lossy",
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json");
+    let imported = process::run_guarded(import)?;
+    assert!(
+        imported.status.success(),
+        "custom-knot import failed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let import_report: serde_json::Value = serde_json::from_slice(&imported.stdout)?;
+    assert!(
+        import_report["result"]["losses"]
+            .as_array()
+            .is_some_and(|losses| losses
+                .iter()
+                .any(|loss| loss["feature_id"] == "hair_curves.nurbs.custom_knots")),
+        "custom-knot import loss was not reported"
+    );
+
+    let strict_output = root.join("strict_custom_knots.blend");
+    let strict_output_arg = strict_output
+        .to_str()
+        .ok_or("strict custom-knot output path is not UTF-8")?;
+    let mut strict_export = Command::new(env!("CARGO_BIN_EXE_pot"));
+    strict_export
+        .args([
+            "export",
+            project_arg,
+            "--format",
+            "blend",
+            "--out",
+            strict_output_arg,
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json");
+    let rejected = process::run_guarded(strict_export)?;
+    assert!(!rejected.status.success());
+    let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout)?;
+    assert_eq!(rejected["error"]["code"], "UNREPRESENTABLE_FEATURE");
+    assert!(
+        rejected["error"]["details"]["losses"]
+            .as_array()
+            .is_some_and(|losses| losses
+                .iter()
+                .any(|loss| loss["feature_id"] == "hair_curves.nurbs.custom_knots")),
+        "strict export did not report the custom-knot loss"
+    );
+
+    let output = root.join("potter_custom_knots.blend");
+    let output_arg = output
+        .to_str()
+        .ok_or("custom-knot output path is not UTF-8")?;
+    let mut export = Command::new(env!("CARGO_BIN_EXE_pot"));
+    export
+        .args([
+            "export",
+            project_arg,
+            "--format",
+            "blend",
+            "--out",
+            output_arg,
+            "--allow-lossy",
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json");
+    let exported = process::run_guarded(export)?;
+    assert!(
+        exported.status.success(),
+        "lossy custom-knot export failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let export_report: serde_json::Value = serde_json::from_slice(&exported.stdout)?;
+    assert!(
+        export_report["result"]["losses"]
+            .as_array()
+            .is_some_and(|losses| losses
+                .iter()
+                .any(|loss| loss["feature_id"] == "hair_curves.nurbs.custom_knots")),
+        "lossy export did not report the custom-knot loss"
+    );
+    run_blender_script(
+        &blender,
+        "read_custom_knots.py",
+        BLENDER_CUSTOM_KNOTS_READBACK,
+        root,
+        "Blender custom-knot Curves readback failed",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn legacy_curve_custom_knots_report_loss_and_export_as_standard_knots() -> TestResult {
+    let Some(blender) = blender_522()? else {
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    run_blender_script(
+        &blender,
+        "build_legacy_custom_knots.py",
+        BLENDER_LEGACY_CUSTOM_KNOTS_SOURCE,
+        root,
+        "Blender legacy custom-knot source generation failed",
+    )?;
+
+    let project = root.join("legacy_custom_knots_project");
+    let project_arg = project
+        .to_str()
+        .ok_or("legacy custom-knot project path is not UTF-8")?;
+    let source_arg = root
+        .join("legacy_custom_knots.blend")
+        .to_str()
+        .ok_or("legacy custom-knot source path is not UTF-8")?
+        .to_owned();
+    let mut initialize = Command::new(env!("CARGO_BIN_EXE_pot"));
+    initialize.args(["init", project_arg, "--json"]);
+    let initialized = process::run_guarded(initialize)?;
+    assert!(initialized.status.success());
+
+    let mut import = Command::new(env!("CARGO_BIN_EXE_pot"));
+    import
+        .args([
+            "import",
+            project_arg,
+            "--file",
+            &source_arg,
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--allow-lossy",
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json");
+    let imported = process::run_guarded(import)?;
+    assert!(
+        imported.status.success(),
+        "legacy custom-knot import failed: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let import_report: serde_json::Value = serde_json::from_slice(&imported.stdout)?;
+    assert!(
+        import_report["result"]["losses"]
+            .as_array()
+            .is_some_and(|losses| losses
+                .iter()
+                .any(|loss| loss["feature_id"] == "blender.curve.nurbs.custom_knots")),
+        "legacy custom-knot import loss was not reported"
+    );
+
+    let strict_output = root.join("strict_legacy_custom_knots.blend");
+    let strict_output_arg = strict_output
+        .to_str()
+        .ok_or("strict legacy custom-knot output path is not UTF-8")?;
+    let mut strict_export = Command::new(env!("CARGO_BIN_EXE_pot"));
+    strict_export
+        .args([
+            "export",
+            project_arg,
+            "--format",
+            "blend",
+            "--out",
+            strict_output_arg,
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json");
+    let rejected = process::run_guarded(strict_export)?;
+    assert!(!rejected.status.success());
+    let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout)?;
+    assert_eq!(rejected["error"]["code"], "UNREPRESENTABLE_FEATURE");
+    assert!(
+        rejected["error"]["details"]["losses"]
+            .as_array()
+            .is_some_and(|losses| losses
+                .iter()
+                .any(|loss| loss["feature_id"] == "blender.curve.nurbs.custom_knots")),
+        "strict legacy custom-knot export did not report the loss"
+    );
+
+    let output = root.join("potter_legacy_custom_knots.blend");
+    let output_arg = output
+        .to_str()
+        .ok_or("lossy legacy custom-knot output path is not UTF-8")?;
+    let mut export = Command::new(env!("CARGO_BIN_EXE_pot"));
+    export
+        .args([
+            "export",
+            project_arg,
+            "--format",
+            "blend",
+            "--out",
+            output_arg,
+            "--allow-lossy",
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json");
+    let exported = process::run_guarded(export)?;
+    assert!(
+        exported.status.success(),
+        "lossy legacy custom-knot export failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let export_report: serde_json::Value = serde_json::from_slice(&exported.stdout)?;
+    assert!(
+        export_report["result"]["losses"]
+            .as_array()
+            .is_some_and(|losses| losses
+                .iter()
+                .any(|loss| loss["feature_id"] == "blender.curve.nurbs.custom_knots")),
+        "lossy legacy Curve export did not report the custom-knot loss"
+    );
+    run_blender_script(
+        &blender,
+        "read_legacy_custom_knots.py",
+        BLENDER_LEGACY_CUSTOM_KNOTS_READBACK,
+        root,
+        "Blender lossy legacy custom-knot readback failed",
+    )?;
     Ok(())
 }

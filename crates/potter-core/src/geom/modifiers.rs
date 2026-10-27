@@ -2344,8 +2344,15 @@ pub(crate) fn evaluated_curve_path_length(
     path.bevel_resolution = 0;
     path.extrude = 0.0;
     path.fill_mode = crate::model::CurveFillMode::None;
-    let path_mesh =
-        crate::geom::curve::evaluate_curve(&path).map_err(|error| mesh_error(&error))?;
+    let path_mesh = crate::geom::curve::evaluate_curve(&path).map_err(|error| {
+        let details = json!({"mesh_error": error.to_string()});
+        crate::geom::curve::curve_error(
+            &error,
+            ErrorCode::InvalidArgument,
+            "modifier produced invalid mesh",
+            details,
+        )
+    })?;
     let indices = id_indices(&path_mesh);
     let points = positions(&path_mesh);
     let mut length = 0.0_f32;

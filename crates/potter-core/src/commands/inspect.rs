@@ -610,6 +610,7 @@ fn data_item(doc: &SceneDoc, id: &Id, data: &DataBlock) -> Value {
         "text": data.text,
         "hair_curves": data.hair_curves.as_ref().map(|hair| json!({
             "curve_count": hair.curves.len(),
+            "curves": hair.curves,
             "attributes": hair.attributes,
             "surface": hair.surface,
             "surface_uv_map": hair.surface_uv_map,

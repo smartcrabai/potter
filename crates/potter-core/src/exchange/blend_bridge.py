@@ -1739,6 +1739,15 @@ def _armature_dump(armature):
 def _material_names(data):
     return [material.name_full if material else None for material in data.materials]
 
+def _legacy_spline_has_custom_knots(spline):
+    if spline.type != "NURBS":
+        return False
+    # Blender 5.2.2 DNA stores Nurb.flagu after its pointer-sized links and fixed scalar fields.
+    flagu_offset = 2 * ctypes.sizeof(ctypes.c_void_p) + 28
+    flags = ctypes.c_uint16.from_address(spline.as_pointer() + flagu_offset).value
+    return bool(flags & (1 << 3))
+
+
 def curve_dump(curve):
     if getattr(getattr(curve, "bl_rna", None), "identifier", "") == "TextCurve":
         font = curve.font
@@ -1751,6 +1760,7 @@ def curve_dump(curve):
             "type": "FONT",
             "resolution_u": int(getattr(curve, "resolution_u", 12)),
             "bevel_depth": float(curve.bevel_depth),
+            "has_bevel_object": getattr(curve, "bevel_object", None) is not None,
             "bevel_resolution": int(curve.bevel_resolution),
             "extrude": float(curve.extrude),
             "fill_mode": str(curve.fill_mode),
@@ -1792,6 +1802,8 @@ def curve_dump(curve):
                     "handle_left": plain(point.handle_left),
                     "handle_right": plain(point.handle_right),
                     "handle_type": point.handle_left_type,
+                    "handle_left_type": point.handle_left_type,
+                    "handle_right_type": point.handle_right_type,
                     "weight": 1.0,
                     "radius": float(point.radius),
                     "tilt": float(point.tilt),
@@ -1802,6 +1814,8 @@ def curve_dump(curve):
                     "handle_left": plain(point.co)[:3],
                     "handle_right": plain(point.co)[:3],
                     "handle_type": "AUTO",
+                    "handle_left_type": "AUTO",
+                    "handle_right_type": "AUTO",
                     "weight": float(point.co[3]),
                     "radius": float(getattr(point, "radius", 1.0)),
                     "tilt": float(getattr(point, "tilt", 0.0)),
@@ -1813,6 +1827,8 @@ def curve_dump(curve):
             "cyclic": bool(getattr(spline, "use_cyclic_u", False)),
             "resolution": int(getattr(spline, "resolution_u", 12)),
             "use_endpoint": bool(getattr(spline, "use_endpoint_u", False)),
+            "use_bezier": bool(getattr(spline, "use_bezier_u", False)),
+            "custom_knots": _legacy_spline_has_custom_knots(spline),
             "points_u": int(getattr(spline, "points_u", 0)),
             "points_v": int(getattr(spline, "points_v", 0)),
             "order_v": int(getattr(spline, "order_v", 3)),
@@ -1859,6 +1875,7 @@ def curve_dump(curve):
         "type": curve_type,
         "resolution_u": int(getattr(curve, "resolution_u", 12)),
         "bevel_depth": float(getattr(curve, "bevel_depth", 0.0)),
+        "has_bevel_object": getattr(curve, "bevel_object", None) is not None,
         "bevel_resolution": int(getattr(curve, "bevel_resolution", 0)),
         "extrude": float(getattr(curve, "extrude", 0.0)),
         "dimensions": "2D" if getattr(curve, "dimensions", "3D") == "2D" else "3D",
@@ -7170,9 +7187,10 @@ def _curve_data_create(name, data_id, item, source, doc, target, pack):
                     target.co = point["co"]
                     target.handle_left = point.get("handle_left", point["co"])
                     target.handle_right = point.get("handle_right", point["co"])
-                    handle_type = point.get("handle_type", "auto").upper()
-                    target.handle_left_type = handle_type
-                    target.handle_right_type = handle_type
+                    target.handle_left_type = point.get(
+                        "handle_left_type", point.get("handle_type", "auto")).upper()
+                    target.handle_right_type = point.get(
+                        "handle_right_type", point.get("handle_type", "auto")).upper()
                 else:
                     collection[index].co = tuple(point["co"]) + (float(point.get("weight", 1.0)),)
                     target = collection[index]
@@ -7183,6 +7201,8 @@ def _curve_data_create(name, data_id, item, source, doc, target, pack):
             if spline_type == "NURBS":
                 spline.order_u = int(source_spline.get("order", 3))
                 spline.use_endpoint_u = bool(source_spline.get("use_endpoint", False))
+                if hasattr(spline, "use_bezier_u"):
+                    spline.use_bezier_u = bool(source_spline.get("use_bezier", False))
         eval_time_fcurves = raw.get("eval_time_fcurves", [])
         if eval_time_fcurves:
             action_name = source.get("eval_time_action_name") or (
@@ -7207,12 +7227,234 @@ def _curve_data_create(name, data_id, item, source, doc, target, pack):
     return curve
 
 
+def _hair_curve_attribute_values(raw, name, domain, data_type, count, defaults):
+    attribute = raw.get("attributes", {}).get(name)
+    if attribute is None:
+        return defaults
+    if attribute.get("domain") != domain or attribute.get("data_type") != data_type:
+        raise ValueError("hair Curves attribute %s has an unsupported domain or type" % name)
+    values = attribute.get("values", [])
+    if len(values) != count:
+        raise ValueError("hair Curves attribute %s has %d values for %d elements"
+                         % (name, len(values), count))
+    return values
+
+
+def _hair_curves_create_from_legacy(name, raw):
+    curves = raw.get("curves", [])
+    curve_count = len(curves)
+    if not curve_count:
+        return None
+    point_counts = [len(curve.get("points", [])) for curve in curves]
+    if any(count == 0 for count in point_counts):
+        return None
+    point_count = sum(point_counts)
+    curve_types = _hair_curve_attribute_values(
+        raw, "curve_type", "CURVE", "INT8", curve_count, [])
+    if not curve_types or any(curve_type not in (1, 2, 3) for curve_type in curve_types):
+        return None
+    cyclic = _hair_curve_attribute_values(
+        raw, "cyclic", "CURVE", "BOOLEAN", curve_count, [False] * curve_count)
+    resolutions = _hair_curve_attribute_values(
+        raw, "resolution", "CURVE", "INT", curve_count, [12] * curve_count)
+    nurbs_orders = _hair_curve_attribute_values(
+        raw, "nurbs_order", "CURVE", "INT8", curve_count, [4] * curve_count)
+    knots_modes = _hair_curve_attribute_values(
+        raw, "knots_mode", "CURVE", "INT8", curve_count, [0] * curve_count)
+    if any(mode not in (0, 1, 2, 3) for mode in knots_modes):
+        return None
+    normal_modes = _hair_curve_attribute_values(
+        raw, "normal_mode", "CURVE", "INT8", curve_count, [0] * curve_count)
+    if (any(mode not in (0, 1) for mode in normal_modes)
+            or any(mode != normal_modes[0] for mode in normal_modes[1:])):
+        return None
+    radii = _hair_curve_attribute_values(
+        raw, "radius", "POINT", "FLOAT", point_count,
+        [float(curve.get("radius", 0.0)) for curve in curves for _ in curve.get("points", [])])
+    tilts = _hair_curve_attribute_values(
+        raw, "tilt", "POINT", "FLOAT", point_count, [0.0] * point_count)
+    positions = [point for curve in curves for point in curve.get("points", [])]
+    left_handles = _hair_curve_attribute_values(
+        raw, "handle_left", "POINT", "FLOAT_VECTOR", point_count, positions)
+    right_handles = _hair_curve_attribute_values(
+        raw, "handle_right", "POINT", "FLOAT_VECTOR", point_count, positions)
+    left_types = _hair_curve_attribute_values(
+        raw, "handle_type_left", "POINT", "INT8", point_count, [1] * point_count)
+    right_types = _hair_curve_attribute_values(
+        raw, "handle_type_right", "POINT", "INT8", point_count, [1] * point_count)
+    nurbs_weights = _hair_curve_attribute_values(
+        raw, "nurbs_weight", "POINT", "FLOAT", point_count, [1.0] * point_count)
+    spline_types = {1: "POLY", 2: "BEZIER", 3: "NURBS"}
+    handle_types = {0: "FREE", 1: "AUTO", 2: "VECTOR", 3: "ALIGNED"}
+    curve = bpy.data.curves.new(name, "CURVE")
+    curve.dimensions = "3D"
+    curve.twist_mode = "MINIMUM" if normal_modes[0] == 0 else "Z_UP"
+    point_offset = 0
+    for curve_index, source_curve in enumerate(curves):
+        spline_type = spline_types.get(int(curve_types[curve_index]))
+        if spline_type is None:
+            raise ValueError("hair Curves curve_type is outside Blender's supported range")
+        spline = curve.splines.new(spline_type)
+        points = source_curve.get("points", [])
+        collection = spline.bezier_points if spline_type == "BEZIER" else spline.points
+        collection.add(len(points) - 1)
+        for point_index, position in enumerate(points):
+            attribute_index = point_offset + point_index
+            if spline_type == "BEZIER":
+                point = collection[point_index]
+                point.co = position
+                point.handle_left = left_handles[attribute_index]
+                point.handle_right = right_handles[attribute_index]
+                try:
+                    point.handle_left_type = handle_types[int(left_types[attribute_index])]
+                    point.handle_right_type = handle_types[int(right_types[attribute_index])]
+                except KeyError as error:
+                    raise ValueError("hair Curves Bezier handle type is outside Blender's supported range") from error
+            else:
+                weight = float(nurbs_weights[attribute_index]) if spline_type == "NURBS" else 1.0
+                collection[point_index].co = tuple(position) + (weight,)
+                point = collection[point_index]
+            point.radius = float(radii[attribute_index])
+            point.tilt = float(tilts[attribute_index])
+        spline.use_cyclic_u = bool(cyclic[curve_index])
+        spline.resolution_u = int(resolutions[curve_index])
+        if spline_type == "NURBS":
+            spline.order_u = int(nurbs_orders[curve_index])
+            knots_mode = int(knots_modes[curve_index])
+            if knots_mode not in (0, 1, 2, 3):
+                raise ValueError("custom NURBS knot vectors cannot be restored through legacy Curve RNA")
+            spline.use_endpoint_u = bool(knots_mode & 1)
+            if not hasattr(spline, "use_bezier_u") and knots_mode & 2:
+                raise ValueError("Blender RNA does not expose Bezier NURBS knot mode")
+            if hasattr(spline, "use_bezier_u"):
+                spline.use_bezier_u = bool(knots_mode & 2)
+        point_offset += len(points)
+    old_active = bpy.context.view_layer.objects.active
+    old_selected = list(bpy.context.selected_objects)
+    obj = bpy.data.objects.new(name, curve)
+    bpy.context.scene.collection.objects.link(obj)
+    try:
+        for selected in old_selected:
+            selected.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.convert(target="CURVES")
+        if obj.type != "CURVES":
+            raise ValueError("legacy Curve did not convert to a Curves data-block")
+        return obj.data
+    finally:
+        if obj.name in bpy.data.objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        if curve.name in bpy.data.curves:
+            bpy.data.curves.remove(curve, do_unlink=True)
+        for selected in list(bpy.context.selected_objects):
+            selected.select_set(False)
+        for selected in old_selected:
+            if selected.name in bpy.data.objects:
+                selected.select_set(True)
+        bpy.context.view_layer.objects.active = (
+            old_active if old_active and old_active.name in bpy.data.objects else None)
+
+
+def _hair_curves_set_curve_types(data, curve_types):
+    if len(curve_types) != len(data.curves):
+        raise ValueError("hair Curves curve_type count does not match its curves")
+    if any(curve_type not in (0, 1, 2, 3) for curve_type in curve_types):
+        raise ValueError("hair Curves curve_type is outside Blender's supported range")
+    if not any(curve_type != 0 for curve_type in curve_types):
+        return data
+
+    selection_name = "_potter_curve_type_selection"
+    while data.attributes.get(selection_name) is not None:
+        selection_name += "_"
+    selection = data.attributes.new(
+        name=selection_name, type="INT", domain="CURVE")
+    for item, curve_type in zip(selection.data, curve_types):
+        item.value = int(curve_type)
+
+    old_active = bpy.context.view_layer.objects.active
+    old_selected = list(bpy.context.selected_objects)
+    tree = None
+    obj = None
+    converted = data
+    try:
+        tree = bpy.data.node_groups.new(
+            "_Potter Curves Type Conversion", "GeometryNodeTree")
+        tree.interface.new_socket(
+            name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+        tree.interface.new_socket(
+            name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+        input_node = tree.nodes.new("NodeGroupInput")
+        output_node = tree.nodes.new("NodeGroupOutput")
+        named_attribute = tree.nodes.new("GeometryNodeInputNamedAttribute")
+        named_attribute.data_type = "INT"
+        named_attribute.inputs["Name"].default_value = selection_name
+        current_geometry = input_node.outputs["Geometry"]
+        # NURBS conversion triples Catmull-Rom points; pass through Poly first.
+        for curve_type, spline_type in (
+                (1, "POLY"), (3, "POLY"), (3, "NURBS"), (2, "BEZIER")):
+            if curve_type not in curve_types:
+                continue
+            set_type = tree.nodes.new("GeometryNodeCurveSplineType")
+            set_type.spline_type = spline_type
+            compare = tree.nodes.new("FunctionNodeCompare")
+            compare.data_type = "INT"
+            compare.operation = "EQUAL"
+            compare.inputs["B"].default_value = curve_type
+            tree.links.new(named_attribute.outputs["Attribute"], compare.inputs["A"])
+            tree.links.new(compare.outputs["Result"], set_type.inputs["Selection"])
+            tree.links.new(current_geometry, set_type.inputs["Curve"])
+            current_geometry = set_type.outputs["Curve"]
+        tree.links.new(current_geometry, output_node.inputs["Geometry"])
+
+        obj = bpy.data.objects.new("_Potter Curves Type Conversion", data)
+        bpy.context.scene.collection.objects.link(obj)
+        for selected in old_selected:
+            selected.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        modifier = obj.modifiers.new("_Potter Curves Type Conversion", "NODES")
+        modifier.node_group = tree
+        bpy.context.view_layer.update()
+        bpy.ops.object.modifier_apply(modifier=modifier.name)
+        converted = obj.data
+        return converted
+    finally:
+        for curves_data in (data, converted):
+            attribute = curves_data.attributes.get(selection_name)
+            if attribute is not None:
+                curves_data.attributes.remove(attribute)
+        if obj is not None and obj.name in bpy.data.objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        if tree is not None and tree.users == 0:
+            bpy.data.node_groups.remove(tree)
+        if converted is not data and data.users == 0:
+            bpy.data.hair_curves.remove(data)
+        for selected in list(bpy.context.selected_objects):
+            selected.select_set(False)
+        for selected in old_selected:
+            if selected.name in bpy.data.objects:
+                selected.select_set(True)
+        bpy.context.view_layer.objects.active = (
+            old_active if old_active and old_active.name in bpy.data.objects else None)
+
+
 def _hair_curves_create(name, data_id, raw, source):
-    data = bpy.data.hair_curves.new(name)
     curves = raw.get("curves", [])
     point_counts = [len(curve.get("points", [])) for curve in curves]
-    if point_counts:
-        data.add_curves(point_counts)
+    curve_types = _hair_curve_attribute_values(
+        raw, "curve_type", "CURVE", "INT8", len(curves), [0] * len(curves))
+    if any(curve_type not in (0, 1, 2, 3) for curve_type in curve_types):
+        raise ValueError("hair Curves curve_type is outside Blender's supported range")
+    data = _hair_curves_create_from_legacy(name, raw)
+    if data is None:
+        data = bpy.data.hair_curves.new(name)
+        if point_counts:
+            data.add_curves(point_counts)
+        data = _hair_curves_set_curve_types(data, curve_types)
+        data.name = name
+    elif len(data.curves) != len(curves):
+        raise ValueError("converted Curves curve count does not match its source payload")
     for curve, source_curve in zip(data.curves, curves):
         points = source_curve.get("points", [])
         radius = float(source_curve.get("radius", 0.0))
@@ -7231,12 +7473,26 @@ def _hair_curves_create(name, data_id, raw, source):
             continue
         if domain not in ("POINT", "CURVE") or not data_type:
             raise ValueError("hair Curves attribute %s has an unsupported domain or type" % name)
+        values = source_attribute.get("values", [])
+        if name == "knots_mode":
+            # The public Curves RNA API cannot restore a custom knot vector.
+            values = [0 if value == 4 else value for value in values]
+        if name == "curve_type":
+            attribute = data.attributes.get(name)
+            if attribute is None:
+                attribute = data.attributes.new(name=name, type=data_type, domain=domain)
+            elif attribute.domain != domain or attribute.data_type != data_type:
+                raise ValueError("hair Curves attribute %s conflicts with built-in domain or type"
+                                 % name)
+            if len(values) != len(attribute.data) or [
+                    int(item.value) for item in attribute.data] != [int(value) for value in values]:
+                raise ValueError("hair Curves curve_type values disagree with the generated splines")
+            continue
         attribute = data.attributes.get(name)
         if attribute is None:
             attribute = data.attributes.new(name=name, type=data_type, domain=domain)
         elif attribute.domain != domain or attribute.data_type != data_type:
             raise ValueError("hair Curves attribute %s conflicts with built-in domain or type" % name)
-        values = source_attribute.get("values", [])
         if len(values) != len(attribute.data):
             raise ValueError("hair Curves attribute %s has %d values for %d elements"
                              % (name, len(values), len(attribute.data)))
@@ -8915,14 +9171,14 @@ def export_doc(doc, target, pack, scene_hash, context):
             obj_data = grease_pencil_map.get(data_id)
             if obj_data is None:
                 raise ValueError("Grease Pencil object references missing data %s" % data_id)
-        elif kind in ("curve", "surface", "text") or native_type in ("CURVE", "SURFACE", "FONT"):
-            obj_data = curve_map.get(data_id)
-            if obj_data is None:
-                raise ValueError("curve object references missing curve data %s" % data_id)
         elif kind == "hair_curves" or native_type == "CURVES":
             obj_data = hair_curves_map.get(data_id)
             if obj_data is None:
                 raise ValueError("hair Curves object references missing data %s" % data_id)
+        elif kind in ("curve", "surface", "text") or native_type in ("CURVE", "SURFACE", "FONT"):
+            obj_data = curve_map.get(data_id)
+            if obj_data is None:
+                raise ValueError("curve object references missing curve data %s" % data_id)
         elif kind == "volume" or native_type == "VOLUME":
             obj_data = volume_map.get(data_id)
             if obj_data is None:

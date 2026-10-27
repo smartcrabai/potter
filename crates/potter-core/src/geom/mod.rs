@@ -336,11 +336,16 @@ impl Aabb {
     }
 }
 
-/// Invalid mesh data, primitive arguments, or exhausted element IDs.
+/// Invalid mesh data, primitive arguments, unsupported features, or exhausted element IDs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MeshError {
     /// A parameter does not satisfy its documented domain.
     InvalidParameter(&'static str),
+    /// A required feature is not represented by the evaluator.
+    UnsupportedFeature {
+        feature_id: &'static str,
+        reason: &'static str,
+    },
     /// Mesh topology or stored IDs are inconsistent.
     InvalidTopology(&'static str),
     /// The next ID cannot be incremented without overflowing `u32`.
@@ -352,6 +357,9 @@ impl fmt::Display for MeshError {
         match self {
             Self::InvalidParameter(message) => {
                 write!(formatter, "invalid primitive parameter: {message}")
+            }
+            Self::UnsupportedFeature { feature_id, reason } => {
+                write!(formatter, "unsupported feature `{feature_id}`: {reason}")
             }
             Self::InvalidTopology(message) => write!(formatter, "invalid mesh topology: {message}"),
             Self::IdExhausted => formatter.write_str("mesh element ID space exhausted"),

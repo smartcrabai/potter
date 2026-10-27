@@ -1678,9 +1678,10 @@ impl Snapshot {
                                 .map(Vec::as_slice);
                             crate::geom::curve::evaluate_curve_with_taper(curve, taper_profile)
                                 .map_err(|error| {
-                                    PotError::with_details(
+                                    crate::geom::curve::curve_error(
+                                        &error,
                                         ErrorCode::SceneInvalid,
-                                        format!("curve geometry is invalid: {error}"),
+                                        "curve geometry is invalid",
                                         json!({ "data": data_id }),
                                     )
                                 })?
@@ -3496,9 +3497,10 @@ pub(crate) fn curve_taper_profiles(
             .map(Vec::as_slice);
         let profile =
             crate::geom::curve::taper_profile_samples(curve, taper_profile).map_err(|error| {
-                PotError::with_details(
+                crate::geom::curve::curve_error(
+                    &error,
                     ErrorCode::SceneInvalid,
-                    format!("curve taper profile is invalid: {error}"),
+                    "curve taper profile is invalid",
                     json!({"feature_id":"curve.taper_object","data":id}),
                 )
             })?;
@@ -3822,9 +3824,10 @@ fn operand_object_mesh(
                 .map(Vec::as_slice);
             crate::geom::curve::evaluate_curve_with_taper(curve, taper_profile).map_err(
                 |error| {
-                    PotError::with_details(
+                    crate::geom::curve::curve_error(
+                        &error,
                         ErrorCode::InvalidArgument,
-                        format!("curve modifier operand is invalid: {error}"),
+                        "curve modifier operand is invalid",
                         json!({"modifier_id":modifier.id,"object":object_id}),
                     )
                 },
@@ -5674,9 +5677,10 @@ pub(crate) fn apply_scene_operand_modifier(
                         .map(Vec::as_slice);
                     crate::geom::curve::evaluate_curve_with_taper(curve, taper_profile).map_err(
                         |error| {
-                            PotError::with_details(
+                            crate::geom::curve::curve_error(
+                                &error,
                                 ErrorCode::InvalidArgument,
-                                format!("curve modifier operand is invalid: {error}"),
+                                "curve modifier operand is invalid",
                                 json!({"modifier_id":modifier.id,"object":object_id}),
                             )
                         },
