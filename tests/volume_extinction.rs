@@ -425,13 +425,12 @@ fn voxel_spectral_warnings(absorption_inputs: Value) -> Result<Vec<Value>, Box<d
 }
 
 #[test]
-fn voxel_volume_with_coloured_absorption_reports_spectral_extinction() -> Result<(), Box<dyn Error>>
-{
+fn voxel_volume_with_coloured_absorption_reports_no_spectral_extinction_warning()
+-> Result<(), Box<dyn Error>> {
     let warnings = voxel_spectral_warnings(json!({"Color": [0.2, 0.5, 0.8, 1.0], "Density": 1.0}))?;
-    assert_eq!(
-        warnings.len(),
-        1,
-        "a coloured voxel absorption must report shader.volume.spectral_extinction once"
+    assert!(
+        warnings.is_empty(),
+        "supported coloured voxel absorption must not report shader.volume.spectral_extinction: {warnings:?}"
     );
     Ok(())
 }
@@ -439,11 +438,65 @@ fn voxel_volume_with_coloured_absorption_reports_spectral_extinction() -> Result
 #[test]
 fn voxel_volume_with_default_absorption_colour_reports_no_spectral_extinction()
 -> Result<(), Box<dyn Error>> {
-    // The default Color 0.8 is grey, so the channels' extinction is equal and nothing is approximated.
     let warnings = voxel_spectral_warnings(json!({"Density": 1.0}))?;
     assert!(
         warnings.is_empty(),
         "a grey voxel absorption must not report shader.volume.spectral_extinction: {warnings:?}"
     );
+    Ok(())
+}
+
+/// Renders two coloured-scattering voxel volumes with realtime and returns their spectral-scattering warnings.
+fn realtime_coloured_scattering_warnings() -> Result<Vec<Value>, Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = directory.path().join("scene");
+    let mut operations = graph_operations(
+        vec![node(
+            "volume",
+            "ShaderNodeVolumeScatter",
+            json!({"Color": [0.05, 0.4, 0.9, 1.0], "Density": 1.0}),
+        )],
+        vec![link("volume", "Volume", "output", "Volume")],
+    );
+    operations.extend([
+        json!({"op":"material.create","id":"fog","graph":GRAPH}),
+        json!({"op":"volume.create","id":"fog_volume","materials":["fog"],"grids":[{"dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],"values":vec![1.0; 8]}]}),
+        json!({"op":"volume.create","id":"fog_volume_duplicate","materials":["fog"],"grids":[{"dims":[2,2,2],"voxel_size":1.0,"origin":[-0.5,-0.5,-0.5],"values":vec![1.0; 8]}]}),
+        json!({"op":"world.create","id":"world_main","color":[1.0,1.0,1.0],"strength":1.0}),
+        json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":2.0}),
+        json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":8,"resolution_y":8,"samples":1,"seed":0,"max_bounces":2,"volume_bounces":2}}),
+    ]);
+    make_scene(&scene, &operations)?;
+    let output = pot()
+        .arg("render")
+        .arg(&scene)
+        .args(["--engine", "realtime", "--format", "png", "--out"])
+        .arg(directory.path().join("render"))
+        .arg("--json")
+        .output()?;
+    let result = assert_cli_success(&output)?;
+    let warnings = result["result"]["warnings"]
+        .as_array()
+        .ok_or("render warnings are missing")?;
+    Ok(warnings
+        .iter()
+        .filter(|warning| {
+            warning["feature_id"] == "shader.volume.spectral_extinction.realtime_scattering"
+        })
+        .cloned()
+        .collect())
+}
+
+#[test]
+fn realtime_coloured_volume_scattering_reports_one_deduplicated_warning()
+-> Result<(), Box<dyn Error>> {
+    let warnings = realtime_coloured_scattering_warnings()?;
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected one warning for two coloured media: {warnings:?}"
+    );
+    assert_eq!(warnings[0]["code"], "UNSUPPORTED_FEATURE");
     Ok(())
 }

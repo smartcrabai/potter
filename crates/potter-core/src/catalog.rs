@@ -123,9 +123,9 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
-        unsupported(
+        supported(
             "shader.volume.spectral_extinction",
-            "Voxel volume with per-channel extinction",
+            "Per-channel RGB extinction, transmittance, and scattering for voxel volumes in path tracing, plus per-channel voxel extinction and colored absorption in realtime; realtime colored in-scatter is not claimed",
             "ShaderNodeVolumeAbsorption, ShaderNodeVolumeScatter, ShaderNodeVolumePrincipled",
             &[
                 "volume.create",
@@ -136,7 +136,22 @@ pub fn feature_catalog() -> Value {
                 "graph.node_add",
                 "graph.link",
             ],
-            "Voxel volumes transport a grey extinction (the channel mean of the material's per-channel extinction) with a per-channel albedo, so a Volume whose Absorption or Scatter colour is not grey reports UNSUPPORTED_FEATURE and its colour is approximated. Material volumes on closed meshes transmit each channel exactly; their in-scatter is a single-scatter approximation.",
+            [true, true, true, true, true, false, false],
+        ),
+        unsupported(
+            "shader.volume.spectral_extinction.realtime_scattering",
+            "Colored voxel-volume in-scatter in realtime rendering",
+            "ShaderNodeVolumeScatter, ShaderNodeVolumePrincipled",
+            &[
+                "volume.create",
+                "volume.update",
+                "material.create",
+                "material.update",
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+            ],
+            "Potter realtime colored in-scatter does not match Blender 5.2.2 EEVEE and is not compared or claimed as supported.",
         ),
         supported(
             "render.volume.scattering",

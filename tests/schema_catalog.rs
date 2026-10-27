@@ -1030,6 +1030,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "modifier.boolean.exact_point_attribute_local_index",
         "constraint.geometry_attribute.instances",
         "animation.fcurve_non_transform_channels",
+        "shader.volume.spectral_extinction",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1064,6 +1065,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "curve.convert.production_settings",
         "blender.curve.bevel_object",
         "modifier.uv_project.animated_camera_lens",
+        "shader.volume.spectral_extinction.realtime_scattering",
     ] {
         assert!(
             features.iter().any(|feature| {
