@@ -383,6 +383,10 @@ fn complete_scene_schema(root: &mut Value) {
         json!({"type":"number","minimum":0,"maximum":20});
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["source_files"] =
         json!({"type":"array","items":{"type":"string"},"default":[]});
+    defs["sequencer"]["properties"]["strips"]["items"]["properties"]["font"] =
+        json!({"type":["string","null"],"default":null});
+    defs["sequencer"]["properties"]["strips"]["items"]["properties"]["wrap_width"] =
+        json!({"type":"number","minimum":0,"maximum":1,"default":1.0});
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["channel"]["minimum"] =
         json!(1);
     let scene = &mut defs["scene"];
@@ -2156,6 +2160,8 @@ fn operation_contract(name: &str) -> OperationContract {
                 "source_files",
                 "color",
                 "text",
+                "font",
+                "wrap_width",
                 "transition",
                 "inputs",
                 "effect",
@@ -2163,7 +2169,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec!["op", "id", "type"],
             "scene sequencer strip",
             "none",
-            json!({"name":"id","source_files":[]}),
+            json!({"name":"id","source_files":[],"font":null,"wrap_width":1.0}),
         ),
         "sequencer.strip_update" => (
             vec!["target", "id", "set"],
@@ -2477,6 +2483,20 @@ fn field_schema(operation: &str, field: &str) -> Value {
     ) && field == "source"
     {
         return json!({"type":["string","null"]});
+    }
+    if matches!(
+        operation,
+        "sequencer.strip_create" | "sequencer.strip_update"
+    ) && field == "font"
+    {
+        return json!({"type":["string","null"],"default":null});
+    }
+    if matches!(
+        operation,
+        "sequencer.strip_create" | "sequencer.strip_update"
+    ) && field == "wrap_width"
+    {
+        return json!({"type":"number","minimum":0,"maximum":1,"default":1.0});
     }
     if matches!(
         operation,
@@ -2979,11 +2999,13 @@ fn set_schema(operation: &str) -> Value {
                 "source_files",
                 "color",
                 "text",
+                "font",
+                "wrap_width",
                 "transition",
                 "inputs",
                 "effect",
             ] {
-                let schema = if matches!(field, "source" | "source_files") {
+                let schema = if matches!(field, "source" | "source_files" | "font" | "wrap_width") {
                     field_schema(operation, field)
                 } else {
                     json!({})
@@ -3418,6 +3440,60 @@ mod tests {
             document["$defs"].as_object().map(serde_json::Map::len),
             Some(crate::ops::OP_NAMES.len() + 4)
         );
+    }
+    #[test]
+    fn sequencer_font_and_wrap_width_are_optional_and_typed() -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let font =
+            &scene["$defs"]["sequencer"]["properties"]["strips"]["items"]["properties"]["font"];
+        assert_eq!(font["type"], serde_json::json!(["string", "null"]));
+        assert_eq!(font["default"], serde_json::Value::Null);
+        assert!(
+            !scene["$defs"]["sequencer"]["properties"]["strips"]["items"]["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "font"))
+        );
+
+        let create = schema("operations", Some("sequencer.strip_create"))?;
+        assert_eq!(
+            create["properties"]["font"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
+            create["x-potter"]["defaults"]["font"],
+            serde_json::Value::Null
+        );
+
+        let update = schema("operations", Some("sequencer.strip_update"))?;
+        assert_eq!(
+            update["properties"]["set"]["properties"]["font"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        let strip_schema = &scene["$defs"]["sequencer"]["properties"]["strips"]["items"];
+        let wrap_width = &strip_schema["properties"]["wrap_width"];
+        assert_eq!(wrap_width["type"], "number");
+        assert_eq!(wrap_width["minimum"], 0);
+        assert_eq!(wrap_width["maximum"], 1);
+        assert_eq!(wrap_width["default"], 1.0);
+        assert!(
+            !scene["$defs"]["sequencer"]["properties"]["strips"]["items"]["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "wrap_width"))
+        );
+
+        assert_eq!(create["properties"]["wrap_width"]["minimum"], 0);
+        assert_eq!(create["properties"]["wrap_width"]["maximum"], 1);
+        assert_eq!(create["x-potter"]["defaults"]["wrap_width"], 1.0);
+
+        assert_eq!(
+            update["properties"]["set"]["properties"]["wrap_width"]["minimum"],
+            0
+        );
+        assert_eq!(
+            update["properties"]["set"]["properties"]["wrap_width"]["maximum"],
+            1
+        );
+        Ok(())
     }
 
     #[test]

@@ -3873,7 +3873,7 @@ fn resolve_optional_text_font_bytes(
     }
 }
 
-fn resolve_text_font_bytes(
+pub(crate) fn resolve_text_font_bytes(
     doc: &SceneDoc,
     project_root: Option<&Path>,
     reference: &str,

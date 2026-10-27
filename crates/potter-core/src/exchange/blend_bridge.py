@@ -1385,6 +1385,19 @@ def _resource_record(kind, owner, path, packed_file=None):
     return {"kind": kind, "owner": owner, "path": resolved,
             "packed": packed_data is not None, "packed_data": packed_data}
 
+
+def _append_font_resource(result, seen_fonts, owner, font):
+    packed_file = getattr(font, "packed_file", None) if font else None
+    if font is None or (font.filepath in ("", "<builtin>") and packed_file is None):
+        return
+    path = bpy.path.abspath(font.filepath) if font.filepath else ""
+    key = path or font.as_pointer()
+    if key in seen_fonts:
+        return
+    seen_fonts.add(key)
+    result.append(_resource_record("font", owner, font.filepath, packed_file))
+
+
 def _library_resolved_path(library):
     # Library.filepath is relative to the file that links it (the parent
     # library, or the main file for top-level libraries), not to itself.
@@ -1539,17 +1552,8 @@ def resources_dump():
         if getattr(getattr(curve, "bl_rna", None), "identifier", "") != "TextCurve":
             continue
         for field in ("font", "font_bold", "font_italic", "font_bold_italic"):
-            font = getattr(curve, field, None)
-            packed_file = getattr(font, "packed_file", None) if font else None
-            if font is None or (font.filepath in ("", "<builtin>") and packed_file is None):
-                continue
-            path = bpy.path.abspath(font.filepath) if font.filepath else ""
-            key = path or font.as_pointer()
-            if key in seen_fonts:
-                continue
-            seen_fonts.add(key)
-            result.append(_resource_record("font", curve.name_full, font.filepath,
-                                           packed_file))
+            _append_font_resource(result, seen_fonts, curve.name_full,
+                                  getattr(curve, field, None))
     for volume in getattr(bpy.data, "volumes", ()):
         filepath = volume_filepath(volume)
         if filepath:
@@ -1573,6 +1577,9 @@ def resources_dump():
                 kind = "movie" if getattr(strip, "type", None) == "MOVIE" else "image"
                 result.append(_resource_record(kind, strip.name, strip.filepath,
                                                getattr(strip, "packed_file", None)))
+            if getattr(strip, "type", None) == "TEXT":
+                _append_font_resource(result, seen_fonts, strip.name,
+                                      getattr(strip, "font", None))
     for cache_file in getattr(bpy.data, "cache_files", ()):
         if cache_file.filepath:
             result.append(_cache_file_resource(cache_file))
@@ -3199,6 +3206,52 @@ def _scene_linear_to_color_gamma(value):
     return 1.055 * value ** (1.0 / 2.4) - 0.055
 
 
+def _sequencer_text_f32(value):
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _sequencer_text_settings(strip):
+    # RNA property defaults differ from TextVars initialized for a new VSE text effect.
+    defaults = {
+        "font_size": 60.0,
+        "location": [0.5, 0.5],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "wrap_width": 1.0,
+        "space_line": 1.0,
+        "abs_space_line": 60.0,
+        "use_absolute_line_spacing": False,
+        "use_bold": False,
+        "use_italic": False,
+        "use_shadow": False,
+        "shadow_angle": _sequencer_text_f32(math.radians(65.0)),
+        "shadow_offset": _sequencer_text_f32(0.04),
+        "shadow_blur": 0.0,
+        "shadow_color": [0.0, 0.0, 0.0, _sequencer_text_f32(0.7)],
+        "use_outline": False,
+        "outline_width": _sequencer_text_f32(0.05),
+        "outline_color": [0.0, 0.0, 0.0, _sequencer_text_f32(0.7)],
+        "use_box": False,
+        "box_color": [_sequencer_text_f32(0.2)] * 3 + [_sequencer_text_f32(0.7)],
+        "box_margin": _sequencer_text_f32(0.01),
+        "box_roundness": 0.0,
+    }
+    try:
+        properties = strip.bl_rna.properties
+    except Exception:
+        return {}
+    settings = {}
+    for field, default in defaults.items():
+        if properties.get(field) is None:
+            continue
+        try:
+            value = plain(getattr(strip, field))
+        except Exception:
+            continue
+        settings[field] = {"value": value, "default": default}
+    return settings
+
 def _sequencer_dump(scene):
     editor = getattr(scene, "sequence_editor", None)
     if editor is None:
@@ -3259,6 +3312,13 @@ def _sequencer_dump(scene):
         for key in getattr(strip, "retiming_keys", ()):
             retiming.append({"frame": float(getattr(key, "timeline_frame", 0.0)),
                              "source_frame": float(getattr(key, "source_frame", 0.0))})
+        font_path = None
+        text_settings = {}
+        if source_type == "text":
+            font_path, _font_name = _text_variant_font_state(getattr(strip, "font", None))
+            if font_path in ("", "builtin"):
+                font_path = None
+            text_settings = _sequencer_text_settings(strip)
         result.append({
             "name": strip.name,
             "type": source_type,
@@ -3281,6 +3341,8 @@ def _sequencer_dump(scene):
             "source_files": source_files,
             "color": color,
             "text": getattr(strip, "text", None),
+            "font": font_path,
+            "text_settings": text_settings,
             "transition": transition,
             "inputs": [getattr(strip, name).name for name in ("input_1", "input_2")
                        if getattr(strip, name, None) is not None],
@@ -8034,7 +8096,7 @@ def _restore_rigid_body_world(scene, source):
     world.point_cache.frame_start = int(source.get("frame_start", scene.frame_start))
     world.point_cache.frame_end = int(source.get("frame_end", scene.frame_end))
 
-def _restore_sequencer(scene, sequencer, scene_map, doc, target):
+def _restore_sequencer(scene, sequencer, scene_map, doc, target, pack):
     sequencer = sequencer or {}
     colorspaces = {
         "srgb": "sRGB",
@@ -8127,7 +8189,13 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                 elif kind == "color":
                     strip = sequences.new_effect(name, "COLOR", channel, frame_start, frame_end)
                 elif kind == "text":
-                    strip = sequences.new_effect(name, "TEXT", channel, frame_start, frame_end)
+                    strip = sequences.new_effect(
+                        name=name,
+                        type="TEXT",
+                        channel=channel,
+                        frame_start=frame_start,
+                        length=frame_end - frame_start,
+                    )
                 elif kind == "meta":
                     strip = sequences.new_meta(name, channel, frame_start, frame_end)
                 else:
@@ -8164,6 +8232,11 @@ def _restore_sequencer(scene, sequencer, scene_map, doc, target):
                     strip.color = color
                 if hasattr(strip, "text"):
                     strip.text = source.get("text") or ""
+                if kind == "text":
+                    strip.wrap_width = float(source.get("wrap_width", 1.0))
+                if kind == "text" and source.get("font"):
+                    strip.font = _load_text_font(
+                        source["font"], "", doc, target, pack)
                 created[source.get("id")] = strip
                 pending.remove(source)
                 progressed = True
@@ -9869,7 +9942,7 @@ def export_doc(doc, target, pack, scene_hash, context):
         view.exposure = float(color.get("exposure", 0.0))
         view.gamma = float(color.get("gamma", 1.0))
         _restore_color_curve(view, color.get("curve"))
-        _restore_sequencer(scene, item.get("sequencer"), scene_map, doc, target)
+        _restore_sequencer(scene, item.get("sequencer"), scene_map, doc, target, pack)
     for node_id, item in doc.get("nodes", {}).items():
         if (node_id in linked_maps["nodes"]
                 or item.get("properties", {}).get("library_override")):

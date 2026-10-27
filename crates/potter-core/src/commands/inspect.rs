@@ -115,6 +115,11 @@ pub fn run(args: InspectArgs) -> Result<(Option<SceneInfo>, Value)> {
             "references": {},
             "masks": doc.masks,
             "resources": [],
+            "sequencers": doc
+                .scenes
+                .iter()
+                .map(|(id, scene)| (id.as_str(), &scene.sequencer))
+                .collect::<BTreeMap<_, _>>(),
             "features": features,
             "evaluation": {
                 "scene_id": snapshot.scene_id,

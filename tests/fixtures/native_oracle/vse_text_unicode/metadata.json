@@ -1,0 +1,844 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "blend_file": "vse_text_unicode_supported.blend",
+  "additional_blend_files": [
+    "vse_text_unicode_half_resolution.blend"
+  ],
+  "render": {
+    "engine": "BLENDER_EEVEE",
+    "resolution": [
+      1024,
+      256
+    ],
+    "resolution_percentage": 100,
+    "format": "PNG",
+    "color_mode": "RGBA",
+    "color_depth": 8,
+    "film_transparent": true,
+    "view_transform": "Standard",
+    "look": "None"
+  },
+  "font_policy": "Default captures use Blender's installed fallback font stack and remain Blender-only. Portable cases use static Lato-Regular, Lato-Italic, Noto Sans CJK subset, and Liberation Sans fonts. Their SIL OFL 1.1 license files are retained beside the fixtures.",
+  "font_assets": {
+    "lato_regular": {
+      "repository_path": "tests/fixtures/text_external_font/Lato-Regular.ttf",
+      "license": "tests/fixtures/text_external_font/OFL.txt"
+    },
+    "lato_italic": {
+      "repository_path": "tests/fixtures/text_external_font/Lato-Italic.ttf",
+      "license": "tests/fixtures/text_external_font/OFL.txt"
+    },
+    "noto_cjk_unicode_subset": {
+      "repository_path": "tests/fixtures/native_oracle/vse_text_unicode/fonts/NotoSansCJKUnicodeSubset.otf",
+      "license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/OFL.txt",
+      "format": "Static OpenType CFF (OTF), decompressed from Blender's bundled WOFF2 with FontTools 4.68.0."
+    },
+    "liberation_sans": {
+      "repository_path": "tests/fixtures/native_oracle/vse_text_unicode/fonts/LiberationSans-Regular.ttf",
+      "license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/LiberationSans-OFL.txt",
+      "license_source": "https://github.com/liberationfonts/liberation-fonts/blob/2.1.5/LICENSE",
+      "source": "https://github.com/liberationfonts/liberation-fonts/releases/tag/2.1.5",
+      "static_kern_table": {
+        "table": "kern",
+        "version": 0,
+        "subtables": [
+          {
+            "format": 0,
+            "pair_count": 908
+          }
+        ],
+        "format_zero_pair_count": 908,
+        "AV_pair_adjustment_units": -152
+      }
+    }
+  },
+  "pixel_hash_representation": "Blender Image.pixels RGBA float32 values, serialized little-endian after reading each PNG.",
+  "cases": [
+    {
+      "name": "default_cjk",
+      "text": "日本語の文字",
+      "probe_only": false,
+      "comparison_scope": "blender_only_default_font",
+      "scene": "VSETextUnicodeDefaultProbes",
+      "frame": 1,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "default_cjk.png",
+      "png_sha256": "19c2ec2ed258ba2edc8117a8c78fb8c36b36724dcc945f60082bd7d69140f4ce",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "348779f41f513ae10498d024c7b92ca2d54753ddd9548da2f18e614733de538d",
+        "nontransparent_pixel_count": 6593,
+        "nontransparent_bounds_blender_xyxy": [
+          312,
+          102,
+          718,
+          160
+        ]
+      },
+      "strip_defaults": {
+        "font": null,
+        "font_asset": null,
+        "font_license": null,
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "default_accented_latin",
+      "text": "Café déjà vu — Ångström naïve",
+      "probe_only": false,
+      "comparison_scope": "blender_only_default_font",
+      "scene": "VSETextUnicodeDefaultProbes",
+      "frame": 2,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "default_accented_latin.png",
+      "png_sha256": "d316a79edd5608120f614190f9f8b051d362e25d7d7bab345ffa32a8b82ffadc",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "814fde0276507176c64a406bf2fde545837186075c0e1a9bcbcde3bcff662e0b",
+        "nontransparent_pixel_count": 12889,
+        "nontransparent_bounds_blender_xyxy": [
+          102,
+          72,
+          924,
+          200
+        ]
+      },
+      "strip_defaults": {
+        "font": null,
+        "font_asset": null,
+        "font_license": null,
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "default_emoji_probe",
+      "text": "Emoji probe: 😀",
+      "probe_only": true,
+      "comparison_scope": "blender_only_default_font",
+      "scene": "VSETextUnicodeDefaultProbes",
+      "frame": 3,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "default_emoji_probe.png",
+      "png_sha256": "849b8000d9e54ac7ce4b939608dc4b0234003bc67964f22d2466fefeba6255cf",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "c9588503cc4e15e9c4bdfa1a926cbf00bcae8bf1525cfaa6d4373353cc23986f",
+        "nontransparent_pixel_count": 6874,
+        "nontransparent_bounds_blender_xyxy": [
+          247,
+          95,
+          776,
+          159
+        ]
+      },
+      "strip_defaults": {
+        "font": null,
+        "font_asset": null,
+        "font_license": null,
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "default_rtl_probe",
+      "text": "مرحبا بالعالم",
+      "probe_only": true,
+      "comparison_scope": "blender_only_default_font",
+      "scene": "VSETextUnicodeDefaultProbes",
+      "frame": 4,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "default_rtl_probe.png",
+      "png_sha256": "4457cc95adefc45984fa9a03fee2f7e3019aa391b600f6928fcc6cfe19e2e2f4",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "133f7715088a637cc61d76c62f1fe61cc91b6013466a38ef27d5576b015e19e3",
+        "nontransparent_pixel_count": 5073,
+        "nontransparent_bounds_blender_xyxy": [
+          281,
+          93,
+          743,
+          154
+        ]
+      },
+      "strip_defaults": {
+        "font": null,
+        "font_asset": null,
+        "font_license": null,
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "default_multiline",
+      "text": "first line\nsecond line",
+      "probe_only": false,
+      "comparison_scope": "blender_only_default_font",
+      "scene": "VSETextUnicodeDefaultProbes",
+      "frame": 5,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "default_multiline.png",
+      "png_sha256": "2c2ad8c8f2063d41351658343865fefa6ea7d45b914bf23c8a6af3950c283397",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "6509ae9deac35fa50bb2470dbb7c9971dbf94e8e3d8038f14e7c816089b1722e",
+        "nontransparent_pixel_count": 9039,
+        "nontransparent_bounds_blender_xyxy": [
+          320,
+          72,
+          707,
+          189
+        ]
+      },
+      "strip_defaults": {
+        "font": null,
+        "font_asset": null,
+        "font_license": null,
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "noto_cjk_multiline",
+      "text": "日本語\n漢字中文",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 1,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0001.png",
+      "png_sha256": "ba637fc986ae49adb02a2a1001d06d31bc53b025ab8f67c48977082a36ac9981",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "a383eaa922553e13c1d361b13bf56ae6945ec977362fd9b338c28dbfed675f0b",
+        "nontransparent_pixel_count": 8167,
+        "nontransparent_bounds_blender_xyxy": [
+          394,
+          53,
+          630,
+          198
+        ]
+      },
+      "strip_defaults": {
+        "font": "Potter CJK Sample Regular",
+        "font_asset": "tests/fixtures/native_oracle/vse_text_unicode/fonts/NotoSansCJKUnicodeSubset.otf",
+        "font_license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/OFL.txt",
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "lato_accented_multiline",
+      "text": "AV Café\nÀ bientôt",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 2,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0002.png",
+      "png_sha256": "4a4d02cfbeda47637a9c6a5210ecce953631290cebbc9221eaebd4e59c2f6b1c",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "90ba41302d5100abe5faca7284a7efd888a8d6a8d0066dc776adf5cff6443273",
+        "nontransparent_pixel_count": 6848,
+        "nontransparent_bounds_blender_xyxy": [
+          389,
+          69,
+          635,
+          184
+        ]
+      },
+      "strip_defaults": {
+        "font": "Lato Regular",
+        "font_asset": "tests/fixtures/text_external_font/Lato-Regular.ttf",
+        "font_license": "tests/fixtures/text_external_font/OFL.txt",
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "liberation_av_kern",
+      "text": "AV",
+      "oracle_expectation": "Static legacy kern-table pair AV is applied.",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 3,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0003.png",
+      "png_sha256": "eb10367bf8ed577d7af8d463a10ec6710df0afb57199cdf23a0ee5fd0bc860ec",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "d69e20bd303fd812ba0b29893f1e77bb193de248e236d889ff67035d9e15c85d",
+        "nontransparent_pixel_count": 1149,
+        "nontransparent_bounds_blender_xyxy": [
+          472,
+          107,
+          552,
+          148
+        ]
+      },
+      "strip_defaults": {
+        "font": "Liberation Sans Regular",
+        "font_asset": "tests/fixtures/native_oracle/vse_text_unicode/fonts/LiberationSans-Regular.ttf",
+        "font_license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/LiberationSans-OFL.txt",
+        "font_license_source": "https://github.com/liberationfonts/liberation-fonts/blob/2.1.5/LICENSE",
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "cjk_no_space_overflow",
+      "text": "日本語漢字",
+      "oracle_expectation": "No-space CJK text remains one line beyond wrap_width.",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 4,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0004.png",
+      "png_sha256": "6fb07da3e188fed8b7b4f9711fe5ce37e001bb84b6d34045e92e3d50a1121713",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "05f4df6835092734fbef758cfb7a64329b329b20383115c8d9ea3074d571c87d",
+        "nontransparent_pixel_count": 6136,
+        "nontransparent_bounds_blender_xyxy": [
+          372,
+          97,
+          658,
+          155
+        ]
+      },
+      "strip_defaults": {
+        "font": "Potter CJK Sample Regular",
+        "font_asset": "tests/fixtures/native_oracle/vse_text_unicode/fonts/NotoSansCJKUnicodeSubset.otf",
+        "font_license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/OFL.txt",
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 0.23999999463558197,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "cjk_ideographic_space_wrap",
+      "text": "日本語　漢",
+      "oracle_expectation": "Blender 5.2.2 wraps at U+0020 only; U+3000 remains on the overflowing line.",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 5,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0005.png",
+      "png_sha256": "9bdc3537507e3ef9167f708e8e44cd059a73d60f8f8fb6904a12818edec5372b",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "4cb5c74e97787378f48ffd21ecbc92b13d1d62be3075abdf11a32d845407fe60",
+        "nontransparent_pixel_count": 5069,
+        "nontransparent_bounds_blender_xyxy": [
+          372,
+          97,
+          661,
+          155
+        ]
+      },
+      "strip_defaults": {
+        "font": "Potter CJK Sample Regular",
+        "font_asset": "tests/fixtures/native_oracle/vse_text_unicode/fonts/NotoSansCJKUnicodeSubset.otf",
+        "font_license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/OFL.txt",
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 0.23999999463558197,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "cjk_ascii_space_wrap",
+      "text": "日本語 漢",
+      "oracle_expectation": "U+0020 spaces wrap CJK words at the configured width.",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 6,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0006.png",
+      "png_sha256": "8e553a9c008e3f69f351e71430b933b587e472db772a53ec211571bcd6fda353",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "b85c1702f674e4a5088c537f2bcf8eb6edaf87ac3f9e8bd58bc21fc58f29a663",
+        "nontransparent_pixel_count": 5069,
+        "nontransparent_bounds_blender_xyxy": [
+          432,
+          53,
+          600,
+          198
+        ]
+      },
+      "strip_defaults": {
+        "font": "Potter CJK Sample Regular",
+        "font_asset": "tests/fixtures/native_oracle/vse_text_unicode/fonts/NotoSansCJKUnicodeSubset.otf",
+        "font_license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/OFL.txt",
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 0.23999999463558197,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "lato_italic_final_negative_lsb",
+      "text": "AF",
+      "oracle_expectation": "The final italic F has a negative left side bearing; center the advance width.",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 7,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0007.png",
+      "png_sha256": "cadbb64ff77f6df8d82b6efe3ef63cd2c0edfb3679d95add1dd8868a442a46fc",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "0d1737f7609fe89acf68644ee016149d84fe3da0c809b45b7a16e137b6da63b5",
+        "nontransparent_pixel_count": 1085,
+        "nontransparent_bounds_blender_xyxy": [
+          475,
+          105,
+          548,
+          148
+        ]
+      },
+      "strip_defaults": {
+        "font": "Lato Italic",
+        "font_asset": "tests/fixtures/text_external_font/Lato-Italic.ttf",
+        "font_license": "tests/fixtures/text_external_font/OFL.txt",
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "scaled_size_50_percent",
+      "text": "M",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodeHalfResolution",
+      "frame": 1,
+      "blend_file": "vse_text_unicode_half_resolution.blend",
+      "capture": "half_resolution_frame_0001.png",
+      "png_sha256": "15dae12c10b5f7fbf8b0c40ee3f55bbb5be561f25c7e0fb04c1b3e7715da246c",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 50,
+        "output_size": [
+          512,
+          128
+        ]
+      },
+      "expected_font_size_pixels": 30,
+      "pixels": {
+        "size": [
+          512,
+          128
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "c1f31972b02b01a5011f036389ec3d77f1500491e58159e50670ea6a708e50c3",
+        "nontransparent_pixel_count": 297,
+        "nontransparent_bounds_blender_xyxy": [
+          244,
+          53,
+          268,
+          75
+        ]
+      },
+      "strip_defaults": {
+        "font": "Lato Regular",
+        "font_asset": "tests/fixtures/text_external_font/Lato-Regular.ttf",
+        "font_license": "tests/fixtures/text_external_font/OFL.txt",
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    }
+  ]
+}

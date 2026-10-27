@@ -50,6 +50,7 @@ repository = "https://github.com/smartcrabai/potter"
 version = "0.2.0"
 
 [workspace.dependencies]
+ab_glyph_rasterizer = "0.1.10"
 anyhow = "1"
 assert_cmd = "=2.2.2"
 base64 = "0.23"

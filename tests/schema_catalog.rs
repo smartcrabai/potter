@@ -360,14 +360,38 @@ fn tracking_masks_and_sequencer_operations_run_through_cli() {
             .unwrap()["status"],
         "partial"
     );
-    for unsupported in ["sequencer.strip.movie", "sequencer.strip.text.unicode"] {
-        assert_eq!(
-            rows.iter()
-                .find(|row| row["feature_id"] == unsupported)
-                .unwrap()["status"],
-            "not_supported"
+    let unicode_text_strip = rows
+        .iter()
+        .find(|row| row["feature_id"] == "sequencer.strip.text.unicode")
+        .unwrap();
+    assert_eq!(unicode_text_strip["status"], "partial");
+    let unicode_text_reason = unicode_text_strip["reason"].as_str().unwrap();
+    for expected in ["Light-target", "U+0020", "U+3000"] {
+        assert!(
+            unicode_text_reason.contains(expected),
+            "Unicode text-strip catalog reason must document `{expected}`"
         );
     }
+    assert_eq!(
+        rows.iter()
+            .find(|row| row["feature_id"] == "sequencer.strip.text.layout")
+            .unwrap()["status"],
+        "partial"
+    );
+    assert!(
+        rows.iter()
+            .find(|row| row["feature_id"] == "sequencer.strip.text.layout")
+            .unwrap()["reason"]
+            .as_str()
+            .unwrap()
+            .contains("wrap_width")
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row["feature_id"] == "sequencer.strip.movie")
+            .unwrap()["status"],
+        "not_supported"
+    );
 }
 
 #[test]

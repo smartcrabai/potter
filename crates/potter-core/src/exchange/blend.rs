@@ -6103,6 +6103,28 @@ fn parse_sequencer(
                     }
                 })
                 .transpose()?;
+            let wrap_width = match strip
+                .get("text_settings")
+                .and_then(|settings| settings.get("wrap_width"))
+            {
+                Some(setting) => {
+                    let value = setting
+                        .get("value")
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| {
+                            invalid_intermediate(
+                                "Blender VSE text wrap width must be a finite number",
+                            )
+                        })?;
+                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                        return Err(invalid_intermediate(
+                            "Blender VSE text wrap width must be between 0 and 1",
+                        ));
+                    }
+                    value as f32
+                }
+                None => 1.0,
+            };
             Ok(SequenceStrip {
                 id,
                 name: name.to_owned(),
@@ -6130,6 +6152,8 @@ fn parse_sequencer(
                 source,
                 color,
                 text: strip.get("text").and_then(Value::as_str).map(str::to_owned),
+                font: strip.get("font").and_then(Value::as_str).map(str::to_owned),
+                wrap_width,
                 transition,
                 inputs,
                 effect,
@@ -10918,6 +10942,58 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             "Blender's USD cache file is not supported; the cache resource is kept but its Mesh Cache and Mesh Sequence Cache modifiers fail at evaluation",
         ));
     }
+    for scene in raw
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for strip in scene
+            .get("sequencer")
+            .and_then(|sequencer| sequencer.get("strips"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if strip.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let name = strip.get("name").and_then(Value::as_str);
+            let settings = strip.get("text_settings");
+            let has_non_default_settings =
+                settings.and_then(Value::as_object).is_some_and(|settings| {
+                    settings.iter().any(|(field, setting)| {
+                        field != "wrap_width"
+                            && setting
+                                .get("value")
+                                .zip(setting.get("default"))
+                                .is_some_and(|(value, default)| value != default)
+                    })
+                });
+            if has_non_default_settings {
+                losses.push(loss(
+                    "sequencer.strip.text.layout",
+                    name,
+                    "Blender VSE text layout and style settings are not represented by Potter text strips; the non-default settings are not applied",
+                ));
+            }
+            let contains_unicode = strip
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_ascii());
+            let has_explicit_font = strip
+                .get("font")
+                .and_then(Value::as_str)
+                .is_some_and(|font| !font.is_empty());
+            if contains_unicode && !has_explicit_font {
+                losses.push(loss(
+                    "sequencer.strip.text.unicode",
+                    name,
+                    "Blender VSE text contains non-ASCII characters but has no explicit external font; assign a supported TTF or OTF font to preserve the text",
+                ));
+            }
+        }
+    }
     for curve in raw
         .get("curves")
         .and_then(Value::as_array)
@@ -13768,6 +13844,117 @@ mod tests {
             )
             .unwrap(),
             (f64::from(0.6_f32), true)
+        );
+    }
+    #[test]
+    fn sequencer_text_import_preserves_font_and_wrap_width_defaults() -> Result<()> {
+        let raw = json!({
+            "sequencer": {
+                "strips": [
+                    {"name":"custom","type":"text","font":"asset://font_lato","text_settings":{"wrap_width":{"value":0.32,"default":1.0}}},
+                    {"name":"legacy","type":"text"}
+                ]
+            }
+        });
+        let sequencer = parse_sequencer(&raw, &BTreeMap::new(), &mut BTreeMap::new())?;
+        assert_eq!(
+            sequencer.strips[0].font.as_deref(),
+            Some("asset://font_lato")
+        );
+        assert_eq!(sequencer.strips[0].wrap_width, 0.32);
+        assert_eq!(sequencer.strips[1].wrap_width, 1.0);
+        assert_eq!(sequencer.strips[1].font, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sequencer_text_import_rejects_invalid_wrap_widths() {
+        for wrap_width in [json!(-0.1), json!(1.01), json!(1.0e300), json!(null)] {
+            let raw = json!({
+                "sequencer": {
+                    "strips": [{
+                        "name": "invalid",
+                        "type": "text",
+                        "text_settings": {
+                            "wrap_width": {
+                                "value": wrap_width,
+                                "default": 1.0
+                            }
+                        }
+                    }]
+                }
+            });
+            assert!(parse_sequencer(&raw, &BTreeMap::new(), &mut BTreeMap::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn sequencer_text_import_reports_only_nondefault_layout_and_unfonted_unicode() {
+        let raw = json!({
+            "scenes": [{
+                "name":"Scene",
+                "sequencer":{"strips":[
+                    {
+                        "name":"default",
+                        "type":"text",
+                        "text":"Default",
+                        "font":null,
+                        "text_settings":{
+                            "font_size":{"value":60.0,"default":60.0},
+                            "use_bold":{"value":false,"default":false},
+                            "use_shadow":{"value":false,"default":false},
+                            "shadow_color":{"value":[0.0,0.0,0.0,0.7],"default":[0.0,0.0,0.0,0.7]},
+                            "box_color":{"value":[0.2,0.2,0.2,0.7],"default":[0.2,0.2,0.2,0.7]}
+                        }
+                    },
+                    {
+                        "name":"wrapped",
+                        "type":"text",
+                        "text":"Wrapped",
+                        "font":null,
+                        "text_settings":{"wrap_width":{"value":0.32,"default":1.0}}
+                    },
+                    {
+                        "name":"layout",
+                        "type":"text",
+                        "text":"Layout",
+                        "font":null,
+                        "text_settings":{
+                            "font_size":{"value":72.0,"default":60.0},
+                            "use_shadow":{"value":false,"default":false}
+                        }
+                    },
+                    {
+                        "name":"unicode_default",
+                        "type":"text",
+                        "text":"こんにちは",
+                        "font":null,
+                        "text_settings":{"use_bold":{"value":false,"default":false}}
+                    },
+                    {
+                        "name":"unicode_font",
+                        "type":"text",
+                        "text":"こんにちは",
+                        "font":"/fonts/Lato-Regular.ttf"
+                    }
+                ]}
+            }]
+        });
+        let losses = import_losses(&raw);
+        let layout_losses = losses
+            .iter()
+            .filter(|loss| loss.feature_id == "sequencer.strip.text.layout")
+            .collect::<Vec<_>>();
+        assert_eq!(layout_losses.len(), 1);
+        assert_eq!(layout_losses[0].data_id.as_deref(), Some("layout"));
+        let unicode_losses = losses
+            .iter()
+            .filter(|loss| loss.feature_id == "sequencer.strip.text.unicode")
+            .collect::<Vec<_>>();
+        assert_eq!(unicode_losses.len(), 1);
+        assert_eq!(
+            unicode_losses[0].data_id.as_deref(),
+            Some("unicode_default")
         );
     }
 
