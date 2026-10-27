@@ -1,0 +1,449 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "scenarios": [
+    {
+      "blend": "dynamic_paint_image.blend",
+      "brush": "ImageBrush",
+      "brush_source": "POINT",
+      "canvas": "ImageCanvas",
+      "directory": ".",
+      "id": "point",
+      "image_dir": "images",
+      "mesh": {
+        "grid_height": 16,
+        "grid_width": 16,
+        "uv_layer": "UVMap"
+      },
+      "outputs": [
+        {
+          "file": "dp_paintmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_paintmap",
+          "width": 16
+        },
+        {
+          "file": "dp_paintmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_paintmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        }
+      ],
+      "surface": {
+        "dissolve_speed": 250,
+        "dry_speed": 500,
+        "frame_end": 2,
+        "frame_start": 1,
+        "image_fileformat": "PNG",
+        "image_output_path": "",
+        "image_resolution": 16,
+        "is_active": true,
+        "output_name_a": "dp_paintmap",
+        "output_name_b": "dp_wetmap",
+        "surface_format": "IMAGE",
+        "surface_type": "PAINT",
+        "use_antialiasing": false,
+        "use_dissolve": false,
+        "use_drying": false,
+        "use_output_a": true,
+        "use_output_b": true
+      }
+    },
+    {
+      "blend": "dynamic_paint_image.blend",
+      "brush": "ImageBrush",
+      "brush_source": "VOLUME",
+      "canvas": "ImageCanvas",
+      "directory": "scenarios/volume_antialias_on",
+      "id": "volume_antialias_on",
+      "image_dir": "images",
+      "mesh": {
+        "grid_height": 16,
+        "grid_width": 16,
+        "uv_layer": "UVMap"
+      },
+      "outputs": [
+        {
+          "file": "dp_paintmap01.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_paintmap##",
+          "width": 16
+        },
+        {
+          "file": "dp_paintmap02.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_paintmap##",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        }
+      ],
+      "surface": {
+        "dissolve_speed": 250,
+        "dry_speed": 500,
+        "frame_end": 2,
+        "frame_start": 1,
+        "image_fileformat": "PNG",
+        "image_output_path": "",
+        "image_resolution": 16,
+        "is_active": true,
+        "output_name_a": "dp_paintmap##",
+        "output_name_b": "dp_wetmap",
+        "surface_format": "IMAGE",
+        "surface_type": "PAINT",
+        "use_antialiasing": true,
+        "use_dissolve": false,
+        "use_drying": false,
+        "use_output_a": true,
+        "use_output_b": true
+      }
+    },
+    {
+      "blend": "dynamic_paint_image.blend",
+      "brush": "ImageBrush",
+      "brush_source": "VOLUME",
+      "canvas": "ImageCanvas",
+      "directory": "scenarios/volume_antialias_off",
+      "id": "volume_antialias_off",
+      "image_dir": "images",
+      "mesh": {
+        "grid_height": 16,
+        "grid_width": 16,
+        "uv_layer": "UVMap"
+      },
+      "outputs": [
+        {
+          "file": "dp_paintmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_paintmap",
+          "width": 16
+        },
+        {
+          "file": "dp_paintmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_paintmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        }
+      ],
+      "surface": {
+        "dissolve_speed": 250,
+        "dry_speed": 500,
+        "frame_end": 2,
+        "frame_start": 1,
+        "image_fileformat": "PNG",
+        "image_output_path": "",
+        "image_resolution": 16,
+        "is_active": true,
+        "output_name_a": "dp_paintmap",
+        "output_name_b": "dp_wetmap",
+        "surface_format": "IMAGE",
+        "surface_type": "PAINT",
+        "use_antialiasing": false,
+        "use_dissolve": false,
+        "use_drying": false,
+        "use_output_a": true,
+        "use_output_b": true
+      }
+    },
+    {
+      "blend": "dynamic_paint_image.blend",
+      "brush": "ImageBrush",
+      "brush_source": "POINT",
+      "canvas": "ImageCanvas",
+      "directory": "scenarios/drying_dissolve",
+      "id": "drying_dissolve",
+      "image_dir": "images",
+      "mesh": {
+        "grid_height": 16,
+        "grid_width": 16,
+        "uv_layer": "UVMap"
+      },
+      "outputs": [
+        {
+          "file": "dp_paintmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_paintmap",
+          "width": 16
+        },
+        {
+          "file": "dp_paintmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_paintmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        }
+      ],
+      "surface": {
+        "dissolve_speed": 250,
+        "dry_speed": 500,
+        "frame_end": 2,
+        "frame_start": 1,
+        "image_fileformat": "PNG",
+        "image_output_path": "",
+        "image_resolution": 16,
+        "is_active": true,
+        "output_name_a": "dp_paintmap",
+        "output_name_b": "dp_wetmap",
+        "surface_format": "IMAGE",
+        "surface_type": "PAINT",
+        "use_antialiasing": false,
+        "use_dissolve": true,
+        "use_drying": true,
+        "use_output_a": true,
+        "use_output_b": true
+      }
+    },
+    {
+      "blend": "dynamic_paint_image.blend",
+      "brush": "ImageBrush",
+      "brush_source": "POINT",
+      "canvas": "ImageCanvas",
+      "directory": "scenarios/uv_islands_margin",
+      "id": "uv_islands_margin",
+      "image_dir": "images",
+      "mesh": {
+        "brush_touches_island_edges": true,
+        "uv_island_count": 2,
+        "uv_layer": "UVMap",
+        "uv_margin_pixels": 2
+      },
+      "outputs": [
+        {
+          "file": "dp_paintmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_paintmap",
+          "width": 16
+        },
+        {
+          "file": "dp_paintmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_paintmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0001.png",
+          "frame": 1,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        },
+        {
+          "file": "dp_wetmap0002.png",
+          "frame": 2,
+          "height": 16,
+          "name": "dp_wetmap",
+          "width": 16
+        }
+      ],
+      "surface": {
+        "dissolve_speed": 250,
+        "dry_speed": 500,
+        "frame_end": 2,
+        "frame_start": 1,
+        "image_fileformat": "PNG",
+        "image_output_path": "",
+        "image_resolution": 16,
+        "is_active": true,
+        "output_name_a": "dp_paintmap",
+        "output_name_b": "dp_wetmap",
+        "surface_format": "IMAGE",
+        "surface_type": "PAINT",
+        "use_antialiasing": false,
+        "use_dissolve": false,
+        "use_drying": false,
+        "use_output_a": true,
+        "use_output_b": true
+      }
+    },
+    {
+      "blend": "dynamic_paint_image.blend",
+      "brush": "ImageBrush",
+      "brush_source": "POINT",
+      "canvas": "ImageCanvas",
+      "directory": "scenarios/uv_edge_v01_filename_patterns",
+      "id": "uv_edge_v01_filename_patterns",
+      "image_dir": "images",
+      "mesh": {
+        "uv_layer": "UVMap",
+        "uv_layout": "edge_v01",
+        "uv_max_v": 0.9,
+        "uv_min_v": 0.1
+      },
+      "outputs": [
+        {
+          "file": "paint_0001.png",
+          "frame": 1,
+          "height": 20,
+          "name": "paint_####.png",
+          "width": 20
+        },
+        {
+          "file": "paint_0002.png",
+          "frame": 2,
+          "height": 20,
+          "name": "paint_####.png",
+          "width": 20
+        },
+        {
+          "file": "paint_01.png",
+          "frame": 1,
+          "height": 20,
+          "name": "paint_##.jpg",
+          "width": 20
+        },
+        {
+          "file": "paint_02.png",
+          "frame": 2,
+          "height": 20,
+          "name": "paint_##.jpg",
+          "width": 20
+        }
+      ],
+      "surface": {
+        "dissolve_speed": 250,
+        "dry_speed": 500,
+        "frame_end": 2,
+        "frame_start": 1,
+        "image_fileformat": "PNG",
+        "image_output_path": "",
+        "image_resolution": 20,
+        "is_active": true,
+        "output_name_a": "paint_####.png",
+        "output_name_b": "paint_##.jpg",
+        "surface_format": "IMAGE",
+        "surface_type": "PAINT",
+        "use_antialiasing": false,
+        "use_dissolve": false,
+        "use_drying": false,
+        "use_output_a": true,
+        "use_output_b": true
+      }
+    },
+    {
+      "blend": "dynamic_paint_image.blend",
+      "brush": "ImageBrush",
+      "brush_source": "POINT",
+      "canvas": "ImageCanvas",
+      "directory": "scenarios/uv_collinear_default_outputs",
+      "id": "uv_collinear_default_outputs",
+      "image_dir": "images",
+      "mesh": {
+        "uv_face_is_collinear": true,
+        "uv_layer": "UVMap",
+        "uv_layout": "collinear_v05",
+        "uv_sample_v": 0.5
+      },
+      "outputs": [
+        {
+          "file": "paintmap0001.png",
+          "frame": 1,
+          "height": 20,
+          "name": "paintmap",
+          "width": 20
+        },
+        {
+          "file": "paintmap0002.png",
+          "frame": 2,
+          "height": 20,
+          "name": "paintmap",
+          "width": 20
+        },
+        {
+          "file": "wetmap0001.png",
+          "frame": 1,
+          "height": 20,
+          "name": "wetmap",
+          "width": 20
+        },
+        {
+          "file": "wetmap0002.png",
+          "frame": 2,
+          "height": 20,
+          "name": "wetmap",
+          "width": 20
+        }
+      ],
+      "surface": {
+        "dissolve_speed": 250,
+        "dry_speed": 500,
+        "frame_end": 2,
+        "frame_start": 1,
+        "image_fileformat": "PNG",
+        "image_output_path": "",
+        "image_resolution": 20,
+        "is_active": true,
+        "output_name_a": "paintmap",
+        "output_name_b": "wetmap",
+        "surface_format": "IMAGE",
+        "surface_type": "PAINT",
+        "use_antialiasing": false,
+        "use_dissolve": false,
+        "use_drying": false,
+        "use_output_a": true,
+        "use_output_b": true
+      }
+    }
+  ]
+}

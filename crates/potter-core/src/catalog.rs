@@ -2321,7 +2321,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint",
-            "Blender PAINT/VERTEX supports POINT proximity and VOLUME closed-mesh brushes with color and wetness replay, drying, dissolve, and named Corner BYTE_COLOR outputs; every active surface evaluates in collection order with its own frame range, brush collection, and outputs. Create/update ensures output A and creates requested B layers, while schema 10 migrates missing A only for pre-10 native PAINT/VERTEX canvases and leaves Blender-imported canvases without toggled outputs untouched. Legacy native brushes without paint_source migrate to POINT using native radius or canvas radius only when local Object.loc matches the old world origin; parented or constrained native brushes retain a LEGACY_WORLD_ORIGIN marker with a load warning and fail only when evaluated until fixed. .blend export refuses the marker because Blender has no equivalent RNA source. VOLUME requires an explicit PAINT/VERTEX surface; native radius and surface-less VOLUME use are refused. WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior influence into an existing named vertex group across integer frames and optionally dissolves it. Arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, baked caches, and DISPLACE/WAVE remain refused.",
+            "PAINT/VERTEX supports POINT proximity and VOLUME closed-mesh brushes with color/wetness replay, drying, dissolve, and named Corner BYTE_COLOR outputs. PAINT/IMAGE rasterizes UV texels using named or active UVs with POINT/VOLUME brushes, jittered Gaussian antialiasing, drying/dissolve, and named A/B PNG sequences under the bake output's images directory; it does not create or auto-bind material Image datablocks. OpenEXR and WEIGHT/IMAGE are refused. Every active surface evaluates in collection order with its own frame range, brush collection, and outputs. Create/update ensures output A and creates requested B layers; schema 10 migration preserves Blender-imported disabled outputs. Legacy world-origin brushes, surface-less VOLUME, unsupported history, spread/drip/shrink, POINT RAMP, nonzero substeps, baked caches, DISPLACE/WAVE remain guarded.",
             "DynamicPaint",
             &[
                 "physics.dynamic_paint.create",
@@ -2368,16 +2368,40 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, false, true, true],
         ),
+        {
+            let mut feature = supported(
+                "physics.dynamic_paint_surface.surface_format",
+                "PAINT surface formats VERTEX and IMAGE; WEIGHT supports VERTEX",
+                "DynamicPaintSurface",
+                &[
+                    "physics.dynamic_paint.create",
+                    "physics.dynamic_paint.update",
+                ],
+                [true, true, true, true, false, true, true],
+            );
+            feature["status"] = json!("partial");
+            feature["reason"] = json!(
+                "PAINT supports VERTEX and PNG IMAGE; WEIGHT supports VERTEX only. PAINT/IMAGE rasterizes named/active-UV texels at square resolutions 16–4096 with a one-million-texel cap and 5-sample jittered Gaussian antialiasing; PNG A/B outputs are written under the bake output's images directory. OpenEXR is refused because no Blender float-image parity oracle is committed. WEIGHT/IMAGE is refused because Blender 5.2.2's dynamicPaint_outputSurfaceImage has no WEIGHT output case."
+            );
+            feature
+        },
         unsupported(
-            "physics.dynamic_paint_surface.surface_format",
-            "Dynamic paint surface formats other than VERTEX",
+            "physics.dynamic_paint_surface.image_fileformat",
+            "Non-PNG Dynamic Paint IMAGE output",
             "DynamicPaintSurface",
             &[],
-            "Only VERTEX PAINT and WEIGHT surfaces are evaluated; IMAGE surfaces are refused with physics.dynamic_paint_surface.surface_format.",
+            "Non-PNG IMAGE output, including OPENEXR, returns UnsupportedFeature until its Blender 5.2.2 float RGBA buffer, ZIP encoding, alpha association, and row ordering have a committed parity oracle.",
+        ),
+        unsupported(
+            "physics.dynamic_paint_surface.weight_image",
+            "WEIGHT dynamic-paint surfaces in IMAGE format",
+            "DynamicPaintSurface",
+            &[],
+            "WEIGHT/IMAGE is refused; Blender 5.2.2's dynamicPaint_outputSurfaceImage has no WEIGHT output case.",
         ),
         supported(
             "physics.dynamic_paint_surface.output_name_b",
-            "Name of the PAINT/VERTEX secondary wetness output layer, written only when its Corner BYTE_COLOR layer exists",
+            "Name of the PAINT secondary wetness output: a Corner BYTE_COLOR layer for VERTEX, written only when that layer exists, or the optional B PNG sequence for IMAGE; A/B image names follow Blender's # frame-placeholder rule",
             "DynamicPaintSurface",
             &[
                 "physics.dynamic_paint.create",
@@ -2387,7 +2411,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "physics.dynamic_paint_surface.frame_start",
-            "Each PAINT/VERTEX surface replays color and wetness from its own frame_start and holds both outputs after frame_end; WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior weights and dissolve over its own integer frame range. Start>end stays unpainted.",
+            "PAINT/VERTEX replays color and wetness and PAINT/IMAGE rasterizes UV texels to A and optional B images over each surface's frame range; WEIGHT/VERTEX accumulates POINT falloff or VOLUME interior weights and dissolve over its own integer frame range. Start>end stays unpainted.",
             "DynamicPaintSurface",
             &[
                 "physics.dynamic_paint.create",
@@ -2472,7 +2496,7 @@ pub fn feature_catalog() -> Value {
             "Dynamic paint surface types and stateful canvas evolution",
             "DynamicPaint",
             &[],
-            "Potter replays ordered PAINT/VERTEX color/wetness and WEIGHT/VERTEX brush results, honoring each active surface's frame range, brush collection, and output layers. It does not replay arbitrary point-cache history, spread/drip, POINT RAMP falloff, nonzero surface substeps, baked caches, or DISPLACE/WAVE.",
+            "Potter replays ordered PAINT/VERTEX color/wetness, PAINT/IMAGE UV texels and named A/optional B PNG sequences, and WEIGHT/VERTEX brush results, honoring each active surface's frame range, brush collection, and outputs; image baking does not create or auto-bind material Image datablocks. OpenEXR and WEIGHT/IMAGE remain refused. Potter does not replay arbitrary point-cache history, spread/drip/shrink, POINT RAMP falloff, nonzero surface substeps, baked caches, or DISPLACE/WAVE.",
         ),
         unsupported(
             "physics.collision.blender_collision_model",

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -91,6 +91,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
     let cache_directory = project.cache_directory();
     let mut stage = BakeStage::create(output)?;
     let mut files = Vec::new();
+    let mut image_names = BTreeSet::new();
     let mut baked_frames = Vec::new();
     let mut evaluation_session = EvaluationSession::default();
     for (frame_index, frame) in frames.into_iter().enumerate() {
@@ -207,17 +208,63 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                     .filter(|(id, _)| matches_target(id))
                     .map(|(id, weights)| (id.to_string(), json!(weights)))
                     .collect::<BTreeMap<_, _>>();
-                let painted_objects = paint_colors
+                let image_frame = snapshot
+                    .paint_images
                     .keys()
-                    .filter(|id| {
-                        !paint_wetness.contains_key(*id) && !paint_weights.contains_key(*id)
-                    })
-                    .count()
-                    + paint_wetness
+                    .any(&matches_target)
+                    .then(|| whole_frame(frame))
+                    .transpose()?;
+                let mut paint_image_files = Vec::new();
+                for (id, surfaces) in &snapshot.paint_images {
+                    if !matches_target(id) {
+                        continue;
+                    }
+                    let Some(image_frame) = image_frame else {
+                        continue;
+                    };
+                    for surface in surfaces.values() {
+                        for image in [surface.output_a.as_ref(), surface.output_b.as_ref()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            let filename = dynamic_paint_image_filename(image, image_frame)?;
+                            let relative = Path::new("images").join(filename);
+                            let relative_name = relative.to_string_lossy().into_owned();
+                            if !image_names.insert(relative_name.clone()) {
+                                return Err(PotError::with_details(
+                                    ErrorCode::InvalidOperation,
+                                    "dynamic-paint image surfaces produce a duplicate output path",
+                                    json!({"path":relative_name}),
+                                ));
+                            }
+                            let directory = stage.path.join("images");
+                            fs::create_dir_all(&directory).map_err(|error| PotError::io(&error))?;
+                            write_dynamic_paint_image(
+                                &directory.join(relative.file_name().ok_or_else(|| {
+                                    PotError::new(
+                                        ErrorCode::BakeFailed,
+                                        "dynamic-paint image filename is invalid",
+                                    )
+                                })?),
+                                image,
+                            )?;
+                            files.push(relative_name.clone());
+                            paint_image_files.push(relative_name);
+                        }
+                    }
+                }
+                let mut painted_ids = BTreeSet::new();
+                painted_ids.extend(paint_colors.keys().cloned());
+                painted_ids.extend(paint_wetness.keys().cloned());
+                painted_ids.extend(paint_weights.keys().cloned());
+                painted_ids.extend(
+                    snapshot
+                        .paint_images
                         .keys()
-                        .filter(|id| !paint_weights.contains_key(*id))
-                        .count()
-                    + paint_weights.len();
+                        .filter(|id| matches_target(id))
+                        .map(ToString::to_string),
+                );
+                let painted_objects = painted_ids.len();
                 let name = format!("frame_{frame_index:08}.json");
                 write_json(
                     &stage.path.join(&name),
@@ -233,7 +280,8 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                         "fluid_particles":fluid_particles,
                         "paint_colors":paint_colors,
                         "paint_wetness":paint_wetness,
-                        "paint_weights":paint_weights
+                        "paint_weights":paint_weights,
+                        "paint_images":paint_image_files
                     }),
                 )?;
                 files.push(name.clone());
@@ -246,6 +294,7 @@ pub fn run(args: BakeArgs) -> Result<(Option<SceneInfo>, Value)> {
                     "particle_count":particles.values().map(|items| items.as_array().map_or(0, Vec::len)).sum::<usize>(),
                     "fluid_particle_count":fluid_particles.values().map(|items| items.as_array().map_or(0, Vec::len)).sum::<usize>(),
                     "painted_objects":painted_objects,
+                    "paint_images":paint_image_files,
                     "deformed_meshes":deformed_meshes.len()
                 }));
             }
@@ -2006,6 +2055,145 @@ fn write_ocean_exr(path: &Path, image: &crate::geom::modifiers::OceanBakeImage) 
     })
 }
 
+fn dynamic_paint_image_filename(
+    image: &crate::sim::DynamicPaintImageData,
+    frame: i32,
+) -> Result<String> {
+    // Mirrors Blender's `imb_ext_image`; unknown suffixes are retained before adding `.png`.
+    const IMAGE_EXTENSIONS: &[&str] = &[
+        ".png", ".tga", ".bmp", ".jpg", ".jpeg", ".sgi", ".rgb", ".rgba", ".tif", ".tiff", ".tx",
+        ".avif", ".jp2", ".j2c", ".hdr", ".dds", ".dpx", ".cin", ".exr", ".psd", ".pdd", ".psb",
+        ".webp",
+    ];
+    let name = image.output_name.as_str();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(PotError::invalid_argument(
+            "dynamic-paint image output names must be safe filename components",
+        ));
+    }
+    if image.file_format != "PNG" {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Dynamic Paint IMAGE output supports PNG only",
+            json!({
+                "feature_id": "physics.dynamic_paint_surface.image_fileformat",
+                "file_format": image.file_format
+            }),
+        ));
+    }
+    let (prefix, suffix, digits) = if let Some(hash_end) = name.rfind('#') {
+        let hash_start = name[..hash_end]
+            .char_indices()
+            .rfind(|(_, character)| *character != '#')
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        (
+            &name[..hash_start],
+            &name[hash_end + 1..],
+            hash_end - hash_start + 1,
+        )
+    } else {
+        (name, "", 4)
+    };
+    let frame = if frame < 0 {
+        let magnitude = frame.unsigned_abs();
+        format!("-{magnitude:0digits$}")
+    } else {
+        format!("{frame:0digits$}")
+    };
+    let mut filename = format!("{prefix}{frame}{suffix}");
+    let lowercase = filename.to_ascii_lowercase();
+    let has_png_extension = Path::new(&filename)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !has_png_extension {
+        if let Some(extension) = IMAGE_EXTENSIONS
+            .iter()
+            .find(|extension| lowercase.ends_with(**extension))
+        {
+            filename.truncate(filename.len() - extension.len());
+        }
+        filename.push_str(".png");
+    }
+    Ok(filename)
+}
+
+fn write_dynamic_paint_image(path: &Path, image: &crate::sim::DynamicPaintImageData) -> Result<()> {
+    let width = usize::try_from(image.resolution)
+        .map_err(|error| PotError::new(ErrorCode::BakeFailed, error.to_string()))?;
+    let pixel_count = width.checked_mul(width).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "dynamic-paint image dimensions overflow",
+        )
+    })?;
+    if image.pixels.len() != pixel_count {
+        return Err(PotError::new(
+            ErrorCode::BakeFailed,
+            "dynamic-paint image pixel count does not match its dimensions",
+        ));
+    }
+    if image.file_format != "PNG" {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Dynamic Paint IMAGE output supports PNG only",
+            json!({
+                "feature_id": "physics.dynamic_paint_surface.image_fileformat",
+                "file_format": image.file_format
+            }),
+        ));
+    }
+    let byte_count = pixel_count.checked_mul(4).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::LimitExceeded,
+            "dynamic-paint PNG byte count overflows",
+        )
+    })?;
+    let mut rgba = Vec::with_capacity(byte_count);
+    for y in (0..width).rev() {
+        for x in 0..width {
+            let pixel = image.pixels[y * width + x];
+            let alpha = pixel[3].clamp(0.0, 1.0);
+            for component in pixel.iter().take(3) {
+                let straight = if alpha > 0.0 { *component / alpha } else { 0.0 };
+                rgba.push(dynamic_paint_srgb_byte(straight));
+            }
+            rgba.push((alpha * 255.0).round() as u8);
+        }
+    }
+    let file = fs::File::create(path).map_err(|error| PotError::io(&error))?;
+    let mut encoder = png::Encoder::new(file, image.resolution, image.resolution);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| {
+        PotError::new(
+            ErrorCode::BakeFailed,
+            format!("dynamic-paint PNG header failed: {error}"),
+        )
+    })?;
+    writer.write_image_data(&rgba).map_err(|error| {
+        PotError::new(
+            ErrorCode::BakeFailed,
+            format!("dynamic-paint PNG encoding failed: {error}"),
+        )
+    })
+}
+
+fn dynamic_paint_srgb_byte(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if value < 0.003_130_8 {
+        12.92 * value
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 fn unsupported(feature_id: &str, message: &str) -> PotError {
     PotError::with_details(
         ErrorCode::UnsupportedFeature,
@@ -2253,13 +2441,14 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        default_modifier_bake_directory, escape_bake_name, fix_frame_range, node_bake_frames,
-        whole_frame,
+        default_modifier_bake_directory, dynamic_paint_image_filename, escape_bake_name,
+        fix_frame_range, node_bake_frames, whole_frame,
     };
     use crate::{
         cli::NodeBakeMode,
         error::{ErrorCode, PotError, Result},
         model::{Scene, SceneDoc},
+        sim::DynamicPaintImageData,
     };
 
     fn scene_doc(edit: impl FnOnce(&mut Scene)) -> Result<SceneDoc> {
@@ -2271,6 +2460,65 @@ mod tests {
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "active scene is missing"))?;
         edit(scene);
         Ok(doc)
+    }
+    fn dynamic_paint_image(output_name: &str, file_format: &str) -> DynamicPaintImageData {
+        DynamicPaintImageData {
+            resolution: 16,
+            file_format: file_format.to_owned(),
+            output_name: output_name.to_owned(),
+            pixels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dynamic_paint_image_filenames_follow_blender_frame_placeholders() -> Result<()> {
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint", "PNG"), 3)?,
+            "paint0003.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint_##", "PNG"), 3)?,
+            "paint_03.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint###_##", "PNG"), 3)?,
+            "paint###_03.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("é##", "PNG"), 3)?,
+            "é03.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint_####.png", "PNG"), 1)?,
+            "paint_0001.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint_##.jpg", "PNG"), 1)?,
+            "paint_01.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint##", "PNG"), 123)?,
+            "paint123.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint##", "PNG"), -3)?,
+            "paint-03.png"
+        );
+
+        let error = dynamic_paint_image_filename(&dynamic_paint_image("paint", "OPENEXR"), 1)
+            .err()
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InternalError,
+                    "OPENEXR Dynamic Paint image output unexpectedly validated",
+                )
+            })?;
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            "physics.dynamic_paint_surface.image_fileformat"
+        );
+        Ok(())
     }
 
     fn animation_frames(doc: &SceneDoc, config: Option<&Value>) -> Result<Vec<f64>> {

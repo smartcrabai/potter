@@ -1008,6 +1008,9 @@ pub struct Snapshot {
     /// Dynamic-paint weights evaluated by canvas and surface index.
     #[serde(skip)]
     pub paint_weights: crate::sim::DynamicPaintSurfaceValues<f64>,
+    /// Dynamic Paint IMAGE outputs for the evaluated frame.
+    #[serde(skip)]
+    pub paint_images: crate::sim::DynamicPaintImageValues,
     /// VDB-aware volume payloads resolved for this evaluation; omitted from snapshots on disk.
     #[serde(skip)]
     pub volume_data: BTreeMap<Id, crate::geom::volume::VolumeData>,
@@ -1762,6 +1765,7 @@ impl Snapshot {
         let mut paint_colors = BTreeMap::new();
         let mut paint_wetness = BTreeMap::new();
         let mut paint_weights = BTreeMap::new();
+        let mut paint_images = BTreeMap::new();
         let simulation_cache_key = simulation.as_ref().map(|result| result.cache_key.clone());
         let mut simulation_warnings = Vec::new();
         if let Some(simulation) = simulation {
@@ -1787,6 +1791,7 @@ impl Snapshot {
             paint_colors = simulation.paint_colors;
             paint_wetness = simulation.paint_wetness;
             paint_weights = simulation.paint_weights;
+            paint_images = simulation.paint_images;
             for (id, states) in simulation.particle_states {
                 simulated_particles.insert(id, states);
             }
@@ -3272,6 +3277,7 @@ impl Snapshot {
             paint_colors,
             paint_wetness,
             paint_weights,
+            paint_images,
             warnings: simulation_warnings
                 .into_iter()
                 .chain(modifier_warnings)
