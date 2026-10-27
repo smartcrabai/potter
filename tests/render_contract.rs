@@ -841,8 +841,17 @@ fn beauty_preview_honours_render_visibility() -> Result<(), Box<dyn Error>> {
     assert_success(&apply_operations(&scene, show, &["--json"])?)?;
     let shown = preview_beauty_center(&scene, &directory.path().join("shown.png"))?;
     assert!(
-        shown[0] > hidden[0] + 40,
+        u16::from(shown[0]) > u16::from(hidden[0]) + 40,
         "a box hidden from render must not appear in the beauty preview: hidden {hidden:?}, shown {shown:?}"
+    );
+    let viewport_hide = r#"{"schema_version":1,"base_revision":3,"operations":[{"op":"node.update","target":{"id":"body"},"set":{"visible":false}}]}"#;
+    let viewport_hidden_update = apply_operations(&scene, viewport_hide, &["--json"])?;
+    assert_success(&viewport_hidden_update)?;
+    let viewport_hidden =
+        preview_beauty_center(&scene, &directory.path().join("viewport-hidden.png"))?;
+    assert_eq!(
+        viewport_hidden, hidden,
+        "a viewport-hidden object with render visibility enabled must stay hidden in the beauty preview"
     );
     Ok(())
 }

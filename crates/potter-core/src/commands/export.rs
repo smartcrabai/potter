@@ -344,7 +344,7 @@ fn export_view<'a>(requested: Option<&'a str>, format: &str) -> Result<&'a str> 
 /// Modifier stack an export evaluates, following Blender 5.2.2's default for each writer:
 /// `Render` for PLY, STL, USD, and Alembic; `Preview` (the viewport stack) for OBJ, glTF, GLB,
 /// VRM, and FBX. BLEND and BVH evaluate no modifiers. SVG and PDF have no Blender writer and keep
-/// the render stack.
+/// the render stack; Blender's glTF `use_visible` filter separately includes FCurve-hidden objects.
 pub(crate) fn export_purpose(format: &str) -> EvaluationPurpose {
     match format {
         "ply" | "stl" | "usd" | "usdc" | "usda" | "usdz" | "alembic" | "svg" | "pdf" => {
@@ -558,7 +558,11 @@ pub(crate) fn export_losses(
                     suggestion: Some("convert to a mesh or export as blend".to_owned()),
                 });
             }
-            if !node.visible || !node.render_visible || !node.selectable {
+            let (visible, render_visible) = snapshot
+                .map_or((node.visible, node.render_visible), |snapshot| {
+                    exchange::evaluated_visibility(snapshot, id, node)
+                });
+            if !visible || !render_visible || !node.selectable {
                 losses.push(Loss {
                     feature_id: "node.visibility".to_owned(),
                     data_id: Some(id.to_string()),
@@ -695,6 +699,7 @@ pub(crate) fn export_losses(
     if matches!(format, "fbx" | "fbx-binary") {
         losses.extend(exchange::fbx::material_graph_losses(doc));
     }
+    losses.extend(exchange::visibility_animation_losses(format, doc));
     losses.extend(fcurve_modifier_losses(doc, format));
     losses
 }
@@ -769,7 +774,7 @@ pub(crate) fn mesh_data_losses(
         losses.extend(exchange::fbx::vertex_group_losses(doc, snapshot)?);
     }
     if matches!(format, "glb" | "gltf" | "vrm" | "vrm0") {
-        losses.extend(exchange::gltf::mesh_export_losses(doc, snapshot)?);
+        losses.extend(exchange::gltf::mesh_export_losses(doc, snapshot, format)?);
     }
     losses.extend(exchange::ray_visibility_losses(format, doc, snapshot)?);
     Ok(losses)

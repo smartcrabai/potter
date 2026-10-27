@@ -64,6 +64,22 @@ POTTER_TO_BLENDER_ANIMATION_PATH = {
     "transform.scale": "scale",
     "camera.lens_mm": "data.lens",
     "light.energy": "data.energy",
+    "camera.sensor_width_mm": "data.sensor_width",
+    "camera.sensor_height_mm": "data.sensor_height",
+    "camera.ortho_scale": "data.ortho_scale",
+    "camera.clip_start": "data.clip_start",
+    "camera.clip_end": "data.clip_end",
+    "camera.shift_x": "data.shift_x",
+    "camera.shift_y": "data.shift_y",
+    "camera.focus_distance": "data.dof.focus_distance",
+    "camera.aperture_fstop": "data.dof.aperture_fstop",
+    "light.color": "data.color",
+    "light.spot_size": "data.spot_size",
+    "light.spot_blend": "data.spot_blend",
+    "light.shadow_soft_size": "data.shadow_soft_size",
+    "light.area_size": "data.size",
+    "light.area_size_y": "data.size_y",
+    "light.sun_angle": "data.angle",
 }
 POTTER_TO_BLENDER_NODE_SOCKET_TYPE = {
     "geometry": "NodeSocketGeometry",
@@ -312,6 +328,66 @@ def custom_props(block):
                 if key not in ("potter.object_solver_inverses_json", "potter.root_collection")}
     except Exception:
         return {}
+
+
+def custom_property_ui(block):
+    result = {}
+    fields = ("subtype", "min", "max", "soft_min", "soft_max", "step", "precision", "default")
+    try:
+        keys = block.keys()
+    except Exception:
+        return result
+    for key in keys:
+        try:
+            ui = block.id_properties_ui(key).as_dict()
+            value = block[key]
+        except Exception:
+            continue
+        if isinstance(value, bool):
+            if ui.get("default") is not True:
+                continue
+            saved_fields = ("subtype", "default")
+        else:
+            if isinstance(value, int):
+                default_min, default_max = -2147483648, 2147483647
+            elif isinstance(value, float):
+                default_min, default_max = -3.4028234663852886e38, 3.4028234663852886e38
+            else:
+                try:
+                    components = list(value)
+                except Exception:
+                    continue
+                if components and all(isinstance(component, bool) for component in components):
+                    default_min, default_max = None, None
+                elif components and all(
+                        isinstance(component, int) and not isinstance(component, bool)
+                        for component in components):
+                    default_min, default_max = -2147483648, 2147483647
+                elif components and all(
+                        isinstance(component, (int, float)) and not isinstance(component, bool)
+                        for component in components):
+                    default_min, default_max = -3.4028234663852886e38, 3.4028234663852886e38
+                else:
+                    continue
+            custom_range = (
+                default_min is not None
+                and default_max is not None
+                and "min" in ui
+                and "max" in ui
+                and (ui["min"] != default_min or ui["max"] != default_max)
+            )
+            default = ui.get("default")
+            if isinstance(default, (list, tuple)):
+                custom_default = any(component not in (0, 0.0, False) for component in default)
+            else:
+                custom_default = default not in (None, 0, 0.0, False)
+            if not custom_range and not custom_default:
+                continue
+            saved_fields = fields
+        result[str(key)] = {name: plain(ui[name]) for name in saved_fields if name in ui}
+    return result
+
+
 
 def _walk_rna_properties(block, omit=(), skip=(), skip_collections=False):
     try:
@@ -2679,8 +2755,18 @@ def object_dump(obj):
                                                                            getattr(strip.action_slot, "name", "")),
                                                            "target_type": getattr(strip.action_slot, "target_id_type", "")}
                                            if getattr(strip, "action_slot", None) else None,
-                                           "properties": rna_props(strip),
-                                           "custom_properties": custom_props(strip)} for strip in track.strips]})
+                                           "properties": {
+                                               **rna_props(strip),
+                                               "use_animated_influence": bool(
+                                                   strip.use_animated_influence),
+                                           },
+                                           "custom_properties": custom_props(strip),
+                                           "influence_curve": next(
+                                               (dump_nla_influence_curve(curve)
+                                                for curve in strip.fcurves
+                                                if curve.data_path == "influence"
+                                                and curve.array_index == 0),
+                                               None)} for strip in track.strips]})
     return {"name": obj.name_full, "potter_id": obj.get("potter.id"), "type": obj.type,
             "library": library_reference(obj), "override_library": _override_dump(obj),
             "data_name": data.name_full if data else None, "parent": obj.parent.name_full if obj.parent else None,
@@ -2708,6 +2794,7 @@ def object_dump(obj):
             "active_vertex_group_index": _active_vertex_group_index(obj),
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
+            "custom_property_ui": custom_property_ui(obj),
             "volume_bounds": volume_bounds,
             "rna_properties": rna_props(obj, ("data", "parent", "children", "users_collection", "modifiers", "constraints", "animation_data", "material_slots", "track_axis", "up_axis", "dimensions"))}
 
@@ -2755,8 +2842,26 @@ def _modifier_bindings_for_fcurve(curve, slot, objects):
     return bindings
 
 
+def _data_owner_fcurve_dump(curve):
+    source = dump_fcurve(curve)
+    if not source["path"].startswith("data."):
+        source["path"] = "data." + source["path"]
+    return source
 
-def action_dump(action):
+
+def _action_fcurve_dump(curve, slot, objects):
+    target_type = getattr(slot, "target_id_type", "")
+    source = (
+        _data_owner_fcurve_dump(curve)
+        if target_type in ("CAMERA", "LIGHT")
+        else dump_fcurve(curve)
+    )
+    return dict(source, modifier_bindings=_modifier_bindings_for_fcurve(
+        curve, slot, objects))
+
+
+
+def action_dump(action, data_owner_type=None):
     slot_ids = _id_map(action, "potter.action_slot_ids_json")
     slots = []
     curves = []
@@ -2776,8 +2881,7 @@ def action_dump(action):
                     if channelbag is None:
                         continue
                     bag_curves = [
-                        dict(dump_fcurve(curve), modifier_bindings=_modifier_bindings_for_fcurve(
-                            curve, slot, assigned_objects))
+                        _action_fcurve_dump(curve, slot, assigned_objects)
                         for curve in channelbag.fcurves]
                     slot_curves.extend(bag_curves)
                     channelbags.append({"slot": getattr(slot, "identifier", ""),
@@ -2795,7 +2899,11 @@ def action_dump(action):
             raise ValueError("cannot read Blender Action slots: %s" % error) from error
     if not curves and hasattr(action, "fcurves"):
         try:
-            curves = [dump_fcurve(curve) for curve in action.fcurves]
+            curves = [
+                _data_owner_fcurve_dump(curve)
+                if data_owner_type in ("CAMERA", "LIGHT")
+                else dump_fcurve(curve)
+                for curve in action.fcurves]
         except Exception as error:
             raise ValueError("cannot read Blender Action fcurves: %s" % error) from error
     return {"name": action.name_full, "potter_id": action.get("potter.id"),
@@ -2824,6 +2932,14 @@ def dump_fcurve(curve):
     return {"path": curve.data_path, "index": int(curve.array_index), "keyframes": keys,
             "extrapolation": curve.extrapolation, "auto_smoothing": curve.auto_smoothing,
             "mute": bool(curve.mute), "modifiers": modifiers}
+
+def dump_nla_influence_curve(curve):
+    result = dump_fcurve(curve)
+    result["sampled_points"] = [
+        {"frame": float(point.co.x), "value": float(point.co.y)}
+        for point in curve.sampled_points
+    ]
+    return result
 
 
 def collection_dump(collection):
@@ -3493,13 +3609,17 @@ def animation_assignment_dump(owner):
         } if action_slot else None,
     }
 
-def animation_drivers_dump(owner):
+def animation_drivers_dump(owner, data_owner=False):
     animation_data = getattr(owner, "animation_data", None)
     if animation_data is None:
         return []
     return [
         {
-            "curve": dump_fcurve(curve),
+            "curve": (
+                _data_owner_fcurve_dump(curve)
+                if data_owner
+                else dump_fcurve(curve)
+            ),
             "driver": {
                 "type": curve.driver.type,
                 "expression": curve.driver.expression,
@@ -3535,6 +3655,17 @@ def dump_all():
         bpy.context.view_layer.update()
     except Exception:
         pass
+    data_action_owners = {}
+    for owner_type, blocks in (("CAMERA", bpy.data.cameras), ("LIGHT", bpy.data.lights)):
+        for block in blocks:
+            animation_data = getattr(block, "animation_data", None)
+            action = getattr(animation_data, "action", None) if animation_data else None
+            if action is not None:
+                data_action_owners.setdefault(action.as_pointer(), set()).add(owner_type)
+    data_action_owners = {
+        pointer: next(iter(owner_types)) if len(owner_types) == 1 else None
+        for pointer, owner_types in data_action_owners.items()
+    }
     data = {"bridge_version": 2, "blender_version": "%d.%d.%d" % bpy.app.version,
             "file_version": list(getattr(bpy.app, "version_file", bpy.app.version)),
             "active_scene": bpy.context.scene.name_full,
@@ -3555,13 +3686,17 @@ def dump_all():
             "materials": [material_dump(item) for item in bpy.data.materials],
             "cameras": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                          **animation_assignment_dump(x),
-                         "drivers": animation_drivers_dump(x),
+                         "drivers": animation_drivers_dump(x, data_owner=True),
                          "library": library_reference(x), "type": x.type,
                          "lens": float(x.lens), "sensor_width": float(x.sensor_width),
                          "sensor_height": float(x.sensor_height), "sensor_fit": x.sensor_fit,
                          "ortho_scale": float(x.ortho_scale),
                          "clip_start": float(x.clip_start), "clip_end": float(x.clip_end),
-                         "shift_x": float(x.shift_x), "shift_y": float(x.shift_y), "custom_properties": custom_props(x),
+                         "shift_x": float(x.shift_x), "shift_y": float(x.shift_y),
+                         "dof_enabled": bool(x.dof.use_dof),
+                         "focus_distance": float(x.dof.focus_distance),
+                         "f_stop": float(x.dof.aperture_fstop),
+                         "custom_properties": custom_props(x),
                          "panorama_type": x.panorama_type, "longitude_min": float(x.longitude_min),
                          "longitude_max": float(x.longitude_max), "latitude_min": float(x.latitude_min),
                          "latitude_max": float(x.latitude_max),
@@ -3569,7 +3704,7 @@ def dump_all():
                          "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.cameras],
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                         **animation_assignment_dump(x),
-                        "drivers": animation_drivers_dump(x),
+                        "drivers": animation_drivers_dump(x, data_owner=True),
                         "library": library_reference(x), "type": x.type,
                         "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
                         "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
@@ -3589,7 +3724,8 @@ def dump_all():
                         "transmission_factor": float(getattr(x, "transmission_factor", 1.0)),
                         "volume_factor": float(getattr(x, "volume_factor", 1.0)),
                         "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.lights],
-            "actions": [action_dump(x) for x in bpy.data.actions],
+            "actions": [action_dump(x, data_action_owners.get(x.as_pointer()))
+                        for x in bpy.data.actions],
             "texts": [{"name": x.name_full, "potter_id": x.get("potter.id"),
                        "library": library_reference(x), "body": x.as_string(),
                        "custom_properties": custom_props(x), "fake_user": bool(x.use_fake_user)} for x in bpy.data.texts],
@@ -3623,12 +3759,38 @@ def set_scene_frame(scene, frame):
 
 def set_props(block, values):
     for key, value in values.items():
-        if key == "potter.id":
+        if key in ("potter.id", "_blender_custom_property_ui"):
             continue
         try:
             block[key] = value
         except Exception as error:
             raise ValueError("cannot set custom property %s" % key) from error
+
+
+def set_custom_property_ui(block, values):
+    for key, settings in values.items():
+        if key not in block.keys():
+            continue
+        value = block[key]
+        if isinstance(value, bool):
+            if not isinstance(settings.get("default"), bool):
+                continue
+        elif not isinstance(value, (int, float)):
+            try:
+                components = list(value)
+            except Exception:
+                continue
+            if not components or not (
+                    all(isinstance(component, bool) for component in components)
+                    or all(isinstance(component, (int, float)) and not isinstance(component, bool)
+                           for component in components)):
+                continue
+        try:
+            block.id_properties_ui(key).update(**settings)
+        except Exception as error:
+            raise ValueError("cannot set custom property UI %s" % key) from error
+
+
 
 
 def _blender_id_pointer_type(block, key, current):
@@ -7759,10 +7921,13 @@ def _restore_drivers(obj, sources, id_lookup, doc):
             path = curve_source["path"]
             index = int(curve_source.get("index", 0))
             owner = obj
-            if obj.type == "CAMERA" and path == "camera.lens_mm":
-                owner, path = obj.data, "lens"
-            elif obj.type == "LIGHT" and path == "light.energy":
-                owner, path = obj.data, "energy"
+            blender_path = POTTER_TO_BLENDER_ANIMATION_PATH.get(path)
+            if blender_path is not None and blender_path.startswith("data."):
+                expected_type = "CAMERA" if path.startswith("camera.") else "LIGHT"
+                if obj.type != expected_type or obj.data is None:
+                    raise ValueError("driver path does not match its Camera/Light data owner")
+                owner = obj.data
+                path = blender_path[len("data."):]
             else:
                 path = blender_animation_path(path, doc)
             animation_data = owner.animation_data_create()
@@ -7771,7 +7936,7 @@ def _restore_drivers(obj, sources, id_lookup, doc):
                 continue
             curve = (
                 owner.driver_add(path, index)
-                if owner is obj
+                if owner is obj or path == "color"
                 else owner.driver_add(path)
             )
             curve.extrapolation = curve_source.get("extrapolation", "CONSTANT").upper()
@@ -8366,6 +8531,19 @@ def _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup):
                 raise ValueError("NLA strip %s references missing Action slot" % strip.name)
             if slot is not None and hasattr(strip, "action_slot"):
                 strip.action_slot = slot
+            if bool(strip_properties.get("use_animated_influence", False)):
+                strip.use_animated_influence = True
+                strip.influence = float(strip_properties.get("influence", 1.0))
+                for frame in (strip.frame_start, strip.frame_end):
+                    strip.keyframe_insert(data_path="influence", frame=frame)
+                curve = next(
+                    (curve for curve in strip.fcurves
+                     if curve.data_path == "influence" and curve.array_index == 0),
+                    None)
+                if curve is None:
+                    raise ValueError("Blender did not create the NLA strip influence curve")
+                for point in curve.keyframe_points:
+                    point.interpolation = "CONSTANT"
 
 def _nla_from_model(doc, node, action_slot_refs_by_action_id):
     actions = doc.get("actions", {})
@@ -8379,6 +8557,9 @@ def _nla_from_model(doc, node, action_slot_refs_by_action_id):
             if action is None:
                 raise ValueError("NLA strip references missing action %s" %
                                  source_strip.get("action"))
+            influence = float(source_strip.get("influence", 1.0))
+            use_animated_influence = (
+                bool(source_strip.get("use_animated_influence", False)) or influence != 1.0)
             strip = {
                 "name": action.get("name", "Action"),
                 "action": action.get("name"),
@@ -8390,7 +8571,8 @@ def _nla_from_model(doc, node, action_slot_refs_by_action_id):
                     "scale": source_strip.get("scale", 1.0),
                     "repeat": source_strip.get("repeat", 1.0),
                     "blend_type": source_strip.get("blend_type", "replace").upper(),
-                    "influence": source_strip.get("influence", 1.0),
+                    "influence": influence,
+                    "use_animated_influence": use_animated_influence,
                     "extrapolation": source_strip.get("extrapolation", "hold").upper(),
                     "blend_in": source_strip.get("blend_in", 0.0),
                     "blend_out": source_strip.get("blend_out", 0.0),
@@ -9276,6 +9458,10 @@ def export_doc(doc, target, pack, scene_hash, context):
             camera.clip_start = raw.get("clip_start", 0.1)
             camera.clip_end = raw.get("clip_end", 1000.0)
             camera.shift_x, camera.shift_y = raw.get("shift", [0.0, 0.0])
+            camera.dof.use_dof = bool(raw.get("dof_enabled", camera.dof.use_dof))
+            camera.dof.focus_distance = float(
+                raw.get("focus_distance", camera.dof.focus_distance))
+            camera.dof.aperture_fstop = float(raw.get("f_stop", camera.dof.aperture_fstop))
             camera.panorama_type = {
                 "equirectangular": "EQUIRECTANGULAR",
                 "fisheye_equidistant": "FISHEYE_EQUIDISTANT",
@@ -9519,6 +9705,8 @@ def export_doc(doc, target, pack, scene_hash, context):
         obj.track_axis = item.get("track_axis", "POS_Y")
         obj.up_axis = item.get("up_axis", "Z")
         set_props(obj, item.get("properties", {}))
+        set_custom_property_ui(
+            obj, (item.get("properties") or {}).get("_blender_custom_property_ui", {}))
         hide_rna = {
             key: value for key, value in (metadata.get("rna_properties") or {}).items()
             if key.startswith("hide_") and key not in ("hide_viewport", "hide_render", "hide_select")

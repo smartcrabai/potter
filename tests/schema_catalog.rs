@@ -92,6 +92,9 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
         assert_eq!(result["kind"], kind);
         assert!(result["op"].is_null());
         let schema = result["schema"].clone();
+        if kind == "scene" {
+            assert_eq!(schema["properties"]["schema_version"]["const"], 13);
+        }
         let validator = jsonschema::validator_for(&schema)?;
         if matches!(kind, "capabilities" | "formats") {
             let catalog = result["catalog"].clone();
@@ -1055,6 +1058,32 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "{feature_id} must be reported as supported"
         );
     }
+    let animation_feature = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "animation.fcurve_non_transform_channels")
+        .expect("non-transform F-Curves are listed in the feature catalog");
+    assert_eq!(animation_feature["status"], "supported");
+    assert_eq!(
+        animation_feature["pot_ops"],
+        json!([
+            "action.update",
+            "fcurve.update",
+            "driver.create",
+            "driver.update"
+        ])
+    );
+    assert_eq!(
+        animation_feature["capabilities"],
+        json!({
+            "create": false,
+            "edit": false,
+            "inspect": true,
+            "evaluate": true,
+            "render": true,
+            "import": true,
+            "export": true
+        })
+    );
     for feature_id in [
         "physics.dynamic_paint_surface.topology",
         "physics.point_cache.source_frames",
@@ -1103,6 +1132,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "blender.text.follow_curve",
         "blender.text.offset",
         "blender.text.taper_object",
+        "modifier.uv_project.animated_camera_parameters",
     ] {
         assert!(
             features.iter().any(|feature| {

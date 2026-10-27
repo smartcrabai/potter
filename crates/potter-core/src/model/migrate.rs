@@ -87,7 +87,8 @@ fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> R
     let mut legacy = source_schema_version == Some(1)
         || has_legacy_mesh_deform_bind(&value)
         || (source_schema_version.is_some_and(|version| version <= 11)
-            && has_refused_animation_outputs(&value));
+            && has_refused_animation_outputs(&value))
+        || (source_schema_version == Some(12) && has_restorable_animation_outputs(&value));
     let source_hash = if retain_original_hash
         && (legacy
             || (source_schema_version.is_some_and(|version| version < 10)
@@ -337,6 +338,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(11) {
         warnings.extend(upgrade_v11(value)?);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(12) {
+        upgrade_v12(value);
     }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
@@ -988,13 +992,17 @@ fn upgrade_v11(value: &mut Value) -> Result<Vec<Value>> {
                     .get("path")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                preserved.push(json!({
+                let mut entry = json!({
                     "kind":"action_fcurve",
                     "action_id":action_id,
                     "curve_index":index,
                     "path":path,
                     "curve":curve,
-                }));
+                });
+                if let Some(bindings) = old_bindings.get(&index.to_string()) {
+                    entry["modifier_bindings"] = bindings.clone();
+                }
+                preserved.push(entry);
                 warnings.push(unsupported_animation_warning("action", action_id, path));
             }
             if let Some(action) = action.as_object_mut() {
@@ -1086,6 +1094,291 @@ fn preserve_unsupported_animation_outputs(value: &mut Value, entries: Vec<Value>
     Ok(())
 }
 
+fn has_restorable_animation_outputs(value: &Value) -> bool {
+    value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("animation"))
+        .and_then(|animation| animation.get("unsupported_outputs"))
+        .and_then(Value::as_array)
+        .is_some_and(|outputs| {
+            outputs.iter().any(|output| match text(output, "kind") {
+                "action_fcurve" => {
+                    let Some(action_id) = output.get("action_id").and_then(Value::as_str) else {
+                        return false;
+                    };
+                    let Some(curve_index) = output
+                        .get("curve_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                    else {
+                        return false;
+                    };
+                    output.get("curve").is_some_and(|curve| {
+                        legacy_action_curve_supported_without_modifier_bindings(
+                            value,
+                            action_id,
+                            curve_index,
+                            curve,
+                        )
+                    })
+                }
+                "driver" => {
+                    let Some(node_id) = output.get("node_id").and_then(Value::as_str) else {
+                        return false;
+                    };
+                    let Some(node) = value.get("nodes").and_then(|nodes| nodes.get(node_id)) else {
+                        return false;
+                    };
+                    output.get("driver").is_some_and(|driver| {
+                        legacy_driver_output_supported(value, node_id, node, driver)
+                    })
+                }
+                _ => false,
+            })
+        })
+}
+
+fn upgrade_v12(value: &mut Value) {
+    let Some(outputs) = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("animation"))
+        .and_then(|animation| animation.get("unsupported_outputs"))
+        .and_then(Value::as_array)
+    else {
+        value["schema_version"] = json!(13);
+        return;
+    };
+
+    let mut restored = vec![false; outputs.len()];
+    let mut action_restores: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    let mut driver_restores: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    for (record_index, output) in outputs.iter().enumerate() {
+        match text(output, "kind") {
+            "action_fcurve" => {
+                let Some(action_id) = output.get("action_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(curve_index) = output
+                    .get("curve_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                else {
+                    continue;
+                };
+                let Some(curve) = output.get("curve") else {
+                    continue;
+                };
+                if legacy_action_curve_supported_without_modifier_bindings(
+                    value,
+                    action_id,
+                    curve_index,
+                    curve,
+                ) {
+                    restored[record_index] = true;
+                    action_restores
+                        .entry(action_id.to_owned())
+                        .or_default()
+                        .push((curve_index, record_index));
+                }
+            }
+            "driver" => {
+                let Some(node_id) = output.get("node_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(driver_index) = output
+                    .get("driver_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                else {
+                    continue;
+                };
+                let Some(node) = value.get("nodes").and_then(|nodes| nodes.get(node_id)) else {
+                    continue;
+                };
+                let Some(driver) = output.get("driver") else {
+                    continue;
+                };
+                if legacy_driver_output_supported(value, node_id, node, driver) {
+                    restored[record_index] = true;
+                    driver_restores
+                        .entry(node_id.to_owned())
+                        .or_default()
+                        .push((driver_index, record_index));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Still-refused records are absent from live arrays, so account for them when mapping original indices.
+    for (action_id, curves) in &mut action_restores {
+        for (index, _) in curves {
+            *index = (*index).saturating_sub(preceding_refused_output_count(
+                outputs,
+                &restored,
+                "action_fcurve",
+                "action_id",
+                action_id,
+                "curve_index",
+                "curve",
+                *index,
+            ));
+        }
+    }
+    for (node_id, drivers) in &mut driver_restores {
+        for (index, _) in drivers {
+            *index = (*index).saturating_sub(preceding_refused_output_count(
+                outputs,
+                &restored,
+                "driver",
+                "node_id",
+                node_id,
+                "driver_index",
+                "driver",
+                *index,
+            ));
+        }
+    }
+
+    let mut restored_records = vec![None; restored.len()];
+    if let Some(outputs) = value
+        .get_mut("compatibility")
+        .and_then(|compatibility| compatibility.get_mut("animation"))
+        .and_then(|animation| animation.get_mut("unsupported_outputs"))
+        .and_then(Value::as_array_mut)
+    {
+        let old_outputs = std::mem::take(outputs);
+        let mut retained = Vec::with_capacity(old_outputs.len());
+        for (record_index, output) in old_outputs.into_iter().enumerate() {
+            if restored[record_index] {
+                restored_records[record_index] = Some(output);
+            } else {
+                retained.push(output);
+            }
+        }
+        *outputs = retained;
+    }
+
+    for (action_id, mut curves) in action_restores {
+        curves.sort_by_key(|(index, _)| *index);
+        if let Some(action) = value
+            .get_mut("actions")
+            .and_then(|actions| actions.get_mut(&action_id))
+        {
+            for (index, record_index) in curves {
+                let Some(mut record) = restored_records[record_index].take() else {
+                    continue;
+                };
+                let Some(record) = record.as_object_mut() else {
+                    continue;
+                };
+                let Some(curve) = record.remove("curve") else {
+                    continue;
+                };
+                insert_action_curve(action, index, curve, record.remove("modifier_bindings"));
+            }
+        }
+    }
+    for (node_id, mut drivers) in driver_restores {
+        drivers.sort_by_key(|(index, _)| *index);
+        if let Some(drivers_live) = value
+            .get_mut("nodes")
+            .and_then(|nodes| nodes.get_mut(&node_id))
+            .and_then(|node| node.get_mut("drivers"))
+            .and_then(Value::as_array_mut)
+        {
+            for (index, record_index) in drivers {
+                let Some(mut record) = restored_records[record_index].take() else {
+                    continue;
+                };
+                let Some(record) = record.as_object_mut() else {
+                    continue;
+                };
+                let Some(driver) = record.remove("driver") else {
+                    continue;
+                };
+                drivers_live.insert(index.min(drivers_live.len()), driver);
+            }
+        }
+    }
+    value["schema_version"] = json!(13);
+}
+
+fn preceding_refused_output_count(
+    outputs: &[Value],
+    restored: &[bool],
+    kind: &str,
+    owner_key: &str,
+    owner_id: &str,
+    index_key: &str,
+    output_key: &str,
+    index: usize,
+) -> usize {
+    outputs
+        .iter()
+        .enumerate()
+        .filter(|(record_index, output)| {
+            !restored[*record_index]
+                && text(output, "kind") == kind
+                && output.get(owner_key).and_then(Value::as_str) == Some(owner_id)
+                && output.get(output_key).is_some()
+                && output
+                    .get(index_key)
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .is_some_and(|preceding_index| preceding_index < index)
+        })
+        .count()
+}
+
+fn insert_action_curve(
+    action: &mut Value,
+    curve_index: usize,
+    curve: Value,
+    curve_bindings: Option<Value>,
+) {
+    let Some(action) = action.as_object_mut() else {
+        return;
+    };
+    let Some(curves) = action.get_mut("fcurves").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let insert_index = curve_index.min(curves.len());
+    curves.insert(insert_index, curve);
+    if let Some(bindings) = action
+        .get_mut("modifier_bindings")
+        .and_then(Value::as_object_mut)
+    {
+        let old_bindings = std::mem::take(bindings);
+        for (index, binding) in old_bindings {
+            let index = index
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index >= insert_index)
+                .and_then(|index| index.checked_add(1))
+                .map_or(index, |index| index.to_string());
+            bindings.insert(index, binding);
+        }
+    }
+    if let Some(curve_bindings) = curve_bindings {
+        let bindings = action
+            .entry("modifier_bindings".to_owned())
+            .or_insert_with(|| json!({}));
+        if let Some(bindings) = bindings.as_object_mut() {
+            bindings.insert(insert_index.to_string(), curve_bindings);
+        }
+    }
+}
+
+fn legacy_action_curve_supported_without_modifier_bindings(
+    scene: &Value,
+    action_id: &str,
+    curve_index: usize,
+    curve: &Value,
+) -> bool {
+    legacy_action_curve_supported_inner(scene, action_id, curve_index, curve, false)
+}
+
 fn has_refused_animation_outputs(value: &Value) -> bool {
     value
         .get("actions")
@@ -1124,6 +1417,16 @@ fn legacy_action_curve_supported(
     curve_index: usize,
     curve: &Value,
 ) -> bool {
+    legacy_action_curve_supported_inner(scene, action_id, curve_index, curve, true)
+}
+
+fn legacy_action_curve_supported_inner(
+    scene: &Value,
+    action_id: &str,
+    curve_index: usize,
+    curve: &Value,
+    check_modifier_bindings: bool,
+) -> bool {
     use crate::eval::animation::{AnimationOutputKind, supports_animation_output};
 
     let path = curve
@@ -1135,14 +1438,25 @@ fn legacy_action_curve_supported(
         .and_then(Value::as_u64)
         .and_then(|index| u32::try_from(index).ok())
         .unwrap_or(0);
-    if u32::try_from(curve_index).is_ok_and(|index| {
-        scene
-            .get("actions")
-            .and_then(|actions| actions.get(action_id))
-            .and_then(|action| action.get("modifier_bindings"))
-            .and_then(|bindings| bindings.get(index.to_string()))
-            .is_some()
-    }) {
+    if scene
+        .get("actions")
+        .and_then(|actions| actions.get(action_id))
+        .and_then(|action| action.get("fcurves"))
+        .and_then(Value::as_array)
+        .is_none()
+    {
+        return false;
+    }
+    if check_modifier_bindings
+        && u32::try_from(curve_index).is_ok_and(|index| {
+            scene
+                .get("actions")
+                .and_then(|actions| actions.get(action_id))
+                .and_then(|action| action.get("modifier_bindings"))
+                .and_then(|bindings| bindings.get(index.to_string()))
+                .is_some()
+        })
+    {
         return true;
     }
     let owners = scene
@@ -1212,6 +1526,7 @@ fn legacy_driver_output_supported(
         .and_then(|index| u32::try_from(index).ok())
         .unwrap_or(0);
     !node_id.is_empty()
+        && node.get("drivers").and_then(Value::as_array).is_some()
         && supports_animation_output(path, index, AnimationOutputKind::Driver)
         && legacy_node_output_supported(scene, node, path, index)
 }
@@ -1233,7 +1548,7 @@ fn legacy_node_uses_action(node: &Value, action_id: &str) -> bool {
             })
 }
 
-fn legacy_node_output_supported(scene: &Value, node: &Value, path: &str, _index: u32) -> bool {
+fn legacy_node_output_supported(scene: &Value, node: &Value, path: &str, index: u32) -> bool {
     let data = node
         .get("data")
         .and_then(Value::as_str)
@@ -1243,7 +1558,18 @@ fn legacy_node_output_supported(scene: &Value, node: &Value, path: &str, _index:
                 .and_then(|blocks| blocks.get(data_id))
         });
     match path {
-        "camera.lens_mm" | "lens" | "data.lens" => {
+        "camera.lens_mm"
+        | "lens"
+        | "data.lens"
+        | "camera.sensor_width_mm"
+        | "camera.sensor_height_mm"
+        | "camera.ortho_scale"
+        | "camera.clip_start"
+        | "camera.clip_end"
+        | "camera.shift_x"
+        | "camera.shift_y"
+        | "camera.focus_distance"
+        | "camera.aperture_fstop" => {
             if data
                 .and_then(|data| data.get("camera"))
                 .is_none_or(Value::is_null)
@@ -1256,6 +1582,73 @@ fn legacy_node_output_supported(scene: &Value, node: &Value, path: &str, _index:
                 .and_then(|data| data.get("light"))
                 .is_none_or(Value::is_null)
             {
+                return false;
+            }
+        }
+        "light.color" | "light.shadow_soft_size" => {
+            if data
+                .and_then(|data| data.get("light"))
+                .is_none_or(Value::is_null)
+            {
+                return false;
+            }
+        }
+        "light.spot_size" | "light.spot_blend" | "light.area_size" | "light.area_size_y"
+        | "light.sun_angle" => {
+            let Some(light) = data
+                .and_then(|data| data.get("light"))
+                .filter(|light| !light.is_null())
+            else {
+                return false;
+            };
+            let light_type = light
+                .get("light_type")
+                .and_then(Value::as_str)
+                .unwrap_or("point");
+            if (matches!(path, "light.spot_size" | "light.spot_blend") && light_type != "spot")
+                || (matches!(path, "light.area_size" | "light.area_size_y") && light_type != "area")
+                || (path == "light.sun_angle" && light_type != "sun")
+            {
+                return false;
+            }
+        }
+        "hide_render" | "hide_viewport" => {}
+        _ if crate::eval::animation::custom_property_path(path) => {
+            let Some(key) = crate::eval::animation::custom_property_name(path) else {
+                return false;
+            };
+            let property = node
+                .get("properties")
+                .and_then(|properties| properties.get("_blender_custom_properties"))
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get(&key))
+                .or_else(|| {
+                    node.get("properties")
+                        .and_then(|properties| properties.get(&key))
+                });
+            if !property.is_some_and(|value| {
+                crate::eval::animation::custom_property_value_supports_index(value, index)
+            }) {
+                return false;
+            }
+            let ui_range = node
+                .get("properties")
+                .and_then(|properties| properties.get("_blender_custom_property_ui"))
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get(&key));
+            if !ui_range.is_some_and(|range| {
+                let has_hard_range = range.get("min").and_then(Value::as_f64).is_some()
+                    && range.get("max").and_then(Value::as_f64).is_some();
+                let has_rna_default = range.get("default").is_some_and(|default| {
+                    let component = default.as_array().map_or(Some(default), |values| {
+                        usize::try_from(index)
+                            .ok()
+                            .and_then(|index| values.get(index))
+                    });
+                    component.is_some_and(|value| value.as_f64().is_some() || value.is_boolean())
+                });
+                has_hard_range || has_rna_default
+            }) {
                 return false;
             }
         }
@@ -2471,7 +2864,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -2493,7 +2886,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -2513,7 +2906,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -2584,7 +2977,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         let first: Vec<&str> = scene["node_groups"]["first"]["links"]
             .as_array()
             .expect("first links")
@@ -2639,7 +3032,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         let sources: Vec<&str> = scene["node_groups"]["group"]["links"]
             .as_array()
             .expect("links")
@@ -2650,15 +3043,293 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_twelve_scenes_pass_through_untouched() {
+    fn current_schema_thirteen_scenes_pass_through_untouched() {
         let mut scene = json!({
-            "schema_version": 12,
+            "schema_version": 13,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         assert_eq!(scene, before);
+    }
+
+    #[test]
+    fn version_twelve_restores_supported_animation_outputs_and_keeps_refused_outputs() {
+        let action_binding = json!([{
+            "node":"object","modifier":"modifier","parameter":"strength"
+        }]);
+        let restored_binding = json!([{
+            "node":"object","modifier":"modifier","parameter":"translation"
+        }]);
+        let mut scene = json!({
+            "schema_version": 12,
+            "actions": {
+                "shared": {
+                    "fcurves": [
+                        {"path":"transform.scale","index":0},
+                        {"path":"transform.rotation_euler","index":0}
+                    ],
+                    "modifier_bindings": {"1": action_binding}
+                },
+                "wrong_owner": {
+                    "fcurves": [{"path":"transform.scale","index":0}]
+                }
+            },
+            "nodes": {
+                "object": {
+                    "kind":"camera",
+                    "data":"camera_data",
+                    "action":"shared",
+                    "properties":{
+                        "custom":10.0,
+                        "legacy":4.0,
+                        "_blender_custom_property_ui":{
+                            "custom":{"min":0.0,"max":20.0}
+                        }
+                    },
+                    "drivers":[{"id":"live_driver","path":"location","index":0}]
+                },
+                "mesh_object": {
+                    "kind":"mesh",
+                    "data":"point_light",
+                    "action":"wrong_owner"
+                }
+            },
+            "data_blocks":{
+                "camera_data":{"camera":{}},
+                "point_light":{"light":{"light_type":"point"}}
+            },
+            "compatibility": {"animation": {"unsupported_outputs": [
+                {
+                    "kind":"action_fcurve","action_id":"shared","curve_index":2,
+                    "path":"camera.sensor_width_mm",
+                    "curve":{"path":"camera.sensor_width_mm","index":0},
+                    "modifier_bindings":restored_binding
+                },
+                {
+                    "kind":"action_fcurve","action_id":"shared","curve_index":3,
+                    "path":"[\"custom\"]",
+                    "curve":{"path":"[\"custom\"]","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"shared","curve_index":4,
+                    "path":"[\"legacy\"]",
+                    "curve":{"path":"[\"legacy\"]","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"shared","curve_index":1,
+                    "path":"custom.unsupported",
+                    "curve":{"path":"custom.unsupported","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"wrong_owner","curve_index":1,
+                    "path":"camera.sensor_width_mm",
+                    "curve":{"path":"camera.sensor_width_mm","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"wrong_owner","curve_index":1,
+                    "path":"light.spot_size",
+                    "curve":{"path":"light.spot_size","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"wrong_owner","curve_index":1,
+                    "path":"[\"missing\"]",
+                    "curve":{"path":"[\"missing\"]","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"wrong_owner","curve_index":1,
+                    "path":"materials[0].diffuse_color",
+                    "curve":{"path":"materials[0].diffuse_color","index":0}
+                },
+                {
+                    "kind":"driver","node_id":"object","driver_index":1,
+                    "path":"camera.sensor_width_mm",
+                    "driver":{"id":"restored_driver","path":"camera.sensor_width_mm","index":0}
+                },
+                {
+                    "kind":"driver","node_id":"object","driver_index":0,
+                    "path":"custom.unsupported",
+                    "driver":{"id":"refused_driver","path":"custom.unsupported","index":0}
+                }
+            ]}}
+        });
+
+        let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+
+        assert_eq!(warnings, Vec::<Value>::new());
+        assert_eq!(scene["schema_version"], json!(13));
+        let curves = scene["actions"]["shared"]["fcurves"]
+            .as_array()
+            .expect("restored action curves");
+        assert_eq!(
+            curves
+                .iter()
+                .map(|curve| curve["path"].as_str().expect("curve path"))
+                .collect::<Vec<_>>(),
+            [
+                "transform.scale",
+                "camera.sensor_width_mm",
+                "[\"custom\"]",
+                "transform.rotation_euler",
+            ]
+        );
+        assert_eq!(
+            scene["actions"]["shared"]["modifier_bindings"],
+            json!({"1":restored_binding,"3":action_binding})
+        );
+        let drivers = scene["nodes"]["object"]["drivers"]
+            .as_array()
+            .expect("restored drivers");
+        assert_eq!(
+            drivers
+                .iter()
+                .map(|driver| driver["id"].as_str().expect("driver ID"))
+                .collect::<Vec<_>>(),
+            ["restored_driver", "live_driver"]
+        );
+        assert_eq!(
+            scene["compatibility"]["animation"]["unsupported_outputs"],
+            json!([
+                {
+                    "kind":"action_fcurve","action_id":"shared","curve_index":4,
+                    "path":"[\"legacy\"]",
+                    "curve":{"path":"[\"legacy\"]","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"shared","curve_index":1,
+                    "path":"custom.unsupported",
+                    "curve":{"path":"custom.unsupported","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"wrong_owner","curve_index":1,
+                    "path":"camera.sensor_width_mm",
+                    "curve":{"path":"camera.sensor_width_mm","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"wrong_owner","curve_index":1,
+                    "path":"light.spot_size",
+                    "curve":{"path":"light.spot_size","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"wrong_owner","curve_index":1,
+                    "path":"[\"missing\"]",
+                    "curve":{"path":"[\"missing\"]","index":0}
+                },
+                {
+                    "kind":"action_fcurve","action_id":"wrong_owner","curve_index":1,
+                    "path":"materials[0].diffuse_color",
+                    "curve":{"path":"materials[0].diffuse_color","index":0}
+                },
+                {
+                    "kind":"driver","node_id":"object","driver_index":0,
+                    "path":"custom.unsupported",
+                    "driver":{"id":"refused_driver","path":"custom.unsupported","index":0}
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn version_eleven_preserves_modifier_bindings_when_refusing_curves() {
+        let bindings = json!([{
+            "node":"object","modifier":"modifier","parameter":"strength"
+        }]);
+        let mut scene = json!({
+            "schema_version": 11,
+            "actions": {"shared": {
+                "fcurves": [
+                    {"path":"transform.translation","index":0},
+                    {"path":"custom.unsupported","index":0},
+                    {"path":"transform.scale","index":0},
+                    {"path":"camera.sensor_width_mm","index":0}
+                ],
+                "modifier_bindings": {"2":bindings}
+            }},
+            "nodes": {"object": {"kind":"empty","action":"shared"}}
+        });
+
+        let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(
+            scene["actions"]["shared"]["fcurves"]
+                .as_array()
+                .expect("retained action curves")
+                .iter()
+                .map(|curve| curve["path"].as_str().expect("curve path"))
+                .collect::<Vec<_>>(),
+            ["transform.translation", "transform.scale"]
+        );
+        assert_eq!(
+            scene["actions"]["shared"]["modifier_bindings"],
+            json!({"1":bindings})
+        );
+        assert_eq!(
+            scene["compatibility"]["animation"]["unsupported_outputs"][0]["curve_index"],
+            json!(1)
+        );
+        assert_eq!(
+            scene["compatibility"]["animation"]["unsupported_outputs"][1]["curve_index"],
+            json!(3)
+        );
+    }
+
+    #[test]
+    fn loading_version_twelve_with_restorable_outputs_marks_scene_legacy() -> TestResult {
+        let mut doc = crate::model::SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let node_id = crate::model::Id::new("animated")?;
+        let action_id = crate::model::Id::new("legacy_action")?;
+        doc.schema_version = 12;
+        doc.nodes.insert(
+            node_id.clone(),
+            crate::model::Node {
+                name: "Animated".to_owned(),
+                kind: "empty".to_owned(),
+                action: Some(action_id.clone()),
+                ..crate::model::Node::default()
+            },
+        );
+        doc.actions.insert(
+            action_id.clone(),
+            crate::model::Action {
+                name: "Legacy".to_owned(),
+                fcurves: vec![crate::model::FCurve {
+                    path: "transform.scale".to_owned(),
+                    index: 0,
+                    keyframes: Vec::new(),
+                    extrapolation: crate::model::Extrapolation::Constant,
+                    auto_smoothing: None,
+                    modifiers: Vec::new(),
+                }],
+                ..crate::model::Action::default()
+            },
+        );
+        doc.compatibility.insert(
+            "animation".to_owned(),
+            json!({"unsupported_outputs": [{
+                "kind":"action_fcurve",
+                "action_id":action_id,
+                "curve_index":1,
+                "path":"transform.translation",
+                "curve":{"path":"transform.translation","index":0}
+            }]}),
+        );
+
+        let parsed = parse_scene(&serde_json::to_vec(&doc)?, no_assets())?;
+
+        assert!(parsed.legacy);
+        assert_eq!(parsed.doc.schema_version, 13);
+        assert_eq!(parsed.doc.actions[&action_id].fcurves.len(), 2);
+        assert_eq!(
+            parsed.doc.compatibility["animation"]["unsupported_outputs"]
+                .as_array()
+                .expect("remaining compatibility outputs")
+                .len(),
+            0
+        );
+        Ok(())
     }
 
     #[test]
@@ -2702,7 +3373,7 @@ mod tests {
         source["schema_version"] = json!(11);
         let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 12);
+        assert_eq!(parsed.doc.schema_version, 13);
         assert_eq!(parsed.doc.actions[&action_id].fcurves, Vec::new());
         assert_eq!(parsed.doc.nodes[&node_id].drivers, Vec::new());
         assert_eq!(
@@ -2741,7 +3412,7 @@ mod tests {
 
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("migrated action curves");
@@ -2949,7 +3620,7 @@ mod tests {
         )
         .expect("brush migration");
         assert!(migrated.legacy);
-        assert_eq!(migrated.doc.schema_version, 12);
+        assert_eq!(migrated.doc.schema_version, 13);
         let settings = &migrated.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")]
             .properties["physics_dynamic_paint"];
         assert_eq!(settings["paint_source"], json!("POINT"));
@@ -3121,7 +3792,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -3164,7 +3835,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -3212,7 +3883,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 12);
+        assert_eq!(parsed.doc.schema_version, 13);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -3258,7 +3929,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(12));
+        assert_eq!(scene["schema_version"], json!(13));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -3301,7 +3972,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(12);
+        expected["schema_version"] = json!(13);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -3339,7 +4010,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 12);
+        assert_eq!(migrated.schema_version, 13);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -3843,7 +4514,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 12);
+        assert_eq!(record.snapshot.schema_version, 13);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -3910,7 +4581,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 12);
+        assert_eq!(record.snapshot.schema_version, 13);
         let history_mesh = record
             .snapshot
             .data_blocks

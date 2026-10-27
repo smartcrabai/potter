@@ -430,7 +430,7 @@ pub(crate) fn export_with_root_allow_lossy(
             fmt_num(node.transform.scale[0]),
             fmt_num(node.transform.scale[1]),
             fmt_num(node.transform.scale[2]),
-            i32::from(node.visible && node.render_visible),
+            i32::from(snapshot.node_is_visible(node_id, node)),
             quote(node_id.as_str()),
             quote(&armature_metadata),
         )
@@ -1150,7 +1150,7 @@ pub(crate) fn vertex_group_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result
     let visible_nodes = super::render_visible_nodes(doc, snapshot)?;
     let mut losses = Vec::new();
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible_nodes.contains(node_id) {
+        if !snapshot.node_is_visible(node_id, node) || !visible_nodes.contains(node_id) {
             continue;
         }
         let Some(data_id) = node.data.as_ref() else {

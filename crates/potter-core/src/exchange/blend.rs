@@ -3619,6 +3619,7 @@ fn build_imported_graph(
             &mut mappings,
             "Camera",
         )?;
+        let defaults = CameraData::default();
         let mut camera = CameraData {
             lens_mm: number_field(item, "lens", 50.0),
             sensor_height_mm: number_field(item, "sensor_height", 24.0),
@@ -3635,7 +3636,13 @@ fn build_imported_graph(
                 number_field(item, "shift_x", 0.0),
                 number_field(item, "shift_y", 0.0),
             ],
-            ..CameraData::default()
+            dof_enabled: item
+                .get("dof_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.dof_enabled),
+            focus_distance: number_field(item, "focus_distance", defaults.focus_distance),
+            f_stop: number_field(item, "f_stop", defaults.f_stop),
+            ..defaults
         };
         imported_camera_projection(item, &mut camera);
         doc.data_blocks.insert(
@@ -4024,12 +4031,19 @@ fn build_imported_graph(
             &mut mappings,
             "Action",
         )?;
+        let light_data_action = lights
+            .iter()
+            .any(|data| data.get("action").and_then(Value::as_str) == Some(name));
+        let object_action = objects
+            .iter()
+            .any(|object| blender_object_uses_action(object, name));
+        let data_owner_type = (light_data_action && !object_action).then_some("LIGHT");
         let fcurves = item
             .get("fcurves")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .map(|curve| convert_fcurve(curve, &mappings))
+            .map(|curve| convert_fcurve_for_owner(curve, &mappings, data_owner_type))
             .collect::<Result<Vec<_>>>()?;
         doc.actions.insert(
             id.clone(),
@@ -4734,12 +4748,17 @@ fn build_imported_graph(
             _ => None,
         };
         if let Some(data_driver_source) = data_driver_source {
-            drivers.extend(parse_drivers(
+            let data_drivers = parse_drivers_with_owner(
                 data_driver_source,
                 &id,
                 &object_ids,
                 &mut mappings,
-            )?);
+                Some(object_type),
+            )?;
+            drivers.extend(data_drivers.into_iter().filter(|driver| {
+                !crate::eval::animation::custom_property_path(&driver.path)
+                    && custom_property_output_path(&driver.path).is_none()
+            }));
         }
         let nla_tracks =
             parse_nla_tracks(item, &id, &action_by_name, &action_slot_ids, &mut mappings)?;
@@ -5148,7 +5167,7 @@ fn build_imported_graph(
             .to_owned(),
     };
     let mut losses = import_losses(raw);
-    losses.extend(uv_project_animated_camera_lens_losses(&doc));
+    losses.extend(uv_project_animated_camera_losses(&doc));
     losses.extend(missing_udim_tile_losses(images, &resource_ids, &doc)?);
     let id_mappings = serde_json::to_value(&mappings).map_err(PotError::internal_json)?;
     let source = json!({
@@ -5196,12 +5215,12 @@ fn build_imported_graph(
             }
         }
     }
+    drop_unsupported_imported_animation_outputs(&mut doc, &compatibility_intermediate);
     doc.compatibility.insert(
         "blender_adapter".to_owned(),
         json!({"intermediate": compatibility_intermediate, "id_mappings": id_mappings.clone(),
             "legacy_texture_names": legacy_texture_names}),
     );
-    drop_unsupported_imported_animation_outputs(&mut doc);
     doc.validate()?;
     attach_native_target_vertex_orders(&mut doc);
     Ok(ImportedGraph {
@@ -8811,6 +8830,18 @@ fn next_counter(length: usize) -> Result<u32> {
         })
 }
 
+fn potter_fcurve_path_for_owner(
+    path: &str,
+    mappings: &BTreeMap<String, String>,
+    data_owner_type: Option<&str>,
+) -> String {
+    if path == "color" && data_owner_type == Some("LIGHT") {
+        potter_fcurve_path("data.color", mappings)
+    } else {
+        potter_fcurve_path(path, mappings)
+    }
+}
+
 fn potter_fcurve_path(path: &str, mappings: &BTreeMap<String, String>) -> String {
     let normalized = match path {
         "location" => "transform.translation",
@@ -8819,7 +8850,23 @@ fn potter_fcurve_path(path: &str, mappings: &BTreeMap<String, String>) -> String
         "rotation_axis_angle" => "transform.rotation_axis_angle",
         "scale" => "transform.scale",
         "lens" | "data.lens" => "camera.lens_mm",
+        "sensor_width" | "data.sensor_width" => "camera.sensor_width_mm",
+        "sensor_height" | "data.sensor_height" => "camera.sensor_height_mm",
+        "ortho_scale" | "data.ortho_scale" => "camera.ortho_scale",
+        "clip_start" | "data.clip_start" => "camera.clip_start",
+        "clip_end" | "data.clip_end" => "camera.clip_end",
+        "shift_x" | "data.shift_x" => "camera.shift_x",
+        "shift_y" | "data.shift_y" => "camera.shift_y",
+        "dof.focus_distance" | "data.dof.focus_distance" => "camera.focus_distance",
+        "dof.aperture_fstop" | "data.dof.aperture_fstop" => "camera.aperture_fstop",
         "energy" | "data.energy" => "light.energy",
+        "data.color" => "light.color",
+        "spot_size" | "data.spot_size" => "light.spot_size",
+        "spot_blend" | "data.spot_blend" => "light.spot_blend",
+        "shadow_soft_size" | "data.shadow_soft_size" => "light.shadow_soft_size",
+        "size" | "data.size" => "light.area_size",
+        "size_y" | "data.size_y" => "light.area_size_y",
+        "angle" | "data.angle" => "light.sun_angle",
         _ => path,
     };
     if normalized != path {
@@ -8929,7 +8976,16 @@ fn fcurve_auto_smoothing(value: &Value) -> Result<Option<FCurveAutoSmoothing>> {
 }
 
 fn convert_fcurve(value: &Value, mappings: &BTreeMap<String, String>) -> Result<FCurve> {
-    let path = potter_fcurve_path(string_field(value, "path")?, mappings);
+    convert_fcurve_for_owner(value, mappings, None)
+}
+
+fn convert_fcurve_for_owner(
+    value: &Value,
+    mappings: &BTreeMap<String, String>,
+    data_owner_type: Option<&str>,
+) -> Result<FCurve> {
+    let path =
+        potter_fcurve_path_for_owner(string_field(value, "path")?, mappings, data_owner_type);
     let blender_index = integer_field(value, "index", 0);
     // Potter stores quaternion F-Curve indices as (x, y, z, w); Blender's are (w, x, y, z).
     let index =
@@ -9434,6 +9490,16 @@ fn parse_drivers(
     object_ids: &BTreeMap<String, Id>,
     mappings: &mut BTreeMap<String, String>,
 ) -> Result<Vec<Driver>> {
+    parse_drivers_with_owner(value, owner, object_ids, mappings, None)
+}
+
+fn parse_drivers_with_owner(
+    value: &Value,
+    owner: &Id,
+    object_ids: &BTreeMap<String, Id>,
+    mappings: &mut BTreeMap<String, String>,
+    data_owner_type: Option<&str>,
+) -> Result<Vec<Driver>> {
     let mut by_name = BTreeMap::new();
     let mut drivers = Vec::new();
     for item in optional_array(value, "drivers")? {
@@ -9446,7 +9512,7 @@ fn parse_drivers(
         let curve = item
             .get("curve")
             .ok_or_else(|| invalid_intermediate("driver has no F-Curve"))?;
-        let parsed_curve = convert_fcurve(curve, mappings)?;
+        let parsed_curve = convert_fcurve_for_owner(curve, mappings, data_owner_type)?;
         if !crate::eval::animation::supports_animation_output(
             &parsed_curve.path,
             parsed_curve.index,
@@ -9642,6 +9708,8 @@ fn parse_nla_tracks(
                         "NOTHING" => NlaExtrapolation::Nothing,
                         _ => NlaExtrapolation::Hold,
                     };
+                    let (influence, use_animated_influence) =
+                        parse_nla_strip_influence(strip, properties, strip_name)?;
                     Ok(NlaStrip {
                         id: strip_id,
                         action,
@@ -9653,7 +9721,8 @@ fn parse_nla_tracks(
                         scale: number_field(properties, "scale", 1.0),
                         repeat: number_field(properties, "repeat", 1.0),
                         blend_type,
-                        influence: number_field(properties, "influence", 1.0),
+                        influence,
+                        use_animated_influence,
                         extrapolation,
                         blend_in: number_field(properties, "blend_in", 0.0),
                         blend_out: number_field(properties, "blend_out", 0.0),
@@ -9669,6 +9738,134 @@ fn parse_nla_tracks(
             })
         })
         .collect()
+}
+
+fn unsupported_nla_influence_curve(strip_name: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        "animated NLA strip influence is non-constant and cannot be represented by one scalar",
+        json!({
+            "feature_id":"blender.animation.nla_influence_curve",
+            "strip":strip_name,
+        }),
+    )
+}
+
+fn same_blender_float(left: f32, right: f32) -> bool {
+    left.to_bits() == right.to_bits()
+        || (left.to_bits().trailing_zeros() >= 31 && right.to_bits().trailing_zeros() >= 31)
+}
+
+fn parse_nla_strip_influence(
+    strip: &Value,
+    properties: &Value,
+    strip_name: &str,
+) -> Result<(f64, bool)> {
+    let use_animated_influence = match properties.get("use_animated_influence") {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "NLA strip use_animated_influence must be a Boolean",
+            ));
+        }
+        None => false,
+    };
+    if !use_animated_influence {
+        return Ok((1.0, false));
+    }
+    let static_influence = number_field(properties, "influence", 1.0);
+    let Some(curve) = strip
+        .get("influence_curve")
+        .filter(|curve| !curve.is_null())
+    else {
+        return Ok((static_influence, true));
+    };
+    if curve.get("mute").and_then(Value::as_bool) == Some(true) {
+        return Ok((static_influence, true));
+    }
+    if curve.get("path").and_then(Value::as_str) != Some("influence")
+        || curve.get("index").and_then(Value::as_u64) != Some(0)
+        || curve
+            .get("modifiers")
+            .and_then(Value::as_array)
+            .is_some_and(|modifiers| !modifiers.is_empty())
+    {
+        return Err(unsupported_nla_influence_curve(strip_name));
+    }
+    match curve.get("sampled_points") {
+        Some(Value::Array(points)) if !points.is_empty() => {
+            return Err(unsupported_nla_influence_curve(strip_name));
+        }
+        Some(Value::Array(_)) | None => {}
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "NLA strip influence sampled_points must be an array",
+            ));
+        }
+    }
+    let keyframes = curve
+        .get("keyframes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_intermediate("NLA strip influence curve has no keyframe array"))?;
+    if keyframes.is_empty() {
+        return Ok((static_influence, true));
+    }
+    let first = keyframes
+        .first()
+        .and_then(|key| key.get("value"))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| invalid_intermediate("NLA strip influence curve value is invalid"))?;
+    let first = first as f32;
+    if !first.is_finite() {
+        return Err(invalid_intermediate(
+            "NLA strip influence curve value is invalid",
+        ));
+    }
+    let first = f64::from(first);
+    for key in keyframes {
+        let value = key
+            .get("value")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| invalid_intermediate("NLA strip influence curve value is invalid"))?;
+        let value = value as f32;
+        if !value.is_finite() {
+            return Err(invalid_intermediate(
+                "NLA strip influence curve value is invalid",
+            ));
+        }
+        if !same_blender_float(value, first as f32) {
+            return Err(unsupported_nla_influence_curve(strip_name));
+        }
+        match key.get("interpolation").and_then(Value::as_str) {
+            Some("BEZIER") => {
+                for handle in ["handle_left", "handle_right"] {
+                    let handle_y = key
+                        .get(handle)
+                        .and_then(Value::as_array)
+                        .and_then(|coordinates| coordinates.get(1))
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| {
+                            invalid_intermediate("NLA strip influence Bezier handle is invalid")
+                        })?;
+                    let handle_y = handle_y as f32;
+                    if !handle_y.is_finite() {
+                        return Err(invalid_intermediate(
+                            "NLA strip influence Bezier handle is invalid",
+                        ));
+                    }
+                    if !same_blender_float(handle_y, first as f32) {
+                        return Err(unsupported_nla_influence_curve(strip_name));
+                    }
+                }
+            }
+            Some("LINEAR" | "CONSTANT") => {}
+            _ => return Err(unsupported_nla_influence_curve(strip_name)),
+        }
+    }
+    Ok((first, true))
 }
 
 /// The numbers of an array field with `count` entries, or `None` when the key is absent or null.
@@ -9843,6 +10040,16 @@ fn object_properties(item: &Value) -> Map<String, Value> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    if let Some(custom_property_ui) = item
+        .get("custom_property_ui")
+        .and_then(Value::as_object)
+        .filter(|properties| !properties.is_empty())
+    {
+        props.insert(
+            "_blender_custom_property_ui".to_owned(),
+            Value::Object(custom_property_ui.clone()),
+        );
+    }
     props.insert("blender_object_metadata".to_owned(), json!({
         "parent_type": item.get("parent_type"), "parent_bone": item.get("parent_bone"),
         "delta_location": item.get("delta_location"), "delta_rotation_euler": item.get("delta_rotation_euler"),
@@ -10169,7 +10376,60 @@ fn is_shape_key_output_path(path: &str) -> bool {
         || path.starts_with("key_blocks[")
 }
 
-fn action_output_has_matching_owner(raw: &Value, action_name: Option<&str>, path: &str) -> bool {
+fn fcurve_data_owner_type(path: &str) -> Option<&'static str> {
+    if matches!(
+        path,
+        "camera.lens_mm"
+            | "camera.sensor_width_mm"
+            | "camera.sensor_height_mm"
+            | "camera.ortho_scale"
+            | "camera.clip_start"
+            | "camera.clip_end"
+            | "camera.shift_x"
+            | "camera.shift_y"
+            | "camera.focus_distance"
+            | "camera.aperture_fstop"
+    ) {
+        Some("CAMERA")
+    } else if matches!(
+        path,
+        "light.energy"
+            | "light.color"
+            | "light.spot_size"
+            | "light.spot_blend"
+            | "light.shadow_soft_size"
+            | "light.area_size"
+            | "light.area_size_y"
+            | "light.sun_angle"
+    ) {
+        Some("LIGHT")
+    } else {
+        None
+    }
+}
+
+fn custom_property_output_path(path: &str) -> Option<(bool, String)> {
+    let (data_owner, path) = path
+        .strip_prefix("data.")
+        .map_or((false, path), |path| (true, path));
+    let quoted_name = path.strip_prefix('[')?.strip_suffix(']')?;
+    let name = serde_json::from_str::<String>(quoted_name)
+        .ok()
+        .or_else(|| {
+            quoted_name
+                .strip_prefix('\'')?
+                .strip_suffix('\'')
+                .map(str::to_owned)
+        })?;
+    Some((data_owner, name))
+}
+
+fn action_output_has_matching_owner(
+    raw: &Value,
+    action_name: Option<&str>,
+    path: &str,
+    index: u32,
+) -> bool {
     let Some(action_name) = action_name else {
         return true;
     };
@@ -10187,8 +10447,21 @@ fn action_output_has_matching_owner(raw: &Value, action_name: Option<&str>, path
             .flatten()
             .any(|data| data.get("action").and_then(Value::as_str) == Some(action_name))
     };
-    match path {
-        "camera.lens_mm" => {
+    if let Some((data_owner, property)) = custom_property_output_path(path) {
+        return !data_owner
+            && !object_users.is_empty()
+            && object_users.iter().all(|object| {
+                object
+                    .get("custom_properties")
+                    .and_then(Value::as_object)
+                    .and_then(|properties| properties.get(&property))
+                    .is_some_and(|value| {
+                        crate::eval::animation::custom_property_value_supports_index(value, index)
+                    })
+            });
+    }
+    match fcurve_data_owner_type(path) {
+        Some("CAMERA") => {
             (object_users.is_empty()
                 || object_users
                     .iter()
@@ -10199,7 +10472,7 @@ fn action_output_has_matching_owner(raw: &Value, action_name: Option<&str>, path
                     .any(|object| object.get("type").and_then(Value::as_str) == Some("CAMERA"))
                     || data_has_action("cameras"))
         }
-        "light.energy" => {
+        Some("LIGHT") => {
             (object_users.is_empty()
                 || object_users
                     .iter()
@@ -10210,32 +10483,34 @@ fn action_output_has_matching_owner(raw: &Value, action_name: Option<&str>, path
                     .any(|object| object.get("type").and_then(Value::as_str) == Some("LIGHT"))
                     || data_has_action("lights"))
         }
-        path if path.starts_with("pose.") || path.contains("pose.bones[") => {
-            !object_users.is_empty()
-                && object_users
-                    .iter()
-                    .all(|object| object.get("type").and_then(Value::as_str) == Some("ARMATURE"))
-        }
-        path if is_shape_key_output_path(path) => {
-            let meshes = raw.get("meshes").and_then(Value::as_array);
-            let data_users = meshes
-                .into_iter()
-                .flatten()
-                .filter(|mesh| {
-                    mesh.get("shape_keys").is_some_and(|keys| {
-                        keys.get("action").and_then(Value::as_str) == Some(action_name)
+        _ => match path {
+            path if path.starts_with("pose.") || path.contains("pose.bones[") => {
+                !object_users.is_empty()
+                    && object_users.iter().all(|object| {
+                        object.get("type").and_then(Value::as_str) == Some("ARMATURE")
                     })
-                })
-                .collect::<Vec<_>>();
-            !data_users.is_empty()
-                && data_users
-                    .iter()
-                    .all(|mesh| raw_shape_key_output_matches(mesh, path))
-                && object_users
-                    .iter()
-                    .all(|object| object.get("type").and_then(Value::as_str) == Some("MESH"))
-        }
-        _ => true,
+            }
+            path if is_shape_key_output_path(path) => {
+                let meshes = raw.get("meshes").and_then(Value::as_array);
+                let data_users = meshes
+                    .into_iter()
+                    .flatten()
+                    .filter(|mesh| {
+                        mesh.get("shape_keys").is_some_and(|keys| {
+                            keys.get("action").and_then(Value::as_str) == Some(action_name)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                !data_users.is_empty()
+                    && data_users
+                        .iter()
+                        .all(|mesh| raw_shape_key_output_matches(mesh, path))
+                    && object_users
+                        .iter()
+                        .all(|object| object.get("type").and_then(Value::as_str) == Some("MESH"))
+            }
+            _ => true,
+        },
     }
 }
 
@@ -10344,24 +10619,44 @@ fn driver_target_loss(raw: &Value, driver: &Value) -> Option<(String, String)> {
     None
 }
 
-fn driver_output_owner_matches(path: &str, owner_type: Option<&str>) -> bool {
-    match path {
-        "camera.lens_mm" => matches!(owner_type, Some("CAMERA")),
-        "light.energy" => matches!(owner_type, Some("LIGHT")),
-        path if path.starts_with("pose.") || path.contains("pose.bones[") => {
-            matches!(owner_type, Some("ARMATURE"))
-        }
-        path if path.starts_with("shape_key.")
-            || path.starts_with("shape_keys.")
-            || path.starts_with("key_blocks[") =>
-        {
-            matches!(owner_type, Some("MESH"))
-        }
-        _ => true,
+fn driver_output_owner_matches(
+    path: &str,
+    index: u32,
+    owner_type: Option<&str>,
+    owner: Option<&Value>,
+    data_owner: bool,
+) -> bool {
+    if let Some((path_owner_is_data, property)) = custom_property_output_path(path) {
+        return !data_owner
+            && !path_owner_is_data
+            && owner.is_some_and(|owner| {
+                owner
+                    .get("custom_properties")
+                    .and_then(Value::as_object)
+                    .and_then(|properties| properties.get(&property))
+                    .is_some_and(|value| {
+                        crate::eval::animation::custom_property_value_supports_index(value, index)
+                    })
+            });
+    }
+    match fcurve_data_owner_type(path) {
+        Some(expected) => owner_type == Some(expected),
+        None => match path {
+            path if path.starts_with("pose.") || path.contains("pose.bones[") => {
+                matches!(owner_type, Some("ARMATURE"))
+            }
+            path if path.starts_with("shape_key.")
+                || path.starts_with("shape_keys.")
+                || path.starts_with("key_blocks[") =>
+            {
+                matches!(owner_type, Some("MESH"))
+            }
+            _ => true,
+        },
     }
 }
 
-fn drop_unsupported_imported_animation_outputs(doc: &mut SceneDoc) {
+fn drop_unsupported_imported_animation_outputs(doc: &mut SceneDoc, raw: &Value) {
     use crate::eval::animation::{
         AnimationOutputKind, supports_animation_output, supports_animation_output_for_node,
     };
@@ -10412,21 +10707,28 @@ fn drop_unsupported_imported_animation_outputs(doc: &mut SceneDoc) {
                                 node,
                                 doc,
                             )
-                        }) && (!is_shape_key_output_path(&curve.path)
-                            || shape_key_data_owners.iter().all(|data| {
-                                data.shape_keys.as_ref().is_some_and(|shape_keys| {
-                                    matches!(
-                                        curve.path.as_str(),
-                                        "shape_keys.evaluation_time"
-                                            | "shape_key.evaluation_time"
-                                            | "key_blocks.eval_time"
-                                    ) || crate::eval::rig::shape_key_id_from_path(
-                                        shape_keys,
-                                        &curve.path,
-                                    )
-                                    .is_some()
-                                })
-                            })))
+                        }) && (custom_property_output_path(&curve.path).is_none()
+                            || action_output_has_matching_owner(
+                                raw,
+                                Some(action.name.as_str()),
+                                &curve.path,
+                                curve.index,
+                            ))
+                            && (!is_shape_key_output_path(&curve.path)
+                                || shape_key_data_owners.iter().all(|data| {
+                                    data.shape_keys.as_ref().is_some_and(|shape_keys| {
+                                        matches!(
+                                            curve.path.as_str(),
+                                            "shape_keys.evaluation_time"
+                                                | "shape_key.evaluation_time"
+                                                | "key_blocks.eval_time"
+                                        ) || crate::eval::rig::shape_key_id_from_path(
+                                            shape_keys,
+                                            &curve.path,
+                                        )
+                                        .is_some()
+                                    })
+                                })))
                 })
                 .collect::<Vec<_>>();
             (action_id.clone(), keep)
@@ -10488,7 +10790,7 @@ fn drop_unsupported_imported_animation_outputs(doc: &mut SceneDoc) {
             .collect();
     }
 }
-fn uv_project_animated_camera_lens_losses(doc: &SceneDoc) -> Vec<Loss> {
+fn uv_project_animated_camera_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
     for node in doc.nodes.values() {
         for modifier in &node.modifiers {
@@ -10521,6 +10823,19 @@ fn uv_project_animated_camera_lens_losses(doc: &SceneDoc) -> Vec<Loss> {
                         Some(node.name.as_str()),
                         &format!(
                             "UV Project modifier `{}` uses camera projector `{}` with an animated or driven lens, which Blender evaluates in dependency-graph order",
+                            modifier.name, projector.name
+                        ),
+                    ));
+                    break;
+                }
+                if data.camera.is_some()
+                    && crate::eval::animation::node_has_camera_projection_animation(projector, doc)
+                {
+                    losses.push(loss(
+                        "modifier.uv_project.animated_camera_parameters",
+                        Some(node.name.as_str()),
+                        &format!(
+                            "UV Project modifier `{}` uses camera projector `{}` with animated projection parameters, which Blender evaluates in dependency-graph order",
                             modifier.name, projector.name
                         ),
                     ));
@@ -11149,7 +11464,23 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let path = potter_fcurve_path(source_path, &BTreeMap::new());
+            let data_owner_type = action_name
+                .filter(|name| {
+                    !raw.get("objects")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .any(|object| blender_object_uses_action(object, name))
+                })
+                .filter(|name| {
+                    raw.get("lights")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .any(|data| data.get("action").and_then(Value::as_str) == Some(*name))
+                })
+                .map(|_| "LIGHT");
+            let path = potter_fcurve_path_for_owner(source_path, &BTreeMap::new(), data_owner_type);
             let index = curve
                 .get("index")
                 .and_then(Value::as_u64)
@@ -11170,14 +11501,23 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     crate::eval::animation::AnimationOutputKind::Action,
                 ) || curve_data_eval_time_action_supported(raw, action_name, &path);
             if !(shared_output_supported || path.starts_with("modifiers[") && supported)
-                || !action_output_has_matching_owner(raw, action_name, &path)
+                || !action_output_has_matching_owner(raw, action_name, &path, index)
             {
+                let data_custom_property =
+                    custom_property_output_path(&path).is_some_and(|(data_owner, _)| data_owner);
+                let reason = if data_custom_property {
+                    format!(
+                        "Data-Block custom-property F-Curve channel path `{source_path}` is retained but Potter evaluates custom-property animation only for Object owners"
+                    )
+                } else {
+                    format!(
+                        "Action F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
+                    )
+                };
                 losses.push(loss(
                     "blender.animation.fcurve_non_transform_channel",
                     action_name,
-                    &format!(
-                        "Action F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
-                    ),
+                    &reason,
                 ));
             }
             if path.starts_with("modifiers[") && !supported {
@@ -11265,18 +11605,34 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 .and_then(Value::as_u64)
                 .and_then(|index| u32::try_from(index).ok())
                 .unwrap_or(0);
+            let owner_matches = driver_output_owner_matches(
+                &path,
+                index,
+                object.get("type").and_then(Value::as_str),
+                Some(object),
+                false,
+            );
             if !crate::eval::animation::supports_animation_output(
                 &path,
                 index,
                 crate::eval::animation::AnimationOutputKind::Driver,
-            ) || !driver_output_owner_matches(&path, object.get("type").and_then(Value::as_str))
+            ) || !owner_matches
             {
+                let data_custom_property =
+                    custom_property_output_path(&path).is_some_and(|(data_owner, _)| data_owner);
+                let reason = if data_custom_property {
+                    format!(
+                        "Data-Block custom-property driver path `{source_path}` is retained but Potter evaluates custom-property animation only for Object owners"
+                    )
+                } else {
+                    format!(
+                        "Driver output F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
+                    )
+                };
                 losses.push(loss(
                     "blender.animation.fcurve_non_transform_channel",
                     owner,
-                    &format!(
-                        "Driver output F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
-                    ),
+                    &reason,
                 ));
             }
         }
@@ -11339,7 +11695,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     .get("path")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let path = potter_fcurve_path(source_path, &BTreeMap::new());
                 let index = curve
                     .get("index")
                     .and_then(Value::as_u64)
@@ -11350,18 +11705,29 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 } else {
                     Some("LIGHT")
                 };
+                let path = potter_fcurve_path_for_owner(source_path, &BTreeMap::new(), owner_type);
+                let owner_matches =
+                    driver_output_owner_matches(&path, index, owner_type, Some(data), true);
                 if !crate::eval::animation::supports_animation_output(
                     &path,
                     index,
                     crate::eval::animation::AnimationOutputKind::Driver,
-                ) || !driver_output_owner_matches(&path, owner_type)
+                ) || !owner_matches
                 {
+                    let data_custom_property = custom_property_output_path(&path).is_some();
+                    let reason = if data_custom_property {
+                        format!(
+                            "Data-Block custom-property driver path `{source_path}` is retained but Potter evaluates custom-property animation only for Object owners"
+                        )
+                    } else {
+                        format!(
+                            "Data-Block driver output F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
+                        )
+                    };
                     losses.push(loss(
                         "blender.animation.fcurve_non_transform_channel",
                         owner,
-                        &format!(
-                            "Data-Block driver output F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
-                        ),
+                        &reason,
                     ));
                 }
             }
@@ -13253,6 +13619,88 @@ mod tests {
     use super::*;
     use crate::model::{HairCurveAttribute, HairCurvesData};
     #[test]
+    fn nla_import_uses_blender_influence_enable_flag_and_constant_curve() {
+        let static_disabled = json!({"properties": {
+            "influence": 0.6, "use_animated_influence": false
+        }});
+        assert_eq!(
+            parse_nla_strip_influence(&static_disabled, &static_disabled["properties"], "static",)
+                .unwrap(),
+            (1.0, false)
+        );
+
+        let animated_without_curve = json!({"properties": {
+            "influence": 0.6, "use_animated_influence": true
+        }});
+        assert_eq!(
+            parse_nla_strip_influence(
+                &animated_without_curve,
+                &animated_without_curve["properties"],
+                "static",
+            )
+            .unwrap(),
+            (0.6, true)
+        );
+
+        let animated_constant = json!({
+            "properties": {"influence": 0.9, "use_animated_influence": true},
+            "influence_curve": {
+                "path":"influence", "index":0, "mute":false, "modifiers":[],
+                "keyframes":[
+                    {"frame":1.0,"value":0.6,"interpolation":"CONSTANT"},
+                    {"frame":7.0,"value":0.6,"interpolation":"CONSTANT"}
+                ]
+            }
+        });
+        assert_eq!(
+            parse_nla_strip_influence(
+                &animated_constant,
+                &animated_constant["properties"],
+                "constant",
+            )
+            .unwrap(),
+            (f64::from(0.6_f32), true)
+        );
+    }
+
+    #[test]
+    fn nla_import_refuses_nonconstant_influence_curve() {
+        let animated = json!({
+            "properties": {"influence": 0.6, "use_animated_influence": true},
+            "influence_curve": {
+                "path":"influence", "index":0, "mute":false, "modifiers":[],
+                "keyframes":[
+                    {"frame":1.0,"value":0.6,"interpolation":"LINEAR"},
+                    {"frame":7.0,"value":0.8,"interpolation":"LINEAR"}
+                ]
+            }
+        });
+        let error = parse_nla_strip_influence(&animated, &animated["properties"], "animated")
+            .expect_err("a nonconstant NLA influence curve is unsupported");
+        assert_eq!(
+            error.details["feature_id"],
+            "blender.animation.nla_influence_curve"
+        );
+        let sampled = json!({
+            "properties": {"influence": 0.6, "use_animated_influence": true},
+            "influence_curve": {
+                "path":"influence", "index":0, "mute":false, "modifiers":[],
+                "keyframes":[],
+                "sampled_points":[
+                    {"frame":1.0,"value":0.6},
+                    {"frame":7.0,"value":0.8}
+                ]
+            }
+        });
+        let error = parse_nla_strip_influence(&sampled, &sampled["properties"], "sampled")
+            .expect_err("a sampled NLA influence curve is unsupported");
+        assert_eq!(
+            error.details["feature_id"],
+            "blender.animation.nla_influence_curve"
+        );
+    }
+
+    #[test]
     fn usd_cache_resources_export_as_cache_usd_losses() {
         let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
         doc.resources.insert(
@@ -13578,7 +14026,7 @@ mod tests {
     }
 
     #[test]
-    fn blender_animation_paths_map_to_potter_model_paths() {
+    fn blender_animation_paths_map_to_potter_model_paths() -> Result<()> {
         let mappings = BTreeMap::from([("Bone:Armature:Root".to_owned(), "bone_root".to_owned())]);
         for (blender, potter) in [
             ("location", "transform.translation"),
@@ -13586,7 +14034,23 @@ mod tests {
             ("rotation_quaternion", "transform.rotation_quaternion"),
             ("scale", "transform.scale"),
             ("data.lens", "camera.lens_mm"),
+            ("data.sensor_width", "camera.sensor_width_mm"),
+            ("data.sensor_height", "camera.sensor_height_mm"),
+            ("data.ortho_scale", "camera.ortho_scale"),
+            ("data.clip_start", "camera.clip_start"),
+            ("data.clip_end", "camera.clip_end"),
+            ("data.shift_x", "camera.shift_x"),
+            ("data.shift_y", "camera.shift_y"),
+            ("data.dof.focus_distance", "camera.focus_distance"),
+            ("data.dof.aperture_fstop", "camera.aperture_fstop"),
             ("data.energy", "light.energy"),
+            ("data.color", "light.color"),
+            ("data.spot_size", "light.spot_size"),
+            ("data.spot_blend", "light.spot_blend"),
+            ("data.shadow_soft_size", "light.shadow_soft_size"),
+            ("data.size", "light.area_size"),
+            ("data.size_y", "light.area_size_y"),
+            ("data.angle", "light.sun_angle"),
             (
                 "pose.bones[\"Root\"].location",
                 "pose.bones[\"bone_root\"].location",
@@ -13594,6 +14058,203 @@ mod tests {
         ] {
             assert_eq!(potter_fcurve_path(blender, &mappings), potter);
         }
+        assert_eq!(
+            potter_fcurve_path_for_owner("color", &mappings, Some("LIGHT")),
+            "light.color"
+        );
+        assert_eq!(
+            potter_fcurve_path_for_owner("color", &mappings, None),
+            "color"
+        );
+        let data_color =
+            convert_fcurve_for_owner(&json!({"path":"color","index":1}), &mappings, Some("LIGHT"))?;
+        assert_eq!(data_color.path, "light.color");
+        assert_eq!(data_color.index, 1);
+        let color = convert_fcurve(&json!({"path": "data.color", "index": 2}), &mappings)?;
+        assert_eq!(color.path, "light.color");
+        assert_eq!(color.index, 2);
+        assert_eq!(
+            potter_fcurve_path_for_owner("color", &mappings, Some("CAMERA")),
+            "color"
+        );
+        for path in [
+            "hide_render",
+            "hide_viewport",
+            "[\"property\"]",
+            "nodes[\"Principled BSDF\"].inputs[\"Base Color\"].default_value",
+        ] {
+            assert_eq!(potter_fcurve_path(path, &mappings), path);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn camera_and_light_animation_paths_require_the_matching_data_owner() {
+        let camera = json!({
+            "objects": [{"type": "CAMERA", "action": "CameraAction"}],
+            "cameras": [],
+            "lights": []
+        });
+        assert!(action_output_has_matching_owner(
+            &camera,
+            Some("CameraAction"),
+            "camera.focus_distance",
+            0
+        ));
+        assert!(!action_output_has_matching_owner(
+            &camera,
+            Some("CameraAction"),
+            "light.spot_size",
+            0
+        ));
+        assert!(driver_output_owner_matches(
+            "camera.aperture_fstop",
+            0,
+            Some("CAMERA"),
+            None,
+            false
+        ));
+        assert!(!driver_output_owner_matches(
+            "camera.aperture_fstop",
+            0,
+            Some("LIGHT"),
+            None,
+            false
+        ));
+
+        let light_data = json!({
+            "objects": [],
+            "cameras": [],
+            "lights": [{"action": "LightAction"}]
+        });
+        assert!(action_output_has_matching_owner(
+            &light_data,
+            Some("LightAction"),
+            "light.color",
+            2
+        ));
+        assert!(!action_output_has_matching_owner(
+            &light_data,
+            Some("LightAction"),
+            "camera.sensor_width_mm",
+            0
+        ));
+        assert!(driver_output_owner_matches(
+            "light.color",
+            2,
+            Some("LIGHT"),
+            None,
+            false
+        ));
+        assert!(!driver_output_owner_matches(
+            "light.color",
+            0,
+            Some("CAMERA"),
+            None,
+            false
+        ));
+        let object = json!({
+            "custom_properties": {"drive": 1.0, "vector": [1.0, 2.0]}
+        });
+        let object_action = json!({
+            "objects": [{
+                "type": "CAMERA",
+                "action": "ObjectAction",
+                "custom_properties": {"drive": 1.0, "vector": [1.0, 2.0]}
+            }],
+            "cameras": [{"action": "ObjectAction"}],
+            "lights": []
+        });
+        assert!(action_output_has_matching_owner(
+            &object_action,
+            Some("ObjectAction"),
+            "[\"drive\"]",
+            0
+        ));
+        assert!(!action_output_has_matching_owner(
+            &object_action,
+            Some("ObjectAction"),
+            "[\"drive\"]",
+            1
+        ));
+        assert!(action_output_has_matching_owner(
+            &object_action,
+            Some("ObjectAction"),
+            "[\"vector\"]",
+            1
+        ));
+        assert!(!action_output_has_matching_owner(
+            &object_action,
+            Some("ObjectAction"),
+            "[\"vector\"]",
+            2
+        ));
+        assert!(!action_output_has_matching_owner(
+            &object_action,
+            Some("ObjectAction"),
+            "data.[\"drive\"]",
+            0
+        ));
+        assert!(driver_output_owner_matches(
+            "[\"drive\"]",
+            0,
+            Some("CAMERA"),
+            Some(&object),
+            false
+        ));
+        assert!(driver_output_owner_matches(
+            "[\"vector\"]",
+            1,
+            Some("CAMERA"),
+            Some(&object),
+            false
+        ));
+        assert!(!driver_output_owner_matches(
+            "[\"vector\"]",
+            2,
+            Some("CAMERA"),
+            Some(&object),
+            false
+        ));
+        assert!(!driver_output_owner_matches(
+            "[\"missing\"]",
+            0,
+            Some("CAMERA"),
+            Some(&object),
+            false
+        ));
+        assert!(!driver_output_owner_matches(
+            "data.[\"drive\"]",
+            0,
+            Some("CAMERA"),
+            Some(&object),
+            true
+        ));
+
+        let data_custom_action = json!({
+            "objects": [],
+            "cameras": [{"action": "DataAction"}],
+            "lights": []
+        });
+        assert!(!action_output_has_matching_owner(
+            &data_custom_action,
+            Some("DataAction"),
+            "[\"drive\"]",
+            0
+        ));
+        let losses = import_losses(&json!({
+            "actions": [{
+                "name": "DataAction",
+                "fcurves": [{"path": "data.[\"drive\"]", "index": 0}]
+            }],
+            "objects": [],
+            "cameras": [{"name": "CameraData", "action": "DataAction"}],
+            "lights": []
+        }));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.animation.fcurve_non_transform_channel"
+                && loss.reason.contains("Data-Block custom-property F-Curve")
+        }));
     }
 
     #[test]

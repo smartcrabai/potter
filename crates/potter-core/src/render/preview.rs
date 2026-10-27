@@ -646,10 +646,18 @@ fn stored_camera(
         Projection::Perspective { .. } => "perspective",
         _ => "panorama",
     };
-    let depth_of_field = camera_data.dof_enabled.then_some(DepthOfField {
-        focus_distance: camera_data.focus_distance,
-        aperture_radius: camera_data.lens_mm / (2000.0 * camera_data.f_stop),
-        aperture_blades: camera_data.aperture_blades,
+    let depth_of_field = camera_data.dof_enabled.then(|| {
+        let f_stop = camera_data.f_stop.max(1.0e-5);
+        let aperture_radius = if camera_data.projection == CameraProjection::Orthographic {
+            1.0 / (2.0 * f_stop)
+        } else {
+            camera_data.lens_mm / (2000.0 * f_stop)
+        };
+        DepthOfField {
+            focus_distance: camera_data.focus_distance.max(1.0e-5),
+            aperture_radius,
+            aperture_blades: camera_data.aperture_blades,
+        }
     });
     let stereo_mode = match camera_data.stereo_mode.as_str() {
         "side_by_side" => StereoMode::SideBySide,
