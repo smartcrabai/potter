@@ -1151,25 +1151,47 @@ pub struct NlaStrip {
     pub repeat: f64,
     pub blend_type: NlaBlendType,
     pub influence: f64,
-    /// Blender's `NlaStrip.use_animated_influence`; nonconstant curves are not representable.
+    /// Blender's `NlaStrip.use_animated_influence`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub use_animated_influence: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub influence_curve: Option<FCurve>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reverse: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_sync_length: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_auto_blend: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mute: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_animated_time: bool,
+    #[serde(default)]
+    pub strip_time: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_time_curve: Option<FCurve>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_animated_time_cyclic: bool,
     pub extrapolation: NlaExtrapolation,
     pub blend_in: f64,
     pub blend_out: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NlaBlendType {
+    #[default]
     Replace,
     Add,
+    Subtract,
+    Multiply,
     Combine,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NlaExtrapolation {
+    #[default]
     Hold,
     HoldForward,
     Nothing,
@@ -2462,6 +2484,12 @@ pub struct Node {
     #[serde(default)]
     pub nla_tracks: Vec<NlaTrack>,
     #[serde(default)]
+    pub action_blend_type: NlaBlendType,
+    #[serde(default = "default_action_influence")]
+    pub action_influence: f64,
+    #[serde(default)]
+    pub action_extrapolation: NlaExtrapolation,
+    #[serde(default)]
     pub properties: Map<String, Value>,
     #[serde(default)]
     pub rigid_body: Option<RigidBody>,
@@ -2511,6 +2539,9 @@ impl Default for Node {
             selectable: true,
             action: None,
             nla_tracks: Vec::new(),
+            action_blend_type: NlaBlendType::default(),
+            action_influence: default_action_influence(),
+            action_extrapolation: NlaExtrapolation::default(),
             properties: Map::new(),
             rigid_body: None,
             force_field: None,
@@ -2843,6 +2874,9 @@ fn default_transparent_max_bounces() -> u32 {
 }
 
 fn default_filter_glossy() -> f64 {
+    1.0
+}
+fn default_action_influence() -> f64 {
     1.0
 }
 

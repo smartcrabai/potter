@@ -4820,6 +4820,9 @@ fn build_imported_graph(
                 },
             );
         }
+        if item.get("nla_tweak_mode").and_then(Value::as_bool) == Some(true) {
+            return Err(unsupported_nla_tweak_mode(name));
+        }
         let action = item
             .get("action")
             .and_then(Value::as_str)
@@ -4831,6 +4834,11 @@ fn build_imported_graph(
                     .and_then(|data_id| data_action_by_id.get(data_id))
                     .cloned()
             });
+        let action_blend_type =
+            nla_blend_type_field(item, "action_blend_type", &format!("object `{name}`"))?;
+        let action_influence = number_field(item, "action_influence", 1.0);
+        let action_extrapolation =
+            nla_extrapolation_field(item, "action_extrapolation", &format!("object `{name}`"))?;
         let mut node = Node {
             name: name.to_owned(),
             kind: kind.to_owned(),
@@ -4875,6 +4883,9 @@ fn build_imported_graph(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             action,
+            action_blend_type,
+            action_influence,
+            action_extrapolation,
             nla_tracks,
             properties,
             rigid_body,
@@ -9704,53 +9715,7 @@ fn parse_nla_tracks(
                         mappings,
                         &format!("NlaStrip:{owner}"),
                     )?;
-                    let action_name = strip
-                        .get("action")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| invalid_intermediate("NLA strip has no action"))?;
-                    let action = action_by_name.get(action_name).cloned().ok_or_else(|| {
-                        invalid_intermediate("NLA strip references an unknown action")
-                    })?;
-                    let action_slot =
-                        action_slot_id(action_name, strip.get("action_slot"), action_slot_ids)?;
-                    let properties = strip.get("properties").unwrap_or(&Value::Null);
-                    let blend_type = match properties
-                        .get("blend_type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("REPLACE")
-                    {
-                        "ADD" => NlaBlendType::Add,
-                        "COMBINE" => NlaBlendType::Combine,
-                        _ => NlaBlendType::Replace,
-                    };
-                    let extrapolation = match properties
-                        .get("extrapolation")
-                        .and_then(Value::as_str)
-                        .unwrap_or("HOLD")
-                    {
-                        "HOLD_FORWARD" => NlaExtrapolation::HoldForward,
-                        "NOTHING" => NlaExtrapolation::Nothing,
-                        _ => NlaExtrapolation::Hold,
-                    };
-                    let (influence, use_animated_influence) =
-                        parse_nla_strip_influence(strip, properties, strip_name)?;
-                    Ok(NlaStrip {
-                        id: strip_id,
-                        action,
-                        action_slot,
-                        frame_start: number_field(properties, "frame_start", 1.0),
-                        frame_end: number_field(properties, "frame_end", 1.0),
-                        action_frame_start: number_field(properties, "action_frame_start", 1.0),
-                        action_frame_end: number_field(properties, "action_frame_end", 1.0),
-                        scale: number_field(properties, "scale", 1.0),
-                        repeat: number_field(properties, "repeat", 1.0),
-                        blend_type,
-                        influence,
-                        use_animated_influence,
-                        extrapolation,
-                        blend_in: number_field(properties, "blend_in", 0.0),
-                        blend_out: number_field(properties, "blend_out", 0.0),
-                    })
+                    parse_nla_strip(strip, strip_id, action_by_name, action_slot_ids, mappings)
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(NlaTrack {
@@ -9763,28 +9728,348 @@ fn parse_nla_tracks(
         })
         .collect()
 }
+fn parse_nla_strip(
+    strip: &Value,
+    id: Id,
+    action_by_name: &BTreeMap<String, Id>,
+    action_slot_ids: &BTreeMap<(String, String), Id>,
+    mappings: &mut BTreeMap<String, String>,
+) -> Result<NlaStrip> {
+    let strip_name = strip
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("NLA Strip");
+    let strip_type = match strip.get("type") {
+        None | Some(Value::Null) => "CLIP",
+        Some(Value::String(strip_type)) => strip_type.as_str(),
+        Some(_) => return Err(invalid_intermediate("NLA strip type must be a string")),
+    };
+    if strip_type != "CLIP" {
+        return Err(unsupported_nla_strip_type(strip_name, strip_type));
+    }
+    let action_name = strip
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_intermediate("NLA strip has no action"))?;
+    let action = action_by_name
+        .get(action_name)
+        .cloned()
+        .ok_or_else(|| invalid_intermediate("NLA strip references an unknown action"))?;
+    let action_slot = action_slot_id(action_name, strip.get("action_slot"), action_slot_ids)?;
+    let properties = strip.get("properties").unwrap_or(&Value::Null);
+    let blend_type = nla_blend_type_field(properties, "blend_type", strip_name)?;
+    let extrapolation = nla_extrapolation_field(properties, "extrapolation", strip_name)?;
+    let (influence, use_animated_influence, influence_curve) =
+        parse_nla_strip_influence(strip, properties, strip_name, mappings)?;
+    let use_animated_time = nla_bool_field(properties, "use_animated_time", false, strip_name)?;
+    let strip_time_curve_source = strip
+        .get("strip_time_curve")
+        .filter(|curve| !curve.is_null());
+    match strip.get("unsupported_curves") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(curves)) if curves.is_empty() => {}
+        Some(Value::Array(_)) => {
+            return Err(unsupported_nla_strip_time(
+                strip_name,
+                "contains an F-Curve for an unmodeled strip property",
+            ));
+        }
+        Some(_) => {
+            return Err(invalid_intermediate(
+                "NLA strip unsupported_curves must be an array",
+            ));
+        }
+    }
+    let strip_time_curve = strip_time_curve_source
+        .map(|curve| {
+            if curve.get("path").and_then(Value::as_str) != Some("strip_time")
+                || curve.get("index").and_then(Value::as_i64) != Some(0)
+            {
+                return Err(unsupported_nla_strip_time(
+                    strip_name,
+                    "has a strip-time F-Curve with an unsupported path or index",
+                ));
+            }
+            if nla_bool_field(curve, "mute", false, strip_name)? {
+                return Err(unsupported_nla_strip_time(
+                    strip_name,
+                    "has a muted strip-time F-Curve",
+                ));
+            }
+            match curve.get("sampled_points") {
+                Some(Value::Array(points)) if !points.is_empty() => {
+                    return Err(unsupported_nla_strip_time(
+                        strip_name,
+                        "has sampled strip-time data that cannot be represented as keyframes",
+                    ));
+                }
+                Some(Value::Array(_)) | None => {}
+                Some(_) => {
+                    return Err(invalid_intermediate(
+                        "NLA strip-time sampled_points must be an array",
+                    ));
+                }
+            }
+            let curve_extrapolation = curve
+                .get("extrapolation")
+                .and_then(Value::as_str)
+                .unwrap_or("CONSTANT");
+            if !matches!(curve_extrapolation, "CONSTANT" | "LINEAR") {
+                return Err(unsupported_nla_strip_time(
+                    strip_name,
+                    "has an unsupported strip-time F-Curve extrapolation mode",
+                ));
+            }
+            let keyframes = curve
+                .get("keyframes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    invalid_intermediate("NLA strip-time F-Curve has no keyframe array")
+                })?;
+            if keyframes.is_empty() {
+                return Err(unsupported_nla_strip_time(
+                    strip_name,
+                    "has an empty strip-time F-Curve",
+                ));
+            }
+            for keyframe in keyframes {
+                let interpolation = keyframe
+                    .get("interpolation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("LINEAR");
+                if !matches!(interpolation, "CONSTANT" | "LINEAR" | "BEZIER") {
+                    return Err(unsupported_nla_strip_time(
+                        strip_name,
+                        "has an unsupported strip-time keyframe interpolation",
+                    ));
+                }
+            }
+            convert_fcurve(curve, mappings)
+        })
+        .transpose()?;
+    Ok(NlaStrip {
+        id,
+        action,
+        action_slot,
+        frame_start: number_field(properties, "frame_start", 1.0),
+        frame_end: number_field(properties, "frame_end", 1.0),
+        action_frame_start: number_field(properties, "action_frame_start", 1.0),
+        action_frame_end: number_field(properties, "action_frame_end", 1.0),
+        scale: number_field(properties, "scale", 1.0),
+        repeat: number_field(properties, "repeat", 1.0),
+        blend_type,
+        influence,
+        use_animated_influence,
+        influence_curve,
+        extrapolation,
+        blend_in: number_field(properties, "blend_in", 0.0),
+        blend_out: number_field(properties, "blend_out", 0.0),
+        reverse: nla_bool_field(properties, "use_reverse", false, strip_name)?,
+        use_sync_length: nla_bool_field(properties, "use_sync_length", false, strip_name)?,
+        use_auto_blend: nla_bool_field(properties, "use_auto_blend", false, strip_name)?,
+        mute: nla_bool_field(properties, "mute", false, strip_name)?,
+        use_animated_time,
+        strip_time: number_field(properties, "strip_time", 0.0),
+        use_animated_time_cyclic: nla_bool_field(
+            properties,
+            "use_animated_time_cyclic",
+            false,
+            strip_name,
+        )?,
+        strip_time_curve,
+    })
+}
 
-fn unsupported_nla_influence_curve(strip_name: &str) -> PotError {
+fn unsupported_nla_tweak_mode(object_name: &str) -> PotError {
     PotError::with_details(
         ErrorCode::UnsupportedFeature,
-        "animated NLA strip influence is non-constant and cannot be represented by one scalar",
+        format!("Blender object `{object_name}` is in NLA tweak mode"),
+        json!({
+            "feature_id":"blender.animation.nla_tweak_mode",
+            "object":object_name,
+            "status":"not_supported",
+        }),
+    )
+}
+
+fn unsupported_nla_strip_type(strip_name: &str, strip_type: &str) -> PotError {
+    let feature_id = match strip_type {
+        "META" => "blender.animation.nla_meta_strip",
+        "TRANSITION" => "blender.animation.nla_transition_strip",
+        "SOUND" => "blender.animation.nla_sound_strip",
+        _ => "blender.animation.nla_strip_type",
+    };
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("Blender NLA {strip_type} strip `{strip_name}` is not supported"),
+        json!({
+            "feature_id":feature_id,
+            "strip":strip_name,
+            "strip_type":strip_type,
+            "status":"not_supported",
+        }),
+    )
+}
+
+fn unsupported_nla_enum(field: &str, value: &str, context: &str) -> PotError {
+    let feature_id = if field.contains("extrapolation") {
+        "blender.animation.nla_extrapolation"
+    } else {
+        "blender.animation.nla_blend_type"
+    };
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("Blender NLA {field} `{value}` on {context} is not supported"),
+        json!({
+            "feature_id":feature_id,
+            "field":field,
+            "value":value,
+            "context":context,
+            "status":"not_supported",
+        }),
+    )
+}
+
+fn nla_blend_type_field(value: &Value, field: &str, context: &str) -> Result<NlaBlendType> {
+    let value = match value.get(field) {
+        None | Some(Value::Null) => "REPLACE",
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => {
+            return Err(invalid_intermediate(&format!(
+                "NLA {field} on {context} must be a string"
+            )));
+        }
+    };
+    match value {
+        "REPLACE" => Ok(NlaBlendType::Replace),
+        "ADD" => Ok(NlaBlendType::Add),
+        "COMBINE" => Ok(NlaBlendType::Combine),
+        "SUBTRACT" => Ok(NlaBlendType::Subtract),
+        "MULTIPLY" => Ok(NlaBlendType::Multiply),
+        other => Err(unsupported_nla_enum(field, other, context)),
+    }
+}
+
+fn nla_extrapolation_field(value: &Value, field: &str, context: &str) -> Result<NlaExtrapolation> {
+    let value = match value.get(field) {
+        None | Some(Value::Null) => "HOLD",
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => {
+            return Err(invalid_intermediate(&format!(
+                "NLA {field} on {context} must be a string"
+            )));
+        }
+    };
+    match value {
+        "HOLD" => Ok(NlaExtrapolation::Hold),
+        "HOLD_FORWARD" => Ok(NlaExtrapolation::HoldForward),
+        "NOTHING" => Ok(NlaExtrapolation::Nothing),
+        other => Err(unsupported_nla_enum(field, other, context)),
+    }
+}
+
+fn nla_bool_field(value: &Value, field: &str, fallback: bool, context: &str) -> Result<bool> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(fallback),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(invalid_intermediate(&format!(
+            "NLA {field} on {context} must be a Boolean"
+        ))),
+    }
+}
+
+fn unsupported_nla_strip_time(strip_name: &str, reason: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("NLA strip `{strip_name}` {reason}"),
+        json!({
+            "feature_id":"blender.animation.nla_strip_time_curve",
+            "strip":strip_name,
+            "reason":reason,
+            "status":"not_supported",
+        }),
+    )
+}
+
+fn unsupported_nla_influence_curve(strip_name: &str, reason: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("animated NLA strip influence on `{strip_name}` is unsupported: {reason}"),
         json!({
             "feature_id":"blender.animation.nla_influence_curve",
             "strip":strip_name,
+            "reason":reason,
         }),
     )
 }
 
 fn same_blender_float(left: f32, right: f32) -> bool {
-    left.to_bits() == right.to_bits()
-        || (left.to_bits().trailing_zeros() >= 31 && right.to_bits().trailing_zeros() >= 31)
+    left.to_bits() == right.to_bits() || (left.abs() < f32::EPSILON && right.abs() < f32::EPSILON)
+}
+
+fn constant_nla_influence_curve(curve: &Value) -> Result<Option<f64>> {
+    if curve
+        .get("modifiers")
+        .and_then(Value::as_array)
+        .is_some_and(|modifiers| !modifiers.is_empty())
+    {
+        return Ok(None);
+    }
+    let keys = curve
+        .get("keyframes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_intermediate("NLA strip influence curve has no keyframe array"))?;
+    let Some(first) = keys.first() else {
+        return Ok(None);
+    };
+    let value = |key: &Value| -> Result<f32> {
+        let value = key
+            .get("value")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| invalid_intermediate("NLA strip influence curve value is invalid"))?;
+        let value = value as f32;
+        value
+            .is_finite()
+            .then_some(value)
+            .ok_or_else(|| invalid_intermediate("NLA strip influence curve value is invalid"))
+    };
+    let first_value = value(first)?;
+    for key in keys {
+        if !same_blender_float(value(key)?, first_value) {
+            return Ok(None);
+        }
+        match key.get("interpolation").and_then(Value::as_str) {
+            Some("CONSTANT" | "LINEAR") => {}
+            Some("BEZIER") => {
+                for handle in ["handle_left", "handle_right"] {
+                    let Some(handle_value) = key
+                        .get(handle)
+                        .and_then(Value::as_array)
+                        .and_then(|coordinates| coordinates.get(1))
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite())
+                    else {
+                        return Ok(None);
+                    };
+                    let handle_value = handle_value as f32;
+                    if !handle_value.is_finite() || !same_blender_float(handle_value, first_value) {
+                        return Ok(None);
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(f64::from(first_value)))
 }
 
 fn parse_nla_strip_influence(
     strip: &Value,
     properties: &Value,
     strip_name: &str,
-) -> Result<(f64, bool)> {
+    mappings: &BTreeMap<String, String>,
+) -> Result<(f64, bool, Option<FCurve>)> {
     let use_animated_influence = match properties.get("use_animated_influence") {
         Some(Value::Bool(value)) => *value,
         Some(_) => {
@@ -9794,31 +10079,33 @@ fn parse_nla_strip_influence(
         }
         None => false,
     };
-    if !use_animated_influence {
-        return Ok((1.0, false));
-    }
     let static_influence = number_field(properties, "influence", 1.0);
     let Some(curve) = strip
         .get("influence_curve")
         .filter(|curve| !curve.is_null())
     else {
-        return Ok((static_influence, true));
+        return Ok((static_influence, use_animated_influence, None));
     };
-    if curve.get("mute").and_then(Value::as_bool) == Some(true) {
-        return Ok((static_influence, true));
-    }
     if curve.get("path").and_then(Value::as_str) != Some("influence")
         || curve.get("index").and_then(Value::as_u64) != Some(0)
-        || curve
-            .get("modifiers")
-            .and_then(Value::as_array)
-            .is_some_and(|modifiers| !modifiers.is_empty())
     {
-        return Err(unsupported_nla_influence_curve(strip_name));
+        return Err(unsupported_nla_influence_curve(
+            strip_name,
+            "the curve must target influence at index zero",
+        ));
+    }
+    if curve.get("mute").and_then(Value::as_bool) == Some(true) {
+        return Err(unsupported_nla_influence_curve(
+            strip_name,
+            "muted influence F-Curves are not represented",
+        ));
     }
     match curve.get("sampled_points") {
         Some(Value::Array(points)) if !points.is_empty() => {
-            return Err(unsupported_nla_influence_curve(strip_name));
+            return Err(unsupported_nla_influence_curve(
+                strip_name,
+                "sampled points cannot be represented as keyframes",
+            ));
         }
         Some(Value::Array(_)) | None => {}
         Some(_) => {
@@ -9827,69 +10114,24 @@ fn parse_nla_strip_influence(
             ));
         }
     }
-    let keyframes = curve
+    if curve
         .get("keyframes")
         .and_then(Value::as_array)
-        .ok_or_else(|| invalid_intermediate("NLA strip influence curve has no keyframe array"))?;
-    if keyframes.is_empty() {
-        return Ok((static_influence, true));
-    }
-    let first = keyframes
-        .first()
-        .and_then(|key| key.get("value"))
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| invalid_intermediate("NLA strip influence curve value is invalid"))?;
-    let first = first as f32;
-    if !first.is_finite() {
-        return Err(invalid_intermediate(
-            "NLA strip influence curve value is invalid",
+        .is_none_or(Vec::is_empty)
+    {
+        return Err(unsupported_nla_influence_curve(
+            strip_name,
+            "has an empty influence F-Curve",
         ));
     }
-    let first = f64::from(first);
-    for key in keyframes {
-        let value = key
-            .get("value")
-            .and_then(Value::as_f64)
-            .filter(|value| value.is_finite())
-            .ok_or_else(|| invalid_intermediate("NLA strip influence curve value is invalid"))?;
-        let value = value as f32;
-        if !value.is_finite() {
-            return Err(invalid_intermediate(
-                "NLA strip influence curve value is invalid",
-            ));
-        }
-        if !same_blender_float(value, first as f32) {
-            return Err(unsupported_nla_influence_curve(strip_name));
-        }
-        match key.get("interpolation").and_then(Value::as_str) {
-            Some("BEZIER") => {
-                for handle in ["handle_left", "handle_right"] {
-                    let handle_y = key
-                        .get(handle)
-                        .and_then(Value::as_array)
-                        .and_then(|coordinates| coordinates.get(1))
-                        .and_then(Value::as_f64)
-                        .filter(|value| value.is_finite())
-                        .ok_or_else(|| {
-                            invalid_intermediate("NLA strip influence Bezier handle is invalid")
-                        })?;
-                    let handle_y = handle_y as f32;
-                    if !handle_y.is_finite() {
-                        return Err(invalid_intermediate(
-                            "NLA strip influence Bezier handle is invalid",
-                        ));
-                    }
-                    if !same_blender_float(handle_y, first as f32) {
-                        return Err(unsupported_nla_influence_curve(strip_name));
-                    }
-                }
-            }
-            Some("LINEAR" | "CONSTANT") => {}
-            _ => return Err(unsupported_nla_influence_curve(strip_name)),
-        }
+    if use_animated_influence && let Some(constant_value) = constant_nla_influence_curve(curve)? {
+        return Ok((constant_value, true, None));
     }
-    Ok((first, true))
+    Ok((
+        static_influence,
+        use_animated_influence,
+        Some(convert_fcurve(curve, mappings)?),
+    ))
 }
 
 /// The numbers of an array field with `count` entries, or `None` when the key is absent or null.
@@ -13803,14 +14045,20 @@ mod tests {
     use super::*;
     use crate::model::{HairCurveAttribute, HairCurvesData};
     #[test]
-    fn nla_import_uses_blender_influence_enable_flag_and_constant_curve() {
+    fn nla_import_preserves_influence_flag_and_curves() {
+        let mappings = BTreeMap::new();
         let static_disabled = json!({"properties": {
             "influence": 0.6, "use_animated_influence": false
         }});
         assert_eq!(
-            parse_nla_strip_influence(&static_disabled, &static_disabled["properties"], "static",)
-                .unwrap(),
-            (1.0, false)
+            parse_nla_strip_influence(
+                &static_disabled,
+                &static_disabled["properties"],
+                "static",
+                &mappings,
+            )
+            .unwrap(),
+            (0.6, false, None)
         );
 
         let animated_without_curve = json!({"properties": {
@@ -13821,9 +14069,10 @@ mod tests {
                 &animated_without_curve,
                 &animated_without_curve["properties"],
                 "static",
+                &mappings,
             )
             .unwrap(),
-            (0.6, true)
+            (0.6, true, None)
         );
 
         let animated_constant = json!({
@@ -13841,9 +14090,60 @@ mod tests {
                 &animated_constant,
                 &animated_constant["properties"],
                 "constant",
+                &mappings,
             )
             .unwrap(),
-            (f64::from(0.6_f32), true)
+            (f64::from(0.6_f32), true, None)
+        );
+
+        let animated_curve = json!({
+            "properties": {"influence": 0.9, "use_animated_influence": true},
+            "influence_curve": {
+                "path":"influence", "index":0, "mute":false, "modifiers":[],
+                "keyframes":[
+                    {"frame":1.0,"value":0.6,"interpolation":"CONSTANT"},
+                    {"frame":7.0,"value":0.8,"interpolation":"LINEAR"}
+                ]
+            }
+        });
+        let (influence, animated, curve) = parse_nla_strip_influence(
+            &animated_curve,
+            &animated_curve["properties"],
+            "animated",
+            &mappings,
+        )
+        .unwrap();
+        assert_eq!(influence, 0.9);
+        assert!(animated);
+        let curve = curve.unwrap();
+        assert_eq!(curve.path, "influence");
+        assert_eq!(curve.keyframes.len(), 2);
+        assert_eq!(curve.keyframes[1].value, 0.8);
+    }
+
+    #[test]
+    fn nla_import_refuses_sampled_influence_curve() {
+        let sampled = json!({
+            "properties": {"influence": 0.6, "use_animated_influence": true},
+            "influence_curve": {
+                "path":"influence", "index":0, "mute":false, "modifiers":[],
+                "keyframes":[],
+                "sampled_points":[
+                    {"frame":1.0,"value":0.6},
+                    {"frame":7.0,"value":0.8}
+                ]
+            }
+        });
+        let error = parse_nla_strip_influence(
+            &sampled,
+            &sampled["properties"],
+            "sampled",
+            &BTreeMap::new(),
+        )
+        .expect_err("sampled influence curves are not representable as keyframes");
+        assert_eq!(
+            error.details["feature_id"],
+            "blender.animation.nla_influence_curve"
         );
     }
     #[test]
@@ -13973,43 +14273,6 @@ mod tests {
         assert_eq!(
             unicode_losses[0].data_id.as_deref(),
             Some("unicode_default")
-        );
-    }
-
-    #[test]
-    fn nla_import_refuses_nonconstant_influence_curve() {
-        let animated = json!({
-            "properties": {"influence": 0.6, "use_animated_influence": true},
-            "influence_curve": {
-                "path":"influence", "index":0, "mute":false, "modifiers":[],
-                "keyframes":[
-                    {"frame":1.0,"value":0.6,"interpolation":"LINEAR"},
-                    {"frame":7.0,"value":0.8,"interpolation":"LINEAR"}
-                ]
-            }
-        });
-        let error = parse_nla_strip_influence(&animated, &animated["properties"], "animated")
-            .expect_err("a nonconstant NLA influence curve is unsupported");
-        assert_eq!(
-            error.details["feature_id"],
-            "blender.animation.nla_influence_curve"
-        );
-        let sampled = json!({
-            "properties": {"influence": 0.6, "use_animated_influence": true},
-            "influence_curve": {
-                "path":"influence", "index":0, "mute":false, "modifiers":[],
-                "keyframes":[],
-                "sampled_points":[
-                    {"frame":1.0,"value":0.6},
-                    {"frame":7.0,"value":0.8}
-                ]
-            }
-        });
-        let error = parse_nla_strip_influence(&sampled, &sampled["properties"], "sampled")
-            .expect_err("a sampled NLA influence curve is unsupported");
-        assert_eq!(
-            error.details["feature_id"],
-            "blender.animation.nla_influence_curve"
         );
     }
 

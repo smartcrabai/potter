@@ -12,8 +12,8 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     model::{
         Action, Extrapolation, FCurve, Id, Interpolation, LightType, ModifierParameterBinding,
-        NlaBlendType, NlaExtrapolation, NlaStrip, Node, PoseBone, PoseRotationMode, SceneDoc,
-        Transform, normalize_rotation,
+        NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, Node, PoseBone, PoseRotationMode,
+        SceneDoc, Transform, normalize_rotation,
     },
 };
 
@@ -33,67 +33,239 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
         .nla_tracks
         .iter()
         .any(|track| track.solo && !track.mute);
+    let nla_mode = node_uses_nla(node, has_solo);
     let mut transform = node.transform.clone();
     let rotation_mode_is_from_blender = node.properties.contains_key("blender_object_metadata");
-    for track in &node.nla_tracks {
+    let rotation_mode =
+        PoseRotationMode::from_blender(&transform.rotation_mode).unwrap_or_default();
+    let initial_kind = if rotation_mode == PoseRotationMode::AxisAngle {
+        RotationChannelKind::AxisAngle
+    } else if rotation_mode.euler_order().is_some() {
+        RotationChannelKind::Euler
+    } else {
+        RotationChannelKind::Quaternion
+    };
+    let domain =
+        transform_nla_domain(node, doc, nla_mode, has_solo, rotation_mode_is_from_blender)?;
+    let mut rotation_state = if domain.rotation {
+        Some(rotation_accumulator_from_quaternion(
+            transform.rotation,
+            initial_kind,
+            rotation_mode,
+        )?)
+    } else {
+        None
+    };
+    for component in 0..3 {
+        if domain.translation[component] {
+            transform.translation[component] = 0.0;
+        }
+        if domain.scale[component] {
+            transform.scale[component] = 1.0;
+        }
+    }
+    if domain.rotation {
+        let state = rotation_state.as_mut().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "rotation domain has no accumulator",
+            )
+        })?;
+        reset_rotation_accumulator(
+            state,
+            domain.rotation_kind,
+            domain.rotation_components,
+            rotation_mode,
+        )?;
+        transform.rotation = rotation_accumulator_to_quaternion(*state, rotation_mode)?;
+    }
+    for (track_index, track) in node.nla_tracks.iter().enumerate() {
         if track.mute || (has_solo && !track.solo) {
             continue;
         }
-        for strip in &track.strips {
-            let Some(action_frame) = strip_action_frame(strip, frame)? else {
-                continue;
-            };
-            let action = doc.actions.get(&strip.action).ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "NLA strip action reference does not exist",
-                    json!({ "action": strip.action, "strip": strip.id }),
-                )
-            })?;
-            let (sampled, channels) = sample_action_transform(
-                node,
-                doc,
-                &transform,
-                action,
-                &strip.action,
-                action_frame,
-                rotation_mode_is_from_blender,
-            )?;
-            blend_transform(
-                &mut transform,
-                &sampled,
-                channels,
-                strip.blend_type,
-                strip_influence(strip, frame)?,
-            )?;
+        let Some((strip_index, strip_frame)) = active_strip_for_track(track, frame) else {
+            continue;
+        };
+        let strip = &track.strips[strip_index];
+        if strip.mute {
+            continue;
         }
-    }
-    if let Some(action_id) = &node.action {
-        let action = doc.actions.get(action_id).ok_or_else(|| {
+        let (blend_in, blend_out) = auto_blend_lengths(node, track_index, strip_index);
+        let influence = strip_influence(strip, strip_frame, blend_in, blend_out)?;
+        if influence <= 0.0 {
+            continue;
+        }
+        let Some(action_frame) = strip_action_frame(strip, strip_frame)? else {
+            continue;
+        };
+        let action = doc.actions.get(&strip.action).ok_or_else(|| {
             PotError::with_details(
                 ErrorCode::SceneInvalid,
-                "node action reference does not exist",
-                json!({ "action": action_id }),
+                "NLA strip action reference does not exist",
+                json!({ "action": strip.action, "strip": strip.id }),
             )
         })?;
         let (sampled, channels) = sample_action_transform(
             node,
             doc,
             &transform,
+            rotation_state.as_ref(),
+            initial_kind,
             action,
-            action_id,
-            frame,
+            &strip.action,
+            action_frame,
             rotation_mode_is_from_blender,
+            true,
         )?;
         blend_transform(
             &mut transform,
+            &mut rotation_state,
+            initial_kind,
+            rotation_mode,
             &sampled,
             channels,
-            NlaBlendType::Replace,
-            1.0,
+            strip.blend_type,
+            influence,
         )?;
     }
+    if let Some(action_id) = &node.action {
+        let action = doc.actions.get(action_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "node action reference does not exist",
+                json!({"action":action_id}),
+            )
+        })?;
+        let (action_frame, blend, influence) =
+            active_action_controls(node, action, frame, nla_mode, has_solo)?;
+        if let Some(action_frame) = action_frame {
+            let (sampled, channels) = sample_action_transform(
+                node,
+                doc,
+                &transform,
+                rotation_state.as_ref(),
+                initial_kind,
+                action,
+                action_id,
+                action_frame,
+                rotation_mode_is_from_blender,
+                nla_mode,
+            )?;
+            blend_transform(
+                &mut transform,
+                &mut rotation_state,
+                initial_kind,
+                rotation_mode,
+                &sampled,
+                channels,
+                blend,
+                influence,
+            )?;
+        }
+    }
+    if let Some(rotation_state) = rotation_state {
+        transform.rotation = rotation_accumulator_to_quaternion(rotation_state, rotation_mode)?;
+    }
     Ok(transform)
+}
+
+fn transform_nla_domain(
+    node: &Node,
+    doc: &SceneDoc,
+    nla_mode: bool,
+    has_solo: bool,
+    rotation_mode_is_from_blender: bool,
+) -> Result<TransformChannels> {
+    let mut channels = TransformChannels::default();
+    if nla_mode && let Some(action_id) = &node.action {
+        let action = doc.actions.get(action_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "node action reference does not exist",
+                json!({"action":action_id}),
+            )
+        })?;
+        add_transform_action_domain(
+            action,
+            &mut channels,
+            &node.transform,
+            rotation_mode_is_from_blender,
+        )?;
+    }
+    for track in &node.nla_tracks {
+        if track.mute || (has_solo && !track.solo) {
+            continue;
+        }
+        for strip in &track.strips {
+            let action = doc.actions.get(&strip.action).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "NLA strip action reference does not exist",
+                    json!({"action":strip.action,"strip":strip.id}),
+                )
+            })?;
+            add_transform_action_domain(
+                action,
+                &mut channels,
+                &node.transform,
+                rotation_mode_is_from_blender,
+            )?;
+        }
+    }
+    Ok(channels)
+}
+
+fn add_transform_action_domain(
+    action: &Action,
+    channels: &mut TransformChannels,
+    transform: &Transform,
+    rotation_mode_is_from_blender: bool,
+) -> Result<()> {
+    let rotation_mode =
+        PoseRotationMode::from_blender(&transform.rotation_mode).unwrap_or_default();
+    let euler_channels_enabled =
+        rotation_mode.euler_order().is_some() || !rotation_mode_is_from_blender;
+    for (curve_index, curve) in action.fcurves.iter().enumerate() {
+        if u32::try_from(curve_index)
+            .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
+        {
+            continue;
+        }
+        match curve.path.as_str() {
+            "transform.translation" => {
+                channels.translation[component_index(curve, 3)?] = true;
+            }
+            "transform.scale" => {
+                channels.scale[component_index(curve, 3)?] = true;
+            }
+            "transform.rotation" | "transform.rotation_quaternion"
+                if !rotation_mode_is_from_blender
+                    || rotation_mode == PoseRotationMode::Quaternion =>
+            {
+                component_index(curve, 4)?;
+                channels.rotation = true;
+                channels.rotation_components = [true; 4];
+                channels.rotation_kind = RotationChannelKind::Quaternion;
+            }
+            "transform.rotation_euler" if euler_channels_enabled => {
+                let component = component_index(curve, 3)?;
+                channels.rotation = true;
+                channels.rotation_components[component] = true;
+                channels.rotation_kind = RotationChannelKind::Euler;
+            }
+            "transform.rotation_axis_angle"
+                if !rotation_mode_is_from_blender
+                    || rotation_mode == PoseRotationMode::AxisAngle =>
+            {
+                let component = component_index(curve, 4)?;
+                channels.rotation = true;
+                channels.rotation_components[component] = true;
+                channels.rotation_kind = RotationChannelKind::AxisAngle;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn custom_property_component<'a>(node: &'a Node, path: &str, index: u32) -> Option<&'a Value> {
@@ -164,17 +336,23 @@ pub(crate) fn animated_scalar_channel(
         .nla_tracks
         .iter()
         .any(|track| track.solo && !track.mute);
-    let mut value = base_value;
-    let mut animated = false;
-    for track in node
-        .nla_tracks
-        .iter()
-        .filter(|track| !track.mute && (!has_solo || track.solo))
-    {
+    let nla_mode = node_uses_nla(node, has_solo);
+    let mut in_nla_domain = false;
+    if nla_mode && let Some(action_id) = &node.action {
+        let action = doc.actions.get(action_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "node action reference does not exist",
+                json!({"action":action_id}),
+            )
+        })?;
+        in_nla_domain = action_has_scalar_curve(action, path, index);
+    }
+    for track in &node.nla_tracks {
+        if track.mute || (has_solo && !track.solo) {
+            continue;
+        }
         for strip in &track.strips {
-            let Some(action_frame) = strip_action_frame(strip, frame)? else {
-                continue;
-            };
             let action = doc.actions.get(&strip.action).ok_or_else(|| {
                 PotError::with_details(
                     ErrorCode::SceneInvalid,
@@ -182,23 +360,45 @@ pub(crate) fn animated_scalar_channel(
                     json!({"action":strip.action,"strip":strip.id}),
                 )
             })?;
-            if let Some(sampled) =
-                sample_scalar_action(action, path, index, action_frame, discrete)?
-            {
-                let sampled = if integer_values {
-                    round_discrete_fcurve_value(sampled)
-                } else {
-                    sampled
-                };
-                value = blend_scalar(
-                    value,
-                    sampled,
-                    base_value,
-                    strip.blend_type,
-                    strip_influence(strip, frame)?,
-                );
-                animated = true;
-            }
+            in_nla_domain |= action_has_scalar_curve(action, path, index);
+        }
+    }
+    let mut value = base_value;
+    let mut animated = in_nla_domain;
+    for (track_index, track) in node.nla_tracks.iter().enumerate() {
+        if track.mute || (has_solo && !track.solo) {
+            continue;
+        }
+        let Some((strip_index, strip_frame)) = active_strip_for_track(track, frame) else {
+            continue;
+        };
+        let strip = &track.strips[strip_index];
+        if strip.mute {
+            continue;
+        }
+        let (blend_in, blend_out) = auto_blend_lengths(node, track_index, strip_index);
+        let influence = strip_influence(strip, strip_frame, blend_in, blend_out)?;
+        if influence <= 0.0 {
+            continue;
+        }
+        let Some(action_frame) = strip_action_frame(strip, strip_frame)? else {
+            continue;
+        };
+        let action = doc.actions.get(&strip.action).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "NLA strip action reference does not exist",
+                json!({"action":strip.action,"strip":strip.id}),
+            )
+        })?;
+        if let Some(sampled) = sample_scalar_action(action, path, index, action_frame, discrete)? {
+            let sampled = if integer_values {
+                round_discrete_fcurve_value(sampled)
+            } else {
+                sampled
+            };
+            value = blend_scalar(value, sampled, base_value, strip.blend_type, influence);
+            animated = true;
         }
     }
     if let Some(action_id) = &node.action {
@@ -209,13 +409,18 @@ pub(crate) fn animated_scalar_channel(
                 json!({"action":action_id}),
             )
         })?;
-        if let Some(sampled) = sample_scalar_action(action, path, index, frame, discrete)? {
+        let (action_frame, blend, influence) =
+            active_action_controls(node, action, frame, nla_mode, has_solo)?;
+        if let Some(action_frame) = action_frame
+            && let Some(sampled) =
+                sample_scalar_action(action, path, index, action_frame, discrete)?
+        {
             let sampled = if integer_values {
                 round_discrete_fcurve_value(sampled)
             } else {
                 sampled
             };
-            value = sampled;
+            value = blend_scalar(value, sampled, base_value, blend, influence);
             animated = true;
         }
     }
@@ -257,14 +462,42 @@ fn sample_scalar_action(
     Ok(sampled)
 }
 
+fn action_has_scalar_curve(action: &Action, path: &str, index: u32) -> bool {
+    action
+        .fcurves
+        .iter()
+        .enumerate()
+        .any(|(curve_index, curve)| {
+            !u32::try_from(curve_index)
+                .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
+                && curve.path == path
+                && curve.index == index
+        })
+}
+
+fn rotation_state_or_initial(
+    rotation_state: Option<&RotationAccumulator>,
+    base_rotation: [f64; 4],
+    initial_kind: RotationChannelKind,
+    rotation_mode: PoseRotationMode,
+) -> Result<RotationAccumulator> {
+    match rotation_state {
+        Some(rotation_state) => Ok(*rotation_state),
+        None => rotation_accumulator_from_quaternion(base_rotation, initial_kind, rotation_mode),
+    }
+}
+
 fn sample_action_transform(
     node: &Node,
     doc: &SceneDoc,
     base: &Transform,
+    rotation_state: Option<&RotationAccumulator>,
+    initial_kind: RotationChannelKind,
     action: &crate::model::Action,
     action_id: &Id,
     frame: f64,
     rotation_mode_is_from_blender: bool,
+    nla_context: bool,
 ) -> Result<(Transform, TransformChannels)> {
     let mut transform = base.clone();
     let mut channels = TransformChannels::default();
@@ -274,7 +507,7 @@ fn sample_action_transform(
         rotation_mode.euler_order().is_some() || !rotation_mode_is_from_blender;
     let mut euler = None;
     let mut axis_angle = None;
-    let mut quaternion = transform.rotation;
+    let mut quaternion = None;
     let mut quaternion_modified = false;
     for (curve_index, curve) in action.fcurves.iter().enumerate() {
         if u32::try_from(curve_index)
@@ -299,8 +532,29 @@ fn sample_action_transform(
             "transform.rotation_quaternion" | "transform.rotation" => {
                 let component = component_index(curve, 4)?;
                 if !rotation_mode_is_from_blender || rotation_mode == PoseRotationMode::Quaternion {
+                    if quaternion.is_none() {
+                        let sampled = if nla_context {
+                            [0.0, 0.0, 0.0, 1.0]
+                        } else {
+                            let state = rotation_state_or_initial(
+                                rotation_state,
+                                base.rotation,
+                                initial_kind,
+                                rotation_mode,
+                            )?;
+                            rotation_accumulator_to_quaternion(state, rotation_mode)?
+                        };
+                        quaternion = Some(sampled);
+                    }
+                    let values = quaternion.as_mut().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "quaternion channel initialization failed",
+                        )
+                    })?;
                     // Potter component order (x, y, z, w); importers map Blender's indices to it.
-                    quaternion[component] = value;
+                    values[component] = value;
+                    channels.rotation_components[component] = true;
                     quaternion_modified = true;
                 }
             }
@@ -308,21 +562,13 @@ fn sample_action_transform(
                 let component = component_index(curve, 3)?;
                 if euler_channels_enabled {
                     if euler.is_none() {
-                        let normalized =
-                            normalize_rotation(transform.rotation).map_err(|error| {
-                                PotError::with_details(
-                                    ErrorCode::SceneInvalid,
-                                    error.message,
-                                    json!({ "action": action_id }),
-                                )
-                            })?;
-                        let rotation = DQuat::from_xyzw(
-                            normalized[0],
-                            normalized[1],
-                            normalized[2],
-                            normalized[3],
-                        );
-                        euler = Some(euler_angles_from_quaternion(rotation, rotation_mode));
+                        let state = rotation_state_or_initial(
+                            rotation_state,
+                            base.rotation,
+                            initial_kind,
+                            rotation_mode,
+                        )?;
+                        euler = Some(rotation_accumulator_to_euler(state, rotation_mode)?);
                     }
                     let angles = euler.as_mut().ok_or_else(|| {
                         PotError::new(
@@ -331,13 +577,21 @@ fn sample_action_transform(
                         )
                     })?;
                     angles[component] = value;
+                    channels.rotation_components[component] = true;
                 }
             }
             "transform.rotation_axis_angle" => {
                 let component = component_index(curve, 4)?;
                 if !rotation_mode_is_from_blender || rotation_mode == PoseRotationMode::AxisAngle {
                     if axis_angle.is_none() {
-                        axis_angle = Some(axis_angle_from_rotation(transform.rotation)?);
+                        let state = rotation_state_or_initial(
+                            rotation_state,
+                            base.rotation,
+                            initial_kind,
+                            rotation_mode,
+                        )?;
+                        axis_angle =
+                            Some(rotation_accumulator_to_axis_angle(state, rotation_mode)?);
                     }
                     axis_angle.as_mut().ok_or_else(|| {
                         PotError::new(
@@ -345,6 +599,7 @@ fn sample_action_transform(
                             "axis-angle channel initialization failed",
                         )
                     })?[component] = value;
+                    channels.rotation_components[component] = true;
                 }
             }
             path => {
@@ -384,18 +639,31 @@ fn sample_action_transform(
         }
     }
     if let Some([angle_x, angle_y, angle_z]) = euler {
-        let rotation = quaternion_from_euler_angles([angle_x, angle_y, angle_z], rotation_mode);
+        let angles = [angle_x, angle_y, angle_z];
+        let rotation = quaternion_from_euler_angles(angles, rotation_mode);
         transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
         channels.rotation = true;
+        channels.rotation_kind = RotationChannelKind::Euler;
+        channels.rotation_values[..3].copy_from_slice(&angles);
     }
     if let Some(axis_angle) = axis_angle {
         let rotation = axis_angle_quaternion(axis_angle);
         transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
         channels.rotation = true;
+        channels.rotation_kind = RotationChannelKind::AxisAngle;
+        channels.rotation_values = axis_angle;
     }
     if quaternion_modified {
+        let quaternion = quaternion.ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "quaternion channel initialization failed",
+            )
+        })?;
         transform.rotation = quaternion;
         channels.rotation = true;
+        channels.rotation_kind = RotationChannelKind::Quaternion;
+        channels.rotation_values = quaternion;
     }
     if channels.rotation {
         transform.rotation = normalize_rotation(transform.rotation).map_err(|error| {
@@ -860,12 +1128,26 @@ pub(crate) fn animated_modifier_scalar(
         .nla_tracks
         .iter()
         .any(|track| track.solo && !track.mute);
+    let nla_mode = node_uses_nla(node, has_solo);
     let mut in_nla_domain = false;
-    for track in node
-        .nla_tracks
-        .iter()
-        .filter(|track| !track.mute && (!has_solo || track.solo))
-    {
+    if nla_mode && let Some(action_id) = &node.action {
+        let action = doc.actions.get(action_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "node action reference does not exist",
+                json!({"action":action_id}),
+            )
+        })?;
+        in_nla_domain = action.modifier_bindings.values().flatten().any(|binding| {
+            &binding.node == node_id
+                && &binding.modifier == modifier_id
+                && binding.parameter == parameter
+        });
+    }
+    for track in &node.nla_tracks {
+        if track.mute || (has_solo && !track.solo) {
+            continue;
+        }
         for strip in &track.strips {
             let action = doc.actions.get(&strip.action).ok_or_else(|| {
                 PotError::with_details(
@@ -902,52 +1184,61 @@ pub(crate) fn animated_modifier_scalar(
     };
     let mut value = nla_default;
     let mut animated = in_nla_domain;
-    for track in &node.nla_tracks {
+    for (track_index, track) in node.nla_tracks.iter().enumerate() {
         if track.mute || (has_solo && !track.solo) {
             continue;
         }
-        for strip in &track.strips {
-            let Some(action_frame) = strip_action_frame(strip, frame)? else {
-                continue;
-            };
-            let action = doc.actions.get(&strip.action).ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "NLA strip action reference does not exist",
-                    json!({"action":strip.action,"strip":strip.id}),
-                )
-            })?;
-            let assigned_slot = strip.action_slot.as_ref().or_else(|| {
-                if action.slots.len() == 1 {
-                    action.slots.first().map(|slot| &slot.id)
-                } else {
-                    None
-                }
-            });
-            let Some(sampled) = sample_modifier_scalar_action(
-                node_id,
-                doc,
-                &strip.action,
-                action,
-                modifier_id,
-                parameter,
-                assigned_slot,
-                action_frame,
-            )?
-            else {
-                continue;
-            };
-            let influence = strip_influence(strip, frame)?;
-            value = blend_scalar(value, sampled, nla_default, strip.blend_type, influence);
-            if !value.is_finite() {
-                return Err(PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "modifier animation evaluated to a non-finite scalar",
-                    json!({"action":strip.action,"modifier":modifier_id,"parameter":parameter,"frame":frame}),
-                ));
-            }
-            animated = true;
+        let Some((strip_index, strip_frame)) = active_strip_for_track(track, frame) else {
+            continue;
+        };
+        let strip = &track.strips[strip_index];
+        if strip.mute {
+            continue;
         }
+        let (blend_in, blend_out) = auto_blend_lengths(node, track_index, strip_index);
+        let influence = strip_influence(strip, strip_frame, blend_in, blend_out)?;
+        if influence <= 0.0 {
+            continue;
+        }
+        let Some(action_frame) = strip_action_frame(strip, strip_frame)? else {
+            continue;
+        };
+        let action = doc.actions.get(&strip.action).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "NLA strip action reference does not exist",
+                json!({"action":strip.action,"strip":strip.id}),
+            )
+        })?;
+        let assigned_slot = strip.action_slot.as_ref().or_else(|| {
+            if action.slots.len() == 1 {
+                action.slots.first().map(|slot| &slot.id)
+            } else {
+                None
+            }
+        });
+        let Some(sampled) = sample_modifier_scalar_action(
+            node_id,
+            doc,
+            &strip.action,
+            action,
+            modifier_id,
+            parameter,
+            assigned_slot,
+            action_frame,
+        )?
+        else {
+            continue;
+        };
+        value = blend_scalar(value, sampled, nla_default, strip.blend_type, influence);
+        if !value.is_finite() {
+            return Err(PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "modifier animation evaluated to a non-finite scalar",
+                json!({"action":strip.action,"modifier":modifier_id,"parameter":parameter,"frame":frame}),
+            ));
+        }
+        animated = true;
     }
     if let Some(action_id) = &node.action {
         let action = doc.actions.get(action_id).ok_or_else(|| {
@@ -964,17 +1255,21 @@ pub(crate) fn animated_modifier_scalar(
                 None
             }
         });
-        if let Some(sampled) = sample_modifier_scalar_action(
-            node_id,
-            doc,
-            action_id,
-            action,
-            modifier_id,
-            parameter,
-            assigned_slot,
-            frame,
-        )? {
-            value = sampled;
+        let (action_frame, blend, influence) =
+            active_action_controls(node, action, frame, nla_mode, has_solo)?;
+        if let Some(action_frame) = action_frame
+            && let Some(sampled) = sample_modifier_scalar_action(
+                node_id,
+                doc,
+                action_id,
+                action,
+                modifier_id,
+                parameter,
+                assigned_slot,
+                action_frame,
+            )?
+        {
+            value = blend_scalar(value, sampled, nla_default, blend, influence);
             animated = true;
         }
     }
@@ -1130,10 +1425,255 @@ fn validate_modifier_parameter_binding(
 }
 
 #[derive(Clone, Copy, Default)]
+enum RotationChannelKind {
+    #[default]
+    Quaternion,
+    Euler,
+    AxisAngle,
+}
+
+#[derive(Clone, Copy, Default)]
 struct TransformChannels {
     translation: [bool; 3],
     scale: [bool; 3],
     rotation: bool,
+    rotation_components: [bool; 4],
+    rotation_kind: RotationChannelKind,
+    rotation_values: [f64; 4],
+}
+
+#[derive(Clone, Copy)]
+enum RotationAccumulator {
+    Quaternion([f64; 4]),
+    Euler([f64; 3]),
+    AxisAngle([f64; 4]),
+}
+
+fn normalize_quaternion_raw(rotation: [f64; 4]) -> Result<[f64; 4]> {
+    if rotation.iter().any(|value| !value.is_finite()) {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "rotation quaternion must be finite",
+        ));
+    }
+    let largest = rotation
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    if largest == 0.0 {
+        return Err(PotError::new(
+            ErrorCode::SceneInvalid,
+            "rotation quaternion must be non-zero",
+        ));
+    }
+    let scaled = rotation.map(|value| value / largest);
+    let length = scaled.iter().map(|value| value * value).sum::<f64>().sqrt();
+    Ok(scaled.map(|value| value / length))
+}
+
+fn rotation_accumulator_from_quaternion(
+    rotation: [f64; 4],
+    kind: RotationChannelKind,
+    rotation_mode: PoseRotationMode,
+) -> Result<RotationAccumulator> {
+    let rotation = normalize_quaternion_raw(rotation)?;
+    Ok(match kind {
+        RotationChannelKind::Quaternion => RotationAccumulator::Quaternion(rotation),
+        RotationChannelKind::Euler => RotationAccumulator::Euler(euler_angles_from_quaternion(
+            DQuat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]),
+            rotation_mode,
+        )),
+        RotationChannelKind::AxisAngle => {
+            RotationAccumulator::AxisAngle(axis_angle_from_rotation(rotation)?)
+        }
+    })
+}
+
+fn rotation_accumulator_to_quaternion(
+    accumulator: RotationAccumulator,
+    rotation_mode: PoseRotationMode,
+) -> Result<[f64; 4]> {
+    let rotation = match accumulator {
+        RotationAccumulator::Quaternion(rotation) => rotation,
+        RotationAccumulator::Euler(angles) => {
+            let rotation = quaternion_from_euler_angles(angles, rotation_mode);
+            [rotation.x, rotation.y, rotation.z, rotation.w]
+        }
+        RotationAccumulator::AxisAngle(axis_angle) => {
+            let rotation = axis_angle_quaternion(axis_angle);
+            [rotation.x, rotation.y, rotation.z, rotation.w]
+        }
+    };
+    normalize_quaternion_raw(rotation)
+}
+
+fn rotation_accumulator_to_euler(
+    accumulator: RotationAccumulator,
+    rotation_mode: PoseRotationMode,
+) -> Result<[f64; 3]> {
+    if let RotationAccumulator::Euler(angles) = accumulator {
+        return Ok(angles);
+    }
+    let rotation = rotation_accumulator_to_quaternion(accumulator, rotation_mode)?;
+    Ok(euler_angles_from_quaternion(
+        DQuat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]),
+        rotation_mode,
+    ))
+}
+
+fn rotation_accumulator_to_axis_angle(
+    accumulator: RotationAccumulator,
+    rotation_mode: PoseRotationMode,
+) -> Result<[f64; 4]> {
+    if let RotationAccumulator::AxisAngle(axis_angle) = accumulator {
+        return Ok(axis_angle);
+    }
+    axis_angle_from_rotation(rotation_accumulator_to_quaternion(
+        accumulator,
+        rotation_mode,
+    )?)
+}
+
+fn ensure_rotation_accumulator_kind(
+    accumulator: &mut RotationAccumulator,
+    kind: RotationChannelKind,
+    rotation_mode: PoseRotationMode,
+) -> Result<()> {
+    let matches = matches!(
+        (&*accumulator, kind),
+        (
+            RotationAccumulator::Quaternion(_),
+            RotationChannelKind::Quaternion
+        ) | (RotationAccumulator::Euler(_), RotationChannelKind::Euler)
+            | (
+                RotationAccumulator::AxisAngle(_),
+                RotationChannelKind::AxisAngle
+            )
+    );
+    if !matches {
+        let quaternion = rotation_accumulator_to_quaternion(*accumulator, rotation_mode)?;
+        *accumulator = rotation_accumulator_from_quaternion(quaternion, kind, rotation_mode)?;
+    }
+    Ok(())
+}
+
+fn reset_rotation_accumulator(
+    accumulator: &mut RotationAccumulator,
+    kind: RotationChannelKind,
+    components: [bool; 4],
+    rotation_mode: PoseRotationMode,
+) -> Result<()> {
+    ensure_rotation_accumulator_kind(accumulator, kind, rotation_mode)?;
+    match accumulator {
+        RotationAccumulator::Quaternion(rotation) => {
+            for (component, animated) in components.iter().enumerate() {
+                if *animated {
+                    rotation[component] = if component == 3 { 1.0 } else { 0.0 };
+                }
+            }
+        }
+        RotationAccumulator::Euler(angles) => {
+            for (component, animated) in components[..3].iter().enumerate() {
+                if *animated {
+                    angles[component] = 0.0;
+                }
+            }
+        }
+        RotationAccumulator::AxisAngle(axis_angle) => {
+            for (component, animated) in components.iter().enumerate() {
+                if *animated {
+                    axis_angle[component] = 0.0;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn raw_quaternion_power(rotation: [f64; 4], influence: f64) -> Result<[f64; 4]> {
+    let rotation = normalize_quaternion_raw(rotation)?;
+    let half_angle = influence * rotation[3].clamp(-1.0, 1.0).acos();
+    let sine = half_angle.sin();
+    let vector_length =
+        (rotation[0] * rotation[0] + rotation[1] * rotation[1] + rotation[2] * rotation[2]).sqrt();
+    let vector = if vector_length > f64::EPSILON {
+        [
+            rotation[0] / vector_length * sine,
+            rotation[1] / vector_length * sine,
+            rotation[2] / vector_length * sine,
+        ]
+    } else {
+        [0.0; 3]
+    };
+    Ok([vector[0], vector[1], vector[2], half_angle.cos()])
+}
+
+fn blend_rotation_accumulator(
+    accumulator: &mut RotationAccumulator,
+    kind: RotationChannelKind,
+    target_values: [f64; 4],
+    components: [bool; 4],
+    rotation_mode: PoseRotationMode,
+    blend: NlaBlendType,
+    influence: f64,
+) -> Result<()> {
+    ensure_rotation_accumulator_kind(accumulator, kind, rotation_mode)?;
+    match accumulator {
+        RotationAccumulator::Quaternion(lower) => {
+            if blend == NlaBlendType::Combine {
+                let lower_rotation = normalize_quaternion_raw(*lower)?;
+                let power = raw_quaternion_power(target_values, influence)?;
+                let lower_quaternion = DQuat::from_xyzw(
+                    lower_rotation[0],
+                    lower_rotation[1],
+                    lower_rotation[2],
+                    lower_rotation[3],
+                );
+                let power_quaternion = DQuat::from_xyzw(power[0], power[1], power[2], power[3]);
+                let result = lower_quaternion * power_quaternion;
+                *lower = normalize_quaternion_raw([result.x, result.y, result.z, result.w])?;
+            } else {
+                for component in 0..4 {
+                    if components[component] {
+                        lower[component] = blend_scalar(
+                            lower[component],
+                            target_values[component],
+                            if component == 3 { 1.0 } else { 0.0 },
+                            blend,
+                            influence,
+                        );
+                    }
+                }
+            }
+        }
+        RotationAccumulator::Euler(lower) => {
+            for component in 0..3 {
+                if components[component] {
+                    lower[component] = blend_scalar(
+                        lower[component],
+                        target_values[component],
+                        0.0,
+                        blend,
+                        influence,
+                    );
+                }
+            }
+        }
+        RotationAccumulator::AxisAngle(lower) => {
+            for component in 0..4 {
+                if components[component] {
+                    lower[component] = blend_scalar(
+                        lower[component],
+                        target_values[component],
+                        0.0,
+                        blend,
+                        influence,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn euler_angles_from_quaternion(
@@ -1187,6 +1727,26 @@ fn axis_angle_quaternion(axis_angle: [f64; 4]) -> DQuat {
     }
 }
 
+fn active_strip_for_track(track: &NlaTrack, frame: f64) -> Option<(usize, f64)> {
+    for (index, strip) in track.strips.iter().enumerate() {
+        if frame < strip.frame_start {
+            if index == 0 {
+                return (strip.extrapolation == NlaExtrapolation::Hold)
+                    .then_some((index, strip.frame_start));
+            }
+            let previous = &track.strips[index - 1];
+            return (previous.extrapolation != NlaExtrapolation::Nothing)
+                .then_some((index - 1, previous.frame_end));
+        }
+        if frame <= strip.frame_end {
+            return Some((index, frame));
+        }
+    }
+    let index = track.strips.len().checked_sub(1)?;
+    let strip = &track.strips[index];
+    (strip.extrapolation != NlaExtrapolation::Nothing).then_some((index, strip.frame_end))
+}
+
 fn strip_action_frame(strip: &NlaStrip, frame: f64) -> Result<Option<f64>> {
     let values = [
         strip.frame_start,
@@ -1198,19 +1758,16 @@ fn strip_action_frame(strip: &NlaStrip, frame: f64) -> Result<Option<f64>> {
         strip.influence,
         strip.blend_in,
         strip.blend_out,
+        strip.strip_time,
     ];
     let timeline_span = strip.frame_end - strip.frame_start;
     let action_span = strip.action_frame_end - strip.action_frame_start;
     if values.iter().any(|value| !value.is_finite())
         || timeline_span <= 0.0
         || action_span <= 0.0
-        || strip.scale <= 0.0
-        || strip.repeat <= 0.0
+        || strip.scale < 0.0
+        || strip.repeat < 0.0
         || !(0.0..=1.0).contains(&strip.influence)
-        || strip.blend_in < 0.0
-        || strip.blend_out < 0.0
-        || strip.blend_in > timeline_span
-        || strip.blend_out > timeline_span
     {
         return Err(PotError::with_details(
             ErrorCode::SceneInvalid,
@@ -1218,57 +1775,174 @@ fn strip_action_frame(strip: &NlaStrip, frame: f64) -> Result<Option<f64>> {
             json!({ "strip": strip.id }),
         ));
     }
-    if frame < strip.frame_start {
-        return Ok(match strip.extrapolation {
-            NlaExtrapolation::Hold => Some(strip.action_frame_start),
-            NlaExtrapolation::HoldForward | NlaExtrapolation::Nothing => None,
-        });
-    }
-    if frame > strip.frame_end {
-        return Ok(match strip.extrapolation {
-            NlaExtrapolation::Hold | NlaExtrapolation::HoldForward => Some(strip.action_frame_end),
-            NlaExtrapolation::Nothing => None,
-        });
-    }
-    let elapsed = (frame - strip.frame_start) / strip.scale;
-    let repeated_span = action_span * strip.repeat;
-    if !elapsed.is_finite() || !repeated_span.is_finite() {
-        return Err(PotError::with_details(
-            ErrorCode::SceneInvalid,
-            "NLA strip frame mapping overflows",
-            json!({ "strip": strip.id }),
-        ));
-    }
-    let offset = if elapsed >= repeated_span {
-        repeated_span
+    let frame = if frame < strip.frame_start {
+        match strip.extrapolation {
+            NlaExtrapolation::Hold => strip.frame_start,
+            NlaExtrapolation::HoldForward | NlaExtrapolation::Nothing => return Ok(None),
+        }
+    } else if frame > strip.frame_end {
+        match strip.extrapolation {
+            NlaExtrapolation::Hold | NlaExtrapolation::HoldForward => strip.frame_end,
+            NlaExtrapolation::Nothing => return Ok(None),
+        }
     } else {
-        elapsed.rem_euclid(action_span)
+        frame
     };
-    let action_frame = strip.action_frame_start + offset;
-    if !action_frame.is_finite() {
-        return Err(PotError::with_details(
+    let action_frame = if strip.use_animated_time {
+        let sampled_time = strip
+            .strip_time_curve
+            .as_ref()
+            .map(|curve| sample_curve(curve, frame))
+            .transpose()?
+            .flatten()
+            .unwrap_or(strip.strip_time);
+        if strip.use_animated_time_cyclic {
+            (sampled_time - strip.action_frame_start) % action_span
+        } else {
+            sampled_time
+        }
+    } else {
+        let scale = if strip.scale == 0.0 {
+            1.0
+        } else {
+            strip.scale.abs()
+        };
+        let repeat = if strip.repeat == 0.0 {
+            1.0
+        } else {
+            strip.repeat
+        };
+        let elapsed = frame - strip.frame_start;
+        let at_end =
+            same_nla_frame(frame, strip.frame_end) && (repeat as f32).fract().abs() < f32::EPSILON;
+        if at_end {
+            if strip.reverse {
+                strip.action_frame_start
+            } else {
+                strip.action_frame_end
+            }
+        } else {
+            let offset = elapsed.rem_euclid(action_span * scale) / scale;
+            if strip.reverse {
+                strip.action_frame_end - offset
+            } else {
+                strip.action_frame_start + offset
+            }
+        }
+    };
+    if action_frame.is_finite() {
+        Ok(Some(action_frame))
+    } else {
+        Err(PotError::with_details(
             ErrorCode::SceneInvalid,
             "NLA strip maps to a non-finite action frame",
             json!({ "strip": strip.id }),
-        ));
+        ))
     }
-    Ok(Some(action_frame))
 }
 
-fn strip_influence(strip: &NlaStrip, frame: f64) -> Result<f64> {
-    if strip.use_animated_influence && strip.influence.is_finite() {
-        return Ok(strip.influence);
+fn same_nla_frame(left: f64, right: f64) -> bool {
+    ((left as f32) - (right as f32)).abs() < f32::EPSILON
+}
+fn endpoint_overlaps(target: &NlaStrip, strips: &[NlaStrip]) -> (Option<f64>, Option<f64>) {
+    let mut start = None;
+    let mut end = None;
+    for (index, strip) in strips.iter().enumerate() {
+        if strip.frame_start <= target.frame_start && strip.frame_end >= target.frame_end {
+            return (None, None);
+        }
+        if strip.frame_end < target.frame_start {
+            continue;
+        }
+        if strip.frame_start > target.frame_end {
+            break;
+        }
+        let next_is_gap = strips
+            .get(index + 1)
+            .is_none_or(|next| !same_nla_frame(next.frame_start, strip.frame_end));
+        if next_is_gap && strip.frame_end > target.frame_start && strip.frame_end < target.frame_end
+        {
+            start = Some(strip.frame_end);
+        }
+        let previous_is_gap =
+            index == 0 || !same_nla_frame(strips[index - 1].frame_end, strip.frame_start);
+        if previous_is_gap
+            && strip.frame_start < target.frame_end
+            && strip.frame_start > target.frame_start
+        {
+            end = Some(strip.frame_start);
+        }
     }
-    let mut fade: f64 = 1.0;
-    if strip.blend_in > 0.0 && frame < strip.frame_start + strip.blend_in {
-        fade = fade.min((frame - strip.frame_start) / strip.blend_in);
+    (start, end)
+}
+
+fn auto_blend_lengths(node: &Node, track_index: usize, strip_index: usize) -> (f64, f64) {
+    let track = &node.nla_tracks[track_index];
+    let strip = &track.strips[strip_index];
+    if !strip.use_auto_blend || node.nla_tracks.len() == 1 {
+        return (strip.blend_in, strip.blend_out);
     }
-    if strip.blend_out > 0.0 && frame > strip.frame_end - strip.blend_out {
-        fade = fade.min((strip.frame_end - frame) / strip.blend_out);
-    }
-    let influence = strip.influence * fade.clamp(0.0, 1.0);
+    let previous_track = track_index
+        .checked_sub(1)
+        .and_then(|index| node.nla_tracks.get(index));
+    let next_track = node.nla_tracks.get(track_index + 1);
+    let (previous_start, previous_end) = previous_track.map_or((None, None), |other| {
+        endpoint_overlaps(strip, &other.strips)
+    });
+    let (next_start, next_end) = next_track.map_or((None, None), |other| {
+        endpoint_overlaps(strip, &other.strips)
+    });
+    let previous_strip = strip_index
+        .checked_sub(1)
+        .and_then(|index| track.strips.get(index));
+    let next_strip = track.strips.get(strip_index + 1);
+    let blend_in = if (previous_start.is_some() || next_start.is_some())
+        && previous_strip
+            .is_none_or(|previous| !same_nla_frame(previous.frame_end, strip.frame_start))
+    {
+        previous_start
+            .or(next_start)
+            .map_or(0.0, |overlap| overlap - strip.frame_start)
+    } else {
+        0.0
+    };
+    let blend_out = if (previous_end.is_some() || next_end.is_some())
+        && next_strip.is_none_or(|next| !same_nla_frame(next.frame_start, strip.frame_end))
+    {
+        previous_end
+            .or(next_end)
+            .map_or(0.0, |overlap| strip.frame_end - overlap)
+    } else {
+        0.0
+    };
+    let strip_length = (strip.frame_end - strip.frame_start).max(0.0);
+    let blend_in = blend_in.clamp(0.0, (strip_length - blend_out).max(0.0));
+    let blend_out = blend_out.clamp(0.0, (strip_length - blend_in).max(0.0));
+    (blend_in, blend_out)
+}
+
+fn strip_influence(strip: &NlaStrip, frame: f64, blend_in: f64, blend_out: f64) -> Result<f64> {
+    let influence = if strip.use_animated_influence {
+        strip
+            .influence_curve
+            .as_ref()
+            .map(|curve| sample_curve(curve, frame))
+            .transpose()?
+            .flatten()
+            .unwrap_or(strip.influence)
+    } else {
+        let blend_in = blend_in.abs();
+        let blend_out = blend_out.abs();
+        if blend_in != 0.0 && frame <= strip.frame_start + blend_in {
+            (frame - strip.frame_start).abs() / blend_in
+        } else if blend_out != 0.0 && frame >= strip.frame_end - blend_out {
+            (strip.frame_end - frame).abs() / blend_out
+        } else {
+            1.0
+        }
+    };
     if influence.is_finite() {
-        Ok(influence)
+        Ok(influence.clamp(0.0, 1.0))
     } else {
         Err(PotError::with_details(
             ErrorCode::SceneInvalid,
@@ -1278,9 +1952,123 @@ fn strip_influence(strip: &NlaStrip, frame: f64) -> Result<f64> {
     }
 }
 
-/// Blender's `nla_blend_value` and `nla_combine_value` for one scalar channel (`NEC_MIX_ADD`).
-/// Replace and Add blend against the lower value. Combine adds the strip's offset from the channel's
-/// default, so an NLA stack over a channel at its default leaves the default untouched (`anim_sys.cc:1866`, `1890`).
+fn node_uses_nla(node: &Node, has_solo: bool) -> bool {
+    has_solo
+        || node
+            .nla_tracks
+            .iter()
+            .any(|track| !track.mute && !track.strips.is_empty())
+}
+fn action_key_range_with_modifiers(action: &Action) -> Result<(f64, f64)> {
+    const MIN_FRAME: f64 = -1_048_574.0;
+    const MAX_FRAME: f64 = 1_048_574.0;
+    let mut minimum = f64::INFINITY;
+    let mut maximum = f64::NEG_INFINITY;
+    let mut found_range = false;
+    for curve in &action.fcurves {
+        for key in &curve.keyframes {
+            if !key.frame.is_finite() {
+                return Err(PotError::new(
+                    ErrorCode::SceneInvalid,
+                    "active action keyframe frame must be finite",
+                ));
+            }
+            minimum = minimum.min(key.frame);
+            maximum = maximum.max(key.frame);
+            found_range = true;
+        }
+        if let Some(modifier) = curve.modifiers.last() {
+            let properties = &modifier.properties;
+            found_range = true;
+            match modifier.modifier_type.as_str() {
+                "LIMITS" => {
+                    if properties.get("use_min_x").and_then(Value::as_bool) == Some(true) {
+                        minimum = minimum.min(
+                            properties
+                                .get("min_x")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                        );
+                    }
+                    if properties.get("use_max_x").and_then(Value::as_bool) == Some(true) {
+                        maximum = maximum.max(
+                            properties
+                                .get("max_x")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                        );
+                    }
+                }
+                "CYCLES" => {
+                    if properties
+                        .get("before_mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("REPEAT")
+                        != "NONE"
+                    {
+                        minimum = minimum.min(MIN_FRAME);
+                    }
+                    if properties
+                        .get("after_mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("REPEAT")
+                        != "NONE"
+                    {
+                        maximum = maximum.max(MAX_FRAME);
+                    }
+                }
+                _ => {
+                    minimum = minimum.min(MIN_FRAME);
+                    maximum = maximum.max(MAX_FRAME);
+                }
+            }
+        }
+    }
+    if !found_range {
+        minimum = 0.0;
+        maximum = 0.0;
+    }
+    minimum = minimum.max(MIN_FRAME);
+    maximum = maximum.min(MAX_FRAME);
+    if maximum <= minimum {
+        maximum = minimum + 1.0;
+    }
+    Ok((minimum, maximum))
+}
+
+fn active_action_controls(
+    node: &Node,
+    action: &Action,
+    frame: f64,
+    nla_mode: bool,
+    has_solo: bool,
+) -> Result<(Option<f64>, NlaBlendType, f64)> {
+    if has_solo {
+        return Ok((None, node.action_blend_type, node.action_influence));
+    }
+    if !nla_mode {
+        return Ok((Some(frame), NlaBlendType::Replace, 1.0));
+    }
+    if !node.action_influence.is_finite() || !(0.0..=1.0).contains(&node.action_influence) {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "active action influence must be between zero and one",
+            json!({ "influence": node.action_influence }),
+        ));
+    }
+    if node.action_influence <= 0.0 {
+        return Ok((None, node.action_blend_type, node.action_influence));
+    }
+    let (start, end) = action_key_range_with_modifiers(action)?;
+    let mapped = match node.action_extrapolation {
+        NlaExtrapolation::Hold => Some(frame),
+        NlaExtrapolation::HoldForward => (frame >= start).then_some(frame),
+        NlaExtrapolation::Nothing => (frame >= start && frame <= end).then_some(frame),
+    };
+    Ok((mapped, node.action_blend_type, node.action_influence))
+}
+
+/// Blender's `nla_blend_value` and `nla_combine_value` for scalar channels.
 fn blend_scalar(
     current: f64,
     target: f64,
@@ -1291,12 +2079,17 @@ fn blend_scalar(
     match blend {
         NlaBlendType::Replace => current * (1.0 - influence) + target * influence,
         NlaBlendType::Add => current + target * influence,
+        NlaBlendType::Subtract => current - target * influence,
+        NlaBlendType::Multiply => current * (1.0 + (target - 1.0) * influence),
         NlaBlendType::Combine => current + (target - default) * influence,
     }
 }
 
 fn blend_transform(
     current: &mut Transform,
+    rotation_state: &mut Option<RotationAccumulator>,
+    initial_kind: RotationChannelKind,
+    rotation_mode: PoseRotationMode,
     sampled: &Transform,
     channels: TransformChannels,
     blend: NlaBlendType,
@@ -1307,7 +2100,6 @@ fn blend_transform(
             current.translation[component] = blend_scalar(
                 current.translation[component],
                 sampled.translation[component],
-                // Location's Blender default is 0, so COMBINE adds the strip's value unchanged.
                 0.0,
                 blend,
                 influence,
@@ -1315,32 +2107,37 @@ fn blend_transform(
         }
         if channels.scale[component] {
             let value = sampled.scale[component];
-            current.scale[component] = match blend {
-                NlaBlendType::Replace => {
-                    current.scale[component] * (1.0 - influence) + value * influence
-                }
-                NlaBlendType::Add => current.scale[component] + (value - 1.0) * influence,
-                NlaBlendType::Combine => {
-                    current.scale[component] * (1.0 + (value - 1.0) * influence)
-                }
+            current.scale[component] = if blend == NlaBlendType::Combine {
+                current.scale[component] * value.powf(influence)
+            } else {
+                blend_scalar(current.scale[component], value, 1.0, blend, influence)
             };
         }
     }
     if channels.rotation {
-        let base = normalize_rotation(current.rotation)
-            .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))?;
-        let target = normalize_rotation(sampled.rotation)
-            .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))?;
-        let base = DQuat::from_xyzw(base[0], base[1], base[2], base[3]);
-        let target = DQuat::from_xyzw(target[0], target[1], target[2], target[3]);
-        let result = if blend == NlaBlendType::Replace {
-            base.slerp(target, influence)
-        } else {
-            let delta = base.inverse() * target;
-            base * DQuat::IDENTITY.slerp(delta, influence)
-        };
-        current.rotation = normalize_rotation([result.x, result.y, result.z, result.w])
-            .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))?;
+        if rotation_state.is_none() {
+            *rotation_state = Some(rotation_accumulator_from_quaternion(
+                current.rotation,
+                initial_kind,
+                rotation_mode,
+            )?);
+        }
+        let state = rotation_state.as_mut().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "rotation channel has no accumulator",
+            )
+        })?;
+        blend_rotation_accumulator(
+            state,
+            channels.rotation_kind,
+            channels.rotation_values,
+            channels.rotation_components,
+            rotation_mode,
+            blend,
+            influence,
+        )?;
+        current.rotation = rotation_accumulator_to_quaternion(*state, rotation_mode)?;
     }
     Ok(())
 }
@@ -1363,31 +2160,80 @@ pub fn animated_pose_bones(
         .nla_tracks
         .iter()
         .any(|track| track.solo && !track.mute);
-    for track in &node.nla_tracks {
+    let nla_mode = node_uses_nla(node, has_solo);
+    let domain = pose_nla_domain(node, doc, nla_mode, has_solo)?;
+    let mut rotation_states = BTreeMap::new();
+    for (bone_id, mask) in domain {
+        let bone = pose.entry(bone_id.clone()).or_default();
+        for component in 0..3 {
+            if mask.translation[component] {
+                bone.translation[component] = 0.0;
+            }
+            if mask.scale[component] {
+                bone.scale[component] = 1.0;
+            }
+        }
+        if mask.rotation.iter().any(|animated| *animated) {
+            let rotation_mode = bone.rotation_mode.unwrap_or_default();
+            let mut state = rotation_accumulator_from_quaternion(
+                bone.rotation,
+                mask.rotation_kind,
+                rotation_mode,
+            )?;
+            reset_rotation_accumulator(
+                &mut state,
+                mask.rotation_kind,
+                mask.rotation,
+                rotation_mode,
+            )?;
+            bone.rotation = rotation_accumulator_to_quaternion(state, rotation_mode)?;
+            rotation_states.insert(bone_id, state);
+        }
+    }
+    for (track_index, track) in node.nla_tracks.iter().enumerate() {
         if track.mute || (has_solo && !track.solo) {
             continue;
         }
-        for strip in &track.strips {
-            let Some(action_frame) = strip_action_frame(strip, frame)? else {
-                continue;
-            };
-            let action = doc.actions.get(&strip.action).ok_or_else(|| {
-                PotError::with_details(
-                    ErrorCode::SceneInvalid,
-                    "NLA strip action reference does not exist",
-                    json!({ "action": strip.action, "strip": strip.id }),
-                )
-            })?;
-            let (sampled, channels) =
-                sample_action_pose(node, doc, &pose, action, &strip.action, action_frame)?;
-            blend_pose(
-                &mut pose,
-                &sampled,
-                channels,
-                strip.blend_type,
-                strip_influence(strip, frame)?,
-            )?;
+        let Some((strip_index, strip_frame)) = active_strip_for_track(track, frame) else {
+            continue;
+        };
+        let strip = &track.strips[strip_index];
+        if strip.mute {
+            continue;
         }
+        let (blend_in, blend_out) = auto_blend_lengths(node, track_index, strip_index);
+        let influence = strip_influence(strip, strip_frame, blend_in, blend_out)?;
+        if influence <= 0.0 {
+            continue;
+        }
+        let Some(action_frame) = strip_action_frame(strip, strip_frame)? else {
+            continue;
+        };
+        let action = doc.actions.get(&strip.action).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "NLA strip action reference does not exist",
+                json!({ "action": strip.action, "strip": strip.id }),
+            )
+        })?;
+        let (sampled, channels) = sample_action_pose(
+            node,
+            doc,
+            &pose,
+            &rotation_states,
+            action,
+            &strip.action,
+            action_frame,
+            true,
+        )?;
+        blend_pose(
+            &mut pose,
+            &mut rotation_states,
+            &sampled,
+            channels,
+            strip.blend_type,
+            influence,
+        )?;
     }
     if let Some(action_id) = &node.action {
         let action = doc.actions.get(action_id).ok_or_else(|| {
@@ -1397,8 +2243,28 @@ pub fn animated_pose_bones(
                 json!({ "action": action_id }),
             )
         })?;
-        let (sampled, channels) = sample_action_pose(node, doc, &pose, action, action_id, frame)?;
-        blend_pose(&mut pose, &sampled, channels, NlaBlendType::Replace, 1.0)?;
+        let (action_frame, blend, influence) =
+            active_action_controls(node, action, frame, nla_mode, has_solo)?;
+        if let Some(action_frame) = action_frame {
+            let (sampled, channels) = sample_action_pose(
+                node,
+                doc,
+                &pose,
+                &rotation_states,
+                action,
+                action_id,
+                action_frame,
+                nla_mode,
+            )?;
+            blend_pose(
+                &mut pose,
+                &mut rotation_states,
+                &sampled,
+                channels,
+                blend,
+                influence,
+            )?;
+        }
     }
     Ok(pose)
 }
@@ -1417,6 +2283,8 @@ struct PoseChannels {
     translation: [bool; 3],
     rotation: [bool; 4],
     scale: [bool; 3],
+    rotation_kind: RotationChannelKind,
+    rotation_values: [f64; 4],
 }
 
 fn pose_curve_path(path: &str) -> Option<(Id, PoseChannel)> {
@@ -1448,13 +2316,107 @@ fn pose_euler_order(rotation_mode: Option<PoseRotationMode>) -> Option<EulerRot>
         Some(mode) => mode.euler_order(),
     }
 }
+
+fn pose_nla_domain(
+    node: &Node,
+    doc: &SceneDoc,
+    nla_mode: bool,
+    has_solo: bool,
+) -> Result<BTreeMap<Id, PoseChannels>> {
+    let mut channels = BTreeMap::<Id, PoseChannels>::new();
+    if nla_mode && let Some(action_id) = &node.action {
+        let action = doc.actions.get(action_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "node action reference does not exist",
+                json!({"action":action_id}),
+            )
+        })?;
+        add_pose_action_domain(node, doc, action, &mut channels)?;
+    }
+    for track in &node.nla_tracks {
+        if track.mute || (has_solo && !track.solo) {
+            continue;
+        }
+        for strip in &track.strips {
+            let action = doc.actions.get(&strip.action).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "NLA strip action reference does not exist",
+                    json!({"action":strip.action,"strip":strip.id}),
+                )
+            })?;
+            add_pose_action_domain(node, doc, action, &mut channels)?;
+        }
+    }
+    Ok(channels)
+}
+
+fn add_pose_action_domain(
+    node: &Node,
+    doc: &SceneDoc,
+    action: &Action,
+    channels: &mut BTreeMap<Id, PoseChannels>,
+) -> Result<()> {
+    for (curve_index, curve) in action.fcurves.iter().enumerate() {
+        if u32::try_from(curve_index)
+            .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
+        {
+            continue;
+        }
+        let Some((bone_id, channel)) = pose_curve_path(&curve.path) else {
+            continue;
+        };
+        if !supports_animation_output_for_node(
+            &curve.path,
+            curve.index,
+            AnimationOutputKind::Action,
+            node,
+            doc,
+        ) {
+            continue;
+        }
+        let component_count = match channel {
+            PoseChannel::Translation | PoseChannel::Scale | PoseChannel::RotationEuler => 3,
+            PoseChannel::Rotation | PoseChannel::RotationAxisAngle => 4,
+        };
+        let component = component_index(curve, component_count)?;
+        let rotation_mode = node.pose.get(&bone_id).and_then(|bone| bone.rotation_mode);
+        let mask = channels.entry(bone_id).or_default();
+        match channel {
+            PoseChannel::Translation => mask.translation[component] = true,
+            PoseChannel::Scale => mask.scale[component] = true,
+            PoseChannel::Rotation
+                if matches!(rotation_mode, None | Some(PoseRotationMode::Quaternion)) =>
+            {
+                mask.rotation = [true; 4];
+                mask.rotation_kind = RotationChannelKind::Quaternion;
+            }
+            PoseChannel::RotationEuler if pose_euler_order(rotation_mode).is_some() => {
+                mask.rotation[component] = true;
+                mask.rotation_kind = RotationChannelKind::Euler;
+            }
+            PoseChannel::RotationAxisAngle
+                if matches!(rotation_mode, None | Some(PoseRotationMode::AxisAngle)) =>
+            {
+                mask.rotation[component] = true;
+                mask.rotation_kind = RotationChannelKind::AxisAngle;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn sample_action_pose(
     node: &Node,
     doc: &SceneDoc,
     base: &BTreeMap<Id, PoseBone>,
+    rotation_states: &BTreeMap<Id, RotationAccumulator>,
     action: &crate::model::Action,
     action_id: &Id,
     frame: f64,
+    nla_context: bool,
 ) -> Result<(BTreeMap<Id, PoseBone>, BTreeMap<Id, PoseChannels>)> {
     let mut pose = base.clone();
     let mut channels = BTreeMap::<Id, PoseChannels>::new();
@@ -1502,22 +2464,41 @@ fn sample_action_pose(
                     None | Some(PoseRotationMode::Quaternion)
                 ) =>
             {
+                if nla_context && mask.rotation.iter().all(|animated| !animated) {
+                    pose_bone.rotation = [0.0, 0.0, 0.0, 1.0];
+                    mask.rotation_values = [0.0, 0.0, 0.0, 1.0];
+                }
                 pose_bone.rotation[component] = value;
                 mask.rotation[component] = true;
+                mask.rotation_kind = RotationChannelKind::Quaternion;
+                mask.rotation_values[component] = value;
             }
             PoseChannel::RotationEuler => {
-                if let Some(order) = pose_euler_order(pose_bone.rotation_mode) {
-                    let angles = euler_rotations.entry(bone_id.clone()).or_insert_with(|| {
-                        let rotation = DQuat::from_xyzw(
-                            pose_bone.rotation[0],
-                            pose_bone.rotation[1],
-                            pose_bone.rotation[2],
-                            pose_bone.rotation[3],
+                if pose_euler_order(pose_bone.rotation_mode).is_some() {
+                    if !euler_rotations.contains_key(&bone_id) {
+                        let rotation_mode = pose_bone.rotation_mode.unwrap_or_default();
+                        let state = match rotation_states.get(&bone_id) {
+                            Some(state) => *state,
+                            None => rotation_accumulator_from_quaternion(
+                                pose_bone.rotation,
+                                RotationChannelKind::Euler,
+                                rotation_mode,
+                            )?,
+                        };
+                        euler_rotations.insert(
+                            bone_id.clone(),
+                            rotation_accumulator_to_euler(state, rotation_mode)?,
                         );
-                        let (x, y, z) = rotation.to_euler(order);
-                        [x, y, z]
-                    });
+                    }
+                    let angles = euler_rotations.get_mut(&bone_id).ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "Euler channel initialization failed",
+                        )
+                    })?;
                     angles[component] = value;
+                    mask.rotation[component] = true;
+                    mask.rotation_kind = RotationChannelKind::Euler;
                 }
             }
             PoseChannel::RotationAxisAngle
@@ -1527,9 +2508,18 @@ fn sample_action_pose(
                 ) =>
             {
                 if !axis_angle_rotations.contains_key(&bone_id) {
+                    let rotation_mode = pose_bone.rotation_mode.unwrap_or_default();
+                    let state = match rotation_states.get(&bone_id) {
+                        Some(state) => *state,
+                        None => rotation_accumulator_from_quaternion(
+                            pose_bone.rotation,
+                            RotationChannelKind::AxisAngle,
+                            rotation_mode,
+                        )?,
+                    };
                     axis_angle_rotations.insert(
                         bone_id.clone(),
-                        axis_angle_from_rotation(pose_bone.rotation)?,
+                        rotation_accumulator_to_axis_angle(state, rotation_mode)?,
                     );
                 }
                 let axis_angle = axis_angle_rotations.get_mut(&bone_id).ok_or_else(|| {
@@ -1539,6 +2529,8 @@ fn sample_action_pose(
                     )
                 })?;
                 axis_angle[component] = value;
+                mask.rotation[component] = true;
+                mask.rotation_kind = RotationChannelKind::AxisAngle;
             }
             PoseChannel::Scale => {
                 pose_bone.scale[component] = value;
@@ -1551,18 +2543,21 @@ fn sample_action_pose(
         let pose_bone = pose.get_mut(&bone_id).ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "sampled pose bone is missing")
         })?;
-        let order = pose_euler_order(pose_bone.rotation_mode)
-            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Euler pose mode is missing"))?;
-        let rotation = DQuat::from_euler(order, angles[0], angles[1], angles[2]);
+        let rotation_mode = pose_bone.rotation_mode.unwrap_or_default();
+        let rotation = quaternion_from_euler_angles(angles, rotation_mode);
         pose_bone.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
-        channels.entry(bone_id).or_default().rotation = [true; 4];
+        let mask = channels.entry(bone_id).or_default();
+        mask.rotation_kind = RotationChannelKind::Euler;
+        mask.rotation_values[..3].copy_from_slice(&angles);
     }
     for (bone_id, axis_angle) in axis_angle_rotations {
         let rotation = axis_angle_quaternion(axis_angle);
         pose.get_mut(&bone_id)
             .ok_or_else(|| PotError::new(ErrorCode::InternalError, "sampled pose bone is missing"))?
             .rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
-        channels.entry(bone_id).or_default().rotation = [true; 4];
+        let mask = channels.entry(bone_id).or_default();
+        mask.rotation_kind = RotationChannelKind::AxisAngle;
+        mask.rotation_values = axis_angle;
     }
     for (bone_id, mask) in &channels {
         if mask.rotation.iter().any(|animated| *animated) {
@@ -1583,6 +2578,7 @@ fn sample_action_pose(
 
 fn blend_pose(
     pose: &mut BTreeMap<Id, PoseBone>,
+    rotation_states: &mut BTreeMap<Id, RotationAccumulator>,
     sampled: &BTreeMap<Id, PoseBone>,
     channels: BTreeMap<Id, PoseChannels>,
     blend: NlaBlendType,
@@ -1592,60 +2588,56 @@ fn blend_pose(
         let source = sampled.get(&bone_id).copied().ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "sampled pose bone is missing")
         })?;
-        let destination = pose.entry(bone_id).or_default();
+        let destination = pose.entry(bone_id.clone()).or_default();
         for component in 0..3 {
             if mask.translation[component] {
                 let value = source.translation[component];
-                destination.translation[component] = match blend {
-                    NlaBlendType::Replace => {
-                        destination.translation[component] * (1.0 - influence) + value * influence
-                    }
-                    NlaBlendType::Add | NlaBlendType::Combine => {
-                        destination.translation[component] + value * influence
-                    }
-                };
+                destination.translation[component] = blend_scalar(
+                    destination.translation[component],
+                    value,
+                    0.0,
+                    blend,
+                    influence,
+                );
             }
             if mask.scale[component] {
                 let value = source.scale[component];
-                destination.scale[component] = match blend {
-                    NlaBlendType::Replace => {
-                        destination.scale[component] * (1.0 - influence) + value * influence
-                    }
-                    NlaBlendType::Add => destination.scale[component] + (value - 1.0) * influence,
-                    NlaBlendType::Combine => {
-                        destination.scale[component] * (1.0 + (value - 1.0) * influence)
-                    }
+                destination.scale[component] = if blend == NlaBlendType::Combine {
+                    destination.scale[component] * value.powf(influence)
+                } else {
+                    blend_scalar(destination.scale[component], value, 1.0, blend, influence)
                 };
             }
         }
         if mask.rotation.iter().any(|animated| *animated) {
+            let rotation_mode = destination.rotation_mode.unwrap_or_default();
+            if !rotation_states.contains_key(&bone_id) {
+                rotation_states.insert(
+                    bone_id.clone(),
+                    rotation_accumulator_from_quaternion(
+                        destination.rotation,
+                        mask.rotation_kind,
+                        rotation_mode,
+                    )?,
+                );
+            }
+            let rotation_state = rotation_states.get_mut(&bone_id).ok_or_else(|| {
+                PotError::new(ErrorCode::InternalError, "pose rotation state is missing")
+            })?;
+            blend_rotation_accumulator(
+                rotation_state,
+                mask.rotation_kind,
+                mask.rotation_values,
+                mask.rotation,
+                rotation_mode,
+                blend,
+                influence,
+            )?;
             destination.rotation =
-                blend_rotation(destination.rotation, source.rotation, blend, influence)?;
+                rotation_accumulator_to_quaternion(*rotation_state, rotation_mode)?;
         }
     }
     Ok(())
-}
-
-fn blend_rotation(
-    base_rotation: [f64; 4],
-    sampled_rotation: [f64; 4],
-    blend: NlaBlendType,
-    influence: f64,
-) -> Result<[f64; 4]> {
-    let base = normalize_rotation(base_rotation)
-        .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))?;
-    let target = normalize_rotation(sampled_rotation)
-        .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))?;
-    let base = DQuat::from_xyzw(base[0], base[1], base[2], base[3]);
-    let target = DQuat::from_xyzw(target[0], target[1], target[2], target[3]);
-    let result = if blend == NlaBlendType::Replace {
-        base.slerp(target, influence)
-    } else {
-        let delta = base.inverse() * target;
-        base * DQuat::IDENTITY.slerp(delta, influence)
-    };
-    normalize_rotation([result.x, result.y, result.z, result.w])
-        .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))
 }
 
 fn non_transform_component_count(
@@ -2398,7 +3390,16 @@ mod tests {
                     repeat: 1.0,
                     blend_type,
                     influence: 0.5,
-                    use_animated_influence: false,
+                    use_animated_influence: true,
+                    influence_curve: None,
+                    reverse: false,
+                    use_sync_length: false,
+                    use_auto_blend: false,
+                    mute: false,
+                    use_animated_time: false,
+                    strip_time: 0.0,
+                    strip_time_curve: None,
+                    use_animated_time_cyclic: false,
                     extrapolation: NlaExtrapolation::Nothing,
                     blend_in: 0.0,
                     blend_out: 0.0,
@@ -2500,7 +3501,18 @@ mod tests {
                         repeat: 1.0,
                         blend_type,
                         influence: number("influence")?,
-                        use_animated_influence: false,
+                        use_animated_influence: strip["use_animated_influence"]
+                            .as_bool()
+                            .unwrap_or(false),
+                        influence_curve: None,
+                        reverse: false,
+                        use_sync_length: false,
+                        use_auto_blend: false,
+                        mute: false,
+                        use_animated_time: false,
+                        strip_time: 0.0,
+                        strip_time_curve: None,
+                        use_animated_time_cyclic: false,
                         extrapolation: NlaExtrapolation::Nothing,
                         blend_in: 0.0,
                         blend_out: 0.0,
@@ -2665,6 +3677,15 @@ mod tests {
                 repeat: 1.0,
                 blend_type: NlaBlendType::Replace,
                 use_animated_influence: false,
+                influence_curve: None,
+                reverse: false,
+                use_sync_length: false,
+                use_auto_blend: false,
+                mute: false,
+                use_animated_time: false,
+                strip_time: 0.0,
+                strip_time_curve: None,
+                use_animated_time_cyclic: false,
                 influence: 1.0,
                 extrapolation: NlaExtrapolation::Nothing,
                 blend_in: 0.0,

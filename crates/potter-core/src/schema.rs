@@ -255,6 +255,12 @@ fn scene_schema() -> Value {
     root["$defs"]["node"]["properties"]["ray_visibility"] = json!({
         "oneOf":[{"type":"null"},{"type":"object","required":["camera","diffuse","glossy","transmission","volume_scatter","shadow"],"properties":{"camera":{"type":"boolean"},"diffuse":{"type":"boolean"},"glossy":{"type":"boolean"},"transmission":{"type":"boolean"},"volume_scatter":{"type":"boolean"},"shadow":{"type":"boolean"}},"additionalProperties":false}]
     });
+    root["$defs"]["node"]["properties"]["action_blend_type"] =
+        json!({"enum":["replace","add","subtract","multiply","combine"],"default":"replace"});
+    root["$defs"]["node"]["properties"]["action_extrapolation"] =
+        json!({"enum":["hold","hold_forward","nothing"],"default":"hold"});
+    root["$defs"]["node"]["properties"]["action_influence"] =
+        json!({"type":"number","minimum":0,"maximum":1,"default":1});
     root["$defs"]["captured_matrix_basis"] = json!({
         "type":"object",
         "required":["matrix_basis","fingerprint"],

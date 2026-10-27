@@ -2,7 +2,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    model::{ActionSlot, Id, NlaBlendType, NlaExtrapolation, NlaStrip, NlaTrack, TimelineMarker},
+    model::{
+        ActionSlot, Extrapolation, FCurve, Id, Interpolation, Keyframe, NlaBlendType,
+        NlaExtrapolation, NlaStrip, NlaTrack, TimelineMarker,
+    },
 };
 
 use super::{
@@ -23,10 +26,20 @@ const STRIP_FIELDS: &[&str] = &[
     "scale",
     "repeat",
     "blend_type",
+    "use_animated_influence",
+    "influence_curve",
     "influence",
     "extrapolation",
     "blend_in",
     "blend_out",
+    "reverse",
+    "use_sync_length",
+    "use_auto_blend",
+    "mute",
+    "use_animated_time",
+    "strip_time",
+    "strip_time_curve",
+    "use_animated_time_cyclic",
 ];
 
 pub(super) fn apply(
@@ -218,10 +231,20 @@ fn create_strip(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
             "scale",
             "repeat",
             "blend_type",
+            "use_animated_influence",
+            "influence_curve",
             "influence",
             "extrapolation",
             "blend_in",
             "blend_out",
+            "reverse",
+            "use_sync_length",
+            "use_auto_blend",
+            "mute",
+            "use_animated_time",
+            "strip_time",
+            "strip_time_curve",
+            "use_animated_time_cyclic",
         ],
         &[
             "target",
@@ -308,6 +331,15 @@ fn create_strip(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         blend_type: NlaBlendType::Replace,
         influence: 1.0,
         use_animated_influence: false,
+        influence_curve: None,
+        reverse: false,
+        use_sync_length: false,
+        use_auto_blend: false,
+        mute: false,
+        use_animated_time: false,
+        strip_time: 0.0,
+        strip_time_curve: None,
+        use_animated_time_cyclic: false,
         extrapolation: NlaExtrapolation::Hold,
         blend_in: 0.0,
         blend_out: 0.0,
@@ -482,6 +514,32 @@ fn push_down(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<
         })
     })?;
     let action_slot = action_slot_for_node(engine, &action_id, &node_id, None, "target")?;
+    let node = engine.doc.nodes.get(&node_id).ok_or_else(|| {
+        crate::error::PotError::new(ErrorCode::InternalError, "NLA node disappeared")
+    })?;
+    let blend_type = node.action_blend_type;
+    let influence = node.action_influence;
+    let extrapolation = node.action_extrapolation;
+    let (use_animated_influence, influence_curve) = if influence < 1.0 {
+        (
+            true,
+            Some(FCurve {
+                path: "influence".to_owned(),
+                index: 0,
+                keyframes: vec![Keyframe {
+                    frame: start,
+                    value: influence,
+                    interpolation: Interpolation::Bezier,
+                    ..Keyframe::default()
+                }],
+                extrapolation: Extrapolation::Constant,
+                auto_smoothing: None,
+                modifiers: Vec::new(),
+            }),
+        )
+    } else {
+        (false, None)
+    };
     let strip = NlaStrip {
         id: strip_id,
         action: action_id,
@@ -492,14 +550,31 @@ fn push_down(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<
         action_frame_end: end,
         scale: 1.0,
         repeat: 1.0,
-        blend_type: NlaBlendType::Replace,
-        influence: 1.0,
-        use_animated_influence: false,
-        extrapolation: NlaExtrapolation::Hold,
+        blend_type,
+        influence,
+        use_animated_influence,
+        influence_curve,
+        reverse: false,
+        use_sync_length: false,
+        use_auto_blend: false,
+        mute: false,
+        use_animated_time: false,
+        strip_time: 0.0,
+        strip_time_curve: None,
+        use_animated_time_cyclic: false,
+        extrapolation,
         blend_in: 0.0,
         blend_out: 0.0,
     };
     validate_strip(engine, &strip, "")?;
+    let active_slot_removed = engine
+        .doc
+        .actions
+        .get_mut(&strip.action)
+        .is_some_and(|action| action.active_slots.remove(&node_id).is_some());
+    if active_slot_removed {
+        engine.mark("actions", &strip.action, ChangeKind::Updated);
+    }
     let name = engine
         .doc
         .actions
@@ -928,6 +1003,7 @@ fn apply_strip_values(
         "influence",
         "blend_in",
         "blend_out",
+        "strip_time",
     ] {
         if let Some(value) = values.get(name) {
             let full_name = field(name);
@@ -945,6 +1021,54 @@ fn apply_strip_values(
                 }
                 "blend_in" => strip.blend_in = number,
                 "blend_out" => strip.blend_out = number,
+                "strip_time" => strip.strip_time = number,
+                _ => unreachable!(),
+            }
+        }
+    }
+    for name in [
+        "use_animated_influence",
+        "reverse",
+        "use_sync_length",
+        "use_auto_blend",
+        "mute",
+        "use_animated_time",
+        "use_animated_time_cyclic",
+    ] {
+        if let Some(value) = values.get(name) {
+            let full_name = field(name);
+            let boolean = bool_value(engine, value, &full_name)?;
+            match name {
+                "use_animated_influence" => strip.use_animated_influence = boolean,
+                "reverse" => strip.reverse = boolean,
+                "use_sync_length" => strip.use_sync_length = boolean,
+                "use_auto_blend" => strip.use_auto_blend = boolean,
+                "mute" => strip.mute = boolean,
+                "use_animated_time" => strip.use_animated_time = boolean,
+                "use_animated_time_cyclic" => strip.use_animated_time_cyclic = boolean,
+                _ => unreachable!(),
+            }
+        }
+    }
+    for name in ["influence_curve", "strip_time_curve"] {
+        if let Some(value) = values.get(name) {
+            let full_name = field(name);
+            let curve = if value.is_null() {
+                None
+            } else {
+                Some(
+                    serde_json::from_value::<FCurve>(value.clone()).map_err(|error| {
+                        engine.error(
+                            ErrorCode::InvalidOperation,
+                            format!("{name} is invalid: {error}"),
+                            &operation_pointer(engine.operation_index, &full_name),
+                        )
+                    })?,
+                )
+            };
+            match name {
+                "influence_curve" => strip.influence_curve = curve,
+                "strip_time_curve" => strip.strip_time_curve = curve,
                 _ => unreachable!(),
             }
         }
@@ -954,11 +1078,13 @@ fn apply_strip_values(
         strip.blend_type = match value.as_str() {
             Some("replace") => NlaBlendType::Replace,
             Some("add") => NlaBlendType::Add,
+            Some("subtract") => NlaBlendType::Subtract,
+            Some("multiply") => NlaBlendType::Multiply,
             Some("combine") => NlaBlendType::Combine,
             _ => {
                 return Err(engine.error(
                     ErrorCode::InvalidOperation,
-                    "blend_type must be replace, add, or combine",
+                    "blend_type must be replace, add, subtract, multiply, or combine",
                     &operation_pointer(engine.operation_index, &name),
                 ));
             }
@@ -1037,22 +1163,36 @@ fn validate_strip(engine: &Engine<'_>, strip: &NlaStrip, prefix: &str) -> Result
             &operation_pointer(engine.operation_index, &format!("{prefix}influence")),
         ));
     }
-    if !strip.blend_in.is_finite() || strip.blend_in < 0.0 || strip.blend_in > duration {
-        return Err(engine.error(
-            ErrorCode::InvalidOperation,
-            "blend_in must be nonnegative and no longer than the strip",
-            &operation_pointer(engine.operation_index, &format!("{prefix}blend_in")),
-        ));
-    }
-    if !strip.blend_out.is_finite()
-        || strip.blend_out < 0.0
-        || strip.blend_out > duration
-        || strip.blend_in + strip.blend_out > duration
+    if let Some(curve) = &strip.influence_curve
+        && (curve.path != "influence" || curve.index != 0)
     {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
-            "blend_out must be nonnegative and fades must fit within the strip",
-            &operation_pointer(engine.operation_index, &format!("{prefix}blend_out")),
+            "influence_curve must animate influence at index zero",
+            &operation_pointer(engine.operation_index, &format!("{prefix}influence_curve")),
+        ));
+    }
+    if !strip.blend_in.is_finite() || !strip.blend_out.is_finite() {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "blend_in and blend_out must be finite",
+            &operation_pointer(engine.operation_index, &format!("{prefix}blend_in")),
+        ));
+    }
+    if !strip.strip_time.is_finite() {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "strip_time must be finite",
+            &operation_pointer(engine.operation_index, &format!("{prefix}strip_time")),
+        ));
+    }
+    if let Some(curve) = &strip.strip_time_curve
+        && (curve.path != "strip_time" || curve.index != 0)
+    {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            "strip_time_curve must animate strip_time at index zero",
+            &operation_pointer(engine.operation_index, &format!("{prefix}strip_time_curve")),
         ));
     }
     Ok(())

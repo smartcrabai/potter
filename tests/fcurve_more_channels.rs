@@ -505,7 +505,12 @@ print("POTTER_NLA_ROUNDTRIP=" + json.dumps(values, sort_keys=True))
     let values = stdout
         .lines()
         .find_map(|line| line.strip_prefix("POTTER_NLA_ROUNDTRIP="))
-        .ok_or_else(|| io::Error::other("Blender omitted exported NLA round-trip values"))?;
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "Blender omitted exported NLA round-trip values: stdout={stdout}; stderr={}",
+                String::from_utf8_lossy(&output.stderr),
+            ))
+        })?;
     let actual: Value = serde_json::from_str(values)?;
     for frame in FRAMES {
         let key = frame.to_string();
