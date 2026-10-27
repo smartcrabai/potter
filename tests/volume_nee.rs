@@ -22,15 +22,10 @@ const ENERGY: f64 = 100.0;
 const POSITION: [f64; 3] = [1.6, 0.6, 0.9];
 const DENSITY: f64 = 0.05;
 const SAMPLES: u32 = 2048;
-/// Voxel cubes take about 100 s per render at `SAMPLES` in a debug build (a mesh render takes about 1 s), so they use
-/// fewer samples. Their tolerances are derived from their own measured spread at this count.
-const VOXEL_SAMPLES: u32 = 512;
-// Tolerances are three times the measured single-render spread of each configuration, rounded up. Potter's sd was
-// measured over four seeds (each seed renders the scene once), on this scene: mesh MIS 0.34-0.36 % at 2048 spp, mesh
-// distance 4.30 %, mesh equiangular 0.07 % (2048 spp); voxel MIS 2.78-2.93 %, gradient 4.52-4.65 %, voxel distance
-// 1.54 %, voxel equiangular 0.64 % (512 spp); diffuse 0.11 % (2048 spp). Blender's own spread at 65536 spp is about
-// 0.1 %, so it does not widen these. The tests use seed 0, so each result is fixed; the tolerance is the noise band
-// a different seed could reach.
+/// Mesh and diffuse cases use their fixed tolerances at 2048 spp; voxel cases average four 32-spp seeds and compare
+/// against Blender at three combined standard errors, capped at the existing tolerance.
+const SINGLE_SCATTER_SEEDS: u32 = 4;
+const VOXEL_SINGLE_SCATTER_SAMPLES: u32 = 32;
 const DIFFUSE_TOLERANCE: f64 = 0.005;
 const MESH_TOLERANCE: f64 = 0.015;
 const MESH_DISTANCE_TOLERANCE: f64 = 0.13;
@@ -83,18 +78,18 @@ fn make_scene(root: &Path, operations: &[Value]) -> Result<std::path::PathBuf, B
 
 /// The common scene: a black world, an orthographic camera at z = 3 (ortho scale 1, so the frame is the unit cube), a
 /// `POSITION`, and single-scatter render settings.
-fn base_operations(samples: u32) -> Vec<Value> {
+fn base_operations(samples: u32, seed: u32) -> Vec<Value> {
     vec![
         json!({"op":"world.create","id":"world_main","color":[0.0,0.0,0.0],"strength":0.0}),
         json!({"op":"camera.create","id":"camera_main","transform":{"translation":[0.0,0.0,3.0]},"projection":"orthographic","ortho_scale":1.0}),
         json!({"op":"light.create","id":"light_main","light_type":"point","energy":ENERGY,"radius":0.0,"transform":{"translation":POSITION}}),
         json!({"op":"scene.update","target":{"id":"scene_main"},"set":{"camera":"camera_main","world":"world_main"}}),
-        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":samples,"seed":0,"max_bounces":0,"pixel_filter_type":"BOX","filter_width":1.0}}),
+        json!({"op":"render.update","target":{"id":"scene_main"},"set":{"resolution_x":SIZE,"resolution_y":SIZE,"samples":samples,"seed":seed,"max_bounces":0,"pixel_filter_type":"BOX","filter_width":1.0}}),
     ]
 }
 
 fn diffuse_scene(root: &Path) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let mut operations = base_operations(SAMPLES);
+    let mut operations = base_operations(SAMPLES, 0);
     operations.extend([
         json!({"op":"graph.create","id":"white_graph","kind":"shader"}),
         json!({"op":"graph.node_add","graph":"white_graph","id":"output","type":"ShaderNodeOutputMaterial"}),
@@ -123,12 +118,10 @@ fn scatter_scene(
     anisotropy: f64,
     medium: Medium,
     sampling: &str,
+    samples: u32,
+    seed: u32,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let samples = match medium {
-        Medium::MeshCube => SAMPLES,
-        Medium::VoxelHomogeneous | Medium::VoxelGradient => VOXEL_SAMPLES,
-    };
-    let mut operations = base_operations(samples);
+    let mut operations = base_operations(samples, seed);
     operations.extend([
         json!({"op":"graph.create","id":"medium_graph","kind":"shader"}),
         json!({"op":"graph.node_add","graph":"medium_graph","id":"output","type":"ShaderNodeOutputMaterial"}),
@@ -199,15 +192,24 @@ struct Pixels {
     red: Vec<f32>,
 }
 
-/// The Blender oracle's mean for a case.
-fn blender_mean(case: &str) -> Result<f64, Box<dyn Error>> {
+/// The Blender oracle's mean and standard error for a case.
+fn blender_statistics(case: &str) -> Result<(f64, f64), Box<dyn Error>> {
     let oracle: Value = serde_json::from_slice(&fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/volume_nee/blender_volume_nee.json"),
     )?)?;
-    oracle["cases"][case]["mean"]
+    let case = &oracle["cases"][case];
+    let mean = case["mean"]
         .as_f64()
-        .ok_or_else(|| format!("oracle case {case} is missing").into())
+        .ok_or("oracle case is missing its mean")?;
+    let stderr = case["stderr"]
+        .as_f64()
+        .ok_or("oracle case is missing its standard error")?;
+    Ok((mean, stderr))
+}
+
+fn blender_mean(case: &str) -> Result<f64, Box<dyn Error>> {
+    Ok(blender_statistics(case)?.0)
 }
 
 fn assert_within(case: &str, measured: f64, tolerance: f64) -> Result<(), Box<dyn Error>> {
@@ -231,29 +233,75 @@ fn point_light_irradiance_unit_matches_blender_on_a_diffuse_plane() -> Result<()
     assert_within("diffuse", measured, DIFFUSE_TOLERANCE)
 }
 
-/// Renders one case at its medium's sample count and compares its frame mean with Blender's mean for `case`.
+/// Renders one mesh case at `SAMPLES` and compares its frame mean with Blender's mean for `case`.
 fn assert_case_matches(
+    case: &str,
+    anisotropy: f64,
+    sampling: &str,
+    tolerance: f64,
+) -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let scene = scatter_scene(
+        directory.path(),
+        anisotropy,
+        Medium::MeshCube,
+        sampling,
+        SAMPLES,
+        0,
+    )?;
+    let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
+    assert_within(case, measured, tolerance)
+}
+
+/// Renders a voxel case in four 32-spp seeds and compares their mean with Blender under the existing tolerance cap.
+fn assert_voxel_case_matches(
     case: &str,
     anisotropy: f64,
     medium: Medium,
     sampling: &str,
     tolerance: f64,
 ) -> Result<(), Box<dyn Error>> {
-    let directory = tempdir()?;
-    let scene = scatter_scene(directory.path(), anisotropy, medium, sampling)?;
-    let measured = render_centre_mean(&scene, &directory.path().join("render"))?;
-    assert_within(case, measured, tolerance)
+    let mut renders = Vec::with_capacity(SINGLE_SCATTER_SEEDS as usize);
+    for seed in 0..SINGLE_SCATTER_SEEDS {
+        let directory = tempdir()?;
+        let scene = scatter_scene(
+            directory.path(),
+            anisotropy,
+            medium,
+            sampling,
+            VOXEL_SINGLE_SCATTER_SAMPLES,
+            seed,
+        )?;
+        renders.push(render_centre_mean(
+            &scene,
+            &directory.path().join("render"),
+        )?);
+    }
+
+    let seeds = f64::from(SINGLE_SCATTER_SEEDS);
+    let mean = renders.iter().sum::<f64>() / seeds;
+    let variance = renders
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (seeds - 1.0);
+    let potter_error = (variance / seeds).sqrt();
+    let (expected, blender_error) = blender_statistics(case)?;
+    let threshold = tolerance.min(3.0 * blender_error.hypot(potter_error) / expected);
+    let relative = (mean - expected).abs() / expected;
+    assert!(
+        relative < threshold,
+        "{case}: Potter seed mean {mean:.6} vs Blender {expected:.6} ({:.1} % apart, combined 3-SE threshold {:.1} %, existing tolerance {:.1} %)",
+        relative * 100.0,
+        threshold * 100.0,
+        tolerance * 100.0
+    );
+    Ok(())
 }
 
 #[test]
 fn mesh_material_single_scatter_matches_blender_at_anisotropy_0() -> Result<(), Box<dyn Error>> {
-    assert_case_matches(
-        "homogeneous_g0",
-        0.0,
-        Medium::MeshCube,
-        "multiple_importance",
-        MESH_TOLERANCE,
-    )
+    assert_case_matches("homogeneous_g0", 0.0, "multiple_importance", MESH_TOLERANCE)
 }
 
 #[test]
@@ -261,7 +309,6 @@ fn mesh_material_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<()
     assert_case_matches(
         "homogeneous_g05",
         0.5,
-        Medium::MeshCube,
         "multiple_importance",
         MESH_TOLERANCE,
     )
@@ -270,7 +317,7 @@ fn mesh_material_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<()
 #[test]
 fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0() -> Result<(), Box<dyn Error>>
 {
-    assert_case_matches(
+    assert_voxel_case_matches(
         "voxel_homogeneous_g0",
         0.0,
         Medium::VoxelHomogeneous,
@@ -282,7 +329,7 @@ fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0() -> Result<
 #[test]
 fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<(), Box<dyn Error>>
 {
-    assert_case_matches(
+    assert_voxel_case_matches(
         "voxel_homogeneous_g05",
         0.5,
         Medium::VoxelHomogeneous,
@@ -293,7 +340,7 @@ fn voxel_homogeneous_single_scatter_matches_blender_at_anisotropy_0_5() -> Resul
 
 #[test]
 fn gradient_single_scatter_matches_blender_at_anisotropy_0() -> Result<(), Box<dyn Error>> {
-    assert_case_matches(
+    assert_voxel_case_matches(
         "gradient_g0",
         0.0,
         Medium::VoxelGradient,
@@ -304,7 +351,7 @@ fn gradient_single_scatter_matches_blender_at_anisotropy_0() -> Result<(), Box<d
 
 #[test]
 fn gradient_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<(), Box<dyn Error>> {
-    assert_case_matches(
+    assert_voxel_case_matches(
         "gradient_g05",
         0.5,
         Medium::VoxelGradient,
@@ -317,18 +364,12 @@ fn gradient_single_scatter_matches_blender_at_anisotropy_0_5() -> Result<(), Box
 // must reproduce Blender's homogeneous cube at anisotropy 0.
 #[test]
 fn distance_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Error>> {
-    assert_case_matches(
-        "homogeneous_g0",
-        0.0,
-        Medium::MeshCube,
-        "distance",
-        MESH_DISTANCE_TOLERANCE,
-    )
+    assert_case_matches("homogeneous_g0", 0.0, "distance", MESH_DISTANCE_TOLERANCE)
 }
 
 #[test]
 fn distance_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
-    assert_case_matches(
+    assert_voxel_case_matches(
         "voxel_homogeneous_g0",
         0.0,
         Medium::VoxelHomogeneous,
@@ -342,7 +383,6 @@ fn equiangular_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Err
     assert_case_matches(
         "homogeneous_g0",
         0.0,
-        Medium::MeshCube,
         "equiangular",
         MESH_EQUIANGULAR_TOLERANCE,
     )
@@ -350,7 +390,7 @@ fn equiangular_sampling_matches_blender_on_mesh_cube() -> Result<(), Box<dyn Err
 
 #[test]
 fn equiangular_sampling_matches_blender_on_voxel_cube() -> Result<(), Box<dyn Error>> {
-    assert_case_matches(
+    assert_voxel_case_matches(
         "voxel_homogeneous_g0",
         0.0,
         Medium::VoxelHomogeneous,

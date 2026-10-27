@@ -174,9 +174,7 @@ struct VolumeInstance<'a> {
     lobes: Vec<ScatterLobe>,
     emission: DVec3,
     scattering: bool,
-    /// Channel-mean σt per unit grid density used by the existing voxel path transport.
-    extinction_scale: f64,
-    /// Per-channel σt per unit grid density for the EEVEE froxel resolve.
+    /// Per-channel σt per unit grid density for path, EEVEE, and froxel transport.
     extinction_rgb_scale: DVec3,
     /// Blender's `cycles.volume_sampling` of the volume's material.
     sampling: crate::model::VolumeSampling,
@@ -193,13 +191,14 @@ struct VolumeInstance<'a> {
 #[derive(Clone, Copy)]
 struct VolumeEvent {
     point: DVec3,
-    albedo: DVec3,
+    scattering_weight: DVec3,
 }
 
 struct VolumeSegment {
-    transmittance: f64,
+    transmittance: DVec3,
     event: Option<VolumeEvent>,
     stochastic: bool,
+    channel_pdf: DVec3,
 }
 
 /// One closure of a hit, weighted as Cycles weights closures (`closure_alloc`): `weight` is the share of the hit the
@@ -3565,7 +3564,7 @@ impl RealtimeVolumeSample<'_, '_> {
                 &mut self.ambient,
                 include_sources,
             )?;
-            Ok((radiance, DVec3::splat(transmittance)))
+            Ok((radiance, transmittance))
         }
     }
 }
@@ -3722,6 +3721,21 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
     let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images, warnings)?;
+    let is_grey =
+        |color: DVec3| color.x.total_cmp(&color.y).is_eq() && color.y.total_cmp(&color.z).is_eq();
+    if volumes.iter().any(|volume| {
+        volume.scattering && (!is_grey(volume.extinction_rgb_scale) || !is_grey(volume.albedo))
+    }) {
+        let warning = serde_json::json!({
+            "code": "UNSUPPORTED_FEATURE",
+            "feature_id": "shader.volume.spectral_extinction.realtime_scattering",
+            "message": "Realtime EEVEE volume scattering does not match Blender 5.2.2's per-channel spectral in-scatter",
+        });
+        let mut recorded = warnings.borrow_mut();
+        if !recorded.contains(&warning) {
+            recorded.push(warning);
+        }
+    }
     let has_mesh_volumes = geometry_has_volume_material(geometry);
     if volumes.is_empty() && !has_mesh_volumes {
         return Ok(None);
@@ -3892,7 +3906,7 @@ fn realtime_mesh_volume_integral(
     if !has_mesh_medium {
         let (radiance, transmittance) =
             realtime_voxel_integral(transport, ray, rng, ambient_cache, include_sources)?;
-        return Ok((radiance, DVec3::splat(transmittance)));
+        return Ok((radiance, transmittance));
     }
 
     // Scan the reusable stack in place, then undo the crossings instead of cloning it.
@@ -3949,7 +3963,7 @@ fn realtime_mesh_volume_integral(
     if !entry.is_finite() || exit <= entry {
         let (radiance, transmittance) =
             realtime_voxel_integral(transport, ray, rng, ambient_cache, include_sources)?;
-        return Ok((radiance, DVec3::splat(transmittance)));
+        return Ok((radiance, transmittance));
     }
     let voxel_step = if minimum_step.is_finite() {
         let span = voxel_exit - voxel_entry;
@@ -4067,7 +4081,7 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
         for index in 0..steps {
             let distance = start + (index as f64 + 0.5) * step;
             let point = self.origin + self.direction * distance;
-            let mut voxel_extinction = 0.0;
+            let mut voxel_extinction = DVec3::ZERO;
             let mut mesh_source = mesh_emission + self.ambient * mesh_scatter;
             let mut voxel_source = DVec3::ZERO;
             if (self.voxel_entry..=self.voxel_exit).contains(&distance) {
@@ -4079,18 +4093,18 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                     .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
                 {
                     let density = volume_density_at(instance, point)?;
-                    let extinction = volume_extinction_density(instance, density);
+                    let extinction = volume_extinction_rgb_density(instance, density);
                     voxel_extinction += extinction;
                     let scattering = if self.include_sources && instance.scattering {
                         extinction
                     } else {
-                        0.0
+                        DVec3::ZERO
                     };
                     if self.include_sources {
                         voxel_source +=
                             instance.emission + self.ambient * instance.albedo * scattering;
                     }
-                    if self.include_sources && scattering > 0.0 {
+                    if self.include_sources && scattering.max_element() > 0.0 {
                         for light in &self.query.transport.lights {
                             if light.ray_mask & RayKind::VolumeScatter.bit() == 0 {
                                 continue;
@@ -4113,7 +4127,7 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                                     RayKind::Shadow,
                                 )?
                             } else {
-                                1.0
+                                DVec3::ONE
                             };
                             let phase =
                                 instance.phase_density(self.direction.dot(sample.direction));
@@ -4166,8 +4180,7 @@ impl RealtimeMeshIntegrator<'_, '_, '_> {
                     mesh_source += sample.radiance * visibility * scatter * gain;
                 }
             }
-            let extinction =
-                mesh_extinction + DVec3::splat(voxel_extinction * self.meters_per_unit);
+            let extinction = mesh_extinction + voxel_extinction * self.meters_per_unit;
             let attenuation = if self.include_sources {
                 let source = mesh_source + voxel_source * self.meters_per_unit;
                 let (attenuation_x, source_distance_x) =
@@ -4199,7 +4212,7 @@ fn realtime_voxel_integral(
     rng: &mut Pcg32,
     ambient_cache: &mut Option<DVec3>,
     include_sources: bool,
-) -> Result<(DVec3, f64)> {
+) -> Result<(DVec3, DVec3)> {
     let RealtimeVolumeRay {
         origin,
         direction,
@@ -4231,7 +4244,7 @@ fn realtime_voxel_integral(
     }
     entry = entry.max(start_distance);
     if !entry.is_finite() || exit <= entry {
-        return Ok((DVec3::ZERO, 1.0));
+        return Ok((DVec3::ZERO, DVec3::ONE));
     }
     let segment_length = exit - entry;
     let step_count = (segment_length / minimum_step).ceil().clamp(1.0, 64.0) as usize;
@@ -4245,12 +4258,12 @@ fn realtime_voxel_integral(
     } else {
         DVec3::ZERO
     };
-    let mut transmittance = 1.0;
+    let mut transmittance = DVec3::ONE;
     let mut radiance = DVec3::ZERO;
     for index in 0..step_count {
         let distance = entry + (index as f64 + 0.5) * step;
         let point = origin + direction * distance;
-        let mut extinction = 0.0;
+        let mut extinction = DVec3::ZERO;
         let mut source = DVec3::ZERO;
         for instance in transport
             .volumes
@@ -4258,12 +4271,12 @@ fn realtime_voxel_integral(
             .filter(|volume| volume.ray_mask & RayKind::Camera.bit() != 0)
         {
             let density = volume_density_at(instance, point)?;
-            let extinction_coefficient = volume_extinction_density(instance, density);
+            let extinction_coefficient = volume_extinction_rgb_density(instance, density);
             extinction += extinction_coefficient;
             let scattering_coefficient = if include_sources && instance.scattering {
                 extinction_coefficient
             } else {
-                0.0
+                DVec3::ZERO
             };
             if include_sources {
                 source += instance.emission;
@@ -4292,7 +4305,7 @@ fn realtime_voxel_integral(
                                 RayKind::Shadow,
                             )?
                         } else {
-                            1.0
+                            DVec3::ONE
                         };
                         let phase = instance.phase_density(direction.dot(sample.direction));
                         source += instance.albedo
@@ -4304,16 +4317,27 @@ fn realtime_voxel_integral(
         }
         let step_in_meters = step * meters_per_unit;
         let attenuation = if include_sources {
-            let (attenuation, source_distance) =
-                homogeneous_segment_integral(extinction, step_in_meters);
-            radiance += source * (transmittance * source_distance);
+            let (attenuation_x, source_distance_x) =
+                homogeneous_segment_integral(extinction.x, step_in_meters);
+            let (attenuation_y, source_distance_y) =
+                homogeneous_segment_integral(extinction.y, step_in_meters);
+            let (attenuation_z, source_distance_z) =
+                homogeneous_segment_integral(extinction.z, step_in_meters);
+            let attenuation = DVec3::new(attenuation_x, attenuation_y, attenuation_z);
+            let source_distance =
+                DVec3::new(source_distance_x, source_distance_y, source_distance_z);
+            radiance += source * transmittance * source_distance;
             attenuation
         } else {
-            homogeneous_segment_transmittance(extinction, step_in_meters)
+            DVec3::new(
+                homogeneous_segment_transmittance(extinction.x, step_in_meters),
+                homogeneous_segment_transmittance(extinction.y, step_in_meters),
+                homogeneous_segment_transmittance(extinction.z, step_in_meters),
+            )
         };
         transmittance *= attenuation;
     }
-    Ok((radiance, transmittance.clamp(0.0, 1.0)))
+    Ok((radiance, transmittance.clamp(DVec3::ZERO, DVec3::ONE)))
 }
 
 fn realtime_world_ambient(
@@ -4477,17 +4501,28 @@ fn event_phase(media: &[MeshMedium], grid: Option<&VoxelGrid>, distance: f64) ->
 
 /// The density per unit distance of a scatter event in a mixed segment: the mesh stack's scatter density past the grid's
 /// optical depth, plus the grid's scatter density past the stack's extinction (the analog first-event density of both).
-fn mixed_scatter_pdf(stack: &BsdfParams, grid: &VoxelGrid, distance: f64) -> f64 {
-    distance_scatter_pdf(stack, distance) * (-grid_depth(grid, distance)).exp()
-        + grid_scatter_pdf(grid, distance) * (-mean_extinction(stack) * distance).exp()
+fn mixed_scatter_pdf(
+    stack: &BsdfParams,
+    grid: &VoxelGrid,
+    distance: f64,
+    channel_pdf: DVec3,
+) -> f64 {
+    distance_scatter_pdf(stack, distance) * grid_survival_pdf(grid, distance, channel_pdf)
+        + grid_scatter_pdf(grid, distance, channel_pdf) * (-mean_extinction(stack) * distance).exp()
 }
 
-/// The density per unit distance of a scatter event in a segment's media, which the distance sampler realises: the MIS
-/// partner of the equiangular samples and the density of distance-sampled events.
-fn segment_scatter_pdf(grid: Option<&VoxelGrid>, stack: Option<&BsdfParams>, distance: f64) -> f64 {
+/// The density per unit distance of a scatter event in a segment's media, which the distance sampler realises.
+/// `channel_pdf` is the same hero-channel mixture used by voxel free-flight sampling,
+/// so its marginal density is used for MIS.
+fn segment_scatter_pdf(
+    grid: Option<&VoxelGrid>,
+    stack: Option<&BsdfParams>,
+    distance: f64,
+    channel_pdf: DVec3,
+) -> f64 {
     match (grid, stack) {
-        (Some(grid), Some(stack)) => mixed_scatter_pdf(stack, grid, distance),
-        (Some(grid), None) => grid_scatter_pdf(grid, distance),
+        (Some(grid), Some(stack)) => mixed_scatter_pdf(stack, grid, distance, channel_pdf),
+        (Some(grid), None) => grid_scatter_pdf(grid, distance, channel_pdf),
         (None, Some(stack)) => distance_scatter_pdf(stack, distance),
         (None, None) => 0.0,
     }
@@ -4500,7 +4535,7 @@ fn segment_transmittance(
     distance: f64,
 ) -> DVec3 {
     let mesh = stack.map_or(DVec3::ONE, |stack| medium_transmittance(stack, distance));
-    let voxel = grid.map_or(1.0, |grid| (-grid_depth(grid, distance)).exp());
+    let voxel = grid.map_or(DVec3::ONE, |grid| (-grid_depth(grid, distance)).exp());
     mesh * voxel
 }
 
@@ -4656,6 +4691,12 @@ fn trace_path(
         } else {
             voxel_grid(&segment_volumes, origin, direction, segment_limit)?
         };
+        let voxel_channel_pdf = grid.as_ref().map_or(DVec3::splat(1.0 / 3.0), |grid| {
+            grid_channel_pdf(grid, throughput)
+        });
+        if grid.is_some() || stack.is_some() {
+            radiance += throughput * emission_until(grid.as_ref(), stack.as_ref(), segment_limit);
+        }
         // A segment holding both a voxel grid and a mesh medium is mixed: its nearest free flight is sampled analogously.
         let mixed = match (grid.as_ref(), stack) {
             (Some(grid), Some(medium)) if !terminal => Some((grid, medium)),
@@ -4704,7 +4745,12 @@ fn trace_path(
                     _ => {
                         2.0 * power_heuristic(
                             pdf,
-                            segment_scatter_pdf(grid.as_ref(), stack.as_ref(), distance),
+                            segment_scatter_pdf(
+                                grid.as_ref(),
+                                stack.as_ref(),
+                                distance,
+                                voxel_channel_pdf,
+                            ),
                         )
                     }
                 };
@@ -4734,30 +4780,20 @@ fn trace_path(
             }
         }
         if let Some((grid, medium)) = mixed {
-            // The grid's stochastic free flight and the mesh's analog collision are sampled independently, and the nearer
-            // event is taken. The grid's emission runs up to that event, weighted by the mesh's chromatic excess, before the
-            // throughput takes any transmittance (`emission_until`). Analog sampling is exact for the event, so the
-            // mesh's chromatic transmittance is its only extra weight (`chromatic_correction`).
-            let voxel =
-                trace_volume_segment(Some(grid), &segment_volumes, origin, direction, rng, true)?;
+            // The voxel hero-channel flight and mesh analog collision are sampled independently; the nearer event receives
+            // the other medium's per-channel survival correction, and their densities form the distance MIS partner.
+            let voxel = trace_volume_segment(Some(grid), origin, direction, throughput, rng, true);
             let voxel_distance = voxel
                 .event
                 .map(|event| (event.point - origin).dot(direction));
             let limit = voxel_distance.unwrap_or(segment_limit);
             let collision = sample_mesh_collision(&medium, limit, rng);
-            let emission_end = collision.unwrap_or(limit);
-            radiance += throughput
-                * emission_until(
-                    Some(grid),
-                    voxel.stochastic,
-                    Some(&medium),
-                    true,
-                    emission_end,
-                );
             if let Some(distance) = collision {
-                if !voxel.stochastic {
-                    throughput *= (-grid_depth(grid, distance)).exp();
-                }
+                throughput *= if voxel.stochastic {
+                    grid_survival_weight(grid, distance, voxel.channel_pdf)
+                } else {
+                    (-grid_depth(grid, distance)).exp()
+                };
                 let scatter_rate = mean_scatter(&medium);
                 let extinction_rate = mean_extinction(&medium);
                 if scatter_rate <= 0.0 || rng.next_f64() * extinction_rate >= scatter_rate {
@@ -4771,7 +4807,7 @@ fn trace_path(
                 };
                 let event = VolumeEvent {
                     point: origin + direction * distance,
-                    albedo: DVec3::ZERO,
+                    scattering_weight: DVec3::ZERO,
                 };
                 let weights = event_weights(
                     &choices,
@@ -4780,7 +4816,7 @@ fn trace_path(
                     direction,
                     segment_limit,
                     distance,
-                    segment_scatter_pdf(Some(grid), Some(&medium), distance),
+                    segment_scatter_pdf(Some(grid), Some(&medium), distance, voxel.channel_pdf),
                 );
                 let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
                 radiance += throughput
@@ -4821,18 +4857,17 @@ fn trace_path(
             // No mesh collision before `limit`: the mesh's chromatic transmittance up to there, then the grid's own event
             // or the segment's end.
             throughput *= chromatic_correction(&medium, limit);
-            if !voxel.stochastic {
+            if voxel.event.is_none() {
                 throughput *= voxel.transmittance;
             }
             if throughput.max_element() <= 1.0e-8 {
                 break;
             }
             if let Some(event) = voxel.event {
-                let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
-                if scatter_probability <= 0.0 || rng.next_f64() >= scatter_probability {
+                if event.scattering_weight.max_element() <= 0.0 {
                     break;
                 }
-                throughput *= event.albedo / scatter_probability;
+                throughput *= event.scattering_weight;
                 let event_distance = (event.point - origin).dot(direction);
                 let phase = event_phase(&media, Some(grid), event_distance);
                 let Some(anisotropy) = phase.pick(rng) else {
@@ -4845,7 +4880,12 @@ fn trace_path(
                     direction,
                     segment_limit,
                     event_distance,
-                    segment_scatter_pdf(Some(grid), Some(&medium), event_distance),
+                    segment_scatter_pdf(
+                        Some(grid),
+                        Some(&medium),
+                        event_distance,
+                        voxel.channel_pdf,
+                    ),
                 );
                 let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
                 radiance += throughput
@@ -4885,17 +4925,9 @@ fn trace_path(
             }
         } else if terminal {
             // The path's last scatter has taken its direct light: this ray only attenuates through the volumes it crosses.
-            radiance += throughput
-                * emission_until(grid.as_ref(), false, stack.as_ref(), false, segment_limit);
             if let Some(grid) = grid.as_ref() {
-                let segment = trace_volume_segment(
-                    Some(grid),
-                    &segment_volumes,
-                    origin,
-                    direction,
-                    rng,
-                    false,
-                )?;
+                let segment =
+                    trace_volume_segment(Some(grid), origin, direction, throughput, rng, false);
                 throughput *= segment.transmittance;
             }
             if let Some(medium) = stack {
@@ -4906,24 +4938,19 @@ fn trace_path(
             }
         } else if let (Some(grid), None) = (grid.as_ref(), stack) {
             let segment =
-                trace_volume_segment(Some(grid), &segment_volumes, origin, direction, rng, true)?;
-            let emission_end = segment
-                .event
-                .map_or(segment_limit, |event| (event.point - origin).dot(direction));
-            radiance += throughput
-                * emission_until(Some(grid), segment.stochastic, None, false, emission_end);
-            if !segment.stochastic {
+                trace_volume_segment(Some(grid), origin, direction, throughput, rng, true);
+            if let Some(event) = segment.event {
+                if event.scattering_weight.max_element() <= 0.0 {
+                    break;
+                }
+                throughput *= event.scattering_weight;
+            } else {
                 throughput *= segment.transmittance;
             }
             if throughput.max_element() <= 1.0e-8 {
                 break;
             }
             if let Some(event) = segment.event {
-                let scatter_probability = (event.albedo.x + event.albedo.y + event.albedo.z) / 3.0;
-                if scatter_probability <= 0.0 || rng.next_f64() >= scatter_probability {
-                    break;
-                }
-                throughput *= event.albedo / scatter_probability;
                 let event_distance = (event.point - origin).dot(direction);
                 let phase = event_phase(&media, Some(grid), event_distance);
                 let Some(anisotropy) = phase.pick(rng) else {
@@ -4936,7 +4963,7 @@ fn trace_path(
                     direction,
                     grid_span(grid),
                     event_distance - grid.entry,
-                    segment_scatter_pdf(Some(grid), None, event_distance),
+                    segment_scatter_pdf(Some(grid), None, event_distance, segment.channel_pdf),
                 );
                 let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
                 radiance += throughput
@@ -4979,8 +5006,6 @@ fn trace_path(
             // flight is spectral ratio tracking (`trace_mesh_medium`). A scatter picks its closure by scatter weight.
             // A mesh medium's emission is integrated in closed form over the whole segment, at the throughput the path
             // carries into it, independent of where it scatters (`volume_integrate_homogeneous`).
-            radiance +=
-                throughput * emission_until(None, false, Some(&medium), false, segment_limit);
             match trace_mesh_medium(&medium, segment_limit, &mut throughput, rng) {
                 MediumOutcome::Scatter(distance) => {
                     let phase = event_phase(&media, None, distance);
@@ -4989,7 +5014,7 @@ fn trace_path(
                     };
                     let event = VolumeEvent {
                         point: origin + direction * distance,
-                        albedo: DVec3::ZERO,
+                        scattering_weight: DVec3::ZERO,
                     };
                     let weights = event_weights(
                         &choices,
@@ -4998,7 +5023,7 @@ fn trace_path(
                         direction,
                         segment_limit,
                         distance,
-                        segment_scatter_pdf(None, Some(&medium), distance),
+                        segment_scatter_pdf(None, Some(&medium), distance, DVec3::splat(1.0 / 3.0)),
                     );
                     let event_footprint = ray_dp + (event.point - origin).length() * ray_dd;
                     radiance += throughput
@@ -5380,7 +5405,7 @@ fn write_center_passes(
             )?;
             let Some(hit) = hit else {
                 if film_transparent {
-                    let alpha = 1.0 - volume_transmittance;
+                    let alpha = 1.0 - volume_transmittance.element_sum() / 3.0;
                     output.linear_rgba[index][3] = finite_f32(alpha);
                     output.rgba[index * 4 + 3] = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
                 } else {
@@ -5439,7 +5464,8 @@ fn write_center_passes(
             ];
             if film_transparent {
                 let coverage = surface.closures.coverage;
-                let alpha = coverage + (1.0 - coverage) * (1.0 - volume_transmittance);
+                let alpha =
+                    coverage + (1.0 - coverage) * (1.0 - volume_transmittance.element_sum() / 3.0);
                 output.linear_rgba[index][3] = finite_f32(alpha);
                 output.rgba[index * 4 + 3] = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
             }
@@ -6828,6 +6854,22 @@ fn shadow_transmittance_with_volumetric_shadows(
                     return false;
                 }
             };
+            if volumetric_shadows && !volumes.is_empty() {
+                match march_volumes(
+                    volumes,
+                    origin,
+                    direction,
+                    hit.distance,
+                    Some(rng),
+                    RayKind::Shadow,
+                ) {
+                    Ok(voxel_transmittance) => transmittance *= voxel_transmittance,
+                    Err(error) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                }
+            }
             if volumetric_shadows && let Some(stack) = stack_medium(&shadow_media) {
                 transmittance *= medium_transmittance(&stack, hit.distance);
             }
@@ -6877,7 +6919,7 @@ fn shadow_transmittance_with_volumetric_shadows(
             RayKind::Shadow,
         )?
     } else {
-        1.0
+        DVec3::ONE
     };
     Ok(transmittance.clamp(DVec3::ZERO, DVec3::ONE) * volume_transmittance)
 }
@@ -8045,9 +8087,6 @@ fn collect_volumes<'a>(
             None => ([0.5; 3], [0.5; 3]),
         };
         let extinction: [f64; 3] = std::array::from_fn(|index| scatter[index] + absorption[index]);
-        let extinction_scale = extinction.iter().sum::<f64>() / 3.0;
-        // Voxel transport is scalar: extinction is the channel mean of σt per unit grid density, and
-        // the albedo is the per-channel σs / σt. That is exact for grey media only.
         let extinction_rgb_scale = DVec3::from_array(extinction);
         let albedo = DVec3::from_array(std::array::from_fn(|index| {
             if extinction[index] > 0.0 {
@@ -8058,20 +8097,6 @@ fn collect_volumes<'a>(
         }))
         .clamp(DVec3::ZERO, DVec3::ONE);
         let scattering = scatter.iter().any(|weight| *weight > 0.0);
-        if (has_volume_output || simple_volume)
-            && extinction
-                .iter()
-                .any(|weight| (weight - extinction_scale).abs() > 1.0e-12)
-        {
-            warnings.borrow_mut().push(serde_json::json!({
-                "code": "UNSUPPORTED_FEATURE",
-                "feature_id": "shader.volume.spectral_extinction",
-                "node_id": node_id.to_string(),
-                "message": format!(
-                    "Volume '{node_id}' has per-channel extinction; voxel volumes transport the channel-mean extinction, so the colour of its absorption and scattering is approximated"
-                ),
-            }));
-        }
         let emission = if has_volume_output || simple_volume {
             params.map_or(DVec3::ZERO, |params| {
                 DVec3::from_array(params.volume_emission)
@@ -8126,7 +8151,6 @@ fn collect_volumes<'a>(
             lobes,
             emission,
             scattering,
-            extinction_scale,
             extinction_rgb_scale,
             sampling: params.map_or(crate::model::VolumeSampling::default(), |params| {
                 params.volume_sampling
@@ -8439,8 +8463,8 @@ fn medium_transmittance(params: &BsdfParams, length: f64) -> DVec3 {
     }))
 }
 
-fn volume_extinction_density(instance: &VolumeInstance<'_>, density: f64) -> f64 {
-    density.max(0.0) * instance.extinction_scale
+fn volume_extinction_rgb_density(instance: &VolumeInstance<'_>, density: f64) -> DVec3 {
+    instance.extinction_rgb_scale * density.max(0.0)
 }
 
 /// The weight of each light's direct light at a distance-sampled scatter event (`volume_direct_scatter_mis`): zero
@@ -8470,19 +8494,22 @@ fn event_weights(
         })
         .collect()
 }
-/// One voxel segment's sampling grid, as `trace_volume_segment` samples it: the steps across the volumes' bounds
-/// along the ray, with each step's grey extinction, emission and scatter per channel at its midpoint. The
-/// equiangular direct light reads the same grid, so its transmittance and scatter densities are the sampler's own.
+/// One voxel segment's per-step RGB extinction, emission, and scatter. Distance sampling selects a hero channel from the
+/// segment's albedo/throughput PDF; equiangular MIS uses the same channel-mixture scatter density.
 struct VoxelGrid {
     entry: f64,
     step: f64,
     meters_per_unit: f64,
-    /// Grey extinction per meter of each step.
-    extinction: Vec<f64>,
+    /// Per-channel extinction per meter of each step.
+    extinction: Vec<DVec3>,
     /// Emission per meter of each step.
     emission: Vec<DVec3>,
     /// Scatter per meter and channel of each step, summed over the volumes.
     scatter: Vec<DVec3>,
+    /// Grid-wide single-scattering albedo used to select the hero channel.
+    channel_albedo: DVec3,
+    /// All per-step extinction and scattering coefficients have identical RGB channels.
+    achromatic: bool,
     /// The scatter of the volumes with each anisotropy, so every phase is evaluated with its own volumes.
     groups: Vec<ScatterGroup>,
     stochastic: bool,
@@ -8532,7 +8559,7 @@ fn voxel_grid(
             minimum_step = minimum_step.min(volume_sampling_step(instance, local_direction));
             stochastic |= instance.scattering
                 && instance.albedo.max_element() > 0.0
-                && instance.extinction_scale > 0.0;
+                && instance.extinction_rgb_scale.max_element() > 0.0;
             samplings.push(instance.sampling);
         }
     }
@@ -8562,17 +8589,22 @@ fn voxel_grid(
     let mut extinction = Vec::with_capacity(steps);
     let mut emission = Vec::with_capacity(steps);
     let mut scatter = vec![DVec3::ZERO; steps];
+    let mut total_extinction = DVec3::ZERO;
+    let mut total_scatter = DVec3::ZERO;
+    let mut achromatic = true;
     for (index, step_total) in scatter.iter_mut().enumerate() {
         let point = origin + direction * (entry + (index as f64 + 0.5) * step);
-        let mut step_extinction = 0.0;
+        let mut step_extinction = DVec3::ZERO;
         let mut step_emission = DVec3::ZERO;
         for instance in volumes {
             let density = volume_density_at(instance, point)?;
-            let coefficient = volume_extinction_density(instance, density);
+            let coefficient = volume_extinction_rgb_density(instance, density);
             let step_scatter = instance.albedo * coefficient;
             step_extinction += coefficient;
             step_emission += instance.emission;
             *step_total += step_scatter;
+            total_extinction += coefficient;
+            total_scatter += step_scatter;
             for lobe in &instance.lobes {
                 if let Some(group) = groups
                     .iter_mut()
@@ -8582,9 +8614,23 @@ fn voxel_grid(
                 }
             }
         }
+        achromatic &= step_extinction.x.total_cmp(&step_extinction.y).is_eq()
+            && step_extinction.y.total_cmp(&step_extinction.z).is_eq()
+            && step_total.x.total_cmp(&step_total.y).is_eq()
+            && step_total.y.total_cmp(&step_total.z).is_eq();
         extinction.push(step_extinction);
         emission.push(step_emission);
     }
+    let extinction_channels = total_extinction.to_array();
+    let scatter_channels = total_scatter.to_array();
+    let channel_albedo = DVec3::from_array(std::array::from_fn(|index| {
+        if extinction_channels[index] > 0.0 {
+            scatter_channels[index] / extinction_channels[index]
+        } else {
+            1.0
+        }
+    }))
+    .clamp(DVec3::ZERO, DVec3::ONE);
     Ok(Some(VoxelGrid {
         entry,
         step,
@@ -8592,6 +8638,8 @@ fn voxel_grid(
         extinction,
         emission,
         scatter,
+        channel_albedo,
+        achromatic,
         groups,
         stochastic,
         samplings,
@@ -8600,15 +8648,15 @@ fn voxel_grid(
 
 /// The optical depth, in meters, from the segment origin to `distance` along the grid's steps. Each step is
 /// linear in its own distance, as the sampler accumulates it.
-fn grid_depth(grid: &VoxelGrid, distance: f64) -> f64 {
-    let mut depth = 0.0;
+fn grid_depth(grid: &VoxelGrid, distance: f64) -> DVec3 {
+    let mut depth = DVec3::ZERO;
     for (index, extinction) in grid.extinction.iter().enumerate() {
         let start = grid.entry + index as f64 * grid.step;
         if distance <= start {
             break;
         }
         let covered = distance.min(start + grid.step) - start;
-        depth += extinction * covered * grid.meters_per_unit;
+        depth += *extinction * (covered * grid.meters_per_unit);
     }
     depth
 }
@@ -8624,24 +8672,43 @@ fn grid_scatter_at(grid: &VoxelGrid, values: &[DVec3], distance: f64) -> DVec3 {
     grid_step_index(grid, distance).map_or(DVec3::ZERO, |index| values[index])
 }
 
-/// The density per unit distance, of the scatter events of the grid at `distance`, that the distance sampler
-/// realises: the channel-mean scatter per meter, transmitted over the depth to `distance`. It is a positive
-/// function of `distance` for the MIS weights, and the estimator is unbiased for any such function.
-fn grid_scatter_pdf(grid: &VoxelGrid, distance: f64) -> f64 {
-    let scatter = grid_scatter_at(grid, &grid.scatter, distance).element_sum() / 3.0;
-    scatter * grid.meters_per_unit * (-grid_depth(grid, distance)).exp()
+fn grid_channel_pdf(grid: &VoxelGrid, throughput: DVec3) -> DVec3 {
+    volume_channel_pdf(grid.channel_albedo, throughput)
+}
+
+fn volume_channel_pdf(albedo: DVec3, throughput: DVec3) -> DVec3 {
+    let weights = (albedo * throughput).abs();
+    let sum = weights.element_sum();
+    if (1.0 - sum) < 1.0 {
+        weights / sum
+    } else {
+        DVec3::splat(1.0 / 3.0)
+    }
+}
+
+fn grid_survival_pdf(grid: &VoxelGrid, distance: f64, channel_pdf: DVec3) -> f64 {
+    channel_pdf.dot((-grid_depth(grid, distance)).exp())
+}
+fn grid_survival_weight(grid: &VoxelGrid, distance: f64, channel_pdf: DVec3) -> DVec3 {
+    let transmittance = (-grid_depth(grid, distance)).exp();
+    let survival_pdf = grid_survival_pdf(grid, distance, channel_pdf);
+    if survival_pdf > 0.0 {
+        transmittance / survival_pdf
+    } else {
+        DVec3::ZERO
+    }
+}
+
+/// The density per unit distance of grid scatter under the hero-channel mixture: per-channel scatter times
+/// transmittance, weighted by the channel PDF.
+fn grid_scatter_pdf(grid: &VoxelGrid, distance: f64, channel_pdf: DVec3) -> f64 {
+    let scatter = grid_scatter_at(grid, &grid.scatter, distance) * grid.meters_per_unit;
+    channel_pdf.dot(scatter * (-grid_depth(grid, distance)).exp())
 }
 
 /// The per-channel extinction of a medium: its scatter plus its absorption, per unit length.
 fn medium_extinction(medium: &BsdfParams) -> DVec3 {
     DVec3::from_array(medium.volume_scatter) + DVec3::from_array(medium.volume_absorption)
-}
-
-/// The per-channel extinction above the channel mean of a mesh medium: the exponent that grey analog sampling leaves to
-/// the channels (`chromatic_correction` is its exponential).
-fn mesh_chromatic(medium: &BsdfParams) -> DVec3 {
-    let extinction = medium_extinction(medium);
-    extinction - DVec3::splat(extinction.element_sum() / 3.0)
 }
 
 /// One piece of a segment's emission, `length` scene units long: `source` per unit length, weighted by the transmittance
@@ -8667,26 +8734,10 @@ fn add_emission_piece(
     *exponent += rate * length;
 }
 
-/// The emission of a segment from its origin to `end`, per channel. A voxel grid contributes its per-step emission and
-/// extinction, and a mesh medium its constant emission and extinction, all in one walk over the pieces. A grid that is
-/// `grid_analog` (stochastic) takes no transmittance weight of its own: its collisions end the emission
-/// (`trace_volume_segment`). A mesh that is `mesh_analog` carries only its chromatic excess over the channel mean, since the
-/// analog survival of the mean is the sampling (`mesh_chromatic`). A deterministic medium carries its full transmittance,
-/// as Cycles' homogeneous integrator does (`volume_integrate_homogeneous`).
-fn emission_until(
-    grid: Option<&VoxelGrid>,
-    grid_analog: bool,
-    mesh: Option<&BsdfParams>,
-    mesh_analog: bool,
-    end: f64,
-) -> DVec3 {
-    let mesh_rate = mesh.map_or(DVec3::ZERO, |medium| {
-        if mesh_analog {
-            mesh_chromatic(medium)
-        } else {
-            medium_extinction(medium)
-        }
-    });
+/// The exact RGB emission integral from the segment origin to `end`. Voxel coefficients are piecewise constant, and mesh
+/// coefficients are constant, so each piece has a closed-form Beer-Lambert integral.
+fn emission_until(grid: Option<&VoxelGrid>, mesh: Option<&BsdfParams>, end: f64) -> DVec3 {
+    let mesh_rate = mesh.map_or(DVec3::ZERO, medium_extinction);
     let mesh_source = mesh.map_or(DVec3::ZERO, |medium| {
         DVec3::from_array(medium.volume_emission)
     });
@@ -8710,17 +8761,13 @@ fn emission_until(
             }
             let covered = (start + grid.step).min(end) - position;
             if covered > 0.0 {
-                let grid_rate = if grid_analog {
-                    0.0
-                } else {
-                    extinction * grid.meters_per_unit
-                };
+                let grid_rate = *extinction * grid.meters_per_unit;
                 let grid_source = grid.emission[index] * grid.meters_per_unit;
                 add_emission_piece(
                     &mut emitted,
                     &mut exponent,
                     covered,
-                    mesh_rate + DVec3::splat(grid_rate),
+                    mesh_rate + grid_rate,
                     grid_source + mesh_source,
                 );
                 position += covered;
@@ -8742,24 +8789,36 @@ fn emission_until(
     emitted
 }
 
-/// Trace one voxel segment's free flight on its grid with the distance sampler's events, and its transmittance
-/// (`volume_integrate_heterogeneous`, with the grid's grey transport). The caller integrates the emission up to the event
-/// with `emission_until`.
+/// Samples one RGB hero channel, then samples a free flight in that channel. The event's RGB
+/// scattering weight divides the per-channel scatter/transmittance by the mixture distance PDF.
 fn trace_volume_segment(
     grid: Option<&VoxelGrid>,
-    volumes: &[VolumeInstance<'_>],
     origin: DVec3,
     direction: DVec3,
+    throughput: DVec3,
     rng: &mut Pcg32,
-    // False for a ray that may not collide any more: its segment only attenuates.
     events: bool,
-) -> Result<VolumeSegment> {
+) -> VolumeSegment {
     let Some(grid) = grid else {
-        return Ok(VolumeSegment {
-            transmittance: 1.0,
+        return VolumeSegment {
+            transmittance: DVec3::ONE,
             event: None,
             stochastic: false,
-        });
+            channel_pdf: DVec3::splat(1.0 / 3.0),
+        };
+    };
+    let channel_pdf = grid_channel_pdf(grid, throughput);
+    let channel = if grid.stochastic && events && !grid.achromatic {
+        let sample = rng.next_f64();
+        if sample < channel_pdf.x {
+            0
+        } else if sample < channel_pdf.x + channel_pdf.y {
+            1
+        } else {
+            2
+        }
+    } else {
+        0
     };
     let free_flight = if grid.stochastic && events {
         -rng.next_f64().max(f64::MIN_POSITIVE).ln()
@@ -8768,59 +8827,64 @@ fn trace_volume_segment(
     };
     let step_in_meters = grid.step * grid.meters_per_unit;
     let mut accumulated_depth = 0.0;
-    for (index, &extinction) in grid.extinction.iter().enumerate() {
-        if extinction <= 0.0 {
+    for (index, extinction) in grid.extinction.iter().enumerate() {
+        let sigma_t = extinction.to_array()[channel];
+        if sigma_t <= 0.0 {
             continue;
         }
         let start = grid.entry + index as f64 * grid.step;
-        let step_depth = extinction * step_in_meters;
-        let event_in_step = free_flight <= accumulated_depth + step_depth;
-        let traveled_meters = if event_in_step {
-            ((free_flight - accumulated_depth) / extinction).clamp(0.0, step_in_meters)
-        } else {
-            step_in_meters
-        };
-        accumulated_depth += extinction * traveled_meters;
-        if event_in_step {
-            let event_point = origin + direction * (start + traveled_meters / grid.meters_per_unit);
-            let midpoint = origin + direction * (start + grid.step * 0.5);
-            let selected = rng.next_f64() * extinction;
-            let mut weight = 0.0;
-            let mut chosen = None;
-            for instance in volumes {
-                let density = volume_density_at(instance, midpoint)?;
-                weight += volume_extinction_density(instance, density);
-                if selected <= weight {
-                    chosen = Some(instance);
-                    break;
+        let step_depth = sigma_t * step_in_meters;
+        if free_flight <= accumulated_depth + step_depth {
+            let traveled_meters =
+                ((free_flight - accumulated_depth) / sigma_t).clamp(0.0, step_in_meters);
+            let event_distance = start + traveled_meters / grid.meters_per_unit;
+            let point = origin + direction * event_distance;
+            let transmittance = (-grid_depth(grid, event_distance)).exp();
+            let scatter = grid_scatter_at(grid, &grid.scatter, event_distance);
+            let scatter_probability = if sigma_t > 0.0 {
+                scatter.to_array()[channel] / sigma_t
+            } else {
+                0.0
+            };
+            let scattering_weight = if rng.next_f64() < scatter_probability {
+                let scatter_pdf = channel_pdf.dot(scatter * grid.meters_per_unit * transmittance);
+                if scatter_pdf > 0.0 {
+                    scatter * (grid.meters_per_unit / scatter_pdf) * transmittance
+                } else {
+                    DVec3::ZERO
                 }
-            }
-            let event = chosen.map_or(
-                VolumeEvent {
-                    point: event_point,
-                    albedo: DVec3::ZERO,
-                },
-                |instance| VolumeEvent {
-                    point: event_point,
-                    albedo: if instance.scattering {
-                        instance.albedo
-                    } else {
-                        DVec3::ZERO
-                    },
-                },
-            );
-            return Ok(VolumeSegment {
-                transmittance: (-accumulated_depth).exp(),
-                event: Some(event),
+            } else {
+                DVec3::ZERO
+            };
+            return VolumeSegment {
+                transmittance: DVec3::ONE,
+                event: Some(VolumeEvent {
+                    point,
+                    scattering_weight,
+                }),
                 stochastic: grid.stochastic,
-            });
+                channel_pdf,
+            };
         }
+        accumulated_depth += step_depth;
     }
-    Ok(VolumeSegment {
-        transmittance: (-accumulated_depth).exp(),
+    let distance = grid.entry + grid_span(grid);
+    let transmittance = (-grid_depth(grid, distance)).exp();
+    let survival_pdf = if grid.stochastic && events {
+        grid_survival_pdf(grid, distance, channel_pdf)
+    } else {
+        1.0
+    };
+    VolumeSegment {
+        transmittance: if survival_pdf > 0.0 {
+            transmittance / survival_pdf
+        } else {
+            DVec3::ZERO
+        },
         event: None,
-        stochastic: grid.stochastic,
-    })
+        stochastic: grid.stochastic && events,
+        channel_pdf,
+    }
 }
 
 fn volume_contains_point(instance: &VolumeInstance<'_>, world_position: DVec3) -> bool {
@@ -8895,7 +8959,7 @@ fn march_volumes(
     max_distance: f64,
     rng: Option<&mut Pcg32>,
     ray: RayKind,
-) -> Result<f64> {
+) -> Result<DVec3> {
     march_volumes_with_budget(
         volumes,
         origin,
@@ -8915,9 +8979,9 @@ fn march_volumes_with_budget(
     mut rng: Option<&mut Pcg32>,
     step_budget: usize,
     ray: RayKind,
-) -> Result<f64> {
+) -> Result<DVec3> {
     let step_budget = step_budget.max(1);
-    let mut transmittance = 1.0;
+    let mut transmittance = DVec3::ONE;
     for instance in volumes {
         if instance.ray_mask & ray.bit() == 0 {
             continue;
@@ -8953,7 +9017,7 @@ fn march_volumes_with_budget(
         if let (Some(random), Some((minimum_density, maximum_density))) =
             (rng.as_deref_mut(), instance.density_range)
         {
-            let majorant = volume_extinction_density(instance, maximum_density);
+            let majorant = instance.extinction_rgb_scale.max_element() * maximum_density;
             if majorant > 0.0 && (maximum_density - minimum_density).abs() > f64::EPSILON {
                 let mut distance = entry;
                 for _ in 0..step_budget {
@@ -8972,16 +9036,21 @@ fn march_volumes_with_budget(
                             "volume density is not finite",
                         ));
                     }
-                    transmittance *=
-                        1.0 - volume_extinction_density(instance, density).min(majorant) / majorant;
-                    if transmittance <= 1.0e-6 {
+                    transmittance *= DVec3::ONE
+                        - volume_extinction_rgb_density(instance, density)
+                            .min(DVec3::splat(majorant))
+                            / majorant;
+                    if transmittance.max_element() <= 1.0e-6 {
                         break;
                     }
                 }
             } else if majorant > 0.0 {
-                transmittance *= (-majorant * segment_length * instance.meters_per_unit).exp();
+                transmittance *= (-volume_extinction_rgb_density(instance, maximum_density)
+                    * segment_length
+                    * instance.meters_per_unit)
+                    .exp();
             }
-            if transmittance <= 1.0e-6 {
+            if transmittance.max_element() <= 1.0e-6 {
                 break;
             }
             continue;
@@ -9003,19 +9072,20 @@ fn march_volumes_with_budget(
                     "volume density is not finite",
                 ));
             }
-            let attenuation =
-                (-volume_extinction_density(instance, density) * step * instance.meters_per_unit)
-                    .exp();
+            let attenuation = (-volume_extinction_rgb_density(instance, density)
+                * step
+                * instance.meters_per_unit)
+                .exp();
             transmittance *= attenuation;
-            if transmittance <= 1.0e-6 {
+            if transmittance.max_element() <= 1.0e-6 {
                 break;
             }
         }
-        if transmittance <= 1.0e-6 {
+        if transmittance.max_element() <= 1.0e-6 {
             break;
         }
     }
-    Ok(transmittance)
+    Ok(transmittance.clamp(DVec3::ZERO, DVec3::ONE))
 }
 
 fn sample_henyey_greenstein_direction(incoming: DVec3, anisotropy: f64, rng: &mut Pcg32) -> DVec3 {
@@ -9227,7 +9297,6 @@ mod volume_extinction_tests {
             lobes: scatter_lobes(&[]),
             emission: DVec3::ZERO,
             scattering: false,
-            extinction_scale: 1.0,
             extinction_rgb_scale: DVec3::ONE,
             sampling: crate::model::VolumeSampling::MultipleImportance,
             interpolation: crate::model::VolumeInterpolation::Linear,
@@ -9245,7 +9314,10 @@ mod volume_extinction_tests {
         )?;
 
         assert!(
-            (transmittance - (-1.0_f64).exp()).abs() <= 1.0e-12,
+            (transmittance - DVec3::splat((-1.0_f64).exp()))
+                .abs()
+                .max_element()
+                <= 1.0e-12,
             "2 scene units at 0.5 m/unit should attenuate by one meter"
         );
         Ok(())
@@ -9278,7 +9350,6 @@ mod volume_extinction_tests {
             }],
             emission: DVec3::ZERO,
             scattering: false,
-            extinction_scale: 1.0,
             extinction_rgb_scale: DVec3::ONE,
             sampling: crate::model::VolumeSampling::default(),
             interpolation: crate::model::VolumeInterpolation::Linear,
@@ -9300,16 +9371,22 @@ mod volume_extinction_tests {
         };
         let hidden_from_camera = [instance(shadow_only)];
         assert!(
-            (march(&hidden_from_camera, RayKind::Camera)? - 1.0).abs() <= 1.0e-12,
+            (march(&hidden_from_camera, RayKind::Camera)? - DVec3::ONE)
+                .abs()
+                .max_element()
+                <= 1.0e-12,
             "a volume hidden from camera rays must pass them"
         );
         assert!(
-            march(&hidden_from_camera, RayKind::Shadow)? < 0.9,
+            march(&hidden_from_camera, RayKind::Shadow)?.max_element() < 0.9,
             "a volume visible to shadows must shadow"
         );
         let hidden_from_shadow = [instance(camera_only)];
         assert!(
-            (march(&hidden_from_shadow, RayKind::Shadow)? - 1.0).abs() <= 1.0e-12,
+            (march(&hidden_from_shadow, RayKind::Shadow)? - DVec3::ONE)
+                .abs()
+                .max_element()
+                <= 1.0e-12,
             "a volume hidden from shadows must pass shadow rays"
         );
         Ok(())
