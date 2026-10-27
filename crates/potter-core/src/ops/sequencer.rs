@@ -552,7 +552,7 @@ mod tests {
                     "id": "title",
                     "type": "text",
                     "font": "asset://font_lato",
-                    "wrap_width": 0.32
+                    "wrap_width": 1.5
                 }]
             }),
         )
@@ -561,7 +561,7 @@ mod tests {
             .sequencer
             .strips[0];
         assert_eq!(strip.font.as_deref(), Some("asset://font_lato"));
-        assert_eq!(strip.wrap_width, 0.32);
+        assert_eq!(strip.wrap_width, 1.5);
 
         let updated = apply_batch(
             &created.doc,
@@ -571,7 +571,7 @@ mod tests {
                 "operations": [{
                     "op": "sequencer.strip_update",
                     "id": "title",
-                    "set": {"font": "/fonts/Lato-Regular.ttf", "wrap_width": 0.5}
+                    "set": {"font": "/fonts/Lato-Regular.ttf", "wrap_width": 2.0}
                 }]
             }),
         )
@@ -580,7 +580,7 @@ mod tests {
             .sequencer
             .strips[0];
         assert_eq!(strip.font.as_deref(), Some("/fonts/Lato-Regular.ttf"));
-        assert_eq!(strip.wrap_width, 0.5);
+        assert_eq!(strip.wrap_width, 2.0);
 
         let cleared = apply_batch(
             &updated.doc,
@@ -653,23 +653,21 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.code, ErrorCode::InvalidOperation);
         }
-        for (index, wrap_width) in [-0.1, 1.01].into_iter().enumerate() {
-            let error = apply_batch(
-                &doc,
-                &json!({
-                    "schema_version": 1,
-                    "base_revision": 0,
-                    "operations": [{
-                        "op": "sequencer.strip_create",
-                        "id": format!("invalid_wrap_{index}"),
-                        "type": "text",
-                        "wrap_width": wrap_width
-                    }]
-                }),
-            )
-            .unwrap_err();
-            assert_eq!(error.code, ErrorCode::InvalidOperation);
-        }
+        let error = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "sequencer.strip_create",
+                    "id": "negative_wrap",
+                    "type": "text",
+                    "wrap_width": -0.1
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
         let error = apply_batch(
             &doc,
             &json!({
@@ -679,7 +677,7 @@ mod tests {
                     "op": "sequencer.strip_create",
                     "id": "non_text_wrap",
                     "type": "image",
-                    "wrap_width": 0.32
+                    "wrap_width": 1.5
                 }]
             }),
         )

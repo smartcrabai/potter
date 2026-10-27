@@ -2766,7 +2766,7 @@ pub fn feature_catalog() -> Value {
             );
             row["status"] = json!("partial");
             row["reason"] = json!(
-                "Text-strip wrap_width is preserved by import, operations, inspect, and export and follows Blender's U+0020/LF wrapping behavior; zero disables wrapping. Non-default font size, position, alignment, line spacing, bold/italic, shadow, outline, and box settings remain import losses."
+                "Text-strip wrap_width is preserved by import, operations, inspect, and export and follows Blender's U+0020/LF wrapping behavior for strips with explicit fonts; zero disables wrapping. Non-default wrap_width is reported as a layout loss without an explicit font. Non-default font size, position, alignment, line spacing, bold/italic, shadow, outline, and box settings remain import losses."
             );
             row
         },

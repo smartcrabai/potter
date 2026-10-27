@@ -13,7 +13,7 @@ mod blender_file;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-const FRAME_CASES: [(u32, &str, &str); 7] = [
+const FRAME_CASES: [(u32, &str, &str); 9] = [
     (1, "noto_cjk_multiline_text", "日本語\n漢字中文"),
     (2, "lato_accented_multiline_text", "AV Café\nÀ bientôt"),
     (3, "liberation_av_kern_text", "AV"),
@@ -21,13 +21,20 @@ const FRAME_CASES: [(u32, &str, &str); 7] = [
     (5, "cjk_ideographic_space_wrap_text", "日本語　漢"),
     (6, "cjk_ascii_space_wrap_text", "日本語 漢"),
     (7, "lato_italic_final_negative_lsb_text", "AF"),
+    (8, "liberation_hello_center_text", "Hello"),
+    (9, "cjk_crlf_ascii_space_wrap_text", "日本語漢字 \r\n日本"),
 ];
-const HALF_RESOLUTION_CASES: [(u32, &str, &str); 1] = [(1, "scaled_size_50_percent_text", "M")];
-const HALF_RESOLUTION_PIXEL_PARITY_LIMITS: [(u64, f64, u32); 1] = [(3_013, 0.400, 1)];
-const WRAP_WIDTH_CASES: [(&str, f64); 3] = [
+const HALF_RESOLUTION_CASES: [(u32, &str, &str); 2] = [
+    (1, "scaled_size_50_percent_text", "M"),
+    (2, "liberation_multiline_50_percent_text", "A\nB\nC"),
+];
+const HALF_RESOLUTION_PIXEL_PARITY_LIMITS: [(u64, f64, u32); 2] =
+    [(176, 0.087_311, 0), (425, 0.271_409, 1)];
+const WRAP_WIDTH_CASES: [(&str, f64); 4] = [
     ("cjk_no_space_overflow_text", 0.24),
     ("cjk_ideographic_space_wrap_text", 0.24),
     ("cjk_ascii_space_wrap_text", 0.24),
+    ("liberation_hello_center_text", 1.5),
 ];
 
 fn pot() -> Command {
@@ -229,13 +236,16 @@ fn compare_frame(
     Ok(metrics)
 }
 
-const PIXEL_PARITY_LIMITS: [(u64, f64, u32); 2] = [(5_514, 2.540, 2), (3_013, 0.400, 1)];
-const ADDITIONAL_PIXEL_PARITY_LIMITS: [(u64, f64, u32); 5] = [
-    PIXEL_PARITY_LIMITS[1],
-    PIXEL_PARITY_LIMITS[0],
-    PIXEL_PARITY_LIMITS[0],
-    PIXEL_PARITY_LIMITS[0],
-    PIXEL_PARITY_LIMITS[1],
+const PIXEL_PARITY_LIMITS: [(u64, f64, u32); 9] = [
+    (3_666, 0.771_729, 1),
+    (3_013, 0.399_647, 1),
+    (452, 0.035_824, 1),
+    (2_798, 0.607_094, 1),
+    (2_362, 0.492_100, 1),
+    (2_362, 0.491_951, 1),
+    (399, 0.031_701, 0),
+    (869, 0.121_659, 1),
+    (3_667, 0.758_828, 1),
 ];
 
 fn measure_blender_parity_cases(
@@ -279,20 +289,11 @@ fn measure_blender_parity_cases(
 }
 
 fn measure_blender_parity(render_dir: &Path, fixture_dir: &Path) -> TestResult {
-    let limits = [
-        PIXEL_PARITY_LIMITS[0],
-        PIXEL_PARITY_LIMITS[1],
-        ADDITIONAL_PIXEL_PARITY_LIMITS[0],
-        ADDITIONAL_PIXEL_PARITY_LIMITS[1],
-        ADDITIONAL_PIXEL_PARITY_LIMITS[2],
-        ADDITIONAL_PIXEL_PARITY_LIMITS[3],
-        ADDITIONAL_PIXEL_PARITY_LIMITS[4],
-    ];
     measure_blender_parity_cases(
         render_dir,
         fixture_dir,
         &FRAME_CASES,
-        &limits,
+        &PIXEL_PARITY_LIMITS,
         "supported_frame_",
     )
 }
@@ -313,7 +314,7 @@ fn unicode_text_strips_import_render_inspect_and_packed_round_trip_match_blender
     inspect_fonts(&project, &FRAME_CASES, &WRAP_WIDTH_CASES)?;
 
     let render_dir = root.path().join("unicode_text_render");
-    render_frames(&project, &render_dir, "1:7")?;
+    render_frames(&project, &render_dir, "1:9")?;
     measure_blender_parity(&render_dir, &fixture_dir)?;
 
     let half_source_blend = fixture_dir.join("vse_text_unicode_half_resolution.blend");
@@ -324,7 +325,7 @@ fn unicode_text_strips_import_render_inspect_and_packed_round_trip_match_blender
     inspect_fonts(&half_project, &HALF_RESOLUTION_CASES, &[])?;
 
     let half_render_dir = root.path().join("unicode_text_half_resolution_render");
-    render_frames(&half_project, &half_render_dir, "1:1")?;
+    render_frames(&half_project, &half_render_dir, "1:2")?;
     measure_blender_parity_cases(
         &half_render_dir,
         &fixture_dir,
@@ -353,7 +354,7 @@ fn unicode_text_strips_import_render_inspect_and_packed_round_trip_match_blender
     inspect_fonts(&round_trip, &FRAME_CASES, &WRAP_WIDTH_CASES)?;
 
     let round_trip_render = root.path().join("unicode_text_round_trip_render");
-    render_frames(&round_trip, &round_trip_render, "1:7")?;
+    render_frames(&round_trip, &round_trip_render, "1:9")?;
     measure_blender_parity(&round_trip_render, &fixture_dir)?;
     Ok(())
 }

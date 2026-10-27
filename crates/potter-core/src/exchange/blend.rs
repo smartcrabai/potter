@@ -6116,9 +6116,9 @@ fn parse_sequencer(
                                 "Blender VSE text wrap width must be a finite number",
                             )
                         })?;
-                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    if !value.is_finite() || value < 0.0 || !(value as f32).is_finite() {
                         return Err(invalid_intermediate(
-                            "Blender VSE text wrap width must be between 0 and 1",
+                            "Blender VSE text wrap width must be finite and nonnegative",
                         ));
                     }
                     value as f32
@@ -10960,10 +10960,14 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             }
             let name = strip.get("name").and_then(Value::as_str);
             let settings = strip.get("text_settings");
+            let has_explicit_font = strip
+                .get("font")
+                .and_then(Value::as_str)
+                .is_some_and(|font| !font.is_empty());
             let has_non_default_settings =
                 settings.and_then(Value::as_object).is_some_and(|settings| {
                     settings.iter().any(|(field, setting)| {
-                        field != "wrap_width"
+                        (field != "wrap_width" || !has_explicit_font)
                             && setting
                                 .get("value")
                                 .zip(setting.get("default"))
@@ -10981,10 +10985,6 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                 .get("text")
                 .and_then(Value::as_str)
                 .is_some_and(|text| !text.is_ascii());
-            let has_explicit_font = strip
-                .get("font")
-                .and_then(Value::as_str)
-                .is_some_and(|font| !font.is_empty());
             if contains_unicode && !has_explicit_font {
                 losses.push(loss(
                     "sequencer.strip.text.unicode",
@@ -13852,6 +13852,7 @@ mod tests {
             "sequencer": {
                 "strips": [
                     {"name":"custom","type":"text","font":"asset://font_lato","text_settings":{"wrap_width":{"value":0.32,"default":1.0}}},
+                    {"name":"wide","type":"text","font":"asset://font_lato","text_settings":{"wrap_width":{"value":1.5,"default":1.0}}},
                     {"name":"legacy","type":"text"}
                 ]
             }
@@ -13862,14 +13863,15 @@ mod tests {
             Some("asset://font_lato")
         );
         assert_eq!(sequencer.strips[0].wrap_width, 0.32);
-        assert_eq!(sequencer.strips[1].wrap_width, 1.0);
-        assert_eq!(sequencer.strips[1].font, None);
+        assert_eq!(sequencer.strips[1].wrap_width, 1.5);
+        assert_eq!(sequencer.strips[2].wrap_width, 1.0);
+        assert_eq!(sequencer.strips[2].font, None);
         Ok(())
     }
 
     #[test]
     fn sequencer_text_import_rejects_invalid_wrap_widths() {
-        for wrap_width in [json!(-0.1), json!(1.01), json!(1.0e300), json!(null)] {
+        for wrap_width in [json!(-0.1), json!(1.0e300), json!(null)] {
             let raw = json!({
                 "sequencer": {
                     "strips": [{
@@ -13911,6 +13913,13 @@ mod tests {
                         "name":"wrapped",
                         "type":"text",
                         "text":"Wrapped",
+                        "font":"/fonts/Lato-Regular.ttf",
+                        "text_settings":{"wrap_width":{"value":0.32,"default":1.0}}
+                    },
+                    {
+                        "name":"fontless_wrapped",
+                        "type":"text",
+                        "text":"Fontless wrapped",
                         "font":null,
                         "text_settings":{"wrap_width":{"value":0.32,"default":1.0}}
                     },
@@ -13945,8 +13954,17 @@ mod tests {
             .iter()
             .filter(|loss| loss.feature_id == "sequencer.strip.text.layout")
             .collect::<Vec<_>>();
-        assert_eq!(layout_losses.len(), 1);
-        assert_eq!(layout_losses[0].data_id.as_deref(), Some("layout"));
+        assert_eq!(layout_losses.len(), 2);
+        assert!(
+            layout_losses
+                .iter()
+                .any(|loss| loss.data_id.as_deref() == Some("layout"))
+        );
+        assert!(
+            layout_losses
+                .iter()
+                .any(|loss| loss.data_id.as_deref() == Some("fontless_wrapped"))
+        );
         let unicode_losses = losses
             .iter()
             .filter(|loss| loss.feature_id == "sequencer.strip.text.unicode")

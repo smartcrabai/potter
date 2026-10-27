@@ -5,8 +5,9 @@ Regenerate from any directory with:
     /Applications/Blender.app/Contents/MacOS/Blender -b --factory-startup --threads 1 \
         -P /Users/admin/apps/potter-text-strip/tests/fixtures/native_oracle/vse_text_unicode/generate.py
 
-The portable blend keeps its existing two captures and adds five Unicode/layout cases. A separate
-blend captures a 50% resolution render; default-font captures remain Blender-only probes.
+The portable blend captures nine Unicode/layout cases, including CRLF wrapping and an above-one
+wrap width. A companion blend captures 50% resolution renders; default-font captures remain
+Blender-only probes.
 """
 
 import array
@@ -140,17 +141,48 @@ PORTABLE_CASES = (
             "The final italic F has a negative left side bearing; center the advance width."
         ),
     },
+    {
+        "name": "liberation_hello_center",
+        "text": "Hello",
+        "probe_only": False,
+        "font_asset": "liberation_sans",
+        "capture": "supported_frame_0008.png",
+        "wrap_width": 1.5,
+        "oracle_expectation": "Centered final-glyph advance width matches FreeType's grid-fitted glyph advance.",
+    },
+    {
+        "name": "cjk_crlf_ascii_space_wrap",
+        "text": "日本語漢字 \r\n日本",
+        "probe_only": False,
+        "font_asset": "noto_cjk_unicode_subset",
+        "capture": "supported_frame_0009.png",
+        "wrap_width": 0.24,
+        "oracle_expectation": "CR participates in Blender's wrap overflow check before the following LF.",
+    },
 )
-HALF_RESOLUTION_CASE = {
-    "name": "scaled_size_50_percent",
-    "text": "M",
-    "probe_only": False,
-    "font_asset": "lato_regular",
-    "font_size": 60,
-    "capture": "half_resolution_frame_0001.png",
-    "blend_file": "vse_text_unicode_half_resolution.blend",
-    "expected_font_size_pixels": 30,
-}
+HALF_RESOLUTION_CASES = (
+    {
+        "name": "scaled_size_50_percent",
+        "text": "M",
+        "probe_only": False,
+        "font_asset": "lato_regular",
+        "font_size": 60,
+        "capture": "half_resolution_frame_0001.png",
+        "blend_file": "vse_text_unicode_half_resolution.blend",
+        "expected_font_size_pixels": 30,
+    },
+    {
+        "name": "liberation_multiline_50_percent",
+        "text": "A\nB\nC",
+        "probe_only": False,
+        "font_asset": "liberation_sans",
+        "font_size": 60,
+        "capture": "half_resolution_frame_0002.png",
+        "blend_file": "vse_text_unicode_half_resolution.blend",
+        "expected_font_size_pixels": 30,
+        "oracle_expectation": "Three-line baselines use FreeType's 26.6 rounded line advance at 30 px.",
+    },
+)
 
 
 def configure_scene(scene, frame_end, resolution_percentage=100):
@@ -457,20 +489,29 @@ portable_render_settings = {
 }
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
-half_font = bpy.data.fonts.load(FONT_ASSETS["lato_regular"]["path"], check_existing=False)
+half_fonts = {
+    name: bpy.data.fonts.load(FONT_ASSETS[name]["path"], check_existing=False)
+    for name in ("lato_regular", "liberation_sans")
+}
 half_resolution_scene = bpy.context.scene
 half_resolution_scene.name = "VSETextUnicodeHalfResolution"
-configure_scene(half_resolution_scene, 1, resolution_percentage=50)
-add_text_strips(half_resolution_scene, (HALF_RESOLUTION_CASE,), {"lato_regular": half_font})
-case_metadata.append(
-    capture_case(half_resolution_scene, HALF_RESOLUTION_CASE, "portable_cli_parity")
+configure_scene(
+    half_resolution_scene,
+    len(HALF_RESOLUTION_CASES),
+    resolution_percentage=50,
 )
+add_text_strips(half_resolution_scene, HALF_RESOLUTION_CASES, half_fonts)
+for case in HALF_RESOLUTION_CASES:
+    case_metadata.append(
+        capture_case(half_resolution_scene, case, "portable_cli_parity")
+    )
 
-half_blend_path = os.path.join(OUTPUT_DIR, HALF_RESOLUTION_CASE["blend_file"])
-half_font.pack()
-half_font.filepath = bpy.path.relpath(
-    FONT_ASSETS["lato_regular"]["path"], start=half_blend_path
+half_blend_path = os.path.join(
+    OUTPUT_DIR, "vse_text_unicode_half_resolution.blend"
 )
+for name, font in half_fonts.items():
+    font.pack()
+    font.filepath = bpy.path.relpath(FONT_ASSETS[name]["path"], start=half_blend_path)
 bpy.context.preferences.filepaths.save_version = 0
 bpy.ops.wm.save_as_mainfile(filepath=half_blend_path)
 print("SAVED", half_blend_path)

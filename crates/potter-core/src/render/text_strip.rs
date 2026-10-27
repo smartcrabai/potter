@@ -107,11 +107,11 @@ pub(super) fn render_external_text_frame(
         return RgbaFrame::new(width, height, pixels);
     }
 
-    let units_per_em = f32::from(face.units_per_em());
-    if units_per_em <= 0.0 {
+    let units_per_em = i64::from(face.units_per_em());
+    if units_per_em <= 0 {
         return Err(unsupported("font has invalid em metrics"));
     }
-    let scale = font_size_px as f32 / units_per_em;
+    let scale = font_size_px as f32 / units_per_em as f32;
     let frame_width = width as f32;
     let available_width = if wrap_width == 0.0 {
         i32::MAX as f32
@@ -119,10 +119,14 @@ pub(super) fn render_external_text_frame(
         (wrap_width * frame_width) as i32 as f32
     };
     let lines = layout_text(&face, text, scale, available_width)?;
-    let line_height = ((f32::from(face.height()) + f32::from(face.line_gap())) * scale)
-        .round()
-        .max(1.0);
-    let descender = (f32::from(face.descender()) * scale).floor();
+    let y_scale = ft_div_fix(i64::from(font_size_px) * 64, units_per_em);
+    let line_height_26_6 = ft_mul_fix(
+        i64::from(face.height()) + i64::from(face.line_gap()),
+        y_scale,
+    );
+    let descender_26_6 = ft_mul_fix(i64::from(face.descender()), y_scale);
+    let line_height = (((line_height_26_6 + 32) & !63) >> 6).max(1) as f32;
+    let descender = ((descender_26_6 & !63) >> 6) as f32;
     if !line_height.is_finite() || !descender.is_finite() {
         return Err(unsupported(
             "font metrics exceed the supported text layout range",
@@ -262,10 +266,10 @@ fn layout_text(
         if bounds.is_none() && !character.is_whitespace() {
             return Err(unsupported("font glyph has no supported outline"));
         }
-        let blf_width = bounds.map_or(raw_advance.ceil(), |bounds| {
+        let blf_width = bounds.map_or(advance.ceil(), |bounds| {
             let min_x = f32::from(bounds.x_min) * scale;
             let max_x = f32::from(bounds.x_max) * scale;
-            raw_advance.max(max_x).ceil() - min_x.min(0.0).floor()
+            advance.max(max_x).ceil() - min_x.min(0.0).floor()
         });
         characters.push(TextGlyph {
             glyph: Some(glyph),
@@ -284,9 +288,6 @@ fn layout_text(
         if characters[index].line_end {
             current_x = 0.0;
             last_space = None;
-            continue;
-        }
-        if characters[index].glyph.is_none() {
             continue;
         }
         if characters[index].break_space {
@@ -334,6 +335,20 @@ fn layout_text(
         set_line_width(line, false);
     }
     Ok(lines)
+}
+fn ft_div_fix(numerator: i64, denominator: i64) -> i64 {
+    let numerator = i128::from(numerator) * 65_536 + i128::from(denominator) / 2;
+    (numerator / i128::from(denominator)) as i64
+}
+
+fn ft_mul_fix(value: i64, scale: i64) -> i64 {
+    let product = i128::from(value) * i128::from(scale);
+    let rounded = if product >= 0 {
+        (product + 32_768) >> 16
+    } else {
+        -((-product + 32_768) >> 16)
+    };
+    rounded as i64
 }
 
 fn set_line_width(line: &mut TextLine, exclude_last: bool) {

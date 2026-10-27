@@ -386,7 +386,7 @@ fn complete_scene_schema(root: &mut Value) {
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["font"] =
         json!({"type":["string","null"],"default":null});
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["wrap_width"] =
-        json!({"type":"number","minimum":0,"maximum":1,"default":1.0});
+        json!({"type":"number","minimum":0,"maximum":f32::MAX,"default":1.0});
     defs["sequencer"]["properties"]["strips"]["items"]["properties"]["channel"]["minimum"] =
         json!(1);
     let scene = &mut defs["scene"];
@@ -2496,7 +2496,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
         "sequencer.strip_create" | "sequencer.strip_update"
     ) && field == "wrap_width"
     {
-        return json!({"type":"number","minimum":0,"maximum":1,"default":1.0});
+        return json!({"type":"number","minimum":0,"maximum":f32::MAX,"default":1.0});
     }
     if matches!(
         operation,
@@ -3473,7 +3473,7 @@ mod tests {
         let wrap_width = &strip_schema["properties"]["wrap_width"];
         assert_eq!(wrap_width["type"], "number");
         assert_eq!(wrap_width["minimum"], 0);
-        assert_eq!(wrap_width["maximum"], 1);
+        assert_eq!(wrap_width["maximum"], serde_json::json!(f32::MAX));
         assert_eq!(wrap_width["default"], 1.0);
         assert!(
             !scene["$defs"]["sequencer"]["properties"]["strips"]["items"]["required"]
@@ -3482,7 +3482,10 @@ mod tests {
         );
 
         assert_eq!(create["properties"]["wrap_width"]["minimum"], 0);
-        assert_eq!(create["properties"]["wrap_width"]["maximum"], 1);
+        assert_eq!(
+            create["properties"]["wrap_width"]["maximum"],
+            serde_json::json!(f32::MAX)
+        );
         assert_eq!(create["x-potter"]["defaults"]["wrap_width"], 1.0);
 
         assert_eq!(
@@ -3491,7 +3494,7 @@ mod tests {
         );
         assert_eq!(
             update["properties"]["set"]["properties"]["wrap_width"]["maximum"],
-            1
+            serde_json::json!(f32::MAX)
         );
         Ok(())
     }

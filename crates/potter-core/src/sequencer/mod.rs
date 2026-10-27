@@ -140,7 +140,8 @@ impl Strip {
             || !self.sound_pitch.is_finite()
             || self.sound_pitch <= 0.0
             || self.color.iter().any(|component| !component.is_finite())
-            || !(0.0..=1.0).contains(&self.wrap_width)
+            || !self.wrap_width.is_finite()
+            || self.wrap_width < 0.0
             || (self.kind == StripType::Transition) != self.transition.is_some()
             || (self.kind == StripType::Effect) != self.effect.is_some()
             || self.modifiers.iter().any(|modifier| !modifier.is_valid())
@@ -161,7 +162,7 @@ impl Strip {
                 "sequencer font must be an explicit external reference on text strips",
             ));
         }
-        if self.kind != StripType::Text && self.wrap_width < 1.0 {
+        if self.kind != StripType::Text && self.wrap_width.to_bits() != 1.0_f32.to_bits() {
             return Err(PotError::new(
                 ErrorCode::InvalidOperation,
                 "sequencer wrap_width is only valid on text strips",

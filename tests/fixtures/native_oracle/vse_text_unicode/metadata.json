@@ -780,6 +780,128 @@
       }
     },
     {
+      "name": "liberation_hello_center",
+      "text": "Hello",
+      "oracle_expectation": "Centered final-glyph advance width matches FreeType's grid-fitted glyph advance.",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 8,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0008.png",
+      "png_sha256": "55fc3e88a723479d40f749b7cb4a4de9b8a7c16b52210136a472577f39282cd9",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "a9d2987c58a1a0353970e9dc2a2dcee412de5b4d4fbfedb969712f588616dbeb",
+        "nontransparent_pixel_count": 2204,
+        "nontransparent_bounds_blender_xyxy": [
+          449,
+          106,
+          578,
+          150
+        ]
+      },
+      "strip_defaults": {
+        "font": "Liberation Sans Regular",
+        "font_asset": "tests/fixtures/native_oracle/vse_text_unicode/fonts/LiberationSans-Regular.ttf",
+        "font_license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/LiberationSans-OFL.txt",
+        "font_license_source": "https://github.com/liberationfonts/liberation-fonts/blob/2.1.5/LICENSE",
+        "font_size": 60.0,
+        "wrap_width": 1.5,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "cjk_crlf_ascii_space_wrap",
+      "text": "日本語漢字 \r\n日本",
+      "oracle_expectation": "CR participates in Blender's wrap overflow check before the following LF.",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodePortable",
+      "frame": 9,
+      "blend_file": "vse_text_unicode_supported.blend",
+      "capture": "supported_frame_0009.png",
+      "png_sha256": "4f512dcda8967f36327d72d33d5a532969ce9ac2ba55d0532455c54f6b382d38",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 100,
+        "output_size": [
+          1024,
+          256
+        ]
+      },
+      "pixels": {
+        "size": [
+          1024,
+          256
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "72a9ba6956f0889db2d79991e6a9065d4980727c01e9ad4c040e1ef18fc31036",
+        "nontransparent_pixel_count": 8266,
+        "nontransparent_bounds_blender_xyxy": [
+          372,
+          10,
+          658,
+          242
+        ]
+      },
+      "strip_defaults": {
+        "font": "Potter CJK Sample Regular",
+        "font_asset": "tests/fixtures/native_oracle/vse_text_unicode/fonts/NotoSansCJKUnicodeSubset.otf",
+        "font_license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/OFL.txt",
+        "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 0.23999999463558197,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
       "name": "scaled_size_50_percent",
       "text": "M",
       "probe_only": false,
@@ -822,6 +944,68 @@
         "font_asset": "tests/fixtures/text_external_font/Lato-Regular.ttf",
         "font_license": "tests/fixtures/text_external_font/OFL.txt",
         "font_license_source": null,
+        "font_size": 60.0,
+        "wrap_width": 1.0,
+        "location": [
+          0.5,
+          0.5
+        ],
+        "alignment_x": "CENTER",
+        "anchor_x": "CENTER",
+        "anchor_y": "CENTER",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "use_shadow": false
+      }
+    },
+    {
+      "name": "liberation_multiline_50_percent",
+      "text": "A\nB\nC",
+      "oracle_expectation": "Three-line baselines use FreeType's 26.6 rounded line advance at 30 px.",
+      "probe_only": false,
+      "comparison_scope": "portable_cli_parity",
+      "scene": "VSETextUnicodeHalfResolution",
+      "frame": 2,
+      "blend_file": "vse_text_unicode_half_resolution.blend",
+      "capture": "half_resolution_frame_0002.png",
+      "png_sha256": "2cd6c15c827418c7074c3770e4c8828c4b58378c2e8224421375d66826a86aff",
+      "render_settings": {
+        "resolution": [
+          1024,
+          256
+        ],
+        "resolution_percentage": 50,
+        "output_size": [
+          512,
+          128
+        ]
+      },
+      "expected_font_size_pixels": 30,
+      "pixels": {
+        "size": [
+          512,
+          128
+        ],
+        "channels": 4,
+        "alpha_mode": "STRAIGHT",
+        "rgba_float32_le_sha256": "80deb6242ca788e64c63dc5d503a5564baa53cc509102d9c889e6149d4e70ffd",
+        "nontransparent_pixel_count": 572,
+        "nontransparent_bounds_blender_xyxy": [
+          246,
+          19,
+          266,
+          109
+        ]
+      },
+      "strip_defaults": {
+        "font": "Liberation Sans Regular",
+        "font_asset": "tests/fixtures/native_oracle/vse_text_unicode/fonts/LiberationSans-Regular.ttf",
+        "font_license": "tests/fixtures/native_oracle/vse_text_unicode/fonts/LiberationSans-OFL.txt",
+        "font_license_source": "https://github.com/liberationfonts/liberation-fonts/blob/2.1.5/LICENSE",
         "font_size": 60.0,
         "wrap_width": 1.0,
         "location": [
