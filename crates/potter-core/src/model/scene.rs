@@ -2867,6 +2867,22 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn default_text_resolution() -> u32 {
+    12
+}
+
+fn default_text_fill_mode() -> CurveFillMode {
+    CurveFillMode::Both
+}
+
+fn default_text_fill_solver() -> CurveFillSolver {
+    CurveFillSolver::Cdt
+}
+
+fn default_text_fill_rule() -> CurveFillRule {
+    CurveFillRule::Nonzero
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CurveDimensions {
@@ -3085,16 +3101,53 @@ impl Default for SurfaceData {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextCharacterFormat {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_bold: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_italic: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_underline: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_small_caps: bool,
+    pub material_index: u32,
+    pub kerning: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TextObjectData {
     pub body: String,
-    /// Resource URI or external file path; geometry uses the built-in font when unavailable.
+    /// Built-in sentinel, registered resource URI, or external font path; unresolved fonts are refused during evaluation.
     pub font: String,
     pub font_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font_bold: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font_bold_italic: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font_italic: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font_bold_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font_bold_italic_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font_italic_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub character_formats: Vec<TextCharacterFormat>,
+    #[serde(default = "default_text_resolution")]
+    pub resolution_u: u32,
     pub size: f64,
     pub align_x: String,
     pub align_y: String,
+    #[serde(default = "default_text_fill_mode")]
+    pub fill_mode: CurveFillMode,
+    #[serde(default = "default_text_fill_solver")]
+    pub fill_solver: CurveFillSolver,
+    #[serde(default = "default_text_fill_rule")]
+    pub fill_rule: CurveFillRule,
     pub extrude: f64,
     pub bevel_depth: f64,
     pub character_spacing: f64,
@@ -3112,9 +3165,20 @@ impl Default for TextObjectData {
             body: String::new(),
             font: "builtin".to_owned(),
             font_name: "Bfont".to_owned(),
+            font_bold: String::new(),
+            font_bold_italic: String::new(),
+            font_italic: String::new(),
+            font_bold_name: String::new(),
+            font_bold_italic_name: String::new(),
+            font_italic_name: String::new(),
+            character_formats: Vec::new(),
+            resolution_u: default_text_resolution(),
             size: 1.0,
             align_x: "left".to_owned(),
             align_y: "baseline".to_owned(),
+            fill_mode: default_text_fill_mode(),
+            fill_solver: default_text_fill_solver(),
+            fill_rule: default_text_fill_rule(),
             extrude: 0.0,
             bevel_depth: 0.0,
             character_spacing: 1.0,

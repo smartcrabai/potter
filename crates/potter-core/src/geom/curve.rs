@@ -12,8 +12,9 @@ use crate::{
         exact::{Rat2, rat_from_f64},
     },
     model::{
-        CurveData, CurveDimensions, CurveFillMode, CurvePoint, CurveSpline, CurveSplineType,
-        CurveTaperRadiusMode, HairCurvesData, SurfaceData, SurfacePoint,
+        CurveData, CurveDimensions, CurveFillMode, CurveFillRule, CurveFillSolver, CurveHandleType,
+        CurvePoint, CurveSpline, CurveSplineType, CurveTaperRadiusMode, HairCurvesData,
+        SurfaceData, SurfacePoint,
     },
 };
 
@@ -264,7 +265,14 @@ pub(crate) fn evaluate_curve_with_taper(
             }
             contours.push(samples);
         }
-        insert_fill(&mut mesh, &contours, data.fill_mode, data.extrude)?;
+        insert_fill(
+            &mut mesh,
+            &contours,
+            data.fill_mode,
+            data.fill_rule,
+            data.fill_solver,
+            data.extrude,
+        )?;
         return Ok(mesh);
     }
 
@@ -747,11 +755,24 @@ fn estimated_spline_samples(spline: &CurveSpline) -> Result<usize, MeshError> {
             }
         }
     };
-    let samples = checked_mul(
-        spans,
-        usize::try_from(spline.resolution)
-            .map_err(|_| MeshError::InvalidParameter("invalid curve spline resolution"))?,
-    )?;
+    let resolution = usize::try_from(spline.resolution)
+        .map_err(|_| MeshError::InvalidParameter("invalid curve spline resolution"))?;
+    let samples = if spline.spline_type == CurveSplineType::Bezier {
+        let mut samples = 0;
+        for span in 0..spans {
+            samples = checked_add(
+                samples,
+                if bezier_span_is_vector(spline, span) {
+                    1
+                } else {
+                    resolution
+                },
+            )?;
+        }
+        samples
+    } else {
+        checked_mul(spans, resolution)?
+    };
     let sample_count = if spline.cyclic {
         samples
     } else {
@@ -763,6 +784,13 @@ fn estimated_spline_samples(spline: &CurveSpline) -> Result<usize, MeshError> {
         ));
     }
     Ok(sample_count)
+}
+
+fn bezier_span_is_vector(spline: &CurveSpline, span: usize) -> bool {
+    let first = &spline.points[span];
+    let second = &spline.points[(span + 1) % spline.points.len()];
+    first.handle_right_type.unwrap_or(first.handle_type) == CurveHandleType::Vector
+        && second.handle_left_type.unwrap_or(second.handle_type) == CurveHandleType::Vector
 }
 
 fn checked_resolution(value: u32, name: &'static str) -> Result<usize, MeshError> {
@@ -939,24 +967,57 @@ fn tessellate_bezier(spline: &CurveSpline) -> Result<Vec<CurveSample>, MeshError
     for span in 0..spans {
         let first = &spline.points[span];
         let second = &spline.points[(span + 1) % count];
+        let vector_span = bezier_span_is_vector(spline, span);
+        let segment_resolution = if vector_span { 1 } else { resolution };
         let control = [
             DVec3::from_array(first.co),
             DVec3::from_array(first.handle_right),
             DVec3::from_array(second.handle_left),
             DVec3::from_array(second.co),
         ];
-        for step in 0..resolution {
-            let t = step as f64 / resolution as f64;
+        let use_forward_diff = !vector_span
+            && control.iter().all(|point| {
+                point
+                    .to_array()
+                    .into_iter()
+                    .all(|component| f64::from(component as f32).to_bits() == component.to_bits())
+            });
+        let mut forward_diff = if use_forward_diff {
+            let it = segment_resolution as f32;
+            let mut f = it;
+            let [q0, q1, q2, q3] = control.map(DVec3::as_vec3);
+            let rt0 = q0;
+            let rt1 = (q1 - q0) * 3.0 / f;
+            f *= f;
+            let rt2 = (q0 - q1 * 2.0 + q2) * 3.0 / f;
+            f *= it;
+            let rt3 = (q3 - q0 + (q1 - q2) * 3.0) / f;
+            Some((rt0, rt1 + rt2 + rt3, rt2 * 2.0 + rt3 * 6.0, rt3 * 6.0))
+        } else {
+            None
+        };
+        for step in 0..segment_resolution {
+            let t = step as f64 / segment_resolution as f64;
             let one_minus_t = 1.0 - t;
             let tangent = (control[1] - control[0]) * (3.0 * one_minus_t * one_minus_t)
                 + (control[2] - control[1]) * (6.0 * one_minus_t * t)
                 + (control[3] - control[2]) * (3.0 * t * t);
+            let position = match &forward_diff {
+                Some((q0, _, _, _)) => q0.as_dvec3(),
+                None if vector_span => control[0],
+                None => de_casteljau(control, t),
+            };
             samples.push(CurveSample {
-                position: de_casteljau(control, t),
+                position,
                 tangent,
                 radius: first.radius + (second.radius - first.radius) * t,
                 tilt: first.tilt + (second.tilt - first.tilt) * t,
             });
+            if let Some((q0, q1, q2, q3)) = &mut forward_diff {
+                *q0 += *q1;
+                *q1 += *q2;
+                *q2 += *q3;
+            }
         }
     }
     if !spline.cyclic {
@@ -982,7 +1043,6 @@ fn de_casteljau(control: [DVec3; 4], parameter: f64) -> DVec3 {
     }
     work[0]
 }
-
 fn tessellate_nurbs(spline: &CurveSpline) -> Result<Vec<CurveSample>, MeshError> {
     let count = spline.points.len();
     let order = checked_order(spline.order, count, "curve spline order")?;
@@ -1603,6 +1663,8 @@ fn insert_fill(
     mesh: &mut Mesh,
     samples: &[Vec<CurveSample>],
     mode: CurveFillMode,
+    fill_rule: CurveFillRule,
+    fill_solver: CurveFillSolver,
     extrude: f64,
 ) -> Result<(), MeshError> {
     let total = samples
@@ -1616,6 +1678,9 @@ fn insert_fill(
         contours.push(start..positions.len());
     }
     let depths = validate_fill_contours(&positions, &contours)?;
+    if fill_solver == CurveFillSolver::Cdt && fill_rule == CurveFillRule::Nonzero {
+        validate_nonzero_fill_matches_contour_depths(&positions, &contours, &depths)?;
+    }
     let triangles = triangulate_fill_contours(&positions, &contours, &depths)?;
 
     let mut bottom = Vec::with_capacity(positions.len());
@@ -1664,7 +1729,7 @@ fn insert_fill(
             let vertices = if extrude > 0.0 { &top } else { &bottom };
             mesh.insert_face(triangle.map(|index| vertices[index]).to_vec(), 0)?;
         }
-        if matches!(mode, CurveFillMode::Back | CurveFillMode::Both) {
+        if mode == CurveFillMode::Back || (mode == CurveFillMode::Both && extrude > 0.0) {
             let mut face = triangle.map(|index| bottom[index]).to_vec();
             face.reverse();
             mesh.insert_face(face, 0)?;
@@ -1750,6 +1815,48 @@ fn validate_fill_contours(
                 .count()
         })
         .collect())
+}
+
+fn validate_nonzero_fill_matches_contour_depths(
+    positions: &[DVec3],
+    contours: &[Range<usize>],
+    depths: &[usize],
+) -> Result<(), MeshError> {
+    let scale = positions
+        .iter()
+        .map(|point| point.abs().max_element())
+        .fold(1.0_f64, f64::max);
+    let normalized: Vec<[f64; 2]> = positions
+        .iter()
+        .map(|point| [point.x / scale, point.y / scale])
+        .collect();
+    let mut directions = Vec::with_capacity(contours.len());
+    for contour in contours {
+        let area = signed_area_xy_2d(&normalized[contour.clone()]);
+        if area.total_cmp(&0.0).is_eq() {
+            return Err(MeshError::InvalidParameter(
+                "2D fill contour has zero signed area",
+            ));
+        }
+        directions.push(if area > 0.0 { 1_i32 } else { -1_i32 });
+    }
+    for (index, contour) in contours.iter().enumerate() {
+        let point = normalized[contour.start];
+        let mut winding = directions[index];
+        for (other_index, other) in contours.iter().enumerate() {
+            if other_index != index && point_in_polygon(point, &normalized[other.start..other.end])
+            {
+                winding += directions[other_index];
+            }
+        }
+        if (winding != 0) != depths[index].is_multiple_of(2) {
+            return Err(MeshError::UnsupportedFeature {
+                feature_id: "curve.fill.multiple_contours",
+                reason: "nonzero winding differs from the supported nested-contour fill",
+            });
+        }
+    }
+    Ok(())
 }
 
 fn triangulate_fill_contours(

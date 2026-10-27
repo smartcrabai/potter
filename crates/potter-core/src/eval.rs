@@ -120,6 +120,7 @@ pub struct EvaluationSession {
     pub(crate) dynamic_paint_holds: crate::sim::DynamicPaintHoldCache,
     pub(crate) instance_attributes: BTreeMap<Id, crate::graph::EvaluatedInstances>,
     pub(crate) skip_instance_geometry_attribute_constraints: bool,
+    external_font_hashes: BTreeMap<Id, BTreeMap<&'static str, String>>,
 }
 impl EvaluationSession {
     fn cache_file_archive_identity(&self) -> Value {
@@ -134,6 +135,26 @@ impl EvaluationSession {
                 })
                 .collect(),
         )
+    }
+    fn external_font_hash_identity(&self) -> Value {
+        Value::Object(
+            self.external_font_hashes
+                .iter()
+                .map(|(data_id, variants)| (data_id.to_string(), json!(variants)))
+                .collect(),
+        )
+    }
+
+    fn record_external_font_hash(
+        &mut self,
+        data_id: &Id,
+        variant: &'static str,
+        content_hash: &str,
+    ) {
+        self.external_font_hashes
+            .entry(data_id.clone())
+            .or_default()
+            .insert(variant, content_hash.to_owned());
     }
 }
 
@@ -774,6 +795,7 @@ impl Snapshot {
                         "adaptive_render": context.adaptive_render,
                         "simulation_cache_key": snapshot.simulation_cache_key,
                         "cache_file_archives": session.cache_file_archive_identity(),
+                        "external_font_hashes": session.external_font_hash_identity(),
                     });
                     snapshot.evaluation_hash = hash::sha256(&hash::canonicalize(&evaluation_key)?);
                     for node_id in node_errors.keys() {
@@ -1018,6 +1040,7 @@ impl Snapshot {
         session: &mut EvaluationSession,
         bake_capture: Option<&(Id, Id, String)>,
     ) -> Result<Self> {
+        session.external_font_hashes.clear();
         let gate = ModifierGate {
             context: modifier_context,
             suppressed,
@@ -1787,11 +1810,124 @@ impl Snapshot {
                                     json!({ "data": data_id }),
                                 )
                             })?;
-                            crate::geom::text::evaluate_text(text).map_err(|error| {
-                                PotError::with_details(
+                            let geometry = if matches!(text.font.as_str(), "" | "builtin") {
+                                crate::geom::text::evaluate_text(text)
+                            } else {
+                                let base_font = resolve_text_font_bytes(
+                                    doc,
+                                    modifier_context.project_root,
+                                    &text.font,
+                                )?;
+                                if let Some((_, content_hash)) = base_font.as_ref() {
+                                    session.record_external_font_hash(
+                                        data_id,
+                                        "base",
+                                        content_hash,
+                                    );
+                                }
+                                let uses_bold = text
+                                    .character_formats
+                                    .iter()
+                                    .any(|format| format.use_bold && !format.use_italic);
+                                let uses_italic = text
+                                    .character_formats
+                                    .iter()
+                                    .any(|format| !format.use_bold && format.use_italic);
+                                let uses_bold_italic = text
+                                    .character_formats
+                                    .iter()
+                                    .any(|format| format.use_bold && format.use_italic);
+                                let bold_font = if uses_bold {
+                                    resolve_optional_text_font_bytes(
+                                        doc,
+                                        modifier_context.project_root,
+                                        &text.font_bold,
+                                    )?
+                                } else {
+                                    None
+                                };
+                                if let Some((_, content_hash)) = bold_font.as_ref() {
+                                    session.record_external_font_hash(
+                                        data_id,
+                                        "bold",
+                                        content_hash,
+                                    );
+                                }
+                                let italic_font = if uses_italic {
+                                    resolve_optional_text_font_bytes(
+                                        doc,
+                                        modifier_context.project_root,
+                                        &text.font_italic,
+                                    )?
+                                } else {
+                                    None
+                                };
+                                if let Some((_, content_hash)) = italic_font.as_ref() {
+                                    session.record_external_font_hash(
+                                        data_id,
+                                        "italic",
+                                        content_hash,
+                                    );
+                                }
+                                let bold_italic_font = if uses_bold_italic {
+                                    resolve_optional_text_font_bytes(
+                                        doc,
+                                        modifier_context.project_root,
+                                        &text.font_bold_italic,
+                                    )?
+                                } else {
+                                    None
+                                };
+                                if let Some((_, content_hash)) = bold_italic_font.as_ref() {
+                                    session.record_external_font_hash(
+                                        data_id,
+                                        "bold_italic",
+                                        content_hash,
+                                    );
+                                }
+                                crate::geom::text::evaluate_text_with_font(
+                                    text,
+                                    crate::geom::text_font::FontSources {
+                                        base: base_font.as_ref().map(|(bytes, _)| bytes.as_slice()),
+                                        bold: if uses_bold {
+                                            text_font_variant(
+                                                &text.font_bold,
+                                                bold_font
+                                                    .as_ref()
+                                                    .map(|(bytes, _)| bytes.as_slice()),
+                                            )
+                                        } else {
+                                            crate::geom::text_font::FontVariantSource::Missing
+                                        },
+                                        italic: if uses_italic {
+                                            text_font_variant(
+                                                &text.font_italic,
+                                                italic_font
+                                                    .as_ref()
+                                                    .map(|(bytes, _)| bytes.as_slice()),
+                                            )
+                                        } else {
+                                            crate::geom::text_font::FontVariantSource::Missing
+                                        },
+                                        bold_italic: if uses_bold_italic {
+                                            text_font_variant(
+                                                &text.font_bold_italic,
+                                                bold_italic_font
+                                                    .as_ref()
+                                                    .map(|(bytes, _)| bytes.as_slice()),
+                                            )
+                                        } else {
+                                            crate::geom::text_font::FontVariantSource::Missing
+                                        },
+                                    },
+                                )
+                            };
+                            geometry.map_err(|error| {
+                                crate::geom::curve::curve_error(
+                                    &error,
                                     ErrorCode::SceneInvalid,
-                                    format!("text geometry is invalid: {error}"),
-                                    json!({ "data": data_id }),
+                                    "text geometry is invalid",
+                                    json!({"data":data_id}),
                                 )
                             })?
                         }
@@ -2517,6 +2653,7 @@ impl Snapshot {
             "adaptive_render": context.adaptive_render,
             "simulation_cache_key": simulation_cache_key,
             "cache_file_archives": session.cache_file_archive_identity(),
+            "external_font_hashes": session.external_font_hash_identity(),
         });
         if let Some(prefix) = modifier_prefix {
             evaluation_key["modifier_prefix"] =
@@ -3118,6 +3255,110 @@ pub(crate) fn read_cache_resource(
         )
     })?;
     crate::cache_sequence::read_cache_resource_record(resource, resource_id.as_str(), project_root)
+}
+
+fn text_font_variant<'a>(
+    path: &str,
+    bytes: Option<&'a [u8]>,
+) -> crate::geom::text_font::FontVariantSource<'a> {
+    match path {
+        "" => crate::geom::text_font::FontVariantSource::Inherit,
+        "builtin" => crate::geom::text_font::FontVariantSource::Builtin,
+        _ => bytes.map_or(
+            crate::geom::text_font::FontVariantSource::Missing,
+            crate::geom::text_font::FontVariantSource::File,
+        ),
+    }
+}
+
+fn resolve_optional_text_font_bytes(
+    doc: &SceneDoc,
+    project_root: Option<&Path>,
+    reference: &str,
+) -> Result<Option<(Vec<u8>, String)>> {
+    if reference.is_empty() || reference == "builtin" {
+        Ok(None)
+    } else {
+        resolve_text_font_bytes(doc, project_root, reference)
+    }
+}
+
+fn resolve_text_font_bytes(
+    doc: &SceneDoc,
+    project_root: Option<&Path>,
+    reference: &str,
+) -> Result<Option<(Vec<u8>, String)>> {
+    if let Some(resource_id) = reference.strip_prefix("asset://") {
+        let resource_id = Id::new(resource_id.to_owned()).map_err(|_| {
+            PotError::with_details(
+                ErrorCode::DependencyMissing,
+                "external font resource reference is invalid",
+                json!({"font":reference}),
+            )
+        })?;
+        return resolve_text_font_resource(doc, project_root, &resource_id);
+    }
+
+    if let Some((resource_id, _)) = doc.resources.iter().find(|(_, resource)| {
+        resource.get("kind").and_then(Value::as_str) == Some("font")
+            && [resource.get("uri"), resource.get("original_path")]
+                .into_iter()
+                .flatten()
+                .any(|path| path.as_str() == Some(reference))
+    }) {
+        return resolve_text_font_resource(doc, project_root, resource_id);
+    }
+
+    let uri = reference.strip_prefix("file://").unwrap_or(reference);
+    let path = if let Some(relative) = uri.strip_prefix("//") {
+        project_root.map(|root| root.join(relative))
+    } else if Path::new(uri).is_absolute() {
+        Some(Path::new(uri).to_path_buf())
+    } else {
+        project_root.map(|root| root.join(uri))
+    };
+    let Some(path) = path else {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "external font paths require an absolute path or a scene resource context",
+            json!({"feature_id":"text.font.external.resource","font":reference}),
+        ));
+    };
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let content_hash = hash::sha256(&bytes);
+            Ok(Some((bytes, content_hash)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(PotError::with_details(
+            ErrorCode::DependencyMissing,
+            format!("external font `{reference}` was not found"),
+            json!({"font":reference,"path":path.display().to_string()}),
+        )),
+        Err(error) => Err(PotError::io_at(&error, &path)),
+    }
+}
+
+fn resolve_text_font_resource(
+    doc: &SceneDoc,
+    project_root: Option<&Path>,
+    resource_id: &Id,
+) -> Result<Option<(Vec<u8>, String)>> {
+    let resource = doc.resources.get(resource_id).ok_or_else(|| {
+        PotError::with_details(
+            ErrorCode::DependencyMissing,
+            format!("external font resource `{resource_id}` is not registered"),
+            json!({"resource_id":resource_id}),
+        )
+    })?;
+    if resource.get("status").and_then(Value::as_str) == Some("missing") {
+        return Err(PotError::with_details(
+            ErrorCode::DependencyMissing,
+            format!("external font resource `{resource_id}` is missing"),
+            json!({"resource_id":resource_id}),
+        ));
+    }
+    crate::cache_sequence::read_cache_resource_record(resource, resource_id.as_str(), project_root)
+        .map(Some)
 }
 
 pub(crate) fn load_vdb_volume_data(
@@ -9295,5 +9536,57 @@ mod tests {
         assert!(serde_json::from_value::<crate::eval::EvaluationContext>(bake).is_err());
         let preview = json!({"purpose": "preview"});
         assert!(serde_json::from_value::<crate::eval::EvaluationContext>(preview).is_ok());
+    }
+
+    #[test]
+    fn external_font_bytes_change_evaluation_identity_at_the_same_path() {
+        let font_dir = tempfile::tempdir().unwrap();
+        let font_path = font_dir.path().join("Lato.ttf");
+        std::fs::write(
+            &font_path,
+            include_bytes!("../../../tests/fixtures/text_external_font/Lato-Regular.ttf"),
+        )
+        .unwrap();
+
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let data_id = Id::new("external_font_data").unwrap();
+        let node_id = Id::new("external_font_object").unwrap();
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "text".to_owned(),
+                text: Some(crate::model::TextObjectData {
+                    body: "Lato".to_owned(),
+                    font: font_path.to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..DataBlock::default()
+            },
+        );
+        doc.nodes.insert(
+            node_id.clone(),
+            Node {
+                name: "External Font".to_owned(),
+                kind: "curve".to_owned(),
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .unwrap()
+            .objects
+            .push(node_id);
+
+        let first = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
+        std::fs::write(
+            &font_path,
+            include_bytes!("../../../tests/fixtures/text_external_font/Lato-Bold.ttf"),
+        )
+        .unwrap();
+        let second = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap();
+
+        assert_eq!(first.scene_hash, second.scene_hash);
+        assert_ne!(first.evaluation_hash, second.evaluation_hash);
     }
 }

@@ -3,7 +3,7 @@
 
 use potter_core::{
     eval::{EvaluationContext, Snapshot},
-    geom::{curve::evaluate_hair_curves, text::evaluate_text},
+    geom::{MeshError, curve::evaluate_hair_curves, text::evaluate_text},
     model::{DataBlock, HairCurve, HairCurvesData, Id, Node, SceneDoc, TextObjectData},
     ops::apply_batch,
 };
@@ -309,37 +309,23 @@ fn text_update_uses_variable_width_hershey_glyphs() {
     );
 }
 #[test]
-fn external_text_font_reference_is_preserved_with_builtin_geometry_fallback() {
+fn missing_external_font_without_scene_resources_is_unsupported() {
     let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-    let external = apply(
+    let doc = apply(
         &base,
         &json!([{
             "op": "text_object.create",
             "id": "external_font",
             "body": "A",
-            "font": "custom"
+            "font": "missing-font.ttf"
         }]),
     );
-    let builtin = apply(
-        &base,
-        &json!([{
-            "op": "text_object.create",
-            "id": "external_font",
-            "body": "A"
-        }]),
-    );
-    let text = external.data_blocks[&Id::new("external_font_text").unwrap()]
-        .text
-        .as_ref()
-        .unwrap();
-    assert_eq!(text.font, "custom");
-    let text_node_id = Id::new("external_font").unwrap();
-    let external_snapshot = evaluated(&external);
-    let builtin_snapshot = evaluated(&builtin);
+    let error = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap_err();
     assert_eq!(
-        external_snapshot.meshes[&text_node_id],
-        builtin_snapshot.meshes[&text_node_id]
+        error.code,
+        potter_core::error::ErrorCode::UnsupportedFeature
     );
+    assert_eq!(error.details["feature_id"], "text.font.external.resource");
 }
 
 #[test]
@@ -352,6 +338,38 @@ fn built_in_hershey_font_covers_printable_ascii() {
     let mesh = evaluate_text(&text).unwrap();
     assert!(!mesh.faces.is_empty(), "font generated no faces");
     assert!(mesh.validate().is_ok());
+}
+
+#[test]
+fn built_in_hershey_rejects_layout_settings() {
+    type ChangeSetting = fn(&mut TextObjectData);
+    let settings: [(&str, ChangeSetting); 7] = [
+        ("character_spacing", |text| text.character_spacing = 2.0),
+        ("word_spacing", |text| text.word_spacing = 2.0),
+        ("line_spacing", |text| text.line_spacing = 2.0),
+        ("shear", |text| text.shear = 1.0),
+        ("offset_x", |text| text.offset_x = 1.0),
+        ("offset_y", |text| text.offset_y = 1.0),
+        ("small_caps_scale", |text| text.small_caps_scale = 0.5),
+    ];
+
+    for (setting, change) in settings {
+        let mut text = TextObjectData {
+            body: "A".to_owned(),
+            ..TextObjectData::default()
+        };
+        change(&mut text);
+        assert!(
+            matches!(
+                evaluate_text(&text),
+                Err(MeshError::UnsupportedFeature {
+                    feature_id: "text.font.builtin.layout_settings",
+                    ..
+                })
+            ),
+            "non-default {setting} should be unsupported"
+        );
+    }
 }
 
 #[test]

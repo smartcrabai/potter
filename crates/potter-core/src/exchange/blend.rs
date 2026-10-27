@@ -35,8 +35,8 @@ use crate::{
         NlaExtrapolation, NlaStrip, NlaTrack, Node, ParentType, PixelFilterType, Profile, RayKind,
         RayVisibility, Registry, RenderSettings, RigidBody, RigidBodyShape, RigidBodyType,
         RigidBodyWorld, Scene, SceneDoc, ShapeKey, ShapeKeyData, SurfaceData, SurfacePoint,
-        TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup, ViewLayer,
-        ViewportDisplay, VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
+        TextCharacterFormat, TextObjectData, TimelineMarker, Transform, UnitSettings, VertexGroup,
+        ViewLayer, ViewportDisplay, VolumeInterpolation, VolumeSampling, World, is_identity_matrix,
     },
     sequencer::{
         EffectType as SequenceEffectType, RetimingKey, SequencerColorSpace, Strip as SequenceStrip,
@@ -6316,6 +6316,45 @@ fn curve_fill_rule(item: &Value) -> Result<CurveFillRule> {
     }
 }
 
+fn text_fill_mode(text: &Value, item: &Value) -> Result<CurveFillMode> {
+    let value = text
+        .get("fill_mode")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("fill_mode").and_then(Value::as_str))
+        .unwrap_or("both");
+    match value {
+        value if value.eq_ignore_ascii_case("none") => Ok(CurveFillMode::None),
+        value if value.eq_ignore_ascii_case("front") => Ok(CurveFillMode::Front),
+        value if value.eq_ignore_ascii_case("back") => Ok(CurveFillMode::Back),
+        value if value.eq_ignore_ascii_case("both") => Ok(CurveFillMode::Both),
+        _ => Err(invalid_intermediate(&format!(
+            "text fill mode `{value}` is unknown"
+        ))),
+    }
+}
+
+fn text_fill_solver(text: &Value) -> Result<CurveFillSolver> {
+    match text.get("fill_solver").and_then(Value::as_str) {
+        None => Ok(CurveFillSolver::Cdt),
+        Some(value) if value.eq_ignore_ascii_case("sweep_line") => Ok(CurveFillSolver::SweepLine),
+        Some(value) if value.eq_ignore_ascii_case("cdt") => Ok(CurveFillSolver::Cdt),
+        Some(value) => Err(invalid_intermediate(&format!(
+            "text fill solver `{value}` is unknown"
+        ))),
+    }
+}
+
+fn text_fill_rule(text: &Value) -> Result<CurveFillRule> {
+    match text.get("fill_rule").and_then(Value::as_str) {
+        None => Ok(CurveFillRule::Nonzero),
+        Some(value) if value.eq_ignore_ascii_case("even_odd") => Ok(CurveFillRule::EvenOdd),
+        Some(value) if value.eq_ignore_ascii_case("nonzero") => Ok(CurveFillRule::Nonzero),
+        Some(value) => Err(invalid_intermediate(&format!(
+            "text fill rule `{value}` is unknown"
+        ))),
+    }
+}
+
 fn import_curves(
     items: &[Value],
     doc: &mut SceneDoc,
@@ -6337,6 +6376,19 @@ fn import_curves(
         let data = match kind {
             "FONT" => {
                 let text = item.get("text").unwrap_or(&Value::Null);
+                let character_formats = optional_array(text, "character_formats")?
+                    .iter()
+                    .map(|format| {
+                        serde_json::from_value::<TextCharacterFormat>(format.clone())
+                            .map_err(|_| invalid_intermediate("text character format is invalid"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let resolution_u = text
+                    .get("resolution_u")
+                    .and_then(Value::as_u64)
+                    .or_else(|| item.get("resolution_u").and_then(Value::as_u64))
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(12);
                 DataBlock {
                     data_type: "text".to_owned(),
                     mesh: None,
@@ -6357,6 +6409,38 @@ fn import_curves(
                             .and_then(Value::as_str)
                             .unwrap_or("Bfont")
                             .to_owned(),
+                        font_bold: text
+                            .get("font_bold")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        font_bold_italic: text
+                            .get("font_bold_italic")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        font_italic: text
+                            .get("font_italic")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        font_bold_name: text
+                            .get("font_bold_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        font_bold_italic_name: text
+                            .get("font_bold_italic_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        font_italic_name: text
+                            .get("font_italic_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        character_formats,
+                        resolution_u,
                         size: number_field(text, "size", 1.0),
                         align_x: text
                             .get("align_x")
@@ -6368,6 +6452,9 @@ fn import_curves(
                             .and_then(Value::as_str)
                             .unwrap_or("baseline")
                             .to_owned(),
+                        fill_mode: text_fill_mode(text, item)?,
+                        fill_solver: text_fill_solver(text)?,
+                        fill_rule: text_fill_rule(text)?,
                         extrude: number_field(text, "extrude", 0.0),
                         bevel_depth: number_field(text, "bevel_depth", 0.0),
                         character_spacing: number_field(text, "character_spacing", 1.0),
@@ -10549,6 +10636,77 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     .or_else(|| curve.get("name").and_then(Value::as_str)),
                 "Blender's public Curve RNA does not expose legacy NURBS custom knot vectors, so import cannot capture them",
             ));
+        }
+        if curve.get("type").and_then(Value::as_str) == Some("FONT") {
+            let text = curve.get("text").unwrap_or(&Value::Null);
+            let name = curve
+                .get("potter_id")
+                .and_then(Value::as_str)
+                .or_else(|| curve.get("name").and_then(Value::as_str));
+            let text_boxes = text.get("text_boxes").and_then(Value::as_array);
+            let overflow = text.get("overflow").and_then(Value::as_str);
+            let has_text_box_layout = text_boxes.is_some_and(|boxes| {
+                boxes.len() > 1
+                    || boxes.iter().any(|text_box| {
+                        ["width", "height", "x", "y"].iter().any(|field| {
+                            text_box
+                                .get(*field)
+                                .and_then(Value::as_f64)
+                                .is_some_and(|value| value != 0.0)
+                        })
+                    })
+            });
+            let has_overflow_mode = overflow.is_some_and(|mode| mode != "NONE");
+            if has_text_box_layout || has_overflow_mode {
+                let boxes = text_boxes.map_or_else(
+                    || "[]".to_owned(),
+                    |boxes| Value::Array(boxes.clone()).to_string(),
+                );
+                let overflow = overflow.unwrap_or("NONE");
+                losses.push(loss(
+                    "blender.text.text_boxes",
+                    name,
+                    &format!(
+                        "Blender text boxes {boxes} with overflow mode `{overflow}` are not represented by Potter text; the imported text ignores this layout"
+                    ),
+                ));
+            }
+            if let Some(follow_curve) = text
+                .get("follow_curve")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
+                losses.push(loss(
+                    "blender.text.follow_curve",
+                    name,
+                    &format!(
+                        "Blender text follows curve object `{follow_curve}`, which Potter text cannot represent; the follow-curve reference is not applied"
+                    ),
+                ));
+            }
+            let offset = text.get("offset").and_then(Value::as_f64).unwrap_or(0.0);
+            if offset != 0.0 {
+                losses.push(loss(
+                    "blender.text.offset",
+                    name,
+                    &format!(
+                        "Blender TextCurve.offset is {offset}, which Potter text cannot represent; the curve offset is not applied"
+                    ),
+                ));
+            }
+            if let Some(taper_object) = text
+                .get("taper_object")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
+                losses.push(loss(
+                    "blender.text.taper_object",
+                    name,
+                    &format!(
+                        "Blender text uses taper object `{taper_object}`, which Potter text cannot represent; the taper object is not applied"
+                    ),
+                ));
+            }
         }
     }
     for curves in raw
