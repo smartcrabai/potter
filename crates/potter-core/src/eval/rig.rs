@@ -1160,7 +1160,12 @@ fn apply_spline_ik(
         let mut path_samples =
             crate::geom::curve::evaluate_curve_spline(spline, curve.twist_mode.as_str(), false)
                 .map_err(|error| {
-                    evaluation_error(format!("spline IK curve evaluation failed: {error}"))
+                    crate::geom::curve::curve_error(
+                        &error,
+                        ErrorCode::EvaluationFailed,
+                        "spline IK curve evaluation failed",
+                        json!({ "target": target_id }),
+                    )
                 })?;
         if spline.cyclic
             && let Some(first) = path_samples.first().copied()
@@ -8755,7 +8760,14 @@ fn constraint_curve_path_samples<'a>(
         curve.twist_mode.as_str(),
         with_orientation,
     )
-    .map_err(|error| evaluation_error(format!("constraint curve evaluation failed: {error}")))?;
+    .map_err(|error| {
+        crate::geom::curve::curve_error(
+            &error,
+            ErrorCode::EvaluationFailed,
+            "constraint curve evaluation failed",
+            json!({ "target": target_id }),
+        )
+    })?;
     if spline.cyclic
         && let Some(first) = samples.first().copied()
     {

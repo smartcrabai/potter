@@ -6,7 +6,10 @@ use serde_json::{Map, Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom,
-    model::{CurveData, CurvePoint, DataBlock, Id, SurfaceData, TextObjectData},
+    model::{
+        CurveData, CurveHandleType, CurvePoint, CurveSplineType, DataBlock, HairCurve,
+        HairCurveAttribute, HairCurvesData, Id, SurfaceData, TextObjectData,
+    },
 };
 
 use super::{
@@ -226,6 +229,8 @@ fn update_curve_point(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
             "handle_left",
             "handle_right",
             "handle_type",
+            "handle_left_type",
+            "handle_right_type",
             "weight",
             "radius",
             "tilt",
@@ -261,6 +266,19 @@ fn update_curve_point(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
         })?;
     let mut point_value = serialize(point)?;
     merge_values(&mut point_value, set);
+    if set.contains_key("handle_type") {
+        let fields = point_value.as_object_mut().ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InternalError,
+                "serialized curve point is not an object",
+            )
+        })?;
+        for side in ["handle_left_type", "handle_right_type"] {
+            if !set.contains_key(side) {
+                fields.remove(side);
+            }
+        }
+    }
     let updated_point: CurvePoint = decode_value(engine, point_value, "set")?;
     let changed = *point != updated_point;
     if !changed {
@@ -315,6 +333,9 @@ fn convert_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
         &["target", "to"],
     )?;
     let destination = read_string(engine, operation, "to")?;
+    if destination == "curves" {
+        return convert_curve_to_curves(engine, operation);
+    }
     if destination != "mesh" {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
@@ -322,7 +343,7 @@ fn convert_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             json!({
                 "operation_index": engine.operation_index,
                 "pointer": operation_pointer(engine.operation_index, "to"),
-                "feature_id": "curve.convert.destination",
+                "feature_id": "curve.convert.destination.other",
                 "destination": destination,
             }),
         ));
@@ -342,10 +363,14 @@ fn convert_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
         .and_then(|taper| taper_profiles.get(taper))
         .map(Vec::as_slice);
     let mesh = geom::curve::evaluate_curve_with_taper(curve, taper_profile).map_err(|error| {
-        engine.error(
+        geom::curve::curve_error(
+            &error,
             ErrorCode::InvalidOperation,
-            format!("curve geometry is invalid: {error}"),
-            &operation_pointer(engine.operation_index, "target"),
+            "curve geometry is invalid",
+            json!({
+                "operation_index": engine.operation_index,
+                "pointer": operation_pointer(engine.operation_index, "target"),
+            }),
         )
     })?;
     let block =
@@ -368,6 +393,413 @@ fn convert_curve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
     engine.mark("nodes", &node_id, ChangeKind::Updated);
     record_curve_loss(engine, &data_id)?;
     Ok(true)
+}
+fn convert_curve_to_curves(
+    engine: &mut Engine<'_>,
+    operation: &Map<String, Value>,
+) -> Result<bool> {
+    let (node_id, data_id) = typed_node_data_id(engine, operation, "curve", "curve")?;
+    let node = engine
+        .doc
+        .nodes
+        .get(&node_id)
+        .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "curve object disappeared"))?;
+    if node.modifiers.iter().any(|modifier| modifier.enabled) {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "curve conversion to Curves requires evaluated modifiers, which are not implemented",
+            json!({
+                "operation_index": engine.operation_index,
+                "pointer": operation_pointer(engine.operation_index, "target"),
+                "feature_id": "curve.convert.evaluated_modifiers",
+                "node_id": node_id,
+            }),
+        ));
+    }
+    let converted_data_id = if super::data_user_count(engine, &data_id) > 1 {
+        super::unique_id(
+            engine,
+            &format!("{node_id}_curves"),
+            super::IdRegistry::DataBlocks,
+        )?
+    } else {
+        data_id.clone()
+    };
+    let (hair_curves, materials, has_production_settings) = {
+        let block = engine.doc.data_blocks.get(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::TargetNotFound, "curve data block disappeared")
+        })?;
+        if block.shape_keys.is_some() {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "curve conversion to Curves requires evaluated shape keys, which are not implemented",
+                json!({
+                    "operation_index": engine.operation_index,
+                    "pointer": operation_pointer(engine.operation_index, "target"),
+                    "feature_id": "curve.convert.shape_keys",
+                    "data_id": data_id,
+                }),
+            ));
+        }
+        let curve = block
+            .curve
+            .as_ref()
+            .ok_or_else(|| super::geometry_data::missing_payload(engine, "curve", "target"))?;
+        if curve.splines.is_empty() {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Blender leaves Curve objects without splines unchanged during conversion to Curves",
+                json!({
+                    "operation_index": engine.operation_index,
+                    "pointer": operation_pointer(engine.operation_index, "target"),
+                    "feature_id": "curve.convert.empty",
+                    "data_id": data_id,
+                }),
+            ));
+        }
+        if curve.has_bevel_object
+            || curve.bevel_depth != 0.0
+            || curve.extrude != 0.0
+            || (curve.dimensions == crate::model::CurveDimensions::TwoD
+                && curve.fill_mode != crate::model::CurveFillMode::None)
+        {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Blender leaves Curve objects unchanged when bevel objects, bevel depth, extrusion, or 2D fill requires implicit mesh conversion",
+                json!({
+                    "operation_index": engine.operation_index,
+                    "pointer": operation_pointer(engine.operation_index, "target"),
+                    "feature_id": "curve.convert.production_settings",
+                    "data_id": data_id,
+                }),
+            ));
+        }
+        if curve
+            .splines
+            .iter()
+            .any(|spline| spline.spline_type == CurveSplineType::Nurbs && spline.custom_knots)
+        {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Curve conversion cannot preserve custom NURBS knot vectors",
+                json!({
+                    "operation_index": engine.operation_index,
+                    "pointer": operation_pointer(engine.operation_index, "target"),
+                    "feature_id": "curve.nurbs.knot_mode",
+                    "data_id": data_id,
+                }),
+            ));
+        }
+        (
+            legacy_curve_to_hair_curves(curve)?,
+            block.materials.clone(),
+            curve_has_unrepresented_production_settings(curve),
+        )
+    };
+    let converted_block = DataBlock {
+        data_type: "hair_curves".to_owned(),
+        mesh: None,
+        materials,
+        hair_curves: Some(hair_curves),
+        ..DataBlock::default()
+    };
+    if converted_data_id == data_id {
+        let block = engine.doc.data_blocks.get_mut(&data_id).ok_or_else(|| {
+            PotError::new(ErrorCode::InternalError, "curve data block disappeared")
+        })?;
+        *block = converted_block;
+        engine.mark("data_blocks", &data_id, ChangeKind::Updated);
+    } else {
+        engine
+            .doc
+            .data_blocks
+            .insert(converted_data_id.clone(), converted_block);
+        engine.mark("data_blocks", &converted_data_id, ChangeKind::Created);
+        engine.map_id("data_blocks", &data_id, &converted_data_id);
+    }
+    let node = engine
+        .doc
+        .nodes
+        .get_mut(&node_id)
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "curve node disappeared"))?;
+    node.data = Some(converted_data_id.clone());
+    "hair_curves".clone_into(&mut node.kind);
+    node.primitive = None;
+    node.modifiers.clear();
+    engine.mark("nodes", &node_id, ChangeKind::Updated);
+    if has_production_settings {
+        record_curve_curves_loss(engine, &converted_data_id)?;
+    }
+    Ok(true)
+}
+
+fn legacy_curve_to_hair_curves(curve: &CurveData) -> Result<HairCurvesData> {
+    let point_count = curve
+        .splines
+        .iter()
+        .try_fold(0_usize, |count, spline| {
+            count.checked_add(spline.points.len())
+        })
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidArgument,
+                "curve point count exceeds the supported range",
+            )
+        })?;
+    let normal_mode = match curve.twist_mode.as_str() {
+        "MINIMUM" => 0,
+        "Z_UP" | "TANGENT" => 1,
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "curve twist mode `{}` has no Curves normal-mode mapping",
+                    curve.twist_mode
+                ),
+                json!({
+                    "feature_id":"curve.convert.twist_mode",
+                    "twist_mode":curve.twist_mode,
+                }),
+            ));
+        }
+    };
+    let mut data = HairCurvesData {
+        curves: Vec::with_capacity(curve.splines.len()),
+        ..HairCurvesData::default()
+    };
+    let has_bezier = curve
+        .splines
+        .iter()
+        .any(|spline| spline.spline_type == CurveSplineType::Bezier);
+    let has_nurbs = curve
+        .splines
+        .iter()
+        .any(|spline| spline.spline_type == CurveSplineType::Nurbs);
+    let has_resolution = has_bezier || has_nurbs;
+    let mut curve_types = Vec::with_capacity(curve.splines.len());
+    let mut cyclic = Vec::with_capacity(curve.splines.len());
+    let mut resolutions = has_resolution.then(|| Vec::with_capacity(curve.splines.len()));
+    let mut nurbs_orders = has_nurbs.then(|| Vec::with_capacity(curve.splines.len()));
+    let mut knots_modes = has_nurbs.then(|| Vec::with_capacity(curve.splines.len()));
+    let mut normal_modes = Vec::with_capacity(curve.splines.len());
+    let mut radii = Vec::with_capacity(point_count);
+    let mut tilts = Vec::with_capacity(point_count);
+    let mut left_handles = has_bezier.then(|| Vec::with_capacity(point_count));
+    let mut right_handles = has_bezier.then(|| Vec::with_capacity(point_count));
+    let mut left_handle_types = has_bezier.then(|| Vec::with_capacity(point_count));
+    let mut right_handle_types = has_bezier.then(|| Vec::with_capacity(point_count));
+    let mut nurbs_weights = has_nurbs.then(|| vec![json!(1.0); point_count]);
+    let mut point_offset = 0;
+    for spline in &curve.splines {
+        let (curve_type, resolution, nurbs_order, knots_mode) = match spline.spline_type {
+            CurveSplineType::Poly => (1, 12, 4, 0),
+            CurveSplineType::Bezier => (2, spline.resolution, 4, 0),
+            CurveSplineType::Nurbs => {
+                let knots_mode = match (spline.use_endpoint, spline.use_bezier) {
+                    (false, false) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (true, true) => 3,
+                };
+                (3, spline.resolution, spline.order, knots_mode)
+            }
+        };
+        curve_types.push(json!(curve_type));
+        cyclic.push(json!(spline.cyclic));
+        if let Some(resolutions) = &mut resolutions {
+            resolutions.push(json!(i32::try_from(resolution).map_err(|_| {
+                PotError::new(
+                    ErrorCode::InvalidArgument,
+                    "curve spline resolution exceeds Blender's integer range",
+                )
+            })?));
+        }
+        if let Some(nurbs_orders) = &mut nurbs_orders {
+            nurbs_orders.push(json!(i8::try_from(nurbs_order).map_err(|_| {
+                PotError::new(
+                    ErrorCode::InvalidArgument,
+                    "NURBS order exceeds Blender's integer range",
+                )
+            })?));
+        }
+        if let Some(knots_modes) = &mut knots_modes {
+            knots_modes.push(json!(knots_mode));
+        }
+        normal_modes.push(json!(normal_mode));
+        let mut points = Vec::with_capacity(spline.points.len());
+        for (point_index, point) in spline.points.iter().enumerate() {
+            points.push(point.co);
+            radii.push(json!(point.radius));
+            tilts.push(json!(point.tilt));
+            if spline.spline_type == CurveSplineType::Nurbs
+                && let Some(nurbs_weights) = &mut nurbs_weights
+            {
+                nurbs_weights[point_offset + point_index] = json!(point.weight);
+            }
+            if let Some(left_handles) = &mut left_handles {
+                if spline.spline_type == CurveSplineType::Bezier {
+                    left_handles.push(json!(point.handle_left));
+                } else {
+                    left_handles.push(json!([0.0, 0.0, 0.0]));
+                }
+            }
+            if let Some(right_handles) = &mut right_handles {
+                if spline.spline_type == CurveSplineType::Bezier {
+                    right_handles.push(json!(point.handle_right));
+                } else {
+                    right_handles.push(json!([0.0, 0.0, 0.0]));
+                }
+            }
+            if let Some(left_handle_types) = &mut left_handle_types {
+                left_handle_types.push(json!(if spline.spline_type == CurveSplineType::Bezier {
+                    handle_type_attribute(point.handle_left_type.unwrap_or(point.handle_type))
+                } else {
+                    0
+                }));
+            }
+            if let Some(right_handle_types) = &mut right_handle_types {
+                right_handle_types.push(json!(if spline.spline_type == CurveSplineType::Bezier {
+                    handle_type_attribute(point.handle_right_type.unwrap_or(point.handle_type))
+                } else {
+                    0
+                }));
+            }
+        }
+        point_offset += spline.points.len();
+        data.curves.push(HairCurve {
+            radius: spline.points.first().map_or(0.0, |point| point.radius),
+            points,
+        });
+    }
+    data.attributes.insert(
+        "curve_type".to_owned(),
+        hair_curve_attribute("CURVE", "INT8", curve_types),
+    );
+    data.attributes.insert(
+        "cyclic".to_owned(),
+        hair_curve_attribute("CURVE", "BOOLEAN", cyclic),
+    );
+    if let Some(resolutions) = resolutions {
+        data.attributes.insert(
+            "resolution".to_owned(),
+            hair_curve_attribute("CURVE", "INT", resolutions),
+        );
+    }
+    if let Some(nurbs_orders) = nurbs_orders {
+        data.attributes.insert(
+            "nurbs_order".to_owned(),
+            hair_curve_attribute("CURVE", "INT8", nurbs_orders),
+        );
+    }
+    if let Some(knots_modes) = knots_modes {
+        data.attributes.insert(
+            "knots_mode".to_owned(),
+            hair_curve_attribute("CURVE", "INT8", knots_modes),
+        );
+    }
+    data.attributes.insert(
+        "normal_mode".to_owned(),
+        hair_curve_attribute("CURVE", "INT8", normal_modes),
+    );
+    data.attributes.insert(
+        "radius".to_owned(),
+        hair_curve_attribute("POINT", "FLOAT", radii),
+    );
+    data.attributes.insert(
+        "tilt".to_owned(),
+        hair_curve_attribute("POINT", "FLOAT", tilts),
+    );
+    if let Some(left_handles) = left_handles {
+        data.attributes.insert(
+            "handle_left".to_owned(),
+            hair_curve_attribute("POINT", "FLOAT_VECTOR", left_handles),
+        );
+    }
+    if let Some(right_handles) = right_handles {
+        data.attributes.insert(
+            "handle_right".to_owned(),
+            hair_curve_attribute("POINT", "FLOAT_VECTOR", right_handles),
+        );
+    }
+    if let Some(left_handle_types) = left_handle_types {
+        data.attributes.insert(
+            "handle_type_left".to_owned(),
+            hair_curve_attribute("POINT", "INT8", left_handle_types),
+        );
+    }
+    if let Some(right_handle_types) = right_handle_types {
+        data.attributes.insert(
+            "handle_type_right".to_owned(),
+            hair_curve_attribute("POINT", "INT8", right_handle_types),
+        );
+    }
+    if let Some(nurbs_weights) = nurbs_weights {
+        data.attributes.insert(
+            "nurbs_weight".to_owned(),
+            hair_curve_attribute("POINT", "FLOAT", nurbs_weights),
+        );
+    }
+    Ok(data)
+}
+
+fn handle_type_attribute(handle_type: CurveHandleType) -> i8 {
+    match handle_type {
+        CurveHandleType::Free => 0,
+        CurveHandleType::Auto => 1,
+        CurveHandleType::Vector => 2,
+        CurveHandleType::Aligned => 3,
+    }
+}
+
+fn hair_curve_attribute(domain: &str, data_type: &str, values: Vec<Value>) -> HairCurveAttribute {
+    HairCurveAttribute {
+        domain: domain.to_owned(),
+        data_type: data_type.to_owned(),
+        values,
+    }
+}
+
+fn curve_has_unrepresented_production_settings(curve: &CurveData) -> bool {
+    curve.taper.is_some()
+        || curve.taper_radius_mode != crate::model::CurveTaperRadiusMode::Override
+        || curve.use_map_taper
+        || curve.use_path
+        || curve.path_duration != 100
+        || curve.eval_time != 0.0
+        || !curve.eval_time_fcurves.is_empty()
+}
+
+fn record_curve_curves_loss(engine: &mut Engine<'_>, data_id: &Id) -> Result<()> {
+    let existed = engine.doc.compatibility.contains_key("losses");
+    let slot = engine
+        .doc
+        .compatibility
+        .entry("losses".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let losses = slot.as_array_mut().ok_or_else(|| {
+        PotError::new(
+            ErrorCode::SceneInvalid,
+            "compatibility losses must be an array",
+        )
+    })?;
+    losses.push(json!({
+        "feature_id": "curve.convert.production_settings",
+        "data_id": data_id,
+        "reason": "Blender converts legacy Curve data to Curves only when its evaluated geometry retains a Curves component; bevel, extrusion, and 2D fill trigger implicit mesh conversion, while taper, path, and evaluation-time settings are recorded as lossy conversions.",
+        "suggestion": "Keep the legacy Curve object when its production settings must remain editable.",
+    }));
+    let compatibility_id = Id::new("losses")
+        .map_err(|error| PotError::new(ErrorCode::InternalError, error.message))?;
+    engine.mark(
+        "compatibility",
+        &compatibility_id,
+        if existed {
+            ChangeKind::Updated
+        } else {
+            ChangeKind::Created
+        },
+    );
+    Ok(())
 }
 
 fn create_surface(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
@@ -842,10 +1274,14 @@ fn validate_curve(engine: &Engine<'_>, curve: &CurveData, pointer: &str) -> Resu
     geom::curve::evaluate_curve_with_taper(curve, Some(&[]))
         .map(|_| ())
         .map_err(|error| {
-            engine.error(
+            geom::curve::curve_error(
+                &error,
                 ErrorCode::InvalidOperation,
-                format!("curve geometry is invalid: {error}"),
-                &operation_pointer(engine.operation_index, pointer),
+                "curve geometry is invalid",
+                json!({
+                    "operation_index": engine.operation_index,
+                    "pointer": operation_pointer(engine.operation_index, pointer),
+                }),
             )
         })
 }

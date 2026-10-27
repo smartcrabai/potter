@@ -542,6 +542,15 @@ fn complete_scene_schema(root: &mut Value) {
 
 fn complete_data_block_schemas(defs: &mut Value) {
     defs["curve_data"] = json!({"type":"object","required":["resolution_u","splines","dimensions","bevel_depth","bevel_resolution","extrude","taper","taper_radius_mode","use_map_taper","fill_mode","twist_mode","use_path","path_duration","eval_time","eval_time_fcurves"],"properties":{"resolution_u":{"type":"integer","minimum":0,"maximum":u32::MAX},"splines":{"type":"array","items":{"type":"object","required":["type","points","order","cyclic","resolution","use_endpoint"],"properties":{"type":{"enum":["bezier","poly","nurbs"]},"points":{"type":"array","items":{"type":"object","required":["co","handle_left","handle_right","handle_type","weight","radius","tilt"],"properties":{"co":{"$ref":"#/$defs/vec3"},"handle_left":{"$ref":"#/$defs/vec3"},"handle_right":{"$ref":"#/$defs/vec3"},"handle_type":{"enum":["auto","vector","aligned","free"]},"weight":{"type":"number"},"radius":{"type":"number"},"tilt":{"type":"number"}},"additionalProperties":false}},"order":{"type":"integer","minimum":0,"maximum":u32::MAX},"cyclic":{"type":"boolean"},"resolution":{"type":"integer","minimum":0,"maximum":u32::MAX},"use_endpoint":{"type":"boolean"}},"additionalProperties":false}},"dimensions":{"enum":["two_d","three_d"]},"bevel_depth":{"type":"number"},"bevel_resolution":{"type":"integer","minimum":0,"maximum":u32::MAX},"extrude":{"type":"number"},"taper":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"taper_radius_mode":{"enum":["override","multiply","add"]},"use_map_taper":{"type":"boolean"},"fill_mode":{"enum":["none","front","back","both"]},"twist_mode":{"type":"string"},"use_path":{"type":"boolean"},"path_duration":{"type":"integer","minimum":0,"maximum":u32::MAX},"eval_time":{"type":"number"},"eval_time_fcurves":{"type":"array","items":{"$ref":"#/$defs/fcurve"}}},"additionalProperties":false});
+    defs["curve_data"]["properties"]["has_bevel_object"] = json!({"type":"boolean"});
+    defs["curve_data"]["properties"]["splines"]["items"]["properties"]["use_bezier"] =
+        json!({"type":"boolean"});
+    defs["curve_data"]["properties"]["splines"]["items"]["properties"]["custom_knots"] =
+        json!({"type":"boolean"});
+    defs["curve_data"]["properties"]["splines"]["items"]["properties"]["points"]["items"]["properties"]
+        ["handle_left_type"] = json!({"enum":["auto","vector","aligned","free"]});
+    defs["curve_data"]["properties"]["splines"]["items"]["properties"]["points"]["items"]["properties"]
+        ["handle_right_type"] = json!({"enum":["auto","vector","aligned","free"]});
     // Optional so pre-5.2 scene documents retain CurveData's Blender-defaulted values.
     defs["curve_data"]["properties"]["fill_solver"] = json!({"enum":["sweep_line","cdt"]});
     defs["curve_data"]["properties"]["fill_rule"] = json!({"enum":["even_odd","nonzero"]});

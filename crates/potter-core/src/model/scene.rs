@@ -2937,6 +2937,10 @@ pub struct CurvePoint {
     pub handle_left: [f64; 3],
     pub handle_right: [f64; 3],
     pub handle_type: CurveHandleType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle_left_type: Option<CurveHandleType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle_right_type: Option<CurveHandleType>,
     pub weight: f64,
     pub radius: f64,
     pub tilt: f64,
@@ -2949,6 +2953,8 @@ impl Default for CurvePoint {
             handle_left: [0.0; 3],
             handle_right: [0.0; 3],
             handle_type: CurveHandleType::Auto,
+            handle_left_type: None,
+            handle_right_type: None,
             weight: 1.0,
             radius: 1.0,
             tilt: 0.0,
@@ -2966,6 +2972,8 @@ pub struct CurveSpline {
     pub cyclic: bool,
     pub resolution: u32,
     pub use_endpoint: bool,
+    pub use_bezier: bool,
+    pub custom_knots: bool,
 }
 
 impl Default for CurveSpline {
@@ -2977,6 +2985,8 @@ impl Default for CurveSpline {
             cyclic: false,
             resolution: 12,
             use_endpoint: false,
+            use_bezier: false,
+            custom_knots: false,
         }
     }
 }
@@ -2990,6 +3000,9 @@ pub struct CurveData {
     pub bevel_depth: f64,
     pub bevel_resolution: u32,
     pub extrude: f64,
+    /// True when the Blender Curve has a `bevel_object` pointer; the target is not represented.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_bevel_object: bool,
     pub taper: Option<Id>,
     pub taper_radius_mode: CurveTaperRadiusMode,
     pub use_map_taper: bool,
@@ -3012,6 +3025,7 @@ impl Default for CurveData {
             bevel_depth: 0.0,
             bevel_resolution: 0,
             extrude: 0.0,
+            has_bevel_object: false,
             taper: None,
             taper_radius_mode: CurveTaperRadiusMode::Override,
             use_map_taper: false,

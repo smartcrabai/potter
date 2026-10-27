@@ -3,8 +3,10 @@
 use std::ops::Range;
 
 use glam::{DMat3, DQuat, DVec2, DVec3};
+use serde_json::{Value, json};
 
 use crate::{
+    error::{ErrorCode, PotError},
     geom::boolean::{
         cdt::{CdtInput, delaunay_2d_calc_inside},
         exact::{Rat2, rat_from_f64},
@@ -128,6 +130,26 @@ struct Frame {
 /// Returns an error for invalid, non-finite, unsupported, or over-budget curve data.
 pub fn evaluate_curve(data: &CurveData) -> Result<Mesh, MeshError> {
     evaluate_curve_with_taper(data, None)
+}
+
+pub(crate) fn curve_error(
+    error: &MeshError,
+    fallback_code: ErrorCode,
+    context: impl Into<String>,
+    details: Value,
+) -> PotError {
+    let (code, details) = match (error, details) {
+        (MeshError::UnsupportedFeature { feature_id, .. }, Value::Object(mut details)) => {
+            details.insert("feature_id".to_owned(), json!(feature_id));
+            (ErrorCode::UnsupportedFeature, Value::Object(details))
+        }
+        (MeshError::UnsupportedFeature { feature_id, .. }, details) => (
+            ErrorCode::UnsupportedFeature,
+            json!({"feature_id":feature_id,"details":details}),
+        ),
+        (_, details) => (fallback_code, details),
+    };
+    PotError::with_details(code, format!("{}: {error}", context.into()), details)
 }
 
 /// Evaluate a curve with its resolved taper profile, if it has one.
@@ -460,6 +482,7 @@ pub fn evaluate_surface(data: &SurfaceData) -> Result<Mesh, MeshError> {
         order_u,
         resolution_u,
         data.use_endpoint_u,
+        false,
         data.cyclic_u,
     )?;
     let axis_v = make_axis(
@@ -467,6 +490,7 @@ pub fn evaluate_surface(data: &SurfaceData) -> Result<Mesh, MeshError> {
         order_v,
         resolution_v,
         data.use_endpoint_v,
+        false,
         data.cyclic_v,
     )?;
     let vertex_count = checked_mul(axis_u.samples.len(), axis_v.samples.len())?;
@@ -620,6 +644,12 @@ fn validate_spline(spline: &CurveSpline) -> Result<(), MeshError> {
             }
         }
         CurveSplineType::Nurbs => {
+            if spline.custom_knots {
+                return Err(MeshError::UnsupportedFeature {
+                    feature_id: "curve.nurbs.knot_mode",
+                    reason: "custom NURBS knot vector values are not represented",
+                });
+            }
             let order = checked_order(spline.order, point_count, "curve spline order")?;
             for point in &spline.points {
                 if point.weight <= 0.0 {
@@ -631,6 +661,14 @@ fn validate_spline(spline: &CurveSpline) -> Result<(), MeshError> {
             if spline.cyclic && point_count < order {
                 return Err(MeshError::InvalidParameter(
                     "cyclic NURBS requires at least as many points as its order",
+                ));
+            }
+            if spline.use_bezier
+                && ((spline.cyclic && !point_count.is_multiple_of(order - 1))
+                    || (!spline.cyclic && !spline.use_endpoint && point_count <= order))
+            {
+                return Err(MeshError::InvalidParameter(
+                    "NURBS Bezier knot mode has an invalid control-point count",
                 ));
             }
         }
@@ -691,13 +729,21 @@ fn estimated_spline_samples(spline: &CurveSpline) -> Result<usize, MeshError> {
             }
         }
         CurveSplineType::Nurbs => {
+            let order = checked_order(spline.order, point_count, "curve spline order")?;
             if spline.cyclic {
-                point_count
+                if spline.use_bezier {
+                    point_count / (order - 1)
+                } else {
+                    point_count
+                }
+            } else if spline.use_bezier {
+                if spline.use_endpoint {
+                    checked_add((point_count - order) / (order - 1), 1)?
+                } else {
+                    (point_count - 2) / (order - 1)
+                }
             } else {
-                point_count
-                    - usize::try_from(spline.order)
-                        .map_err(|_| MeshError::InvalidParameter("invalid curve spline order"))?
-                    + 1
+                point_count - order + 1
             }
         }
     };
@@ -941,7 +987,14 @@ fn tessellate_nurbs(spline: &CurveSpline) -> Result<Vec<CurveSample>, MeshError>
     let count = spline.points.len();
     let order = checked_order(spline.order, count, "curve spline order")?;
     let resolution = checked_resolution(spline.resolution, "curve spline resolution")?;
-    let axis = make_axis(count, order, resolution, spline.use_endpoint, spline.cyclic)?;
+    let axis = make_axis(
+        count,
+        order,
+        resolution,
+        spline.use_endpoint,
+        spline.use_bezier,
+        spline.cyclic,
+    )?;
     let mut controls: Vec<HomogeneousPoint> = spline
         .points
         .iter()
@@ -1006,6 +1059,7 @@ fn make_axis(
     order: usize,
     resolution: usize,
     use_endpoint: bool,
+    use_bezier: bool,
     cyclic: bool,
 ) -> Result<SplineAxis, MeshError> {
     let controls = if cyclic {
@@ -1014,18 +1068,42 @@ fn make_axis(
         count
     };
     let knot_count = checked_add(controls, order)?;
-    let mut knots = Vec::with_capacity(knot_count);
-    if use_endpoint && !cyclic {
-        knots.resize(knot_count, 0.0);
-        for knot in knots.iter_mut().take(knot_count).skip(controls) {
-            *knot = 1.0;
-        }
-        let span_count = controls - order + 1;
-        for (index, knot) in knots.iter_mut().enumerate().take(controls).skip(order) {
-            *knot = (index - order + 1) as f64 / span_count as f64;
-        }
+    let mut knots = vec![0.0; knot_count];
+    let repeat_inner = if use_bezier { order - 1 } else { 1 };
+    let head = if use_endpoint && cyclic {
+        order - 1
+    } else if use_endpoint {
+        order
+    } else if use_bezier {
+        2.min(repeat_inner)
     } else {
-        knots.extend((0..knot_count).map(|index| index as f64));
+        1
+    };
+    let tail = if cyclic {
+        2 * order - 1
+    } else if use_endpoint {
+        order
+    } else {
+        0
+    };
+    let offset = usize::from(use_endpoint && cyclic);
+    let mut current = 0.0;
+    if offset != 0 {
+        knots[0] = current;
+        current += 1.0;
+    }
+    let mut repeat = head;
+    for knot in knots.iter_mut().take(knot_count - tail).skip(offset) {
+        *knot = current;
+        repeat -= 1;
+        if repeat == 0 {
+            current += 1.0;
+            repeat = repeat_inner;
+        }
+    }
+    let tail_start = knot_count - tail;
+    for index in 0..tail {
+        knots[tail_start + index] = current + (knots[index] - knots[0]);
     }
 
     let mut samples = Vec::new();

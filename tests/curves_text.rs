@@ -65,6 +65,108 @@ fn bezier_matches_analytic_cubic_and_order_two_nurbs_matches_polyline() {
 }
 
 #[test]
+fn nurbs_bezier_knots_evaluate_and_custom_knots_are_unsupported() {
+    let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+    let points = json!([
+        {"co":[0.0,0.0,0.0]},
+        {"co":[1.0,0.0,0.0]},
+        {"co":[2.0,0.0,0.0]},
+        {"co":[3.0,0.0,0.0]},
+        {"co":[4.0,0.0,0.0]},
+        {"co":[5.0,0.0,0.0]},
+        {"co":[6.0,0.0,0.0]}
+    ]);
+    let cyclic_points = json!([
+        {"co":[1.0,0.0,0.0]},
+        {"co":[0.5,0.866_025_403_784_438_6,0.0]},
+        {"co":[-0.5,0.866_025_403_784_438_6,0.0]},
+        {"co":[-1.0,0.0,0.0]},
+        {"co":[-0.5,-0.866_025_403_784_438_6,0.0]},
+        {"co":[0.5,-0.866_025_403_784_438_6,0.0]}
+    ]);
+    let mut doc = apply(
+        &base,
+        &json!([
+            {
+                "op":"curve.create",
+                "id":"bezier_nurbs",
+                "data_id":"bezier_nurbs_data",
+                "dimensions":"three_d",
+                "splines":[{
+                    "type":"nurbs",
+                    "points":points.clone(),
+                    "order":3,
+                    "cyclic":false,
+                    "resolution":2,
+                    "use_endpoint":true,
+                    "use_bezier":true
+                }]
+            },
+            {
+                "op":"curve.create",
+                "id":"open_bezier_nurbs",
+                "data_id":"open_bezier_nurbs_data",
+                "dimensions":"three_d",
+                "splines":[{
+                    "type":"nurbs",
+                    "points":points,
+                    "order":3,
+                    "cyclic":false,
+                    "resolution":2,
+                    "use_endpoint":false,
+                    "use_bezier":true
+                }]
+            },
+            {
+                "op":"curve.create",
+                "id":"cyclic_bezier_nurbs",
+                "data_id":"cyclic_bezier_nurbs_data",
+                "dimensions":"three_d",
+                "splines":[{
+                    "type":"nurbs",
+                    "points":cyclic_points,
+                    "order":3,
+                    "cyclic":true,
+                    "resolution":2,
+                    "use_endpoint":false,
+                    "use_bezier":true
+                }]
+            }
+        ]),
+    );
+    let snapshot = evaluated(&doc);
+    let mesh = &snapshot.meshes[&Id::new("bezier_nurbs").unwrap()];
+    assert_eq!(mesh.vertices.len(), 7);
+    let open_mesh = &snapshot.meshes[&Id::new("open_bezier_nurbs").unwrap()];
+    assert_eq!(open_mesh.vertices.len(), 5);
+    let cyclic_mesh = &snapshot.meshes[&Id::new("cyclic_bezier_nurbs").unwrap()];
+    assert_eq!(cyclic_mesh.vertices.len(), 6);
+    let expected_x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    for (vertex, expected_x) in mesh.vertices.iter().zip(expected_x) {
+        assert_eq!(vertex.co.to_array(), [expected_x, 0.0, 0.0]);
+    }
+
+    let data = doc
+        .data_blocks
+        .get_mut(&Id::new("bezier_nurbs_data").unwrap())
+        .unwrap()
+        .curve
+        .as_mut()
+        .unwrap();
+    data.splines[0].custom_knots = true;
+    let error = Snapshot::evaluate(&doc, &EvaluationContext::default()).unwrap_err();
+    assert_eq!(
+        error.code,
+        potter_core::error::ErrorCode::UnsupportedFeature
+    );
+    assert_eq!(error.details["feature_id"], "curve.nurbs.knot_mode");
+    assert_eq!(
+        error.message,
+        "curve geometry is invalid: unsupported feature `curve.nurbs.knot_mode`: custom NURBS knot vector values are not represented"
+    );
+}
+
+#[test]
 fn cyclic_bevel_is_a_closed_tube_and_text_bounds_scale_with_size() {
     let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
     let circle = json!([
@@ -140,6 +242,48 @@ fn curve_editing_and_conversion_report_production_data_loss() {
     assert_eq!(mesh.vertices.len(), 40);
     assert_eq!(mesh.faces.len(), 20);
     assert!(mesh.validate().is_ok());
+}
+#[test]
+fn handle_type_updates_replace_stale_per_side_overrides() {
+    let base = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+    let doc = apply(
+        &base,
+        &json!([
+            {
+                "op":"curve.create",
+                "id":"handles",
+                "data_id":"handles_data",
+                "dimensions":"three_d",
+                "splines":[{
+                    "type":"bezier",
+                    "points":[
+                        {"co":[0.0,0.0,0.0],"handle_left":[-0.2,0.0,0.0],"handle_right":[0.2,0.0,0.0],"handle_type":"auto","handle_left_type":"aligned","handle_right_type":"free"},
+                        {"co":[1.0,0.0,0.0],"handle_left":[0.8,0.0,0.0],"handle_right":[1.2,0.0,0.0],"handle_type":"auto","handle_left_type":"aligned","handle_right_type":"free"}
+                    ],
+                    "order":3,
+                    "cyclic":false,
+                    "resolution":4,
+                    "use_endpoint":false
+                }]
+            },
+            {"op":"curve.point_update","target":{"id":"handles"},"spline_index":0,"point_index":0,"set":{"handle_type":"vector"}},
+            {"op":"curve.point_update","target":{"id":"handles"},"spline_index":0,"point_index":1,"set":{"handle_type":"vector","handle_left_type":"free"}},
+            {"op":"curve.convert","target":{"id":"handles"},"to":"curves"}
+        ]),
+    );
+    let attributes = &doc.data_blocks[&Id::new("handles_data").unwrap()]
+        .hair_curves
+        .as_ref()
+        .unwrap()
+        .attributes;
+    assert_eq!(
+        attributes["handle_type_left"].values.as_slice(),
+        &[json!(2), json!(0)]
+    );
+    assert_eq!(
+        attributes["handle_type_right"].values.as_slice(),
+        &[json!(2), json!(2)]
+    );
 }
 
 #[test]

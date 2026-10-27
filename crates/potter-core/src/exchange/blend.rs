@@ -6395,8 +6395,8 @@ fn import_curves(
                         let points = optional_array(spline, "points")?
                             .iter()
                             .map(|point| {
-                                let handle_type = match point
-                                    .get("handle_type")
+                                let parse_handle_type = |field| match point
+                                    .get(field)
                                     .and_then(Value::as_str)
                                     .unwrap_or("AUTO")
                                     .to_ascii_lowercase()
@@ -6407,11 +6407,18 @@ fn import_curves(
                                     "free" => CurveHandleType::Free,
                                     _ => CurveHandleType::Auto,
                                 };
+                                let handle_type = parse_handle_type("handle_type");
                                 Ok(CurvePoint {
                                     co: vec3_field(point, "co", [0.0; 3]),
                                     handle_left: vec3_field(point, "handle_left", [0.0; 3]),
                                     handle_right: vec3_field(point, "handle_right", [0.0; 3]),
                                     handle_type,
+                                    handle_left_type: point
+                                        .get("handle_left_type")
+                                        .map(|_| parse_handle_type("handle_left_type")),
+                                    handle_right_type: point
+                                        .get("handle_right_type")
+                                        .map(|_| parse_handle_type("handle_right_type")),
                                     weight: number_field(point, "weight", 1.0),
                                     radius: number_field(point, "radius", 1.0),
                                     tilt: number_field(point, "tilt", 0.0),
@@ -6434,6 +6441,14 @@ fn import_curves(
                                 })?,
                             use_endpoint: spline
                                 .get("use_endpoint")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            use_bezier: spline
+                                .get("use_bezier")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            custom_knots: spline
+                                .get("custom_knots")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false),
                         })
@@ -6462,6 +6477,10 @@ fn import_curves(
                                 invalid_intermediate("curve bevel resolution is out of range")
                             })?,
                         extrude: number_field(item, "extrude", 0.0),
+                        has_bevel_object: item
+                            .get("has_bevel_object")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                         taper: None,
                         taper_radius_mode: match item
                             .get("taper_radius_mode")
@@ -9835,6 +9854,70 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             "Blender's USD cache file is not supported; the cache resource is kept but its Mesh Cache and Mesh Sequence Cache modifiers fail at evaluation",
         ));
     }
+    for curve in raw
+        .get("curves")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if curve.get("has_bevel_object").and_then(Value::as_bool) == Some(true) {
+            losses.push(loss(
+                "blender.curve.bevel_object",
+                curve
+                    .get("potter_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| curve.get("name").and_then(Value::as_str)),
+                "the Curve's bevel-object pointer is kept as a conversion-refusal marker but the referenced Object is not represented",
+            ));
+        }
+        if curve
+            .get("splines")
+            .and_then(Value::as_array)
+            .is_some_and(|splines| {
+                splines
+                    .iter()
+                    .any(|spline| spline.get("custom_knots").and_then(Value::as_bool) == Some(true))
+            })
+        {
+            losses.push(loss(
+                "blender.curve.nurbs.custom_knots",
+                curve
+                    .get("potter_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| curve.get("name").and_then(Value::as_str)),
+                "Blender's public Curve RNA does not expose legacy NURBS custom knot vectors, so import cannot capture them",
+            ));
+        }
+    }
+    for curves in raw
+        .get("hair_curves")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let custom_knots = curves
+            .get("attributes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|attribute| {
+                attribute.get("name").and_then(Value::as_str) == Some("knots_mode")
+                    && attribute
+                        .get("values")
+                        .and_then(Value::as_array)
+                        .is_some_and(|values| values.iter().any(|value| value.as_i64() == Some(4)))
+            });
+        if custom_knots {
+            losses.push(loss(
+                "hair_curves.nurbs.custom_knots",
+                curves
+                    .get("potter_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| curves.get("name").and_then(Value::as_str)),
+                "Blender stores custom NURBS knot vectors outside the public Curves attribute API, so the vector is not captured during import",
+            ));
+        }
+    }
     // Physics pointers resolve only to collections explicitly imported by their bridge identity.
     let collection_bridge_ids: BTreeSet<&str> = raw
         .get("collections")
@@ -11417,6 +11500,45 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
                 "data-block is preserved in compatibility JSON but is not reconstructed as a Blender data-block",
             ));
         }
+        if data
+            .curve
+            .as_ref()
+            .is_some_and(|curve| curve.has_bevel_object)
+        {
+            losses.push(loss(
+                "blender.curve.bevel_object",
+                Some(data_id.as_str()),
+                "the Curve bevel-object target is not represented, so export cannot restore its bevel geometry",
+            ));
+        }
+        if data
+            .hair_curves
+            .as_ref()
+            .and_then(|curves| curves.attributes.get("knots_mode"))
+            .is_some_and(|attribute| {
+                attribute
+                    .values
+                    .iter()
+                    .any(|value| value.as_i64() == Some(4))
+            })
+        {
+            losses.push(loss(
+                "hair_curves.nurbs.custom_knots",
+                Some(data_id.as_str()),
+                "Blender stores custom NURBS knot vectors outside the public Curves attribute API, so export cannot restore the vector",
+            ));
+        }
+        if data
+            .curve
+            .as_ref()
+            .is_some_and(|curve| curve.splines.iter().any(|spline| spline.custom_knots))
+        {
+            losses.push(loss(
+                "blender.curve.nurbs.custom_knots",
+                Some(data_id.as_str()),
+                "Blender's public Curve RNA cannot restore legacy NURBS custom knot vectors; lossy export recreates standard knots",
+            ));
+        }
         if let Some(mesh) = &data.mesh {
             let color_names = color_layers::read(mesh)
                 .layers
@@ -12125,6 +12247,7 @@ fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss
 mod tests {
     #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
     use super::*;
+    use crate::model::{HairCurveAttribute, HairCurvesData};
     #[test]
     fn usd_cache_resources_export_as_cache_usd_losses() {
         let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
@@ -20074,6 +20197,102 @@ print("UNSUPPORTED_POSE " + json.dumps({
                 ),
             ]
         );
+    }
+    #[test]
+    fn import_losses_report_hair_curves_custom_knots() {
+        let raw = json!({"hair_curves": [{
+            "name": "Custom Curves",
+            "attributes": [{
+                "name": "knots_mode",
+                "domain": "CURVE",
+                "data_type": "INT8",
+                "values": [4]
+            }]
+        }]});
+        assert!(import_losses(&raw).iter().any(|loss| {
+            loss.feature_id == "hair_curves.nurbs.custom_knots"
+                && loss.data_id.as_deref() == Some("Custom Curves")
+        }));
+    }
+
+    #[test]
+    fn import_losses_report_legacy_curve_custom_knots() {
+        let raw = json!({"curves": [{
+            "name": "Custom Curve",
+            "splines": [{
+                "type": "NURBS",
+                "custom_knots": true
+            }]
+        }]});
+        let losses = import_losses(&raw);
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.curve.nurbs.custom_knots"
+                && loss.data_id.as_deref() == Some("Custom Curve")
+        }));
+        assert!(losses.iter().all(|loss| {
+            loss.feature_id != "curve.convert.nurbs.custom_knots"
+                && loss.feature_id != "hair_curves.nurbs.custom_knots"
+        }));
+    }
+
+    #[test]
+    fn export_losses_report_legacy_curve_custom_knots() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let data_id = Id::new("custom_curve_data")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "curve".to_owned(),
+                curve: Some(CurveData {
+                    splines: vec![CurveSpline {
+                        spline_type: CurveSplineType::Nurbs,
+                        custom_knots: true,
+                        ..CurveSpline::default()
+                    }],
+                    ..CurveData::default()
+                }),
+                ..DataBlock::default()
+            },
+        );
+        let losses = export_losses(&doc);
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.curve.nurbs.custom_knots"
+                && loss.data_id.as_deref() == Some(data_id.as_str())
+        }));
+        assert!(losses.iter().all(|loss| {
+            loss.feature_id != "curve.convert.nurbs.custom_knots"
+                && loss.feature_id != "hair_curves.nurbs.custom_knots"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn export_losses_report_hair_curves_custom_knots() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let data_id = Id::new("custom_curves_data")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "hair_curves".to_owned(),
+                hair_curves: Some(HairCurvesData {
+                    attributes: BTreeMap::from([(
+                        "knots_mode".to_owned(),
+                        HairCurveAttribute {
+                            domain: "CURVE".to_owned(),
+                            data_type: "INT8".to_owned(),
+                            values: vec![json!(4)],
+                        },
+                    )]),
+                    ..HairCurvesData::default()
+                }),
+                ..DataBlock::default()
+            },
+        );
+        assert!(export_losses(&doc).iter().any(|loss| {
+            loss.feature_id == "hair_curves.nurbs.custom_knots"
+                && loss.data_id.as_deref() == Some(data_id.as_str())
+        }));
+        Ok(())
     }
 
     #[test]

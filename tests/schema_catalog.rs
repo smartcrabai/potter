@@ -1020,6 +1020,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "driver.location_rotation_difference",
         "shape_key.absolute",
         "curve.taper_object",
+        "curve.convert.destination",
         "curve.fill.multiple_contours",
         "physics.dynamic_paint_surface.frame_start",
         "physics.dynamic_paint_surface.output_name_b",
@@ -1051,6 +1052,16 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "graph.bake.legacy_instance_columns_missing",
         "constraint.geometry_attribute.instances.no_evaluated_geometry",
         "driver.geometry_attribute.instance_dependency",
+        "curve.convert.empty",
+        "curve.convert.destination.other",
+        "curve.convert.evaluated_modifiers",
+        "curve.convert.shape_keys",
+        "curve.convert.twist_mode",
+        "curve.nurbs.knot_mode",
+        "hair_curves.nurbs.custom_knots",
+        "blender.curve.nurbs.custom_knots",
+        "curve.convert.production_settings",
+        "blender.curve.bevel_object",
     ] {
         assert!(
             features.iter().any(|feature| {
