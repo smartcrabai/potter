@@ -1620,7 +1620,21 @@ fn render_strip_content(
                     json!({"strip_id":strip.id}),
                 )
             })?;
-            let pixels = render_text_frame(text, strip.color, width, height)?;
+            let pixels = if let Some(font) = strip.font.as_deref() {
+                super::text_strip::render_external_text_frame(
+                    doc,
+                    root,
+                    font,
+                    text,
+                    strip.wrap_width,
+                    strip.color,
+                    scene.render.resolution_percentage,
+                    width,
+                    height,
+                )?
+            } else {
+                render_text_frame(text, strip.color, width, height)?
+            };
             Some(SequencerFrame::from_straight_scene_linear(
                 pixels,
                 ImageColorspace::Srgb,

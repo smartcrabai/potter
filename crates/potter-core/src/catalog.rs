@@ -2742,13 +2742,34 @@ pub fn feature_catalog() -> Value {
             &[],
             "Movie strips cannot be rendered because no pure-Rust movie decoder is available.",
         ),
-        unsupported(
-            "sequencer.strip.text.unicode",
-            "Unicode text strip rendering",
-            "Sequence",
-            &[],
-            "The built-in text strip rasterizer supports ASCII glyphs only.",
-        ),
+        {
+            let mut row = supported(
+                "sequencer.strip.text.unicode",
+                "Unicode VSE text strips with explicit TrueType/OpenType fonts",
+                "Sequence",
+                &["sequencer.strip_create", "sequencer.strip_update"],
+                [true, true, true, true, false, true, true],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "Unicode strips require an explicit static TrueType/OpenType font; available glyphs in simple left-to-right, non-combining text use Blender's default 60 px centered layout with truncated render-scale sizing. The pure-Rust renderer uses unhinted outlines, per-glyph advances, and quantized 8-bit area coverage; pair kerning is intentionally omitted because VSE draws each glyph separately. Wrapping follows Blender's two-pass algorithm: only ASCII U+0020 creates a word break and only LF creates a line; U+3000 spaces and words without ASCII spaces overflow rather than break. At 1024×256, committed Blender 5.2.2 captures compare with premultiplied-RGBA/alpha MAE ≤2.540/255 for the Noto CJK subset and ≤0.400/255 for Lato, with alpha bounds within 2/1 pixels. A skrifa Light-target trial was rejected: Lato measured 6,638 changed alpha pixels and 4.159821/255 alpha MAE against the committed capture (the existing limit is 3,013 pixels and 0.400/255); FreeType light hinting and its per-glyph `lsb_delta` adjustment remain unsupported. Non-default wrap_width is supported in `sequencer.strip.text.layout`; other non-default font size, position, alignment, line spacing, bold/italic, shadow, outline, and box settings remain unsupported. Unicode without a font, missing glyphs, variable/color fonts, combining sequences, RTL/complex shaping, and emoji sequences are unsupported; the legacy no-font ASCII path remains unchanged. Blender uses FreeType BLF and defaults to DejaVuSansMono.woff2 with Noto fallbacks (`source/blender/sequencer/intern/effects/effect_text.cc:795-833,848-937,1046-1076`; `source/blender/blenfont/intern/blf_font.cc:365-420,1066-1118,1260-1276`; `source/blender/blenfont/intern/blf_glyph.cc:238-245,862-873`)."
+            );
+            row
+        },
+        {
+            let mut row = supported(
+                "sequencer.strip.text.layout",
+                "VSE text-strip wrap width",
+                "Sequence",
+                &["sequencer.strip_create", "sequencer.strip_update"],
+                [true, true, true, true, false, true, true],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "Text-strip wrap_width is preserved by import, operations, inspect, and export and follows Blender's U+0020/LF wrapping behavior for strips with explicit fonts; zero disables wrapping. Non-default wrap_width is reported as a layout loss without an explicit font. Non-default font size, position, alignment, line spacing, bold/italic, shadow, outline, and box settings remain import losses."
+            );
+            row
+        },
         supported(
             "asset.library",
             "Native Potter project and Blender libraries with linked IDs, editable overrides, reload, and relocation",

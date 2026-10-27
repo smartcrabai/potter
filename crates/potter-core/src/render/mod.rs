@@ -20,6 +20,7 @@ mod sequence;
 mod studio;
 mod subsurface;
 mod subsurface_walk;
+mod text_strip;
 mod wireframe;
 mod world_probe;
 

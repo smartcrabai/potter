@@ -429,6 +429,11 @@ fn configure_blender_resources(
             {
                 strip.source.clone_from(&Some(uri.clone()));
             }
+            if let Some(font) = strip.font.as_ref()
+                && let Some(uri) = reference_uris.get(&resource_reference_key(font))
+            {
+                strip.font.clone_from(&Some(uri.clone()));
+            }
             for source_file in &mut strip.source_files {
                 if let Some(uri) = reference_uris.get(&resource_reference_key(source_file)) {
                     source_file.clone_from(uri);
@@ -910,9 +915,15 @@ mod tests {
         let alias = directory.path().join("alias.exr");
         fs::write(&original, b"image").unwrap();
         std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let font_original = directory.path().join("Lato-Regular.ttf");
+        let font_alias = directory.path().join("font-alias.ttf");
+        fs::write(&font_original, b"font").unwrap();
+        std::os::unix::fs::symlink(&font_original, &font_alias).unwrap();
 
         let digest = "sha256:frame-hash";
         let uri = "assets/sha256/frame-hash/frame.exr";
+        let font_digest = "sha256:font-hash";
+        let font_uri = "assets/sha256/font-hash/Lato-Regular.ttf";
         let mut doc = SceneDoc::new("resource_path_test".to_owned());
         let resource_id = Id::new("resource_frame").unwrap();
         doc.resources.insert(
@@ -923,6 +934,17 @@ mod tests {
                 "filename": "frame.exr",
                 "status": "available",
                 "kind": "image_sequence",
+                "source_packed": false,
+            }),
+        );
+        doc.resources.insert(
+            Id::new("resource_font").unwrap(),
+            json!({
+                "original_path": font_original.to_string_lossy(),
+                "hash": font_digest,
+                "filename": "Lato-Regular.ttf",
+                "status": "available",
+                "kind": "font",
                 "source_packed": false,
             }),
         );
@@ -942,10 +964,18 @@ mod tests {
             source: Some("scene_source".to_owned()),
             ..crate::sequencer::Strip::default()
         });
+        scene.sequencer.strips.push(crate::sequencer::Strip {
+            kind: crate::sequencer::StripType::Text,
+            font: Some(font_alias.to_string_lossy().into_owned()),
+            ..crate::sequencer::Strip::default()
+        });
 
         configure_blender_resources(
             &mut doc,
-            &BTreeMap::from([(digest.to_owned(), b"image".to_vec())]),
+            &BTreeMap::from([
+                (digest.to_owned(), b"image".to_vec()),
+                (font_digest.to_owned(), b"font".to_vec()),
+            ]),
             AssetPolicy::Copy,
         )
         .unwrap();
@@ -954,6 +984,7 @@ mod tests {
         assert_eq!(strips[0].source_files[0], uri);
         assert_eq!(strips[1].source.as_deref(), Some(uri));
         assert_eq!(strips[2].source.as_deref(), Some("scene_source"));
+        assert_eq!(strips[3].font.as_deref(), Some(font_uri));
     }
 
     #[test]

@@ -73,6 +73,11 @@ pub struct Strip {
     /// Scene-linear RGBA; Blender's `COLOR_GAMMA` Color/Text properties are decoded on import.
     pub color: [f32; 4],
     pub text: Option<String>,
+    /// External font path or asset URI for text strips; `None` selects the default font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    /// Blender VSE text wrapping width as a fraction of the frame width; zero disables wrapping.
+    pub wrap_width: f32,
     pub transition: Option<TransitionType>,
     pub inputs: Vec<String>,
     pub effect: Option<EffectType>,
@@ -103,6 +108,8 @@ impl Default for Strip {
             source_files: Vec::new(),
             color: [0.0, 0.0, 0.0, 1.0],
             text: None,
+            font: None,
+            wrap_width: 1.0,
             transition: None,
             inputs: Vec::new(),
             effect: None,
@@ -133,6 +140,8 @@ impl Strip {
             || !self.sound_pitch.is_finite()
             || self.sound_pitch <= 0.0
             || self.color.iter().any(|component| !component.is_finite())
+            || !self.wrap_width.is_finite()
+            || self.wrap_width < 0.0
             || (self.kind == StripType::Transition) != self.transition.is_some()
             || (self.kind == StripType::Effect) != self.effect.is_some()
             || self.modifiers.iter().any(|modifier| !modifier.is_valid())
@@ -140,6 +149,23 @@ impl Strip {
             return Err(PotError::new(
                 ErrorCode::InvalidOperation,
                 "sequencer strip has invalid identity, timing, channel, or settings",
+            ));
+        }
+        if self
+            .font
+            .as_deref()
+            .is_some_and(|font| font.is_empty() || font == "builtin")
+            || (self.font.is_some() && self.kind != StripType::Text)
+        {
+            return Err(PotError::new(
+                ErrorCode::InvalidOperation,
+                "sequencer font must be an explicit external reference on text strips",
+            ));
+        }
+        if self.kind != StripType::Text && self.wrap_width.to_bits() != 1.0_f32.to_bits() {
+            return Err(PotError::new(
+                ErrorCode::InvalidOperation,
+                "sequencer wrap_width is only valid on text strips",
             ));
         }
         if !self.source_files.is_empty() {

@@ -408,6 +408,8 @@ const STRIP_FIELDS: &[&str] = &[
     "source_files",
     "color",
     "text",
+    "font",
+    "wrap_width",
     "transition",
     "inputs",
     "effect",
@@ -434,6 +436,8 @@ const STRIP_SET_FIELDS: &[&str] = &[
     "source_files",
     "color",
     "text",
+    "font",
+    "wrap_width",
     "transition",
     "inputs",
     "effect",
@@ -529,6 +533,151 @@ mod tests {
                     "op": "sequencer.strip_update",
                     "id": "template",
                     "set": {"source_files": ["/tmp/another.exr"]}
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+    }
+    #[test]
+    fn text_strip_font_and_wrap_width_create_update_clear_and_validate() {
+        let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let created = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "sequencer.strip_create",
+                    "id": "title",
+                    "type": "text",
+                    "font": "asset://font_lato",
+                    "wrap_width": 1.5
+                }]
+            }),
+        )
+        .unwrap();
+        let strip = &created.doc.scenes[&created.doc.active_scene]
+            .sequencer
+            .strips[0];
+        assert_eq!(strip.font.as_deref(), Some("asset://font_lato"));
+        assert_eq!(strip.wrap_width, 1.5);
+
+        let updated = apply_batch(
+            &created.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": created.doc.revision,
+                "operations": [{
+                    "op": "sequencer.strip_update",
+                    "id": "title",
+                    "set": {"font": "/fonts/Lato-Regular.ttf", "wrap_width": 2.0}
+                }]
+            }),
+        )
+        .unwrap();
+        let strip = &updated.doc.scenes[&updated.doc.active_scene]
+            .sequencer
+            .strips[0];
+        assert_eq!(strip.font.as_deref(), Some("/fonts/Lato-Regular.ttf"));
+        assert_eq!(strip.wrap_width, 2.0);
+
+        let cleared = apply_batch(
+            &updated.doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": updated.doc.revision,
+                "operations": [{
+                    "op": "sequencer.strip_update",
+                    "id": "title",
+                    "set": {"font": null, "wrap_width": 0.0}
+                }]
+            }),
+        )
+        .unwrap();
+        let strip = &cleared.doc.scenes[&cleared.doc.active_scene]
+            .sequencer
+            .strips[0];
+        assert_eq!(strip.font, None);
+        assert_eq!(strip.wrap_width, 0.0);
+
+        let legacy_text = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "sequencer.strip_create",
+                    "id": "legacy_title",
+                    "type": "text"
+                }]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_text.doc.scenes[&legacy_text.doc.active_scene]
+                .sequencer
+                .strips[0]
+                .font,
+            None
+        );
+        assert_eq!(
+            legacy_text.doc.scenes[&legacy_text.doc.active_scene]
+                .sequencer
+                .strips[0]
+                .wrap_width,
+            1.0
+        );
+        let legacy_json_strip: crate::sequencer::Strip =
+            serde_json::from_value(json!({"id":"legacy_title","type":"text"})).unwrap();
+        assert_eq!(legacy_json_strip.wrap_width, 1.0);
+
+        for (id, kind, font) in [
+            ("empty_font", "text", ""),
+            ("builtin_font", "text", "builtin"),
+            ("non_text_font", "image", "/fonts/Lato-Regular.ttf"),
+        ] {
+            let error = apply_batch(
+                &doc,
+                &json!({
+                    "schema_version": 1,
+                    "base_revision": 0,
+                    "operations": [{
+                        "op": "sequencer.strip_create",
+                        "id": id,
+                        "type": kind,
+                        "font": font
+                    }]
+                }),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidOperation);
+        }
+        let error = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "sequencer.strip_create",
+                    "id": "negative_wrap",
+                    "type": "text",
+                    "wrap_width": -0.1
+                }]
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        let error = apply_batch(
+            &doc,
+            &json!({
+                "schema_version": 1,
+                "base_revision": 0,
+                "operations": [{
+                    "op": "sequencer.strip_create",
+                    "id": "non_text_wrap",
+                    "type": "image",
+                    "wrap_width": 1.5
                 }]
             }),
         )

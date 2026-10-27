@@ -7,6 +7,7 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
+ab_glyph_rasterizer.workspace = true
 cap-fs-ext.workspace = true
 cap-primitives.workspace = true
 cap-std.workspace = true
