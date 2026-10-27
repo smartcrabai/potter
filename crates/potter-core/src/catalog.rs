@@ -1669,7 +1669,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "constraint.extended_transform",
-            "Locked track, stretch-to, transformation, maintain-volume, floor, pivot, and shrinkwrap-lite constraints",
+            "Locked track, stretch-to, transformation, maintain-volume, floor, pivot, shrinkwrap, and clamp-to constraints",
             "Constraint",
             &[
                 "constraint.create",
@@ -1966,12 +1966,163 @@ pub fn feature_catalog() -> Value {
             ],
             [true, true, true, true, true, false, false],
         ),
+        supported(
+            "constraint.copy_scale.modes",
+            "Copy Scale power, uniform, multiplicative offset, and additive offset modes",
+            "COPY_SCALE",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        supported(
+            "constraint.copy_location.offset_invert",
+            "Copy Location per-axis inversion and offset behavior",
+            "COPY_LOCATION",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        supported(
+            "constraint.copy_rotation.euler_order",
+            "Copy Rotation explicit and owner Euler orders with all mix modes",
+            "COPY_ROTATION",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        supported(
+            "constraint.limit_rotation.euler_order_and_wrapping",
+            "Limit Rotation explicit/owner Euler orders with cyclic and legacy clamps",
+            "LIMIT_ROTATION",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        supported(
+            "constraint.child_of.channel_filtering",
+            "Child Of channel-filtered parent and inverse composition across supported spaces, including SPACEONCE",
+            "CHILD_OF",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        supported(
+            "constraint.pivot.owner_euler_order",
+            "Pivot NX default and owner Euler-order gating",
+            "PIVOT",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        supported(
+            "constraint.transformation.reversed_range",
+            "Transformation reversed input-range clamp behavior",
+            "TRANSFORM",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        supported(
+            "constraint.floor.rotation",
+            "Floor constraints with and without target rotation",
+            "FLOOR",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        supported(
+            "constraint.maintain_volume.modes",
+            "Maintain Volume STRICT, UNIFORM, and SINGLE_AXIS modes",
+            "MAINTAIN_VOLUME",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
         unsupported(
-            "constraint.other_standard",
-            "Other standard Blender constraints",
-            "Constraint",
+            "constraint.clamp_to.custom_spaces",
+            "Clamp To with CUSTOM owner or target space",
+            "CLAMP_TO",
             &[],
-            "Remaining Blender standard constraint types outside the supported transform, Transform Cache, spline IK, Action, Geometry Attribute, Camera Solver, Follow Track, and Object Solver subsets are not implemented.",
+            "Clamp To evaluation does not resolve CUSTOM spaces; active constraints using a custom owner or target space are refused.",
+        ),
+        unsupported(
+            "constraint.follow_path.custom_spaces",
+            "Follow Path with CUSTOM owner or target space",
+            "FOLLOW_PATH",
+            &[],
+            "Follow Path evaluation does not resolve CUSTOM spaces; active constraints using a custom owner or target space are refused.",
+        ),
+        partially_supported(
+            "constraint.child_of.pending_inverse",
+            "Child Of first-evaluation inverse capture",
+            "CHILD_OF",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            "constraint.create/update capture Blender's inverse at the current frame for an invertible target parent; targetless constraints defer capture until a target is assigned. An imported .blend that still has set_inverse_pending is loss-reported and refused, and schema-12 documents preserve that raw state in compatibility data.",
+        ),
+        supported(
+            "constraint.limit_distance.initial_distance",
+            "Limit Distance zero-distance recapture",
+            "LIMIT_DISTANCE",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            [true, true, true, true, true, false, false],
+        ),
+        partially_supported(
+            "constraint.stretch_to.initial_length",
+            "Stretch To first-evaluation rest length capture",
+            "STRETCH_TO",
+            &[
+                "constraint.create",
+                "constraint.update",
+                "constraint.delete",
+                "constraint.reorder",
+            ],
+            "constraint.create/update capture Blender's zero rest length at the current frame when the normalized sampled length is nonzero; targetless constraints defer capture until a target is assigned, while zero-length samples remain refused. An imported .blend that still has rest_length zero is loss-reported and refused, and schema-12 documents preserve that raw state in compatibility data.",
         ),
         supported(
             "constraint.target_bbone_shape",
@@ -2713,6 +2864,24 @@ fn unsupported(
         pot_ops,
         [false; 7],
         "not_supported",
+        &json!(reason),
+    )
+}
+
+fn partially_supported(
+    feature_id: &str,
+    name: &str,
+    blender_type: &str,
+    pot_ops: &[&str],
+    reason: &str,
+) -> Value {
+    feature_row(
+        feature_id,
+        name,
+        blender_type,
+        pot_ops,
+        [true, true, true, true, true, false, true],
+        "partial",
         &json!(reason),
     )
 }

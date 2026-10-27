@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{DMat4, DVec3};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -1308,6 +1308,123 @@ fn object_solver_inverse_matrix(
     }
 }
 
+fn constraint_initial_state_feature(constraint: &Constraint) -> Option<&'static str> {
+    match constraint.constraint_type {
+        ConstraintType::StretchTo
+            if constraint
+                .params
+                .get("rest_length")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                == 0.0 =>
+        {
+            Some("constraint.stretch_to.initial_length")
+        }
+        ConstraintType::ChildOf
+            if constraint
+                .params
+                .get("set_inverse_pending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            Some("constraint.child_of.pending_inverse")
+        }
+        _ => None,
+    }
+}
+
+fn capture_constraint_initial_state(
+    engine: &mut Engine<'_>,
+    owner_id: &Id,
+    constraint_id: &Id,
+) -> Result<bool> {
+    let (feature_id, constraint_type, enabled, influence, has_target) = {
+        let constraint = engine
+            .doc
+            .nodes
+            .get(owner_id)
+            .and_then(|node| {
+                node.constraints
+                    .iter()
+                    .find(|constraint| &constraint.id == constraint_id)
+            })
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "constraint disappeared"))?;
+        let Some(feature_id) = constraint_initial_state_feature(constraint) else {
+            return Ok(false);
+        };
+        (
+            feature_id,
+            constraint.constraint_type,
+            constraint.enabled,
+            constraint.influence,
+            constraint.target.is_some(),
+        )
+    };
+    if !enabled || influence == 0.0 {
+        return Ok(false);
+    }
+    if matches!(
+        constraint_type,
+        ConstraintType::StretchTo | ConstraintType::ChildOf
+    ) && !has_target
+    {
+        return Ok(false);
+    }
+    let frame = engine
+        .doc
+        .scenes
+        .get(&engine.doc.active_scene)
+        .map(|scene| scene.frame_current)
+        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "active scene disappeared"))?;
+    let (captures, evaluation_result) =
+        crate::eval::evaluate_with_constraint_initial_state_capture_outcome(
+            engine.doc,
+            frame,
+            engine.asset_root,
+            engine.cache_directory,
+        );
+    let mut captured_current = false;
+    let mut changed_any = false;
+    for ((captured_owner, captured_id), params) in captures {
+        let is_current = &captured_owner == owner_id && &captured_id == constraint_id;
+        let changed = engine
+            .doc
+            .nodes
+            .get_mut(&captured_owner)
+            .and_then(|node| {
+                node.constraints
+                    .iter_mut()
+                    .find(|constraint| constraint.id == captured_id)
+            })
+            .is_some_and(|constraint| {
+                constraint.params.extend(params);
+                true
+            });
+        if changed {
+            engine.mark("nodes", &captured_owner, ChangeKind::Updated);
+            changed_any = true;
+            captured_current |= is_current;
+        }
+    }
+    if let Err(error) = evaluation_result {
+        if error.details.get("owner_id").and_then(Value::as_str) == Some(owner_id.as_str())
+            && error.details.get("constraint_id").and_then(Value::as_str)
+                == Some(constraint_id.as_str())
+        {
+            return Err(error);
+        }
+        return Ok(changed_any);
+    }
+    if !captured_current {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "constraint initial state could not be captured at the current scene frame",
+            json!({"feature_id":feature_id,"status":"not_supported","constraint_id":constraint_id}),
+        ));
+    }
+    Ok(changed_any)
+}
+
 fn constraint_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     check_fields(
         engine,
@@ -1354,6 +1471,17 @@ fn constraint_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
     let enabled = read_bool(engine, operation, "enabled", true)?;
     let mut params = read_params(engine, operation.get("params"), "params")?;
     apply_constraint_defaults(kind, &mut params);
+    if kind == ConstraintType::ChildOf
+        && let Some(default) = params::default_value(
+            ParameterFamily::Constraint,
+            "child_of",
+            "set_inverse_pending",
+        )
+    {
+        params
+            .entry("set_inverse_pending".to_owned())
+            .or_insert_with(|| default.clone());
+    }
     validate_constraint_parameter_map(engine, kind, &params, "/params")?;
     validate_constraint_params(engine, kind, &params, "params")?;
     if let Some(key) = constraint_target_param(kind)
@@ -1408,23 +1536,26 @@ fn constraint_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
         ));
     }
     let path_target = target.clone();
-    let node =
-        engine.doc.nodes.get_mut(&owner_id).ok_or_else(|| {
+    let constraint_id = id.clone();
+    {
+        let node = engine.doc.nodes.get_mut(&owner_id).ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "constraint owner disappeared")
         })?;
-    node.constraints.push(Constraint {
-        id,
-        constraint_type: kind,
-        name,
-        target,
-        subtarget,
-        owner_bone,
-        influence,
-        enabled,
-        params,
-        inverse_matrix,
-        inverse_frame,
-    });
+        node.constraints.push(Constraint {
+            id,
+            constraint_type: kind,
+            name,
+            target,
+            subtarget,
+            owner_bone,
+            influence,
+            enabled,
+            params,
+            inverse_matrix,
+            inverse_frame,
+        });
+    }
+    capture_constraint_initial_state(engine, &owner_id, &constraint_id)?;
     engine.mark("nodes", &owner_id, ChangeKind::Updated);
     enable_constraint_target_path(engine, kind, path_target.as_ref());
     Ok(true)
@@ -1528,6 +1659,18 @@ fn constraint_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
         next.params = object_value(engine, value, "set/params")?;
     }
     apply_constraint_defaults(next.constraint_type, &mut next.params);
+    if next.constraint_type == ConstraintType::ChildOf
+        && (old.constraint_type != ConstraintType::ChildOf || set.contains_key("params"))
+        && let Some(default) = params::default_value(
+            ParameterFamily::Constraint,
+            "child_of",
+            "set_inverse_pending",
+        )
+    {
+        next.params
+            .entry("set_inverse_pending".to_owned())
+            .or_insert_with(|| default.clone());
+    }
     if set.contains_key("params") || set.contains_key("type") {
         validate_constraint_parameter_map(
             engine,
@@ -1560,16 +1703,16 @@ fn constraint_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
             next.target = parameter_target;
         }
     }
-    let set_inverse = set
+    let explicit_set_inverse = set
         .get("set_inverse")
         .map(|value| bool_value(engine, value, "set/set_inverse"))
-        .transpose()?
-        .unwrap_or_else(|| {
-            next.params
-                .get("set_inverse_pending")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        });
+        .transpose()?;
+    let set_inverse = explicit_set_inverse.unwrap_or_else(|| {
+        next.params
+            .get("set_inverse_pending")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
     let clear_inverse = set
         .get("clear_inverse")
         .map(|value| bool_value(engine, value, "set/clear_inverse"))
@@ -1600,7 +1743,9 @@ fn constraint_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
         next.params
             .insert("set_inverse_pending".to_owned(), Value::Bool(false));
     }
-    if (set_inverse || clear_inverse) && next.constraint_type != ConstraintType::ObjectSolver {
+    if (explicit_set_inverse.unwrap_or(false) || clear_inverse)
+        && next.constraint_type != ConstraintType::ObjectSolver
+    {
         return Err(invalid(
             engine,
             "set_inverse and clear_inverse are only valid for Object Solver constraints",
@@ -1624,24 +1769,31 @@ fn constraint_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) ->
         next.owner_bone.as_ref(),
         "set/owner_bone",
     )?;
-    if next == old {
+    let changed = next != old;
+    let needs_initial_capture =
+        next.enabled && next.influence != 0.0 && constraint_initial_state_feature(&next).is_some();
+    if !changed && !needs_initial_capture {
         return Ok(false);
     }
     let path_kind = next.constraint_type;
     let path_target = next.target.clone();
-    let node =
-        engine.doc.nodes.get_mut(&owner_id).ok_or_else(|| {
+    {
+        let node = engine.doc.nodes.get_mut(&owner_id).ok_or_else(|| {
             PotError::new(ErrorCode::InternalError, "constraint owner disappeared")
         })?;
-    let constraint = node
-        .constraints
-        .iter_mut()
-        .find(|constraint| constraint.id == id)
-        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "constraint disappeared"))?;
-    *constraint = next;
-    engine.mark("nodes", &owner_id, ChangeKind::Updated);
+        let constraint = node
+            .constraints
+            .iter_mut()
+            .find(|constraint| constraint.id == id)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "constraint disappeared"))?;
+        *constraint = next;
+    }
+    let captured = capture_constraint_initial_state(engine, &owner_id, &id)?;
+    if changed || captured {
+        engine.mark("nodes", &owner_id, ChangeKind::Updated);
+    }
     enable_constraint_target_path(engine, path_kind, path_target.as_ref());
-    Ok(true)
+    Ok(changed || captured)
 }
 
 fn constraint_delete(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
@@ -2887,6 +3039,7 @@ fn apply_constraint_defaults(kind: ConstraintType, params: &mut Map<String, Valu
     let defaults: &[&str] = match kind {
         ConstraintType::TrackTo | ConstraintType::LockedTrack => &["track_axis", "up_axis"],
         ConstraintType::LimitDistance => &["distance"],
+        ConstraintType::StretchTo => &["rest_length"],
         ConstraintType::FollowPath => &["offset_factor"],
         _ => &[],
     };

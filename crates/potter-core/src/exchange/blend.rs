@@ -11388,6 +11388,72 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                     "constraint is preserved in compatibility data but is not editable/evaluated by potter",
                 ));
             }
+            let properties = constraint.get("properties").and_then(Value::as_object);
+            let muted = properties
+                .and_then(|properties| properties.get("mute"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let influence = properties
+                .and_then(|properties| properties.get("influence"))
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            let active = !muted && influence != 0.0;
+            let initial_capture = match constraint_type {
+                "STRETCH_TO" => Some((
+                    "constraint.stretch_to.initial_length",
+                    "rest_length",
+                    "An imported .blend still storing zero needs Blender's first-evaluation length capture; Potter reports a loss and refuses that raw state",
+                )),
+                _ => None,
+            };
+            if active
+                && let Some((feature_id, property, reason)) = initial_capture
+                && constraint
+                    .get("properties")
+                    .and_then(|properties| properties.get(property))
+                    .and_then(Value::as_f64)
+                    == Some(0.0)
+            {
+                losses.push(loss(
+                    feature_id,
+                    constraint.get("name").and_then(Value::as_str),
+                    reason,
+                ));
+            }
+            let has_custom_space = ["owner_space", "target_space"].into_iter().any(|space| {
+                properties
+                    .and_then(|properties| properties.get(space))
+                    .and_then(Value::as_str)
+                    == Some("CUSTOM")
+            });
+            let custom_space_feature = match constraint_type {
+                "CLAMP_TO" => Some("constraint.clamp_to.custom_spaces"),
+                "FOLLOW_PATH" => Some("constraint.follow_path.custom_spaces"),
+                _ => None,
+            };
+            if active
+                && has_custom_space
+                && let Some(feature_id) = custom_space_feature
+            {
+                losses.push(loss(
+                    feature_id,
+                    constraint.get("name").and_then(Value::as_str),
+                    "CUSTOM-space evaluation is not implemented; the constraint's raw settings are preserved in Blender compatibility data",
+                ));
+            }
+            if active
+                && constraint_type == "CHILD_OF"
+                && properties
+                    .and_then(|properties| properties.get("set_inverse_pending"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            {
+                losses.push(loss(
+                    "constraint.child_of.pending_inverse",
+                    constraint.get("name").and_then(Value::as_str),
+                    "Blender captures and persists the inverse on first evaluation; Potter refuses active pending inverse state on import and reports a loss, while constraint.create/update capture it",
+                ));
+            }
         }
         for modifier in object
             .get("modifiers")
@@ -13048,15 +13114,57 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
         }
     }
     losses.extend(material_field_losses(doc));
+    let mut imported_initial_state_losses = BTreeSet::new();
     if let Some(intermediate) = doc
         .compatibility
         .get("blender_adapter")
         .and_then(|adapter| adapter.get("intermediate"))
     {
-        losses.extend(import_losses(intermediate).into_iter().filter(|loss| {
+        let imported = import_losses(intermediate);
+        imported_initial_state_losses.extend(
+            imported
+                .iter()
+                .filter(|loss| {
+                    matches!(
+                        loss.feature_id.as_str(),
+                        "constraint.limit_distance.initial_distance"
+                            | "constraint.stretch_to.initial_length"
+                            | "constraint.child_of.pending_inverse"
+                    )
+                })
+                .map(|loss| (loss.feature_id.clone(), loss.data_id.clone())),
+        );
+        losses.extend(imported.into_iter().filter(|loss| {
             loss.feature_id != "blender.material.displacement_method"
                 || imported_both_loss_applies(doc, loss.data_id.as_deref())
         }));
+    }
+    if let Some(states) = doc
+        .compatibility
+        .get("constraints")
+        .and_then(|constraints| constraints.get("uninitialized_initial_states"))
+        .and_then(Value::as_array)
+    {
+        for state in states {
+            let Some(feature_id) = state.get("feature_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let constraint = state.get("constraint").unwrap_or(&Value::Null);
+            let data_id = constraint
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| constraint.get("id").and_then(Value::as_str))
+                .or_else(|| state.get("owner_id").and_then(Value::as_str));
+            let key = (feature_id.to_owned(), data_id.map(str::to_owned));
+            if imported_initial_state_losses.contains(&key) {
+                continue;
+            }
+            losses.push(loss(
+                feature_id,
+                data_id,
+                "The schema migration preserved this uninitialized constraint in compatibility data; Potter does not evaluate or recreate it during Blender export",
+            ));
+        }
     }
     losses
 }
@@ -13865,6 +13973,188 @@ mod tests {
             loss.feature_id == "blender.animation.fcurve_non_transform_channel"
                 && loss.reason.contains("key_blocks[")
         }));
+    }
+
+    #[test]
+    fn zero_limit_distance_capture_remains_importable_while_stretch_to_zero_is_lossy() {
+        let raw = json!({
+            "objects": [{
+                "name": "Object",
+                "type": "EMPTY",
+                "constraints": [
+                    {
+                        "name": "Limit Distance zero",
+                        "type": "LIMIT_DISTANCE",
+                        "properties": {"distance": 0.0}
+                    },
+                    {
+                        "name": "Limit Distance nonzero",
+                        "type": "LIMIT_DISTANCE",
+                        "properties": {"distance": 2.0}
+                    },
+                    {
+                        "name": "Limit Distance muted zero",
+                        "type": "LIMIT_DISTANCE",
+                        "properties": {"distance": 0.0, "mute": true}
+                    },
+                    {
+                        "name": "Limit Distance zero influence",
+                        "type": "LIMIT_DISTANCE",
+                        "properties": {"distance": 0.0, "influence": 0.0}
+                    },
+                    {
+                        "name": "Stretch To zero",
+                        "type": "STRETCH_TO",
+                        "properties": {"rest_length": 0.0}
+                    },
+                    {
+                        "name": "Stretch To nonzero",
+                        "type": "STRETCH_TO",
+                        "properties": {"rest_length": 2.0}
+                    }
+                ]
+            }]
+        });
+        let losses = import_losses(&raw);
+        assert_eq!(losses.len(), 1);
+        assert!(
+            !losses
+                .iter()
+                .any(|loss| loss.feature_id == "constraint.limit_distance.initial_distance")
+        );
+        let stretch_to = losses
+            .iter()
+            .find(|loss| loss.feature_id == "constraint.stretch_to.initial_length")
+            .unwrap();
+        assert_eq!(stretch_to.data_id.as_deref(), Some("Stretch To zero"));
+        assert!(stretch_to.reason.contains("imported .blend"));
+        assert!(stretch_to.reason.contains("refuses that raw state"));
+    }
+
+    #[test]
+    fn migrated_initial_constraint_compatibility_reports_export_loss() {
+        let mut doc = crate::model::SceneDoc::new("scene-test".to_owned());
+        doc.compatibility.insert(
+            "constraints".to_owned(),
+            json!({
+                "uninitialized_initial_states": [{
+                    "owner_id":"owner",
+                    "feature_id":"constraint.limit_distance.initial_distance",
+                    "constraint":{"name":"Zero distance","type":"limit_distance"}
+                }]
+            }),
+        );
+        let loss = export_losses(&doc)
+            .into_iter()
+            .find(|loss| loss.feature_id == "constraint.limit_distance.initial_distance")
+            .expect("migrated constraint export loss");
+        assert_eq!(loss.data_id.as_deref(), Some("Zero distance"));
+        assert!(
+            loss.reason
+                .contains("preserved this uninitialized constraint")
+        );
+    }
+
+    #[test]
+    fn custom_constraint_spaces_are_import_losses_only_for_active_custom_spaces() {
+        let raw = json!({
+            "objects": [{
+                "name": "Object",
+                "type": "EMPTY",
+                "constraints": [
+                    {"name": "Clamp owner custom", "type": "CLAMP_TO",
+                     "properties": {"owner_space": "CUSTOM", "target_space": "WORLD"}},
+                    {"name": "Clamp target custom", "type": "CLAMP_TO",
+                     "properties": {"owner_space": "LOCAL", "target_space": "CUSTOM"}},
+                    {"name": "Clamp world local", "type": "CLAMP_TO",
+                     "properties": {"owner_space": "WORLD", "target_space": "LOCAL"}},
+                    {"name": "Clamp muted custom", "type": "CLAMP_TO",
+                     "properties": {"owner_space": "CUSTOM", "mute": true}},
+                    {"name": "Follow owner custom", "type": "FOLLOW_PATH",
+                     "properties": {"owner_space": "CUSTOM", "target_space": "WORLD"}},
+                    {"name": "Follow target custom", "type": "FOLLOW_PATH",
+                     "properties": {"owner_space": "LOCAL", "target_space": "CUSTOM"}},
+                    {"name": "Follow world local", "type": "FOLLOW_PATH",
+                     "properties": {"owner_space": "WORLD", "target_space": "LOCAL"}}
+                ]
+            }]
+        });
+        let losses = import_losses(&raw);
+        let custom_space_losses: Vec<_> = losses
+            .iter()
+            .filter(|loss| {
+                loss.feature_id == "constraint.clamp_to.custom_spaces"
+                    || loss.feature_id == "constraint.follow_path.custom_spaces"
+            })
+            .collect();
+        assert_eq!(custom_space_losses.len(), 4);
+        for (feature_id, data_id) in [
+            ("constraint.clamp_to.custom_spaces", "Clamp owner custom"),
+            ("constraint.clamp_to.custom_spaces", "Clamp target custom"),
+            (
+                "constraint.follow_path.custom_spaces",
+                "Follow owner custom",
+            ),
+            (
+                "constraint.follow_path.custom_spaces",
+                "Follow target custom",
+            ),
+        ] {
+            let loss = custom_space_losses
+                .iter()
+                .find(|loss| {
+                    loss.feature_id == feature_id && loss.data_id.as_deref() == Some(data_id)
+                })
+                .unwrap();
+            assert!(
+                loss.reason
+                    .contains("CUSTOM-space evaluation is not implemented")
+            );
+            assert!(loss.reason.contains("raw settings are preserved"));
+        }
+        assert!(custom_space_losses.iter().all(|loss| {
+            !matches!(
+                loss.data_id.as_deref(),
+                Some("Clamp world local" | "Follow world local" | "Clamp muted custom")
+            )
+        }));
+    }
+
+    #[test]
+    fn pending_child_of_inverse_is_an_import_loss_only_when_active() {
+        let raw = json!({
+            "objects": [{
+                "name": "Object",
+                "type": "EMPTY",
+                "constraints": [
+                    {"name": "Pending inverse", "type": "CHILD_OF",
+                     "properties": {"set_inverse_pending": true}},
+                    {"name": "Pending inverse muted", "type": "CHILD_OF",
+                     "properties": {"set_inverse_pending": true, "mute": true}},
+                    {"name": "Captured inverse", "type": "CHILD_OF",
+                     "properties": {"set_inverse_pending": false}},
+                    {"name": "No pending flag", "type": "CHILD_OF", "properties": {}},
+                ]
+            }]
+        });
+        let losses = import_losses(&raw);
+        let pending_inverse_losses: Vec<_> = losses
+            .iter()
+            .filter(|loss| loss.feature_id == "constraint.child_of.pending_inverse")
+            .collect();
+        assert_eq!(pending_inverse_losses.len(), 1);
+        let pending_inverse = pending_inverse_losses[0];
+        assert_eq!(pending_inverse.data_id.as_deref(), Some("Pending inverse"));
+        assert!(
+            pending_inverse
+                .reason
+                .contains("captures and persists the inverse on first evaluation")
+        );
+        assert!(
+            pending_inverse
+                .reason
+                .contains("refuses active pending inverse state on import")
+        );
     }
 
     #[test]

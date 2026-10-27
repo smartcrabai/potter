@@ -901,6 +901,23 @@ fn apply_batch_internal(
         referenced_assets.extend(image.tiles.iter().filter_map(|tile| tile.blob.as_deref()));
     }
     pending_assets.retain(|digest, _| referenced_assets.contains(digest.as_str()));
+    if !changes.is_empty() {
+        let capture_frame = working
+            .scenes
+            .get(&working.active_scene)
+            .map_or(evaluation_frame, |scene| scene.frame_current);
+        // Do not make unrelated edits fail when another scene feature blocks evaluation.
+        if let Ok(captured_owners) = crate::eval::capture_limit_distance_initial_states(
+            &mut working,
+            capture_frame,
+            asset_root,
+            cache_directory,
+        ) {
+            for owner_id in captured_owners {
+                changes.record("nodes", &owner_id, ChangeKind::Updated);
+            }
+        }
+    }
     changes.reconcile(doc, &working)?;
     let scene_changed = !changes.is_empty();
     if scene_changed {

@@ -10,6 +10,9 @@
 //! `matrix_basis` on a node; version 6 documents have none, so [`upgrade_v6`] changes nothing else.
 //! Version 10 gates native Dynamic Paint output-layer and brush-source migrations on the source schema.
 //! Version 11 stores multi-input links in descending `multi_input_sort_id` order; version-10 links are reversed by `upgrade_v10`.
+//! Legacy documents capture `STRETCH_TO` and `CHILD_OF` first-evaluation state at the active
+//! scene's frame; targeted states that cannot be captured move to compatibility while targetless
+//! constraints remain editable.
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -17,7 +20,9 @@ use std::{
 
 use serde_json::{Map, Value, json};
 
-use super::{Image, ImageAlphaMode, RayKind, RayVisibility, SceneDoc};
+use super::{
+    Constraint, ConstraintType, Id, Image, ImageAlphaMode, RayKind, RayVisibility, SceneDoc,
+};
 use crate::{
     color::curve::{CurveMapping, CurvePoint, HandleType},
     error::{ErrorCode, PotError, Result},
@@ -72,15 +77,24 @@ pub struct ParsedScene {
 /// Parses a scene document, upgrading it through every schema version to the current one, then
 /// migrates loaded-only resource sentinels and native Dynamic Paint settings from schema 9.
 pub fn parse_scene(bytes: &[u8], root: &Path) -> Result<ParsedScene> {
-    parse_scene_inner(bytes, root, false)
+    parse_scene_inner(bytes, root, false, None)
 }
 
 /// Parses a project scene while retaining its pre-migration hash for project metadata.
-pub(crate) fn parse_scene_with_original_hash(bytes: &[u8], root: &Path) -> Result<ParsedScene> {
-    parse_scene_inner(bytes, root, true)
+pub(crate) fn parse_scene_with_original_hash(
+    bytes: &[u8],
+    root: &Path,
+    cache_directory: &Path,
+) -> Result<ParsedScene> {
+    parse_scene_inner(bytes, root, true, Some(cache_directory))
 }
 
-fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> Result<ParsedScene> {
+fn parse_scene_inner(
+    bytes: &[u8],
+    root: &Path,
+    retain_original_hash: bool,
+    cache_directory: Option<&Path>,
+) -> Result<ParsedScene> {
     let mut value = parse_value(bytes)?;
     let source_schema_version = value.get("schema_version").and_then(Value::as_u64);
     // Load-time migrations preserve original bytes while the upgraded scene is first committed.
@@ -88,9 +102,12 @@ fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> R
         || has_legacy_mesh_deform_bind(&value)
         || (source_schema_version.is_some_and(|version| version <= 11)
             && has_refused_animation_outputs(&value))
-        || (source_schema_version == Some(12) && has_restorable_animation_outputs(&value));
+        || (source_schema_version == Some(12) && has_restorable_animation_outputs(&value))
+        || (source_schema_version.is_some_and(|version| version <= 13)
+            && has_uninitialized_initial_constraint_states(&value));
     let source_hash = if retain_original_hash
         && (legacy
+            || has_uninitialized_limit_distance_states(&value)
             || (source_schema_version.is_some_and(|version| version < 10)
                 && (has_dynamic_paint_canvas(&value)
                     || has_dynamic_paint_brush_without_source(&value))))
@@ -101,6 +118,11 @@ fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> R
     };
     let mut legacy_hash = if legacy { source_hash.clone() } else { None };
     let mut warnings = upgrade_scene(&mut value, root)?;
+    let legacy_candidates = if source_schema_version.is_some_and(|version| version <= 13) {
+        targeted_uninitialized_initial_constraints(&value)
+    } else {
+        Vec::new()
+    };
     let mut doc: SceneDoc = serde_json::from_value(value).map_err(|error| json_error(&error))?;
     crate::geom::legacy_texture::migrate_legacy_volume_noise_sentinel(&mut doc)?;
     if source_schema_version.is_some_and(|version| version < 10) {
@@ -111,8 +133,73 @@ fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> R
         warnings.extend(brush_warnings);
         if changed {
             legacy = true;
-            legacy_hash = source_hash;
+            legacy_hash.clone_from(&source_hash);
         }
+    }
+    if !legacy_candidates.is_empty()
+        && let Some(frame) = doc
+            .scenes
+            .get(&doc.active_scene)
+            .map(|scene| scene.frame_current)
+    {
+        let mut candidates = legacy_candidates;
+        let max_evaluations = candidates.len() + 1;
+        for _ in 0..max_evaluations {
+            let candidates_before = candidates.len();
+            let (captures, evaluation_result) =
+                crate::eval::evaluate_with_constraint_initial_state_capture_outcome(
+                    &doc,
+                    frame,
+                    Some(root),
+                    cache_directory,
+                );
+            let retry_candidate = evaluation_result
+                .as_ref()
+                .err()
+                .and_then(|error| {
+                    let owner_id = error.details.get("owner_id").and_then(Value::as_str)?;
+                    let constraint_id =
+                        error.details.get("constraint_id").and_then(Value::as_str)?;
+                    candidates
+                        .iter()
+                        .find(|candidate| {
+                            candidate.owner_id == owner_id
+                                && candidate.constraint_id == constraint_id
+                        })
+                        .map(|_| ())
+                })
+                .is_some();
+            let (capture_warnings, remaining_candidates) =
+                apply_legacy_initial_constraint_captures(
+                    &mut doc,
+                    captures,
+                    &evaluation_result,
+                    candidates,
+                )?;
+            warnings.extend(capture_warnings);
+            if evaluation_result.is_ok()
+                || !retry_candidate
+                || remaining_candidates.len() >= candidates_before
+            {
+                break;
+            }
+            candidates = remaining_candidates;
+        }
+    }
+    if let Some(frame) = doc
+        .scenes
+        .get(&doc.active_scene)
+        .map(|scene| scene.frame_current)
+        && let Ok(captured_owners) = crate::eval::capture_limit_distance_initial_states(
+            &mut doc,
+            frame,
+            Some(root),
+            cache_directory,
+        )
+        && !captured_owners.is_empty()
+    {
+        legacy = true;
+        legacy_hash.clone_from(&source_hash);
     }
     Ok(ParsedScene {
         doc,
@@ -120,6 +207,243 @@ fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> R
         legacy,
         legacy_hash,
     })
+}
+
+fn has_uninitialized_limit_distance_states(value: &Value) -> bool {
+    value
+        .get("nodes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|nodes| nodes.values())
+        .filter_map(|node| node.get("constraints").and_then(Value::as_array))
+        .flatten()
+        .any(|constraint| {
+            constraint.get("type").and_then(Value::as_str) == Some("limit_distance")
+                && constraint
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+                && constraint
+                    .get("influence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0)
+                    != 0.0
+                && constraint_param_missing_or_zero(constraint, "distance")
+        })
+}
+
+fn has_uninitialized_initial_constraint_states(value: &Value) -> bool {
+    value
+        .get("nodes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|nodes| nodes.values())
+        .filter_map(|node| node.get("constraints").and_then(Value::as_array))
+        .flatten()
+        .any(|constraint| initial_constraint_state_feature(constraint).is_some())
+}
+
+fn constraint_param_missing_or_zero(constraint: &Value, key: &str) -> bool {
+    let Some(params) = constraint.get("params") else {
+        return true;
+    };
+    let Some(params) = params.as_object() else {
+        return false;
+    };
+    params
+        .get(key)
+        .is_none_or(|value| value.as_f64() == Some(0.0))
+}
+
+fn initial_constraint_state_feature(constraint: &Value) -> Option<(&'static str, &'static str)> {
+    let enabled = constraint
+        .get("enabled")
+        .map_or(Some(true), Value::as_bool)?;
+    let influence = constraint
+        .get("influence")
+        .map_or(Some(1.0), Value::as_f64)?;
+    if !enabled || influence <= 0.0 {
+        return None;
+    }
+    match constraint.get("type").and_then(Value::as_str) {
+        Some("stretch_to") if constraint_param_missing_or_zero(constraint, "rest_length") => {
+            Some((
+                "constraint.stretch_to.initial_length",
+                "STRETCH_TO rest_length",
+            ))
+        }
+        Some("child_of")
+            if constraint
+                .get("params")
+                .and_then(|params| params.get("set_inverse_pending"))
+                .and_then(Value::as_bool)
+                == Some(true) =>
+        {
+            Some((
+                "constraint.child_of.pending_inverse",
+                "CHILD_OF pending inverse",
+            ))
+        }
+        _ => None,
+    }
+}
+
+struct UncapturedInitialConstraint {
+    owner_id: String,
+    constraint_index: usize,
+    constraint_id: String,
+    feature_id: &'static str,
+    description: &'static str,
+    constraint: Value,
+}
+
+fn targeted_uninitialized_initial_constraints(value: &Value) -> Vec<UncapturedInitialConstraint> {
+    let Some(nodes) = value.get("nodes").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for (owner_id, node) in nodes {
+        let Some(constraints) = node.get("constraints").and_then(Value::as_array) else {
+            continue;
+        };
+        for (constraint_index, constraint) in constraints.iter().enumerate() {
+            let Some((feature_id, description)) = initial_constraint_state_feature(constraint)
+            else {
+                continue;
+            };
+            let Some(constraint_id) = constraint.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if constraint.get("target").and_then(Value::as_str).is_none() {
+                continue;
+            }
+            candidates.push(UncapturedInitialConstraint {
+                owner_id: owner_id.clone(),
+                constraint_index,
+                constraint_id: constraint_id.to_owned(),
+                feature_id,
+                description,
+                constraint: constraint.clone(),
+            });
+        }
+    }
+    candidates
+}
+
+fn has_uninitialized_initial_constraint_state(constraint: &Constraint) -> bool {
+    if !constraint.enabled || constraint.influence <= 0.0 {
+        return false;
+    }
+    match constraint.constraint_type {
+        ConstraintType::StretchTo => {
+            constraint
+                .params
+                .get("rest_length")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                == 0.0
+        }
+        ConstraintType::ChildOf => {
+            constraint
+                .params
+                .get("set_inverse_pending")
+                .and_then(Value::as_bool)
+                == Some(true)
+        }
+        _ => false,
+    }
+}
+
+fn apply_legacy_initial_constraint_captures(
+    doc: &mut SceneDoc,
+    captures: crate::eval::ConstraintInitialStateCaptures,
+    evaluation_result: &Result<()>,
+    candidates: Vec<UncapturedInitialConstraint>,
+) -> Result<(Vec<Value>, Vec<UncapturedInitialConstraint>)> {
+    for ((owner_id, constraint_id), params) in captures {
+        if let Some(constraint) = doc.nodes.get_mut(&owner_id).and_then(|node| {
+            node.constraints
+                .iter_mut()
+                .find(|constraint| constraint.id == constraint_id)
+        }) {
+            constraint.params.extend(params);
+        }
+    }
+
+    let evaluation_error_owner_id = evaluation_result
+        .as_ref()
+        .err()
+        .and_then(|error| error.details.get("owner_id"))
+        .and_then(Value::as_str);
+    let evaluation_error_id = evaluation_result
+        .as_ref()
+        .err()
+        .and_then(|error| error.details.get("constraint_id"))
+        .and_then(Value::as_str);
+    let evaluation_completed = evaluation_result.is_ok();
+    let mut selected = BTreeMap::<String, BTreeSet<usize>>::new();
+    let mut preserved = Vec::new();
+    let mut warnings = Vec::new();
+    let mut remaining = Vec::new();
+    for candidate in candidates {
+        let owner_id = Id::new(candidate.owner_id.clone())?;
+        let Some((current_index, constraint)) = doc.nodes.get(&owner_id).and_then(|node| {
+            node.constraints
+                .iter()
+                .enumerate()
+                .find(|(_, constraint)| constraint.id.as_str() == candidate.constraint_id)
+        }) else {
+            continue;
+        };
+        if !has_uninitialized_initial_constraint_state(constraint) {
+            continue;
+        }
+        if !evaluation_completed
+            && (evaluation_error_owner_id != Some(candidate.owner_id.as_str())
+                || evaluation_error_id != Some(candidate.constraint_id.as_str()))
+        {
+            remaining.push(candidate);
+            continue;
+        }
+        selected
+            .entry(candidate.owner_id.clone())
+            .or_default()
+            .insert(current_index);
+        preserved.push(json!({
+            "owner_id":candidate.owner_id,
+            "constraint_index":candidate.constraint_index,
+            "feature_id":candidate.feature_id,
+            "constraint":candidate.constraint,
+        }));
+        warnings.push(json!({
+            "code":"constraint.uninitialized_initial_state_migrated",
+            "feature_id":candidate.feature_id,
+            "message":format!(
+                "The active {} on `{}` has an uninitialized first-evaluation state; it was moved to compatibility.constraints.uninitialized_initial_states and is no longer evaluated",
+                candidate.description,
+                candidate.owner_id
+            ),
+            "owner_id":candidate.owner_id,
+            "constraint_index":candidate.constraint_index,
+        }));
+    }
+    for (owner_id, indices) in selected {
+        let owner_id = Id::new(owner_id)?;
+        if let Some(node) = doc.nodes.get_mut(&owner_id) {
+            let old_constraints = std::mem::take(&mut node.constraints);
+            let mut retained = Vec::with_capacity(old_constraints.len());
+            for (index, constraint) in old_constraints.into_iter().enumerate() {
+                if !indices.contains(&index) {
+                    retained.push(constraint);
+                }
+            }
+            node.constraints = retained;
+        }
+    }
+    if !preserved.is_empty() {
+        preserve_uninitialized_initial_constraint_states(doc, preserved)?;
+    }
+    Ok((warnings, remaining))
 }
 
 fn has_dynamic_paint_canvas(value: &Value) -> bool {
@@ -299,9 +623,9 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 11 before retiring unsupported animation
-/// outputs in version 12. `root` is the project directory that holds the document's image blobs and linked sources,
-/// which the version 3 to 4 step reads.
+/// Upgrades a scene document in place through schema version 13. Version 12 constraint states move
+/// to compatibility data, while version 11 retires unsupported animation outputs. `root` is the
+/// project directory that holds image blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
@@ -341,6 +665,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(12) {
         upgrade_v12(value);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(13) {
+        warnings.extend(upgrade_v13(value));
     }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
@@ -1054,6 +1381,32 @@ fn upgrade_v11(value: &mut Value) -> Result<Vec<Value>> {
     }
     value["schema_version"] = json!(12);
     Ok(warnings)
+}
+
+fn upgrade_v13(value: &mut Value) -> Vec<Value> {
+    value["schema_version"] = json!(14);
+    Vec::new()
+}
+
+fn preserve_uninitialized_initial_constraint_states(
+    doc: &mut SceneDoc,
+    entries: Vec<Value>,
+) -> Result<()> {
+    let compatibility = doc
+        .compatibility
+        .entry("constraints".to_owned())
+        .or_insert_with(|| json!({}));
+    let constraints = compatibility
+        .as_object_mut()
+        .ok_or_else(|| invalid("constraint compatibility data must be an object"))?;
+    let states = constraints
+        .entry("uninitialized_initial_states".to_owned())
+        .or_insert_with(|| json!([]));
+    let states = states
+        .as_array_mut()
+        .ok_or_else(|| invalid("uninitialized initial constraint states must be an array"))?;
+    states.extend(entries);
+    Ok(())
 }
 
 fn unsupported_animation_warning(kind: &str, owner_id: &str, path: &str) -> Value {
@@ -2864,7 +3217,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -2886,7 +3239,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -2906,7 +3259,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -2977,7 +3330,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         let first: Vec<&str> = scene["node_groups"]["first"]["links"]
             .as_array()
             .expect("first links")
@@ -3032,7 +3385,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         let sources: Vec<&str> = scene["node_groups"]["group"]["links"]
             .as_array()
             .expect("links")
@@ -3043,15 +3396,278 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_thirteen_scenes_pass_through_untouched() {
+    fn schema_twelve_targetless_initial_constraint_states_stay_on_node() -> TestResult {
+        let mut source = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))?;
+        source["schema_version"] = json!(12);
+        let original_constraints = json!([
+            {
+                "id":"limit_distance",
+                "type":"limit_distance",
+                "name":"Limit Distance",
+                "params":{}
+            },
+            {
+                "id":"limit_distance_zero",
+                "type":"limit_distance",
+                "name":"Limit Distance Zero",
+                "params":{"distance":0.0}
+            },
+            {
+                "id":"disabled_limit_distance",
+                "type":"limit_distance",
+                "name":"Disabled Limit Distance",
+                "enabled":false,
+                "params":{"distance":0.0}
+            },
+            {
+                "id":"stretch_to",
+                "type":"stretch_to",
+                "name":"Stretch To",
+                "params":{"rest_length":0.0}
+            },
+            {
+                "id":"zero_influence_child_of",
+                "type":"child_of",
+                "name":"Zero Influence Child Of",
+                "influence":0.0,
+                "params":{"set_inverse_pending":true}
+            },
+            {
+                "id":"child_of",
+                "type":"child_of",
+                "name":"Child Of",
+                "params":{"set_inverse_pending":true}
+            }
+        ]);
+        source["nodes"]["owner"] = json!({
+            "name":"Owner",
+            "kind":"empty",
+            "constraints":original_constraints.clone()
+        });
+        source["nodes"]["target"] = json!({"name":"Target","kind":"empty"});
+
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+
+        assert!(parsed.legacy);
+        assert_eq!(parsed.doc.schema_version, 14);
+        assert!(!parsed.doc.compatibility.contains_key("constraints"));
+        let node_id = Id::new("owner")?;
+        let constraints = &parsed.doc.nodes[&node_id].constraints;
+        assert_eq!(
+            constraints
+                .iter()
+                .map(|constraint| constraint.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "limit_distance",
+                "limit_distance_zero",
+                "disabled_limit_distance",
+                "stretch_to",
+                "zero_influence_child_of",
+                "child_of"
+            ]
+        );
+        assert_eq!(parsed.warnings, Vec::<Value>::new());
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_thirteen_first_evaluation_captures_stretch_to_and_child_of() -> TestResult {
+        let mut source = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))?;
+        source["schema_version"] = json!(13);
+        source["scenes"]["scene_main"]["frame_current"] = json!(7.0);
+        source["nodes"] = json!({
+            "target": {
+                "name":"Target",
+                "kind":"empty",
+                "transform":{"translation":[0.0,4.0,0.0]}
+            },
+            "stretch_owner": {
+                "name":"Stretch Owner",
+                "kind":"empty",
+                "constraints":[{
+                    "id":"stretch",
+                    "type":"stretch_to",
+                    "name":"Legacy Stretch",
+                    "target":"target",
+                    "params":{}
+                }]
+            },
+            "child_owner": {
+                "name":"Child Owner",
+                "kind":"empty",
+                "constraints":[{
+                    "id":"child",
+                    "type":"child_of",
+                    "name":"Legacy Child Of",
+                    "target":"target",
+                    "params":{"set_inverse_pending":true}
+                }]
+            },
+            "zz_degenerate_owner": {
+                "name":"Degenerate Owner",
+                "kind":"empty",
+                "transform":{"translation":[0.0,4.0,0.0]},
+                "constraints":[{
+                    "id":"degenerate",
+                    "type":"stretch_to",
+                    "name":"Degenerate Stretch",
+                    "target":"target",
+                    "params":{}
+                }]
+            }
+        });
+
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+
+        let stretch_owner = &parsed.doc.nodes[&Id::new("stretch_owner")?];
+        let stretch = &stretch_owner.constraints[0];
+        let rest_length = stretch.params["rest_length"]
+            .as_f64()
+            .ok_or("legacy Stretch To rest_length was not captured")?;
+        assert!((rest_length - 4.0).abs() < 1.0e-9);
+        let child_owner = &parsed.doc.nodes[&Id::new("child_owner")?];
+        let child = &child_owner.constraints[0];
+        assert_eq!(child.params["set_inverse_pending"], json!(false));
+        assert!(child.params["inverse_matrix"].as_array().is_some());
+
+        let records = &parsed.doc.compatibility["constraints"]["uninitialized_initial_states"];
+        assert_eq!(records.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            records[0]["feature_id"],
+            json!("constraint.stretch_to.initial_length")
+        );
+        assert_eq!(records[0]["owner_id"], json!("zz_degenerate_owner"));
+
+        Ok(())
+    }
+    #[test]
+    fn schema_thirteen_retries_captures_after_uncapturable_candidate() -> TestResult {
+        let mut source = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))?;
+        source["schema_version"] = json!(13);
+        source["nodes"] = json!({
+            "a_degenerate_owner": {
+                "name":"Degenerate Owner",
+                "kind":"empty",
+                "transform":{"translation":[0.0,4.0,0.0]},
+                "constraints":[{
+                    "id":"degenerate",
+                    "type":"stretch_to",
+                    "name":"Degenerate Stretch",
+                    "target":"target",
+                    "params":{}
+                }]
+            },
+            "b_stretch_owner": {
+                "name":"Stretch Owner",
+                "kind":"empty",
+                "constraints":[{
+                    "id":"stretch",
+                    "type":"stretch_to",
+                    "name":"Legacy Stretch",
+                    "target":"target",
+                    "params":{}
+                }]
+            },
+            "target": {
+                "name":"Target",
+                "kind":"empty",
+                "transform":{"translation":[0.0,4.0,0.0]}
+            }
+        });
+
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+
+        let stretch_owner = &parsed.doc.nodes[&Id::new("b_stretch_owner")?];
+        assert_eq!(stretch_owner.constraints.len(), 1);
+        let rest_length = stretch_owner.constraints[0].params["rest_length"]
+            .as_f64()
+            .ok_or("second Stretch To rest_length was not captured")?;
+        assert!((rest_length - 4.0).abs() < 1.0e-9);
+        let records = &parsed.doc.compatibility["constraints"]["uninitialized_initial_states"];
+        assert_eq!(records.as_array().map(Vec::len), Some(1));
+        assert_eq!(records[0]["owner_id"], json!("a_degenerate_owner"));
+        assert_eq!(records[0]["constraint"]["id"], json!("degenerate"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_thirteen_targetless_child_of_remains_editable() -> TestResult {
+        let mut source = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))?;
+        source["schema_version"] = json!(13);
+        source["nodes"] = json!({
+            "owner": {
+                "name":"Owner",
+                "kind":"empty",
+                "constraints":[{
+                    "id":"child",
+                    "type":"child_of",
+                    "name":"Targetless Child Of",
+                    "params":{"set_inverse_pending":true}
+                }]
+            },
+            "target":{"name":"Target","kind":"empty"}
+        });
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+        assert!(!parsed.doc.compatibility.contains_key("constraints"));
+        let owner_id = Id::new("owner")?;
+        assert_eq!(
+            parsed.doc.nodes[&owner_id].constraints[0].params["set_inverse_pending"],
+            json!(true)
+        );
+
+        let updated = crate::ops::apply_batch(
+            &parsed.doc,
+            &json!({
+                "schema_version":1,
+                "base_revision":0,
+                "operations":[{
+                    "op":"constraint.update",
+                    "target":{"id":"owner"},
+                    "id":"child",
+                    "set":{"target":"target"}
+                }]
+            }),
+        )?;
+        let child = &updated.doc.nodes[&owner_id].constraints[0];
+        assert_eq!(child.target.as_ref().map(Id::as_str), Some("target"));
+        assert_eq!(child.params["set_inverse_pending"], json!(false));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_thirteen_scenes_upgrade_to_fourteen_without_other_changes() {
         let mut scene = json!({
             "schema_version": 13,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
-        let before = scene.clone();
+        let mut expected = scene.clone();
+        expected["schema_version"] = json!(14);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(13));
-        assert_eq!(scene, before);
+        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene, expected);
+    }
+    #[test]
+    fn schema_twelve_scenes_chain_both_migrations_to_fourteen() {
+        let mut scene = json!({
+            "schema_version": 12,
+            "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
+        });
+        let mut expected = scene.clone();
+        expected["schema_version"] = json!(14);
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene, expected);
     }
 
     #[test]
@@ -3158,7 +3774,7 @@ mod tests {
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
         assert_eq!(warnings, Vec::<Value>::new());
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("restored action curves");
@@ -3252,7 +3868,7 @@ mod tests {
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
         assert_eq!(warnings.len(), 2);
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         assert_eq!(
             scene["actions"]["shared"]["fcurves"]
                 .as_array()
@@ -3320,7 +3936,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&doc)?, no_assets())?;
 
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 13);
+        assert_eq!(parsed.doc.schema_version, 14);
         assert_eq!(parsed.doc.actions[&action_id].fcurves.len(), 2);
         assert_eq!(
             parsed.doc.compatibility["animation"]["unsupported_outputs"]
@@ -3373,7 +3989,7 @@ mod tests {
         source["schema_version"] = json!(11);
         let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 13);
+        assert_eq!(parsed.doc.schema_version, 14);
         assert_eq!(parsed.doc.actions[&action_id].fcurves, Vec::new());
         assert_eq!(parsed.doc.nodes[&node_id].drivers, Vec::new());
         assert_eq!(
@@ -3412,7 +4028,7 @@ mod tests {
 
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("migrated action curves");
@@ -3620,7 +4236,7 @@ mod tests {
         )
         .expect("brush migration");
         assert!(migrated.legacy);
-        assert_eq!(migrated.doc.schema_version, 13);
+        assert_eq!(migrated.doc.schema_version, 14);
         let settings = &migrated.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")]
             .properties["physics_dynamic_paint"];
         assert_eq!(settings["paint_source"], json!("POINT"));
@@ -3792,7 +4408,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -3835,7 +4451,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -3883,7 +4499,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 13);
+        assert_eq!(parsed.doc.schema_version, 14);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -3929,7 +4545,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(13));
+        assert_eq!(scene["schema_version"], json!(14));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -3972,7 +4588,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(13);
+        expected["schema_version"] = json!(14);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -4010,7 +4626,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 13);
+        assert_eq!(migrated.schema_version, 14);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -4514,7 +5130,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 13);
+        assert_eq!(record.snapshot.schema_version, 14);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -4581,7 +5197,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 13);
+        assert_eq!(record.snapshot.schema_version, 14);
         let history_mesh = record
             .snapshot
             .data_blocks

@@ -112,6 +112,8 @@ pub struct EvaluationContext {
     pub purpose: EvaluationPurpose,
 }
 
+pub(crate) type ConstraintInitialStateCaptures = BTreeMap<(Id, Id), Map<String, Value>>;
+
 /// Runtime state retained while evaluating successive frames, including the Alembic archive selected by a `CacheFile`.
 /// Create one per render/bake frame sequence; ordinary single-frame evaluation uses a fresh session.
 #[derive(Debug, Default)]
@@ -121,6 +123,10 @@ pub struct EvaluationSession {
     pub(crate) instance_attributes: BTreeMap<Id, crate::graph::EvaluatedInstances>,
     pub(crate) skip_instance_geometry_attribute_constraints: bool,
     external_font_hashes: BTreeMap<Id, BTreeMap<&'static str, String>>,
+    pub(crate) capture_constraint_initial_states: bool,
+    pub(crate) capture_only_limit_distance_initial_states: bool,
+    pub(crate) recapture_constraint_initial_states: bool,
+    pub(crate) captured_constraint_initial_states: ConstraintInitialStateCaptures,
 }
 impl EvaluationSession {
     fn cache_file_archive_identity(&self) -> Value {
@@ -156,6 +162,119 @@ impl EvaluationSession {
             .or_default()
             .insert(variant, content_hash.to_owned());
     }
+}
+
+pub(crate) fn evaluate_with_constraint_initial_state_capture_outcome(
+    doc: &SceneDoc,
+    frame: f64,
+    project_root: Option<&Path>,
+    cache_directory: Option<&Path>,
+) -> (ConstraintInitialStateCaptures, Result<()>) {
+    let mut session = EvaluationSession {
+        capture_constraint_initial_states: true,
+        ..EvaluationSession::default()
+    };
+    let result = Snapshot::evaluate_with_cache_session(
+        doc,
+        &EvaluationContext {
+            frame: Some(frame),
+            ..EvaluationContext::default()
+        },
+        project_root,
+        cache_directory,
+        &mut session,
+    )
+    .map(|_| ());
+    (session.captured_constraint_initial_states, result)
+}
+
+pub(crate) fn evaluate_with_limit_distance_initial_state_capture(
+    doc: &SceneDoc,
+    frame: f64,
+    project_root: Option<&Path>,
+    cache_directory: Option<&Path>,
+) -> Result<ConstraintInitialStateCaptures> {
+    let mut session = EvaluationSession {
+        capture_constraint_initial_states: true,
+        capture_only_limit_distance_initial_states: true,
+        ..EvaluationSession::default()
+    };
+    Snapshot::evaluate_with_cache_session(
+        doc,
+        &EvaluationContext {
+            frame: Some(frame),
+            ..EvaluationContext::default()
+        },
+        project_root,
+        cache_directory,
+        &mut session,
+    )?;
+    Ok(session.captured_constraint_initial_states)
+}
+
+pub(crate) fn capture_limit_distance_initial_states(
+    doc: &mut SceneDoc,
+    frame: f64,
+    project_root: Option<&Path>,
+    cache_directory: Option<&Path>,
+) -> Result<BTreeSet<Id>> {
+    let has_pending = doc.nodes.values().any(|node| {
+        node.constraints.iter().any(|constraint| {
+            constraint.constraint_type == ConstraintType::LimitDistance
+                && constraint.enabled
+                && constraint.influence != 0.0
+                && constraint.target.is_some()
+                && constraint
+                    .params
+                    .get("distance")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    == 0.0
+        })
+    });
+    if !has_pending {
+        return Ok(BTreeSet::new());
+    }
+    let captures = evaluate_with_limit_distance_initial_state_capture(
+        doc,
+        frame,
+        project_root,
+        cache_directory,
+    )?;
+    let mut changed_owners = BTreeSet::new();
+    for ((owner_id, constraint_id), params) in captures {
+        let Some(distance) = params
+            .get("distance")
+            .and_then(Value::as_f64)
+            .filter(|distance| distance.is_finite() && *distance > 0.0)
+        else {
+            continue;
+        };
+        let Some(constraint) = doc.nodes.get_mut(&owner_id).and_then(|node| {
+            node.constraints
+                .iter_mut()
+                .find(|constraint| constraint.id == constraint_id)
+        }) else {
+            continue;
+        };
+        if constraint.constraint_type != ConstraintType::LimitDistance
+            || !constraint.enabled
+            || constraint.influence == 0.0
+            || constraint
+                .params
+                .get("distance")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                != 0.0
+        {
+            continue;
+        }
+        constraint
+            .params
+            .insert("distance".to_owned(), json!(distance));
+        changed_owners.insert(owner_id);
+    }
+    Ok(changed_owners)
 }
 
 #[derive(Debug)]
@@ -2938,6 +3057,8 @@ impl Snapshot {
                 &mut session.instance_attributes,
                 std::mem::take(&mut instance_attributes),
             );
+            let prior_recapture = session.recapture_constraint_initial_states;
+            session.recapture_constraint_initial_states = session.capture_constraint_initial_states;
             let evaluated_matrices = rig::evaluate_world_matrices_with_evaluated_meshes(
                 doc,
                 frame,
@@ -2948,6 +3069,7 @@ impl Snapshot {
                 &meshes,
                 session,
             );
+            session.recapture_constraint_initial_states = prior_recapture;
             let evaluated_instances =
                 std::mem::replace(&mut session.instance_attributes, prior_instances);
             matrices = evaluated_matrices?;

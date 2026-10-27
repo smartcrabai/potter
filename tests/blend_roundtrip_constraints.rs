@@ -283,7 +283,7 @@ for index, kind in enumerate(constraint_types):
         current.owner_space = "CUSTOM" if index % 2 == 0 else "LOCAL"
         current.target_space = "LOCAL" if index % 2 == 0 else "CUSTOM"
         if hasattr(current, "space_object"):
-            current.space_object = custom_space if kind == "transform_cache" else mesh_target
+            current.space_object = custom_space if kind in ("transform_cache", "child_of") else mesh_target
         if hasattr(current, "space_subtarget"):
             current.space_subtarget = ""
         if hasattr(current, "head_tail"):
@@ -311,6 +311,14 @@ for index, kind in enumerate(constraint_types):
             current.inverse_matrix = Matrix.Translation((-0.23, 0.17, -0.31))
             for axis in "xyz":
                 setattr(current, "use_location_" + axis, axis != "y")
+            if current is constraint:
+                owner.parent = custom_space
+        elif kind == "limit_distance":
+            current.distance = 1.25
+            current.limit_mode = "LIMITDIST_INSIDE" if current is constraint else "LIMITDIST_OUTSIDE"
+        elif kind == "stretch_to":
+            current.rest_length = 1.1
+            current.volume = "VOLUME_X" if current is constraint else "VOLUME_Z"
         elif kind == "follow_path":
             current.use_curve_follow = True
             current.forward_axis = "FORWARD_X"
@@ -368,13 +376,9 @@ for index, kind in enumerate(constraint_types):
             current.cache_file = cache_file
             current.object_path = cache_object_path
 
-        if kind == "follow_path":
-            if current is constraint:
-                current.owner_space = "WORLD"
-                current.target_space = "WORLD"
-            else:
-                current.owner_space = "CUSTOM"
-                current.target_space = "LOCAL"
+        if kind in ("follow_path", "clamp_to"):
+            current.owner_space = "WORLD"
+            current.target_space = "WORLD"
         elif current is pose_constraint:
             current.owner_space = "CUSTOM"
             current.target_space = "CUSTOM"
@@ -383,7 +387,7 @@ for index, kind in enumerate(constraint_types):
             current.target_space = "LOCAL" if index % 2 == 0 else "CUSTOM"
         if hasattr(current, "space_object"):
             current.space_object = (
-                custom_space if kind == "transform_cache"
+                custom_space if kind in ("transform_cache", "child_of")
                 else None if kind == "follow_path" and current is constraint
                 else mesh_target)
         if hasattr(current, "space_subtarget"):
@@ -1749,7 +1753,7 @@ fn round_trip_constraint(kind: &str) -> TestResult {
             );
             for (owner, fixed_location, expected_factor, expected_valid) in [
                 ("object", false, object_factor, true),
-                ("pose", true, 0.35, false),
+                ("pose", true, 0.35, true),
             ] {
                 let owner_diagnostics = &diagnostics[owner];
                 assert_eq!(

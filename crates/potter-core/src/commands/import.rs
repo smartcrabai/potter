@@ -189,6 +189,20 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
             "format": format,
         }),
     );
+    if let Some(frame) = candidate
+        .scenes
+        .get(&candidate.active_scene)
+        .map(|scene| scene.frame_current)
+    {
+        // Capture pending zero Limit Distance values at the imported scene's current frame.
+        let _captured_owners = crate::eval::capture_limit_distance_initial_states(
+            &mut candidate,
+            frame,
+            Some(project.path()),
+            Some(project.cache_directory()),
+        )
+        .ok();
+    }
     let changes = scene_changes(&before, &candidate)?;
     candidate.validate()?;
     let candidate_revision = before
