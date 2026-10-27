@@ -6,7 +6,7 @@ use glam::{DVec2, DVec3};
 
 use crate::{
     geom::{Edge, Face, Mesh, MeshError},
-    model::TextObjectData,
+    model::{CurveFillMode, CurveFillRule, CurveFillSolver, TextObjectData},
 };
 
 const MAX_BODY_BYTES: usize = 4096;
@@ -27,21 +27,50 @@ const STROKE_WIDTH: f64 = 0.65;
 ///
 /// Returns an error for unsupported text data, non-finite geometry, or over-budget text.
 pub fn evaluate_text(data: &TextObjectData) -> Result<Mesh, MeshError> {
-    if !data.size.is_finite() || data.size <= 0.0 {
-        return Err(MeshError::InvalidParameter(
-            "text size must be finite and positive",
-        ));
+    validate_text_data(data)?;
+    if !matches!(data.font.as_str(), "" | "builtin") {
+        return Err(MeshError::UnsupportedFeature {
+            feature_id: "text.font.external.resource",
+            reason: "external font geometry requires a resolved font resource",
+        });
     }
-    if !data.extrude.is_finite() || data.extrude < 0.0 {
-        return Err(MeshError::InvalidParameter(
-            "text extrusion must be finite and nonnegative",
-        ));
+    if data.character_spacing.to_bits() != 1.0_f64.to_bits()
+        || data.word_spacing.to_bits() != 1.0_f64.to_bits()
+        || data.line_spacing.to_bits() != 1.0_f64.to_bits()
+        || data.shear != 0.0
+        || data.offset_x != 0.0
+        || data.offset_y != 0.0
+        || data.small_caps_scale.to_bits() != 0.75_f64.to_bits()
+        || data.align_y == "bottom_exact"
+    {
+        return Err(MeshError::UnsupportedFeature {
+            feature_id: "text.font.builtin.layout_settings",
+            reason: "the built-in Hershey font does not support Blender text layout settings",
+        });
     }
-    if !data.bevel_depth.is_finite() || data.bevel_depth < 0.0 {
-        return Err(MeshError::InvalidParameter(
-            "text bevel depth must be finite and nonnegative",
-        ));
+    if data.character_formats.iter().any(|format| {
+        format.use_bold
+            || format.use_italic
+            || format.use_underline
+            || format.use_small_caps
+            || format.material_index != 0
+            || format.kerning != 0.0
+    }) {
+        return Err(MeshError::UnsupportedFeature {
+            feature_id: "text.font.builtin.character_styles",
+            reason: "the built-in Hershey font does not support Blender per-character text styles",
+        });
     }
+    if data.fill_mode != CurveFillMode::Both
+        || data.fill_solver != CurveFillSolver::Cdt
+        || data.fill_rule != CurveFillRule::Nonzero
+    {
+        return Err(MeshError::UnsupportedFeature {
+            feature_id: "text.font.builtin.fill_settings",
+            reason: "the built-in Hershey font does not support alternate Blender fill settings",
+        });
+    }
+
     let horizontal_alignment = match data.align_x.as_str() {
         "left" => HorizontalAlignment::Left,
         "center" => HorizontalAlignment::Center,
@@ -63,11 +92,6 @@ pub fn evaluate_text(data: &TextObjectData) -> Result<Mesh, MeshError> {
             ));
         }
     };
-    if data.body.len() > MAX_BODY_BYTES {
-        return Err(MeshError::InvalidParameter(
-            "text body exceeds the 4096-byte limit",
-        ));
-    }
 
     let lines = split_lines(&data.body)?;
     let last_line_offset = f64::from(
@@ -190,6 +214,88 @@ pub fn evaluate_text(data: &TextObjectData) -> Result<Mesh, MeshError> {
 
     builder.mesh.validate()?;
     Ok(builder.mesh)
+}
+/// Validate text properties without requiring a font file to be present.
+///
+/// # Errors
+///
+/// Returns an error for invalid dimensions, alignments, or non-finite text settings.
+pub fn validate_text_data(data: &TextObjectData) -> Result<(), MeshError> {
+    if !data.size.is_finite() || data.size <= 0.0 {
+        return Err(MeshError::InvalidParameter(
+            "text size must be finite and positive",
+        ));
+    }
+    if !data.extrude.is_finite() || data.extrude < 0.0 {
+        return Err(MeshError::InvalidParameter(
+            "text extrusion must be finite and nonnegative",
+        ));
+    }
+    if !data.bevel_depth.is_finite() || data.bevel_depth < 0.0 {
+        return Err(MeshError::InvalidParameter(
+            "text bevel depth must be finite and nonnegative",
+        ));
+    }
+    if !matches!(data.align_x.as_str(), "left" | "center" | "right") {
+        return Err(MeshError::InvalidParameter(
+            "text horizontal alignment must be left, center, or right",
+        ));
+    }
+    if !matches!(
+        data.align_y.as_str(),
+        "baseline" | "top" | "center" | "bottom" | "bottom_exact"
+    ) {
+        return Err(MeshError::InvalidParameter(
+            "text vertical alignment must be baseline, top, center, bottom, or bottom_exact",
+        ));
+    }
+    if data.resolution_u == 0 {
+        return Err(MeshError::InvalidParameter(
+            "text resolution_u must be positive",
+        ));
+    }
+    if data.body.len() > MAX_BODY_BYTES {
+        return Err(MeshError::InvalidParameter(
+            "text body exceeds the 4096-byte limit",
+        ));
+    }
+    if ![
+        data.character_spacing,
+        data.word_spacing,
+        data.line_spacing,
+        data.shear,
+        data.offset_x,
+        data.offset_y,
+        data.small_caps_scale,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        return Err(MeshError::InvalidParameter("text settings must be finite"));
+    }
+    if data.character_formats.len() > data.body.chars().count() {
+        return Err(MeshError::InvalidParameter(
+            "text character format count exceeds body length",
+        ));
+    }
+    if data
+        .character_formats
+        .iter()
+        .any(|format| !format.kerning.is_finite())
+    {
+        return Err(MeshError::InvalidParameter(
+            "text character kerning must be finite",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn evaluate_text_with_font(
+    data: &TextObjectData,
+    fonts: crate::geom::text_font::FontSources<'_>,
+) -> Result<Mesh, MeshError> {
+    validate_text_data(data)?;
+    crate::geom::text_font::evaluate_external_text(data, fonts)
 }
 
 #[derive(Clone, Copy)]

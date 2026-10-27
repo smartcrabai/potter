@@ -540,6 +540,20 @@ fn complete_scene_schema(root: &mut Value) {
     complete_data_block_schemas(defs);
 }
 
+fn text_character_format_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "use_bold":{"type":"boolean","default":false},
+            "use_italic":{"type":"boolean","default":false},
+            "use_underline":{"type":"boolean","default":false},
+            "use_small_caps":{"type":"boolean","default":false},
+            "material_index":{"type":"integer","minimum":0,"maximum":u32::MAX,"default":0},
+            "kerning":{"type":"number","default":0}
+        },
+        "additionalProperties":false
+    })
+}
 fn complete_data_block_schemas(defs: &mut Value) {
     defs["curve_data"] = json!({"type":"object","required":["resolution_u","splines","dimensions","bevel_depth","bevel_resolution","extrude","taper","taper_radius_mode","use_map_taper","fill_mode","twist_mode","use_path","path_duration","eval_time","eval_time_fcurves"],"properties":{"resolution_u":{"type":"integer","minimum":0,"maximum":u32::MAX},"splines":{"type":"array","items":{"type":"object","required":["type","points","order","cyclic","resolution","use_endpoint"],"properties":{"type":{"enum":["bezier","poly","nurbs"]},"points":{"type":"array","items":{"type":"object","required":["co","handle_left","handle_right","handle_type","weight","radius","tilt"],"properties":{"co":{"$ref":"#/$defs/vec3"},"handle_left":{"$ref":"#/$defs/vec3"},"handle_right":{"$ref":"#/$defs/vec3"},"handle_type":{"enum":["auto","vector","aligned","free"]},"weight":{"type":"number"},"radius":{"type":"number"},"tilt":{"type":"number"}},"additionalProperties":false}},"order":{"type":"integer","minimum":0,"maximum":u32::MAX},"cyclic":{"type":"boolean"},"resolution":{"type":"integer","minimum":0,"maximum":u32::MAX},"use_endpoint":{"type":"boolean"}},"additionalProperties":false}},"dimensions":{"enum":["two_d","three_d"]},"bevel_depth":{"type":"number"},"bevel_resolution":{"type":"integer","minimum":0,"maximum":u32::MAX},"extrude":{"type":"number"},"taper":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"taper_radius_mode":{"enum":["override","multiply","add"]},"use_map_taper":{"type":"boolean"},"fill_mode":{"enum":["none","front","back","both"]},"twist_mode":{"type":"string"},"use_path":{"type":"boolean"},"path_duration":{"type":"integer","minimum":0,"maximum":u32::MAX},"eval_time":{"type":"number"},"eval_time_fcurves":{"type":"array","items":{"$ref":"#/$defs/fcurve"}}},"additionalProperties":false});
     defs["curve_data"]["properties"]["has_bevel_object"] = json!({"type":"boolean"});
@@ -556,6 +570,26 @@ fn complete_data_block_schemas(defs: &mut Value) {
     defs["curve_data"]["properties"]["fill_rule"] = json!({"enum":["even_odd","nonzero"]});
     defs["surface_data"] = json!({"type":"object","required":["points","order_u","order_v","resolution","cyclic_u","cyclic_v","use_endpoint_u","use_endpoint_v"],"properties":{"points":{"type":"array","items":{"type":"array","items":{"type":"object","required":["co","weight"],"properties":{"co":{"$ref":"#/$defs/vec3"},"weight":{"type":"number"}},"additionalProperties":false}}},"order_u":{"type":"integer","minimum":0,"maximum":u32::MAX},"order_v":{"type":"integer","minimum":0,"maximum":u32::MAX},"resolution":{"type":"array","items":{"type":"integer","minimum":0,"maximum":u32::MAX},"minItems":2,"maxItems":2},"cyclic_u":{"type":"boolean"},"cyclic_v":{"type":"boolean"},"use_endpoint_u":{"type":"boolean"},"use_endpoint_v":{"type":"boolean"}},"additionalProperties":false});
     defs["text_data"] = json!({"type":"object","required":["body","font","font_name","size","align_x","align_y","extrude","bevel_depth","character_spacing","word_spacing","line_spacing","shear","offset_x","offset_y","small_caps_scale"],"properties":{"body":{"type":"string"},"font":{"type":"string"},"font_name":{"type":"string"},"size":{"type":"number"},"align_x":{"type":"string"},"align_y":{"type":"string"},"extrude":{"type":"number"},"bevel_depth":{"type":"number"},"character_spacing":{"type":"number"},"word_spacing":{"type":"number"},"line_spacing":{"type":"number"},"shear":{"type":"number"},"offset_x":{"type":"number"},"offset_y":{"type":"number"},"small_caps_scale":{"type":"number"}},"additionalProperties":false});
+    for field in [
+        "font_bold",
+        "font_bold_italic",
+        "font_italic",
+        "font_bold_name",
+        "font_bold_italic_name",
+        "font_italic_name",
+    ] {
+        defs["text_data"]["properties"][field] = json!({"type":"string"});
+    }
+    defs["text_data"]["properties"]["character_formats"] =
+        json!({"type":"array","items":text_character_format_schema()});
+    defs["text_data"]["properties"]["resolution_u"] =
+        json!({"type":"integer","minimum":0,"maximum":u32::MAX,"default":12});
+    defs["text_data"]["properties"]["fill_mode"] =
+        json!({"enum":["none","front","back","both"],"default":"both"});
+    defs["text_data"]["properties"]["fill_solver"] =
+        json!({"enum":["sweep_line","cdt"],"default":"cdt"});
+    defs["text_data"]["properties"]["fill_rule"] =
+        json!({"enum":["even_odd","nonzero"],"default":"nonzero"});
     defs["hair_curves_data"] = json!({"type":"object","required":["curves"],"properties":{"curves":{"type":"array","items":{"type":"object","required":["points","radius"],"properties":{"points":{"type":"array","items":{"$ref":"#/$defs/vec3"}},"radius":{"type":"number"}},"additionalProperties":false}},"attributes":{"type":"object","additionalProperties":{"type":"object","required":["domain","data_type","values"],"properties":{"domain":{"enum":["POINT","CURVE"]},"data_type":{"type":"string","minLength":1},"values":{"type":"array","items":{}}},"additionalProperties":false}},"surface":{"oneOf":[{"$ref":"#/$defs/id"},{"type":"null"}]},"surface_uv_map":{"type":"string"},"use_mirror_x":{"type":"boolean"},"use_mirror_y":{"type":"boolean"},"use_mirror_z":{"type":"boolean"},"selection_domain":{"enum":["POINT","CURVE"]}},"additionalProperties":false});
     defs["metaball_data"] = json!({"type":"object","required":["elements","resolution","render_resolution","threshold"],"properties":{"elements":{"type":"array","items":{"type":"object","required":["type","co","radius","stiffness","size","rotation","negative"],"properties":{"type":{"enum":["ball","capsule","plane","ellipsoid","cube"]},"co":{"$ref":"#/$defs/vec3"},"radius":{"type":"number"},"stiffness":{"type":"number"},"size":{"$ref":"#/$defs/vec3"},"rotation":{"$ref":"#/$defs/vec3"},"negative":{"type":"boolean"}},"additionalProperties":false}},"resolution":{"type":"number"},"render_resolution":{"type":"number"},"threshold":{"type":"number"}},"additionalProperties":false});
     defs["lattice_data"] = json!({"type":"object","required":["points_u","points_v","points_w","interpolation","points","domain"],"properties":{"points_u":{"type":"integer","minimum":0},"points_v":{"type":"integer","minimum":0},"points_w":{"type":"integer","minimum":0},"interpolation":{"enum":["linear","cardinal","catmull_rom","bspline"]},"points":{"type":"array","items":{"$ref":"#/$defs/vec3"}},"domain":{"type":"object","required":["min","max"],"properties":{"min":{"$ref":"#/$defs/vec3"},"max":{"$ref":"#/$defs/vec3"}},"additionalProperties":false}},"additionalProperties":false});
@@ -2174,6 +2208,58 @@ fn operation_contract(name: &str) -> OperationContract {
             "none",
             json!({"partial_components":true,"null_clears_optional_components":true}),
         ),
+        "text_object.create" => (
+            vec![
+                "id",
+                "name",
+                "data_id",
+                "body",
+                "font",
+                "font_name",
+                "font_bold",
+                "font_bold_italic",
+                "font_italic",
+                "font_bold_name",
+                "font_bold_italic_name",
+                "font_italic_name",
+                "character_formats",
+                "resolution_u",
+                "size",
+                "align_x",
+                "align_y",
+                "fill_mode",
+                "fill_solver",
+                "fill_rule",
+                "extrude",
+                "bevel_depth",
+                "character_spacing",
+                "word_spacing",
+                "line_spacing",
+                "shear",
+                "offset_x",
+                "offset_y",
+                "small_caps_scale",
+                "collection",
+                "transform",
+                "parent",
+                "parent_inverse",
+                "materials",
+                "visible",
+                "render_visible",
+                "selectable",
+            ],
+            vec!["op", "id"],
+            "text object",
+            "none",
+            json!({"name":"id","font":"builtin","font_name":"Bfont","resolution_u":12,"fill_mode":"both","fill_solver":"cdt","fill_rule":"nonzero"}),
+        ),
+        "text_object.update" => (
+            vec!["target", "set"],
+            vec!["op", "target", "set"],
+            "text object",
+            "none",
+            json!({}),
+        ),
         _ => (
             vec!["target", "set"],
             vec!["op", "target", "set"],
@@ -2192,7 +2278,77 @@ fn operation_contract(name: &str) -> OperationContract {
     }
 }
 
+fn text_data_field_schema(field: &str) -> Option<Value> {
+    match field {
+        "body"
+        | "font"
+        | "font_name"
+        | "font_bold"
+        | "font_bold_italic"
+        | "font_italic"
+        | "font_bold_name"
+        | "font_bold_italic_name"
+        | "font_italic_name"
+        | "align_x"
+        | "align_y" => Some(json!({"type":"string"})),
+        "fill_mode" => Some(json!({"enum":["none","front","back","both"],"default":"both"})),
+        "fill_solver" => Some(json!({"enum":["sweep_line","cdt"],"default":"cdt"})),
+        "fill_rule" => Some(json!({"enum":["even_odd","nonzero"],"default":"nonzero"})),
+        "character_formats" => Some(json!({
+            "type":"array",
+            "items":text_character_format_schema()
+        })),
+        "resolution_u" => {
+            Some(json!({"type":"integer","minimum":0,"maximum":u32::MAX,"default":12}))
+        }
+        "size" | "extrude" | "bevel_depth" | "character_spacing" | "word_spacing"
+        | "line_spacing" | "shear" | "offset_x" | "offset_y" | "small_caps_scale" => {
+            Some(json!({"type":"number"}))
+        }
+        _ => None,
+    }
+}
+
+fn text_data_set_properties() -> Value {
+    let mut properties = Map::new();
+    for field in [
+        "body",
+        "font",
+        "font_name",
+        "font_bold",
+        "font_bold_italic",
+        "font_italic",
+        "font_bold_name",
+        "font_bold_italic_name",
+        "font_italic_name",
+        "character_formats",
+        "resolution_u",
+        "size",
+        "align_x",
+        "align_y",
+        "fill_mode",
+        "fill_solver",
+        "fill_rule",
+        "extrude",
+        "bevel_depth",
+        "character_spacing",
+        "word_spacing",
+        "line_spacing",
+        "shear",
+        "offset_x",
+        "offset_y",
+        "small_caps_scale",
+    ] {
+        if let Some(schema) = text_data_field_schema(field) {
+            properties.insert(field.to_owned(), schema);
+        }
+    }
+    Value::Object(properties)
+}
 fn field_schema(operation: &str, field: &str) -> Value {
+    if operation == "text_object.create" {
+        return text_data_field_schema(field).unwrap_or_else(|| common_field_schema(field));
+    }
     if operation == "keyframe.insert" {
         return match field {
             "interpolation" => json!({"enum":["constant","linear","bezier"],"default":"linear"}),
@@ -2787,6 +2943,7 @@ fn elements_schema() -> Value {
 
 fn set_schema(operation: &str) -> Value {
     let mut properties = match operation {
+        "text_object.update" => text_data_set_properties(),
         "scene.update" => json!({
             "name":{"type":"string"},"frame_current":{"type":"number"},
             "frame_start":{"type":"integer"},"frame_end":{"type":"integer"},

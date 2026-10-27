@@ -351,6 +351,12 @@ fn tracking_masks_and_sequencer_operations_run_through_cli() {
             "supported"
         );
     }
+    assert_eq!(
+        rows.iter()
+            .find(|row| row["feature_id"] == "text.font.external")
+            .unwrap()["status"],
+        "partial"
+    );
     for unsupported in ["sequencer.strip.movie", "sequencer.strip.text.unicode"] {
         assert_eq!(
             rows.iter()
@@ -984,11 +990,20 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         let pot_ops = feature["pot_ops"]
             .as_array()
             .expect("each feature has a pot_ops array");
-        match feature["status"]
+        let status = feature["status"]
             .as_str()
-            .expect("each feature has a status")
-        {
-            "supported" => {
+            .expect("each feature has a status");
+        match status {
+            "supported" | "partial" => {
+                if status == "partial" {
+                    let reason = feature["reason"]
+                        .as_str()
+                        .expect("partial features have a string reason");
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "{feature_id} must explain its partial support"
+                    );
+                }
                 for operation in pot_ops {
                     let operation = operation
                         .as_str()
@@ -1068,6 +1083,26 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "blender.curve.bevel_object",
         "modifier.uv_project.animated_camera_lens",
         "shader.volume.spectral_extinction.realtime_scattering",
+        "text.font.external.format",
+        "text.font.external.resource",
+        "text.font.external.charmap",
+        "text.font.external.style_builtin_variant",
+        "text.font.external.missing_glyph",
+        "text.font.external.bevel",
+        "text.font.external.underline",
+        "text.font.external.character_material",
+        "text.font.builtin.character_styles",
+        "text.font.external.fill_solver",
+        "text.font.external.extrusion_without_fill",
+        "text.font.builtin.fill_settings",
+        "text.font.external.combining_mark",
+        "text.font.external.variable",
+        "text.font.external.align_y.bottom",
+        "text.font.builtin.layout_settings",
+        "blender.text.text_boxes",
+        "blender.text.follow_curve",
+        "blender.text.offset",
+        "blender.text.taper_object",
     ] {
         assert!(
             features.iter().any(|feature| {

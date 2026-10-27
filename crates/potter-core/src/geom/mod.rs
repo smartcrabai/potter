@@ -53,6 +53,7 @@ pub mod sculpt;
 mod sculpt_dabs;
 pub(crate) mod spatial;
 pub mod text;
+pub(crate) mod text_font;
 pub(crate) mod triangulate;
 pub(crate) mod uv_layers;
 mod uv_sphere;

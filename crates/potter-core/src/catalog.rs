@@ -355,12 +355,131 @@ pub fn feature_catalog() -> Value {
             &["text_object.create", "text_object.update"],
             [true, true, true, true, false, false, false],
         ),
+        {
+            let mut row = supported(
+                "text.font.external",
+                "External TrueType and OpenType text fonts",
+                "Text",
+                &["text_object.create", "text_object.update"],
+                [true, true, true, true, false, true, true],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "Registered, packed, and project-relative Unicode TrueType/OpenType outline fonts with available glyphs evaluate with FreeType-compatible font metrics, manual kerning, external bold/italic variants, spacing, resolution, and 2D fill/extrusion. Potter welds coincident mesh vertices, so raw Blender vertex/edge multiplicity differs. Missing glyphs, zero-advance combining glyphs, variable fonts, and exact BOTTOM alignment are refused; text boxes, follow-curve, offset, and taper-object settings report import losses; font-table kerning remains unused as in Blender's layout."
+            );
+            row
+        },
         unsupported(
-            "text.font.external",
-            "External text font files",
+            "text.font.external.format",
+            "External font formats unsupported by the outline parser",
             "Text",
-            &["text_object.create", "text_object.update"],
-            "Only the built-in public-domain Hershey Simplex font is included.",
+            &[],
+            "External fonts must be valid TrueType/OpenType outline fonts.",
+        ),
+        unsupported(
+            "text.font.external.charmap",
+            "External fonts without a Unicode character map",
+            "Text",
+            &[],
+            "External fonts without a Unicode character map are not evaluated.",
+        ),
+        unsupported(
+            "text.font.external.missing_glyph",
+            "External font missing glyphs",
+            "Text",
+            &[],
+            "Characters without glyphs in the selected external font are explicitly refused.",
+        ),
+        unsupported(
+            "text.font.external.combining_mark",
+            "Combining and zero-advance external glyphs",
+            "Text",
+            &[],
+            "Zero-advance glyphs are refused because Blender repositions combining marks over their base glyph.",
+        ),
+        unsupported(
+            "text.font.external.variable",
+            "Variable external fonts",
+            "Text",
+            &[],
+            "Variable font axes are not evaluated; external variable fonts are refused.",
+        ),
+        unsupported(
+            "text.font.external.align_y.bottom",
+            "Exact BOTTOM vertical alignment for external text",
+            "Text",
+            &[],
+            "TOP_BASELINE, TOP, CENTER, and BOTTOM_BASELINE are supported; Blender's BOTTOM alignment is refused.",
+        ),
+        unsupported(
+            "text.font.external.style_builtin_variant",
+            "Built-in bold and italic variants on external text",
+            "Text",
+            &[],
+            "The built-in Blender font's bold/italic variants are not parsed for external text.",
+        ),
+        unsupported(
+            "text.font.external.bevel",
+            "Beveled external font text",
+            "Text",
+            &[],
+            "External font outline bevel geometry is not implemented.",
+        ),
+        unsupported(
+            "text.font.external.underline",
+            "Underlined external font text",
+            "Text",
+            &[],
+            "Per-character underline geometry is not implemented.",
+        ),
+        unsupported(
+            "text.font.external.character_material",
+            "Per-character text material assignment",
+            "Text",
+            &[],
+            "Per-character text material indices are preserved but not evaluated.",
+        ),
+        unsupported(
+            "text.font.builtin.layout_settings",
+            "Non-default layout settings on built-in Hershey text",
+            "Text",
+            &[],
+            "The built-in Hershey evaluator refuses non-default spacing, shear, offsets, small-caps scale, and exact BOTTOM alignment.",
+        ),
+        unsupported(
+            "text.font.builtin.character_styles",
+            "Per-character styles on the built-in Hershey font",
+            "Text",
+            &[],
+            "The built-in Hershey evaluator does not implement Blender per-character text styles.",
+        ),
+        unsupported(
+            "text.font.external.resource",
+            "External font evaluation without a scene resource context",
+            "Text",
+            &[],
+            "The standalone text geometry API cannot resolve external file or asset resources; evaluate through a scene context.",
+        ),
+        unsupported(
+            "text.font.external.extrusion_without_fill",
+            "External font extrusion without fill",
+            "Text",
+            &[],
+            "External text extrusion requires a 2D filled font curve.",
+        ),
+        unsupported(
+            "text.font.external.fill_solver",
+            "External font fill with Sweep Line solver",
+            "Text",
+            &[],
+            "External text fill uses Blender's default CDT solver; Sweep Line text fill is not implemented.",
+        ),
+        unsupported(
+            "text.font.builtin.fill_settings",
+            "Alternate fill settings on built-in Hershey text",
+            "Text",
+            &[],
+            "The built-in Hershey evaluator supports only Blender's default text fill settings.",
         ),
         supported(
             "hair_curves.lines",
@@ -452,6 +571,34 @@ pub fn feature_catalog() -> Value {
             "Curve",
             &[],
             "The bevel-object target is not represented; import records the marker and reports loss, while strict .blend export refuses to invent the missing target.",
+        ),
+        unsupported(
+            "blender.text.text_boxes",
+            "Blender text-box layout",
+            "Text",
+            &[],
+            "Non-default text boxes or overflow modes are not represented and report an import loss.",
+        ),
+        unsupported(
+            "blender.text.follow_curve",
+            "Blender text-on-curve reference",
+            "Text",
+            &[],
+            "Text-on-curve references are not represented and report an import loss.",
+        ),
+        unsupported(
+            "blender.text.offset",
+            "Blender TextCurve offset",
+            "Text",
+            &[],
+            "Non-zero TextCurve offsets are not represented and report an import loss.",
+        ),
+        unsupported(
+            "blender.text.taper_object",
+            "Blender text taper-object reference",
+            "Text",
+            &[],
+            "Text taper-object references are not represented and report an import loss.",
         ),
         supported(
             "curve.fill.multiple_contours",
@@ -2852,7 +2999,7 @@ fn format_row(
 
 #[must_use]
 pub fn capabilities_schema() -> Value {
-    json!({"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Potter capabilities catalog","type":"object","required":["catalog_version","features"],"properties":{"catalog_version":{"const":1},"features":{"type":"array","items":{"$ref":"#/$defs/feature"}}},"$defs":{"feature":{"type":"object","required":["feature_id","name","blender_type","pot_ops","capabilities","status","reason"],"properties":{"feature_id":{"type":"string"},"name":{"type":"string"},"blender_type":{"type":"string"},"pot_ops":{"type":"array","items":{"type":"string"}},"capabilities":{"type":"object","required":["create","edit","inspect","evaluate","render","import","export"],"properties":{"create":{"type":"boolean"},"edit":{"type":"boolean"},"inspect":{"type":"boolean"},"evaluate":{"type":"boolean"},"render":{"type":"boolean"},"import":{"type":"boolean"},"export":{"type":"boolean"}},"additionalProperties":false},"status":{"enum":["supported","not_supported"]},"reason":{"type":["string","null"]},"enabled":{"type":"boolean"}},"additionalProperties":false}}})
+    json!({"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Potter capabilities catalog","type":"object","required":["catalog_version","features"],"properties":{"catalog_version":{"const":1},"features":{"type":"array","items":{"$ref":"#/$defs/feature"}}},"$defs":{"feature":{"type":"object","required":["feature_id","name","blender_type","pot_ops","capabilities","status","reason"],"properties":{"feature_id":{"type":"string"},"name":{"type":"string"},"blender_type":{"type":"string"},"pot_ops":{"type":"array","items":{"type":"string"}},"capabilities":{"type":"object","required":["create","edit","inspect","evaluate","render","import","export"],"properties":{"create":{"type":"boolean"},"edit":{"type":"boolean"},"inspect":{"type":"boolean"},"evaluate":{"type":"boolean"},"render":{"type":"boolean"},"import":{"type":"boolean"},"export":{"type":"boolean"}},"additionalProperties":false},"status":{"enum":["supported","partial","not_supported"]},"reason":{"type":["string","null"]},"enabled":{"type":"boolean"}},"additionalProperties":false}}})
 }
 
 #[must_use]

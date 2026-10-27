@@ -879,11 +879,30 @@ fn create_text_object(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
             "data_id",
             "body",
             "font",
+            "font_name",
+            "font_bold",
+            "font_bold_italic",
+            "font_italic",
+            "font_bold_name",
+            "font_bold_italic_name",
+            "font_italic_name",
+            "character_formats",
+            "resolution_u",
             "size",
             "align_x",
             "align_y",
+            "fill_mode",
+            "fill_solver",
+            "fill_rule",
             "extrude",
             "bevel_depth",
+            "character_spacing",
+            "word_spacing",
+            "line_spacing",
+            "shear",
+            "offset_x",
+            "offset_y",
+            "small_caps_scale",
             "collection",
             "transform",
             "parent",
@@ -905,9 +924,20 @@ fn create_text_object(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
             "body",
             "font",
             "font_name",
+            "font_bold",
+            "font_bold_italic",
+            "font_italic",
+            "font_bold_name",
+            "font_bold_italic_name",
+            "font_italic_name",
+            "character_formats",
+            "resolution_u",
             "size",
             "align_x",
             "align_y",
+            "fill_mode",
+            "fill_solver",
+            "fill_rule",
             "extrude",
             "bevel_depth",
             "character_spacing",
@@ -920,10 +950,10 @@ fn create_text_object(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
         ],
         "",
     )?;
-    geom::text::evaluate_text(&text).map_err(|error| {
+    geom::text::validate_text_data(&text).map_err(|error| {
         engine.error(
             ErrorCode::InvalidOperation,
-            format!("text geometry is invalid: {error}"),
+            format!("text data is invalid: {error}"),
             &operation_pointer(engine.operation_index, "body"),
         )
     })?;
@@ -955,9 +985,20 @@ fn update_text_object(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
             "body",
             "font",
             "font_name",
+            "font_bold",
+            "font_bold_italic",
+            "font_italic",
+            "font_bold_name",
+            "font_bold_italic_name",
+            "font_italic_name",
+            "character_formats",
+            "resolution_u",
             "size",
             "align_x",
             "align_y",
+            "fill_mode",
+            "fill_solver",
+            "fill_rule",
             "extrude",
             "bevel_depth",
             "character_spacing",
@@ -979,11 +1020,16 @@ fn update_text_object(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
         .ok_or_else(|| super::geometry_data::missing_payload(engine, "text", "target"))?;
     let mut updated: Value = serialize(&text)?;
     merge_values(&mut updated, set);
-    let updated: TextObjectData = decode_value(engine, updated, "set")?;
-    geom::text::evaluate_text(&updated).map_err(|error| {
+    let mut updated: TextObjectData = decode_value(engine, updated, "set")?;
+    if updated.body != text.body && !set.contains_key("character_formats") {
+        updated
+            .character_formats
+            .truncate(updated.body.chars().count());
+    }
+    geom::text::validate_text_data(&updated).map_err(|error| {
         engine.error(
             ErrorCode::InvalidOperation,
-            format!("text geometry is invalid: {error}"),
+            format!("text data is invalid: {error}"),
             &operation_pointer(engine.operation_index, "set"),
         )
     })?;

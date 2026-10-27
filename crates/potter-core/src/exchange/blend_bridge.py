@@ -1458,13 +1458,22 @@ def resources_dump():
         record = _legacy_texture_record(texture)
         if record is not None:
             result.append(record)
+    seen_fonts = set()
     for curve in bpy.data.curves:
         if getattr(getattr(curve, "bl_rna", None), "identifier", "") != "TextCurve":
             continue
-        font = curve.font
-        if font is not None and (font.filepath or getattr(font, "packed_file", None)):
+        for field in ("font", "font_bold", "font_italic", "font_bold_italic"):
+            font = getattr(curve, field, None)
+            packed_file = getattr(font, "packed_file", None) if font else None
+            if font is None or (font.filepath in ("", "<builtin>") and packed_file is None):
+                continue
+            path = bpy.path.abspath(font.filepath) if font.filepath else ""
+            key = path or font.as_pointer()
+            if key in seen_fonts:
+                continue
+            seen_fonts.add(key)
             result.append(_resource_record("font", curve.name_full, font.filepath,
-                                           getattr(font, "packed_file", None)))
+                                           packed_file))
     for volume in getattr(bpy.data, "volumes", ()):
         filepath = volume_filepath(volume)
         if filepath:
@@ -1818,10 +1827,25 @@ def _legacy_spline_has_custom_knots(spline):
     return bool(flags & (1 << 3))
 
 
+def _text_variant_font_state(font):
+    if font is None:
+        return "", ""
+    if font.filepath in ("", "<builtin>"):
+        return "builtin", font.name_full
+    return bpy.path.abspath(font.filepath), font.name_full
+
+
 def curve_dump(curve):
     if getattr(getattr(curve, "bl_rna", None), "identifier", "") == "TextCurve":
         font = curve.font
-        font_path = bpy.path.abspath(font.filepath) if font and font.filepath else "builtin"
+        follow_curve = getattr(curve, "follow_curve", None)
+        taper_object = getattr(curve, "taper_object", None)
+        font_path = ("builtin" if not font or font.filepath in ("", "<builtin>")
+                     else bpy.path.abspath(font.filepath))
+        font_bold_path, font_bold_name = _text_variant_font_state(curve.font_bold)
+        font_bold_italic_path, font_bold_italic_name = _text_variant_font_state(
+            curve.font_bold_italic)
+        font_italic_path, font_italic_name = _text_variant_font_state(curve.font_italic)
         return {
             "name": curve.name_full,
             "potter_id": curve.get("potter.id"),
@@ -1839,14 +1863,37 @@ def curve_dump(curve):
                 "body": curve.body,
                 "font": font_path,
                 "font_name": font.name_full if font else "Bfont",
+                "font_bold": font_bold_path,
+                "font_bold_italic": font_bold_italic_path,
+                "font_italic": font_italic_path,
+                "font_bold_name": font_bold_name,
+                "font_bold_italic_name": font_bold_italic_name,
+                "font_italic_name": font_italic_name,
+                "character_formats": [
+                    {
+                        "use_bold": bool(format.use_bold),
+                        "use_italic": bool(format.use_italic),
+                        "use_underline": bool(format.use_underline),
+                        "use_small_caps": bool(format.use_small_caps),
+                        "material_index": int(format.material_index),
+                        "kerning": float(format.kerning),
+                    }
+                    for format in getattr(curve, "body_format", ())
+                ],
+                "resolution_u": int(getattr(curve, "resolution_u", 12)),
                 "size": float(curve.size),
                 "align_x": curve.align_x.lower(),
                 "align_y": {
                     "BASELINE": "baseline",
-                    "TOP_BASELINE": "top",
+                    "TOP_BASELINE": "baseline",
+                    "TOP": "top",
                     "CENTER": "center",
                     "BOTTOM_BASELINE": "bottom",
+                    "BOTTOM": "bottom_exact",
                 }.get(curve.align_y, curve.align_y.lower()),
+                "fill_mode": curve.fill_mode.lower(),
+                "fill_solver": str(getattr(curve, "fill_solver", "CDT")).lower(),
+                "fill_rule": str(getattr(curve, "fill_rule", "NONZERO")).lower(),
                 "extrude": float(curve.extrude),
                 "bevel_depth": float(curve.bevel_depth),
                 "character_spacing": float(getattr(curve, "space_character", 1.0)),
@@ -1856,6 +1903,16 @@ def curve_dump(curve):
                 "offset_x": float(getattr(curve, "offset_x", 0.0)),
                 "offset_y": float(getattr(curve, "offset_y", 0.0)),
                 "small_caps_scale": float(getattr(curve, "small_caps_scale", 0.75)),
+                "text_boxes": [{
+                    "width": float(box.width),
+                    "height": float(box.height),
+                    "x": float(box.x),
+                    "y": float(box.y),
+                } for box in getattr(curve, "text_boxes", ())],
+                "overflow": str(getattr(curve, "overflow", "NONE")),
+                "follow_curve": follow_curve.name_full if follow_curve else None,
+                "offset": float(getattr(curve, "offset", 0.0)),
+                "taper_object": taper_object.name_full if taper_object else None,
             },
             "custom_properties": custom_props(curve),
             "fake_user": bool(curve.use_fake_user),
@@ -1991,6 +2048,8 @@ def curve_dump(curve):
             "align_y": curve.align_y.lower(),
             "extrude": float(curve.extrude),
             "bevel_depth": float(curve.bevel_depth),
+            "fill_solver": str(getattr(curve, "fill_solver", "CDT")).lower(),
+            "fill_rule": str(getattr(curve, "fill_rule", "NONZERO")).lower(),
         }
     return result
 
@@ -7206,35 +7265,65 @@ def _cache_file_from_alembic(filepath, identity):
 
 
 
+def _load_text_font(font_path, font_name, doc, target, pack):
+    resolved_font = _resource_path(doc, font_path)
+    if not resolved_font or not os.path.isfile(resolved_font):
+        raise ValueError("external text font is missing: %s" % font_path)
+    font = bpy.data.fonts.load(resolved_font, check_existing=True)
+    if font_name:
+        font.name = font_name
+    if pack and hasattr(font, "pack"):
+        font.pack()
+    font.filepath = _relative_blend_path(resolved_font, target)
+    return font
+
+
 def _curve_data_create(name, data_id, item, source, doc, target, pack):
     curve_data = item.get("curve") or {}
     resolution_u = curve_data.get("resolution_u", source.get("resolution_u", 12))
     if item.get("type") == "text":
         raw = item.get("text") or {}
         curve = bpy.data.curves.new(name, "FONT")
+        curve.resolution_u = int(raw.get("resolution_u", resolution_u))
         curve.body = raw.get("body", "")
         curve.size = float(raw.get("size", 1.0))
         curve.align_x = raw.get("align_x", "left").upper()
         curve.align_y = {
-            "baseline": "BASELINE",
-            "top": "TOP_BASELINE",
+            "baseline": "TOP_BASELINE",
+            "top": "TOP",
             "center": "CENTER",
             "bottom": "BOTTOM_BASELINE",
+            "bottom_exact": "BOTTOM",
         }.get(raw.get("align_y", "baseline"), raw.get("align_y", "baseline").upper())
+        curve.fill_mode = raw.get("fill_mode", "both").upper()
+        curve.fill_solver = str(raw.get("fill_solver", "cdt")).upper()
+        curve.fill_rule = str(raw.get("fill_rule", "nonzero")).upper()
         curve.extrude = float(raw.get("extrude", 0.0))
         curve.bevel_depth = float(raw.get("bevel_depth", 0.0))
         font_path = raw.get("font", "builtin")
         if font_path not in ("builtin", "", None):
-            resolved_font = _resource_path(doc, font_path)
-            if not resolved_font or not os.path.isfile(resolved_font):
-                raise ValueError("external text font is missing: %s" % font_path)
-            font = bpy.data.fonts.load(resolved_font, check_existing=True)
-            font.filepath = _relative_blend_path(resolved_font, target)
-            if raw.get("font_name"):
-                font.name = raw["font_name"]
-            if pack and hasattr(font, "pack"):
-                font.pack()
-            curve.font = font
+            curve.font = _load_text_font(
+                font_path, raw.get("font_name", ""), doc, target, pack)
+        for attribute, name_field in (
+            ("font_bold", "font_bold_name"),
+            ("font_italic", "font_italic_name"),
+            ("font_bold_italic", "font_bold_italic_name"),
+        ):
+            variant_path = raw.get(attribute, "")
+            if variant_path in ("", None):
+                setattr(curve, attribute, None)
+            elif variant_path != "builtin":
+                setattr(curve, attribute, _load_text_font(
+                    variant_path, raw.get(name_field, ""), doc, target, pack))
+        formats = raw.get("character_formats", [])
+        if len(formats) > len(curve.body_format):
+            raise ValueError("text character format count exceeds body length")
+        for index, values in enumerate(formats):
+            character_format = curve.body_format[index]
+            for field in ("use_bold", "use_italic", "use_underline", "use_small_caps"):
+                setattr(character_format, field, bool(values.get(field, False)))
+            character_format.material_index = int(values.get("material_index", 0))
+            character_format.kerning = float(values.get("kerning", 0.0))
         for field, attribute in (
             ("character_spacing", "space_character"),
             ("word_spacing", "space_word"),

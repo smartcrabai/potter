@@ -397,8 +397,15 @@ fn configure_blender_resources(
         let Some(text) = data.text.as_mut() else {
             continue;
         };
-        if let Some(uri) = reference_uris.get(&resource_reference_key(&text.font)) {
-            text.font.clone_from(uri);
+        for font in [
+            &mut text.font,
+            &mut text.font_bold,
+            &mut text.font_italic,
+            &mut text.font_bold_italic,
+        ] {
+            if let Some(uri) = reference_uris.get(&resource_reference_key(font)) {
+                font.clone_from(uri);
+            }
         }
     }
     for scene in doc.scenes.values_mut() {
