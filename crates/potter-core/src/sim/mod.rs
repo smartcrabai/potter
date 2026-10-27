@@ -8,6 +8,7 @@ mod particle_distribution;
 mod particle_jitter;
 mod particle_textures;
 pub mod particles;
+pub(crate) mod point_cache;
 pub mod softbody;
 mod solver;
 
@@ -568,8 +569,11 @@ pub(crate) fn evaluate_stack_modifier(
     let mut particles = None;
     match system {
         "cloth" | "soft_body" => {
-            let colliders =
-                collider_triangles(doc, matrices, &members, gate, ColliderConsumer::Surface)?;
+            let colliders = if point_cache_is_baked(settings) {
+                Vec::new()
+            } else {
+                collider_triangles(doc, matrices, &members, gate, ColliderConsumer::Surface)?
+            };
             let positions = simulate_surface(
                 &context, node_id, system, settings, &mesh, matrix, &colliders,
             )?;
@@ -986,8 +990,11 @@ fn evaluate_physics(
                 && gate.is_property_active(id, node, property, system)
             {
                 let mesh = mesh_with_vertex_groups(doc, node, id)?;
-                let colliders =
-                    collider_triangles(doc, matrices, members, gate, ColliderConsumer::Surface)?;
+                let colliders = if point_cache_is_baked(settings) {
+                    Vec::new()
+                } else {
+                    collider_triangles(doc, matrices, members, gate, ColliderConsumer::Surface)?
+                };
                 let positions =
                     simulate_surface(&context, id, system, settings, &mesh, matrix, &colliders)?;
                 result
@@ -1459,6 +1466,14 @@ fn point_cache_window(settings: &Value) -> Result<CacheWindow> {
     frame_window(start, end)
 }
 
+fn point_cache_is_baked(settings: &Value) -> bool {
+    settings
+        .get("point_cache")
+        .and_then(|cache| cache.get("is_baked"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// Window of a fluid domain's `cache_frame_start` and `cache_frame_end`.
 fn domain_cache_window(settings: &Value) -> Result<CacheWindow> {
     let start = setting_number(
@@ -1793,8 +1808,9 @@ fn mesh_with_vertex_groups(doc: &SceneDoc, node: &Node, id: &Id) -> Result<Mesh>
 
 /// Cloth or soft-body vertex positions for `subject` at the context frame, in its local space.
 ///
-/// The solver runs inside the point-cache window. Cloth takes its collision toggle and collection
-/// from the nested `collision_settings`; soft bodies take `collision_collection`.
+/// Unbaked solves run inside the point-cache window; baked caches bypass the solver and replay
+/// cached positions directly. Cloth takes its collision toggle and collection from
+/// `collision_settings`; soft bodies take `collision_collection`.
 fn simulate_surface(
     context: &FrameContext<'_>,
     subject: &Id,
@@ -1805,7 +1821,23 @@ fn simulate_surface(
     colliders: &[(Id, ColliderTriangle)],
 ) -> Result<Vec<DVec3>> {
     let window = point_cache_window(settings)?;
+    let baked = point_cache_is_baked(settings);
+    if baked && f64::from((context.frame as f32).trunc()) <= window.start {
+        return Ok(mesh.vertices.iter().map(|vertex| vertex.co).collect());
+    }
     let inverse = invert_matrix(matrix, subject)?;
+    if baked {
+        return point_cache::evaluate_surface(
+            settings,
+            system,
+            context.frame,
+            inverse,
+            mesh.vertices.len(),
+            subject.as_str(),
+            context.doc,
+            context.gate.context.project_root,
+        );
+    }
     let (collision_enabled, collection) = if system == "cloth" {
         let collision = settings.get("collision_settings");
         if let Some(collision) = collision {
@@ -2446,6 +2478,12 @@ fn validate_dynamic_paint_point_cache(surface: &Value) -> Result<()> {
     if !cache.is_object() {
         return Err(PotError::invalid_argument(
             "dynamic-paint point_cache must be an object",
+        ));
+    }
+    if cache.get("is_baked").and_then(Value::as_bool) == Some(true) {
+        return Err(unsupported_feature(
+            "physics.point_cache.is_baked",
+            "baked Dynamic Paint point caches are not supported; baked playback is limited to disk-backed cloth and soft-body caches",
         ));
     }
     physics_support::reject_unhonoured(

@@ -81,12 +81,23 @@ pub fn run(args: &ImportArgs) -> Result<(Option<SceneInfo>, Value)> {
             packed_resource_hashes.insert(digest.to_owned());
         }
     }
+    let point_cache_hashes = imported
+        .doc
+        .resources
+        .values()
+        .filter_map(|resource| {
+            (resource["kind"].as_str() == Some("point_cache_frame"))
+                .then(|| resource["hash"].as_str().map(str::to_owned))
+                .flatten()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
 
     let mut asset_blobs = BTreeMap::new();
     for (digest, bytes) in imported.assets {
         if format == "blend"
             && args.asset_policy == AssetPolicy::Link
             && !packed_resource_hashes.contains(&digest)
+            && !point_cache_hashes.contains(&digest)
         {
             continue;
         }
@@ -320,9 +331,10 @@ fn configure_blender_resources(
         if source["packed"] == true && source.get("sequence_frames").is_some() {
             continue;
         }
-        let original_path = source
-            .get("original_path")
-            .and_then(Value::as_str)
+        let cache_frame = source["kind"].as_str() == Some("point_cache_frame");
+        let original_path = (!cache_frame)
+            .then(|| source.get("original_path").and_then(Value::as_str))
+            .flatten()
             .map(str::to_owned);
         let digest = source
             .get("hash")
@@ -336,7 +348,7 @@ fn configure_blender_resources(
             })
             .unwrap_or("resource");
         let source_packed = source["source_packed"] == true;
-        let copy = policy == AssetPolicy::Copy || source_packed;
+        let copy = policy == AssetPolicy::Copy || source_packed || cache_frame;
         let available = source["status"] != "missing"
             && digest
                 .as_deref()
@@ -345,6 +357,8 @@ fn configure_blender_resources(
             let digest = digest.as_deref().unwrap_or_default();
             let hex = digest.strip_prefix("sha256:").unwrap_or_default();
             format!("assets/sha256/{hex}/{filename}")
+        } else if cache_frame {
+            format!("missing://point-cache/{filename}")
         } else {
             original_path
                 .clone()

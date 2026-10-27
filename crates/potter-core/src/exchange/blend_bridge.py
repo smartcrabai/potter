@@ -464,12 +464,69 @@ def _physics_rna_values(block, depth=0):
 
 
 
-def _physics_point_cache(block):
+def _point_cache_locator(obj, modifier_type, cache):
+    if (obj is None or modifier_type not in ("CLOTH", "SOFT_BODY")
+            or getattr(obj, "library", None) is not None
+            or not bool(getattr(cache, "is_baked", False))
+            or not (bool(getattr(cache, "use_disk_cache", False))
+                    or bool(getattr(cache, "use_external", False)))):
+        return None
+    stack_index = int(getattr(cache, "index", -1))
+    if stack_index < 0:
+        return None
+    if bool(getattr(cache, "use_external", False)):
+        cache_directory = bpy.path.abspath(str(getattr(cache, "filepath", "")))
+    else:
+        blend_path = bpy.data.filepath
+        if not blend_path:
+            return None
+        blend_name = os.path.splitext(os.path.basename(blend_path))[0]
+        cache_directory = bpy.path.abspath("//blendcache_" + blend_name)
+    if not cache_directory:
+        return None
+    prefix = str(getattr(cache, "name", ""))
+    if not prefix and not bool(getattr(cache, "use_external", False)):
+        prefix = "".join("%02X" % value for value in obj.name.encode("utf-8"))
+    suffix = "_%02d.bphys" % stack_index
+    start = int(getattr(cache, "frame_start", 1))
+    end = int(getattr(cache, "frame_end", 250))
+    frames_by_number = {}
+    try:
+        with os.scandir(cache_directory) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                if not entry.name.startswith(prefix + "_") or not entry.name.endswith(suffix):
+                    continue
+                frame_text = entry.name[len(prefix) + 1:-len(suffix)]
+                if not frame_text.isdecimal():
+                    continue
+                frame = int(frame_text)
+                if start <= frame <= end:
+                    frames_by_number[frame] = os.path.abspath(entry.path)
+    except OSError:
+        pass
+    return {
+        "directory": cache_directory,
+        "prefix": prefix,
+        "stack_index": stack_index,
+        "kind": "cloth" if modifier_type == "CLOTH" else "soft_body",
+        "frames": [
+            {"frame": frame, "path": path}
+            for frame, path in sorted(frames_by_number.items())
+        ],
+    }
+
+
+def _physics_point_cache(block, obj=None, modifier_type=None):
     cache = getattr(block, "point_cache", None) if block is not None else None
     if cache is None:
         return None
     result = _physics_rna_values(cache)
     result["is_baked"] = bool(getattr(cache, "is_baked", False))
+    locator = _point_cache_locator(obj, modifier_type, cache)
+    if locator is not None:
+        result["_potter_cache_locator"] = locator
     return result
 
 MAX_PARTICLE_PATH_KEYS = 1_000_000
@@ -780,7 +837,7 @@ def _physics_modifier_settings(obj, modifier):
         collision_settings = getattr(modifier, "collision_settings", None)
         if collision_settings is not None:
             result["collision_settings"] = _physics_rna_values(collision_settings)
-    point_cache = _physics_point_cache(modifier)
+    point_cache = _physics_point_cache(modifier, obj, modifier.type)
     if point_cache is not None:
         result["point_cache"] = point_cache
     return result
@@ -1434,6 +1491,19 @@ def resources_dump():
     for cache_file in getattr(bpy.data, "cache_files", ()):
         if cache_file.filepath:
             result.append(_cache_file_resource(cache_file))
+    cache_frame_paths = set()
+    for obj in bpy.data.objects:
+        for modifier in obj.modifiers:
+            locator = _point_cache_locator(
+                obj, modifier.type, getattr(modifier, "point_cache", None))
+            if locator is None:
+                continue
+            for frame in locator["frames"]:
+                path = frame["path"]
+                if path not in cache_frame_paths:
+                    cache_frame_paths.add(path)
+                    result.append(_resource_record(
+                        "point_cache_frame", os.path.basename(path), path))
     for clip in getattr(bpy.data, "movieclips", ()):
         if clip.filepath:
             result.append(_resource_record("movie_clip", clip.name_full, clip.filepath))
@@ -4617,7 +4687,10 @@ def set_modifier_params(modifier, item, id_lookup, texture_lookup, doc, target, 
             cache_block = getattr(modifier, "point_cache", None)
         if point_cache is not None:
             set_rna(cache_block, _rna_writable(cache_block, point_cache), id_lookup)
-            if point_cache.get("is_baked"):
+            cache_locator = point_cache.get("_potter_cache_locator")
+            if (point_cache.get("is_baked")
+                    and not (isinstance(cache_locator, dict)
+                             and cache_locator.get("kind") in ("cloth", "soft_body"))):
                 _bake_point_cache(obj, cache_block)
     if dynamic_paint_temporary_link:
         obj.select_set(False)

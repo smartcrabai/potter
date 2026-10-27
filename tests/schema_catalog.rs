@@ -1027,6 +1027,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "physics.dynamic_paint_surface.surface_type",
         "physics.dynamic_paint_canvas.canvas_surfaces",
         "constraint.ik.swing_ellipse_limit",
+        "physics.point_cache.is_baked",
         "modifier.boolean.exact_point_attribute_local_index",
         "constraint.geometry_attribute.instances",
         "animation.fcurve_non_transform_channels",

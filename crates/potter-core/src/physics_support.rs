@@ -335,8 +335,8 @@ pub(crate) fn fluid_domain_system(domain_type: &str) -> &'static str {
 /// Blender properties that hold runtime or host state, not user settings.
 ///
 /// These are never reported and never honoured. Soft-body estimates are recomputed each evaluation.
-/// Fluid cache flags describe bake state on disk. Paths, cache indices, and names identify the
-/// file system or datablock.
+/// Fluid cache flags describe bake state on disk. Point-cache paths, indices, storage flags, sample
+/// steps, and the Potter locator identify the cached frames; `is_baked` selects playback instead.
 pub(crate) fn is_runtime_state(system: &str, property: &str) -> bool {
     match system {
         "soft_body" => {
@@ -349,7 +349,18 @@ pub(crate) fn is_runtime_state(system: &str, property: &str) -> bool {
                 || property.starts_with("is_cache_baking_")
         }
         "dynamic_paint_surface" => matches!(property, "image_output_path" | "name"),
-        "point_cache" => matches!(property, "filepath" | "index" | "name" | "use_disk_cache"),
+        "point_cache" => {
+            matches!(
+                property,
+                "filepath"
+                    | "index"
+                    | "name"
+                    | "frame_step"
+                    | "use_disk_cache"
+                    | "use_external"
+                    | "_potter_cache_locator"
+            )
+        }
         _ => false,
     }
 }
@@ -451,6 +462,9 @@ pub(crate) fn reject_unhonoured(system: &str, settings: &Value, honoured: &[&str
     for (property, value) in settings {
         if !is_blender_property(system, property)
             || honoured.contains(&property.as_str())
+            || (system == "point_cache"
+                && property == "is_baked"
+                && settings.contains_key("_potter_cache_locator"))
             || !is_semantic_when(system, property, settings)
             || is_default_value(system, property, value)
         {
@@ -539,6 +553,12 @@ fn strip_accepted_block(
     let keys = block.keys().cloned().collect::<Vec<_>>();
     for key in keys {
         if key == "role" {
+            continue;
+        }
+        if system == "point_cache"
+            && matches!(key.as_str(), "is_baked" | "frame_start" | "frame_end")
+            && block.contains_key("_potter_cache_locator")
+        {
             continue;
         }
         if let Some(nested) = nested_physics_system(system, &key) {

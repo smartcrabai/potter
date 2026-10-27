@@ -145,11 +145,12 @@ pub fn export_blend(
     check_blender_version(&blender)?;
     let mut losses = export_losses(doc);
     losses.extend(native_bind_export_losses(doc, project));
-    // An accepted import loss for a physics setting is re-reported from its compatibility payload, so
-    // re-exporting that setting adds no new loss. Other accepted losses (images, materials) still refuse.
+    // Accepted is_baked loss is per document. A supported disk cache kept through another cache's
+    // accepted loss still needs its source-frame export loss.
     losses.retain(|loss| {
         !(loss.feature_id.starts_with("blender.physics.")
-            && doc.accepted_losses.contains(&loss.feature_id))
+            && doc.accepted_losses.contains(&loss.feature_id)
+            && loss.feature_id != "blender.physics.point_cache.is_baked")
     });
     let (texture_losses, texture_edits) =
         crate::exchange::material_graph::plan_blend_textures(doc)?;
@@ -3179,6 +3180,19 @@ fn build_imported_graph(
     let volumes = optional_array(raw, "volumes")?;
     let mut mappings = BTreeMap::<String, String>::new();
     let (resource_ids, resource_assets) = import_blender_resources(raw, file, &mut doc)?;
+    let cache_resource_hashes = doc
+        .resources
+        .iter()
+        .filter_map(|(id, resource)| {
+            (resource["kind"].as_str() == Some("point_cache_frame"))
+                .then(|| {
+                    resource["hash"]
+                        .as_str()
+                        .map(|hash| (id.as_str().to_owned(), hash.to_owned()))
+                })
+                .flatten()
+        })
+        .collect::<BTreeMap<_, _>>();
     let movie_clip_ids = import_movie_clips(raw, &resource_ids, &mut doc, &mut mappings)?;
     let mut collection_ids = BTreeMap::new();
     for item in collections {
@@ -4524,6 +4538,14 @@ fn build_imported_graph(
                         &action_ids,
                     )?;
                     canonicalize_particle_texture_slots(&mut settings, &resource_ids, &image_ids);
+                    if matches!(model_type.as_str(), "cloth" | "soft_body") {
+                        canonicalize_point_cache_locator(
+                            &mut settings,
+                            model_type.as_str(),
+                            &resource_ids,
+                            &cache_resource_hashes,
+                        );
+                    }
                     if let (Some(system), Some(block)) = (blender_system, settings.as_object_mut())
                     {
                         resolve_physics_collection_references(system, block, &collection_ids);
@@ -7082,7 +7104,7 @@ fn import_blender_resources(
         let uri = resolved_path
             .as_ref()
             .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
-        let original_path = (!uri.is_empty()).then(|| uri.clone());
+        let original_path = (kind != "point_cache_frame" && !uri.is_empty()).then(|| uri.clone());
         let status = if bytes.is_some() {
             "available"
         } else {
@@ -10424,6 +10446,60 @@ fn uv_project_animated_camera_lens_losses(doc: &SceneDoc) -> Vec<Loss> {
     losses
 }
 
+fn canonicalize_point_cache_locator(
+    settings: &mut Value,
+    system: &str,
+    resource_ids: &BTreeMap<String, String>,
+    resource_hashes: &BTreeMap<String, String>,
+) {
+    let Some(point_cache) = settings
+        .get_mut("point_cache")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    point_cache.remove("filepath");
+    let kind = point_cache
+        .get("_potter_cache_locator")
+        .and_then(|locator| locator.get("kind"))
+        .and_then(Value::as_str);
+    if kind != Some(system) {
+        point_cache.remove("_potter_cache_locator");
+        return;
+    }
+    if !crate::sim::point_cache::supports_import(point_cache, system) {
+        point_cache.remove("_potter_cache_locator");
+        return;
+    }
+    let source_frames = point_cache
+        .get("_potter_cache_locator")
+        .and_then(|locator| locator.get("frames"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut frames = source_frames
+        .iter()
+        .filter_map(|frame| {
+            let frame_number = frame
+                .get("frame")
+                .and_then(Value::as_i64)
+                .and_then(|number| i32::try_from(number).ok())?;
+            let path = frame.get("path").and_then(Value::as_str)?;
+            let resource_id = resource_ids.get(path)?;
+            let hash = resource_hashes.get(resource_id)?;
+            Some(json!({
+                "frame": frame_number,
+                "resource_id": resource_id,
+                "hash": hash,
+            }))
+        })
+        .collect::<Vec<_>>();
+    frames.sort_by_key(|frame| frame["frame"].as_i64().unwrap_or_default());
+    point_cache.insert(
+        "_potter_cache_locator".to_owned(),
+        json!({"kind": system, "frames": frames}),
+    );
+}
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
     // Blender's USD CacheFiles are not read: their Mesh Cache and Mesh Sequence Cache modifiers would fail at
@@ -11600,6 +11676,7 @@ fn physics_import_losses(
             system,
             block,
             modifier_name,
+            matches!(system, "cloth" | "soft_body").then_some(system),
             weight_brush_used,
             paint_brush_used,
             collections,
@@ -11613,17 +11690,26 @@ fn collect_physics_import_losses(
     system: &str,
     block: &Map<String, Value>,
     owner: Option<&str>,
+    baked_cache_system: Option<&str>,
     weight_brush_used: bool,
     paint_brush_used: bool,
     collections: &BTreeSet<&str>,
     losses: &mut Vec<Loss>,
 ) {
+    let supported_baked_surface_cache = system == "point_cache"
+        && baked_cache_system
+            .is_some_and(|owner| crate::sim::point_cache::supports_import(block, owner));
     for (key, value) in block {
+        if supported_baked_surface_cache
+            && matches!(key.as_str(), "is_baked" | "frame_start" | "frame_end")
+        {
+            continue;
+        }
         if key == "role" {
             continue;
         }
         if crate::physics_support::is_runtime_state(system, key) {
-            // Blender's solver state (estimates, cache paths, cache flags), not a setting the user chose.
+            // Blender's transient solver state (estimates, cache paths, and storage flags).
             continue;
         }
         if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
@@ -11633,6 +11719,7 @@ fn collect_physics_import_losses(
                         nested,
                         nested_block,
                         owner,
+                        baked_cache_system,
                         weight_brush_used,
                         paint_brush_used,
                         collections,
@@ -11645,6 +11732,7 @@ fn collect_physics_import_losses(
                             nested,
                             nested_block,
                             owner,
+                            baked_cache_system,
                             weight_brush_used,
                             paint_brush_used,
                             collections,
@@ -11659,13 +11747,17 @@ fn collect_physics_import_losses(
         if !crate::physics_support::is_semantic_when(system, key, block) {
             continue;
         }
-        let consumed = crate::physics_support::is_honoured_dynamic_paint_brush_property(
-            system,
-            key,
-            block,
-            weight_brush_used,
-            paint_brush_used,
-        );
+        let consumed = if system == "point_cache" && key == "is_baked" {
+            supported_baked_surface_cache
+        } else {
+            crate::physics_support::is_honoured_dynamic_paint_brush_property(
+                system,
+                key,
+                block,
+                weight_brush_used,
+                paint_brush_used,
+            )
+        };
         if let Some(bridge_id) = collection_pointer_bridge_id(value) {
             // A consumed pointer to an imported collection is mapped on import; every other pointer is cleared there.
             if !(consumed && collections.contains(bridge_id)) {
@@ -11708,8 +11800,8 @@ fn collect_physics_import_losses(
 }
 
 /// Potter physics settings that the bridge writes only as Blender RNA properties. A key that Blender does not have is dropped
-/// on export, so each set one is reported; null, an empty string, and an empty collection are unset. `role` and `is_baked` are
-/// bridge markers. Each dynamic-paint surface is a block of its own, checked against the surface properties.
+/// on export, so each set one is reported; null, an empty string, and an empty collection are unset.
+/// `role` and `_potter_cache_locator` are bridge markers; `is_baked` is recreated with Blender's bake operator.
 fn potter_physics_export_losses(node: &Node) -> Vec<Loss> {
     let mut losses = Vec::new();
     for modifier in &node.modifiers {
@@ -11770,6 +11862,19 @@ fn collect_potter_physics_export_losses(
     owner: &Id,
     losses: &mut Vec<Loss>,
 ) {
+    let preserves_source_cache = settings
+        .get("_potter_cache_locator")
+        .and_then(|locator| locator.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "cloth" | "soft_body"));
+    if system == "point_cache" && settings["is_baked"] == true && preserves_source_cache {
+        losses.push(loss(
+            "blender.physics.point_cache.is_baked",
+            Some(owner.as_str()),
+            "the source .bphys frames are not materialized in Blender's cache sidecar; the exported cache remains unbaked",
+        ));
+    }
+
     for (key, value) in settings {
         let unset = match value {
             Value::Null => true,
@@ -11778,10 +11883,7 @@ fn collect_potter_physics_export_losses(
             Value::Object(entries) => entries.is_empty(),
             _ => false,
         };
-        if matches!(key.as_str(), "role" | "is_baked")
-            || unset
-            || crate::physics_support::is_runtime_state(system, key)
-        {
+        if key == "role" || unset || crate::physics_support::is_runtime_state(system, key) {
             continue;
         }
         if let Some(nested) = crate::physics_support::nested_physics_system(system, key) {
