@@ -6,6 +6,7 @@ import sys
 
 ROOT = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
 BLEND_PATH = os.path.join(ROOT, "source.blend")
+MEMORY_ONLY_BLEND_PATH = os.path.join(ROOT, "memory_only.blend")
 ORACLE_PATH = os.path.join(ROOT, "oracle.json")
 FRAME_START = 1
 FRAME_END = 9
@@ -190,3 +191,16 @@ for obj in objects:
 with open(ORACLE_PATH, "w", encoding="utf-8") as output:
     json.dump({"objects": {name: {"rest_positions": rest[name], "samples": samples[name]}
                            for name in samples}}, output, separators=(",", ":"))
+
+for obj in (cloth_obj, soft_obj):
+    bpy.data.objects.remove(obj, do_unlink=True)
+scene.animation_data_clear()
+bpy.data.orphans_purge(do_recursive=True)
+bpy.ops.wm.save_as_mainfile(filepath=MEMORY_ONLY_BLEND_PATH)
+bpy.ops.wm.open_mainfile(filepath=MEMORY_ONLY_BLEND_PATH)
+scene = bpy.context.scene
+if len(scene.objects) != 1 or scene.objects[0].name != "MemoryClothBaked":
+    raise RuntimeError("memory-only .blend must contain only the baked cloth")
+memory_cloth = bpy.data.objects["MemoryClothBaked"].modifiers["BakedMemoryCloth"]
+if not memory_cloth.point_cache.is_baked or memory_cloth.point_cache.use_disk_cache:
+    raise RuntimeError("memory-only .blend did not retain the memory-baked cloth cache")

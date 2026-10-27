@@ -145,12 +145,11 @@ pub fn export_blend(
     check_blender_version(&blender)?;
     let mut losses = export_losses(doc);
     losses.extend(native_bind_export_losses(doc, project));
-    // Accepted is_baked loss is per document. A supported disk cache kept through another cache's
-    // accepted loss still needs its source-frame export loss.
+    // Accepted physics import losses are re-reported from the original Blender settings and must
+    // remain accepted. Export-only point-cache losses use a distinct feature ID.
     losses.retain(|loss| {
         !(loss.feature_id.starts_with("blender.physics.")
-            && doc.accepted_losses.contains(&loss.feature_id)
-            && loss.feature_id != "blender.physics.point_cache.is_baked")
+            && doc.accepted_losses.contains(&loss.feature_id))
     });
     let (texture_losses, texture_edits) =
         crate::exchange::material_graph::plan_blend_textures(doc)?;
@@ -11869,7 +11868,7 @@ fn collect_potter_physics_export_losses(
         .is_some_and(|kind| matches!(kind, "cloth" | "soft_body"));
     if system == "point_cache" && settings["is_baked"] == true && preserves_source_cache {
         losses.push(loss(
-            "blender.physics.point_cache.is_baked",
+            "blender.physics.point_cache.source_frames",
             Some(owner.as_str()),
             "the source .bphys frames are not materialized in Blender's cache sidecar; the exported cache remains unbaked",
         ));

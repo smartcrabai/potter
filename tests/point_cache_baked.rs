@@ -123,6 +123,129 @@ fn copy_directory(source: &Path, destination: &Path) -> TestResult<()> {
     Ok(())
 }
 
+fn assert_memory_only_cache_export(blender: &Path, root: &Path) -> TestResult<()> {
+    let project = root.join("memory-only-project");
+    let mut initialize = Command::new(env!("CARGO_BIN_EXE_pot"));
+    initialize.args(["init"]).arg(&project).arg("--json");
+    checked_output(initialize, "pot init memory-only project")?;
+
+    let mut import = Command::new(env!("CARGO_BIN_EXE_pot"));
+    import
+        .args(["import"])
+        .arg(&project)
+        .args(["--file"])
+        .arg(root.join("memory_only.blend"))
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(blender)
+        .args(["--allow-lossy", "--json"]);
+    let imported = checked_json(import, "pot import memory-only baked cloth")?;
+    let losses = imported["result"]["losses"]
+        .as_array()
+        .ok_or("memory-only import losses are missing")?;
+    let baked_cache_losses: Vec<_> = losses
+        .iter()
+        .filter(|loss| loss["feature_id"] == "blender.physics.point_cache.is_baked")
+        .collect();
+    assert_eq!(
+        baked_cache_losses.len(),
+        1,
+        "memory-only import must report its accepted baked-cache loss: {losses:?}"
+    );
+    assert_eq!(baked_cache_losses[0]["data_id"], "BakedMemoryCloth");
+    let imported_mappings = imported["result"]["id_mappings"]
+        .as_object()
+        .ok_or("memory-only import ID mappings are missing")?;
+    let memory_id = imported_mappings
+        .get("Object:MemoryClothBaked")
+        .and_then(Value::as_str)
+        .ok_or("memory-only object mapping is missing")?;
+    let imported_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let imported_cache =
+        &imported_scene["nodes"][memory_id]["properties"]["physics_cloth"]["point_cache"];
+    assert_eq!(imported_cache["is_baked"], true);
+    assert!(
+        imported_cache.get("_potter_cache_locator").is_none(),
+        "memory-only cache must not retain a disk-cache locator"
+    );
+
+    let exported_blend = root.join("memory-only-export.blend");
+    let mut export = Command::new(env!("CARGO_BIN_EXE_pot"));
+    export
+        .args(["export"])
+        .arg(&project)
+        .args(["--format", "blend", "--out"])
+        .arg(&exported_blend)
+        .args(["--blender"])
+        .arg(blender)
+        .arg("--json");
+    let export_result = checked_json(export, "strict pot export memory-only baked cloth")?;
+    let export_losses = export_result["result"]["losses"]
+        .as_array()
+        .ok_or("memory-only export losses are missing")?;
+    assert!(
+        !export_losses
+            .iter()
+            .any(|loss| loss["feature_id"] == "blender.physics.point_cache.is_baked"),
+        "accepted memory-cache import loss must not be reported again: {export_losses:?}"
+    );
+
+    let reimport_project = root.join("memory-only-export-reimport");
+    let mut initialize_reimport = Command::new(env!("CARGO_BIN_EXE_pot"));
+    initialize_reimport
+        .args(["init"])
+        .arg(&reimport_project)
+        .arg("--json");
+    checked_output(initialize_reimport, "pot init memory-only export reimport")?;
+
+    let mut reimport = Command::new(env!("CARGO_BIN_EXE_pot"));
+    reimport
+        .args(["import"])
+        .arg(&reimport_project)
+        .args(["--file"])
+        .arg(&exported_blend)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--allow-lossy",
+            "--blender",
+        ])
+        .arg(blender)
+        .arg("--json");
+    let reimported = checked_json(reimport, "pot import memory-only Blender export")?;
+    let reimport_mappings = reimported["result"]["id_mappings"]
+        .as_object()
+        .ok_or("memory-only reimport ID mappings are missing")?;
+    let reimport_memory_id = reimport_mappings
+        .get("Object:MemoryClothBaked")
+        .and_then(Value::as_str)
+        .ok_or("reimported memory-only object mapping is missing")?;
+    let reimport_scene: Value =
+        serde_json::from_slice(&fs::read(reimport_project.join("scene.json"))?)?;
+    let reimport_cache =
+        &reimport_scene["nodes"][reimport_memory_id]["properties"]["physics_cloth"]["point_cache"];
+    assert_eq!(
+        reimport_cache["is_baked"], true,
+        "Blender-backed export readback must retain its native memory bake"
+    );
+    assert!(
+        reimport_cache.get("_potter_cache_locator").is_none(),
+        "memory-only export must not invent disk frame resources"
+    );
+    Ok(())
+}
+
 fn assert_positions_close(expected: &[[f64; 3]], actual: &[[f64; 3]], context: &str) {
     assert_eq!(
         actual.len(),
@@ -149,6 +272,7 @@ fn mixed_disk_and_memory_baked_caches_match_blender_playback() -> TestResult<()>
     let directory = tempdir()?;
     let root = directory.path();
     generate_fixture(&blender, root)?;
+    assert_memory_only_cache_export(&blender, root)?;
     let oracle: Value = serde_json::from_slice(&fs::read(root.join("oracle.json"))?)?;
     let objects = oracle["objects"]
         .as_object()
@@ -193,6 +317,48 @@ fn mixed_disk_and_memory_baked_caches_match_blender_playback() -> TestResult<()>
         baked_cache_losses[0]["data_id"], "BakedMemoryCloth",
         "the baked-cache loss must belong to the memory-baked cloth: {baked_cache_losses:?}"
     );
+
+    let mappings = imported["result"]["id_mappings"]
+        .as_object()
+        .ok_or("import ID mappings are missing")?;
+    let imported_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let mut disk_modifier_ids = Vec::with_capacity(2);
+    for (object_name, modifier_name) in [
+        ("ClothBaked", "BakedCloth"),
+        ("SoftBodyBaked", "BakedSoftBody"),
+    ] {
+        let node_id = mappings
+            .get(&format!("Object:{object_name}"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("imported object mapping for {object_name} is missing"))?;
+        let modifier = imported_scene["nodes"][node_id]["modifiers"]
+            .as_array()
+            .ok_or_else(|| format!("{object_name}: Potter modifiers are missing"))?
+            .iter()
+            .find(|modifier| modifier["name"] == modifier_name)
+            .ok_or_else(|| format!("{object_name}: Potter modifier {modifier_name} is missing"))?;
+        disk_modifier_ids.push(
+            modifier["id"]
+                .as_str()
+                .ok_or_else(|| format!("{object_name}: Potter modifier ID is missing"))?
+                .to_owned(),
+        );
+    }
+    assert_ne!(
+        disk_modifier_ids[0], disk_modifier_ids[1],
+        "disk-backed cache modifiers must have distinct Potter IDs"
+    );
+    let memory_id = mappings
+        .get("Object:MemoryClothBaked")
+        .and_then(Value::as_str)
+        .ok_or("memory-baked object mapping is missing")?;
+    let memory_modifier_id = imported_scene["nodes"][memory_id]["modifiers"]
+        .as_array()
+        .ok_or("memory-baked Potter modifiers are missing")?
+        .iter()
+        .find(|modifier| modifier["name"] == "BakedMemoryCloth")
+        .and_then(|modifier| modifier["id"].as_str())
+        .ok_or("memory-baked Potter modifier ID is missing")?;
     let exported_blend = root.join("exported-point-caches.blend");
     let mut export = Command::new(env!("CARGO_BIN_EXE_pot"));
     export
@@ -207,11 +373,34 @@ fn mixed_disk_and_memory_baked_caches_match_blender_playback() -> TestResult<()>
     let export_losses = export_result["result"]["losses"]
         .as_array()
         .ok_or("export losses are missing")?;
+    let source_frame_losses: Vec<_> = export_losses
+        .iter()
+        .filter(|loss| loss["feature_id"] == "blender.physics.point_cache.source_frames")
+        .collect();
+    assert_eq!(
+        source_frame_losses.len(),
+        disk_modifier_ids.len(),
+        "each supported disk cache must report one source-frame export loss: {export_losses:?}"
+    );
+    for modifier_id in &disk_modifier_ids {
+        assert!(
+            source_frame_losses
+                .iter()
+                .any(|loss| loss["data_id"].as_str() == Some(modifier_id.as_str())),
+            "source-frame export loss for Potter modifier {modifier_id} is missing: {source_frame_losses:?}"
+        );
+    }
     assert!(
-        export_losses
+        !source_frame_losses
+            .iter()
+            .any(|loss| loss["data_id"].as_str() == Some(memory_modifier_id)),
+        "accepted memory-cache import loss must not count as a source-frame export loss: {source_frame_losses:?}"
+    );
+    assert!(
+        !export_losses
             .iter()
             .any(|loss| loss["feature_id"] == "blender.physics.point_cache.is_baked"),
-        "lossy .blend export must report the baked-cache loss: {export_losses:?}"
+        "accepted memory-cache import loss must not be reported again: {export_losses:?}"
     );
 
     let reimport_project = root.join("exported-blend-reimport");
@@ -260,10 +449,6 @@ fn mixed_disk_and_memory_baked_caches_match_blender_playback() -> TestResult<()>
         );
     }
 
-    let mappings = imported["result"]["id_mappings"]
-        .as_object()
-        .ok_or("import ID mappings are missing")?;
-    let imported_scene: Value = serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
     for (name, property) in [
         ("ClothBaked", "physics_cloth"),
         ("SoftBodyBaked", "physics_soft_body"),
@@ -284,10 +469,6 @@ fn mixed_disk_and_memory_baked_caches_match_blender_playback() -> TestResult<()>
             "{name}: supported cache must retain project frame resources"
         );
     }
-    let memory_id = mappings
-        .get("Object:MemoryClothBaked")
-        .and_then(Value::as_str)
-        .ok_or("memory-baked object mapping is missing")?;
     let memory_cache =
         &imported_scene["nodes"][memory_id]["properties"]["physics_cloth"]["point_cache"];
     assert_eq!(memory_cache["is_baked"], true);

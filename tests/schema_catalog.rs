@@ -1042,6 +1042,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
     }
     for feature_id in [
         "physics.dynamic_paint_surface.topology",
+        "physics.point_cache.source_frames",
         "constraint.geometry_attribute.instances.collection_instances",
         "constraint.geometry_attribute.instances.attribute_conversion",
         "constraint.geometry_attribute.instances.picked_instance",

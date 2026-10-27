@@ -2132,10 +2132,17 @@ pub fn feature_catalog() -> Value {
                 [false, false, true, true, true, true, false],
             );
             feature["reason"] = json!(
-                "Exact playback and Blender import cover disk-backed Blender 5.2.2 cloth and soft-body caches with positive frame ranges, stable vertex counts, and supported uncompressed or Zstandard BPHYSICS blocks; Blender export reports that source .bphys frames are omitted and leaves caches unbaked. Memory-only, particle, Dynamic Paint, linked-object, and unsupported cache encodings remain refused."
+                "Exact playback and Blender import cover disk-backed Blender 5.2.2 cloth and soft-body caches with positive frame ranges, stable vertex counts, and supported uncompressed or Zstandard BPHYSICS blocks; see physics.point_cache.source_frames for the export limitation. Memory-only, particle, Dynamic Paint, linked-object, and unsupported cache encodings remain refused."
             );
             feature
         },
+        unsupported(
+            "physics.point_cache.source_frames",
+            "Baked point-cache source-frame export",
+            "PointCache",
+            &[],
+            "Potter's .blend exporter does not materialize imported .bphys frames into Blender's cache sidecar; it reports blender.physics.point_cache.source_frames and leaves the exported cache unbaked.",
+        ),
         unsupported(
             "physics.fluid.solver_parity",
             "Blender Mantaflow fluid solver numerical parity",
