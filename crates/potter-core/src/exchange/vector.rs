@@ -170,7 +170,7 @@ pub(super) fn for_each_projected_stroke(
         let Some(node) = doc.nodes.get(node_id) else {
             continue;
         };
-        if !node.visible || !node.render_visible || !visible_nodes.contains(node_id) {
+        if !snapshot.node_is_visible(node_id, node) || !visible_nodes.contains(node_id) {
             continue;
         }
         for stroke in node_strokes {

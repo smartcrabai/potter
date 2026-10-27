@@ -6,14 +6,14 @@
 use std::collections::BTreeMap;
 
 use glam::{DQuat, EulerRot};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
     model::{
-        Action, Extrapolation, FCurve, Id, Interpolation, ModifierParameterBinding, NlaBlendType,
-        NlaExtrapolation, NlaStrip, Node, PoseBone, PoseRotationMode, SceneDoc, Transform,
-        normalize_rotation,
+        Action, Extrapolation, FCurve, Id, Interpolation, LightType, ModifierParameterBinding,
+        NlaBlendType, NlaExtrapolation, NlaStrip, Node, PoseBone, PoseRotationMode, SceneDoc,
+        Transform, normalize_rotation,
     },
 };
 
@@ -96,14 +96,52 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
     Ok(transform)
 }
 
+fn custom_property_component<'a>(node: &'a Node, path: &str, index: u32) -> Option<&'a Value> {
+    let key = custom_property_name(path)?;
+    let property = node
+        .properties
+        .get("_blender_custom_properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(&key))
+        .or_else(|| node.properties.get(&key))?;
+    match property {
+        Value::Array(values) => usize::try_from(index)
+            .ok()
+            .and_then(|index| values.get(index)),
+        _ if index == 0 => Some(property),
+        _ => None,
+    }
+}
+
+fn animation_channel_is_boolean(node: &Node, path: &str, index: u32) -> bool {
+    matches!(path, "hide_render" | "hide_viewport")
+        || custom_property_component(node, path, index).is_some_and(Value::is_boolean)
+}
+
+fn animation_channel_has_integer_values(node: &Node, path: &str, index: u32) -> bool {
+    matches!(path, "hide_render" | "hide_viewport")
+        || custom_property_component(node, path, index).is_some_and(|value| {
+            value.is_boolean() || value.as_i64().is_some() || value.as_u64().is_some()
+        })
+}
+
+/// Blender's `FCURVE_INT_VALUES` rounds Boolean/integer samples before RNA writes.
+pub(crate) fn round_discrete_fcurve_value(value: f64) -> f64 {
+    f64::from(((value as f32) + 0.5).floor())
+}
+
 /// Evaluate a scalar non-transform Action channel through NLA and the active Action.
 ///
+/// Each F-Curve sample is rounded for Boolean/integer channels (`FCURVE_INT_VALUES`), but the NLA
+/// blend stays in float: `base_value` is the RNA default that Replace/Add/Combine strips start
+/// from (`nla_blend_value`). The caller performs the final Boolean/integer RNA write.
 /// The F-Curve sampler is shared with transform channels, so interpolation, extrapolation, and
 /// modifier handling stay identical.
 pub(crate) fn animated_scalar_channel(
     node: &Node,
     doc: &SceneDoc,
     path: &str,
+    index: u32,
     base_value: f64,
     frame: f64,
 ) -> Result<Option<f64>> {
@@ -113,13 +151,15 @@ pub(crate) fn animated_scalar_channel(
             "animation frame and base channel value must be finite",
         ));
     }
-    if !supports_animation_output_for_node(path, 0, AnimationOutputKind::Action, node, doc) {
+    if !supports_animation_output(path, index, AnimationOutputKind::Action) {
         return Err(PotError::with_details(
             ErrorCode::UnsupportedFeature,
             format!("animation scalar path `{path}` is not supported by this node"),
             json!({ "feature_id":format!("animation.fcurve_non_transform_channels.{path}") }),
         ));
     }
+    let discrete = animation_channel_is_boolean(node, path, index);
+    let integer_values = animation_channel_has_integer_values(node, path, index);
     let has_solo = node
         .nla_tracks
         .iter()
@@ -142,7 +182,14 @@ pub(crate) fn animated_scalar_channel(
                     json!({"action":strip.action,"strip":strip.id}),
                 )
             })?;
-            if let Some(sampled) = sample_scalar_action(action, path, action_frame)? {
+            if let Some(sampled) =
+                sample_scalar_action(action, path, index, action_frame, discrete)?
+            {
+                let sampled = if integer_values {
+                    round_discrete_fcurve_value(sampled)
+                } else {
+                    sampled
+                };
                 value = blend_scalar(
                     value,
                     sampled,
@@ -162,7 +209,12 @@ pub(crate) fn animated_scalar_channel(
                 json!({"action":action_id}),
             )
         })?;
-        if let Some(sampled) = sample_scalar_action(action, path, frame)? {
+        if let Some(sampled) = sample_scalar_action(action, path, index, frame, discrete)? {
+            let sampled = if integer_values {
+                round_discrete_fcurve_value(sampled)
+            } else {
+                sampled
+            };
             value = sampled;
             animated = true;
         }
@@ -177,17 +229,28 @@ pub(crate) fn animated_scalar_channel(
     Ok(animated.then_some(value))
 }
 
-fn sample_scalar_action(action: &Action, path: &str, frame: f64) -> Result<Option<f64>> {
+fn sample_scalar_action(
+    action: &Action,
+    path: &str,
+    index: u32,
+    frame: f64,
+    discrete: bool,
+) -> Result<Option<f64>> {
     let mut sampled = None;
     for (curve_index, curve) in action.fcurves.iter().enumerate() {
         if u32::try_from(curve_index)
             .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
             || curve.path != path
+            || curve.index != index
         {
             continue;
         }
-        component_index(curve, 1)?;
-        if let Some(value) = sample_curve(curve, frame)? {
+        let value = if discrete {
+            sample_curve_discrete(curve, frame)?
+        } else {
+            sample_curve(curve, frame)?
+        };
+        if let Some(value) = value {
             sampled = Some(value);
         }
     }
@@ -310,16 +373,13 @@ fn sample_action_transform(
                         json!({ "feature_id": feature_id, "action": action_id }),
                     ));
                 }
-                if let Some(component_count) = non_transform_component_count(path, node, doc) {
-                    component_index(curve, component_count)?;
-                } else {
-                    let feature_id = format!("animation.fcurve_non_transform_channels.{path}");
-                    return Err(PotError::with_details(
-                        ErrorCode::UnsupportedFeature,
-                        format!("animation curve path `{path}` does not belong to this node"),
-                        json!({ "feature_id": feature_id, "action": action_id }),
-                    ));
-                }
+                let Some(component_count) =
+                    non_transform_component_count(path, curve.index, node, doc)
+                else {
+                    // Blender ignores supported F-Curves whose RNA owner no longer matches.
+                    continue;
+                };
+                component_index(curve, component_count)?;
             }
         }
     }
@@ -387,13 +447,58 @@ pub(crate) fn supports_animation_output_for_node(
         .as_ref()
         .and_then(|data_id| doc.data_blocks.get(data_id));
     match path {
-        "camera.lens_mm" | "lens" | "data.lens" => {
+        "camera.lens_mm"
+        | "lens"
+        | "data.lens"
+        | "camera.sensor_width_mm"
+        | "camera.sensor_height_mm"
+        | "camera.ortho_scale"
+        | "camera.clip_start"
+        | "camera.clip_end"
+        | "camera.shift_x"
+        | "camera.shift_y"
+        | "camera.focus_distance"
+        | "camera.aperture_fstop" => {
             if data.and_then(|data| data.camera.as_ref()).is_none() {
                 return false;
             }
         }
         "light.energy" | "energy" | "data.energy" => {
             if data.and_then(|data| data.light.as_ref()).is_none() {
+                return false;
+            }
+        }
+        "light.spot_size"
+        | "light.spot_blend"
+        | "light.shadow_soft_size"
+        | "light.area_size"
+        | "light.area_size_y"
+        | "light.sun_angle"
+        | "light.color" => {
+            let Some(light) = data.and_then(|data| data.light.as_ref()) else {
+                return false;
+            };
+            if (matches!(path, "light.spot_size" | "light.spot_blend")
+                && light.light_type != LightType::Spot)
+                || (matches!(path, "light.area_size" | "light.area_size_y")
+                    && light.light_type != LightType::Area)
+                || (path == "light.sun_angle" && light.light_type != LightType::Sun)
+            {
+                return false;
+            }
+        }
+        "hide_render" | "hide_viewport" => {}
+        _ if custom_property_path(path) => {
+            let Some(key) = custom_property_name(path) else {
+                return false;
+            };
+            let property = node
+                .properties
+                .get("_blender_custom_properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get(&key))
+                .or_else(|| node.properties.get(&key));
+            if !property.is_some_and(|value| custom_property_value_supports_index(value, index)) {
                 return false;
             }
         }
@@ -429,24 +534,75 @@ pub(crate) fn supports_animation_output_for_node(
     }
     true
 }
+
+pub(crate) fn custom_property_path(path: &str) -> bool {
+    path.starts_with("[\"") && path.ends_with("\"]")
+}
+
+pub(crate) fn custom_property_name(path: &str) -> Option<String> {
+    serde_json::from_str(path.get(1..path.len().checked_sub(1)?)?).ok()
+}
+
+pub(crate) fn custom_property_value_supports_index(property: &Value, index: u32) -> bool {
+    let Ok(index) = usize::try_from(index) else {
+        return false;
+    };
+    match property {
+        Value::Bool(_) | Value::Number(_) => index == 0,
+        Value::Array(values) => {
+            let Some(first) = values.first() else {
+                return false;
+            };
+            let homogeneous_scalar = if first.is_boolean() {
+                values.iter().all(Value::is_boolean)
+            } else if first.is_number() {
+                values.iter().all(Value::is_number)
+            } else {
+                false
+            };
+            homogeneous_scalar && index < values.len()
+        }
+        _ => false,
+    }
+}
 /// Returns whether this node has an active camera-lens Action, NLA, or driver channel.
 pub(crate) fn node_has_camera_lens_animation(node: &Node, doc: &SceneDoc) -> bool {
-    let is_lens_channel = |path: &str, index: u32, kind| {
-        matches!(path, "camera.lens_mm" | "lens" | "data.lens")
-            && supports_animation_output_for_node("camera.lens_mm", index, kind, node, doc)
+    node_has_camera_channel_animation(node, doc, &["camera.lens_mm", "lens", "data.lens"])
+}
+
+/// Returns whether UV projection reads an animated camera parameter.
+pub(crate) fn node_has_camera_projection_animation(node: &Node, doc: &SceneDoc) -> bool {
+    node_has_camera_channel_animation(
+        node,
+        doc,
+        &[
+            "camera.sensor_width_mm",
+            "camera.sensor_height_mm",
+            "camera.ortho_scale",
+            "camera.clip_start",
+            "camera.clip_end",
+            "camera.shift_x",
+            "camera.shift_y",
+        ],
+    )
+}
+
+fn node_has_camera_channel_animation(node: &Node, doc: &SceneDoc, paths: &[&str]) -> bool {
+    let has_channel = |path: &str, index: u32, kind| {
+        paths.contains(&path) && supports_animation_output_for_node(path, index, kind, node, doc)
     };
-    let action_has_lens_channel = |action: &Action| {
+    let action_has_channel = |action: &Action| {
         action
             .fcurves
             .iter()
-            .any(|curve| is_lens_channel(&curve.path, curve.index, AnimationOutputKind::Action))
+            .any(|curve| has_channel(&curve.path, curve.index, AnimationOutputKind::Action))
     };
 
     if node
         .action
         .as_ref()
         .and_then(|action_id| doc.actions.get(action_id))
-        .is_some_and(action_has_lens_channel)
+        .is_some_and(action_has_channel)
     {
         return true;
     }
@@ -461,27 +617,52 @@ pub(crate) fn node_has_camera_lens_animation(node: &Node, doc: &SceneDoc) -> boo
         .filter(|track| !track.mute && (!has_solo || track.solo))
         .flat_map(|track| track.strips.iter())
         .filter_map(|strip| doc.actions.get(&strip.action))
-        .any(action_has_lens_channel)
+        .any(action_has_channel)
     {
         return true;
     }
 
     node.drivers
         .iter()
-        .any(|driver| is_lens_channel(&driver.path, driver.index, AnimationOutputKind::Driver))
+        .any(|driver| has_channel(&driver.path, driver.index, AnimationOutputKind::Driver))
 }
 
 fn action_output_component_count(path: &str) -> Option<usize> {
     match path {
-        "transform.translation" | "transform.scale" | "transform.rotation_euler" => Some(3),
+        "transform.translation"
+        | "transform.scale"
+        | "transform.rotation_euler"
+        | "light.color" => Some(3),
         "transform.rotation_quaternion"
         | "transform.rotation_axis_angle"
         | "transform.rotation" => Some(4),
         "camera.lens_mm"
+        | "lens"
+        | "data.lens"
         | "light.energy"
-        | "shape_keys.evaluation_time"
-        | "shape_key.evaluation_time"
-        | "key_blocks.eval_time" => Some(1),
+        | "energy"
+        | "data.energy"
+        | "camera.sensor_width_mm"
+        | "camera.sensor_height_mm"
+        | "camera.ortho_scale"
+        | "camera.clip_start"
+        | "camera.clip_end"
+        | "camera.shift_x"
+        | "camera.shift_y"
+        | "camera.focus_distance"
+        | "camera.aperture_fstop"
+        | "light.spot_size"
+        | "light.spot_blend"
+        | "light.shadow_soft_size"
+        | "light.area_size"
+        | "light.area_size_y"
+        | "light.sun_angle"
+        | "hide_render"
+        | "hide_viewport" => Some(1),
+        _ if custom_property_path(path) => Some(usize::MAX),
+        "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time" => {
+            Some(1)
+        }
         _ if pose_channel_suffix(path).is_some_and(|channel| {
             matches!(
                 channel,
@@ -520,16 +701,35 @@ fn driver_output_component_count(path: &str) -> Option<usize> {
         | "scale"
         | "transform.scale"
         | "rotation_euler"
-        | "transform.rotation_euler" => Some(3),
+        | "transform.rotation_euler"
+        | "light.color" => Some(3),
         "rotation"
         | "transform.rotation"
         | "rotation_quaternion"
         | "transform.rotation_quaternion" => Some(4),
         "camera.lens_mm"
+        | "camera.sensor_width_mm"
+        | "camera.sensor_height_mm"
+        | "camera.ortho_scale"
+        | "camera.clip_start"
+        | "camera.clip_end"
+        | "camera.shift_x"
+        | "camera.shift_y"
+        | "camera.focus_distance"
+        | "camera.aperture_fstop"
         | "light.energy"
-        | "shape_keys.evaluation_time"
-        | "shape_key.evaluation_time"
-        | "key_blocks.eval_time" => Some(1),
+        | "light.spot_size"
+        | "light.spot_blend"
+        | "light.shadow_soft_size"
+        | "light.area_size"
+        | "light.area_size_y"
+        | "light.sun_angle"
+        | "hide_render"
+        | "hide_viewport" => Some(1),
+        _ if custom_property_path(path) => Some(usize::MAX),
+        "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time" => {
+            Some(1)
+        }
         _ if pose_channel_suffix(path).is_some_and(|channel| {
             matches!(
                 channel,
@@ -1056,6 +1256,9 @@ fn strip_action_frame(strip: &NlaStrip, frame: f64) -> Result<Option<f64>> {
 }
 
 fn strip_influence(strip: &NlaStrip, frame: f64) -> Result<f64> {
+    if strip.use_animated_influence && strip.influence.is_finite() {
+        return Ok(strip.influence);
+    }
     let mut fade: f64 = 1.0;
     if strip.blend_in > 0.0 && frame < strip.frame_start + strip.blend_in {
         fade = fade.min((frame - strip.frame_start) / strip.blend_in);
@@ -1445,8 +1648,13 @@ fn blend_rotation(
         .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))
 }
 
-fn non_transform_component_count(path: &str, node: &Node, doc: &SceneDoc) -> Option<usize> {
-    if !supports_animation_output_for_node(path, 0, AnimationOutputKind::Action, node, doc) {
+fn non_transform_component_count(
+    path: &str,
+    index: u32,
+    node: &Node,
+    doc: &SceneDoc,
+) -> Option<usize> {
+    if !supports_animation_output_for_node(path, index, AnimationOutputKind::Action, node, doc) {
         return None;
     }
     animation_output_component_count(path, AnimationOutputKind::Action)
@@ -1466,6 +1674,18 @@ fn component_index(curve: &FCurve, count: usize) -> Result<usize> {
 
 /// Sample one scalar curve, applying its Blender F-Curve modifier stack.
 pub(crate) fn sample_curve(curve: &FCurve, frame: f64) -> Result<Option<f64>> {
+    sample_curve_with_discrete_values(curve, frame, false)
+}
+
+fn sample_curve_discrete(curve: &FCurve, frame: f64) -> Result<Option<f64>> {
+    sample_curve_with_discrete_values(curve, frame, true)
+}
+
+fn sample_curve_with_discrete_values(
+    curve: &FCurve,
+    frame: f64,
+    discrete: bool,
+) -> Result<Option<f64>> {
     if curve.keyframes.is_empty()
         && !curve.modifiers.iter().any(|modifier| {
             matches!(
@@ -1477,11 +1697,11 @@ pub(crate) fn sample_curve(curve: &FCurve, frame: f64) -> Result<Option<f64>> {
         return Ok(None);
     }
     if curve.modifiers.is_empty() {
-        return sample_curve_base(curve, frame);
+        return sample_curve_base(curve, frame, discrete);
     }
     let (evaltime, cycle_offsets) =
         crate::eval::fcurve_modifiers::evaluate_time(curve, frame as f32)?;
-    let value = sample_curve_base(curve, f64::from(evaltime))?.unwrap_or(0.0);
+    let value = sample_curve_base(curve, f64::from(evaltime), discrete)?.unwrap_or(0.0);
     let value = crate::eval::fcurve_modifiers::evaluate_value(
         curve,
         evaltime,
@@ -1491,7 +1711,7 @@ pub(crate) fn sample_curve(curve: &FCurve, frame: f64) -> Result<Option<f64>> {
     finite_sample(curve, f64::from(value))
 }
 
-fn sample_curve_base(curve: &FCurve, frame: f64) -> Result<Option<f64>> {
+fn sample_curve_base(curve: &FCurve, frame: f64, discrete: bool) -> Result<Option<f64>> {
     if curve.keyframes.is_empty() {
         return Ok(None);
     }
@@ -1514,6 +1734,12 @@ fn sample_curve_base(curve: &FCurve, frame: f64) -> Result<Option<f64>> {
             curve,
             "keyframes and Bezier handles must be finite, strictly frame-ordered, and numerically bounded",
         ));
+    }
+    if discrete {
+        let index = keys
+            .partition_point(|key| key.frame <= frame)
+            .saturating_sub(1);
+        return Ok(Some(keys[index].value));
     }
     let first = &keys[0];
     if frame < first.frame {
@@ -2172,6 +2398,7 @@ mod tests {
                     repeat: 1.0,
                     blend_type,
                     influence: 0.5,
+                    use_animated_influence: false,
                     extrapolation: NlaExtrapolation::Nothing,
                     blend_in: 0.0,
                     blend_out: 0.0,
@@ -2273,6 +2500,7 @@ mod tests {
                         repeat: 1.0,
                         blend_type,
                         influence: number("influence")?,
+                        use_animated_influence: false,
                         extrapolation: NlaExtrapolation::Nothing,
                         blend_in: 0.0,
                         blend_out: 0.0,
@@ -2436,6 +2664,7 @@ mod tests {
                 scale: 1.0,
                 repeat: 1.0,
                 blend_type: NlaBlendType::Replace,
+                use_animated_influence: false,
                 influence: 1.0,
                 extrapolation: NlaExtrapolation::Nothing,
                 blend_in: 0.0,

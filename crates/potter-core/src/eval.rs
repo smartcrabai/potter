@@ -283,14 +283,280 @@ pub struct EvaluatedNode {
     /// Light data after evaluating supported Action or driver channels.
     #[serde(skip)]
     pub(crate) evaluated_light: Option<LightData>,
+    /// Evaluated viewport visibility, which Blender does not apply to renders.
+    #[serde(skip)]
+    pub(crate) evaluated_visible: Option<bool>,
+    /// Evaluated render visibility.
+    #[serde(skip)]
+    pub(crate) evaluated_render_visible: Option<bool>,
+    /// Evaluated object custom-property values.
+    #[serde(skip)]
+    pub(crate) evaluated_custom_properties: BTreeMap<String, Value>,
 }
 
-/// Blender's `Camera.lens` RNA property clamps sampled and driven values to 1 mm.
+/// Blender's `Camera.lens` RNA property clamps sampled and driven values to [1 mm, `FLT_MAX`].
 pub(crate) fn clamp_camera_lens(lens_mm: f64) -> f64 {
-    if lens_mm < 1.0 { 1.0 } else { lens_mm }
+    clamp_rna_float(lens_mm, 1.0, f32::MAX)
 }
 
-fn evaluated_data_blocks(
+struct AnimationChannelContext<'a> {
+    node_id: &'a Id,
+    node: &'a Node,
+    doc: &'a SceneDoc,
+    frame: f64,
+    driver_values: &'a BTreeMap<(Id, String, u32), f64>,
+}
+
+impl AnimationChannelContext<'_> {
+    fn value(&self, path: &str, index: u32, base: f64) -> Result<Option<f64>> {
+        let action_value =
+            animation::animated_scalar_channel(self.node, self.doc, path, index, base, self.frame)?;
+        let driver_value =
+            self.driver_values
+                .iter()
+                .find_map(|((target, driver_path, component), value)| {
+                    (target == self.node_id && driver_path == path && *component == index)
+                        .then_some(*value)
+                });
+        Ok(driver_value.or(action_value))
+    }
+}
+
+fn clamp_rna_float(value: f64, min: f32, max: f32) -> f64 {
+    f64::from((value as f32).clamp(min, max))
+}
+
+fn custom_property_ui<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
+    node.properties
+        .get("_blender_custom_property_ui")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(key))
+}
+
+fn invalid_custom_property_ui_range(key: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::SceneInvalid,
+        "custom property RNA hard range is invalid",
+        json!({"property":key}),
+    )
+}
+
+fn custom_property_float_bounds(node: &Node, key: &str) -> Result<(f32, f32)> {
+    let settings = custom_property_ui(node, key);
+    let min = match settings.and_then(|settings| settings.get("min")) {
+        Some(value) => value
+            .as_f64()
+            .map(|value| value as f32)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| invalid_custom_property_ui_range(key))?,
+        None => f32::MIN,
+    };
+    let max = match settings.and_then(|settings| settings.get("max")) {
+        Some(value) => value
+            .as_f64()
+            .map(|value| value as f32)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| invalid_custom_property_ui_range(key))?,
+        None => f32::MAX,
+    };
+    if min > max {
+        return Err(invalid_custom_property_ui_range(key));
+    }
+    Ok((min, max))
+}
+
+fn custom_property_integer_bounds(node: &Node, key: &str) -> Result<(i32, i32)> {
+    let settings = custom_property_ui(node, key);
+    let min = match settings.and_then(|settings| settings.get("min")) {
+        Some(value) => i32::try_from(
+            value
+                .as_i64()
+                .ok_or_else(|| invalid_custom_property_ui_range(key))?,
+        )
+        .map_err(|_| invalid_custom_property_ui_range(key))?,
+        None => i32::MIN,
+    };
+    let max = match settings.and_then(|settings| settings.get("max")) {
+        Some(value) => i32::try_from(
+            value
+                .as_i64()
+                .ok_or_else(|| invalid_custom_property_ui_range(key))?,
+        )
+        .map_err(|_| invalid_custom_property_ui_range(key))?,
+        None => i32::MAX,
+    };
+    if min > max {
+        return Err(invalid_custom_property_ui_range(key));
+    }
+    Ok((min, max))
+}
+
+/// Blender's `ANIMSYS_FLOAT_AS_BOOL`: the blended float is thresholded, never rounded again.
+fn blender_bool(value: f64) -> bool {
+    (value as f32) > 1.0_f32 - f32::EPSILON
+}
+
+fn blender_bool_value(value: bool) -> f64 {
+    if value { 1.0 } else { 0.0 }
+}
+
+/// Blender's integer RNA write: `int(value)` truncates toward zero, then the hard range clamps.
+fn blender_int(value: f64, min: i32, max: i32) -> i32 {
+    ((value as f32) as i32).clamp(min, max)
+}
+
+fn invalid_custom_property_ui_default(key: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::SceneInvalid,
+        "custom property RNA default is invalid",
+        json!({"property":key}),
+    )
+}
+
+fn custom_property_stored<'a>(node: &'a Node, key: &str) -> Option<&'a Value> {
+    node.properties
+        .get("_blender_custom_properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(key))
+        .or_else(|| node.properties.get(key))
+}
+
+/// Selects one component of a custom property: arrays by index, scalars only at index zero.
+fn custom_property_component(property: &Value, index: u32) -> Option<&Value> {
+    match property {
+        Value::Array(values) => usize::try_from(index)
+            .ok()
+            .and_then(|index| values.get(index)),
+        _ if index == 0 => Some(property),
+        _ => None,
+    }
+}
+
+/// The RNA default that Blender's NLA and Combine blends start from for one custom-property
+/// component: its UI `default` when the importer kept one, otherwise zero (`False` for Booleans).
+fn custom_property_default(node: &Node, key: &str, index: u32) -> Result<f64> {
+    let Some(default) = custom_property_ui(node, key).and_then(|settings| settings.get("default"))
+    else {
+        return Ok(0.0);
+    };
+    custom_property_component(default, index)
+        .or_else(|| (default.is_number() || default.is_boolean()).then_some(default))
+        .and_then(|component| {
+            component
+                .as_f64()
+                .or_else(|| component.as_bool().map(blender_bool_value))
+        })
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| invalid_custom_property_ui_default(key))
+}
+
+/// Converts an evaluated custom-property component to the value Blender's RNA write stores.
+fn evaluated_custom_property_value(
+    node: &Node,
+    key: &str,
+    component: &Value,
+    value: f64,
+) -> Result<Value> {
+    if component.is_boolean() {
+        Ok(Value::Bool(blender_bool(value)))
+    } else if component.as_i64().is_some() || component.as_u64().is_some() {
+        let (min, max) = custom_property_integer_bounds(node, key)?;
+        Ok(Value::from(blender_int(value, min, max)))
+    } else {
+        let (min, max) = custom_property_float_bounds(node, key)?;
+        Ok(Value::from(clamp_rna_float(value, min, max)))
+    }
+}
+
+/// An Object custom-property channel named by a `SINGLE_PROP` variable.
+pub(crate) struct CustomPropertyReference {
+    /// Blender's F-Curve and driver data path, `["key"]`.
+    pub(crate) path: String,
+    pub(crate) key: String,
+    pub(crate) index: u32,
+}
+
+/// Resolves a `SINGLE_PROP` path to an Object custom property, including explicit paths whose
+/// property no longer exists so Blender-invalid drivers can be skipped. Blender's `["key"]` and
+/// `["key"][n]` spellings and Potter's `properties.key` / `key` spellings name the same channel.
+pub(crate) fn custom_property_reference(
+    node: &Node,
+    path: &str,
+    index: u32,
+) -> Option<CustomPropertyReference> {
+    let (key, component, explicit) = if animation::custom_property_path(path) {
+        (animation::custom_property_name(path)?, index, true)
+    } else if let Some((name, element)) = path
+        .strip_suffix(']')
+        .and_then(|body| body.rsplit_once("]["))
+        && let Ok(element) = element.parse::<u32>()
+    {
+        (
+            animation::custom_property_name(&format!("{name}]"))?,
+            element,
+            true,
+        )
+    } else {
+        let explicit = path.starts_with("properties.");
+        let name = path.strip_prefix("properties.").unwrap_or(path);
+        if name.is_empty() || name.contains(['.', '[', ']', '"']) {
+            return None;
+        }
+        (name.to_owned(), index, explicit)
+    };
+    if !explicit {
+        custom_property_stored(node, &key)?;
+    }
+    let quoted = serde_json::to_string(&key).ok()?;
+    Some(CustomPropertyReference {
+        path: format!("[{quoted}]"),
+        key,
+        index: component,
+    })
+}
+
+/// Evaluates the custom-property component a `SINGLE_PROP` variable reads at `frame`.
+///
+/// Action and NLA samples start from the RNA default, and a driver output overrides them. An
+/// overridden value takes the same Boolean, integer, and hard-range conversion as the RNA write; an
+/// unoverridden component reads its stored value. Returns `None` for a missing or non-numeric one.
+pub(crate) fn evaluated_custom_property_component(
+    node: &Node,
+    doc: &SceneDoc,
+    frame: f64,
+    reference: &CustomPropertyReference,
+    driven: Option<f64>,
+) -> Result<Option<f64>> {
+    let Some(property) = custom_property_stored(node, &reference.key) else {
+        return Ok(None);
+    };
+    let Some(component) = custom_property_component(property, reference.index) else {
+        return Ok(None);
+    };
+    if !(component.is_number() || component.is_boolean()) {
+        return Ok(None);
+    }
+    let base = custom_property_default(node, &reference.key, reference.index)?;
+    let action_value = animation::animated_scalar_channel(
+        node,
+        doc,
+        &reference.path,
+        reference.index,
+        base,
+        frame,
+    )?;
+    let Some(value) = driven.or(action_value) else {
+        return Ok(component
+            .as_f64()
+            .or_else(|| component.as_bool().map(blender_bool_value)));
+    };
+    let evaluated = evaluated_custom_property_value(node, &reference.key, component, value)?;
+    Ok(evaluated
+        .as_f64()
+        .or_else(|| evaluated.as_bool().map(blender_bool_value)))
+}
+
+pub(crate) fn evaluated_data_blocks(
     node_id: &Id,
     node: &Node,
     doc: &SceneDoc,
@@ -304,35 +570,220 @@ fn evaluated_data_blocks(
     else {
         return Ok((None, None));
     };
-    let evaluate_channel = |path: &str, base: f64| {
-        let action_value = animation::animated_scalar_channel(node, doc, path, base, frame)?;
-        let driver_value =
-            driver_values
+    let channels = AnimationChannelContext {
+        node_id,
+        node,
+        doc,
+        frame,
+        driver_values,
+    };
+    let mut camera = data.camera.clone();
+    let mut camera_animated = false;
+    if let Some(camera) = camera.as_mut() {
+        for (path, value) in [
+            ("camera.lens_mm", &mut camera.lens_mm),
+            ("camera.sensor_width_mm", &mut camera.sensor_width_mm),
+            ("camera.sensor_height_mm", &mut camera.sensor_height_mm),
+            ("camera.ortho_scale", &mut camera.ortho_scale),
+            ("camera.clip_start", &mut camera.clip_start),
+            ("camera.clip_end", &mut camera.clip_end),
+            ("camera.focus_distance", &mut camera.focus_distance),
+            ("camera.aperture_fstop", &mut camera.f_stop),
+        ] {
+            if let Some(animated) = channels.value(path, 0, *value)? {
+                *value = match path {
+                    "camera.lens_mm" => clamp_camera_lens(animated),
+                    "camera.sensor_width_mm" | "camera.sensor_height_mm" => {
+                        clamp_rna_float(animated, 1.0, f32::MAX)
+                    }
+                    "camera.ortho_scale" => clamp_rna_float(animated, 0.0, f32::MAX),
+                    "camera.clip_start" | "camera.clip_end" => {
+                        clamp_rna_float(animated, 1.0e-6, f32::MAX)
+                    }
+                    "camera.focus_distance" | "camera.aperture_fstop" => {
+                        clamp_rna_float(animated, 0.0, f32::MAX)
+                    }
+                    "camera.shift_x" | "camera.shift_y" => {
+                        clamp_rna_float(animated, f32::MIN, f32::MAX)
+                    }
+                    _ => animated,
+                };
+                camera_animated = true;
+            }
+        }
+        if let Some(animated) = channels.value("camera.shift_x", 0, camera.shift[0])? {
+            camera.shift[0] = clamp_rna_float(animated, f32::MIN, f32::MAX);
+            camera_animated = true;
+        }
+        if let Some(animated) = channels.value("camera.shift_y", 0, camera.shift[1])? {
+            camera.shift[1] = clamp_rna_float(animated, f32::MIN, f32::MAX);
+            camera_animated = true;
+        }
+    }
+    let mut light = data.light.clone();
+    let mut light_animated = false;
+    if let Some(light) = light.as_mut() {
+        for (path, value) in [
+            ("light.energy", &mut light.energy),
+            ("light.shadow_soft_size", &mut light.radius),
+            ("light.spot_size", &mut light.spot_size),
+            ("light.spot_blend", &mut light.spot_blend),
+            ("light.area_size", &mut light.area_size),
+            ("light.area_size_y", &mut light.area_size_y),
+            ("light.sun_angle", &mut light.sun_angle),
+        ] {
+            if !animation::supports_animation_output(
+                path,
+                0,
+                animation::AnimationOutputKind::Action,
+            ) {
+                continue;
+            }
+            if let Some(animated) = channels.value(path, 0, *value)? {
+                *value = match path {
+                    "light.energy" => clamp_rna_float(animated, f32::MIN, f32::MAX),
+                    "light.shadow_soft_size" | "light.area_size" | "light.area_size_y" => {
+                        clamp_rna_float(animated, 0.0, f32::MAX)
+                    }
+                    "light.spot_size" => clamp_rna_float(
+                        animated,
+                        std::f32::consts::PI / 180.0,
+                        std::f32::consts::PI,
+                    ),
+                    "light.spot_blend" => clamp_rna_float(animated, 0.0, 1.0),
+                    "light.sun_angle" => clamp_rna_float(animated, 0.0, std::f32::consts::PI),
+                    _ => animated,
+                };
+                light_animated = true;
+            }
+        }
+        for index in 0..3 {
+            if let Some(animated) =
+                channels.value("light.color", index, light.color[index as usize])?
+            {
+                light.color[index as usize] = clamp_rna_float(animated, 0.0, f32::MAX);
+                light_animated = true;
+            }
+        }
+    }
+    Ok((
+        camera_animated.then_some(camera).flatten(),
+        light_animated.then_some(light).flatten(),
+    ))
+}
+
+fn evaluated_node_state(
+    node_id: &Id,
+    node: &Node,
+    doc: &SceneDoc,
+    frame: f64,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
+) -> Result<(bool, bool, BTreeMap<String, Value>)> {
+    let channels = AnimationChannelContext {
+        node_id,
+        node,
+        doc,
+        frame,
+        driver_values,
+    };
+    let hide_viewport = channels
+        .value("hide_viewport", 0, 0.0)?
+        .map_or(!node.visible, blender_bool);
+    let hide_render = channels
+        .value("hide_render", 0, 0.0)?
+        .map_or(!node.render_visible, blender_bool);
+
+    let mut paths = BTreeSet::new();
+    if let Some(action) = node
+        .action
+        .as_ref()
+        .and_then(|action| doc.actions.get(action))
+    {
+        paths.extend(
+            action
+                .fcurves
                 .iter()
-                .find_map(|((target, driver_path, index), value)| {
-                    (target == node_id && driver_path == path && *index == 0).then_some(*value)
-                });
-        Ok::<_, PotError>(driver_value.or(action_value))
-    };
-    let camera = if let Some(camera) = data.camera.as_ref() {
-        evaluate_channel("camera.lens_mm", camera.lens_mm)?.map(|lens_mm| {
-            let mut evaluated = camera.clone();
-            evaluated.lens_mm = clamp_camera_lens(lens_mm);
-            evaluated
-        })
-    } else {
-        None
-    };
-    let light = if let Some(light) = data.light.as_ref() {
-        evaluate_channel("light.energy", light.energy)?.map(|energy| {
-            let mut evaluated = light.clone();
-            evaluated.energy = energy;
-            evaluated
-        })
-    } else {
-        None
-    };
-    Ok((camera, light))
+                .filter(|curve| animation::custom_property_path(&curve.path))
+                .map(|curve| (curve.path.clone(), curve.index)),
+        );
+    }
+    let has_solo = node
+        .nla_tracks
+        .iter()
+        .any(|track| track.solo && !track.mute);
+    for track in node
+        .nla_tracks
+        .iter()
+        .filter(|track| !track.mute && (!has_solo || track.solo))
+    {
+        for strip in &track.strips {
+            if let Some(action) = doc.actions.get(&strip.action) {
+                paths.extend(
+                    action
+                        .fcurves
+                        .iter()
+                        .filter(|curve| animation::custom_property_path(&curve.path))
+                        .map(|curve| (curve.path.clone(), curve.index)),
+                );
+            }
+        }
+    }
+    paths.extend(
+        node.drivers
+            .iter()
+            .filter(|driver| animation::custom_property_path(&driver.path))
+            .map(|driver| (driver.path.clone(), driver.index)),
+    );
+    let mut evaluated_properties = BTreeMap::new();
+    for (path, index) in paths {
+        let Some(key) = animation::custom_property_name(&path) else {
+            continue;
+        };
+        let Some(property) = custom_property_stored(node, &key) else {
+            continue;
+        };
+        let Some(property_component) = custom_property_component(property, index) else {
+            continue;
+        };
+        if !(property_component.is_number() || property_component.is_boolean()) {
+            continue;
+        }
+        let base = custom_property_default(node, &key, index)?;
+        let Some(value) = channels.value(&path, index, base)? else {
+            continue;
+        };
+        let evaluated = evaluated_custom_property_value(node, &key, property_component, value)?;
+        let output = evaluated_properties
+            .entry(key)
+            .or_insert_with(|| property.clone());
+        if let Value::Array(values) = output {
+            let Some(component) = usize::try_from(index)
+                .ok()
+                .and_then(|index| values.get_mut(index))
+            else {
+                continue;
+            };
+            *component = evaluated;
+        } else {
+            *output = evaluated;
+        }
+    }
+    Ok((!hide_viewport, !hide_render, evaluated_properties))
+}
+
+fn evaluated_node_is_visible(
+    purpose: EvaluationPurpose,
+    node: &Node,
+    evaluated: Option<&EvaluatedNode>,
+) -> bool {
+    match (purpose, evaluated) {
+        (EvaluationPurpose::Render, Some(evaluated)) => evaluated
+            .evaluated_render_visible
+            .unwrap_or(node.render_visible),
+        (EvaluationPurpose::Render, None) => node.render_visible,
+        (_, Some(evaluated)) => evaluated.evaluated_visible.unwrap_or(node.visible),
+        (_, None) => node.visible,
+    }
 }
 
 /// Evaluated world-space Grease Pencil stroke used by vector exporters and preview.
@@ -444,6 +895,11 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Visibility for the current evaluation context: Blender's viewport flag does not hide renders.
+    #[must_use]
+    pub(crate) fn node_is_visible(&self, node_id: &Id, node: &Node) -> bool {
+        evaluated_node_is_visible(self.purpose, node, self.nodes.get(node_id))
+    }
     /// Member-local binding for an evaluated collection instance; out-of-range slots clamp to
     /// its last entry. Empty binding tables return `None`.
     #[must_use]
@@ -2441,6 +2897,8 @@ impl Snapshot {
             };
             let (evaluated_camera, evaluated_light) =
                 evaluated_data_blocks(id, node, doc, frame, driver_values)?;
+            let (evaluated_visible, evaluated_render_visible, evaluated_custom_properties) =
+                evaluated_node_state(id, node, doc, frame, driver_values)?;
             let dimensions = bounds.map(|bounds| bounds.size().to_array());
             nodes.insert(
                 id.clone(),
@@ -2452,6 +2910,9 @@ impl Snapshot {
                     mesh_materials: node_materials,
                     evaluated_camera,
                     evaluated_light,
+                    evaluated_visible: Some(evaluated_visible),
+                    evaluated_render_visible: Some(evaluated_render_visible),
+                    evaluated_custom_properties,
                 },
             );
         }
@@ -2608,6 +3069,7 @@ impl Snapshot {
             } = evaluate_collection_instance(
                 doc,
                 id,
+                context.purpose,
                 &matrices,
                 &meshes,
                 &nodes,
@@ -4259,6 +4721,20 @@ pub(crate) fn resolve_modifier_object_operands(
                     "UV Project does not evaluate cameras with animated or driven lenses",
                     json!({
                         "feature_id":"modifier.uv_project.animated_camera_lens",
+                        "modifier_id":modifier.id,
+                        "object":object_id,
+                    }),
+                ));
+            }
+            if modifier.modifier_type == "uv_project"
+                && data_block.is_some_and(|data| data.data_type == "camera")
+                && crate::eval::animation::node_has_camera_projection_animation(object, doc)
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "UV Project does not evaluate cameras with animated projection parameters",
+                    json!({
+                        "feature_id":"modifier.uv_project.animated_camera_parameters",
                         "modifier_id":modifier.id,
                         "object":object_id,
                     }),
@@ -7272,6 +7748,7 @@ fn remap_slot_binding(
 fn evaluate_collection_instance<'a>(
     doc: &SceneDoc,
     instance_id: &Id,
+    purpose: EvaluationPurpose,
     matrices: &BTreeMap<Id, DMat4>,
     meshes: &'a BTreeMap<Id, Mesh>,
     nodes: &BTreeMap<Id, EvaluatedNode>,
@@ -7307,6 +7784,7 @@ fn evaluate_collection_instance<'a>(
         meshes,
         adaptive_normals,
         nodes,
+        purpose,
         active_instances,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
@@ -7452,6 +7930,7 @@ fn append_collection_geometry<'a>(
     meshes: &'a BTreeMap<Id, Mesh>,
     adaptive_normals: &'a BTreeMap<Id, Vec<Option<DVec3>>>,
     nodes: &BTreeMap<Id, EvaluatedNode>,
+    purpose: EvaluationPurpose,
     active_instances: &mut BTreeSet<Id>,
     visited_collections: &mut BTreeSet<Id>,
     collection_stack: &mut BTreeSet<Id>,
@@ -7484,13 +7963,14 @@ fn append_collection_geometry<'a>(
                 json!({ "collection": collection_id, "node_id": object_id }),
             )
         })?;
-        if !source_node.visible || !source_node.render_visible {
+        if !evaluated_node_is_visible(purpose, source_node, nodes.get(object_id)) {
             continue;
         }
         let member = if instance_collection_target(source_node)?.is_some() {
             let nested = evaluate_collection_instance(
                 doc,
                 object_id,
+                purpose,
                 matrices,
                 meshes,
                 nodes,
@@ -7609,6 +8089,7 @@ fn append_collection_geometry<'a>(
             meshes,
             adaptive_normals,
             nodes,
+            purpose,
             active_instances,
             visited_collections,
             collection_stack,
@@ -8696,6 +9177,9 @@ mod tests {
                 mesh_materials: Vec::new(),
                 evaluated_camera: None,
                 evaluated_light: None,
+                evaluated_visible: None,
+                evaluated_render_visible: None,
+                evaluated_custom_properties: BTreeMap::new(),
             },
         )]);
         let mut adaptive_normals = BTreeMap::new();
@@ -9288,6 +9772,7 @@ mod tests {
         let evaluation = evaluate_collection_instance(
             &doc,
             &outer_instance_id,
+            super::EvaluationPurpose::Preview,
             &matrices,
             &meshes,
             &BTreeMap::new(),

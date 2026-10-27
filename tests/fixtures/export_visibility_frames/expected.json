@@ -1,0 +1,397 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "formats": {
+    "1": {
+      "alembic": {
+        "names": [
+          "vis_render_fades_out",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 109,
+        "visible": {
+          "vis_render_fades_out": true,
+          "vis_static_viewport_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "fbx": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 127,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_viewport_off": false,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "fbx-binary": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 127,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_viewport_off": false,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "glb": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 123,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "gltf": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 123,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "obj": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 123,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "pdf": {
+        "edges": 327,
+        "names": [
+          "vis_render_fades_out",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ]
+      },
+      "ply": {
+        "triangles": 109
+      },
+      "stl": {
+        "triangles": 109
+      },
+      "svg": {
+        "edges": 327,
+        "names": [
+          "vis_render_fades_out",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ]
+      },
+      "usda": {
+        "names": [
+          "vis_render_fades_out",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 109,
+        "visible": {
+          "vis_render_fades_out": true,
+          "vis_static_viewport_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "usdc": {
+        "names": [
+          "vis_render_fades_out",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 109,
+        "visible": {
+          "vis_render_fades_out": true,
+          "vis_static_viewport_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "usdz": {
+        "names": [
+          "vis_render_fades_out",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 109,
+        "visible": {
+          "vis_render_fades_out": true,
+          "vis_static_viewport_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      }
+    },
+    "5": {
+      "alembic": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 117,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_static_viewport_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "fbx": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 127,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_viewport_off": false,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": false
+        }
+      },
+      "fbx-binary": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 127,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_viewport_off": false,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": false
+        }
+      },
+      "glb": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 123,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "gltf": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 123,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "obj": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_render_fades_out",
+          "vis_static_render_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix"
+        ],
+        "triangles": 91,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_render_fades_out": true,
+          "vis_static_render_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true
+        }
+      },
+      "pdf": {
+        "edges": 351,
+        "names": [
+          "vis_render_fades_in",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ]
+      },
+      "ply": {
+        "triangles": 117
+      },
+      "stl": {
+        "triangles": 117
+      },
+      "svg": {
+        "edges": 351,
+        "names": [
+          "vis_render_fades_in",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ]
+      },
+      "usda": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 117,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_static_viewport_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "usdc": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 117,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_static_viewport_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      },
+      "usdz": {
+        "names": [
+          "vis_render_fades_in",
+          "vis_static_viewport_off",
+          "vis_static_visible",
+          "vis_stored_hidden_mix",
+          "vis_viewport_fades_out"
+        ],
+        "triangles": 117,
+        "visible": {
+          "vis_render_fades_in": true,
+          "vis_static_viewport_off": true,
+          "vis_static_visible": true,
+          "vis_stored_hidden_mix": true,
+          "vis_viewport_fades_out": true
+        }
+      }
+    }
+  },
+  "frames": [
+    "1",
+    "5"
+  ]
+}

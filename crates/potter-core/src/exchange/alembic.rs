@@ -9,8 +9,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ExchangeUvLayer, ImportedGraph, Loss, import_error, import_uv_layers, render_visible_nodes,
-    unique_uv_name, uv_import_loss,
+    ExchangeUvLayer, ImportedGraph, Loss, evaluated_visibility, import_error, import_uv_layers,
+    render_visible_nodes, unique_uv_name, uv_import_loss,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -65,8 +65,7 @@ pub(crate) fn export(
         .nodes
         .iter()
         .filter(|(id, node)| {
-            node.visible
-                && node.render_visible
+            snapshot.node_is_visible(id, node)
                 && node.data.is_some()
                 && visible_nodes.contains(*id)
                 && snapshot.meshes.contains_key(*id)
@@ -113,7 +112,8 @@ pub(crate) fn export(
                 ),
             ));
         }
-        if !allow_lossy && (!node.visible || !node.render_visible || !node.selectable) {
+        let (visible, render_visible) = evaluated_visibility(snapshot, id, node);
+        if !allow_lossy && (!visible || !render_visible || !node.selectable) {
             return Err(unsupported(
                 "node.visibility",
                 format!("Alembic export does not represent visibility or selectability on `{id}`"),

@@ -127,7 +127,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 12,
+            schema_version: 13,
             scene_id,
             revision: 0,
             active_scene,
@@ -155,7 +155,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 12 {
+        if self.schema_version != 13 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -1151,6 +1151,9 @@ pub struct NlaStrip {
     pub repeat: f64,
     pub blend_type: NlaBlendType,
     pub influence: f64,
+    /// Blender's `NlaStrip.use_animated_influence`; nonconstant curves are not representable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_animated_influence: bool,
     pub extrapolation: NlaExtrapolation,
     pub blend_in: f64,
     pub blend_out: f64,
@@ -3616,6 +3619,7 @@ mod tests {
     #[test]
     fn default_scene_has_contract_initial_state_and_empty_registries() {
         let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        assert_eq!(doc.schema_version, 13);
         doc.validate().unwrap();
         let value = serde_json::to_value(doc).unwrap();
         assert_eq!(value["revision"], 0);

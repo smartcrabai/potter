@@ -2095,10 +2095,10 @@ struct SunDisc {
 fn camera_sun_discs(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<SunDisc> {
     doc.nodes
         .iter()
-        .filter(|(_, node)| {
+        .filter(|(node_id, node)| {
             node.kind == "light"
-                && node.visible
-                && node.render_visible
+                && snapshot.node_is_visible(node_id, node)
+                && crate::exchange::evaluated_visibility(snapshot, node_id, node).1
                 && node.resolved_ray_visibility().allows(RayKind::Camera)
         })
         .filter_map(|(node_id, node)| {
@@ -7815,7 +7815,11 @@ fn collect_lights_impl(
         .map_or(0.01, |scene| scene.render.eevee_light_threshold);
     doc.nodes
         .iter()
-        .filter(|(_, node)| node.kind == "light" && node.visible && node.render_visible)
+        .filter(|(node_id, node)| {
+            node.kind == "light"
+                && snapshot.node_is_visible(node_id, node)
+                && crate::exchange::evaluated_visibility(snapshot, node_id, node).1
+        })
         .filter_map(|(node_id, node)| {
             let evaluated = snapshot.nodes.get(node_id)?;
             let data = evaluated.evaluated_light.as_ref().or_else(|| {
@@ -7967,7 +7971,9 @@ fn collect_volumes<'a>(
     let mut volumes = Vec::new();
     let mut evaluator_workspace = EvaluatorWorkspace::default();
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible {
+        if !snapshot.node_is_visible(node_id, node)
+            || !crate::exchange::evaluated_visibility(snapshot, node_id, node).1
+        {
             continue;
         }
         let Some(data_id) = node.data.as_ref() else {

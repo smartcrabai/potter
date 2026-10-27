@@ -6,8 +6,8 @@ use std::{
 
 use super::material_graph::{GraphTextures, move_textures_to_graph};
 use super::{
-    ExchangeMesh, ExchangeUvLayer, ImportedGraph, Loss, evaluated_meshes, import_error,
-    import_uv_layers, shading, srgb_decode,
+    ExchangeMesh, ExchangeUvLayer, ImportedGraph, Loss, evaluated_meshes, evaluated_visibility,
+    import_error, import_uv_layers, shading, srgb_decode,
 };
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -308,12 +308,13 @@ fn write_node(
             snapshot.revision
         ),
     );
+    let (visible, render_visible) = evaluated_visibility(snapshot, id, node);
     line(
         output,
         &format!(
             "{}custom bool potter:visible = {}",
             spaces(child_depth),
-            node.visible
+            visible
         ),
     );
     line(
@@ -321,7 +322,7 @@ fn write_node(
         &format!(
             "{}custom bool potter:renderVisible = {}",
             spaces(child_depth),
-            node.render_visible
+            render_visible
         ),
     );
     line(

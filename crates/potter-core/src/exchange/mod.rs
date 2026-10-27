@@ -370,8 +370,7 @@ pub(crate) fn evaluated_meshes(
     let visible_nodes = render_visible_nodes(doc, snapshot)?;
     let mut output = Vec::new();
     for (node_id, node) in &doc.nodes {
-        if !node.visible
-            || !node.render_visible
+        if !snapshot.node_is_visible(node_id, node)
             || node.data.is_none()
             || !visible_nodes.contains(node_id)
         {
@@ -491,8 +490,7 @@ pub(crate) fn attribute_losses(
     let visible_nodes = render_visible_nodes(doc, snapshot)?;
     let mut losses = Vec::new();
     for (node_id, node) in &doc.nodes {
-        if !node.visible
-            || !node.render_visible
+        if !snapshot.node_is_visible(node_id, node)
             || node.data.is_none()
             || !visible_nodes.contains(node_id)
         {
@@ -1013,6 +1011,65 @@ pub(crate) fn render_visible_nodes(
     Ok(visible)
 }
 
+/// Blender's viewport and render visibility of a node at the snapshot frame: the evaluated state
+/// when the snapshot holds it, otherwise the stored flag.
+pub(crate) fn evaluated_visibility(
+    snapshot: &crate::eval::Snapshot,
+    id: &Id,
+    node: &Node,
+) -> (bool, bool) {
+    let evaluated = snapshot.nodes.get(id);
+    (
+        evaluated
+            .and_then(|state| state.evaluated_visible)
+            .unwrap_or(node.visible),
+        evaluated
+            .and_then(|state| state.evaluated_render_visible)
+            .unwrap_or(node.render_visible),
+    )
+}
+
+/// Visibility F-Curves and drivers. Every interchange writer except `.blend` writes the frame's
+/// evaluated visibility, so the animation itself is lost and reported here.
+pub(crate) fn visibility_animation_losses(format: &str, doc: &SceneDoc) -> Vec<Loss> {
+    if format == "blend" {
+        return Vec::new();
+    }
+    let mut losses = Vec::new();
+    for (id, node) in &doc.nodes {
+        let mut paths = BTreeSet::<&str>::new();
+        if let Some(action) = node
+            .action
+            .as_ref()
+            .and_then(|action_id| doc.actions.get(action_id))
+        {
+            paths.extend(action.fcurves.iter().map(|curve| curve.path.as_str()));
+        }
+        for track in node.nla_tracks.iter().filter(|track| !track.mute) {
+            for strip in &track.strips {
+                if let Some(action) = doc.actions.get(&strip.action) {
+                    paths.extend(action.fcurves.iter().map(|curve| curve.path.as_str()));
+                }
+            }
+        }
+        paths.extend(node.drivers.iter().map(|driver| driver.path.as_str()));
+        for path in paths
+            .into_iter()
+            .filter(|path| matches!(*path, "hide_render" | "hide_viewport"))
+        {
+            losses.push(Loss {
+                feature_id: "animation.visibility".to_owned(),
+                data_id: Some(id.to_string()),
+                reason: format!(
+                    "{format} exports the evaluated frame and cannot preserve animated `{path}` on `{id}`"
+                ),
+                suggestion: Some("export as blend to preserve the visibility animation".to_owned()),
+            });
+        }
+    }
+    losses
+}
+
 /// Blender's ray-visibility flags that differ from the default for the node's kind, as Blender's
 /// RNA names with their value (`visible_camera=false`). Empty when the node keeps the default.
 pub(crate) fn ray_visibility_differences(node: &Node) -> Vec<String> {
@@ -1042,8 +1099,7 @@ pub(crate) fn ray_visibility_losses(
             doc.nodes
                 .iter()
                 .filter(|(id, node)| {
-                    node.visible
-                        && node.render_visible
+                    snapshot.node_is_visible(id, node)
                         && node.data.is_some()
                         && visible.contains(*id)
                         && snapshot.meshes.contains_key(*id)

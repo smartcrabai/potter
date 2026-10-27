@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationPurpose, Snapshot},
+    eval::Snapshot,
     geom::{
         GeneratedCorners, GeneratedVertex, Mesh, TextureSpace,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
@@ -468,9 +468,9 @@ pub(super) fn extract_geometry(
     });
     for (node_id, node) in &doc.nodes {
         if !visible_nodes.contains(node_id)
-            || !node.visible
-            || ((snapshot.purpose == EvaluationPurpose::Render || matches!(mode, Mode::Beauty))
-                && !node.render_visible)
+            || !snapshot.node_is_visible(node_id, node)
+            || (matches!(mode, Mode::Beauty)
+                && !crate::exchange::evaluated_visibility(snapshot, node_id, node).1)
         {
             continue;
         }

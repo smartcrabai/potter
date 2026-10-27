@@ -1030,6 +1030,18 @@ pub fn feature_catalog() -> Value {
             ],
             "UV Project evaluation does not support camera projectors whose lens is animated or driven.",
         ),
+        unsupported(
+            "modifier.uv_project.animated_camera_parameters",
+            "UV Project camera projectors with animated sensor, shift, clipping, or orthographic settings",
+            "UV_PROJECT",
+            &[
+                "modifier.create",
+                "modifier.update",
+                "modifier.reorder",
+                "modifier.apply",
+            ],
+            "UV Project evaluation does not support camera projectors with animated projection parameters.",
+        ),
         supported(
             "modifier.uv_warp",
             "UV-domain scale, rotation, offset, and object-relative warp",
@@ -1549,7 +1561,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "animation.fcurve_non_transform_channels",
-            "Action/driver `camera.lens_mm` and `light.energy` F-Curves; existing shape-key `.value` and evaluation-time channels; other non-transform paths refused",
+            "Camera lens/sensor/clip/shift/DOF/orthographic settings; light energy/color and SPOT/AREA/SUN settings; Object hide flags and raw numeric/Boolean scalar or array custom properties, honoring recorded RNA defaults and hard min/max; .blend import/export, inspect, evaluation and render; shape-key `.value` and evaluation-time channels; material-node sockets and other unsupported paths refused",
             "FCurve",
             &[
                 "action.update",
@@ -1557,7 +1569,7 @@ pub fn feature_catalog() -> Value {
                 "driver.create",
                 "driver.update",
             ],
-            [false, false, true, true, true, false, false],
+            [false, false, true, true, true, true, true],
         ),
         supported(
             "rig.advanced",

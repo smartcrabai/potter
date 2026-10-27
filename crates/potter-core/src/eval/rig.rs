@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    eval::{EvaluationSession, animation::animated_transform},
+    eval::{
+        CustomPropertyReference, EvaluationSession, animation::animated_transform,
+        custom_property_reference, evaluated_custom_property_component,
+    },
     geom::{
         Mesh,
         blender_matrix::{blender_matrix_from_f64, blender_mul_m4, dmat4_from_blender},
@@ -7413,27 +7416,16 @@ fn follow_track_matrix(
             json!({"constraint_id":constraint.id,"camera":camera_id}),
         )
     })?;
-    let camera_data = camera_node
+    let base_camera_data = camera_node
         .data
         .as_ref()
         .and_then(|data_id| doc.data_blocks.get(data_id))
         .and_then(|data| data.camera.as_ref())
         .ok_or_else(|| evaluation_error("Follow Track target has no camera data"))?;
-    let lens_mm = crate::eval::clamp_camera_lens(
-        driver_values
-            .iter()
-            .find_map(|((target, path, index), value)| {
-                (target == camera_id && path == "camera.lens_mm" && *index == 0).then_some(*value)
-            })
-            .or(crate::eval::animation::animated_scalar_channel(
-                camera_node,
-                doc,
-                "camera.lens_mm",
-                camera_data.lens_mm,
-                frame,
-            )?)
-            .unwrap_or(camera_data.lens_mm),
-    );
+    let evaluated_camera_data =
+        crate::eval::evaluated_data_blocks(camera_id, camera_node, doc, frame, driver_values)?.0;
+    let camera_data = evaluated_camera_data.as_ref().unwrap_or(base_camera_data);
+    let lens_mm = camera_data.lens_mm;
     let intrinsics = &clip.tracking.camera;
     let (ray_origin_local, direction) =
         if camera_data.projection == crate::model::CameraProjection::Orthographic {
@@ -10247,7 +10239,7 @@ pub(crate) fn evaluate_drivers(
         context: &mut DriverEvaluationContext<'_>,
         outputs: &mut BTreeMap<(Id, String, u32), f64>,
         active: &mut BTreeSet<usize>,
-    ) -> Result<f64> {
+    ) -> Result<Option<f64>> {
         let entry = &entries[index];
         let output_key = (
             entry.owner.to_owned(),
@@ -10255,7 +10247,7 @@ pub(crate) fn evaluate_drivers(
             entry.driver.index,
         );
         if let Some(value) = outputs.get(&output_key) {
-            return Ok(*value);
+            return Ok(Some(*value));
         }
         if !active.insert(index) {
             return Err(evaluation_error_with(
@@ -10271,15 +10263,47 @@ pub(crate) fn evaluate_drivers(
                     json!({ "driver_id": entry.driver.id, "name": variable.name }),
                 ));
             }
-            let source_key = (
-                variable.target.clone(),
-                variable.path.clone(),
-                variable.index,
-            );
-            let value = if let Some(dependency) = by_output.get(&source_key) {
-                visit(*dependency, entries, by_output, context, outputs, active)?
+            let value = if let Some((target, reference)) =
+                single_prop_custom_property(context.doc, variable)
+            {
+                // A driven custom property is visited first, so its driver output is evaluated.
+                let driven = match by_output.get(&(
+                    variable.target.clone(),
+                    reference.path.clone(),
+                    reference.index,
+                )) {
+                    Some(dependency) => {
+                        visit(*dependency, entries, by_output, context, outputs, active)?
+                    }
+                    None => None,
+                };
+                let Some(value) = evaluated_custom_property_component(
+                    target,
+                    context.doc,
+                    context.frame,
+                    &reference,
+                    driven,
+                )?
+                else {
+                    // Blender marks the driver invalid when its RNA target no longer resolves.
+                    active.remove(&index);
+                    return Ok(None);
+                };
+                value
             } else {
-                variable_value(context.doc, context.frame, variable)?
+                let source_key = (
+                    variable.target.clone(),
+                    variable.path.clone(),
+                    variable.index,
+                );
+                if let Some(dependency) = by_output.get(&source_key) {
+                    match visit(*dependency, entries, by_output, context, outputs, active)? {
+                        Some(value) => value,
+                        None => variable_value(context.doc, context.frame, variable)?,
+                    }
+                } else {
+                    variable_value(context.doc, context.frame, variable)?
+                }
             };
             variables.insert(variable.name.clone(), value);
         }
@@ -10322,7 +10346,7 @@ pub(crate) fn evaluate_drivers(
         }
         active.remove(&index);
         outputs.insert(output_key, value);
-        Ok(value)
+        Ok(Some(value))
     }
     if !frame.is_finite() {
         return Err(evaluation_error("driver evaluation frame is non-finite"));
@@ -10364,6 +10388,19 @@ pub(crate) fn evaluate_drivers(
         )?;
     }
     Ok(outputs)
+}
+
+/// The Object custom property that a `SINGLE_PROP` variable reads, with its target node.
+fn single_prop_custom_property<'a>(
+    doc: &'a SceneDoc,
+    variable: &DriverVariable,
+) -> Option<(&'a Node, CustomPropertyReference)> {
+    if variable.variable_type != DriverVariableType::SingleProp {
+        return None;
+    }
+    let target = doc.nodes.get(&variable.target)?;
+    let reference = custom_property_reference(target, &variable.path, variable.index)?;
+    Some((target, reference))
 }
 
 fn variable_value(doc: &SceneDoc, frame: f64, variable: &DriverVariable) -> Result<f64> {
@@ -10562,12 +10599,37 @@ pub(crate) fn apply_transform_drivers(
         if target_id != node_id {
             continue;
         }
-        validate_driver_output(node_id, node, doc, path, *index)?;
+        let transform_output = matches!(
+            path.as_str(),
+            "location"
+                | "translation"
+                | "transform.location"
+                | "transform.translation"
+                | "scale"
+                | "transform.scale"
+                | "rotation"
+                | "transform.rotation"
+                | "transform.rotation_quaternion"
+                | "rotation_euler"
+                | "transform.rotation_euler"
+        );
+        if transform_output
+            || !crate::eval::animation::supports_animation_output(
+                path,
+                *index,
+                crate::eval::animation::AnimationOutputKind::Driver,
+            )
+        {
+            validate_driver_output(node_id, node, doc, path, *index)?;
+        }
         if !value.is_finite() {
             return Err(evaluation_error_with(
                 "transform driver value is non-finite",
                 json!({ "node": node_id, "path": path }),
             ));
+        }
+        if !transform_output {
+            continue;
         }
         match path.as_str() {
             "location" | "translation" | "transform.location" | "transform.translation" => {

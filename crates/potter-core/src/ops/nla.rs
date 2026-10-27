@@ -307,6 +307,7 @@ fn create_strip(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Resu
         repeat: 1.0,
         blend_type: NlaBlendType::Replace,
         influence: 1.0,
+        use_animated_influence: false,
         extrapolation: NlaExtrapolation::Hold,
         blend_in: 0.0,
         blend_out: 0.0,
@@ -493,6 +494,7 @@ fn push_down(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<
         repeat: 1.0,
         blend_type: NlaBlendType::Replace,
         influence: 1.0,
+        use_animated_influence: false,
         extrapolation: NlaExtrapolation::Hold,
         blend_in: 0.0,
         blend_out: 0.0,
@@ -937,7 +939,10 @@ fn apply_strip_values(
                 "action_frame_end" => strip.action_frame_end = number,
                 "scale" => strip.scale = number,
                 "repeat" => strip.repeat = number,
-                "influence" => strip.influence = number,
+                "influence" => {
+                    strip.influence = number;
+                    strip.use_animated_influence = number.to_bits() != 1.0_f64.to_bits();
+                }
                 "blend_in" => strip.blend_in = number,
                 "blend_out" => strip.blend_out = number,
                 _ => unreachable!(),

@@ -1955,6 +1955,20 @@ fn normalized_v1_local(matrix: DMat4, can_bake_scale: bool) -> Result<(DMat4, DV
     ))
 }
 
+/// The Blender 5.2.2 export probe keeps FCurve-hidden objects even when `visible_get()` is false.
+fn writer_node_is_visible(
+    snapshot: &Snapshot,
+    node_id: &Id,
+    node: &Node,
+    use_gltf_visible_filter: bool,
+) -> bool {
+    if use_gltf_visible_filter {
+        node.visible
+    } else {
+        snapshot.node_is_visible(node_id, node)
+    }
+}
+
 fn exportable_mesh_nodes(
     doc: &SceneDoc,
     snapshot: &Snapshot,
@@ -1963,8 +1977,7 @@ fn exportable_mesh_nodes(
     doc.nodes
         .iter()
         .filter(|(id, node)| {
-            node.visible
-                && node.render_visible
+            snapshot.node_is_visible(id, node)
                 && visible.contains(*id)
                 && snapshot
                     .meshes
@@ -2460,7 +2473,7 @@ pub(crate) fn vrm_frame_maps(
     let mut armature_ids = super::vrm::referenced_armatures(avatar);
     armature_ids.extend(bone_parent_armatures(doc));
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible.contains(node_id) {
+        if !snapshot.node_is_visible(node_id, node) || !visible.contains(node_id) {
             continue;
         }
         if node
@@ -3350,13 +3363,19 @@ pub(crate) struct TexCoordPlan {
 
 /// Losses of a glTF or VRM export of `doc` for mesh data glTF cannot write losslessly: generic and
 /// Blender-only attributes, out-of-range carried colors, and vertex-color reads that name no layer.
-pub(crate) fn mesh_export_losses(doc: &SceneDoc, snapshot: &Snapshot) -> Result<Vec<Loss>> {
+pub(crate) fn mesh_export_losses(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    format: &str,
+) -> Result<Vec<Loss>> {
     let surfaces = resolve_material_surfaces_with_snapshot(doc, snapshot)?;
     let visible = super::render_visible_nodes(doc, snapshot)?;
     let mut losses = Vec::new();
     let mut reported = BTreeSet::<(String, String)>::new();
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible.contains(node_id) {
+        if !writer_node_is_visible(snapshot, node_id, node, matches!(format, "glb" | "gltf"))
+            || !visible.contains(node_id)
+        {
             continue;
         }
         let Some(evaluated) = snapshot.meshes.get(node_id) else {
@@ -3776,7 +3795,9 @@ pub(crate) fn tex_coord_plan(
     };
     let mut reported = BTreeSet::<(Id, Option<String>, Id, usize, &'static str)>::new();
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible.contains(node_id) {
+        if !writer_node_is_visible(snapshot, node_id, node, vrm.is_none())
+            || !visible.contains(node_id)
+        {
             continue;
         }
         let Some(evaluated) = snapshot.meshes.get(node_id) else {
@@ -4326,7 +4347,7 @@ pub(crate) fn validate_vrm_mesh_references(
     let mut rest_world_cache = BTreeMap::<Id, BTreeMap<Id, DMat4>>::new();
     let mut data_skin_bindings = BTreeMap::<Id, SkinBinding>::new();
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible.contains(node_id) {
+        if !snapshot.node_is_visible(node_id, node) || !visible.contains(node_id) {
             continue;
         }
         let Some(data_id) = &node.data else {
@@ -4354,7 +4375,7 @@ pub(crate) fn validate_vrm_mesh_references(
     }
     let mut exported_mesh_nodes = BTreeSet::new();
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible.contains(node_id) {
+        if !snapshot.node_is_visible(node_id, node) || !visible.contains(node_id) {
             continue;
         }
         let Some(evaluated) = snapshot.meshes.get(node_id) else {
@@ -4450,6 +4471,8 @@ fn export_with_root_inner(
     vrm: Option<(&AvatarSettings, AvatarVersion)>,
     precomputed_frame_maps: Option<&VrmFrameMaps>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
+    let use_gltf_visible_filter = vrm.is_none();
+
     let inverse_basis = POT_TO_GLTF.inverse();
     let mut binary = Vec::new();
     let mut views = Vec::<Value>::new();
@@ -4552,7 +4575,9 @@ fn export_with_root_inner(
     let mut data_skin_bindings = BTreeMap::<Id, SkinBinding>::new();
     let mut rest_world_cache = BTreeMap::<Id, BTreeMap<Id, DMat4>>::new();
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible_node_ids.contains(node_id) {
+        if !writer_node_is_visible(snapshot, node_id, node, use_gltf_visible_filter)
+            || !visible_node_ids.contains(node_id)
+        {
             continue;
         }
         let Some(data_id) = &node.data else {
@@ -4592,7 +4617,9 @@ fn export_with_root_inner(
     };
     let geometry_basis = vrm.map_or(POT_TO_GLTF, |(_, version)| avatar_basis(version));
     for (node_id, node) in &doc.nodes {
-        if !node.visible || !node.render_visible || !visible_node_ids.contains(node_id) {
+        if !writer_node_is_visible(snapshot, node_id, node, use_gltf_visible_filter)
+            || !visible_node_ids.contains(node_id)
+        {
             continue;
         }
         let Some(evaluated) = snapshot.meshes.get(node_id) else {
@@ -5234,7 +5261,9 @@ fn export_with_root_inner(
                 .get(parent)
                 .ok_or_else(|| PotError::new(ErrorCode::SceneInvalid, "node parent is missing"))?;
         }
-        if visible_node_ids.contains(id) && node.visible && node.render_visible {
+        if visible_node_ids.contains(id)
+            && writer_node_is_visible(snapshot, id, node, use_gltf_visible_filter)
+        {
             if let Some(index) = node_mesh_indices.get(id) {
                 gltf_node["mesh"] = json!(index);
             }
@@ -11542,7 +11571,7 @@ mod tests {
         read_vertex_color(&mut doc, "paint", "Corner")?;
 
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             !losses
                 .iter()
@@ -11703,7 +11732,7 @@ mod tests {
             },
         );
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             !losses
                 .iter()
@@ -11786,7 +11815,7 @@ mod tests {
             json!([values[..3].to_vec(), values[3..].to_vec()])
         );
         assert!(
-            !super::mesh_export_losses(&doc, &snapshot)?
+            !super::mesh_export_losses(&doc, &snapshot, "gltf")?
                 .iter()
                 .any(|loss| loss.feature_id == "mesh.color_attribute")
         );
@@ -11832,7 +11861,7 @@ mod tests {
         );
         read_vertex_color(&mut doc, "paint", "Missing")?;
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             losses.iter().any(|loss| {
                 loss.feature_id == "material.shader_graph.vertex_color"
@@ -11880,7 +11909,7 @@ mod tests {
         read_vertex_color(&mut doc, "paint", "Paint")?;
         set_graph_alpha(&mut doc, "paint", 0.5)?;
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             !losses.iter().any(|loss| {
                 loss.feature_id == "material.shader_graph.vertex_color"
@@ -11897,7 +11926,7 @@ mod tests {
         colors.layers[0].values[..3].fill([1.0, 1.0, 1.0, 0.5]);
         crate::geom::color_layers::write(mesh, &colors);
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             losses.iter().any(|loss| {
                 loss.feature_id == "material.shader_graph.vertex_color"
@@ -11928,7 +11957,7 @@ mod tests {
             },
         );
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             !losses.iter().any(|loss| {
                 loss.feature_id == "material.shader_graph.vertex_color"
@@ -11945,7 +11974,7 @@ mod tests {
         colors.layers[0].values[0][3] = 0.5;
         crate::geom::color_layers::write(mesh, &colors);
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             losses.iter().any(|loss| {
                 loss.feature_id == "material.shader_graph.vertex_color"
@@ -12138,7 +12167,7 @@ mod tests {
             );
         }
 
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             !losses
                 .iter()
@@ -12416,7 +12445,7 @@ mod tests {
         );
         read_vertex_color(&mut doc, "paint", "HDR")?;
         let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
-        let losses = super::mesh_export_losses(&doc, &snapshot)?;
+        let losses = super::mesh_export_losses(&doc, &snapshot, "gltf")?;
         assert!(
             losses.iter().any(|loss| {
                 loss.feature_id == "mesh.color_attribute"
@@ -12670,7 +12699,7 @@ mod tests {
             1
         );
         assert!(
-            super::mesh_export_losses(&imported.doc, &snapshot)?
+            super::mesh_export_losses(&imported.doc, &snapshot, "gltf")?
                 .iter()
                 .all(|loss| loss.feature_id != "mesh.color_attribute")
         );

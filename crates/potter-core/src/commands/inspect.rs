@@ -482,6 +482,20 @@ fn node_item(
     let materials = (0..snapshot.slot_count(id, node, data_block))
         .map(|slot| snapshot.slot_material(id, node, data_block, slot))
         .collect::<Vec<_>>();
+    let mut properties = node.properties.clone();
+    properties.remove("_blender_custom_property_ui");
+    for (key, value) in &evaluated.evaluated_custom_properties {
+        let nested = properties
+            .get_mut("_blender_custom_properties")
+            .and_then(Value::as_object_mut);
+        if let Some(nested) = nested
+            && nested.contains_key(key)
+        {
+            nested.insert(key.clone(), value.clone());
+            continue;
+        }
+        properties.insert(key.clone(), value.clone());
+    }
     let mut item = json!({
         "type": "node",
         "id": id,
@@ -511,10 +525,10 @@ fn node_item(
         "sharing": { "users": users, "count": users.len(), "shared": users.len() > 1 },
         "materials": materials,
         "modifiers": modifiers,
-        "visible": node.visible,
-        "render_visible": node.render_visible,
+        "visible": evaluated.evaluated_visible.unwrap_or(node.visible),
+        "render_visible": evaluated.evaluated_render_visible.unwrap_or(node.render_visible),
         "selectable": node.selectable,
-        "properties": node.properties,
+        "properties": properties,
         "library": linkage["library"],
         "library_name": linkage["library_name"],
         "editable": linkage["editable"],
