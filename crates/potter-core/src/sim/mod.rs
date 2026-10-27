@@ -2370,6 +2370,8 @@ fn dynamic_paint_brush_settings(
             })?;
             let transform = crate::eval::rig::apply_transform_drivers(
                 &id,
+                node,
+                doc,
                 &node.transform.rotation_mode,
                 animated,
                 driver_values,

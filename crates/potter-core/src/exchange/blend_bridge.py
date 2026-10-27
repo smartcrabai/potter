@@ -3351,6 +3351,49 @@ def material_dump(material):
             **_material_field_values(material)}
 
 
+def animation_assignment_dump(owner):
+    animation_data = getattr(owner, "animation_data", None)
+    action = getattr(animation_data, "action", None) if animation_data else None
+    action_slot = getattr(animation_data, "action_slot", None) if animation_data else None
+    return {
+        "action": action.name_full if action else None,
+        "action_slot": {
+            "identifier": getattr(action_slot, "identifier", ""),
+            "name": getattr(action_slot, "name_display", getattr(action_slot, "name", "")),
+            "target_type": getattr(action_slot, "target_id_type", ""),
+        } if action_slot else None,
+    }
+
+def animation_drivers_dump(owner):
+    animation_data = getattr(owner, "animation_data", None)
+    if animation_data is None:
+        return []
+    return [
+        {
+            "curve": dump_fcurve(curve),
+            "driver": {
+                "type": curve.driver.type,
+                "expression": curve.driver.expression,
+                "variables": [
+                    {
+                        "name": variable.name,
+                        "type": variable.type,
+                        "targets": [
+                            {
+                                "id_type": target.id_type,
+                                "id": plain(target.id),
+                                "data_path": target.data_path,
+                            }
+                            for target in variable.targets
+                        ],
+                    }
+                    for variable in curve.driver.variables
+                ],
+            },
+        }
+        for curve in animation_data.drivers
+    ]
+
 def dump_all():
     # The probe texture is created and removed here, before any loop iterates bpy.data.textures.
     _image_texture_defaults()
@@ -3382,6 +3425,8 @@ def dump_all():
                             for item in getattr(bpy.data, "movieclips", ())],
             "materials": [material_dump(item) for item in bpy.data.materials],
             "cameras": [{"name": x.name_full, "potter_id": x.get("potter.id"),
+                         **animation_assignment_dump(x),
+                         "drivers": animation_drivers_dump(x),
                          "library": library_reference(x), "type": x.type,
                          "lens": float(x.lens), "sensor_width": float(x.sensor_width),
                          "sensor_height": float(x.sensor_height), "sensor_fit": x.sensor_fit,
@@ -3394,6 +3439,8 @@ def dump_all():
                          "fisheye_fov": float(x.fisheye_fov), "fisheye_lens": float(x.fisheye_lens),
                          "fake_user": bool(x.use_fake_user), "users": int(x.users)} for x in bpy.data.cameras],
             "lights": [{"name": x.name_full, "potter_id": x.get("potter.id"),
+                        **animation_assignment_dump(x),
+                        "drivers": animation_drivers_dump(x),
                         "library": library_reference(x), "type": x.type,
                         "color": plain(x.color), "energy": float(x.energy), "shadow_soft_size": float(x.shadow_soft_size),
                         "sun_angle": float(getattr(x, "angle", math.radians(0.526))),
@@ -7543,13 +7590,28 @@ def _restore_constraints(obj, sources, id_lookup, doc, target):
 def _restore_drivers(obj, sources, id_lookup, doc):
     if not sources:
         return
-    animation_data = obj.animation_data_create()
     for source in sources:
         curve_source = source.get("curve", {})
         driver_source = source.get("driver", {})
         try:
-            curve = obj.driver_add(blender_animation_path(curve_source["path"], doc),
-                                   int(curve_source.get("index", 0)))
+            path = curve_source["path"]
+            index = int(curve_source.get("index", 0))
+            owner = obj
+            if obj.type == "CAMERA" and path == "camera.lens_mm":
+                owner, path = obj.data, "lens"
+            elif obj.type == "LIGHT" and path == "light.energy":
+                owner, path = obj.data, "energy"
+            else:
+                path = blender_animation_path(path, doc)
+            animation_data = owner.animation_data_create()
+            if any(curve.data_path == path and curve.array_index == index
+                   for curve in animation_data.drivers):
+                continue
+            curve = (
+                owner.driver_add(path, index)
+                if owner is obj
+                else owner.driver_add(path)
+            )
             curve.extrapolation = curve_source.get("extrapolation", "CONSTANT").upper()
             curve.mute = bool(curve_source.get("mute", False))
             for key in curve_source.get("keyframes", []):
@@ -7566,7 +7628,9 @@ def _restore_drivers(obj, sources, id_lookup, doc):
                 variable.type = variable_source.get("type", "SINGLE_PROP")
                 targets = variable_source.get("targets", [])
                 for target, target_source in zip(variable.targets, targets):
-                    target.id_type = target_source.get("id_type", "OBJECT")
+                    target_id_type = target_source.get("id_type", "OBJECT")
+                    if target.id_type != target_id_type:
+                        target.id_type = target_id_type
                     reference = target_source.get("id")
                     target.id = _resolve_compat_value(reference, id_lookup)
                     target.data_path = target_source.get("data_path", "")
@@ -7835,12 +7899,18 @@ def _canonical_fcurves(model_curves, source_curves, doc, include_unmatched=True,
 
 
 def _model_action_slot(doc, action_id, model_slot, flat_curves):
-    node = doc.get("nodes", {}).get(model_slot.get("node"), {})
+    node_id = model_slot.get("node")
+    node = doc.get("nodes", {}).get(node_id, {})
     data = doc.get("data_blocks", {}).get(node.get("data"), {})
     shape_keys = data.get("shape_keys") or {}
-    is_key_slot = shape_keys.get("action") == action_id
+    active_slot_id = (
+        (doc.get("actions", {}).get(action_id, {}).get("active_slots") or {})
+        .get(node_id)
+    )
+    is_object_slot = active_slot_id == model_slot.get("id")
+    is_key_slot = shape_keys.get("action") == action_id and not is_object_slot
     return {
-        "identifier": model_slot.get("id", ""),
+        "identifier": model_slot.get("blender_identifier") or model_slot.get("id", ""),
         "potter_id": model_slot.get("id"),
         "name": (shape_keys.get("action_slot") or node.get("name", "Action")
                  if is_key_slot else node.get("name", "Action")),
@@ -7910,11 +7980,21 @@ def _canonical_action_data(doc, item, source, action_id, object_map):
     flat_curves = _canonical_fcurves(
         model_curves, source.get("fcurves", []), doc)
     slot_sources = [dict(slot) for slot in source.get("slots", [])]
+    if not item.get("slots") and any(
+        node.get("action") == action_id for node in doc.get("nodes", {}).values()
+    ):
+        for slot in slot_sources:
+            if slot.get("target_type") in ("CAMERA", "LIGHT"):
+                slot["target_type"] = "OBJECT"
     for model_slot in item.get("slots", []):
         descriptor = _model_action_slot(doc, action_id, model_slot, flat_curves)
         existing = next((
             slot for slot in slot_sources
             if slot.get("potter_id") == model_slot.get("id")
+            or (
+                model_slot.get("blender_identifier")
+                and slot.get("identifier") == model_slot.get("blender_identifier")
+            )
             or (slot.get("name") == descriptor["name"]
                 and slot.get("target_type", descriptor["target_type"])
                 == descriptor["target_type"])
@@ -7923,6 +8003,13 @@ def _canonical_action_data(doc, item, source, action_id, object_map):
             slot_sources.append(descriptor)
         elif not existing.get("potter_id"):
             existing["potter_id"] = model_slot.get("id")
+    if any(node.get("action") == action_id for node in doc.get("nodes", {}).values()):
+        object_slots = [slot for slot in slot_sources if slot.get("target_type") == "OBJECT"]
+        data_slots = [
+            slot for slot in slot_sources if slot.get("target_type") in ("CAMERA", "LIGHT")
+        ]
+        if len(slot_sources) == 2 and len(object_slots) == 1 and len(data_slots) == 1:
+            slot_sources = [dict(object_slots[0], fcurves=flat_curves)]
     if not slot_sources and flat_curves:
         slot_sources = [{"identifier": "", "name": item["name"],
                          "target_type": "OBJECT", "fcurves": flat_curves}]

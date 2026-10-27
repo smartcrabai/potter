@@ -51,6 +51,8 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
                 )
             })?;
             let (sampled, channels) = sample_action_transform(
+                node,
+                doc,
                 &transform,
                 action,
                 &strip.action,
@@ -75,6 +77,8 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
             )
         })?;
         let (sampled, channels) = sample_action_transform(
+            node,
+            doc,
             &transform,
             action,
             action_id,
@@ -91,6 +95,508 @@ pub fn animated_transform(node: &Node, doc: &SceneDoc, frame: f64) -> Result<Tra
     }
     Ok(transform)
 }
+
+/// Evaluate a scalar non-transform Action channel through NLA and the active Action.
+///
+/// The F-Curve sampler is shared with transform channels, so interpolation, extrapolation, and
+/// modifier handling stay identical.
+pub(crate) fn animated_scalar_channel(
+    node: &Node,
+    doc: &SceneDoc,
+    path: &str,
+    base_value: f64,
+    frame: f64,
+) -> Result<Option<f64>> {
+    if !frame.is_finite() || !base_value.is_finite() {
+        return Err(PotError::new(
+            ErrorCode::InvalidArgument,
+            "animation frame and base channel value must be finite",
+        ));
+    }
+    if !supports_animation_output_for_node(path, 0, AnimationOutputKind::Action, node, doc) {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!("animation scalar path `{path}` is not supported by this node"),
+            json!({ "feature_id":format!("animation.fcurve_non_transform_channels.{path}") }),
+        ));
+    }
+    let has_solo = node
+        .nla_tracks
+        .iter()
+        .any(|track| track.solo && !track.mute);
+    let mut value = base_value;
+    let mut animated = false;
+    for track in node
+        .nla_tracks
+        .iter()
+        .filter(|track| !track.mute && (!has_solo || track.solo))
+    {
+        for strip in &track.strips {
+            let Some(action_frame) = strip_action_frame(strip, frame)? else {
+                continue;
+            };
+            let action = doc.actions.get(&strip.action).ok_or_else(|| {
+                PotError::with_details(
+                    ErrorCode::SceneInvalid,
+                    "NLA strip action reference does not exist",
+                    json!({"action":strip.action,"strip":strip.id}),
+                )
+            })?;
+            if let Some(sampled) = sample_scalar_action(action, path, action_frame)? {
+                value = blend_scalar(
+                    value,
+                    sampled,
+                    base_value,
+                    strip.blend_type,
+                    strip_influence(strip, frame)?,
+                );
+                animated = true;
+            }
+        }
+    }
+    if let Some(action_id) = &node.action {
+        let action = doc.actions.get(action_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                "node action reference does not exist",
+                json!({"action":action_id}),
+            )
+        })?;
+        if let Some(sampled) = sample_scalar_action(action, path, frame)? {
+            value = sampled;
+            animated = true;
+        }
+    }
+    if !value.is_finite() {
+        return Err(PotError::with_details(
+            ErrorCode::SceneInvalid,
+            "animated scalar channel evaluated to a non-finite value",
+            json!({"path":path,"frame":frame}),
+        ));
+    }
+    Ok(animated.then_some(value))
+}
+
+fn sample_scalar_action(action: &Action, path: &str, frame: f64) -> Result<Option<f64>> {
+    let mut sampled = None;
+    for (curve_index, curve) in action.fcurves.iter().enumerate() {
+        if u32::try_from(curve_index)
+            .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
+            || curve.path != path
+        {
+            continue;
+        }
+        component_index(curve, 1)?;
+        if let Some(value) = sample_curve(curve, frame)? {
+            sampled = Some(value);
+        }
+    }
+    Ok(sampled)
+}
+
+fn sample_action_transform(
+    node: &Node,
+    doc: &SceneDoc,
+    base: &Transform,
+    action: &crate::model::Action,
+    action_id: &Id,
+    frame: f64,
+    rotation_mode_is_from_blender: bool,
+) -> Result<(Transform, TransformChannels)> {
+    let mut transform = base.clone();
+    let mut channels = TransformChannels::default();
+    let rotation_mode =
+        PoseRotationMode::from_blender(&transform.rotation_mode).unwrap_or_default();
+    let euler_channels_enabled =
+        rotation_mode.euler_order().is_some() || !rotation_mode_is_from_blender;
+    let mut euler = None;
+    let mut axis_angle = None;
+    let mut quaternion = transform.rotation;
+    let mut quaternion_modified = false;
+    for (curve_index, curve) in action.fcurves.iter().enumerate() {
+        if u32::try_from(curve_index)
+            .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
+        {
+            continue;
+        }
+        let Some(value) = sample_curve(curve, frame)? else {
+            continue;
+        };
+        match curve.path.as_str() {
+            "transform.translation" => {
+                let component = component_index(curve, 3)?;
+                transform.translation[component] = value;
+                channels.translation[component] = true;
+            }
+            "transform.scale" => {
+                let component = component_index(curve, 3)?;
+                transform.scale[component] = value;
+                channels.scale[component] = true;
+            }
+            "transform.rotation_quaternion" | "transform.rotation" => {
+                let component = component_index(curve, 4)?;
+                if !rotation_mode_is_from_blender || rotation_mode == PoseRotationMode::Quaternion {
+                    // Potter component order (x, y, z, w); importers map Blender's indices to it.
+                    quaternion[component] = value;
+                    quaternion_modified = true;
+                }
+            }
+            "transform.rotation_euler" => {
+                let component = component_index(curve, 3)?;
+                if euler_channels_enabled {
+                    if euler.is_none() {
+                        let normalized =
+                            normalize_rotation(transform.rotation).map_err(|error| {
+                                PotError::with_details(
+                                    ErrorCode::SceneInvalid,
+                                    error.message,
+                                    json!({ "action": action_id }),
+                                )
+                            })?;
+                        let rotation = DQuat::from_xyzw(
+                            normalized[0],
+                            normalized[1],
+                            normalized[2],
+                            normalized[3],
+                        );
+                        euler = Some(euler_angles_from_quaternion(rotation, rotation_mode));
+                    }
+                    let angles = euler.as_mut().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "Euler channel initialization failed",
+                        )
+                    })?;
+                    angles[component] = value;
+                }
+            }
+            "transform.rotation_axis_angle" => {
+                let component = component_index(curve, 4)?;
+                if !rotation_mode_is_from_blender || rotation_mode == PoseRotationMode::AxisAngle {
+                    if axis_angle.is_none() {
+                        axis_angle = Some(axis_angle_from_rotation(transform.rotation)?);
+                    }
+                    axis_angle.as_mut().ok_or_else(|| {
+                        PotError::new(
+                            ErrorCode::InternalError,
+                            "axis-angle channel initialization failed",
+                        )
+                    })?[component] = value;
+                }
+            }
+            path => {
+                if pose_curve_path(path).is_some() {
+                    if supports_animation_output_for_node(
+                        path,
+                        curve.index,
+                        AnimationOutputKind::Action,
+                        node,
+                        doc,
+                    ) {
+                        continue;
+                    }
+                    let feature_id = format!("animation.fcurve_non_transform_channels.{path}");
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        format!("pose animation path `{path}` does not belong to this node"),
+                        json!({ "feature_id": feature_id, "action": action_id }),
+                    ));
+                }
+                if !supports_animation_output(path, curve.index, AnimationOutputKind::Action) {
+                    let feature_id = format!("animation.fcurve_non_transform_channels.{path}");
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        format!("animation curve path `{path}` is not supported"),
+                        json!({ "feature_id": feature_id, "action": action_id }),
+                    ));
+                }
+                if let Some(component_count) = non_transform_component_count(path, node, doc) {
+                    component_index(curve, component_count)?;
+                } else {
+                    let feature_id = format!("animation.fcurve_non_transform_channels.{path}");
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        format!("animation curve path `{path}` does not belong to this node"),
+                        json!({ "feature_id": feature_id, "action": action_id }),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some([angle_x, angle_y, angle_z]) = euler {
+        let rotation = quaternion_from_euler_angles([angle_x, angle_y, angle_z], rotation_mode);
+        transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
+        channels.rotation = true;
+    }
+    if let Some(axis_angle) = axis_angle {
+        let rotation = axis_angle_quaternion(axis_angle);
+        transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
+        channels.rotation = true;
+    }
+    if quaternion_modified {
+        transform.rotation = quaternion;
+        channels.rotation = true;
+    }
+    if channels.rotation {
+        transform.rotation = normalize_rotation(transform.rotation).map_err(|error| {
+            PotError::with_details(
+                ErrorCode::SceneInvalid,
+                error.message,
+                json!({ "action": action_id }),
+            )
+        })?;
+    }
+    Ok((transform, channels))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnimationOutputKind {
+    Action,
+    Driver,
+}
+
+pub(crate) fn animation_output_component_count(
+    path: &str,
+    kind: AnimationOutputKind,
+) -> Option<usize> {
+    match kind {
+        AnimationOutputKind::Action => action_output_component_count(path),
+        AnimationOutputKind::Driver => driver_output_component_count(path),
+    }
+}
+
+/// The common path/index policy for Action F-Curves and driver outputs.
+pub(crate) fn supports_animation_output(path: &str, index: u32, kind: AnimationOutputKind) -> bool {
+    animation_output_component_count(path, kind)
+        .is_some_and(|count| usize::try_from(index).is_ok_and(|index| index < count))
+}
+
+/// Checks a supported output against the data and concrete node owner.
+pub(crate) fn supports_animation_output_for_node(
+    path: &str,
+    index: u32,
+    kind: AnimationOutputKind,
+    node: &Node,
+    doc: &SceneDoc,
+) -> bool {
+    if !supports_animation_output(path, index, kind) {
+        return false;
+    }
+    let data = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id));
+    match path {
+        "camera.lens_mm" | "lens" | "data.lens" => {
+            if data.and_then(|data| data.camera.as_ref()).is_none() {
+                return false;
+            }
+        }
+        "light.energy" | "energy" | "data.energy" => {
+            if data.and_then(|data| data.light.as_ref()).is_none() {
+                return false;
+            }
+        }
+        "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time" => {
+            if data.and_then(|data| data.shape_keys.as_ref()).is_none() {
+                return false;
+            }
+        }
+        _ if path.strip_suffix(".value").is_some()
+            && (path.starts_with("shape_key.")
+                || path.starts_with("shape_keys.")
+                || path.starts_with("key_blocks["))
+            && !data
+                .and_then(|data| data.shape_keys.as_ref())
+                .is_some_and(|shape_keys| {
+                    crate::eval::rig::shape_key_id_from_path(shape_keys, path).is_some()
+                }) =>
+        {
+            return false;
+        }
+        _ => {}
+    }
+    if pose_channel_suffix(path).is_some() {
+        let Some(armature) = data.and_then(|data| data.armature.as_ref()) else {
+            return false;
+        };
+        let Some(bone_id) = pose_bone_id_from_path(path) else {
+            return false;
+        };
+        if !armature.bones.contains_key(&bone_id) {
+            return false;
+        }
+    }
+    true
+}
+/// Returns whether this node has an active camera-lens Action, NLA, or driver channel.
+pub(crate) fn node_has_camera_lens_animation(node: &Node, doc: &SceneDoc) -> bool {
+    let is_lens_channel = |path: &str, index: u32, kind| {
+        matches!(path, "camera.lens_mm" | "lens" | "data.lens")
+            && supports_animation_output_for_node("camera.lens_mm", index, kind, node, doc)
+    };
+    let action_has_lens_channel = |action: &Action| {
+        action
+            .fcurves
+            .iter()
+            .any(|curve| is_lens_channel(&curve.path, curve.index, AnimationOutputKind::Action))
+    };
+
+    if node
+        .action
+        .as_ref()
+        .and_then(|action_id| doc.actions.get(action_id))
+        .is_some_and(action_has_lens_channel)
+    {
+        return true;
+    }
+
+    let has_solo = node
+        .nla_tracks
+        .iter()
+        .any(|track| track.solo && !track.mute);
+    if node
+        .nla_tracks
+        .iter()
+        .filter(|track| !track.mute && (!has_solo || track.solo))
+        .flat_map(|track| track.strips.iter())
+        .filter_map(|strip| doc.actions.get(&strip.action))
+        .any(action_has_lens_channel)
+    {
+        return true;
+    }
+
+    node.drivers
+        .iter()
+        .any(|driver| is_lens_channel(&driver.path, driver.index, AnimationOutputKind::Driver))
+}
+
+fn action_output_component_count(path: &str) -> Option<usize> {
+    match path {
+        "transform.translation" | "transform.scale" | "transform.rotation_euler" => Some(3),
+        "transform.rotation_quaternion"
+        | "transform.rotation_axis_angle"
+        | "transform.rotation" => Some(4),
+        "camera.lens_mm"
+        | "light.energy"
+        | "shape_keys.evaluation_time"
+        | "shape_key.evaluation_time"
+        | "key_blocks.eval_time" => Some(1),
+        _ if pose_channel_suffix(path).is_some_and(|channel| {
+            matches!(
+                channel,
+                "location"
+                    | "translation"
+                    | "scale"
+                    | "rotation"
+                    | "rotation_quaternion"
+                    | "rotation_euler"
+                    | "rotation_axis_angle"
+            )
+        }) =>
+        {
+            pose_channel_suffix(path).map(|channel| {
+                if matches!(
+                    channel,
+                    "rotation" | "rotation_quaternion" | "rotation_axis_angle"
+                ) {
+                    4
+                } else {
+                    3
+                }
+            })
+        }
+        _ if shape_key_value_path(path) => Some(1),
+        _ => None,
+    }
+}
+
+fn driver_output_component_count(path: &str) -> Option<usize> {
+    match path {
+        "location"
+        | "translation"
+        | "transform.location"
+        | "transform.translation"
+        | "scale"
+        | "transform.scale"
+        | "rotation_euler"
+        | "transform.rotation_euler" => Some(3),
+        "rotation"
+        | "transform.rotation"
+        | "rotation_quaternion"
+        | "transform.rotation_quaternion" => Some(4),
+        "camera.lens_mm"
+        | "light.energy"
+        | "shape_keys.evaluation_time"
+        | "shape_key.evaluation_time"
+        | "key_blocks.eval_time" => Some(1),
+        _ if pose_channel_suffix(path).is_some_and(|channel| {
+            matches!(
+                channel,
+                "location"
+                    | "translation"
+                    | "scale"
+                    | "rotation"
+                    | "bbone_curveinx"
+                    | "bbone_curveinz"
+                    | "bbone_curveoutx"
+                    | "bbone_curveoutz"
+                    | "bbone_rollin"
+                    | "bbone_rollout"
+                    | "bbone_scalein"
+                    | "bbone_scaleout"
+                    | "bbone_easein"
+                    | "bbone_easeout"
+            )
+        }) =>
+        {
+            pose_channel_suffix(path).map(|channel| {
+                if channel == "rotation" {
+                    4
+                } else if matches!(
+                    channel,
+                    "location" | "translation" | "scale" | "bbone_scalein" | "bbone_scaleout"
+                ) {
+                    3
+                } else {
+                    1
+                }
+            })
+        }
+        _ if shape_key_value_path(path) => Some(1),
+        _ => None,
+    }
+}
+
+fn pose_channel_suffix(path: &str) -> Option<&str> {
+    if let Some(start) = path.find("pose.bones[") {
+        let rest = &path[start + "pose.bones[".len()..];
+        let end = rest.find(']')?;
+        Some(rest[end + 1..].trim_start_matches('.'))
+    } else {
+        path.strip_prefix("pose.")
+            .and_then(|rest| rest.split_once('.').map(|(_, channel)| channel))
+    }
+}
+fn pose_bone_id_from_path(path: &str) -> Option<Id> {
+    let key = if let Some(start) = path.find("pose.bones[") {
+        let rest = &path[start + "pose.bones[".len()..];
+        let end = rest.find(']')?;
+        rest[..end].trim_matches(['"', '\''])
+    } else {
+        path.strip_prefix("pose.")?.split_once('.')?.0
+    };
+    Id::new(key).ok()
+}
+
+fn shape_key_value_path(path: &str) -> bool {
+    path.strip_suffix(".value").is_some_and(|base| {
+        (base.starts_with("shape_key.") || base.starts_with("shape_keys."))
+            && base.split('.').count() == 2
+            || base.starts_with("key_blocks[") && base.ends_with(']')
+    })
+}
+
 /// Evaluate one ID-bound modifier scalar through the node's NLA tracks and active action.
 ///
 /// The optional result distinguishes an unanimated property from an animated value equal to its
@@ -460,134 +966,6 @@ pub(crate) fn quaternion_from_euler_angles(
     )
 }
 
-fn sample_action_transform(
-    base: &Transform,
-    action: &crate::model::Action,
-    action_id: &Id,
-    frame: f64,
-    rotation_mode_is_from_blender: bool,
-) -> Result<(Transform, TransformChannels)> {
-    let mut transform = base.clone();
-    let mut channels = TransformChannels::default();
-    let rotation_mode =
-        PoseRotationMode::from_blender(&transform.rotation_mode).unwrap_or_default();
-    let euler_channels_enabled =
-        rotation_mode.euler_order().is_some() || !rotation_mode_is_from_blender;
-    let mut euler = None;
-    let mut axis_angle = None;
-    let mut quaternion = transform.rotation;
-    let mut quaternion_modified = false;
-    for (curve_index, curve) in action.fcurves.iter().enumerate() {
-        if u32::try_from(curve_index)
-            .is_ok_and(|index| action.modifier_bindings.contains_key(&index))
-        {
-            continue;
-        }
-        let Some(value) = sample_curve(curve, frame)? else {
-            continue;
-        };
-        match curve.path.as_str() {
-            "transform.translation" => {
-                let component = component_index(curve, 3)?;
-                transform.translation[component] = value;
-                channels.translation[component] = true;
-            }
-            "transform.scale" => {
-                let component = component_index(curve, 3)?;
-                transform.scale[component] = value;
-                channels.scale[component] = true;
-            }
-            "transform.rotation_quaternion" | "transform.rotation" => {
-                let component = component_index(curve, 4)?;
-                if !rotation_mode_is_from_blender || rotation_mode == PoseRotationMode::Quaternion {
-                    // Potter component order (x, y, z, w); importers map Blender's indices to it.
-                    quaternion[component] = value;
-                    quaternion_modified = true;
-                }
-            }
-            "transform.rotation_euler" => {
-                let component = component_index(curve, 3)?;
-                if euler_channels_enabled {
-                    if euler.is_none() {
-                        let normalized =
-                            normalize_rotation(transform.rotation).map_err(|error| {
-                                PotError::with_details(
-                                    ErrorCode::SceneInvalid,
-                                    error.message,
-                                    json!({ "action": action_id }),
-                                )
-                            })?;
-                        let rotation = DQuat::from_xyzw(
-                            normalized[0],
-                            normalized[1],
-                            normalized[2],
-                            normalized[3],
-                        );
-                        euler = Some(euler_angles_from_quaternion(rotation, rotation_mode));
-                    }
-                    let angles = euler.as_mut().ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InternalError,
-                            "Euler channel initialization failed",
-                        )
-                    })?;
-                    angles[component] = value;
-                }
-            }
-            "transform.rotation_axis_angle" => {
-                let component = component_index(curve, 4)?;
-                if !rotation_mode_is_from_blender || rotation_mode == PoseRotationMode::AxisAngle {
-                    if axis_angle.is_none() {
-                        axis_angle = Some(axis_angle_from_rotation(transform.rotation)?);
-                    }
-                    axis_angle.as_mut().ok_or_else(|| {
-                        PotError::new(
-                            ErrorCode::InternalError,
-                            "axis-angle channel initialization failed",
-                        )
-                    })?[component] = value;
-                }
-            }
-            path => {
-                if let Some(component_count) = non_transform_component_count(path) {
-                    component_index(curve, component_count)?;
-                } else if pose_curve_path(path).is_none() {
-                    let feature_id = format!("animation.fcurve_non_transform_channels.{path}");
-                    return Err(PotError::with_details(
-                        ErrorCode::UnsupportedFeature,
-                        format!("animation curve path `{path}` is not supported"),
-                        json!({ "feature_id": feature_id, "action": action_id }),
-                    ));
-                }
-            }
-        }
-    }
-    if let Some([angle_x, angle_y, angle_z]) = euler {
-        let rotation = quaternion_from_euler_angles([angle_x, angle_y, angle_z], rotation_mode);
-        transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
-        channels.rotation = true;
-    }
-    if let Some(axis_angle) = axis_angle {
-        let rotation = axis_angle_quaternion(axis_angle);
-        transform.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
-        channels.rotation = true;
-    }
-    if quaternion_modified {
-        transform.rotation = quaternion;
-        channels.rotation = true;
-    }
-    if channels.rotation {
-        transform.rotation = normalize_rotation(transform.rotation).map_err(|error| {
-            PotError::with_details(
-                ErrorCode::SceneInvalid,
-                error.message,
-                json!({ "action": action_id }),
-            )
-        })?;
-    }
-    Ok((transform, channels))
-}
-
 fn axis_angle_from_rotation(rotation: [f64; 4]) -> Result<[f64; 4]> {
     let normalized = normalize_rotation(rotation)
         .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))?;
@@ -798,7 +1176,7 @@ pub fn animated_pose_bones(
                 )
             })?;
             let (sampled, channels) =
-                sample_action_pose(&pose, action, &strip.action, action_frame)?;
+                sample_action_pose(node, doc, &pose, action, &strip.action, action_frame)?;
             blend_pose(
                 &mut pose,
                 &sampled,
@@ -816,7 +1194,7 @@ pub fn animated_pose_bones(
                 json!({ "action": action_id }),
             )
         })?;
-        let (sampled, channels) = sample_action_pose(&pose, action, action_id, frame)?;
+        let (sampled, channels) = sample_action_pose(node, doc, &pose, action, action_id, frame)?;
         blend_pose(&mut pose, &sampled, channels, NlaBlendType::Replace, 1.0)?;
     }
     Ok(pose)
@@ -868,6 +1246,8 @@ fn pose_euler_order(rotation_mode: Option<PoseRotationMode>) -> Option<EulerRot>
     }
 }
 fn sample_action_pose(
+    node: &Node,
+    doc: &SceneDoc,
     base: &BTreeMap<Id, PoseBone>,
     action: &crate::model::Action,
     action_id: &Id,
@@ -881,6 +1261,23 @@ fn sample_action_pose(
         let Some((bone_id, channel)) = pose_curve_path(&curve.path) else {
             continue;
         };
+        if !supports_animation_output_for_node(
+            &curve.path,
+            curve.index,
+            AnimationOutputKind::Action,
+            node,
+            doc,
+        ) {
+            let feature_id = format!("animation.fcurve_non_transform_channels.{}", curve.path);
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "animation curve path `{}` is not supported by this pose bone",
+                    curve.path
+                ),
+                json!({ "feature_id": feature_id, "action": action_id }),
+            ));
+        }
         let component_count = match channel {
             PoseChannel::Translation | PoseChannel::Scale | PoseChannel::RotationEuler => 3,
             PoseChannel::Rotation | PoseChannel::RotationAxisAngle => 4,
@@ -1048,27 +1445,11 @@ fn blend_rotation(
         .map_err(|error| PotError::new(ErrorCode::SceneInvalid, error.message))
 }
 
-fn non_transform_component_count(path: &str) -> Option<usize> {
-    match path {
-        "visible"
-        | "camera.lens_mm"
-        | "light.energy"
-        | "shape_keys.evaluation_time"
-        | "shape_key.evaluation_time"
-        | "key_blocks.eval_time" => Some(1),
-        path if (path.starts_with("shape_key.")
-            || path.starts_with("shape_keys.")
-            || path.starts_with("key_blocks["))
-            && path.strip_suffix(".value").is_some() =>
-        {
-            Some(1)
-        }
-        _ => path
-            .strip_prefix("material.")
-            .and_then(|rest| rest.strip_suffix(".base_color"))
-            .filter(|id| crate::model::is_valid_id(id))
-            .map(|_| 4),
+fn non_transform_component_count(path: &str, node: &Node, doc: &SceneDoc) -> Option<usize> {
+    if !supports_animation_output_for_node(path, 0, AnimationOutputKind::Action, node, doc) {
+        return None;
     }
+    animation_output_component_count(path, AnimationOutputKind::Action)
 }
 
 fn component_index(curve: &FCurve, count: usize) -> Result<usize> {
@@ -1482,7 +1863,27 @@ mod tests {
                 ..Action::default()
             },
         );
-        let animated = animated_pose_bones(&node(Some(action_id)), &doc, 6.0).unwrap();
+        let data_id = Id::new("armature_data").unwrap();
+        let _ = doc.data_blocks.insert(
+            data_id.clone(),
+            crate::model::DataBlock {
+                armature: Some(crate::model::ArmatureData {
+                    bones: std::collections::BTreeMap::from([(
+                        bone_id.clone(),
+                        serde_json::from_value(serde_json::json!({
+                            "name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]
+                        }))
+                        .unwrap(),
+                    )]),
+                    ..crate::model::ArmatureData::default()
+                }),
+                ..crate::model::DataBlock::default()
+            },
+        );
+        let mut animated_node = node(Some(action_id));
+        animated_node.kind = "armature".to_owned();
+        animated_node.data = Some(data_id);
+        let animated = animated_pose_bones(&animated_node, &doc, 6.0).unwrap();
         assert_eq!(
             animated[&bone_id],
             PoseBone {
@@ -1490,6 +1891,44 @@ mod tests {
                 ..PoseBone::default()
             }
         );
+        let euler_action_id = Id::new("pose_euler_action").unwrap();
+        let _ = doc.actions.insert(
+            euler_action_id.clone(),
+            Action {
+                name: "Pose Euler".to_owned(),
+                fcurves: vec![FCurve {
+                    path: "pose.bone_arm.rotation_euler".to_owned(),
+                    index: 0,
+                    keyframes: vec![Keyframe {
+                        frame: 1.0,
+                        value: 0.5,
+                        interpolation: Interpolation::Linear,
+                        ..Keyframe::default()
+                    }],
+                    auto_smoothing: None,
+                    extrapolation: Extrapolation::Constant,
+                    modifiers: Vec::new(),
+                }],
+                ..Action::default()
+            },
+        );
+        let mut rotation_node = animated_node.clone();
+        rotation_node.action = Some(euler_action_id);
+        rotation_node.pose.insert(
+            bone_id.clone(),
+            PoseBone {
+                rotation_mode: Some(crate::model::PoseRotationMode::Quaternion),
+                ..PoseBone::default()
+            },
+        );
+        let quaternion_pose = animated_pose_bones(&rotation_node, &doc, 1.0).unwrap();
+        assert_eq!(
+            quaternion_pose[&bone_id].rotation,
+            PoseBone::default().rotation
+        );
+        rotation_node.pose.get_mut(&bone_id).unwrap().rotation_mode =
+            Some(crate::model::PoseRotationMode::Xyz);
+        assert!(animated_pose_bones(&rotation_node, &doc, 1.0).is_ok());
     }
 
     #[test]
@@ -1874,6 +2313,46 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn unsupported_non_transform_action_path_is_refused() {
+        let node_id = Id::new("unsupported_channel_node").unwrap();
+        let action_id = Id::new("unsupported_channel_action").unwrap();
+        let subject = node(Some(action_id.clone()));
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        doc.nodes.insert(node_id, subject.clone());
+        let mut curve = curve(
+            vec![
+                Keyframe {
+                    frame: 1.0,
+                    value: 1.0,
+                    ..Keyframe::default()
+                },
+                Keyframe {
+                    frame: 2.0,
+                    value: 0.0,
+                    ..Keyframe::default()
+                },
+            ],
+            Extrapolation::Constant,
+        );
+        curve.path = "visible".to_owned();
+        doc.actions.insert(
+            action_id,
+            Action {
+                name: "Unsupported Visibility".to_owned(),
+                fcurves: vec![curve],
+                ..Action::default()
+            },
+        );
+
+        let error = animated_transform(&subject, &doc, 1.0).unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            serde_json::json!("animation.fcurve_non_transform_channels.visible")
+        );
     }
 
     #[test]

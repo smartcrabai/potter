@@ -22,8 +22,8 @@ use crate::{
     hash,
     model::{
         ArmatureData, CameraData, ConstraintType, CurveData, CurveFillMode, CurveFillRule,
-        CurveFillSolver, DataBlock, Id, Modifier, Node, Scene, SceneDoc, TextureCoordinateMapping,
-        TrackAxis, VertexGroup,
+        CurveFillSolver, DataBlock, Id, LightData, Modifier, Node, Scene, SceneDoc,
+        TextureCoordinateMapping, TrackAxis, VertexGroup,
     },
     params::{self, ParameterFamily},
 };
@@ -160,6 +160,7 @@ fn adaptive_render_context<'a>(
     scene: &'a Scene,
     matrices: &BTreeMap<Id, DMat4>,
     request: &'a AdaptiveRenderRequest,
+    evaluated_camera: Option<&'a CameraData>,
 ) -> Result<AdaptiveRenderContext<'a>> {
     if request.resolution.contains(&0)
         || !request.dicing_rate.is_finite()
@@ -214,7 +215,7 @@ fn adaptive_render_context<'a>(
             ));
         }
         Some(AdaptiveRenderCamera {
-            data,
+            data: evaluated_camera.unwrap_or(data),
             world_to_camera,
         })
     } else {
@@ -255,6 +256,62 @@ pub struct EvaluatedNode {
     /// subject. Not serialized.
     #[serde(skip)]
     pub mesh_materials: Vec<Option<Id>>,
+    /// Camera data after evaluating supported Action or driver channels.
+    #[serde(skip)]
+    pub(crate) evaluated_camera: Option<CameraData>,
+    /// Light data after evaluating supported Action or driver channels.
+    #[serde(skip)]
+    pub(crate) evaluated_light: Option<LightData>,
+}
+
+/// Blender's `Camera.lens` RNA property clamps sampled and driven values to 1 mm.
+pub(crate) fn clamp_camera_lens(lens_mm: f64) -> f64 {
+    if lens_mm < 1.0 { 1.0 } else { lens_mm }
+}
+
+fn evaluated_data_blocks(
+    node_id: &Id,
+    node: &Node,
+    doc: &SceneDoc,
+    frame: f64,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
+) -> Result<(Option<CameraData>, Option<LightData>)> {
+    let Some(data) = node
+        .data
+        .as_ref()
+        .and_then(|data_id| doc.data_blocks.get(data_id))
+    else {
+        return Ok((None, None));
+    };
+    let evaluate_channel = |path: &str, base: f64| {
+        let action_value = animation::animated_scalar_channel(node, doc, path, base, frame)?;
+        let driver_value =
+            driver_values
+                .iter()
+                .find_map(|((target, driver_path, index), value)| {
+                    (target == node_id && driver_path == path && *index == 0).then_some(*value)
+                });
+        Ok::<_, PotError>(driver_value.or(action_value))
+    };
+    let camera = if let Some(camera) = data.camera.as_ref() {
+        evaluate_channel("camera.lens_mm", camera.lens_mm)?.map(|lens_mm| {
+            let mut evaluated = camera.clone();
+            evaluated.lens_mm = clamp_camera_lens(lens_mm);
+            evaluated
+        })
+    } else {
+        None
+    };
+    let light = if let Some(light) = data.light.as_ref() {
+        evaluate_channel("light.energy", light.energy)?.map(|energy| {
+            let mut evaluated = light.clone();
+            evaluated.energy = energy;
+            evaluated
+        })
+    } else {
+        None
+    };
+    Ok((camera, light))
 }
 
 /// Evaluated world-space Grease Pencil stroke used by vector exporters and preview.
@@ -1032,10 +1089,30 @@ impl Snapshot {
             scene.fps_base,
             session,
         )?;
+        let adaptive_camera_data = if let Some(request) = context.adaptive_render.as_ref()
+            && let Some(camera_id) = scene
+                .render
+                .dicing_camera
+                .as_ref()
+                .or(request.camera_id.as_ref())
+            && let Some(camera_node) = doc.nodes.get(camera_id)
+        {
+            evaluated_data_blocks(camera_id, camera_node, doc, frame, driver_values)?.0
+        } else {
+            None
+        };
         let adaptive_render = context
             .adaptive_render
             .as_ref()
-            .map(|request| adaptive_render_context(doc, scene, &matrices, request))
+            .map(|request| {
+                adaptive_render_context(
+                    doc,
+                    scene,
+                    &matrices,
+                    request,
+                    adaptive_camera_data.as_ref(),
+                )
+            })
             .transpose()?;
         let object_meshes: BTreeMap<_, _> = doc
             .nodes
@@ -2226,6 +2303,8 @@ impl Snapshot {
             } else {
                 None
             };
+            let (evaluated_camera, evaluated_light) =
+                evaluated_data_blocks(id, node, doc, frame, driver_values)?;
             let dimensions = bounds.map(|bounds| bounds.size().to_array());
             nodes.insert(
                 id.clone(),
@@ -2235,6 +2314,8 @@ impl Snapshot {
                     dimensions,
                     materials: effective_material_slots(node, &node_materials),
                     mesh_materials: node_materials,
+                    evaluated_camera,
+                    evaluated_light,
                 },
             );
         }
@@ -3928,6 +4009,20 @@ pub(crate) fn resolve_modifier_object_operands(
                 .data
                 .as_ref()
                 .and_then(|data_id| doc.data_blocks.get(data_id));
+            if modifier.modifier_type == "uv_project"
+                && data_block.is_some_and(|data| data.data_type == "camera")
+                && crate::eval::animation::node_has_camera_lens_animation(object, doc)
+            {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "UV Project does not evaluate cameras with animated or driven lenses",
+                    json!({
+                        "feature_id":"modifier.uv_project.animated_camera_lens",
+                        "modifier_id":modifier.id,
+                        "object":object_id,
+                    }),
+                ));
+            }
             if modifier.modifier_type == "data_transfer"
                 && data_block.is_none_or(|data| data.data_type != "mesh")
             {
@@ -4104,10 +4199,11 @@ fn operand_local_to_subject(
     })
 }
 
-/// Evaluate an attribute modifier against its resolved scene operands. `bone_matrices` supplies
-/// the pose-bone world matrices that `uv_warp` bone references read; `bone_pose_matrices` supplies
-/// the raw pose matrices that texture mapping through `mask_tex_map_bone` reads. `project_root`
-/// resolves image mask textures.
+/// Evaluate an attribute modifier against its resolved scene operands.
+///
+/// `bone_matrices` supplies the pose-bone world matrices that `uv_warp` bone references read;
+/// `bone_pose_matrices` supplies the raw pose matrices that texture mapping through
+/// `mask_tex_map_bone` reads. `project_root` resolves image mask textures.
 pub(crate) fn apply_scene_attribute_modifier(
     mesh: &mut Mesh,
     modifier: &Modifier,
@@ -8357,6 +8453,8 @@ mod tests {
                 dimensions: None,
                 materials: Vec::new(),
                 mesh_materials: Vec::new(),
+                evaluated_camera: None,
+                evaluated_light: None,
             },
         )]);
         let mut adaptive_normals = BTreeMap::new();

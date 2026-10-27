@@ -2164,6 +2164,36 @@ fn vertex_group_remove(engine: &mut Engine<'_>, operation: &Map<String, Value>) 
     Ok(changed)
 }
 
+fn validate_driver_output_path(
+    engine: &Engine<'_>,
+    node_id: &Id,
+    path: &str,
+    index: u32,
+    field: &str,
+) -> Result<()> {
+    let node = engine.doc.nodes.get(node_id).ok_or_else(|| {
+        engine.error(
+            ErrorCode::TargetNotFound,
+            format!("driver owner node `{node_id}` was not found"),
+            &pointer(engine, "target"),
+        )
+    })?;
+    if !crate::eval::animation::supports_animation_output_for_node(
+        path,
+        index,
+        crate::eval::animation::AnimationOutputKind::Driver,
+        node,
+        engine.doc,
+    ) {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("driver output path `{path}` is not supported by node `{node_id}`"),
+            &pointer(engine, field),
+        ));
+    }
+    Ok(())
+}
+
 fn driver_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     check_fields(
         engine,
@@ -2196,6 +2226,7 @@ fn driver_create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
             .ok_or_else(|| invalid(engine, "index is required", "index"))?,
         "index",
     )?;
+    validate_driver_output_path(engine, &node_id, &path, index, "path")?;
     let driver_type = driver_type(
         engine,
         operation
@@ -2278,6 +2309,7 @@ fn driver_update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
         .map(|value| u32_value(engine, value, "set/index"))
         .transpose()?
         .unwrap_or(old.index);
+    validate_driver_output_path(engine, &node_id, &path, index, "set/path")?;
     let driver_type = set
         .get("type")
         .map(|value| driver_type(engine, value, "set/type"))

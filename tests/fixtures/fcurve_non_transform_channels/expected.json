@@ -1,0 +1,68 @@
+{
+  "blender_version": "5.2.2 LTS",
+  "base": {
+    "camera_lens_mm": 35.0,
+    "light_energy": 75.0,
+    "driven_camera_lens_mm": 55.0,
+    "scene_driver_light_energy": 2.0,
+    "data_target_camera_lens_mm": 24.0
+  },
+  "frames": {
+    "2": {
+      "camera_lens_mm": 39.5555534362793,
+      "light_energy": 80.0,
+      "driven_camera_lens_mm": 11.0,
+      "scene_driver_light_energy": 4.0,
+      "data_target_camera_lens_mm": 39.5555534362793
+    },
+    "3": {
+      "camera_lens_mm": 68.44444274902344,
+      "light_energy": 140.0,
+      "driven_camera_lens_mm": 16.0,
+      "scene_driver_light_energy": 6.0,
+      "data_target_camera_lens_mm": 68.44444274902344
+    },
+    "4": {
+      "camera_lens_mm": 84.0,
+      "light_energy": 200.0,
+      "driven_camera_lens_mm": 21.0,
+      "scene_driver_light_energy": 8.0,
+      "data_target_camera_lens_mm": 84.0
+    },
+    "5": {
+      "camera_lens_mm": 73.11111450195312,
+      "light_energy": 260.0,
+      "driven_camera_lens_mm": 26.0,
+      "scene_driver_light_energy": 10.0,
+      "data_target_camera_lens_mm": 73.11111450195312
+    },
+    "6": {
+      "camera_lens_mm": 52.888885498046875,
+      "light_energy": 320.0,
+      "driven_camera_lens_mm": 31.0,
+      "scene_driver_light_energy": 12.0,
+      "data_target_camera_lens_mm": 52.888885498046875
+    },
+    "7": {
+      "camera_lens_mm": 42.0,
+      "light_energy": 380.0,
+      "driven_camera_lens_mm": 31.0,
+      "scene_driver_light_energy": 14.0,
+      "data_target_camera_lens_mm": 42.0
+    },
+    "8": {
+      "camera_lens_mm": 39.5555534362793,
+      "light_energy": 440.0,
+      "driven_camera_lens_mm": 31.0,
+      "scene_driver_light_energy": 16.0,
+      "data_target_camera_lens_mm": 39.5555534362793
+    },
+    "10": {
+      "camera_lens_mm": 84.0,
+      "light_energy": 560.0,
+      "driven_camera_lens_mm": 31.0,
+      "scene_driver_light_energy": 20.0,
+      "data_target_camera_lens_mm": 84.0
+    }
+  }
+}
