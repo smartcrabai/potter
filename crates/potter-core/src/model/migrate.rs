@@ -84,7 +84,10 @@ fn parse_scene_inner(bytes: &[u8], root: &Path, retain_original_hash: bool) -> R
     let mut value = parse_value(bytes)?;
     let source_schema_version = value.get("schema_version").and_then(Value::as_u64);
     // Load-time migrations preserve original bytes while the upgraded scene is first committed.
-    let mut legacy = source_schema_version == Some(1) || has_legacy_mesh_deform_bind(&value);
+    let mut legacy = source_schema_version == Some(1)
+        || has_legacy_mesh_deform_bind(&value)
+        || (source_schema_version.is_some_and(|version| version <= 11)
+            && has_refused_animation_outputs(&value));
     let source_hash = if retain_original_hash
         && (legacy
             || (source_schema_version.is_some_and(|version| version < 10)
@@ -295,8 +298,8 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 10, converting superseded modifier binds on
-/// the way. `root` is the project directory that holds the document's image blobs and linked sources,
+/// Upgrades a scene document in place through schema version 11 before retiring unsupported animation
+/// outputs in version 12. `root` is the project directory that holds the document's image blobs and linked sources,
 /// which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
@@ -331,6 +334,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(10) {
         upgrade_v10(value);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(11) {
+        warnings.extend(upgrade_v11(value)?);
     }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
@@ -912,6 +918,440 @@ fn upgrade_v10(value: &mut Value) {
     value["schema_version"] = json!(11);
 }
 
+fn upgrade_v11(value: &mut Value) -> Result<Vec<Value>> {
+    let action_keep = value
+        .get("actions")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|actions| actions.iter())
+        .map(|(action_id, action)| {
+            let keep = action
+                .get("fcurves")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, curve)| legacy_action_curve_supported(value, action_id, index, curve))
+                .collect::<Vec<_>>();
+            (action_id.clone(), keep)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let driver_keep = value
+        .get("nodes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|nodes| nodes.iter())
+        .map(|(node_id, node)| {
+            let keep = node
+                .get("drivers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|driver| legacy_driver_output_supported(value, node_id, node, driver))
+                .collect::<Vec<_>>();
+            (node_id.clone(), keep)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut preserved = Vec::new();
+    let mut warnings = Vec::new();
+    if let Some(actions) = value.get_mut("actions").and_then(Value::as_object_mut) {
+        for (action_id, action) in actions {
+            let Some(keep) = action_keep.get(action_id) else {
+                continue;
+            };
+            let Some(curves) = action.get_mut("fcurves").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            if keep.iter().all(|keep| *keep) {
+                continue;
+            }
+            let old_curves = std::mem::take(curves);
+            let old_bindings = action
+                .get("modifier_bindings")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut new_curves = Vec::with_capacity(old_curves.len());
+            let mut new_bindings = Map::new();
+            for (index, curve) in old_curves.into_iter().enumerate() {
+                if keep.get(index).copied().unwrap_or(false) {
+                    if let (Ok(old_index), Ok(new_index)) =
+                        (u32::try_from(index), u32::try_from(new_curves.len()))
+                        && let Some(bindings) = old_bindings.get(&old_index.to_string())
+                    {
+                        new_bindings.insert(new_index.to_string(), bindings.clone());
+                    }
+                    new_curves.push(curve);
+                    continue;
+                }
+                let path = curve
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                preserved.push(json!({
+                    "kind":"action_fcurve",
+                    "action_id":action_id,
+                    "curve_index":index,
+                    "path":path,
+                    "curve":curve,
+                }));
+                warnings.push(unsupported_animation_warning("action", action_id, path));
+            }
+            if let Some(action) = action.as_object_mut() {
+                action.insert("fcurves".to_owned(), Value::Array(new_curves));
+                if !old_bindings.is_empty() || action.contains_key("modifier_bindings") {
+                    action.insert("modifier_bindings".to_owned(), Value::Object(new_bindings));
+                }
+            }
+        }
+    }
+    if let Some(nodes) = value.get_mut("nodes").and_then(Value::as_object_mut) {
+        for (node_id, node) in nodes {
+            let Some(keep) = driver_keep.get(node_id) else {
+                continue;
+            };
+            let Some(drivers) = node.get_mut("drivers").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            if keep.iter().all(|keep| *keep) {
+                continue;
+            }
+            let old_drivers = std::mem::take(drivers);
+            let mut new_drivers = Vec::with_capacity(old_drivers.len());
+            for (index, driver) in old_drivers.into_iter().enumerate() {
+                if keep.get(index).copied().unwrap_or(false) {
+                    new_drivers.push(driver);
+                    continue;
+                }
+                let path = driver
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                preserved.push(json!({
+                    "kind":"driver",
+                    "node_id":node_id,
+                    "driver_index":index,
+                    "path":path,
+                    "driver":driver,
+                }));
+                warnings.push(unsupported_animation_warning("driver", node_id, path));
+            }
+            if let Some(node) = node.as_object_mut() {
+                node.insert("drivers".to_owned(), Value::Array(new_drivers));
+            }
+        }
+    }
+    if !preserved.is_empty() {
+        preserve_unsupported_animation_outputs(value, preserved)?;
+    }
+    value["schema_version"] = json!(12);
+    Ok(warnings)
+}
+
+fn unsupported_animation_warning(kind: &str, owner_id: &str, path: &str) -> Value {
+    json!({
+        "code":"animation.unsupported_output_migrated",
+        "feature_id":format!("animation.fcurve_non_transform_channels.{path}"),
+        "message":format!(
+            "The version-11 {kind} output `{path}` on `{owner_id}` is unsupported; it was moved to compatibility.animation.unsupported_outputs and is no longer evaluated"
+        ),
+        "owner_id":owner_id,
+        "path":path,
+    })
+}
+
+fn preserve_unsupported_animation_outputs(value: &mut Value, entries: Vec<Value>) -> Result<()> {
+    let document = value
+        .as_object_mut()
+        .ok_or_else(|| invalid("scene document must be an object"))?;
+    let compatibility = document
+        .entry("compatibility".to_owned())
+        .or_insert_with(|| json!({}));
+    let compatibility = compatibility
+        .as_object_mut()
+        .ok_or_else(|| invalid("scene compatibility data must be an object"))?;
+    let animation = compatibility
+        .entry("animation".to_owned())
+        .or_insert_with(|| json!({}));
+    let animation = animation
+        .as_object_mut()
+        .ok_or_else(|| invalid("animation compatibility data must be an object"))?;
+    let outputs = animation
+        .entry("unsupported_outputs".to_owned())
+        .or_insert_with(|| json!([]));
+    let outputs = outputs
+        .as_array_mut()
+        .ok_or_else(|| invalid("animation unsupported_outputs must be an array"))?;
+    outputs.extend(entries);
+    Ok(())
+}
+
+fn has_refused_animation_outputs(value: &Value) -> bool {
+    value
+        .get("actions")
+        .and_then(Value::as_object)
+        .is_some_and(|actions| {
+            actions.iter().any(|(action_id, action)| {
+                action
+                    .get("fcurves")
+                    .and_then(Value::as_array)
+                    .is_some_and(|curves| {
+                        curves.iter().enumerate().any(|(index, curve)| {
+                            !legacy_action_curve_supported(value, action_id, index, curve)
+                        })
+                    })
+            })
+        })
+        || value
+            .get("nodes")
+            .and_then(Value::as_object)
+            .is_some_and(|nodes| {
+                nodes.iter().any(|(node_id, node)| {
+                    node.get("drivers")
+                        .and_then(Value::as_array)
+                        .is_some_and(|drivers| {
+                            drivers.iter().any(|driver| {
+                                !legacy_driver_output_supported(value, node_id, node, driver)
+                            })
+                        })
+                })
+            })
+}
+
+fn legacy_action_curve_supported(
+    scene: &Value,
+    action_id: &str,
+    curve_index: usize,
+    curve: &Value,
+) -> bool {
+    use crate::eval::animation::{AnimationOutputKind, supports_animation_output};
+
+    let path = curve
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let index = curve
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or(0);
+    if u32::try_from(curve_index).is_ok_and(|index| {
+        scene
+            .get("actions")
+            .and_then(|actions| actions.get(action_id))
+            .and_then(|action| action.get("modifier_bindings"))
+            .and_then(|bindings| bindings.get(index.to_string()))
+            .is_some()
+    }) {
+        return true;
+    }
+    let owners = scene
+        .get("nodes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|nodes| nodes.values())
+        .filter(|node| legacy_node_uses_action(node, action_id))
+        .collect::<Vec<_>>();
+    if path == "eval_time"
+        && owners.is_empty()
+        && scene
+            .get("data_blocks")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|blocks| blocks.values())
+            .any(|data| {
+                data.get("curve")
+                    .and_then(|curve| curve.get("eval_time_fcurves"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|curves| curves.iter().any(|candidate| candidate == curve))
+            })
+    {
+        return true;
+    }
+    if !supports_animation_output(path, index, AnimationOutputKind::Action) {
+        return false;
+    }
+    if owners
+        .iter()
+        .any(|node| !legacy_node_output_supported(scene, node, path, index))
+    {
+        return false;
+    }
+    let data_action_owners = scene
+        .get("data_blocks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|blocks| blocks.values())
+        .filter(|data| {
+            data.get("shape_keys").is_some_and(|shape_keys| {
+                shape_keys.get("action").and_then(Value::as_str) == Some(action_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    !is_shape_key_animation_path(path)
+        || data_action_owners
+            .iter()
+            .all(|data| legacy_data_output_supported(data, path))
+}
+
+fn legacy_driver_output_supported(
+    scene: &Value,
+    node_id: &str,
+    node: &Value,
+    driver: &Value,
+) -> bool {
+    use crate::eval::animation::{AnimationOutputKind, supports_animation_output};
+
+    let path = driver
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let index = driver
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or(0);
+    !node_id.is_empty()
+        && supports_animation_output(path, index, AnimationOutputKind::Driver)
+        && legacy_node_output_supported(scene, node, path, index)
+}
+
+fn legacy_node_uses_action(node: &Value, action_id: &str) -> bool {
+    node.get("action").and_then(Value::as_str) == Some(action_id)
+        || node
+            .get("nla_tracks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|track| {
+                track
+                    .get("strips")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|strip| strip.get("action").and_then(Value::as_str) == Some(action_id))
+            })
+}
+
+fn legacy_node_output_supported(scene: &Value, node: &Value, path: &str, _index: u32) -> bool {
+    let data = node
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(|data_id| {
+            scene
+                .get("data_blocks")
+                .and_then(|blocks| blocks.get(data_id))
+        });
+    match path {
+        "camera.lens_mm" | "lens" | "data.lens" => {
+            if data
+                .and_then(|data| data.get("camera"))
+                .is_none_or(Value::is_null)
+            {
+                return false;
+            }
+        }
+        "light.energy" | "energy" | "data.energy" => {
+            if data
+                .and_then(|data| data.get("light"))
+                .is_none_or(Value::is_null)
+            {
+                return false;
+            }
+        }
+        "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time" => {
+            if data
+                .and_then(|data| data.get("shape_keys"))
+                .is_none_or(Value::is_null)
+            {
+                return false;
+            }
+        }
+        _ if path.strip_suffix(".value").is_some()
+            && (path.starts_with("shape_key.")
+                || path.starts_with("shape_keys.")
+                || path.starts_with("key_blocks["))
+            && data.is_none_or(|data| !legacy_shape_key_path_exists(data, path)) =>
+        {
+            return false;
+        }
+        _ => {}
+    }
+    if let Some((bone_key, _)) = legacy_pose_channel(path) {
+        let Some(armature) = data.and_then(|data| data.get("armature")) else {
+            return false;
+        };
+        if armature
+            .get("bones")
+            .and_then(|bones| bones.get(bone_key))
+            .is_none()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn legacy_pose_channel(path: &str) -> Option<(&str, &str)> {
+    let (bone, channel) = if let Some(start) = path.find("pose.bones[") {
+        let rest = &path[start + "pose.bones[".len()..];
+        let end = rest.find(']')?;
+        (
+            rest[..end].trim_matches(['"', '\'']),
+            rest[end + 1..].trim_start_matches('.'),
+        )
+    } else {
+        path.strip_prefix("pose.")?.split_once('.')?
+    };
+    Some((bone, channel))
+}
+
+fn is_shape_key_animation_path(path: &str) -> bool {
+    matches!(
+        path,
+        "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time"
+    ) || path.starts_with("shape_key.")
+        || path.starts_with("shape_keys.")
+        || path.starts_with("key_blocks[")
+}
+fn legacy_data_output_supported(data: &Value, path: &str) -> bool {
+    data.get("shape_keys").is_some_and(|shape_keys| {
+        legacy_shape_key_path_exists(data, path)
+            || matches!(
+                path,
+                "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time"
+            ) && !shape_keys.is_null()
+    })
+}
+
+fn legacy_shape_key_path_exists(data: &Value, path: &str) -> bool {
+    let Some(keys) = data
+        .get("shape_keys")
+        .and_then(|shape_keys| shape_keys.get("keys"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let Some(path) = path.strip_suffix(".value") else {
+        return false;
+    };
+    if let Some(key_id) = path
+        .strip_prefix("shape_key.")
+        .or_else(|| path.strip_prefix("shape_keys."))
+    {
+        return keys.contains_key(key_id);
+    }
+    let Some(start) = path.find("key_blocks[") else {
+        return false;
+    };
+    let rest = &path[start + "key_blocks[".len()..];
+    let Some(end) = rest.find(']') else {
+        return false;
+    };
+    let name = rest[..end].trim_matches(['"', '\'']);
+    keys.values()
+        .any(|key| key.get("name").and_then(Value::as_str) == Some(name))
+}
 fn reverse_tree_links(tree: Option<&mut Value>) {
     let Some(links) = tree
         .and_then(|tree| tree.get_mut("links"))
@@ -2031,7 +2471,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -2053,7 +2493,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -2073,7 +2513,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -2144,7 +2584,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         let first: Vec<&str> = scene["node_groups"]["first"]["links"]
             .as_array()
             .expect("first links")
@@ -2199,7 +2639,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         let sources: Vec<&str> = scene["node_groups"]["group"]["links"]
             .as_array()
             .expect("links")
@@ -2210,15 +2650,141 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_eleven_scenes_pass_through_untouched() {
+    fn current_schema_twelve_scenes_pass_through_untouched() {
         let mut scene = json!({
-            "schema_version": 11,
+            "schema_version": 12,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         assert_eq!(scene, before);
+    }
+
+    #[test]
+    fn loading_version_eleven_moves_refused_animation_outputs_with_warning() -> TestResult {
+        let mut doc = crate::model::SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let node_id = crate::model::Id::new("animated")?;
+        let action_id = crate::model::Id::new("legacy_action")?;
+        let _ = doc.nodes.insert(
+            node_id.clone(),
+            crate::model::Node {
+                name: "Animated".to_owned(),
+                kind: "empty".to_owned(),
+                action: Some(action_id.clone()),
+                drivers: vec![crate::model::Driver {
+                    id: crate::model::Id::new("legacy_driver")?,
+                    path: "visible".to_owned(),
+                    index: 0,
+                    driver_type: crate::model::DriverType::Average,
+                    variables: Vec::new(),
+                    expression: None,
+                }],
+                ..crate::model::Node::default()
+            },
+        );
+        let _ = doc.actions.insert(
+            action_id.clone(),
+            crate::model::Action {
+                name: "Legacy".to_owned(),
+                fcurves: vec![crate::model::FCurve {
+                    path: "modifiers[\"Ocean\"].time".to_owned(),
+                    index: 0,
+                    keyframes: Vec::new(),
+                    extrapolation: crate::model::Extrapolation::Constant,
+                    auto_smoothing: None,
+                    modifiers: Vec::new(),
+                }],
+                ..crate::model::Action::default()
+            },
+        );
+        let mut source = serde_json::to_value(doc)?;
+        source["schema_version"] = json!(11);
+        let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
+        assert!(parsed.legacy);
+        assert_eq!(parsed.doc.schema_version, 12);
+        assert_eq!(parsed.doc.actions[&action_id].fcurves, Vec::new());
+        assert_eq!(parsed.doc.nodes[&node_id].drivers, Vec::new());
+        assert_eq!(
+            parsed.doc.compatibility["animation"]["unsupported_outputs"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(parsed.warnings.len(), 2);
+        assert!(
+            parsed.warnings.iter().all(|warning| {
+                warning["code"] == json!("animation.unsupported_output_migrated")
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_eleven_shared_object_key_action_keeps_both_outputs() {
+        let mut scene = json!({
+            "schema_version": 11,
+            "actions": {"shared": {"fcurves": [
+                {"path":"transform.translation","index":0},
+                {"path":"key_blocks[\"Smile\"].value","index":0},
+                {"path":"key_blocks.eval_time","index":0},
+                {"path":"key_blocks[\"Missing\"].value","index":0}
+            ]}},
+            "nodes": {"mesh_object": {
+                "kind":"mesh","data":"mesh_data","action":"shared"
+            }},
+            "data_blocks": {"mesh_data": {"shape_keys": {
+                "action":"shared",
+                "keys": {"shape_smile":{"name":"Smile"}}
+            }}}
+        });
+
+        let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+
+        assert_eq!(scene["schema_version"], json!(12));
+        let curves = scene["actions"]["shared"]["fcurves"]
+            .as_array()
+            .expect("migrated action curves");
+        assert_eq!(curves.len(), 3);
+        assert!(
+            curves
+                .iter()
+                .any(|curve| { curve["path"] == json!("transform.translation") })
+        );
+        assert!(
+            curves
+                .iter()
+                .any(|curve| { curve["path"] == json!("key_blocks[\"Smile\"].value") })
+        );
+        assert!(
+            curves
+                .iter()
+                .any(|curve| { curve["path"] == json!("key_blocks.eval_time") })
+        );
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            scene["compatibility"]["animation"]["unsupported_outputs"][0]["path"],
+            json!("key_blocks[\"Missing\"].value")
+        );
+    }
+
+    #[test]
+    fn version_eleven_orphan_action_keeps_shape_key_curves() {
+        // A fake-user Action nobody evaluates keeps its curves, as a fresh import does.
+        let mut scene = json!({
+            "schema_version": 11,
+            "actions": {"stashed": {"fcurves": [
+                {"path":"key_blocks[\"Smile\"].value","index":0}
+            ]}}
+        });
+
+        let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            scene["actions"]["stashed"]["fcurves"][0]["path"],
+            json!("key_blocks[\"Smile\"].value")
+        );
     }
     fn dynamic_paint_canvas_scene(schema_version: u32, blender_imported: bool) -> SceneDoc {
         use glam::DVec3;
@@ -2383,7 +2949,7 @@ mod tests {
         )
         .expect("brush migration");
         assert!(migrated.legacy);
-        assert_eq!(migrated.doc.schema_version, 11);
+        assert_eq!(migrated.doc.schema_version, 12);
         let settings = &migrated.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")]
             .properties["physics_dynamic_paint"];
         assert_eq!(settings["paint_source"], json!("POINT"));
@@ -2555,7 +3121,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -2598,7 +3164,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -2646,7 +3212,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 11);
+        assert_eq!(parsed.doc.schema_version, 12);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -2692,7 +3258,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(11));
+        assert_eq!(scene["schema_version"], json!(12));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -2735,7 +3301,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(11);
+        expected["schema_version"] = json!(12);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -2773,7 +3339,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 11);
+        assert_eq!(migrated.schema_version, 12);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -3277,7 +3843,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 11);
+        assert_eq!(record.snapshot.schema_version, 12);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -3344,7 +3910,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 11);
+        assert_eq!(record.snapshot.schema_version, 12);
         let history_mesh = record
             .snapshot
             .data_blocks

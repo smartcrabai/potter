@@ -447,6 +447,8 @@ fn node_item(
         .as_ref()
         .and_then(|data_id| doc.data_blocks.get(data_id))
         .and_then(|data| data.light.as_ref());
+    let camera_data = evaluated.evaluated_camera.as_ref().or(camera_data);
+    let light_data = evaluated.evaluated_light.as_ref().or(light_data);
     let evaluated_shape_keys = if let Some(shape_keys) = node
         .data
         .as_ref()

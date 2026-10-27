@@ -516,6 +516,33 @@ fn shape_key_value_blends_basis_and_target_positions() -> IntegrationResult {
     );
     Ok(())
 }
+
+#[test]
+fn shape_key_action_ignores_object_location_curves() -> IntegrationResult {
+    let (_directory, project) = new_project(&json!([
+        {"op":"node.create","id":"mesh","kind":"plane","params":{"size":2.0}},
+        {"op":"shape_key.create","target":{"id":"mesh"},"id":"raise","name":"Raise","positions":{"0":[3.0,1.0,0.0]}},
+        {"op":"action.create","id":"shared_action"},
+        {"op":"node.update","target":{"id":"mesh"},"set":{"action":"shared_action"}},
+        {"op":"keyframe.insert","target":{"id":"mesh"},"path":"transform.translation","index":0,"frame":1.0,"value":0.0,"interpolation":"linear"},
+        {"op":"keyframe.insert","target":{"id":"mesh"},"path":"transform.translation","index":0,"frame":2.0,"value":2.0,"interpolation":"linear"},
+        {"op":"keyframe.insert","target":{"id":"mesh"},"path":"shape_key.raise.value","index":0,"frame":1.0,"value":0.0,"interpolation":"linear"},
+        {"op":"keyframe.insert","target":{"id":"mesh"},"path":"shape_key.raise.value","index":0,"frame":2.0,"value":1.0,"interpolation":"linear"}
+    ]))?;
+
+    let evaluated = snapshot(&project, Some(2.0))?;
+    assert_vec3_close(
+        mesh_vertex(&evaluated, "mesh", 0)?,
+        DVec3::new(3.0, 1.0, 0.0),
+        1.0e-12,
+    );
+    assert_vec3_close(
+        node_matrix(&evaluated, "mesh")?.w_axis.truncate(),
+        DVec3::new(2.0, 0.0, 0.0),
+        1.0e-12,
+    );
+    Ok(())
+}
 #[test]
 fn absolute_shape_keys_interpolate_at_animated_evaluation_time() -> IntegrationResult {
     let (_directory, project) = new_project(&json!([
@@ -1037,6 +1064,46 @@ fn scripted_driver_expression_drives_a_transform_component() -> IntegrationResul
     Ok(())
 }
 #[test]
+fn driver_create_refuses_unimplemented_output_channels() -> IntegrationResult {
+    let (_directory, project) = new_project(&json!([
+        {"op":"node.create","id":"plain","kind":"empty"}
+    ]))?;
+    let batch = project.join("unsupported-driver.json");
+    fs::write(
+        &batch,
+        serde_json::to_vec(&json!({
+            "schema_version":1,
+            "base_revision":1,
+            "operations":[{
+                "op":"driver.create",
+                "target":{"id":"plain"},
+                "id":"unsupported",
+                "path":"visible",
+                "index":0,
+                "type":"sum",
+                "variables":[]
+            }]
+        }))?,
+    )?;
+    let output = pot()
+        .args(["apply"])
+        .arg(&project)
+        .arg("--file")
+        .arg(batch)
+        .arg("--json")
+        .output()?;
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["error"]["code"], "INVALID_OPERATION");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("visible"))
+    );
+    Ok(())
+}
+
+#[test]
 fn driver_location_rotation_difference_and_context_property_variables_evaluate() -> IntegrationResult
 {
     let (_directory, project) = new_project(&json!([
@@ -1127,6 +1194,24 @@ fn pose_bone_keyframes_evaluate_at_a_fractional_frame() -> IntegrationResult {
 
     let evaluated = snapshot(&project, Some(1.5))?;
     assert!((bone_matrix(&evaluated, "arm", "root")?.w_axis.x - 1.0).abs() < 1.0e-12);
+    Ok(())
+}
+
+#[test]
+fn inactive_pose_rotation_curves_are_ignored_after_rotation_mode_change() -> IntegrationResult {
+    let (_directory, project) = new_project(&json!([
+        {"op":"node.create","id":"arm","kind":"armature"},
+        {"op":"bone.create","target":{"id":"arm"},"id":"root","name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]},
+        {"op":"action.create","id":"pose_action","name":"Pose"},
+        {"op":"node.update","target":{"id":"arm"},"set":{"action":"pose_action"}},
+        {"op":"keyframe.insert","target":{"id":"arm"},"path":"pose.root.rotation","index":0,"frame":1.0,"value":1.0,"interpolation":"linear"},
+        {"op":"keyframe.insert","target":{"id":"arm"},"path":"pose.root.rotation","index":0,"frame":2.0,"value":0.0,"interpolation":"linear"},
+        {"op":"pose.set","target":{"id":"arm"},"bone_id":"root","set":{"rotation_mode":"XYZ"}}
+    ]))?;
+
+    let first_frame = bone_matrix(&snapshot(&project, Some(1.0))?, "arm", "root")?;
+    let second_frame = bone_matrix(&snapshot(&project, Some(2.0))?, "arm", "root")?;
+    assert_matrix_close(first_frame, second_frame, 1.0e-12);
     Ok(())
 }
 #[test]

@@ -2920,15 +2920,16 @@ fn shade(
         }
         let glass = eevee_transmission::glass_light(params, normal, view, lower, thickness);
         for (id, light_node) in &doc.nodes {
-            let Some(light) = light_node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))
-                .and_then(|block| block.light.as_ref())
-            else {
+            let Some(evaluated) = snapshot.nodes.get(id) else {
                 continue;
             };
-            let Some(evaluated) = snapshot.nodes.get(id) else {
+            let Some(light) = evaluated.evaluated_light.as_ref().or_else(|| {
+                light_node
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id))
+                    .and_then(|block| block.light.as_ref())
+            }) else {
                 continue;
             };
             let matrix = DMat4::from_cols_array(&evaluated.world_matrix);

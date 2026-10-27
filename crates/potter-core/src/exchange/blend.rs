@@ -4052,6 +4052,22 @@ fn build_imported_graph(
             .ok_or_else(|| invalid_intermediate("shape-key data block is missing"))?;
         shape_keys.action = Some(action_id);
     }
+    let mut data_action_by_id = BTreeMap::new();
+    for (data_items, data_ids) in [(cameras, &camera_ids), (lights, &light_ids)] {
+        for item in data_items {
+            let Some(action_name) = item.get("action").and_then(Value::as_str) else {
+                continue;
+            };
+            let data_name = string_field(item, "name")?;
+            let data_id = data_ids
+                .get(data_name)
+                .ok_or_else(|| invalid_intermediate("animated data-block ID mapping is missing"))?;
+            let action_id = action_by_name.get(action_name).cloned().ok_or_else(|| {
+                invalid_intermediate("camera or light references an unknown animation action")
+            })?;
+            data_action_by_id.insert(data_id.clone(), action_id);
+        }
+    }
     let mut object_ids = BTreeMap::new();
     for item in objects {
         let name = string_field(item, "name")?;
@@ -4686,7 +4702,24 @@ fn build_imported_graph(
                 }
             }
         }
-        let drivers = parse_drivers(item, &id, &object_ids, &mut mappings)?;
+        let mut drivers = parse_drivers(item, &id, &object_ids, &mut mappings)?;
+        let data_driver_source = match object_type {
+            "CAMERA" => cameras
+                .iter()
+                .find(|data| data.get("name").and_then(Value::as_str) == data_name),
+            "LIGHT" => lights
+                .iter()
+                .find(|data| data.get("name").and_then(Value::as_str) == data_name),
+            _ => None,
+        };
+        if let Some(data_driver_source) = data_driver_source {
+            drivers.extend(parse_drivers(
+                data_driver_source,
+                &id,
+                &object_ids,
+                &mut mappings,
+            )?);
+        }
         let nla_tracks =
             parse_nla_tracks(item, &id, &action_by_name, &action_slot_ids, &mut mappings)?;
         let rigid_body = item
@@ -4747,6 +4780,17 @@ fn build_imported_graph(
                 },
             );
         }
+        let action = item
+            .get("action")
+            .and_then(Value::as_str)
+            .and_then(|action_name| action_by_name.get(action_name))
+            .cloned()
+            .or_else(|| {
+                data_id
+                    .as_ref()
+                    .and_then(|data_id| data_action_by_id.get(data_id))
+                    .cloned()
+            });
         let mut node = Node {
             name: name.to_owned(),
             kind: kind.to_owned(),
@@ -4790,11 +4834,7 @@ fn build_imported_graph(
                 .get("hide_select")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            action: item
-                .get("action")
-                .and_then(Value::as_str)
-                .and_then(|action_name| action_by_name.get(action_name))
-                .cloned(),
+            action,
             nla_tracks,
             properties,
             rigid_body,
@@ -5087,6 +5127,7 @@ fn build_imported_graph(
             .to_owned(),
     };
     let mut losses = import_losses(raw);
+    losses.extend(uv_project_animated_camera_lens_losses(&doc));
     losses.extend(missing_udim_tile_losses(images, &resource_ids, &doc)?);
     let id_mappings = serde_json::to_value(&mappings).map_err(PotError::internal_json)?;
     let source = json!({
@@ -5139,6 +5180,7 @@ fn build_imported_graph(
         json!({"intermediate": compatibility_intermediate, "id_mappings": id_mappings.clone(),
             "legacy_texture_names": legacy_texture_names}),
     );
+    drop_unsupported_imported_animation_outputs(&mut doc);
     doc.validate()?;
     attach_native_target_vertex_orders(&mut doc);
     Ok(ImportedGraph {
@@ -9285,85 +9327,118 @@ fn parse_drivers(
     mappings: &mut BTreeMap<String, String>,
 ) -> Result<Vec<Driver>> {
     let mut by_name = BTreeMap::new();
-    optional_array(value, "drivers")?
-        .iter()
-        .map(|item| {
-            let curve = item
-                .get("curve")
-                .ok_or_else(|| invalid_intermediate("driver has no F-Curve"))?;
-            let parsed_curve = convert_fcurve(curve, mappings)?;
-            let name = format!("{}[{}]", parsed_curve.path, parsed_curve.index);
-            let id = mapped_id(
-                item,
-                "potter_id",
-                "driver",
-                &name,
-                &mut by_name,
-                mappings,
-                &format!("Driver:{owner}"),
-            )?;
-            let driver = item
-                .get("driver")
-                .ok_or_else(|| invalid_intermediate("driver has no driver settings"))?;
-            let driver_type = match driver.get("type").and_then(Value::as_str).unwrap_or("") {
-                "SCRIPTED" => DriverType::ScriptedExpression,
-                "SUM" => DriverType::Sum,
-                "MIN" => DriverType::Min,
-                "MAX" => DriverType::Max,
-                _ => DriverType::Average,
+    let mut drivers = Vec::new();
+    for item in optional_array(value, "drivers")? {
+        let Some(driver) = item.get("driver") else {
+            return Err(invalid_intermediate("driver has no driver settings"));
+        };
+        if !driver_targets_are_importable(driver, object_ids) {
+            continue;
+        }
+        let curve = item
+            .get("curve")
+            .ok_or_else(|| invalid_intermediate("driver has no F-Curve"))?;
+        let parsed_curve = convert_fcurve(curve, mappings)?;
+        if !crate::eval::animation::supports_animation_output(
+            &parsed_curve.path,
+            parsed_curve.index,
+            crate::eval::animation::AnimationOutputKind::Driver,
+        ) {
+            continue;
+        }
+        let name = format!("{}[{}]", parsed_curve.path, parsed_curve.index);
+        let id = mapped_id(
+            item,
+            "potter_id",
+            "driver",
+            &name,
+            &mut by_name,
+            mappings,
+            &format!("Driver:{owner}"),
+        )?;
+        let driver_type = match driver.get("type").and_then(Value::as_str).unwrap_or("") {
+            "SCRIPTED" => DriverType::ScriptedExpression,
+            "SUM" => DriverType::Sum,
+            "MIN" => DriverType::Min,
+            "MAX" => DriverType::Max,
+            _ => DriverType::Average,
+        };
+        let mut variables = Vec::new();
+        for variable in optional_array(driver, "variables")? {
+            let variable_type = match variable.get("type").and_then(Value::as_str).unwrap_or("") {
+                "TRANSFORMS" => DriverVariableType::Transforms,
+                _ => DriverVariableType::SingleProp,
             };
-            let mut variables = Vec::new();
-            for variable in optional_array(driver, "variables")? {
-                let variable_type = match variable.get("type").and_then(Value::as_str).unwrap_or("")
-                {
-                    "TRANSFORMS" => DriverVariableType::Transforms,
-                    _ => DriverVariableType::SingleProp,
-                };
-                let target = variable
-                    .get("targets")
-                    .and_then(Value::as_array)
-                    .and_then(|targets| targets.first())
-                    .ok_or_else(|| invalid_intermediate("driver variable has no target"))?;
-                let target_name = target
-                    .get("id")
-                    .and_then(|id| id.get("name"))
+            let target = variable
+                .get("targets")
+                .and_then(Value::as_array)
+                .and_then(|targets| targets.first())
+                .ok_or_else(|| invalid_intermediate("driver variable has no target"))?;
+            let target_name = target
+                .get("id")
+                .and_then(|id| id.get("name"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_intermediate("driver target has no object ID"))?;
+            let target_id = object_ids
+                .get(target_name)
+                .cloned()
+                .ok_or_else(|| invalid_intermediate("driver target object was not imported"))?;
+            variables.push(DriverVariable {
+                name: variable
+                    .get("name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| invalid_intermediate("driver target has no object ID"))?;
-                let target_id = object_ids
-                    .get(target_name)
-                    .cloned()
-                    .ok_or_else(|| invalid_intermediate("driver target object was not imported"))?;
-                variables.push(DriverVariable {
-                    name: variable
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("var")
-                        .to_owned(),
-                    variable_type,
-                    target: target_id,
-                    path: target
-                        .get("data_path")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    index: 0,
-                    target_2: None,
-                    transform_space: None,
-                });
-            }
-            Ok(Driver {
-                id,
-                path: parsed_curve.path,
-                index: parsed_curve.index,
-                driver_type,
-                variables,
-                expression: driver
-                    .get("expression")
+                    .unwrap_or("var")
+                    .to_owned(),
+                variable_type,
+                target: target_id,
+                path: target
+                    .get("data_path")
                     .and_then(Value::as_str)
-                    .map(str::to_owned),
-            })
+                    .unwrap_or_default()
+                    .to_owned(),
+                index: 0,
+                target_2: None,
+                transform_space: None,
+            });
+        }
+        drivers.push(Driver {
+            id,
+            path: parsed_curve.path,
+            index: parsed_curve.index,
+            driver_type,
+            variables,
+            expression: driver
+                .get("expression")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    Ok(drivers)
+}
+
+fn driver_targets_are_importable(driver: &Value, object_ids: &BTreeMap<String, Id>) -> bool {
+    driver
+        .get("variables")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|variable| {
+            variable
+                .get("targets")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
         })
-        .collect()
+        .all(|target| {
+            matches!(
+                target.get("id_type").and_then(Value::as_str),
+                None | Some("OBJECT")
+            ) && target
+                .get("id")
+                .and_then(|id| id.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| object_ids.contains_key(name))
+        })
 }
 
 /// Resolves a Blender Action slot reference (an identifier, or an object with `identifier` or
@@ -9837,6 +9912,518 @@ fn canonicalize_particle_texture_slots(
     }
 }
 
+fn supported_shared_object_data_action(raw: &Value, action: &Value) -> bool {
+    let slots = action.get("slots").and_then(Value::as_array);
+    if action
+        .get("slot_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| slots.map_or(0, Vec::len) as u64)
+        != 2
+        || slots.is_none_or(|slots| slots.len() != 2)
+    {
+        return false;
+    }
+    let Some(action_name) = action.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(slots) = slots else {
+        return false;
+    };
+    let mut object_slots = slots
+        .iter()
+        .filter(|slot| slot.get("target_type").and_then(Value::as_str) == Some("OBJECT"));
+    let Some(object_slot) = object_slots.next() else {
+        return false;
+    };
+    if object_slots.next().is_some() {
+        return false;
+    }
+    let mut data_slots = slots.iter().filter(|slot| {
+        matches!(
+            slot.get("target_type").and_then(Value::as_str),
+            Some("CAMERA" | "LIGHT" | "KEY")
+        )
+    });
+    let Some(data_slot) = data_slots.next() else {
+        return false;
+    };
+    if data_slots.next().is_some() {
+        return false;
+    }
+    let Some(data_type) = data_slot.get("target_type").and_then(Value::as_str) else {
+        return false;
+    };
+    let object_type = if data_type == "KEY" {
+        "MESH"
+    } else {
+        data_type
+    };
+    let Some(objects) = raw.get("objects").and_then(Value::as_array) else {
+        return false;
+    };
+    let object_users = objects
+        .iter()
+        .filter(|object| {
+            object.get("action").and_then(Value::as_str) == Some(action_name)
+                && object.get("type").and_then(Value::as_str) == Some(object_type)
+                && action_slot_matches(object.get("action_slot"), object_slot)
+        })
+        .collect::<Vec<_>>();
+    if object_users.len() != 1 {
+        return false;
+    }
+    let Some(data_name) = object_users[0].get("data_name").and_then(Value::as_str) else {
+        return false;
+    };
+    if data_type == "KEY" {
+        return raw
+            .get("meshes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|mesh| {
+                mesh.get("name").and_then(Value::as_str) == Some(data_name)
+                    && mesh.get("shape_keys").is_some_and(|shape_keys| {
+                        shape_keys.get("action").and_then(Value::as_str) == Some(action_name)
+                            && action_slot_matches(shape_keys.get("action_slot"), data_slot)
+                    })
+            })
+            .count()
+            == 1;
+    }
+    let data_collection = if data_type == "CAMERA" {
+        "cameras"
+    } else if data_type == "LIGHT" {
+        "lights"
+    } else {
+        return false;
+    };
+    raw.get(data_collection)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|data| {
+            data.get("name").and_then(Value::as_str) == Some(data_name)
+                && data.get("action").and_then(Value::as_str) == Some(action_name)
+                && action_slot_matches(data.get("action_slot"), data_slot)
+        })
+        .count()
+        == 1
+}
+
+fn curve_data_eval_time_action_supported(
+    raw: &Value,
+    action_name: Option<&str>,
+    path: &str,
+) -> bool {
+    path == "eval_time"
+        && action_name.is_some_and(|action_name| {
+            raw.get("curves")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|curve| {
+                    curve.get("eval_time_action_name").and_then(Value::as_str) == Some(action_name)
+                        && curve
+                            .get("eval_time_fcurves")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .any(|fcurve| {
+                                fcurve.get("path").and_then(Value::as_str) == Some("eval_time")
+                            })
+                })
+        })
+}
+
+fn action_slot_matches(reference: Option<&Value>, slot: &Value) -> bool {
+    let identifier = slot.get("identifier").and_then(Value::as_str);
+    let name = slot.get("name").and_then(Value::as_str);
+    match reference {
+        Some(Value::String(reference)) => {
+            identifier == Some(reference.as_str()) || name == Some(reference.as_str())
+        }
+        Some(Value::Object(reference)) => {
+            identifier.is_some_and(|identifier| {
+                reference.get("identifier").and_then(Value::as_str) == Some(identifier)
+            }) || name
+                .is_some_and(|name| reference.get("name").and_then(Value::as_str) == Some(name))
+        }
+        _ => false,
+    }
+}
+fn is_shape_key_output_path(path: &str) -> bool {
+    matches!(
+        path,
+        "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time"
+    ) || path.starts_with("shape_key.")
+        || path.starts_with("shape_keys.")
+        || path.starts_with("key_blocks[")
+}
+
+fn action_output_has_matching_owner(raw: &Value, action_name: Option<&str>, path: &str) -> bool {
+    let Some(action_name) = action_name else {
+        return true;
+    };
+    let object_users = raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|object| blender_object_uses_action(object, action_name))
+        .collect::<Vec<_>>();
+    let data_has_action = |collection: &str| {
+        raw.get(collection)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|data| data.get("action").and_then(Value::as_str) == Some(action_name))
+    };
+    match path {
+        "camera.lens_mm" => {
+            (object_users.is_empty()
+                || object_users
+                    .iter()
+                    .all(|object| object.get("type").and_then(Value::as_str) == Some("CAMERA")))
+                && !data_has_action("lights")
+                && (object_users
+                    .iter()
+                    .any(|object| object.get("type").and_then(Value::as_str) == Some("CAMERA"))
+                    || data_has_action("cameras"))
+        }
+        "light.energy" => {
+            (object_users.is_empty()
+                || object_users
+                    .iter()
+                    .all(|object| object.get("type").and_then(Value::as_str) == Some("LIGHT")))
+                && !data_has_action("cameras")
+                && (object_users
+                    .iter()
+                    .any(|object| object.get("type").and_then(Value::as_str) == Some("LIGHT"))
+                    || data_has_action("lights"))
+        }
+        path if path.starts_with("pose.") || path.contains("pose.bones[") => {
+            !object_users.is_empty()
+                && object_users
+                    .iter()
+                    .all(|object| object.get("type").and_then(Value::as_str) == Some("ARMATURE"))
+        }
+        path if is_shape_key_output_path(path) => {
+            let meshes = raw.get("meshes").and_then(Value::as_array);
+            let data_users = meshes
+                .into_iter()
+                .flatten()
+                .filter(|mesh| {
+                    mesh.get("shape_keys").is_some_and(|keys| {
+                        keys.get("action").and_then(Value::as_str) == Some(action_name)
+                    })
+                })
+                .collect::<Vec<_>>();
+            !data_users.is_empty()
+                && data_users
+                    .iter()
+                    .all(|mesh| raw_shape_key_output_matches(mesh, path))
+                && object_users
+                    .iter()
+                    .all(|object| object.get("type").and_then(Value::as_str) == Some("MESH"))
+        }
+        _ => true,
+    }
+}
+
+fn raw_shape_key_output_matches(mesh: &Value, path: &str) -> bool {
+    let Some(shape_keys) = mesh.get("shape_keys").filter(|keys| !keys.is_null()) else {
+        return false;
+    };
+    if matches!(
+        path,
+        "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time"
+    ) {
+        return true;
+    }
+    let Some(keys) = shape_keys.get("keys").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(base) = path.strip_suffix(".value") else {
+        return false;
+    };
+    if let Some(key_id) = base
+        .strip_prefix("shape_key.")
+        .or_else(|| base.strip_prefix("shape_keys."))
+    {
+        return keys
+            .iter()
+            .any(|key| key.get("potter_id").and_then(Value::as_str) == Some(key_id));
+    }
+    let Some(start) = base.find("key_blocks[") else {
+        return false;
+    };
+    let rest = &base[start + "key_blocks[".len()..];
+    let Some(end) = rest.find(']') else {
+        return false;
+    };
+    let name = rest[..end].trim_matches(['"', '\'']);
+    keys.iter()
+        .any(|key| key.get("name").and_then(Value::as_str) == Some(name))
+}
+fn blender_object_uses_action(object: &Value, action_name: &str) -> bool {
+    object.get("action").and_then(Value::as_str) == Some(action_name)
+        || object
+            .get("nla_tracks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|track| {
+                track
+                    .get("strips")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|strip| strip.get("action").and_then(Value::as_str) == Some(action_name))
+            })
+}
+
+fn driver_target_loss(raw: &Value, driver: &Value) -> Option<(String, String)> {
+    for target in driver
+        .get("driver")
+        .and_then(|driver| driver.get("variables"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|variable| {
+            variable
+                .get("targets")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+    {
+        let id_type = target
+            .get("id_type")
+            .and_then(Value::as_str)
+            .unwrap_or("OBJECT");
+        if id_type != "OBJECT" {
+            return Some((
+                "blender.animation.driver_target_id_type".to_owned(),
+                format!(
+                    "driver target ID type `{id_type}` is not an Object and cannot be resolved"
+                ),
+            ));
+        }
+        let Some(name) = target
+            .get("id")
+            .and_then(|id| id.get("name"))
+            .and_then(Value::as_str)
+        else {
+            return Some((
+                "blender.animation.driver_target".to_owned(),
+                "Object driver target has no resolvable ID name".to_owned(),
+            ));
+        };
+        if !raw
+            .get("objects")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|object| object.get("name").and_then(Value::as_str) == Some(name))
+        {
+            return Some((
+                "blender.animation.driver_target".to_owned(),
+                format!("Object driver target `{name}` was not imported"),
+            ));
+        }
+    }
+    None
+}
+
+fn driver_output_owner_matches(path: &str, owner_type: Option<&str>) -> bool {
+    match path {
+        "camera.lens_mm" => matches!(owner_type, Some("CAMERA")),
+        "light.energy" => matches!(owner_type, Some("LIGHT")),
+        path if path.starts_with("pose.") || path.contains("pose.bones[") => {
+            matches!(owner_type, Some("ARMATURE"))
+        }
+        path if path.starts_with("shape_key.")
+            || path.starts_with("shape_keys.")
+            || path.starts_with("key_blocks[") =>
+        {
+            matches!(owner_type, Some("MESH"))
+        }
+        _ => true,
+    }
+}
+
+fn drop_unsupported_imported_animation_outputs(doc: &mut SceneDoc) {
+    use crate::eval::animation::{
+        AnimationOutputKind, supports_animation_output, supports_animation_output_for_node,
+    };
+
+    let retained_curves = doc
+        .actions
+        .iter()
+        .map(|(action_id, action)| {
+            let owners = doc
+                .nodes
+                .values()
+                .filter(|node| {
+                    node.action.as_ref() == Some(action_id)
+                        || node
+                            .nla_tracks
+                            .iter()
+                            .flat_map(|track| &track.strips)
+                            .any(|strip| &strip.action == action_id)
+                })
+                .collect::<Vec<_>>();
+            let shape_key_data_owners = doc
+                .data_blocks
+                .values()
+                .filter(|data| {
+                    data.shape_keys
+                        .as_ref()
+                        .and_then(|keys| keys.action.as_ref())
+                        == Some(action_id)
+                })
+                .collect::<Vec<_>>();
+            let keep = action
+                .fcurves
+                .iter()
+                .enumerate()
+                .map(|(curve_index, curve)| {
+                    let bound_modifier = u32::try_from(curve_index)
+                        .is_ok_and(|index| action.modifier_bindings.contains_key(&index));
+                    bound_modifier
+                        || (supports_animation_output(
+                            &curve.path,
+                            curve.index,
+                            AnimationOutputKind::Action,
+                        ) && owners.iter().all(|node| {
+                            supports_animation_output_for_node(
+                                &curve.path,
+                                curve.index,
+                                AnimationOutputKind::Action,
+                                node,
+                                doc,
+                            )
+                        }) && (!is_shape_key_output_path(&curve.path)
+                            || shape_key_data_owners.iter().all(|data| {
+                                data.shape_keys.as_ref().is_some_and(|shape_keys| {
+                                    matches!(
+                                        curve.path.as_str(),
+                                        "shape_keys.evaluation_time"
+                                            | "shape_key.evaluation_time"
+                                            | "key_blocks.eval_time"
+                                    ) || crate::eval::rig::shape_key_id_from_path(
+                                        shape_keys,
+                                        &curve.path,
+                                    )
+                                    .is_some()
+                                })
+                            })))
+                })
+                .collect::<Vec<_>>();
+            (action_id.clone(), keep)
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (action_id, action) in &mut doc.actions {
+        let Some(keep) = retained_curves.get(action_id) else {
+            continue;
+        };
+        if keep.iter().all(|keep| *keep) {
+            continue;
+        }
+        let mut old_bindings = std::mem::take(&mut action.modifier_bindings);
+        let mut fcurves = Vec::with_capacity(action.fcurves.len());
+        let mut modifier_bindings = BTreeMap::new();
+        for (index, curve) in std::mem::take(&mut action.fcurves).into_iter().enumerate() {
+            if !keep.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            if let (Ok(old_index), Ok(new_index)) =
+                (u32::try_from(index), u32::try_from(fcurves.len()))
+                && let Some(bindings) = old_bindings.remove(&old_index)
+            {
+                modifier_bindings.insert(new_index, bindings);
+            }
+            fcurves.push(curve);
+        }
+        action.fcurves = fcurves;
+        action.modifier_bindings = modifier_bindings;
+    }
+    let retained_drivers = doc
+        .nodes
+        .iter()
+        .map(|(node_id, node)| {
+            let keep = node
+                .drivers
+                .iter()
+                .map(|driver| {
+                    supports_animation_output_for_node(
+                        &driver.path,
+                        driver.index,
+                        AnimationOutputKind::Driver,
+                        node,
+                        doc,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (node_id.clone(), keep)
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (node_id, node) in &mut doc.nodes {
+        let Some(keep) = retained_drivers.get(node_id) else {
+            continue;
+        };
+        node.drivers = std::mem::take(&mut node.drivers)
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(driver, keep)| keep.then_some(driver))
+            .collect();
+    }
+}
+fn uv_project_animated_camera_lens_losses(doc: &SceneDoc) -> Vec<Loss> {
+    let mut losses = Vec::new();
+    for node in doc.nodes.values() {
+        for modifier in &node.modifiers {
+            if modifier.modifier_type != "uv_project" {
+                continue;
+            }
+            let Some(projectors) = modifier.params.get("projectors").and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for projector_text in projectors.iter().filter_map(Value::as_str) {
+                let Ok(projector_id) = Id::new(projector_text.to_owned()) else {
+                    continue;
+                };
+                let Some(projector) = doc.nodes.get(&projector_id) else {
+                    continue;
+                };
+                let Some(data) = projector
+                    .data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id))
+                else {
+                    continue;
+                };
+                if data.camera.is_some()
+                    && crate::eval::animation::node_has_camera_lens_animation(projector, doc)
+                {
+                    losses.push(loss(
+                        "modifier.uv_project.animated_camera_lens",
+                        Some(node.name.as_str()),
+                        &format!(
+                            "UV Project modifier `{}` uses camera projector `{}` with an animated or driven lens, which Blender evaluates in dependency-graph order",
+                            modifier.name, projector.name
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    losses
+}
+
 fn import_losses(raw: &Value) -> Vec<Loss> {
     let mut losses = Vec::new();
     // Blender's USD CacheFiles are not read: their Mesh Cache and Mesh Sequence Cache modifiers would fail at
@@ -10303,16 +10890,20 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
         .flatten()
     {
         let action_name = action.get("name").and_then(Value::as_str);
-        if action
+        let slot_count = action
             .get("slot_count")
             .and_then(Value::as_u64)
-            .unwrap_or(1)
-            > 1
-        {
+            .unwrap_or_else(|| {
+                action
+                    .get("slots")
+                    .and_then(Value::as_array)
+                    .map_or(0, |slots| slots.len() as u64)
+            });
+        if slot_count > 1 && !supported_shared_object_data_action(raw, action) {
             losses.push(loss(
                 "blender.animation.action_slot",
                 action_name,
-                "non-modifier F-Curve slot ownership is flattened; supported Ocean.time bindings retain their Action slot",
+                "non-modifier F-Curve slot ownership is flattened; only the matching one-Object plus one-Camera/Light/Key Action is shared losslessly",
             ));
         }
         for curve in action
@@ -10321,10 +10912,16 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             .into_iter()
             .flatten()
         {
-            let path = curve
+            let source_path = curve
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let path = potter_fcurve_path(source_path, &BTreeMap::new());
+            let index = curve
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|index| u32::try_from(index).ok())
+                .unwrap_or(0);
             let bindings = curve
                 .get("modifier_bindings")
                 .and_then(Value::as_array)
@@ -10333,6 +10930,23 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
             let supported = bindings
                 .iter()
                 .any(|binding| is_ocean_time_binding(raw, binding));
+            let shared_output_supported =
+                crate::eval::animation::supports_animation_output(
+                    &path,
+                    index,
+                    crate::eval::animation::AnimationOutputKind::Action,
+                ) || curve_data_eval_time_action_supported(raw, action_name, &path);
+            if !(shared_output_supported || path.starts_with("modifiers[") && supported)
+                || !action_output_has_matching_owner(raw, action_name, &path)
+            {
+                losses.push(loss(
+                    "blender.animation.fcurve_non_transform_channel",
+                    action_name,
+                    &format!(
+                        "Action F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
+                    ),
+                ));
+            }
             if path.starts_with("modifiers[") && !supported {
                 losses.push(loss(
                     "blender.animation.modifier_parameter",
@@ -10384,6 +10998,137 @@ fn import_losses(raw: &Value) -> Vec<Loss> {
                         "blender.animation.keyframe_interpolation",
                         action_name,
                         "this keyframe interpolation mode is not representable",
+                    ));
+                }
+            }
+        }
+    }
+    for object in raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let owner = object.get("name").and_then(Value::as_str);
+        for driver in object
+            .get("drivers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some((feature, reason)) = driver_target_loss(raw, driver) {
+                losses.push(loss(feature, owner, &reason));
+            }
+            let Some(curve) = driver.get("curve") else {
+                continue;
+            };
+            let source_path = curve
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let path = potter_fcurve_path(source_path, &BTreeMap::new());
+            let index = curve
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|index| u32::try_from(index).ok())
+                .unwrap_or(0);
+            if !crate::eval::animation::supports_animation_output(
+                &path,
+                index,
+                crate::eval::animation::AnimationOutputKind::Driver,
+            ) || !driver_output_owner_matches(&path, object.get("type").and_then(Value::as_str))
+            {
+                losses.push(loss(
+                    "blender.animation.fcurve_non_transform_channel",
+                    owner,
+                    &format!(
+                        "Driver output F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
+                    ),
+                ));
+            }
+        }
+    }
+    for object in raw
+        .get("objects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(object_action) = object.get("action").and_then(Value::as_str) else {
+            continue;
+        };
+        let data_name = object.get("data_name").and_then(Value::as_str);
+        let data_collection = match object.get("type").and_then(Value::as_str) {
+            Some("CAMERA") => Some("cameras"),
+            Some("LIGHT") => Some("lights"),
+            _ => None,
+        };
+        let Some(data_action) = data_collection
+            .and_then(|collection| raw.get(collection))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|data| data.get("name").and_then(Value::as_str) == data_name)
+            .and_then(|data| data.get("action"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if object_action != data_action {
+            losses.push(loss(
+                "blender.animation.data_action_conflict",
+                object.get("name").and_then(Value::as_str),
+                "the Object and its Camera/Light Data-Block have different active Actions; Potter can represent only one active Action per node",
+            ));
+        }
+    }
+    for collection in ["cameras", "lights"] {
+        for data in raw
+            .get(collection)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let owner = data.get("name").and_then(Value::as_str);
+            for driver in data
+                .get("drivers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some((feature, reason)) = driver_target_loss(raw, driver) {
+                    losses.push(loss(feature, owner, &reason));
+                }
+                let Some(curve) = driver.get("curve") else {
+                    continue;
+                };
+                let source_path = curve
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let path = potter_fcurve_path(source_path, &BTreeMap::new());
+                let index = curve
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| u32::try_from(index).ok())
+                    .unwrap_or(0);
+                let owner_type = if collection == "cameras" {
+                    Some("CAMERA")
+                } else {
+                    Some("LIGHT")
+                };
+                if !crate::eval::animation::supports_animation_output(
+                    &path,
+                    index,
+                    crate::eval::animation::AnimationOutputKind::Driver,
+                ) || !driver_output_owner_matches(&path, owner_type)
+                {
+                    losses.push(loss(
+                        "blender.animation.fcurve_non_transform_channel",
+                        owner,
+                        &format!(
+                            "Data-Block driver output F-Curve channel path `{source_path}` is retained but Potter does not evaluate it for this owner"
+                        ),
                     ));
                 }
             }
@@ -12270,6 +13015,149 @@ mod tests {
                 && loss.data_id.as_deref() == Some("CacheFile"))
         );
         assert!(import_losses(&json!({})).is_empty());
+    }
+    #[test]
+    fn shared_camera_action_and_non_object_driver_targets_report_precise_losses() {
+        let raw = json!({
+            "actions":[{
+                "name":"Shared",
+                "slot_count":2,
+                "slots":[
+                    {"name":"ObjectSlot","identifier":"OB","target_type":"OBJECT"},
+                    {"name":"CameraSlot","identifier":"CA","target_type":"CAMERA"}
+                ],
+                "fcurves":[{"path":"data.lens","index":0}]
+            },{
+                "name":"Wrong",
+                "slot_count":1,
+                "fcurves":[{"path":"data.lens","index":0}]
+            }],
+            "objects":[{
+                "name":"CameraObject",
+                "type":"CAMERA",
+                "data_name":"CameraData",
+                "action":"Shared",
+                "action_slot":"OB",
+                "drivers":[
+                    {
+                        "curve":{"path":"modifiers[\"Array\"].count","index":0},
+                        "driver":{"variables":[]}
+                    },
+                    {
+                        "curve":{"path":"data.lens","index":0},
+                        "driver":{"variables":[{
+                            "targets":[{"id_type":"CAMERA","id":{"name":"CameraData"},"data_path":"lens"}]
+                        }]}
+                    }
+                ]
+            },{
+                "name":"MeshObject",
+                "type":"MESH",
+                "action":"Wrong"
+            }],
+            "cameras":[{
+                "name":"CameraData",
+                "action":"Shared",
+                "action_slot":"CA"
+            }]
+        });
+        let losses = import_losses(&raw);
+        assert!(
+            !losses
+                .iter()
+                .any(|loss| loss.feature_id == "blender.animation.action_slot")
+        );
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.animation.fcurve_non_transform_channel"
+                && loss.reason.contains("modifiers[")
+        }));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.animation.driver_target_id_type"
+                && loss.reason.contains("CAMERA")
+        }));
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.animation.fcurve_non_transform_channel"
+                && loss.data_id.as_deref() == Some("Wrong")
+                && loss.reason.contains("data.lens")
+        }));
+        let owner = Id::new("camera_node").unwrap();
+        let mut mappings = BTreeMap::new();
+        let drivers = parse_drivers(
+            &json!({"drivers":[{
+                "curve":{"path":"data.lens","index":0},
+                "driver":{"variables":[{
+                    "targets":[{"id_type":"CAMERA","id":{"name":"CameraData"},"data_path":"lens"}]
+                }]}
+            }]}),
+            &owner,
+            &BTreeMap::new(),
+            &mut mappings,
+        )
+        .unwrap();
+        assert_eq!(drivers, Vec::new());
+    }
+
+    #[test]
+    fn shared_object_key_action_is_lossless_only_for_matching_mesh_owner() {
+        let raw = json!({
+            "actions":[{
+                "name":"Shared",
+                "slot_count":2,
+                "slots":[
+                    {"name":"ObjectSlot","identifier":"OB","target_type":"OBJECT"},
+                    {"name":"KeySlot","identifier":"KE","target_type":"KEY"}
+                ],
+                "fcurves":[
+                    {"path":"location","index":0},
+                    {"path":"key_blocks[\"Smile\"].value","index":0}
+                ]
+            }],
+            "objects":[{
+                "name":"MeshObject",
+                "type":"MESH",
+                "data_name":"MeshData",
+                "action":"Shared",
+                "action_slot":{"name":"ObjectSlot","identifier":"OB"}
+            }],
+            "meshes":[{
+                "name":"MeshData",
+                "shape_keys":{
+                    "action":"Shared",
+                    "action_slot":"KeySlot",
+                    "keys":[{"name":"Smile"}]
+                }
+            }]
+        });
+        let losses = import_losses(&raw);
+        assert!(
+            !losses
+                .iter()
+                .any(|loss| loss.feature_id == "blender.animation.action_slot"),
+            "matching Object and Key slots were reported lossy: {losses:?}"
+        );
+        assert!(
+            !losses
+                .iter()
+                .any(|loss| loss.feature_id == "blender.animation.fcurve_non_transform_channel"),
+            "Object transform or resolved shape-key output was rejected: {losses:?}"
+        );
+
+        let mut mismatched_owner = raw.clone();
+        mismatched_owner["objects"][0]["data_name"] = json!("OtherMesh");
+        let losses = import_losses(&mismatched_owner);
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.feature_id == "blender.animation.action_slot")
+        );
+
+        let mut unresolved_shape_key = raw;
+        unresolved_shape_key["meshes"][0]["shape_keys"]["keys"][0]["name"] = json!("OtherKey");
+        let losses = import_losses(&unresolved_shape_key);
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == "blender.animation.fcurve_non_transform_channel"
+                && loss.reason.contains("key_blocks[")
+        }));
     }
 
     #[test]

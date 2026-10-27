@@ -1029,6 +1029,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "constraint.ik.swing_ellipse_limit",
         "modifier.boolean.exact_point_attribute_local_index",
         "constraint.geometry_attribute.instances",
+        "animation.fcurve_non_transform_channels",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1062,6 +1063,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "blender.curve.nurbs.custom_knots",
         "curve.convert.production_settings",
         "blender.curve.bevel_object",
+        "modifier.uv_project.animated_camera_lens",
     ] {
         assert!(
             features.iter().any(|feature| {

@@ -124,6 +124,66 @@ bpy.context.view_layer.update()
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "shape_key_source.blend"))
 "#;
 
+const SHARED_OBJECT_KEY_FIXTURE: &str = r#"
+import bpy
+import json
+import os
+import sys
+
+root = os.path.realpath(sys.argv[sys.argv.index("--") + 1])
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+mesh = bpy.data.meshes.new("SharedObjectKeyMesh")
+mesh.from_pydata([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)], [], [])
+mesh.update()
+target = bpy.data.objects.new("SharedObjectKeyTarget", mesh)
+scene.collection.objects.link(target)
+target.shape_key_add(name="Basis", from_mix=False)
+smile = target.shape_key_add(name="Smile", from_mix=False)
+smile.data[0].co.z += 1.0
+key_data = mesh.shape_keys
+
+frames = {
+    1: ((0.0, 0.0, 0.0), 0.0),
+    5: ((2.0, 1.0, -1.0), 0.5),
+    9: ((4.0, 3.0, 2.0), 1.0),
+}
+for frame, (location, value) in frames.items():
+    scene.frame_set(frame)
+    target.location = location
+    target.keyframe_insert(data_path="location", frame=frame)
+    smile.value = value
+    smile.keyframe_insert(data_path="value", frame=frame)
+if (target.animation_data is None or key_data.animation_data is None
+        or target.animation_data.action is None
+        or target.animation_data.action != key_data.animation_data.action):
+    raise RuntimeError("default keying did not share an Action between the Object and Key")
+action = target.animation_data.action
+
+slot_types = sorted(slot.target_id_type for slot in action.slots)
+if slot_types != ["KEY", "OBJECT"]:
+    raise RuntimeError("default keying did not create Object and Key Action slots: %r" % slot_types)
+
+samples = {}
+for frame in (1, 3, 5, 7, 9):
+    scene.frame_set(frame)
+    bpy.context.view_layer.update()
+    evaluated = target.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    evaluated_mesh = evaluated.to_mesh()
+    samples[str(frame)] = {
+        "location": [float(value) for value in target.location],
+        "shape_value": float(key_data.key_blocks["Smile"].value),
+        "shape_vertex_z": float(evaluated_mesh.vertices[0].co.z),
+    }
+    evaluated.to_mesh_clear()
+
+with open(os.path.join(root, "shared_action_expected.json"), "w", encoding="utf-8") as handle:
+    json.dump({"slot_types": slot_types, "frames": samples}, handle)
+scene.frame_set(1)
+bpy.context.view_layer.update()
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(root, "shared_action_source.blend"))
+"#;
+
 fn run_blender(blender: &Path, root: &Path) -> Result<(), Box<dyn Error>> {
     blender_script::run_blender_script(
         blender,
@@ -173,6 +233,60 @@ fn assert_nearest_parity(actual: &[[f64; 3]], expected: &[[f64; 3]], label: &str
         max_error < TOLERANCE,
         "{label}: symmetric nearest-vertex gap {max_error} exceeds {TOLERANCE}; actual={actual:?}, expected={expected:?}"
     );
+}
+
+fn assert_shared_action_parity(
+    scene: &potter_core::model::SceneDoc,
+    target_id: &potter_core::model::Id,
+    expected: &Value,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    for frame in [1_u32, 3, 5, 7, 9] {
+        let snapshot = potter_core::eval::Snapshot::evaluate(
+            scene,
+            &potter_core::eval::EvaluationContext {
+                frame: Some(f64::from(frame)),
+                ..potter_core::eval::EvaluationContext::default()
+            },
+        )?;
+        let matrix = &snapshot
+            .nodes
+            .get(target_id)
+            .ok_or("shared-action target was not evaluated")?
+            .world_matrix;
+        let sample = &expected["frames"][frame.to_string()];
+        let location = sample["location"]
+            .as_array()
+            .ok_or("Blender location was not an array")?;
+        for (index, component) in [matrix[12], matrix[13], matrix[14]].iter().enumerate() {
+            let expected = location
+                .get(index)
+                .and_then(Value::as_f64)
+                .ok_or("Blender location component was not numeric")?;
+            assert!(
+                (*component - expected).abs() < TOLERANCE,
+                "{label}: Object location at frame {frame}, component {index}: Potter={component}, Blender={expected}"
+            );
+        }
+        let shape_value = snapshot
+            .meshes
+            .get(target_id)
+            .and_then(|mesh| mesh.vertices.first())
+            .map(|vertex| vertex.co.z)
+            .ok_or("evaluated shape-key vertex was missing")?;
+        let expected_value = sample["shape_value"]
+            .as_f64()
+            .ok_or("Blender shape-key value was not numeric")?;
+        let expected_vertex_z = sample["shape_vertex_z"]
+            .as_f64()
+            .ok_or("Blender shape-key vertex was not numeric")?;
+        assert!((expected_value - expected_vertex_z).abs() < TOLERANCE);
+        assert!(
+            (shape_value - expected_value).abs() < TOLERANCE,
+            "{label}: shape-key value at frame {frame}: Potter={shape_value}, Blender={expected_value}"
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -357,5 +471,142 @@ fn blender_key_action_deforms_surface_target_and_bound_object() -> Result<(), Bo
         bound_after[0][2] - bound_before[0][2] > 0.14,
         "Surface Deform did not follow the evaluated target"
     );
+    Ok(())
+}
+
+#[test]
+fn blender_default_keying_shared_object_key_action_round_trips_both_channels()
+-> Result<(), Box<dyn Error>> {
+    let Some(blender) = blender_executable() else {
+        eprintln!("Skipping shared Object+Key Action parity: no Blender executable was found");
+        return Ok(());
+    };
+    let directory = tempdir()?;
+    let root = directory.path();
+    blender_script::run_blender_script(
+        &blender,
+        "make_shared_object_key_action.py",
+        SHARED_OBJECT_KEY_FIXTURE,
+        root,
+        "Shared Object+Key Action fixture failed",
+    )?;
+    let expected: Value =
+        serde_json::from_slice(&fs::read(root.join("shared_action_expected.json"))?)?;
+    assert_eq!(expected["slot_types"], serde_json::json!(["KEY", "OBJECT"]));
+
+    let project = root.join("shared_action_project");
+    pot_json(&[
+        "init",
+        project.to_str().ok_or("project path was not UTF-8")?,
+    ])?;
+    let source = root.join("shared_action_source.blend");
+    let import = pot_json(&[
+        "import",
+        project.to_str().ok_or("project path was not UTF-8")?,
+        "--file",
+        source.to_str().ok_or("blend path was not UTF-8")?,
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().ok_or("Blender path was not UTF-8")?,
+    ])?;
+    assert_eq!(import["result"]["losses"], serde_json::json!([]));
+    let scene: potter_core::model::SceneDoc =
+        serde_json::from_slice(&fs::read(project.join("scene.json"))?)?;
+    let target_id = potter_core::model::Id::new(
+        import["result"]["id_mappings"]["Object:SharedObjectKeyTarget"]
+            .as_str()
+            .ok_or("shared-action object mapping was missing")?
+            .to_owned(),
+    )?;
+    let target = &scene.nodes[&target_id];
+    let data_id = target
+        .data
+        .as_ref()
+        .ok_or("shared-action mesh data was missing")?;
+    let shape_keys = scene.data_blocks[data_id]
+        .shape_keys
+        .as_ref()
+        .ok_or("shared-action shape keys were missing")?;
+    let action_id = target
+        .action
+        .as_ref()
+        .ok_or("Object Action was not imported")?;
+    assert_eq!(shape_keys.action.as_ref(), Some(action_id));
+    let action = &scene.actions[action_id];
+    assert_eq!(action.slots.len(), 2);
+    assert!(
+        action
+            .fcurves
+            .iter()
+            .any(|curve| curve.path == "transform.translation"),
+        "Object transform curves were dropped from the shared Action"
+    );
+    assert!(
+        action
+            .fcurves
+            .iter()
+            .any(|curve| curve.path == "key_blocks[\"Smile\"].value"),
+        "shape-key value curves were dropped from the shared Action"
+    );
+    assert_shared_action_parity(&scene, &target_id, &expected, "strict import")?;
+
+    let exported = root.join("shared_action_roundtrip.blend");
+    let export = pot_json(&[
+        "export",
+        project.to_str().ok_or("project path was not UTF-8")?,
+        "--format",
+        "blend",
+        "--out",
+        exported.to_str().ok_or("export path was not UTF-8")?,
+        "--blender",
+        blender.to_str().ok_or("Blender path was not UTF-8")?,
+    ])?;
+    assert_eq!(export["result"]["losses"], serde_json::json!([]));
+
+    let roundtrip_project = root.join("shared_action_roundtrip_project");
+    pot_json(&[
+        "init",
+        roundtrip_project
+            .to_str()
+            .ok_or("round-trip project path was not UTF-8")?,
+    ])?;
+    let roundtrip_import = pot_json(&[
+        "import",
+        roundtrip_project
+            .to_str()
+            .ok_or("round-trip project path was not UTF-8")?,
+        "--file",
+        exported
+            .to_str()
+            .ok_or("exported blend path was not UTF-8")?,
+        "--format",
+        "blend",
+        "--mode",
+        "replace",
+        "--base-revision",
+        "0",
+        "--blender",
+        blender.to_str().ok_or("Blender path was not UTF-8")?,
+    ])?;
+    assert_eq!(roundtrip_import["result"]["losses"], serde_json::json!([]));
+    let roundtrip_scene: potter_core::model::SceneDoc =
+        serde_json::from_slice(&fs::read(roundtrip_project.join("scene.json"))?)?;
+    let roundtrip_target_id = potter_core::model::Id::new(
+        roundtrip_import["result"]["id_mappings"]["Object:SharedObjectKeyTarget"]
+            .as_str()
+            .ok_or("round-trip object mapping was missing")?
+            .to_owned(),
+    )?;
+    assert_shared_action_parity(
+        &roundtrip_scene,
+        &roundtrip_target_id,
+        &expected,
+        "round-trip import",
+    )?;
     Ok(())
 }

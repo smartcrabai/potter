@@ -2040,6 +2040,7 @@ fn apply_pose_bone_constraints(
                 target_matrix,
                 constraint,
                 doc,
+                driver_values,
                 frame,
                 target_worlds,
                 evaluated_meshes,
@@ -2758,15 +2759,48 @@ fn sample_shape_key_action_values(
         {
             continue;
         }
-        let Some(key_id) = shape_key_id_from_path(shape_keys, &curve.path) else {
+        let evaluation_time_path = matches!(
+            curve.path.as_str(),
+            "shape_keys.evaluation_time" | "shape_key.evaluation_time" | "key_blocks.eval_time"
+        );
+        let shape_key_value_path = curve.path.strip_suffix(".value").is_some_and(|base| {
+            (base.starts_with("shape_key.") || base.starts_with("shape_keys."))
+                && base.split('.').count() == 2
+                || base.starts_with("key_blocks[") && base.ends_with(']')
+        });
+        if !evaluation_time_path && !shape_key_value_path {
             continue;
-        };
-        if curve.index != 0 {
+        }
+        let key_id = shape_key_id_from_path(shape_keys, &curve.path);
+        let supported_path = crate::eval::animation::supports_animation_output(
+            &curve.path,
+            0,
+            crate::eval::animation::AnimationOutputKind::Action,
+        );
+        if !supported_path || (!evaluation_time_path && key_id.is_none()) {
+            let feature_id = format!("animation.fcurve_non_transform_channels.{}", curve.path);
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "shape key animation path `{}` is not supported by this data-block",
+                    curve.path
+                ),
+                json!({"feature_id":feature_id,"action":action_id}),
+            ));
+        }
+        if !crate::eval::animation::supports_animation_output(
+            &curve.path,
+            curve.index,
+            crate::eval::animation::AnimationOutputKind::Action,
+        ) {
             return Err(evaluation_error_with(
                 "shape key value curve index must be zero",
                 json!({"action":action_id,"path":curve.path,"index":curve.index}),
             ));
         }
+        let Some(key_id) = key_id else {
+            continue;
+        };
         if let Some(value) = crate::eval::animation::sample_curve(curve, frame)? {
             values.insert(key_id, value);
         }
@@ -2801,7 +2835,7 @@ fn shape_key_driver_values(
     Ok(driven)
 }
 
-fn shape_key_id_from_path(shape_keys: &ShapeKeyData, path: &str) -> Option<Id> {
+pub(crate) fn shape_key_id_from_path(shape_keys: &ShapeKeyData, path: &str) -> Option<Id> {
     let path_id = path
         .strip_prefix("shape_key.")
         .or_else(|| path.strip_prefix("shape_keys."))
@@ -5184,8 +5218,14 @@ fn evaluate_world_matrices_with_meshes(
             }
         }
         let animated = animated_transform(node, doc, frame)?;
-        let effective_transform =
-            apply_transform_drivers(id, &node.transform.rotation_mode, animated, driver_values)?;
+        let effective_transform = apply_transform_drivers(
+            id,
+            node,
+            doc,
+            &node.transform.rotation_mode,
+            animated,
+            driver_values,
+        )?;
         let captured_matrix_basis = node.captured_matrix_basis(&effective_transform)?;
         let local = captured_matrix_basis.map_or_else(
             || effective_transform.matrix(),
@@ -5465,6 +5505,7 @@ fn evaluate_world_matrices_with_meshes(
                 target_matrix,
                 constraint,
                 doc,
+                driver_values,
                 frame,
                 output,
                 evaluated_meshes,
@@ -7241,6 +7282,7 @@ fn follow_track_matrix(
     camera_world: DMat4,
     constraint: &Constraint,
     doc: &SceneDoc,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
     frame: f64,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
@@ -7377,6 +7419,21 @@ fn follow_track_matrix(
         .and_then(|data_id| doc.data_blocks.get(data_id))
         .and_then(|data| data.camera.as_ref())
         .ok_or_else(|| evaluation_error("Follow Track target has no camera data"))?;
+    let lens_mm = crate::eval::clamp_camera_lens(
+        driver_values
+            .iter()
+            .find_map(|((target, path, index), value)| {
+                (target == camera_id && path == "camera.lens_mm" && *index == 0).then_some(*value)
+            })
+            .or(crate::eval::animation::animated_scalar_channel(
+                camera_node,
+                doc,
+                "camera.lens_mm",
+                camera_data.lens_mm,
+                frame,
+            )?)
+            .unwrap_or(camera_data.lens_mm),
+    );
     let intrinsics = &clip.tracking.camera;
     let (ray_origin_local, direction) =
         if camera_data.projection == crate::model::CameraProjection::Orthographic {
@@ -7391,7 +7448,7 @@ fn follow_track_matrix(
             }
             (DVec3::new(x, y, 0.0), DVec3::NEG_Z)
         } else {
-            let focal = camera_data.lens_mm / camera_data.sensor_width_mm;
+            let focal = lens_mm / camera_data.sensor_width_mm;
             if !focal.is_finite() || focal <= 0.0 {
                 return Err(evaluation_error(
                     "Follow Track camera focal length is invalid",
@@ -7729,6 +7786,7 @@ fn apply_object_constraint(
     target: DMat4,
     constraint: &Constraint,
     doc: &SceneDoc,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
     frame: f64,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
@@ -7913,6 +7971,7 @@ fn apply_object_constraint(
         target_in_space,
         constraint,
         doc,
+        driver_values,
         frame,
         world_matrices,
         evaluated_meshes,
@@ -7938,6 +7997,7 @@ fn apply_object_constraint_in_space(
     target: DMat4,
     constraint: &Constraint,
     doc: &SceneDoc,
+    driver_values: &BTreeMap<(Id, String, u32), f64>,
     frame: f64,
     world_matrices: &BTreeMap<Id, DMat4>,
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
@@ -8678,6 +8738,7 @@ fn apply_object_constraint_in_space(
                 target,
                 constraint,
                 doc,
+                driver_values,
                 frame,
                 world_matrices,
                 evaluated_meshes,
@@ -10446,8 +10507,49 @@ fn transform_channel(
     values.get(usize::try_from(index).ok()?).copied()
 }
 
+fn validate_driver_output(
+    node_id: &Id,
+    node: &Node,
+    doc: &SceneDoc,
+    path: &str,
+    index: u32,
+) -> Result<()> {
+    use crate::eval::animation::{
+        AnimationOutputKind, animation_output_component_count, supports_animation_output,
+        supports_animation_output_for_node,
+    };
+
+    let kind = AnimationOutputKind::Driver;
+    if !supports_animation_output_for_node(path, 0, kind, node, doc) {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!("driver output path `{path}` is not supported by this node"),
+            json!({
+                "feature_id":format!("animation.fcurve_non_transform_channels.{path}"),
+                "node_id":node_id,
+                "path":path,
+            }),
+        ));
+    }
+    if !supports_animation_output(path, index, kind) {
+        let component_count = animation_output_component_count(path, kind).unwrap_or(0);
+        let message = if component_count == 1 {
+            "scalar driver output index must be zero".to_owned()
+        } else {
+            format!("driver output index is outside the component range for `{path}`")
+        };
+        return Err(evaluation_error_with(
+            &message,
+            json!({"node_id":node_id,"path":path,"index":index}),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn apply_transform_drivers(
     node_id: &Id,
+    node: &Node,
+    doc: &SceneDoc,
     rotation_mode: &str,
     mut transform: Transform,
     drivers: &BTreeMap<(Id, String, u32), f64>,
@@ -10460,6 +10562,7 @@ pub(crate) fn apply_transform_drivers(
         if target_id != node_id {
             continue;
         }
+        validate_driver_output(node_id, node, doc, path, *index)?;
         if !value.is_finite() {
             return Err(evaluation_error_with(
                 "transform driver value is non-finite",

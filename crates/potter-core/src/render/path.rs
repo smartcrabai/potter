@@ -2103,16 +2103,16 @@ fn camera_sun_discs(doc: &SceneDoc, snapshot: &Snapshot) -> Vec<SunDisc> {
                 && node.resolved_ray_visibility().allows(RayKind::Camera)
         })
         .filter_map(|(node_id, node)| {
-            let data = node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))?
-                .light
-                .as_ref()?;
+            let evaluated = snapshot.nodes.get(node_id)?;
+            let data = evaluated.evaluated_light.as_ref().or_else(|| {
+                node.data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id))
+                    .and_then(|data| data.light.as_ref())
+            })?;
             if data.light_type != LightType::Sun {
                 return None;
             }
-            let evaluated = snapshot.nodes.get(node_id)?;
             let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
             let to_sun = matrix.transform_vector3(DVec3::Z).normalize_or_zero();
             let half_angle = data.sun_angle.min(179.9_f64.to_radians()) / 2.0;
@@ -2346,9 +2346,10 @@ mod camera_light_shape_tests {
 
     use glam::{DMat4, DQuat, DVec3};
 
-    use super::{PointLight, camera_light_shape_hit, light_hit};
+    use super::{PointLight, camera_light_shape_hit, camera_sun_discs, light_hit};
     use crate::{
-        model::{LightType, RayKind},
+        eval::{EvaluationContext, Snapshot},
+        model::{DataBlock, Id, LightData, LightType, Node, RayKind, SceneDoc},
         render::{
             light_model::{AreaShape, Spread, area_radiance},
             raster::{Camera, Projection, StereoMode},
@@ -2393,6 +2394,41 @@ mod camera_light_shape_tests {
             ray_mask: RayKind::Camera.bit(),
             camera_shape_eligible: true,
         }
+    }
+
+    #[test]
+    fn point_light_is_not_a_camera_sun_disc() -> Result<(), Box<dyn Error>> {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let node_id = Id::new("point_light")?;
+        let data_id = Id::new("point_light_data")?;
+        doc.data_blocks.insert(
+            data_id.clone(),
+            DataBlock {
+                data_type: "light".to_owned(),
+                light: Some(LightData {
+                    light_type: LightType::Point,
+                    ..LightData::default()
+                }),
+                ..DataBlock::default()
+            },
+        );
+        doc.collections
+            .get_mut(&Id::from_static("collection_root"))
+            .ok_or("root collection is missing")?
+            .objects
+            .push(node_id.clone());
+        doc.nodes.insert(
+            node_id,
+            Node {
+                name: "Point Light".to_owned(),
+                kind: "light".to_owned(),
+                data: Some(data_id),
+                ..Node::default()
+            },
+        );
+        let snapshot = Snapshot::evaluate(&doc, &EvaluationContext::default())?;
+        assert!(camera_sun_discs(&doc, &snapshot).is_empty());
+        Ok(())
     }
 
     #[test]
@@ -7739,13 +7775,13 @@ fn collect_lights_impl(
         .iter()
         .filter(|(_, node)| node.kind == "light" && node.visible && node.render_visible)
         .filter_map(|(node_id, node)| {
-            let data = node
-                .data
-                .as_ref()
-                .and_then(|data_id| doc.data_blocks.get(data_id))?
-                .light
-                .as_ref()?;
             let evaluated = snapshot.nodes.get(node_id)?;
+            let data = evaluated.evaluated_light.as_ref().or_else(|| {
+                node.data
+                    .as_ref()
+                    .and_then(|data_id| doc.data_blocks.get(data_id))
+                    .and_then(|data| data.light.as_ref())
+            })?;
             let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
             let color = DVec3::from_array(data.color).max(DVec3::ZERO);
             let energy = data.energy.max(0.0);

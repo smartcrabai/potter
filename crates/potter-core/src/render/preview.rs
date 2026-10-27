@@ -627,6 +627,7 @@ fn stored_camera(
             "camera is missing from evaluation",
         )
     })?;
+    let camera_data = evaluated.evaluated_camera.as_ref().unwrap_or(camera_data);
     let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
     let position = matrix.transform_point3(DVec3::ZERO);
     let forward = matrix.transform_vector3(-DVec3::Z).normalize_or_zero();

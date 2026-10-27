@@ -116,6 +116,7 @@ fn update_action(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
                 })?;
             for curve in &mut curves {
                 validate_path(engine, &curve.path, curve.index, "set/fcurves")?;
+                validate_path_for_action(engine, &id, &curve.path, curve.index, "set/fcurves")?;
                 validate_keyframes(engine, &curve.keyframes, "set/fcurves")?;
                 validate_fcurve_modifiers(engine, &curve.modifiers, "set/fcurves/modifiers")?;
                 super::animation_handles::recalculate(curve);
@@ -209,10 +210,10 @@ fn insert_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
         ],
         &["target", "path", "index", "frame", "value"],
     )?;
-    let action_id = target_node_action(engine, operation)?;
+    let (action_id, node_id) = target_node_action(engine, operation)?;
     let path = read_string(engine, operation, "path")?;
     let index = read_index(engine, operation)?;
-    validate_path(engine, &path, index, "path")?;
+    validate_path_for_node(engine, &node_id, &path, index, "path")?;
     let frame = super::finite_number(
         engine,
         operation.get("frame"),
@@ -350,10 +351,10 @@ fn delete_keyframe(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> R
         &["op", "target", "path", "index", "frame"],
         &["target", "path", "index", "frame"],
     )?;
-    let action_id = target_node_action(engine, operation)?;
+    let (action_id, node_id) = target_node_action(engine, operation)?;
     let path = read_string(engine, operation, "path")?;
     let index = read_index(engine, operation)?;
-    validate_path(engine, &path, index, "path")?;
+    validate_path_for_node(engine, &node_id, &path, index, "path")?;
     let frame = super::finite_number(
         engine,
         operation.get("frame"),
@@ -406,10 +407,10 @@ fn update_fcurve(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Res
         &["op", "target", "path", "index", "set"],
         &["target", "path", "index", "set"],
     )?;
-    let action_id = target_node_action(engine, operation)?;
+    let (action_id, node_id) = target_node_action(engine, operation)?;
     let path = read_string(engine, operation, "path")?;
     let index = read_index(engine, operation)?;
-    validate_path(engine, &path, index, "path")?;
+    validate_path_for_node(engine, &node_id, &path, index, "path")?;
     let set = operation
         .get("set")
         .and_then(Value::as_object)
@@ -520,7 +521,7 @@ fn action_target_id(engine: &Engine<'_>, operation: &Map<String, Value>) -> Resu
     Ok(id)
 }
 
-fn target_node_action(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<Id> {
+fn target_node_action(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<(Id, Id)> {
     let target = operation.get("target").ok_or_else(|| {
         engine.error(
             ErrorCode::InvalidOperation,
@@ -557,7 +558,7 @@ fn target_node_action(engine: &mut Engine<'_>, operation: &Map<String, Value>) -
             &operation_pointer(engine.operation_index, "target"),
         ));
     }
-    Ok(action_id)
+    Ok((action_id, node_id))
 }
 
 fn read_index(engine: &Engine<'_>, operation: &Map<String, Value>) -> Result<u32> {
@@ -654,65 +655,107 @@ fn parse_fcurve_auto_smoothing(
 }
 
 fn validate_path(engine: &Engine<'_>, path: &str, index: u32, field: &str) -> Result<()> {
-    let Some(component_count) = animation_path_component_count(path) else {
+    use crate::eval::animation::{
+        AnimationOutputKind, animation_output_component_count, supports_animation_output,
+    };
+
+    let kind = AnimationOutputKind::Action;
+    if !supports_animation_output(path, 0, kind) {
         return Err(engine.error(
             ErrorCode::InvalidOperation,
             format!("unsupported animation path `{path}`"),
             &operation_pointer(engine.operation_index, field),
         ));
-    };
-    if usize::try_from(index).is_ok_and(|value| value < component_count) {
+    }
+    if supports_animation_output(path, index, kind) {
         Ok(())
     } else {
+        let component_count = animation_output_component_count(path, kind).unwrap_or(0);
         Err(engine.error(
             ErrorCode::InvalidOperation,
-            format!("index is outside the component range for `{path}`"),
+            format!("index is outside the component range for `{path}` ({component_count})"),
             &operation_pointer(engine.operation_index, "index"),
         ))
     }
 }
 
-fn animation_path_component_count(path: &str) -> Option<usize> {
-    match path {
-        "transform.translation" | "transform.rotation_euler" | "transform.scale" => Some(3),
-        "transform.rotation_quaternion"
-        | "transform.rotation_axis_angle"
-        | "transform.rotation" => Some(4),
-        "visible"
-        | "camera.lens_mm"
-        | "light.energy"
-        | "shape_keys.evaluation_time"
-        | "shape_key.evaluation_time"
-        | "key_blocks.eval_time" => Some(1),
-        _ if path
-            .strip_prefix("material.")
-            .and_then(|rest| rest.strip_suffix(".base_color"))
-            .is_some_and(crate::model::is_valid_id) =>
-        {
-            Some(4)
-        }
-        _ => {
-            if let Some(rest) = path.strip_prefix("pose.")
-                && let Some((bone_id, channel)) = rest.split_once('.')
-                && crate::model::is_valid_id(bone_id)
-                && !channel.contains('.')
-            {
-                return match channel {
-                    "location" | "translation" | "scale" | "rotation_euler" => Some(3),
-                    "rotation" | "rotation_quaternion" | "rotation_axis_angle" => Some(4),
-                    _ => None,
-                };
-            }
-            if let Some(rest) = path.strip_prefix("shape_key.")
-                && let Some((key_id, channel)) = rest.split_once('.')
-                && crate::model::is_valid_id(key_id)
-                && channel == "value"
-            {
-                return Some(1);
-            }
-            None
+fn validate_path_for_node(
+    engine: &Engine<'_>,
+    node_id: &Id,
+    path: &str,
+    index: u32,
+    field: &str,
+) -> Result<()> {
+    validate_path(engine, path, index, field)?;
+    let node = engine.doc.nodes.get(node_id).ok_or_else(|| {
+        engine.error(
+            ErrorCode::TargetNotFound,
+            format!("node `{node_id}` was not found"),
+            &operation_pointer(engine.operation_index, "target"),
+        )
+    })?;
+    if !crate::eval::animation::supports_animation_output_for_node(
+        path,
+        index,
+        crate::eval::animation::AnimationOutputKind::Action,
+        node,
+        engine.doc,
+    ) {
+        return Err(engine.error(
+            ErrorCode::InvalidOperation,
+            format!("animation path `{path}` is not supported by node `{node_id}`"),
+            &operation_pointer(engine.operation_index, field),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_path_for_action(
+    engine: &Engine<'_>,
+    action_id: &Id,
+    path: &str,
+    index: u32,
+    field: &str,
+) -> Result<()> {
+    for (node_id, node) in &engine.doc.nodes {
+        let uses_action = node.action.as_ref() == Some(action_id)
+            || node
+                .nla_tracks
+                .iter()
+                .flat_map(|track| &track.strips)
+                .any(|strip| &strip.action == action_id);
+        if uses_action {
+            validate_path_for_node(engine, node_id, path, index, field)?;
         }
     }
+    for (data_id, data) in &engine.doc.data_blocks {
+        if data
+            .shape_keys
+            .as_ref()
+            .and_then(|shape_keys| shape_keys.action.as_ref())
+            != Some(action_id)
+        {
+            continue;
+        }
+        let owner = crate::model::Node {
+            data: Some(data_id.clone()),
+            ..crate::model::Node::default()
+        };
+        if !crate::eval::animation::supports_animation_output_for_node(
+            path,
+            index,
+            crate::eval::animation::AnimationOutputKind::Action,
+            &owner,
+            engine.doc,
+        ) {
+            return Err(engine.error(
+                ErrorCode::InvalidOperation,
+                format!("animation path `{path}` is not supported by data-block `{data_id}`"),
+                &operation_pointer(engine.operation_index, field),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_keyframes(engine: &Engine<'_>, keyframes: &[Keyframe], field: &str) -> Result<()> {
@@ -1156,6 +1199,117 @@ mod tests {
         model::{Action, Extrapolation, FCurve, Id, Interpolation, Keyframe},
         ops::apply_batch,
     };
+
+    #[test]
+    fn keyframe_operations_validate_data_and_pose_rotation_owners() {
+        let mut doc =
+            crate::model::SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let camera_node = Id::new("camera_node").unwrap();
+        let plain_node = Id::new("plain_node").unwrap();
+        let camera_data = Id::new("camera_data").unwrap();
+        let camera_action = Id::new("camera_action").unwrap();
+        let armature_node = Id::new("armature_node").unwrap();
+        let armature_data = Id::new("armature_data").unwrap();
+        let pose_action = Id::new("pose_action").unwrap();
+        let bone_id = Id::new("root_bone").unwrap();
+        let _ = doc.data_blocks.insert(
+            camera_data.clone(),
+            crate::model::DataBlock {
+                camera: Some(crate::model::CameraData::default()),
+                ..crate::model::DataBlock::default()
+            },
+        );
+        let _ = doc.data_blocks.insert(
+            armature_data.clone(),
+            crate::model::DataBlock {
+                armature: Some(crate::model::ArmatureData {
+                    bones: std::collections::BTreeMap::from([(
+                        bone_id.clone(),
+                        serde_json::from_value(json!({
+                            "name":"Root","head":[0.0,0.0,0.0],"tail":[0.0,1.0,0.0]
+                        }))
+                        .unwrap(),
+                    )]),
+                    ..crate::model::ArmatureData::default()
+                }),
+                ..crate::model::DataBlock::default()
+            },
+        );
+        for (id, name, kind, action, data) in [
+            (
+                camera_node.clone(),
+                "Camera",
+                "camera",
+                camera_action.clone(),
+                Some(camera_data),
+            ),
+            (
+                plain_node.clone(),
+                "Plain",
+                "empty",
+                camera_action.clone(),
+                None,
+            ),
+            (
+                armature_node.clone(),
+                "Armature",
+                "armature",
+                pose_action.clone(),
+                Some(armature_data),
+            ),
+        ] {
+            let pose = if id == armature_node {
+                std::collections::BTreeMap::from([(
+                    bone_id.clone(),
+                    crate::model::PoseBone {
+                        rotation_mode: Some(crate::model::PoseRotationMode::Quaternion),
+                        ..crate::model::PoseBone::default()
+                    },
+                )])
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            let _ = doc.nodes.insert(
+                id,
+                crate::model::Node {
+                    name: name.to_owned(),
+                    kind: kind.to_owned(),
+                    action: Some(action),
+                    data,
+                    pose,
+                    ..crate::model::Node::default()
+                },
+            );
+        }
+        for action in [camera_action, pose_action] {
+            let _ = doc.actions.insert(
+                action.clone(),
+                Action {
+                    name: action.to_string(),
+                    ..Action::default()
+                },
+            );
+        }
+        let camera_insert = json!({"schema_version":1,"base_revision":0,"operations":[
+            {"op":"keyframe.insert","target":{"id":"camera_node"},
+             "path":"camera.lens_mm","index":0,"frame":1.0,"value":35.0}
+        ]});
+        assert!(apply_batch(&doc, &camera_insert).is_ok());
+        let wrong_data = json!({"schema_version":1,"base_revision":0,"operations":[
+            {"op":"keyframe.insert","target":{"id":"plain_node"},
+             "path":"camera.lens_mm","index":0,"frame":1.0,"value":35.0}
+        ]});
+        assert_eq!(
+            apply_batch(&doc, &wrong_data).unwrap_err().code,
+            ErrorCode::InvalidOperation
+        );
+        let pose_path = format!("pose.{bone_id}.rotation_euler");
+        let inactive_pose_rotation = json!({"schema_version":1,"base_revision":0,"operations":[
+            {"op":"keyframe.insert","target":{"id":"armature_node"},
+             "path":pose_path,"index":0,"frame":1.0,"value":0.5}
+        ]});
+        assert!(apply_batch(&doc, &inactive_pose_rotation).is_ok());
+    }
 
     #[test]
     fn action_assignment_and_keyframe_insert_replace_existing_frame() {

@@ -8,6 +8,8 @@ use std::{
 use glam::{DMat4, DVec3};
 use potter_core::{
     error::ErrorCode,
+    eval::{EvaluationContext, Snapshot},
+    exchange::blend::import_blend,
     geom::{
         Mesh,
         modifiers::attributes::{
@@ -147,6 +149,51 @@ result = {
         'aligned_normal':mat_cols(aligned_normal.matrix_world),
     },
 }
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+def channel_curve(owner, data_path):
+    action = owner.animation_data.action
+    for layer in action.layers:
+        for strip in layer.strips:
+            for slot in action.slots:
+                channelbag = strip.channelbag(slot)
+                if channelbag is None:
+                    continue
+                for curve in channelbag.fcurves:
+                    if curve.data_path == data_path and curve.array_index == 0:
+                        return curve
+    raise RuntimeError('Missing camera lens F-Curve')
+animated_projector = make_camera('AnimatedLensCamera', 'PERSP', (0.0,0.0,5.0),(0.0,0.0,0.0),(1.0,1.0,1.0),lens=42.0,shift=(0.0,0.0))
+for frame in (1,3):
+    animated_projector.location.x = 0.0
+    animated_projector.keyframe_insert(data_path='location', index=0, frame=frame)
+    animated_projector.data.keyframe_insert(data_path='lens', frame=frame)
+if animated_projector.animation_data.action != animated_projector.data.animation_data.action:
+    raise RuntimeError('UV Project camera lens must share the Object Action')
+if {slot.target_id_type for slot in animated_projector.animation_data.action.slots} != {'OBJECT','CAMERA'}:
+    raise RuntimeError('UV Project camera Action must have Object and Camera slots')
+curve = channel_curve(animated_projector.data, 'lens')
+for point, lens in zip(curve.keyframe_points, (0.25,30.0)):
+    point.co.y = lens
+    point.interpolation = 'LINEAR'
+curve.update()
+animated_subject = make_subject('AnimatedLensSubject')
+animated_modifier = animated_subject.modifiers.new('AnimatedLensProject', 'UV_PROJECT')
+animated_modifier.uv_layer = 'UVMap'
+animated_modifier.projector_count = 1
+animated_modifier.projectors[0].object = animated_projector
+driven_projector = make_camera('DrivenLensCamera', 'PERSP', (0.0,0.0,5.0),(0.0,0.0,0.0),(1.0,1.0,1.0),lens=42.0,shift=(0.0,0.0))
+driver = driven_projector.data.driver_add('lens').driver
+driver.type = 'SCRIPTED'
+driver.expression = '0.25'
+driven_subject = make_subject('DrivenLensSubject')
+driven_modifier = driven_subject.modifiers.new('DrivenLensProject', 'UV_PROJECT')
+driven_modifier.uv_layer = 'UVMap'
+driven_modifier.projector_count = 1
+driven_modifier.projectors[0].object = driven_projector
+scene.frame_set(1)
+bpy.ops.wm.save_as_mainfile(filepath=root + '/uv_project_animated_lens.blend')
+
 with open(root + '/expected_uv_project.json','w') as file:
     json.dump(result,file)
 ";
@@ -559,7 +606,7 @@ fn assert_uv_parity(
         .fold(0.0_f64, f64::max);
     assert!(
         max_error <= 3.0e-5,
-        "{name}: max per-loop UV error {max_error}"
+        "{name}: max per-loop UV error {max_error}; actual={actual:?}; expected={expected:?}"
     );
     Ok(max_error)
 }
@@ -581,6 +628,22 @@ fn read_oracle(
     Ok(serde_json::from_slice(&fs::read(root.join(filename))?)?)
 }
 
+fn run_uv_project_oracle(
+    blender: &std::path::Path,
+) -> Result<(Value, tempfile::TempDir), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    run_blender_script(
+        blender,
+        "modifier_uv_oracle.py",
+        UV_PROJECTION_ORACLE,
+        &root,
+        "Blender UV oracle failed",
+    )?;
+    let expected = serde_json::from_slice(&fs::read(root.join("expected_uv_project.json"))?)?;
+    Ok((expected, directory))
+}
+
 #[test]
 fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
 -> Result<(), Box<dyn Error>> {
@@ -588,7 +651,7 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
         eprintln!("skipping UV modifier Blender parity test: Blender is unavailable");
         return Ok(());
     };
-    let expected = read_oracle(&blender, UV_PROJECTION_ORACLE, "expected_uv_project.json")?;
+    let (expected, oracle_directory) = run_uv_project_oracle(&blender)?;
     let mesh = test_mesh()?;
     let subject = matrix_from_oracle(&expected["matrices"]["subject"])?;
     let persp_world = matrix_from_oracle(&expected["matrices"]["perspective"])?;
@@ -746,6 +809,125 @@ fn uv_project_matches_blender_camera_modes_aspect_scale_and_projector_list()
         &expected["scaled_projector_normal_selection"],
         "UVMap",
     )?;
+    let source_blend = oracle_directory
+        .path()
+        .join("uv_project_animated_lens.blend");
+    let imported = import_blend(&source_blend, Some(blender.as_path()))?;
+    let lens_feature = "modifier.uv_project.animated_camera_lens";
+    assert_eq!(
+        imported
+            .losses
+            .iter()
+            .filter(|loss| loss.feature_id == lens_feature)
+            .count(),
+        2,
+        "both animated and driven UV Project lenses must be import losses: {:?}",
+        imported.losses
+    );
+    for (subject_name, other_subject_name) in [
+        ("AnimatedLensSubject", "DrivenLensSubject"),
+        ("DrivenLensSubject", "AnimatedLensSubject"),
+    ] {
+        let subject_id = Id::new(
+            imported.id_mappings[&format!("Object:{subject_name}")]
+                .as_str()
+                .ok_or("UV Project subject mapping is missing")?
+                .to_owned(),
+        )?;
+        let other_subject_id = Id::new(
+            imported.id_mappings[&format!("Object:{other_subject_name}")]
+                .as_str()
+                .ok_or("other UV Project subject mapping is missing")?
+                .to_owned(),
+        )?;
+        let mut isolated_doc = imported.doc.clone();
+        isolated_doc
+            .nodes
+            .get_mut(&other_subject_id)
+            .ok_or("other UV Project subject is missing")?
+            .modifiers
+            .clear();
+        assert!(
+            isolated_doc.nodes.get(&subject_id).is_some_and(|node| node
+                .modifiers
+                .iter()
+                .any(|modifier| { modifier.modifier_type == "uv_project" })),
+            "{subject_name} must retain its UV Project modifier"
+        );
+        let error = Snapshot::evaluate(&isolated_doc, &EvaluationContext::default())
+            .err()
+            .ok_or("animated or driven UV Project lens evaluated successfully")?;
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature, "{subject_name}");
+        assert_eq!(error.details["feature_id"], lens_feature, "{subject_name}");
+    }
+
+    let cli_directory = tempdir()?;
+    let cli_project = cli_directory.path().join("project");
+    let initialized = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("init")
+        .arg(&cli_project)
+        .arg("--json")
+        .output()?;
+    assert!(initialized.status.success());
+    let strict_import = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("import")
+        .arg(&cli_project)
+        .arg("--file")
+        .arg(&source_blend)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender)
+        .arg("--json")
+        .output()?;
+    assert!(
+        !strict_import.status.success(),
+        "strict import must reject animated and driven UV Project lenses"
+    );
+    let strict_report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&strict_import.stdout),
+        String::from_utf8_lossy(&strict_import.stderr)
+    );
+    assert!(
+        strict_report.contains(lens_feature),
+        "strict import must identify the UV Project lens loss: {strict_report}"
+    );
+    let lossy_import = Command::new(env!("CARGO_BIN_EXE_pot"))
+        .arg("import")
+        .arg(&cli_project)
+        .arg("--file")
+        .arg(&source_blend)
+        .args([
+            "--format",
+            "blend",
+            "--mode",
+            "replace",
+            "--base-revision",
+            "0",
+            "--blender",
+        ])
+        .arg(&blender)
+        .args(["--allow-lossy", "--json"])
+        .output()?;
+    assert!(
+        lossy_import.status.success(),
+        "allow-lossy import must accept UV Project lens losses: {}",
+        String::from_utf8_lossy(&lossy_import.stdout)
+    );
+    let lossy_report: Value = serde_json::from_slice(&lossy_import.stdout)?;
+    assert!(
+        lossy_report["result"]["losses"]
+            .as_array()
+            .is_some_and(|losses| losses.iter().any(|loss| loss["feature_id"] == lens_feature)),
+        "allow-lossy import must report the UV Project lens loss: {lossy_report}"
+    );
     Ok(())
 }
 
