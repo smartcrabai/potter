@@ -1465,6 +1465,7 @@ fn make_result(bodies: Vec<Body>, key: String) -> Result<SimulationResult> {
         paint_colors: BTreeMap::new(),
         paint_wetness: BTreeMap::new(),
         paint_weights: BTreeMap::new(),
+        paint_images: BTreeMap::new(),
         physics_cache_key: None,
     })
 }

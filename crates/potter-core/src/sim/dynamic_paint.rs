@@ -1,6 +1,6 @@
 //! Deterministic vertex colors from point-brush proximity and volume-mesh interior coverage.
 
-use glam::{DMat4, DVec3};
+use glam::{DMat4, DVec3, Vec3};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
@@ -106,38 +106,7 @@ pub(crate) fn paint_step(
         } else {
             DVec3::ZERO
         };
-        if settings.use_drying {
-            if point.wetness >= 0.001 {
-                let previous_wetness = point.wetness;
-                point.wetness =
-                    dissolve_value(point.wetness, settings.dry_speed, settings.dry_log).max(0.0);
-                if point.wetness < settings.color_dry_threshold {
-                    let blended = blend_paint_colors(point.dry, point.wet);
-                    let dry_ratio = point.wetness / previous_wetness;
-                    point.wet[3] *= dry_ratio;
-                    point.dry[3] = (blended[3] - point.wet[3]) / (1.0 - point.wet[3]);
-                    if point.dry[3] != 0.0 {
-                        for component in 0..3 {
-                            point.dry[component] = (blended[component] * blended[3]
-                                - point.wet[component] * point.wet[3])
-                                / (point.dry[3] * (1.0 - point.wet[3]));
-                        }
-                    }
-                }
-            } else if point.painted {
-                point.dry = blend_paint_colors(point.dry, point.wet);
-                point.wetness = 0.0;
-                point.wet[3] = 0.0;
-            }
-        }
-        if settings.use_dissolve {
-            point.dry[3] =
-                dissolve_value(point.dry[3], settings.dissolve_speed, settings.dissolve_log)
-                    .max(0.0);
-            point.wet[3] =
-                dissolve_value(point.wet[3], settings.dissolve_speed, settings.dissolve_log)
-                    .max(0.0);
-        }
+        prepare_paint_point(point, settings);
 
         for brush in brushes {
             let influence = if let Some(mask) = &brush.volume_mask {
@@ -164,28 +133,7 @@ pub(crate) fn paint_step(
             }
             let strength = (influence * brush.strength * f64::from(settings.influence_scale))
                 .clamp(0.0, 1.0) as f32;
-            let source_alpha = strength;
-            let paint_wetness = brush.wetness as f32 * strength;
-            let previous_alpha = point.wet[3];
-            let mixed_alpha = previous_alpha * (1.0 - source_alpha) + source_alpha;
-            if mixed_alpha != 0.0 {
-                for component in 0..3 {
-                    point.wet[component] =
-                        (point.wet[component] * previous_alpha * (1.0 - source_alpha)
-                            + brush.color[component] as f32 * source_alpha)
-                            / mixed_alpha;
-                }
-            }
-            if brush.absolute_alpha {
-                point.wet[3] = previous_alpha.max(strength);
-                point.wetness = point.wetness.max(paint_wetness);
-            } else {
-                point.wet[3] = mixed_alpha;
-                let wetness = paint_wetness.clamp(0.0, 1.0);
-                point.wetness = point.wetness * (1.0 - wetness) + wetness;
-            }
-            point.wetness = point.wetness.max(0.001);
-            point.painted = true;
+            apply_paint_brush(point, brush, strength);
         }
     }
     if points.iter().any(|point| {
@@ -199,6 +147,204 @@ pub(crate) fn paint_step(
         return Err(invalid("dynamic-paint paint output is not finite"));
     }
     Ok(())
+}
+const IMAGE_GAUSSIAN: [f32; 5] = [0.996_849, 0.596_145, 0.596_145, 0.596_145, 0.524_141];
+const IMAGE_GAUSSIAN_TOTAL: f32 = 3.309_425;
+
+fn prepare_paint_point(point: &mut PaintPoint, settings: PaintSettings) {
+    if settings.use_drying {
+        if point.wetness >= 0.001 {
+            let previous_wetness = point.wetness;
+            point.wetness =
+                dissolve_value(point.wetness, settings.dry_speed, settings.dry_log).max(0.0);
+            if point.wetness < settings.color_dry_threshold {
+                let blended = blend_paint_colors(point.dry, point.wet);
+                let dry_ratio = point.wetness / previous_wetness;
+                point.wet[3] *= dry_ratio;
+                point.dry[3] = (blended[3] - point.wet[3]) / (1.0 - point.wet[3]);
+                if point.dry[3] != 0.0 {
+                    for component in 0..3 {
+                        point.dry[component] = (blended[component] * blended[3]
+                            - point.wet[component] * point.wet[3])
+                            / (point.dry[3] * (1.0 - point.wet[3]));
+                    }
+                }
+            }
+        } else if point.painted {
+            point.dry = blend_paint_colors(point.dry, point.wet);
+            point.wetness = 0.0;
+            point.wet[3] = 0.0;
+        }
+    }
+    if settings.use_dissolve {
+        point.dry[3] =
+            dissolve_value(point.dry[3], settings.dissolve_speed, settings.dissolve_log).max(0.0);
+        point.wet[3] =
+            dissolve_value(point.wet[3], settings.dissolve_speed, settings.dissolve_log).max(0.0);
+    }
+}
+
+fn apply_paint_brush(point: &mut PaintPoint, brush: &super::DynamicPaintBrush, strength: f32) {
+    let paint_wetness = brush.wetness as f32 * strength;
+    let previous_alpha = point.wet[3];
+    let mixed_alpha = previous_alpha * (1.0 - strength) + strength;
+    if mixed_alpha != 0.0 {
+        for component in 0..3 {
+            point.wet[component] = (point.wet[component] * previous_alpha * (1.0 - strength)
+                + brush.color[component] as f32 * strength)
+                / mixed_alpha;
+        }
+    }
+    if brush.absolute_alpha {
+        point.wet[3] = previous_alpha.max(strength);
+        point.wetness = point.wetness.max(paint_wetness);
+    } else {
+        point.wet[3] = mixed_alpha;
+        let wetness = paint_wetness.clamp(0.0, 1.0);
+        point.wetness = point.wetness * (1.0 - wetness) + wetness;
+    }
+    point.wetness = point.wetness.max(0.001);
+    point.painted = true;
+}
+
+/// Advance one Blender PAINT/IMAGE frame using pixel-center POINT samples or Gaussian volume
+/// supersampling at the stored UV barycentrics.
+pub(crate) fn paint_image_step(
+    sample_positions: &[[f32; 3]],
+    samples_per_pixel: usize,
+    brushes: &[super::DynamicPaintBrush],
+    points: &mut [PaintPoint],
+    settings: PaintSettings,
+) -> Result<()> {
+    if !matches!(samples_per_pixel, 1 | 5)
+        || points
+            .len()
+            .checked_mul(samples_per_pixel)
+            .is_none_or(|count| count != sample_positions.len())
+        || !settings.influence_scale.is_finite()
+        || settings.influence_scale < 0.0
+        || (settings.use_drying && (!settings.dry_speed.is_finite() || settings.dry_speed <= 0.0))
+        || (settings.use_dissolve
+            && (!settings.dissolve_speed.is_finite() || settings.dissolve_speed <= 0.0))
+        || brushes.iter().any(|brush| {
+            brush
+                .volume_mask
+                .as_ref()
+                .is_some_and(|mask| mask.len() != sample_positions.len())
+        })
+    {
+        return Err(invalid("dynamic-paint image inputs are invalid"));
+    }
+    let checks = points
+        .len()
+        .checked_mul(brushes.len())
+        .ok_or_else(|| limit("dynamic-paint image brush work exceeds limits"))?;
+    if checks > MAX_DISTANCE_CHECKS {
+        return Err(limit("dynamic-paint image brush work exceeds limits"));
+    }
+    if sample_positions
+        .iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+        || brushes.iter().any(|brush| {
+            !brush.position.is_finite()
+                || !brush.radius.is_finite()
+                || brush.radius < 0.0
+                || !brush.strength.is_finite()
+                || !brush.wetness.is_finite()
+                || !(0.0..=1.0).contains(&brush.strength)
+                || brush.color.iter().any(|value| !value.is_finite())
+        })
+        || points.iter().any(|point| {
+            point
+                .dry
+                .iter()
+                .chain(&point.wet)
+                .any(|value| !value.is_finite())
+                || !point.wetness.is_finite()
+        })
+    {
+        return Err(invalid("dynamic-paint image values must be finite"));
+    }
+
+    for (pixel_index, point) in points.iter_mut().enumerate() {
+        prepare_paint_point(point, settings);
+        let sample_start = pixel_index * samples_per_pixel;
+        for brush in brushes {
+            let influence = if let Some(mask) = &brush.volume_mask {
+                if samples_per_pixel == 1 {
+                    if mask[sample_start] { 1.0 } else { 0.0 }
+                } else {
+                    let mut strength = 0.0_f32;
+                    for (sample_index, &weight) in IMAGE_GAUSSIAN.iter().enumerate() {
+                        if mask[sample_start + sample_index] {
+                            strength += weight;
+                        }
+                    }
+                    strength / IMAGE_GAUSSIAN_TOTAL
+                }
+            } else {
+                if brush.radius == 0.0 {
+                    continue;
+                }
+                let point = Vec3::from_array(sample_positions[sample_start]);
+                let distance = point.distance(brush.position.as_vec3());
+                let radius = brush.radius as f32;
+                if distance > radius {
+                    continue;
+                }
+                if brush.constant_falloff {
+                    1.0
+                } else {
+                    1.0 - distance / radius
+                }
+            };
+            if influence >= 0.001 {
+                let strength =
+                    (influence * settings.influence_scale * brush.strength as f32).clamp(0.0, 1.0);
+                apply_paint_brush(point, brush, strength);
+            }
+        }
+    }
+    if points.iter().any(|point| {
+        point
+            .dry
+            .iter()
+            .chain(&point.wet)
+            .any(|value| !value.is_finite())
+            || !point.wetness.is_finite()
+    }) {
+        return Err(invalid("dynamic-paint image output is not finite"));
+    }
+    Ok(())
+}
+
+pub(crate) fn paint_image_output(
+    points: &[PaintPoint],
+    surface: &super::dynamic_paint_image::ImageSurface,
+) -> Vec<[f32; 4]> {
+    let mut pixels = vec![[0.0; 4]; surface.resolution * surface.resolution];
+    for (point, image_pixel) in points.iter().zip(&surface.pixels) {
+        let mut color = blend_paint_colors(point.dry, point.wet);
+        let alpha = color[3];
+        for component in &mut color[..3] {
+            *component *= alpha;
+        }
+        pixels[image_pixel.pixel_index] = color;
+    }
+    pixels
+}
+
+pub(crate) fn paint_image_wetness_output(
+    points: &[PaintPoint],
+    surface: &super::dynamic_paint_image::ImageSurface,
+) -> Vec<[f32; 4]> {
+    let mut pixels = vec![[0.0; 4]; surface.resolution * surface.resolution];
+    for (point, image_pixel) in points.iter().zip(&surface.pixels) {
+        let wetness = point.wetness.min(1.0);
+        pixels[image_pixel.pixel_index] = [wetness, wetness, wetness, 1.0];
+    }
+    pixels
 }
 
 pub(crate) fn paint_output(points: &[PaintPoint]) -> Vec<[f64; 4]> {

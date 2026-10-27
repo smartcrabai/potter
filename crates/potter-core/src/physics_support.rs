@@ -245,6 +245,23 @@ pub(crate) fn is_honoured_property(
         {
             return true;
         }
+        let image_surface = setting.get("surface_format").and_then(Value::as_str) == Some("IMAGE");
+        if image_surface {
+            if surface_type != "PAINT" && property == "surface_format" {
+                return false;
+            }
+            if surface_type == "PAINT"
+                && matches!(
+                    property,
+                    "image_resolution" | "image_fileformat" | "uv_layer" | "use_antialiasing"
+                )
+            {
+                return true;
+            }
+            if surface_type == "PAINT" && property == "use_output_b" {
+                return true;
+            }
+        }
         if surface_type == "PAINT" && property == "output_name_b" {
             return true;
         }
@@ -375,7 +392,10 @@ pub(crate) fn is_semantic_when(system: &str, property: &str, setting: &Map<Strin
     if is_runtime_state(system, property) {
         return false;
     }
-    if system == "dynamic_paint_surface" && property == "use_output_b" {
+    if system == "dynamic_paint_surface"
+        && property == "use_output_b"
+        && setting.get("surface_format").and_then(Value::as_str) != Some("IMAGE")
+    {
         return false;
     }
     if system == "dynamic_paint_surface"

@@ -1068,6 +1068,39 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "{feature_id} must be reported as supported"
         );
     }
+    let image_surface_format = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "physics.dynamic_paint_surface.surface_format")
+        .expect("Dynamic Paint surface formats are listed in the feature catalog");
+    assert_eq!(image_surface_format["status"], "partial");
+    assert_eq!(
+        image_surface_format["capabilities"],
+        json!({
+            "create": true,
+            "edit": true,
+            "inspect": true,
+            "evaluate": true,
+            "render": false,
+            "import": true,
+            "export": true
+        })
+    );
+    assert_eq!(
+        image_surface_format["pot_ops"],
+        json!([
+            "physics.dynamic_paint.create",
+            "physics.dynamic_paint.update"
+        ])
+    );
+    let image_surface_reason = image_surface_format["reason"]
+        .as_str()
+        .expect("partially supported surface formats have a reason");
+    for capability in ["PAINT/IMAGE", "WEIGHT/IMAGE", "UV texels", "PNG"] {
+        assert!(
+            image_surface_reason.contains(capability),
+            "surface-format reason must describe {capability}"
+        );
+    }
     let animation_feature = features
         .iter()
         .find(|feature| feature["feature_id"] == "animation.fcurve_non_transform_channels")
@@ -1121,6 +1154,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "the obsolete blanket standard-constraint limitation must not be reported"
     );
     for feature_id in [
+        "physics.dynamic_paint_surface.image_fileformat",
         "physics.dynamic_paint_surface.topology",
         "physics.point_cache.source_frames",
         "constraint.geometry_attribute.instances.collection_instances",
