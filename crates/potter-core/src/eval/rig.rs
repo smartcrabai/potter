@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 use crate::{
     error::{ErrorCode, PotError, Result},
     eval::{
-        CustomPropertyReference, EvaluationSession, animation::animated_transform,
-        custom_property_reference, evaluated_custom_property_component,
+        ConstraintInitialStateCaptures, CustomPropertyReference, EvaluationSession,
+        animation::animated_transform, custom_property_reference,
+        evaluated_custom_property_component,
     },
     geom::{
         Mesh,
@@ -53,12 +54,63 @@ struct IkGoal {
     pole: Option<DMat4>,
 }
 
+struct ConstraintInitialStateCapture<'a> {
+    owner_id: &'a Id,
+    owner_world: DMat4,
+    recapture: bool,
+    capture_enabled: bool,
+    states: &'a mut ConstraintInitialStateCaptures,
+}
+
 fn evaluation_error(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, message)
 }
 
 fn evaluation_error_with(message: impl Into<String>, details: Value) -> PotError {
     PotError::with_details(ErrorCode::EvaluationFailed, message, details)
+}
+
+fn constraint_error_with_context(
+    mut error: PotError,
+    owner_id: &Id,
+    constraint: &Constraint,
+) -> PotError {
+    if let Some(details) = error.details.as_object_mut() {
+        details
+            .entry("owner_id".to_owned())
+            .or_insert_with(|| Value::String(owner_id.to_string()));
+        details
+            .entry("constraint_id".to_owned())
+            .or_insert_with(|| Value::String(constraint.id.to_string()));
+    }
+    error
+}
+
+fn skip_targetless_initial_constraint_capture(
+    constraint: &Constraint,
+    capturing_initial_states: bool,
+) -> bool {
+    if !capturing_initial_states || constraint.target.is_some() {
+        return false;
+    }
+    match constraint.constraint_type {
+        ConstraintType::StretchTo => {
+            constraint
+                .params
+                .get("rest_length")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                == 0.0
+        }
+        ConstraintType::ChildOf => {
+            constraint
+                .params
+                .get("set_inverse_pending")
+                .and_then(Value::as_bool)
+                == Some(true)
+        }
+        _ => false,
+    }
 }
 
 fn finite_matrix(matrix: DMat4) -> bool {
@@ -1804,6 +1856,7 @@ fn apply_pose_bone_constraints(
 ) -> Result<()> {
     let skip_instance_geometry_attribute_constraints =
         session.skip_instance_geometry_attribute_constraints;
+    let capture_constraint_initial_states = session.capture_constraint_initial_states;
     if !constraints.iter().any(|constraint| {
         constraint.owner_bone.is_some()
             && constraint.enabled
@@ -1811,6 +1864,10 @@ fn apply_pose_bone_constraints(
             && !skip_instance_geometry_attribute_constraint(
                 constraint,
                 skip_instance_geometry_attribute_constraints,
+            )
+            && !skip_targetless_initial_constraint_capture(
+                constraint,
+                capture_constraint_initial_states,
             )
             && !matches!(
                 constraint.constraint_type,
@@ -1847,6 +1904,10 @@ fn apply_pose_bone_constraints(
                 constraint,
                 skip_instance_geometry_attribute_constraints,
             )
+            && !skip_targetless_initial_constraint_capture(
+                constraint,
+                capture_constraint_initial_states,
+            )
             && !matches!(
                 constraint.constraint_type,
                 ConstraintType::Ik | ConstraintType::SplineIk
@@ -1880,6 +1941,10 @@ fn apply_pose_bone_constraints(
                 && !skip_instance_geometry_attribute_constraint(
                     constraint,
                     skip_instance_geometry_attribute_constraints,
+                )
+                && !skip_targetless_initial_constraint_capture(
+                    constraint,
+                    capture_constraint_initial_states,
                 )
                 && !matches!(
                     constraint.constraint_type,
@@ -2038,6 +2103,16 @@ fn apply_pose_bone_constraints(
             } else {
                 armature_world_inverse
             };
+            let capture_enabled = session.capture_constraint_initial_states
+                && !session.capture_only_limit_distance_initial_states;
+            let recapture = session.recapture_constraint_initial_states;
+            let capture_initial_states = Some(ConstraintInitialStateCapture {
+                owner_id: armature_node_id,
+                owner_world: armature_world,
+                recapture,
+                capture_enabled,
+                states: &mut session.captured_constraint_initial_states,
+            });
             let constrained = apply_object_constraint(
                 constraint_source,
                 target_matrix,
@@ -2049,13 +2124,18 @@ fn apply_pose_bone_constraints(
                 evaluated_meshes,
                 &session.instance_attributes,
                 Some(armature_node_id),
+                pose.get(owner_bone)
+                    .and_then(|bone| bone.rotation_mode)
+                    .map_or("QUATERNION", PoseRotationMode::as_blender_str),
                 armature_node_id,
                 armature_world,
                 Some(matrices),
                 target_bone_pose_matrices.as_ref(),
                 armature_targets.as_ref(),
                 Some(constraint_world_to_owner),
-            )?;
+                capture_initial_states,
+            )
+            .map_err(|error| constraint_error_with_context(error, armature_node_id, constraint))?;
             let mut constrained_pose = if legacy_space {
                 constrained
             } else {
@@ -5298,6 +5378,7 @@ fn evaluate_world_matrices_with_meshes(
         };
         let skip_instance_geometry_attribute_constraints =
             session.skip_instance_geometry_attribute_constraints;
+        let capture_constraint_initial_states = session.capture_constraint_initial_states;
         for constraint in node.constraints.iter().filter(|constraint| {
             constraint.owner_bone.is_none()
                 && constraint.enabled
@@ -5305,6 +5386,10 @@ fn evaluate_world_matrices_with_meshes(
                 && !skip_instance_geometry_attribute_constraint(
                     constraint,
                     skip_instance_geometry_attribute_constraints,
+                )
+                && !skip_targetless_initial_constraint_capture(
+                    constraint,
+                    capture_constraint_initial_states,
                 )
         }) {
             let target_id = constraint
@@ -5503,6 +5588,16 @@ fn evaluate_world_matrices_with_meshes(
             } else {
                 target_world.unwrap_or(DMat4::IDENTITY)
             };
+            let capture_enabled = session.capture_constraint_initial_states
+                && !session.capture_only_limit_distance_initial_states;
+            let recapture = session.recapture_constraint_initial_states;
+            let capture_initial_states = Some(ConstraintInitialStateCapture {
+                owner_id: id,
+                owner_world: world,
+                recapture,
+                capture_enabled,
+                states: &mut session.captured_constraint_initial_states,
+            });
             world = apply_object_constraint(
                 world,
                 target_matrix,
@@ -5514,13 +5609,16 @@ fn evaluate_world_matrices_with_meshes(
                 evaluated_meshes,
                 &session.instance_attributes,
                 Some(id),
+                node.transform.rotation_mode.as_str(),
                 id,
                 world,
                 None,
                 target_bone_pose_matrices.as_ref(),
                 armature_targets.as_ref(),
                 None,
-            )?;
+                capture_initial_states,
+            )
+            .map_err(|error| constraint_error_with_context(error, id, constraint))?;
         }
         if !finite_matrix(world) {
             return Err(evaluation_error_with(
@@ -5795,6 +5893,12 @@ fn blender_euler_matrix_quaternion(matrix: DMat3) -> Result<DQuat> {
 }
 
 fn blend_transform(source: DMat4, target: DMat4, influence: f64) -> Result<DMat4> {
+    if influence <= 0.0 {
+        return Ok(source);
+    }
+    if influence >= 1.0 {
+        return Ok(target);
+    }
     let source = matrix_transform(source)?;
     let target = matrix_transform(target)?;
     let source_rotation = source.rotation_quat();
@@ -5808,6 +5912,54 @@ fn blend_transform(source: DMat4, target: DMat4, influence: f64) -> Result<DMat4
     let matrix = DMat4::from_scale_rotation_translation(scale, rotation, translation);
     if !finite_matrix(matrix) {
         return Err(evaluation_error("constraint result is non-finite"));
+    }
+    Ok(matrix)
+}
+/// Match Blender's `interp_m4_m4m4`, retaining shear while interpolating constraint influence.
+fn blend_constraint_matrices(source: DMat4, target: DMat4, influence: f64) -> Result<DMat4> {
+    if influence <= 0.0 {
+        return Ok(source);
+    }
+    if influence >= 1.0 {
+        return Ok(target);
+    }
+    let source_basis = DMat3::from_cols(
+        source.x_axis.truncate(),
+        source.y_axis.truncate(),
+        source.z_axis.truncate(),
+    );
+    let target_basis = DMat3::from_cols(
+        target.x_axis.truncate(),
+        target.y_axis.truncate(),
+        target.z_axis.truncate(),
+    );
+    let (source_rotation, source_stretch) = polar_decompose_bbone_basis(source_basis)
+        .map_err(|_| evaluation_error("constraint influence matrix is singular"))?;
+    let (target_rotation, target_stretch) = polar_decompose_bbone_basis(target_basis)
+        .map_err(|_| evaluation_error("constraint influence matrix is singular"))?;
+    let rotation = DQuat::from_mat3(&source_rotation)
+        .slerp(DQuat::from_mat3(&target_rotation), influence)
+        .normalize();
+    let stretch = DMat3::from_cols(
+        source_stretch.x_axis.lerp(target_stretch.x_axis, influence),
+        source_stretch.y_axis.lerp(target_stretch.y_axis, influence),
+        source_stretch.z_axis.lerp(target_stretch.z_axis, influence),
+    );
+    let basis = DMat3::from_quat(rotation) * stretch;
+    let translation = source
+        .w_axis
+        .truncate()
+        .lerp(target.w_axis.truncate(), influence);
+    let matrix = DMat4::from_cols(
+        basis.x_axis.extend(0.0),
+        basis.y_axis.extend(0.0),
+        basis.z_axis.extend(0.0),
+        translation.extend(1.0),
+    );
+    if !finite_matrix(matrix) {
+        return Err(evaluation_error(
+            "constraint influence result is non-finite",
+        ));
     }
     Ok(matrix)
 }
@@ -7784,24 +7936,48 @@ fn apply_object_constraint(
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
     evaluated_instances: &BTreeMap<Id, crate::graph::EvaluatedInstances>,
     owner_node_id: Option<&Id>,
+    owner_rotation_mode: &str,
     owner_space_node_id: &Id,
     owner_world: DMat4,
     owner_bone_matrices: Option<&BTreeMap<Id, BoneMatrices>>,
     target_bone_pose_matrices: Option<&BTreeMap<Id, DMat4>>,
     armature_targets: Option<&ArmatureConstraintTargets>,
     world_to_owner: Option<DMat4>,
+    mut initial_capture: Option<ConstraintInitialStateCapture<'_>>,
 ) -> Result<DMat4> {
     if constraint.constraint_type == ConstraintType::ClampTo
         && (string_param_default(&constraint.params, "owner_space", "WORLD")? == "CUSTOM"
             || string_param_default(&constraint.params, "target_space", "WORLD")? == "CUSTOM")
     {
-        return Ok(source);
+        if checked_influence(constraint)? == 0.0 {
+            return Ok(source);
+        }
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Clamp To constraints with CUSTOM spaces are not supported",
+            json!({
+                "feature_id":"constraint.clamp_to.custom_spaces",
+                "status":"not_supported",
+                "constraint_id":constraint.id,
+            }),
+        ));
     }
     if constraint.constraint_type == ConstraintType::FollowPath
         && (string_param_default(&constraint.params, "owner_space", "WORLD")? == "CUSTOM"
             || string_param_default(&constraint.params, "target_space", "WORLD")? == "CUSTOM")
     {
-        return Ok(source);
+        if checked_influence(constraint)? == 0.0 {
+            return Ok(source);
+        }
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "Follow Path constraints with CUSTOM spaces are not supported",
+            json!({
+                "feature_id":"constraint.follow_path.custom_spaces",
+                "status":"not_supported",
+                "constraint_id":constraint.id,
+            }),
+        ));
     }
     if constraint.constraint_type == ConstraintType::TransformCache {
         let influence = checked_influence(constraint)?;
@@ -7872,7 +8048,7 @@ fn apply_object_constraint(
             let result = if influence >= 1.0 {
                 constrained
             } else {
-                blend_transform(source, constrained, influence)?
+                blend_constraint_matrices(source, constrained, influence)?
             };
             return if finite_matrix(result) {
                 Ok(result)
@@ -7969,15 +8145,78 @@ fn apply_object_constraint(
         evaluated_meshes,
         evaluated_instances,
         owner_node_id,
+        owner_rotation_mode,
         world_to_owner,
         Some(1.0),
+        initial_capture.as_mut(),
     )?;
-    let result_world = owner_to_world * result;
+    let result_world =
+        if constraint.constraint_type == ConstraintType::ChildOf && constraint.target.is_some() {
+            result
+        } else {
+            owner_to_world * result
+        };
     if influence >= 1.0 {
         Ok(result_world)
     } else {
-        blend_transform(source, result_world, influence)
+        blend_constraint_matrices(source, result_world, influence)
     }
+}
+
+fn child_of_parent_matrix(
+    target: DMat4,
+    constraint: &Constraint,
+    doc: &SceneDoc,
+    use_location: [bool; 3],
+    use_rotation: [bool; 3],
+    use_scale: [bool; 3],
+) -> Result<DMat4> {
+    if use_location.iter().all(|enabled| *enabled)
+        && use_rotation.iter().all(|enabled| *enabled)
+        && use_scale.iter().all(|enabled| *enabled)
+    {
+        return Ok(target);
+    }
+    let target_rotation_mode = constraint
+        .target
+        .as_ref()
+        .and_then(|target_id| doc.nodes.get(target_id))
+        .map_or("QUATERNION", |target_node| {
+            if let Some(subtarget) = &constraint.subtarget {
+                if target_node.kind == "armature"
+                    && let Some(pose_bone) = target_node.pose.get(subtarget)
+                {
+                    return pose_bone
+                        .rotation_mode
+                        .map_or("QUATERNION", PoseRotationMode::as_blender_str);
+                }
+                "XYZ"
+            } else {
+                target_node.transform.rotation_mode.as_str()
+            }
+        });
+    let target_order = transformation_euler_order("AUTO", target_rotation_mode)?;
+    let target_transform = matrix_transform(target)?;
+    let mut translation = target_transform.translation;
+    let mut scale = matrix_axis_sizes(target).to_array();
+    let mut angles = euler_angles(target_transform.rotation_quat(), target_order);
+    for axis in 0..3 {
+        if !use_location[axis] {
+            translation[axis] = 0.0;
+        }
+        if !use_rotation[axis] {
+            angles[axis] = 0.0;
+        }
+        if !use_scale[axis] {
+            scale[axis] = 1.0;
+        }
+    }
+    let rotation = quaternion_from_euler_angles(angles, target_order);
+    Ok(DMat4::from_scale_rotation_translation(
+        DVec3::from_array(scale),
+        rotation,
+        DVec3::from_array(translation),
+    ))
 }
 
 #[expect(
@@ -7995,8 +8234,10 @@ fn apply_object_constraint_in_space(
     evaluated_meshes: Option<&BTreeMap<Id, Mesh>>,
     evaluated_instances: &BTreeMap<Id, crate::graph::EvaluatedInstances>,
     owner_node_id: Option<&Id>,
+    owner_rotation_mode: &str,
     world_to_owner: Option<DMat4>,
     influence_override: Option<f64>,
+    mut initial_capture: Option<&mut ConstraintInitialStateCapture<'_>>,
 ) -> Result<DMat4> {
     let influence = if let Some(influence) = influence_override {
         influence
@@ -8086,122 +8327,82 @@ fn apply_object_constraint_in_space(
             desired.scale = weighted_target.scale;
         }
         ConstraintType::CopyLocation => {
+            let use_offset = param_bool(&constraint.params, "use_offset", false)?;
             for axis in 0..3 {
                 if param_bool(&constraint.params, ["use_x", "use_y", "use_z"][axis], true)? {
-                    desired.translation[axis] = target_transform.translation[axis];
+                    let mut copied = target_transform.translation[axis];
+                    if param_bool(
+                        &constraint.params,
+                        ["invert_x", "invert_y", "invert_z"][axis],
+                        false,
+                    )? {
+                        copied = -copied;
+                    }
+                    desired.translation[axis] = copied
+                        + if use_offset {
+                            source_translation[axis]
+                        } else {
+                            0.0
+                        };
                 }
             }
         }
         ConstraintType::CopyRotation => {
-            let (source_x, source_y, source_z) = DQuat::from_xyzw(
-                source_rotation[0],
-                source_rotation[1],
-                source_rotation[2],
-                source_rotation[3],
-            )
-            .to_euler(EulerRot::XYZEx);
-            let (target_x, target_y, target_z) = DQuat::from_xyzw(
-                target_transform.rotation[0],
-                target_transform.rotation[1],
-                target_transform.rotation[2],
-                target_transform.rotation[3],
-            )
-            .to_euler(EulerRot::XYZEx);
-            let source_angles = [source_x, source_y, source_z];
-            let target_angles = [target_x, target_y, target_z];
-            let mut copied_angles = [0.0; 3];
-            let mut use_axis = [false; 3];
-            let mut invert_axis = [false; 3];
+            let order = transformation_euler_order(
+                string_param_default(&constraint.params, "euler_order", "AUTO")?,
+                owner_rotation_mode,
+            )?;
+            let source_angles = euler_angles(source_quat, order);
+            let target_rotation =
+                matrix_transform(orthogonalize_m4_stable_axis1(target)?)?.rotation_quat();
+            let mut angles = compatible_euler(target_rotation, source_angles, order);
+            let mix_mode = match constraint.params.get("mix_mode") {
+                Some(_) => string_param_default(&constraint.params, "mix_mode", "REPLACE")?,
+                None if param_bool(&constraint.params, "use_offset", false)? => "OFFSET",
+                None => "REPLACE",
+            };
+            if !matches!(mix_mode, "REPLACE" | "ADD" | "BEFORE" | "AFTER" | "OFFSET") {
+                return Err(evaluation_error_with(
+                    "copy-rotation mix_mode is invalid",
+                    json!({"constraint_id":constraint.id,"mix_mode":mix_mode}),
+                ));
+            }
+            let default_angles = if matches!(mix_mode, "REPLACE" | "OFFSET") {
+                source_angles
+            } else {
+                [0.0; 3]
+            };
             for axis in 0..3 {
-                use_axis[axis] =
-                    param_bool(&constraint.params, ["use_x", "use_y", "use_z"][axis], true)?;
-                if use_axis[axis] {
-                    invert_axis[axis] = param_bool(
+                if param_bool(&constraint.params, ["use_x", "use_y", "use_z"][axis], true)? {
+                    if mix_mode == "OFFSET" {
+                        let mut offset = [0.0; 3];
+                        offset[axis] = source_angles[axis];
+                        let current = quaternion_from_euler_angles(angles, order);
+                        let component = quaternion_from_euler_angles(offset, order);
+                        angles = euler_angles(current * component, order);
+                    }
+                    if param_bool(
                         &constraint.params,
                         ["invert_x", "invert_y", "invert_z"][axis],
                         false,
-                    )?;
-                    copied_angles[axis] = if invert_axis[axis] {
-                        -target_angles[axis]
-                    } else {
-                        target_angles[axis]
-                    };
+                    )? {
+                        angles[axis] = -angles[axis];
+                    }
+                } else {
+                    angles[axis] = default_angles[axis];
                 }
             }
-            let mix_mode = string_param_default(&constraint.params, "mix_mode", "REPLACE")?;
+            if mix_mode == "ADD" {
+                for axis in 0..3 {
+                    angles[axis] += source_angles[axis];
+                }
+            }
+            angles = compatible_euler_components(angles, source_angles);
+            let copied = quaternion_from_euler_angles(angles, order);
             let rotation = match mix_mode {
-                "REPLACE" => DQuat::from_euler(
-                    EulerRot::XYZEx,
-                    if use_axis[0] {
-                        copied_angles[0]
-                    } else {
-                        source_angles[0]
-                    },
-                    if use_axis[1] {
-                        copied_angles[1]
-                    } else {
-                        source_angles[1]
-                    },
-                    if use_axis[2] {
-                        copied_angles[2]
-                    } else {
-                        source_angles[2]
-                    },
-                ),
-                "ADD" => DQuat::from_euler(
-                    EulerRot::XYZEx,
-                    source_angles[0] + copied_angles[0],
-                    source_angles[1] + copied_angles[1],
-                    source_angles[2] + copied_angles[2],
-                ),
-                "BEFORE" => {
-                    DQuat::from_euler(
-                        EulerRot::XYZEx,
-                        copied_angles[0],
-                        copied_angles[1],
-                        copied_angles[2],
-                    ) * source_quat
-                }
-                "AFTER" => {
-                    source_quat
-                        * DQuat::from_euler(
-                            EulerRot::XYZEx,
-                            copied_angles[0],
-                            copied_angles[1],
-                            copied_angles[2],
-                        )
-                }
-                "OFFSET" => {
-                    let mut offset_angles = target_angles;
-                    for axis in 0..3 {
-                        if use_axis[axis] {
-                            let axis_rotation = DQuat::from_axis_angle(
-                                [DVec3::X, DVec3::Y, DVec3::Z][axis],
-                                source_angles[axis],
-                            );
-                            let euler_rotation = DQuat::from_euler(
-                                EulerRot::XYZEx,
-                                offset_angles[0],
-                                offset_angles[1],
-                                offset_angles[2],
-                            );
-                            let (x, y, z) =
-                                (euler_rotation * axis_rotation).to_euler(EulerRot::XYZEx);
-                            offset_angles = [x, y, z];
-                            if invert_axis[axis] {
-                                offset_angles[axis] = -offset_angles[axis];
-                            }
-                        } else {
-                            offset_angles[axis] = source_angles[axis];
-                        }
-                    }
-                    DQuat::from_euler(
-                        EulerRot::XYZEx,
-                        offset_angles[0],
-                        offset_angles[1],
-                        offset_angles[2],
-                    )
-                }
+                "REPLACE" | "ADD" | "OFFSET" => copied,
+                "BEFORE" => copied * source_quat,
+                "AFTER" => source_quat * copied,
                 _ => {
                     return Err(evaluation_error_with(
                         "copy-rotation mix_mode is invalid",
@@ -8212,26 +8413,80 @@ fn apply_object_constraint_in_space(
             desired.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
         }
         ConstraintType::CopyScale => {
+            let use_axis = [
+                param_bool(&constraint.params, "use_x", true)?,
+                param_bool(&constraint.params, "use_y", true)?,
+                param_bool(&constraint.params, "use_z", true)?,
+            ];
+            let use_uniform = param_bool(&constraint.params, "use_make_uniform", false)?;
+            let owner_sizes = matrix_axis_sizes(source);
+            let mut size = matrix_axis_sizes(target);
+            if use_uniform {
+                let total = if use_axis[0] && use_axis[1] && use_axis[2] {
+                    DMat3::from_mat4(target).determinant().abs()
+                } else {
+                    let mut total = 1.0;
+                    for axis in 0..3 {
+                        if use_axis[axis] {
+                            total *= size[axis];
+                        }
+                    }
+                    total
+                };
+                size = DVec3::splat(total.cbrt());
+            }
+            let power = number_param(&constraint.params, "power")?.unwrap_or(1.0);
             for axis in 0..3 {
-                if param_bool(&constraint.params, ["use_x", "use_y", "use_z"][axis], true)? {
-                    desired.scale[axis] = target_transform.scale[axis];
+                size[axis] = size[axis].powf(power);
+            }
+            if param_bool(&constraint.params, "use_offset", false)? {
+                if param_bool(&constraint.params, "use_add", false)? {
+                    size += owner_sizes - DVec3::ONE;
+                } else {
+                    size *= owner_sizes;
+                }
+            }
+            for axis in 0..3 {
+                if (use_axis[axis] || use_uniform) && owner_sizes[axis] != 0.0 {
+                    desired.scale[axis] = source_scale[axis] * size[axis] / owner_sizes[axis];
                 }
             }
         }
         ConstraintType::LimitDistance => {
-            let distance_limit = number_param(&constraint.params, "distance")?.unwrap_or(0.0);
+            let mut distance_limit = number_param(&constraint.params, "distance")?.unwrap_or(0.0);
             if !distance_limit.is_finite() || distance_limit < 0.0 {
                 return Err(evaluation_error(
                     "limit-distance value must be non-negative",
                 ));
             }
+            let current_distance = (source.w_axis.truncate() - target.w_axis.truncate()).length();
+            if distance_limit == 0.0 {
+                let cached = initial_capture
+                    .as_deref()
+                    .filter(|capture| !capture.recapture)
+                    .and_then(|capture| {
+                        capture
+                            .states
+                            .get(&(capture.owner_id.clone(), constraint.id.clone()))
+                    })
+                    .and_then(|params| params.get("distance"))
+                    .and_then(Value::as_f64)
+                    .filter(|distance| *distance > 0.0);
+                if let Some(cached) = cached {
+                    distance_limit = cached;
+                } else if current_distance.is_finite() {
+                    if let Some(capture) = initial_capture.as_deref_mut() {
+                        capture
+                            .states
+                            .entry((capture.owner_id.clone(), constraint.id.clone()))
+                            .or_default()
+                            .insert("distance".to_owned(), json!(current_distance));
+                    }
+                    distance_limit = current_distance;
+                }
+            }
             let offset = source.w_axis.truncate() - target.w_axis.truncate();
-            let distance_limit = if distance_limit == 0.0 {
-                offset.length()
-            } else {
-                distance_limit
-            };
-            let distance = offset.length();
+            let distance = current_distance;
             let mode = string_param_default(&constraint.params, "limit_mode", "LIMITDIST_INSIDE")?;
             let (clamp_surface, scale) = match mode {
                 "LIMITDIST_OUTSIDE" => {
@@ -8430,19 +8685,59 @@ fn apply_object_constraint_in_space(
             }
         }
         ConstraintType::StretchTo => {
+            let mut rest_length = number_param(&constraint.params, "rest_length")?.unwrap_or(0.0);
+            if !rest_length.is_finite() || rest_length < 0.0 {
+                return Err(evaluation_error("stretch-to rest_length is invalid"));
+            }
             let position = source.w_axis.truncate();
             let direction = target.w_axis.truncate() - position;
             let distance = direction.length();
-            if distance > f64::EPSILON {
-                let normalized_distance = distance / source_scale[1].abs().max(f64::EPSILON);
-                let mut rest_length =
-                    number_param(&constraint.params, "rest_length")?.unwrap_or(0.0);
-                if !rest_length.is_finite() || rest_length < 0.0 {
-                    return Err(evaluation_error("stretch-to rest_length is invalid"));
+            if rest_length == 0.0 {
+                let cached = initial_capture
+                    .as_deref()
+                    .filter(|capture| capture.capture_enabled && !capture.recapture)
+                    .and_then(|capture| {
+                        capture
+                            .states
+                            .get(&(capture.owner_id.clone(), constraint.id.clone()))
+                    })
+                    .and_then(|params| params.get("rest_length"))
+                    .and_then(Value::as_f64);
+                if let Some(cached) = cached {
+                    rest_length = cached;
+                } else if let Some(capture) = initial_capture
+                    .as_deref_mut()
+                    .filter(|capture| capture.capture_enabled)
+                {
+                    let size_y = source_scale[1].abs();
+                    let initial_rest_length = if size_y == 0.0 {
+                        0.0
+                    } else {
+                        distance / size_y
+                    };
+                    if initial_rest_length.is_finite() && initial_rest_length > 0.0 {
+                        capture
+                            .states
+                            .entry((capture.owner_id.clone(), constraint.id.clone()))
+                            .or_default()
+                            .insert("rest_length".to_owned(), json!(initial_rest_length));
+                        rest_length = initial_rest_length;
+                    }
                 }
                 if rest_length == 0.0 {
-                    rest_length = normalized_distance;
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        "zero stretch-to rest length depends on Blender's cached initial length",
+                        json!({
+                            "feature_id":"constraint.stretch_to.initial_length",
+                            "status":"not_supported",
+                            "constraint_id":constraint.id,
+                        }),
+                    ));
                 }
+            }
+            if distance > f64::EPSILON {
+                let normalized_distance = distance / source_scale[1].abs().max(f64::EPSILON);
                 let mut bulge = (rest_length / normalized_distance)
                     .powf(number_param(&constraint.params, "bulge")?.unwrap_or(1.0));
                 if bulge > 1.0 && param_bool(&constraint.params, "use_bulge_max", false)? {
@@ -8484,9 +8779,6 @@ fn apply_object_constraint_in_space(
             }
         }
         ConstraintType::Transformation => {
-            let owner_rotation_mode = owner_node_id
-                .and_then(|owner_id| doc.nodes.get(owner_id))
-                .map_or("XYZ", |node| node.transform.rotation_mode.as_str());
             desired = transformation_constraint(
                 &desired,
                 &target_transform,
@@ -8501,16 +8793,25 @@ fn apply_object_constraint_in_space(
                 axis_vector(axis_name)
                     .ok_or_else(|| evaluation_error("maintain-volume free_axis is invalid"))?,
             )?;
-            let base_volume = number_param(&constraint.params, "volume")?.unwrap_or(1.0);
-            let cross_section = (0..3)
-                .filter(|axis| *axis != free_axis)
-                .map(|axis| desired.scale[axis].abs())
-                .product::<f64>();
-            let free_scale = desired.scale[free_axis].abs();
-            if free_scale <= f64::EPSILON || cross_section <= f64::EPSILON {
-                return Err(evaluation_error("maintain-volume scale must be nonzero"));
-            }
-            let correction = (base_volume / (free_scale * cross_section)).sqrt();
+            let mode = string_param_default(&constraint.params, "mode", "STRICT")?;
+            let owner_sizes = matrix_axis_sizes(source);
+            let total_scale = match mode {
+                "STRICT" => owner_sizes.x * owner_sizes.y * owner_sizes.z,
+                "UNIFORM" => owner_sizes[free_axis].powi(3),
+                "SINGLE_AXIS" => owner_sizes[free_axis],
+                _ => {
+                    return Err(evaluation_error_with(
+                        "maintain-volume mode is invalid",
+                        json!({"constraint_id":constraint.id,"mode":mode}),
+                    ));
+                }
+            };
+            let volume = number_param(&constraint.params, "volume")?.unwrap_or(1.0);
+            let correction = if total_scale == 0.0 {
+                1.0
+            } else {
+                (volume / total_scale).sqrt()
+            };
             for axis in 0..3 {
                 if axis != free_axis {
                     desired.scale[axis] *= correction;
@@ -8518,29 +8819,43 @@ fn apply_object_constraint_in_space(
             }
         }
         ConstraintType::Floor => {
-            let axis = string_param_default(&constraint.params, "floor_location", "FLOOR_Z")?;
-            let local_normal =
-                axis_vector(axis).ok_or_else(|| evaluation_error("floor axis is invalid"))?;
-            let target_rotation = DQuat::from_xyzw(
-                target_transform.rotation[0],
-                target_transform.rotation[1],
-                target_transform.rotation[2],
-                target_transform.rotation[3],
-            );
-            let normal = (target_rotation * local_normal).normalize_or_zero();
+            let axis_name = string_param_default(&constraint.params, "floor_location", "FLOOR_Z")?;
+            let floor_axis =
+                axis_vector(axis_name).ok_or_else(|| evaluation_error("floor axis is invalid"))?;
+            let axis = axis_index(floor_axis)?;
+            let use_rotation = param_bool(&constraint.params, "use_rotation", false)?;
+            let mut floor_source = if use_rotation {
+                checked_inverse(target, "floor target matrix")? * source
+            } else {
+                source
+            };
+            let source_position = floor_source.w_axis.truncate();
+            let target_position = if use_rotation {
+                DVec3::ZERO
+            } else {
+                target.w_axis.truncate()
+            };
             let offset = number_param(&constraint.params, "offset")?.unwrap_or(0.0);
-            let plane_point = target.w_axis.truncate();
-            let position = source.w_axis.truncate();
-            let distance = (position - plane_point).dot(normal);
-            if distance < offset {
-                desired.translation = (position + normal * (offset - distance)).to_array();
+            let crosses_floor = if floor_axis[axis] > 0.0 {
+                source_position[axis] - offset < target_position[axis]
+            } else {
+                source_position[axis] - offset > target_position[axis]
+            };
+            if crosses_floor {
+                floor_source.w_axis[axis] = target_position[axis] + offset;
+                let floor_matrix = if use_rotation {
+                    target * floor_source
+                } else {
+                    floor_source
+                };
+                desired.translation = floor_matrix.w_axis.truncate().to_array();
             }
         }
         ConstraintType::Pivot => {
             let owner_position = source.w_axis.truncate();
-            let rotation_range =
-                string_param_default(&constraint.params, "rotation_range", "ALWAYS_ACTIVE")?;
-            let euler = blender_euler_xyz(source_quat);
+            let rotation_range = string_param_default(&constraint.params, "rotation_range", "NX")?;
+            let order = transformation_euler_order("AUTO", owner_rotation_mode)?;
+            let euler = euler_angles(source_quat, order);
             let inactive = match rotation_range {
                 "ALWAYS_ACTIVE" => false,
                 "NX" => euler[0] > 0.0,
@@ -8626,75 +8941,175 @@ fn apply_object_constraint_in_space(
             limit_components(&constraint.params, &mut desired.scale, "scale")?;
         }
         ConstraintType::LimitRotation => {
-            let mut euler = DQuat::from_xyzw(
-                desired.rotation[0],
-                desired.rotation[1],
-                desired.rotation[2],
-                desired.rotation[3],
-            )
-            .to_euler(EulerRot::XYZ);
-            let mut components = [euler.0, euler.1, euler.2];
-            limit_components(&constraint.params, &mut components, "rotation")?;
-            euler = (components[0], components[1], components[2]);
-            let rotation = DQuat::from_euler(EulerRot::XYZ, euler.0, euler.1, euler.2);
+            let order = transformation_euler_order(
+                string_param_default(&constraint.params, "euler_order", "AUTO")?,
+                owner_rotation_mode,
+            )?;
+            let legacy = param_bool(&constraint.params, "use_legacy_behavior", false)?;
+            let mut angles = euler_angles(source_quat, order);
+            for axis in 0..3 {
+                if param_bool(
+                    &constraint.params,
+                    ["use_limit_x", "use_limit_y", "use_limit_z"][axis],
+                    false,
+                )? {
+                    let min_key = ["min_x", "min_y", "min_z"][axis];
+                    let max_key = ["max_x", "max_y", "max_z"][axis];
+                    let minimum = number_param(&constraint.params, min_key)?.ok_or_else(|| {
+                        evaluation_error(format!("rotation constraint is missing {min_key}"))
+                    })?;
+                    let maximum = number_param(&constraint.params, max_key)?.ok_or_else(|| {
+                        evaluation_error(format!("rotation constraint is missing {max_key}"))
+                    })?;
+                    angles[axis] = if legacy {
+                        if angles[axis] < minimum {
+                            minimum
+                        } else if angles[axis] > maximum {
+                            maximum
+                        } else {
+                            angles[axis]
+                        }
+                    } else {
+                        clamp_rotation_angle(angles[axis], minimum, maximum)
+                    };
+                }
+            }
+            let rotation = quaternion_from_euler_angles(angles, order);
             desired.rotation = [rotation.x, rotation.y, rotation.z, rotation.w];
         }
         ConstraintType::ChildOf => {
-            let inverse = match constraint.params.get("inverse_matrix") {
-                Some(value) => value_matrix(value)
-                    .filter(|matrix| finite_matrix(*matrix))
-                    .ok_or_else(|| {
-                        evaluation_error_with(
-                            "child-of inverse_matrix must be a finite 4x4 matrix",
-                            json!({ "constraint_id": constraint.id }),
-                        )
-                    })?,
-                None => DMat4::IDENTITY,
+            if constraint.target.is_none() {
+                return Ok(source);
+            }
+            let use_location = [
+                param_bool(&constraint.params, "use_location_x", true)?,
+                param_bool(&constraint.params, "use_location_y", true)?,
+                param_bool(&constraint.params, "use_location_z", true)?,
+            ];
+            let use_rotation = [
+                param_bool(&constraint.params, "use_rotation_x", true)?,
+                param_bool(&constraint.params, "use_rotation_y", true)?,
+                param_bool(&constraint.params, "use_rotation_z", true)?,
+            ];
+            let use_scale = [
+                param_bool(&constraint.params, "use_scale_x", true)?,
+                param_bool(&constraint.params, "use_scale_y", true)?,
+                param_bool(&constraint.params, "use_scale_z", true)?,
+            ];
+            let all_channels_enabled = use_location.iter().all(|enabled| *enabled)
+                && use_rotation.iter().all(|enabled| *enabled)
+                && use_scale.iter().all(|enabled| *enabled);
+            let inverse_pending = param_bool(&constraint.params, "set_inverse_pending", false)?;
+            let inverse = if inverse_pending {
+                let cached = initial_capture
+                    .as_deref()
+                    .filter(|capture| capture.capture_enabled && !capture.recapture)
+                    .and_then(|capture| {
+                        capture
+                            .states
+                            .get(&(capture.owner_id.clone(), constraint.id.clone()))
+                    })
+                    .and_then(|params| params.get("inverse_matrix"))
+                    .and_then(value_matrix)
+                    .filter(|matrix| finite_matrix(*matrix));
+                if let Some(inverse) = cached {
+                    inverse
+                } else if let Some(capture) =
+                    initial_capture.filter(|capture| capture.capture_enabled)
+                {
+                    let parent = child_of_parent_matrix(
+                        target,
+                        constraint,
+                        doc,
+                        use_location,
+                        use_rotation,
+                        use_scale,
+                    )?;
+                    let mut inverse = checked_inverse(parent, "Child Of parent")?;
+                    if constraint.owner_bone.is_some() {
+                        inverse *= capture.owner_world;
+                    }
+                    if !finite_matrix(inverse) {
+                        return Err(evaluation_error("Child Of initial inverse is non-finite"));
+                    }
+                    let values = capture
+                        .states
+                        .entry((capture.owner_id.clone(), constraint.id.clone()))
+                        .or_default();
+                    values.insert("inverse_matrix".to_owned(), json!(inverse.to_cols_array()));
+                    values.insert("set_inverse_pending".to_owned(), Value::Bool(false));
+                    inverse
+                } else {
+                    return Err(PotError::with_details(
+                        ErrorCode::UnsupportedFeature,
+                        "Child Of pending inverse initialization is not supported",
+                        json!({
+                            "feature_id":"constraint.child_of.pending_inverse",
+                            "status":"not_supported",
+                            "constraint_id":constraint.id,
+                        }),
+                    ));
+                }
+            } else {
+                match constraint.params.get("inverse_matrix") {
+                    Some(value) => value_matrix(value)
+                        .filter(|matrix| finite_matrix(*matrix))
+                        .ok_or_else(|| {
+                            evaluation_error_with(
+                                "child-of inverse_matrix must be a finite 4x4 matrix",
+                                json!({ "constraint_id": constraint.id }),
+                            )
+                        })?,
+                    None => DMat4::IDENTITY,
+                }
             };
-            let child = target * inverse * source;
+            let parent = child_of_parent_matrix(
+                target,
+                constraint,
+                doc,
+                use_location,
+                use_rotation,
+                use_scale,
+            )?;
+            let inverse = if all_channels_enabled {
+                inverse
+            } else {
+                let owner_order = transformation_euler_order("AUTO", owner_rotation_mode)?;
+                let inverse_transform = matrix_transform(inverse)?;
+                let mut translation = inverse_transform.translation;
+                let mut scale = matrix_axis_sizes(inverse).to_array();
+                let mut angles = euler_angles(inverse_transform.rotation_quat(), owner_order);
+                for axis in 0..3 {
+                    if !use_location[axis] {
+                        translation[axis] = 0.0;
+                    }
+                    if !use_rotation[axis] {
+                        angles[axis] = 0.0;
+                    }
+                    if !use_scale[axis] {
+                        scale[axis] = 1.0;
+                    }
+                }
+                let rotation = quaternion_from_euler_angles(angles, owner_order);
+                DMat4::from_scale_rotation_translation(
+                    DVec3::from_array(scale),
+                    rotation,
+                    DVec3::from_array(translation),
+                )
+            };
+            let mut child = parent * inverse * source;
             if !finite_matrix(child) {
                 return Err(evaluation_error_with(
                     "child-of constraint result is non-finite",
                     json!({ "constraint_id": constraint.id }),
                 ));
             }
-            let mut child_transform = matrix_transform(child)?;
-            let owner_transform = matrix_transform(source)?;
-            for (axis, (location_key, scale_key)) in [
-                ("use_location_x", "use_scale_x"),
-                ("use_location_y", "use_scale_y"),
-                ("use_location_z", "use_scale_z"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if !param_bool(&constraint.params, location_key, true)? {
-                    child_transform.translation[axis] = owner_transform.translation[axis];
-                }
-                if !param_bool(&constraint.params, scale_key, true)? {
-                    child_transform.scale[axis] = owner_transform.scale[axis];
+            for (axis, enabled) in use_location.iter().enumerate() {
+                if !enabled {
+                    child.w_axis[axis] = source.w_axis[axis];
                 }
             }
-            let mut child_angles = blender_euler_xyz(child_transform.rotation_quat());
-            let owner_angles = blender_euler_xyz(owner_transform.rotation_quat());
-            for (axis, rotation_key) in ["use_rotation_x", "use_rotation_y", "use_rotation_z"]
-                .into_iter()
-                .enumerate()
-            {
-                if !param_bool(&constraint.params, rotation_key, true)? {
-                    child_angles[axis] = owner_angles[axis];
-                }
-            }
-            let child_rotation = DQuat::from_rotation_z(child_angles[2])
-                * DQuat::from_rotation_y(child_angles[1])
-                * DQuat::from_rotation_x(child_angles[0]);
-            child_transform.rotation = [
-                child_rotation.x,
-                child_rotation.y,
-                child_rotation.z,
-                child_rotation.w,
-            ];
-            return blend_transform(source, child_transform.matrix(), influence);
+            return blend_transform(source, child, influence);
         }
         ConstraintType::Ik | ConstraintType::SplineIk => return Ok(source),
         ConstraintType::TransformCache => return Ok(target),
@@ -9063,22 +9478,44 @@ fn constraint_channel(matrix: DMat4, channel: &str) -> Result<f64> {
     }
 }
 
-/// Blender's `mat4_to_eul` normalizes each matrix column before extracting XYZ Euler angles.
-fn blender_matrix_euler_xyz(matrix: DMat4) -> [f64; 3] {
-    let x = matrix.x_axis.truncate().normalize_or_zero();
-    let y = matrix.y_axis.truncate().normalize_or_zero();
-    let z = matrix.z_axis.truncate().normalize_or_zero();
-    let cy = x.x.hypot(x.y);
-    let (first, second) = if cy > 0.000_037_5 {
-        (
-            [y.z.atan2(z.z), (-x.z).atan2(cy), x.y.atan2(x.x)],
-            [(-y.z).atan2(-z.z), (-x.z).atan2(-cy), (-x.y).atan2(-x.x)],
-        )
+const EULER_HYPOT_EPSILON: f64 = 0.000_037_5;
+
+fn blender_matrix_euler_solutions(matrix: DMat4, order: EulerRot) -> ([f64; 3], [f64; 3]) {
+    let columns = [
+        matrix.x_axis.truncate().normalize_or_zero(),
+        matrix.y_axis.truncate().normalize_or_zero(),
+        matrix.z_axis.truncate().normalize_or_zero(),
+    ];
+    let [i, j, k] = euler_order_axes(order);
+    let at = |column: usize, row: usize| columns[column][row];
+    let cy = at(i, i).hypot(at(i, j));
+    let (mut first, mut second) = if cy > EULER_HYPOT_EPSILON {
+        let mut first = [0.0; 3];
+        let mut second = [0.0; 3];
+        first[i] = at(j, k).atan2(at(k, k));
+        first[j] = (-at(i, k)).atan2(cy);
+        first[k] = at(i, j).atan2(at(i, i));
+        second[i] = (-at(j, k)).atan2(-at(k, k));
+        second[j] = (-at(i, k)).atan2(-cy);
+        second[k] = (-at(i, j)).atan2(-at(i, i));
+        (first, second)
     } else {
-        let euler = [(-z.y).atan2(y.y), (-x.z).atan2(cy), 0.0];
-        (euler, euler)
+        let mut first = [0.0; 3];
+        first[i] = (-at(k, j)).atan2(at(j, j));
+        first[j] = (-at(i, k)).atan2(cy);
+        (first, first)
     };
-    let score = |euler: [f64; 3]| euler.iter().map(|angle| angle.abs()).sum::<f64>();
+    if euler_order_has_odd_parity(order) {
+        for angle in first.iter_mut().chain(second.iter_mut()) {
+            *angle = -*angle;
+        }
+    }
+    (first, second)
+}
+
+fn blender_matrix_euler(matrix: DMat4, order: EulerRot) -> [f64; 3] {
+    let (first, second) = blender_matrix_euler_solutions(matrix, order);
+    let score = |angles: [f64; 3]| angles.iter().map(|angle| angle.abs()).sum::<f64>();
     if score(first) > score(second) {
         second
     } else {
@@ -9086,18 +9523,13 @@ fn blender_matrix_euler_xyz(matrix: DMat4) -> [f64; 3] {
     }
 }
 
+/// Blender normalizes matrix columns before extracting XYZ Euler angles.
+fn blender_matrix_euler_xyz(matrix: DMat4) -> [f64; 3] {
+    blender_matrix_euler(matrix, EulerRot::XYZEx)
+}
+
 fn blender_euler_xyz(rotation: DQuat) -> [f64; 3] {
-    let matrix = DMat4::from_quat(rotation);
-    let y = (-matrix.x_axis.z).clamp(-1.0, 1.0).asin();
-    let (x, z) = if y.cos().abs() > f64::EPSILON * 64.0 {
-        (
-            matrix.y_axis.z.atan2(matrix.z_axis.z),
-            matrix.x_axis.y.atan2(matrix.x_axis.x),
-        )
-    } else {
-        (0.0, (-matrix.y_axis.x).atan2(matrix.y_axis.y))
-    };
-    [x, y, z]
+    blender_matrix_euler(DMat4::from_quat(rotation), EulerRot::XYZEx)
 }
 
 fn transformation_euler_order(value: &str, owner_mode: &str) -> Result<EulerRot> {
@@ -9111,6 +9543,109 @@ fn transformation_euler_order(value: &str, owner_mode: &str) -> Result<EulerRot>
         "ZYX" => EulerRot::ZYXEx,
         _ => return Err(evaluation_error("transformation Euler order is invalid")),
     })
+}
+fn pose_rotation_mode_for_euler_order(order: EulerRot) -> PoseRotationMode {
+    match order {
+        EulerRot::XZYEx => PoseRotationMode::Xzy,
+        EulerRot::YXZEx => PoseRotationMode::Yxz,
+        EulerRot::YZXEx => PoseRotationMode::Yzx,
+        EulerRot::ZXYEx => PoseRotationMode::Zxy,
+        EulerRot::ZYXEx => PoseRotationMode::Zyx,
+        _ => PoseRotationMode::Xyz,
+    }
+}
+
+fn quaternion_from_euler_angles(angles: [f64; 3], order: EulerRot) -> DQuat {
+    super::animation::quaternion_from_euler_angles(
+        angles,
+        pose_rotation_mode_for_euler_order(order),
+    )
+}
+
+fn euler_angles(rotation: DQuat, order: EulerRot) -> [f64; 3] {
+    blender_matrix_euler(DMat4::from_quat(rotation), order)
+}
+
+fn euler_order_axes(order: EulerRot) -> [usize; 3] {
+    match order {
+        EulerRot::XZYEx => [0, 2, 1],
+        EulerRot::YXZEx => [1, 0, 2],
+        EulerRot::YZXEx => [1, 2, 0],
+        EulerRot::ZXYEx => [2, 0, 1],
+        EulerRot::ZYXEx => [2, 1, 0],
+        _ => [0, 1, 2],
+    }
+}
+
+fn euler_order_has_odd_parity(order: EulerRot) -> bool {
+    matches!(order, EulerRot::XZYEx | EulerRot::YXZEx | EulerRot::ZYXEx)
+}
+
+fn compatible_euler_components(mut angles: [f64; 3], reference: [f64; 3]) -> [f64; 3] {
+    let pi = std::f64::consts::PI;
+    let tau = std::f64::consts::TAU;
+    for axis in 0..3 {
+        let difference = angles[axis] - reference[axis];
+        if difference > pi {
+            angles[axis] -= (difference / tau + 0.5).floor() * tau;
+        } else if difference < -pi {
+            angles[axis] += (-difference / tau + 0.5).floor() * tau;
+        }
+    }
+    for axis in 0..3 {
+        let next = (axis + 1) % 3;
+        let last = (axis + 2) % 3;
+        let difference = angles[axis] - reference[axis];
+        if difference.abs() > pi
+            && (angles[next] - reference[next]).abs() < std::f64::consts::FRAC_PI_2
+            && (angles[last] - reference[last]).abs() < std::f64::consts::FRAC_PI_2
+        {
+            angles[axis] += if difference > 0.0 { -tau } else { tau };
+        }
+    }
+    angles
+}
+
+fn compatible_euler(rotation: DQuat, reference: [f64; 3], order: EulerRot) -> [f64; 3] {
+    let (first, second) = blender_matrix_euler_solutions(DMat4::from_quat(rotation), order);
+    let first = compatible_euler_components(first, reference);
+    let second = compatible_euler_components(second, reference);
+    let first_distance = (0..3)
+        .map(|axis| (first[axis] - reference[axis]).abs())
+        .sum::<f64>();
+    let second_distance = (0..3)
+        .map(|axis| (second[axis] - reference[axis]).abs())
+        .sum::<f64>();
+    if first_distance > second_distance {
+        second
+    } else {
+        first
+    }
+}
+
+fn clamp_rotation_angle(angle: f64, minimum: f64, maximum: f64) -> f64 {
+    let tau = std::f64::consts::TAU;
+    if maximum - minimum >= tau {
+        return angle;
+    }
+    if maximum <= minimum {
+        return minimum;
+    }
+    let wrap = |value: f64| {
+        let turns = value / tau + 0.5;
+        ((turns - turns.floor()) - 0.5) * tau
+    };
+    let minimum = wrap(minimum - angle);
+    let maximum = wrap(maximum - angle);
+    if minimum < maximum {
+        angle + 0.0_f64.clamp(minimum, maximum)
+    } else if maximum >= 0.0 || minimum <= 0.0 {
+        angle
+    } else if maximum.abs() < minimum.abs() {
+        angle + maximum
+    } else {
+        angle + minimum
+    }
 }
 
 type TransformationRangeKeys = (
@@ -9162,10 +9697,7 @@ fn transformation_constraint(
     let output_order = transformation_euler_order(output_rotation_mode, owner_rotation_mode)?;
     let input_values = match map_from {
         "LOCATION" => target.translation,
-        "ROTATION" => {
-            let rotation = target.rotation_quat().to_euler(input_order);
-            [rotation.0, rotation.1, rotation.2]
-        }
+        "ROTATION" => euler_angles(target.rotation_quat(), input_order),
         "SCALE" => {
             if target_is_negative {
                 target.scale.map(|value| -value)
@@ -9197,7 +9729,11 @@ fn transformation_constraint(
         if input_max - input_min > f64::EPSILON && !extrapolate {
             input = input.clamp(input_min, input_max);
         } else if input_min - input_max > f64::EPSILON && !extrapolate {
-            input = input.clamp(input_max, input_min);
+            if input < input_min {
+                input = input_min;
+            } else if input > input_max {
+                input = input_max;
+            }
         }
         let factor = if (input_max - input_min).abs() > f64::EPSILON {
             (input - input_min) / (input_max - input_min)
@@ -9236,14 +9772,17 @@ fn transformation_constraint(
         },
         "ROTATION" => {
             let source_rotation = source.rotation_quat();
-            let output_rotation = DQuat::from_euler(output_order, mapped[0], mapped[1], mapped[2]);
+            let output_rotation = quaternion_from_euler_angles(mapped, output_order);
             let rotation = match string_param_default(&constraint.params, "mix_mode_rot", "ADD")? {
                 "REPLACE" => output_rotation,
                 "BEFORE" => output_rotation * source_rotation,
                 "AFTER" => source_rotation * output_rotation,
                 "ADD" => {
-                    let (x, y, z) = source_rotation.to_euler(output_order);
-                    DQuat::from_euler(output_order, x + mapped[0], y + mapped[1], z + mapped[2])
+                    let [x, y, z] = euler_angles(source_rotation, output_order);
+                    quaternion_from_euler_angles(
+                        [x + mapped[0], y + mapped[1], z + mapped[2]],
+                        output_order,
+                    )
                 }
                 _ => {
                     return Err(evaluation_error(
@@ -10080,13 +10619,19 @@ fn axis_vector(axis: &str) -> Option<DVec3> {
     match axis {
         "X" | "x" | "TRACK_X" | "track_x" | "UP_X" | "up_x" | "LOCK_X" | "SAMEVOL_X"
         | "FLOOR_X" => Some(DVec3::X),
-        "-X" | "-x" | "TRACK_NEGATIVE_X" | "track_negative_x" => Some(DVec3::NEG_X),
+        "-X" | "-x" | "TRACK_NEGATIVE_X" | "track_negative_x" | "FLOOR_NEGATIVE_X" => {
+            Some(DVec3::NEG_X)
+        }
         "Y" | "y" | "TRACK_Y" | "track_y" | "UP_Y" | "up_y" | "LOCK_Y" | "SAMEVOL_Y"
         | "FLOOR_Y" => Some(DVec3::Y),
-        "-Y" | "-y" | "TRACK_NEGATIVE_Y" | "track_negative_y" => Some(DVec3::NEG_Y),
+        "-Y" | "-y" | "TRACK_NEGATIVE_Y" | "track_negative_y" | "FLOOR_NEGATIVE_Y" => {
+            Some(DVec3::NEG_Y)
+        }
         "Z" | "z" | "TRACK_Z" | "track_z" | "UP_Z" | "up_z" | "LOCK_Z" | "SAMEVOL_Z"
         | "FLOOR_Z" => Some(DVec3::Z),
-        "-Z" | "-z" | "TRACK_NEGATIVE_Z" | "track_negative_z" => Some(DVec3::NEG_Z),
+        "-Z" | "-z" | "TRACK_NEGATIVE_Z" | "track_negative_z" | "FLOOR_NEGATIVE_Z" => {
+            Some(DVec3::NEG_Z)
+        }
         _ => None,
     }
 }

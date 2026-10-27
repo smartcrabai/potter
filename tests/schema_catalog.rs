@@ -93,7 +93,7 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
         assert!(result["op"].is_null());
         let schema = result["schema"].clone();
         if kind == "scene" {
-            assert_eq!(schema["properties"]["schema_version"]["const"], 13);
+            assert_eq!(schema["properties"]["schema_version"]["const"], 14);
         }
         let validator = jsonschema::validator_for(&schema)?;
         if matches!(kind, "capabilities" | "formats") {
@@ -1050,6 +1050,16 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "constraint.geometry_attribute.instances",
         "animation.fcurve_non_transform_channels",
         "shader.volume.spectral_extinction",
+        "constraint.copy_scale.modes",
+        "constraint.copy_location.offset_invert",
+        "constraint.floor.rotation",
+        "constraint.maintain_volume.modes",
+        "constraint.copy_rotation.euler_order",
+        "constraint.limit_rotation.euler_order_and_wrapping",
+        "constraint.child_of.channel_filtering",
+        "constraint.pivot.owner_euler_order",
+        "constraint.transformation.reversed_range",
+        "constraint.limit_distance.initial_distance",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1083,6 +1093,32 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "import": true,
             "export": true
         })
+    );
+    for feature_id in [
+        "constraint.child_of.pending_inverse",
+        "constraint.stretch_to.initial_length",
+    ] {
+        assert!(
+            features.iter().any(|feature| {
+                feature["feature_id"] == feature_id
+                    && feature["status"] == "partial"
+                    && feature["capabilities"]["evaluate"] == true
+                    && feature["capabilities"]["import"] == false
+                    && feature["reason"].as_str().is_some_and(|reason| {
+                        !reason.trim().is_empty()
+                            && reason.contains(
+                                "targetless constraints defer capture until a target is assigned",
+                            )
+                    })
+            }),
+            "{feature_id} must report captured operations and guarded imports"
+        );
+    }
+    assert!(
+        !features
+            .iter()
+            .any(|feature| feature["feature_id"] == "constraint.other_standard"),
+        "the obsolete blanket standard-constraint limitation must not be reported"
     );
     for feature_id in [
         "physics.dynamic_paint_surface.topology",
@@ -1133,6 +1169,8 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "blender.text.offset",
         "blender.text.taper_object",
         "modifier.uv_project.animated_camera_parameters",
+        "constraint.clamp_to.custom_spaces",
+        "constraint.follow_path.custom_spaces",
     ] {
         assert!(
             features.iter().any(|feature| {

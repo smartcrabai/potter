@@ -967,12 +967,6 @@ fn follow_track_reports_missing_reconstruction_marker_and_clip_data() -> TestRes
         error.message,
         "follow-track constraint has no enabled markers"
     );
-    assert!(
-        error
-            .details
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty)
-    );
 
     let mut doc = ops::apply_batch(
         &SceneDoc::new("00000000-0000-4000-8000-000000000002".to_owned()),

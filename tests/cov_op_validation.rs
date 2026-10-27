@@ -403,7 +403,7 @@ fn constraint_valid_boundaries_are_committed() {
             {"op":"constraint.create","target":{"id":"owner"},"id":"follow","type":"follow_path","constraint_target":"path","params":{"offset_factor":1.0}},
             {"op":"constraint.create","target":{"id":"owner"},"id":"map","type":"transformation","constraint_target":"path","params":{"map_from":"LOCATION","map_to":"LOCATION","from_min_x":0.0,"from_max_x":4.440_892_098_500_626e-16,"to_min_x":0.0,"to_max_x":1.0,"from_min_y":0.0,"from_max_y":0.0,"to_min_y":0.0,"to_max_y":1.0}},
             {"op":"constraint.create","target":{"id":"owner"},"id":"track","type":"track_to","constraint_target":"path","params":{"track_axis":"TRACK_NEGATIVE_X","up_axis":"UP_Z"}},
-            {"op":"constraint.create","target":{"id":"owner"},"id":"stretch","type":"stretch_to","constraint_target":"path","params":{"rest_length":0.0}}
+            {"op":"constraint.create","target":{"id":"owner"},"id":"stretch","type":"stretch_to","constraint_target":"path","enabled":false,"params":{"rest_length":0.0}}
         ]),
     );
     assert!(
@@ -424,6 +424,7 @@ fn constraint_valid_boundaries_are_committed() {
     );
     assert_eq!(constraints[3].params["track_axis"], "TRACK_NEGATIVE_X");
     assert_eq!(constraints[4].params["rest_length"], 0.0);
+    assert!(!constraints[4].enabled);
 }
 #[test]
 fn tracking_and_action_constraints_accept_valid_references_and_boundaries() {

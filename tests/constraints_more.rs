@@ -4370,3 +4370,93 @@ fn blender_euler_curves_and_transform_drivers_share_rotation_mode() -> TestResul
     );
     Ok(())
 }
+
+#[test]
+fn zero_limit_distance_persists_first_nonzero_separation_after_target_moves() -> TestResult {
+    let created = ops::apply_batch(
+        &SceneDoc::new("00000000-0000-4000-8000-000000000004".to_owned()),
+        &json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[
+                {"op":"node.create","id":"owner","kind":"empty"},
+                {"op":"node.create","id":"target","kind":"empty"},
+                {"op":"constraint.create","target":{"id":"owner"},"id":"distance",
+                 "type":"limit_distance","constraint_target":"target","params":{"distance":0.0}}
+            ]
+        }),
+    )?;
+    let first_move = ops::apply_batch(
+        &created.doc,
+        &json!({
+            "schema_version":1,
+            "base_revision":created.doc.revision,
+            "operations":[{
+                "op":"node.update",
+                "target":{"id":"target"},
+                "set":{"transform":{"translation":[5.0,0.0,0.0]}}
+            }]
+        }),
+    )?;
+    let owner_id = Id::new("owner".to_owned())?;
+    let constraint = &first_move.doc.nodes[&owner_id].constraints[0];
+    assert_eq!(constraint.params["distance"], 5.0);
+
+    let second_move = ops::apply_batch(
+        &first_move.doc,
+        &json!({
+            "schema_version":1,
+            "base_revision":first_move.doc.revision,
+            "operations":[{
+                "op":"node.update",
+                "target":{"id":"target"},
+                "set":{"transform":{"translation":[10.0,0.0,0.0]}}
+            }]
+        }),
+    )?;
+    assert_eq!(
+        second_move.doc.nodes[&owner_id].constraints[0].params["distance"],
+        5.0
+    );
+    let snapshot = Snapshot::evaluate(&second_move.doc, &EvaluationContext::default())?;
+    let owner = snapshot
+        .nodes
+        .get(&owner_id)
+        .ok_or("evaluated owner is missing")?;
+    assert!((DMat4::from_cols_array(&owner.world_matrix).w_axis.x - 5.0).abs() < 1.0e-9);
+    Ok(())
+}
+
+#[test]
+fn parsing_zero_limit_distance_captures_at_the_stored_scene_frame() -> TestResult {
+    let created = ops::apply_batch(
+        &SceneDoc::new("00000000-0000-4000-8000-000000000005".to_owned()),
+        &json!({
+            "schema_version":1,
+            "base_revision":0,
+            "operations":[
+                {"op":"node.create","id":"owner","kind":"empty"},
+                {"op":"node.create","id":"target","kind":"empty",
+                 "transform":{"translation":[5.0,0.0,0.0]}},
+                {"op":"constraint.create","target":{"id":"owner"},"id":"distance",
+                 "type":"limit_distance","constraint_target":"target","params":{"distance":0.0}}
+            ]
+        }),
+    )?;
+    let mut source = created.doc;
+    let owner_id = Id::new("owner".to_owned())?;
+    source
+        .nodes
+        .get_mut(&owner_id)
+        .ok_or("owner is missing")?
+        .constraints[0]
+        .params
+        .insert("distance".to_owned(), json!(0.0));
+    let parsed =
+        potter_core::model::parse_scene(&serde_json::to_vec(&source)?, Path::new("no-assets"))?;
+    assert_eq!(
+        parsed.doc.nodes[&owner_id].constraints[0].params["distance"],
+        5.0
+    );
+    Ok(())
+}

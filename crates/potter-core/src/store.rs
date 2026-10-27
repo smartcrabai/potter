@@ -128,7 +128,9 @@ impl Project {
     /// digest and compatibility hash are returned when load-time migration changes the document.
     fn read_snapshot(path: &Path) -> Result<SnapshotRead> {
         let bytes = fs::read(path.join("scene.json")).map_err(|error| PotError::io(&error))?;
-        let parsed = crate::model::migrate::parse_scene_with_original_hash(&bytes, path)?;
+        let cache_directory = path.join(".potter/cache");
+        let parsed =
+            crate::model::migrate::parse_scene_with_original_hash(&bytes, path, &cache_directory)?;
         parsed.doc.validate()?;
         let digest = hash::sha256(&bytes);
         let mut warnings = parsed.warnings;
@@ -1058,7 +1060,7 @@ mod tests {
 
         let (loaded, warnings) = super::read_history_blob(directory.path(), &digest).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(loaded.snapshot.schema_version, 13);
+        assert_eq!(loaded.snapshot.schema_version, 14);
         assert_eq!(fs::read(&path).unwrap(), bytes);
 
         let mut corrupted = bytes;

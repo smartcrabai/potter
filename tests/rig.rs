@@ -1686,7 +1686,7 @@ fn pose_bone_constraints_apply_supported_constraint_transforms() -> IntegrationR
         "child_of",
         Some("target_location"),
         None,
-        json!({}),
+        json!({"set_inverse_pending":false,"inverse_matrix":[1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0]}),
     );
     add_pose_constraint(
         &mut operations,
@@ -1981,7 +1981,7 @@ fn copy_rotation_scale_damped_track_limits_and_child_of_are_evaluated() -> Integ
         {"op":"constraint.create","target":{"id":"limited"},"id":"rotation_limit","type":"limit_rotation","params":{"min_z":-0.25,"max_z":0.25,"use_limit_z":true}},
         {"op":"node.create","id":"child_target","kind":"empty","transform":{"translation":[3.0,0.0,0.0]}},
         {"op":"node.create","id":"child_of_owner","kind":"empty","transform":{"translation":[1.0,0.0,0.0]}},
-        {"op":"constraint.create","target":{"id":"child_of_owner"},"id":"child_of","type":"child_of","constraint_target":"child_target"}
+        {"op":"constraint.create","target":{"id":"child_of_owner"},"id":"child_of","type":"child_of","constraint_target":"child_target","params":{"set_inverse_pending":false,"inverse_matrix":[1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0,1.0]}}
     ]))?;
     let evaluated = snapshot(&project, None)?;
     assert_vec3_close(
