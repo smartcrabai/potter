@@ -2059,6 +2059,12 @@ fn dynamic_paint_image_filename(
     image: &crate::sim::DynamicPaintImageData,
     frame: i32,
 ) -> Result<String> {
+    // Mirrors Blender's `imb_ext_image`; unknown suffixes are retained before adding `.png`.
+    const IMAGE_EXTENSIONS: &[&str] = &[
+        ".png", ".tga", ".bmp", ".jpg", ".jpeg", ".sgi", ".rgb", ".rgba", ".tif", ".tiff", ".tx",
+        ".avif", ".jp2", ".j2c", ".hdr", ".dds", ".dpx", ".cin", ".exr", ".psd", ".pdd", ".psb",
+        ".webp",
+    ];
     let name = image.output_name.as_str();
     if name.is_empty()
         || name == "."
@@ -2100,7 +2106,21 @@ fn dynamic_paint_image_filename(
     } else {
         format!("{frame:0digits$}")
     };
-    Ok(format!("{prefix}{frame}{suffix}.png"))
+    let mut filename = format!("{prefix}{frame}{suffix}");
+    let lowercase = filename.to_ascii_lowercase();
+    let has_png_extension = Path::new(&filename)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !has_png_extension {
+        if let Some(extension) = IMAGE_EXTENSIONS
+            .iter()
+            .find(|extension| lowercase.ends_with(**extension))
+        {
+            filename.truncate(filename.len() - extension.len());
+        }
+        filename.push_str(".png");
+    }
+    Ok(filename)
 }
 
 fn write_dynamic_paint_image(path: &Path, image: &crate::sim::DynamicPaintImageData) -> Result<()> {
@@ -2467,6 +2487,14 @@ mod tests {
         assert_eq!(
             dynamic_paint_image_filename(&dynamic_paint_image("é##", "PNG"), 3)?,
             "é03.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint_####.png", "PNG"), 1)?,
+            "paint_0001.png"
+        );
+        assert_eq!(
+            dynamic_paint_image_filename(&dynamic_paint_image("paint_##.jpg", "PNG"), 1)?,
+            "paint_01.png"
         );
         assert_eq!(
             dynamic_paint_image_filename(&dynamic_paint_image("paint##", "PNG"), 123)?,

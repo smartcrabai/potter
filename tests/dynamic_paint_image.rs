@@ -40,12 +40,54 @@ fn run_pot_json(command: &mut Command, label: &str) -> TestResult<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn rgba8_pixels(path: &Path) -> TestResult<Vec<u8>> {
+fn rgba8_pixels(path: &Path, width: u32, height: u32) -> TestResult<Vec<u8>> {
     let image = image::open(path)
         .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?;
-    assert_eq!(image.width(), 16, "{} width", path.display());
-    assert_eq!(image.height(), 16, "{} height", path.display());
+    assert_eq!(image.width(), width, "{} width", path.display());
+    assert_eq!(image.height(), height, "{} height", path.display());
     Ok(image.into_rgba8().into_raw())
+}
+
+fn assert_painted_pixel(pixels: &[u8], width: u32, column: u32, row: u32, label: &str) {
+    let start = ((row * width + column) * 4) as usize;
+    let pixel = &pixels[start..start + 4];
+    assert!(
+        pixel[3] > 0 && (pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0),
+        "{label} must paint a colored pixel at ({column}, {row})"
+    );
+}
+
+fn assert_scenario_discriminator(
+    id: &str,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    frame: u64,
+    label: &str,
+) {
+    match id {
+        "uv_edge_v01_filename_patterns" => {
+            assert_eq!((width, height), (20, 20));
+            let column = if frame == 1 { 0 } else { width - 1 };
+            for blender_row in [0, 1] {
+                let png_row = height - 1 - blender_row;
+                assert_painted_pixel(
+                    pixels,
+                    width,
+                    column,
+                    png_row,
+                    &format!("{label} Blender row {blender_row}"),
+                );
+            }
+        }
+        "uv_collinear_default_outputs" => {
+            assert_eq!((width, height), (20, 20));
+            for row in [9, 10] {
+                assert_painted_pixel(pixels, width, 10, row, label);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn read_file(path: &Path) -> TestResult<Vec<u8>> {
@@ -116,6 +158,8 @@ fn dynamic_paint_image_bake_matches_blender_png_sequence() -> TestResult<()> {
             "volume_antialias_off",
             "drying_dissolve",
             "uv_islands_margin",
+            "uv_edge_v01_filename_patterns",
+            "uv_collinear_default_outputs",
         ]
     );
     let mut volume_aa_on = None;
@@ -194,19 +238,51 @@ fn dynamic_paint_image_bake_matches_blender_png_sequence() -> TestResult<()> {
                 assert_eq!(scenario["mesh"]["uv_margin_pixels"], 2);
                 assert_eq!(scenario["mesh"]["brush_touches_island_edges"], true);
             }
+            "uv_edge_v01_filename_patterns" => {
+                assert_eq!(scenario["mesh"]["uv_min_v"], 0.1);
+                assert_eq!(expected_surface["image_resolution"], 20);
+            }
+            "uv_collinear_default_outputs" => {
+                assert_eq!(scenario["mesh"]["uv_sample_v"], 0.5);
+                assert_eq!(scenario["mesh"]["uv_face_is_collinear"], true);
+                assert_eq!(expected_surface["image_resolution"], 20);
+            }
             _ => unreachable!("scenario ids are checked above"),
         }
-        let expected_output_name = if id == "volume_antialias_on" {
-            "dp_paintmap##"
-        } else {
-            "dp_paintmap"
+        let (expected_output_name_a, expected_output_name_b) = match id {
+            "volume_antialias_on" => ("dp_paintmap##", "dp_wetmap"),
+            "uv_edge_v01_filename_patterns" => ("paint_####.png", "paint_##.jpg"),
+            "uv_collinear_default_outputs" => ("paintmap", "wetmap"),
+            _ => ("dp_paintmap", "dp_wetmap"),
         };
-        assert_eq!(expected_surface["output_name_a"], expected_output_name);
+        assert_eq!(expected_surface["output_name_a"], expected_output_name_a);
+        assert_eq!(expected_surface["output_name_b"], expected_output_name_b);
+        let expected_resolution = u32::try_from(
+            expected_surface["image_resolution"]
+                .as_u64()
+                .ok_or("image resolution is missing")?,
+        )?;
 
         let outputs = scenario["outputs"]
             .as_array()
             .ok_or("committed Blender image outputs are missing")?;
         assert_eq!(outputs.len(), 4, "{id} expects A/B images for both frames");
+        if id == "uv_edge_v01_filename_patterns" {
+            let files = outputs
+                .iter()
+                .map(|output| output["file"].as_str())
+                .collect::<Option<Vec<_>>>()
+                .ok_or("normalized PNG filenames are missing")?;
+            assert_eq!(
+                files,
+                vec![
+                    "paint_0001.png",
+                    "paint_0002.png",
+                    "paint_01.png",
+                    "paint_02.png"
+                ]
+            );
+        }
         let image_dir = scenario["image_dir"]
             .as_str()
             .ok_or("scenario image directory is missing")?;
@@ -221,8 +297,25 @@ fn dynamic_paint_image_bake_matches_blender_png_sequence() -> TestResult<()> {
             let filename = output["file"]
                 .as_str()
                 .ok_or("Blender image output filename is missing")?;
-            let generated_pixels = rgba8_pixels(&generated_case.join(image_dir).join(filename))?;
-            let committed_pixels = rgba8_pixels(&fixture_case.join(image_dir).join(filename))?;
+            let width = u32::try_from(
+                output["width"]
+                    .as_u64()
+                    .ok_or("Blender image width is missing")?,
+            )?;
+            let height = u32::try_from(
+                output["height"]
+                    .as_u64()
+                    .ok_or("Blender image height is missing")?,
+            )?;
+            assert_eq!(width, expected_resolution, "{id} image width");
+            assert_eq!(height, expected_resolution, "{id} image height");
+            let generated_pixels = rgba8_pixels(
+                &generated_case.join(image_dir).join(filename),
+                width,
+                height,
+            )?;
+            let committed_pixels =
+                rgba8_pixels(&fixture_case.join(image_dir).join(filename), width, height)?;
             assert_eq!(
                 generated_pixels, committed_pixels,
                 "generated Blender pixels differ from committed {id}/{filename}"
@@ -236,6 +329,14 @@ fn dynamic_paint_image_bake_matches_blender_png_sequence() -> TestResult<()> {
                     assert_uv_outer_margin(&generated_pixels, "Blender UV islands", frame);
                     assert_uv_island_margin_pixel(&generated_pixels, "Blender UV islands", frame);
                 }
+                assert_scenario_discriminator(
+                    id,
+                    &generated_pixels,
+                    width,
+                    height,
+                    frame,
+                    &format!("Blender {id} frame {frame}"),
+                );
             }
             blender_pixels.insert((name.to_owned(), frame), generated_pixels);
         }
@@ -254,10 +355,12 @@ fn dynamic_paint_image_bake_matches_blender_png_sequence() -> TestResult<()> {
             let frame_two = blender_pixels
                 .get(&(name.to_owned(), 2))
                 .ok_or("Blender frame 2 output is missing")?;
-            assert_ne!(
-                frame_one, frame_two,
-                "{id} {name} must change between frames"
-            );
+            if id != "uv_collinear_default_outputs" {
+                assert_ne!(
+                    frame_one, frame_two,
+                    "{id} {name} must change between frames"
+                );
+            }
         }
         for frame in [1, 2] {
             let paint = blender_pixels
@@ -391,8 +494,9 @@ fn dynamic_paint_image_bake_matches_blender_png_sequence() -> TestResult<()> {
             let name = output["name"].as_str().ok_or("output name is missing")?;
             let frame = output["frame"].as_u64().ok_or("output frame is missing")?;
             let filename = output["file"].as_str().ok_or("output file is missing")?;
-            let path = bake_dir.join("images").join(filename);
-            let actual = rgba8_pixels(&path)?;
+            let path = bake_dir.join(image_dir).join(filename);
+            assert!(path.is_file(), "Potter image output is missing: {path:?}");
+            let actual = rgba8_pixels(&path, expected_resolution, expected_resolution)?;
             let expected = blender_pixels
                 .get(&(name.to_owned(), frame))
                 .ok_or("Blender image pixels are missing")?;
@@ -405,6 +509,14 @@ fn dynamic_paint_image_bake_matches_blender_png_sequence() -> TestResult<()> {
                     assert_uv_outer_margin(&actual, "Potter UV islands", frame);
                     assert_uv_island_margin_pixel(&actual, "Potter UV islands", frame);
                 }
+                assert_scenario_discriminator(
+                    id,
+                    &actual,
+                    expected_resolution,
+                    expected_resolution,
+                    frame,
+                    &format!("Potter {id} frame {frame}"),
+                );
             }
             assert_eq!(
                 &actual, expected,
@@ -427,10 +539,12 @@ fn dynamic_paint_image_bake_matches_blender_png_sequence() -> TestResult<()> {
             let frame_two = potter_pixels
                 .get(&(name.to_owned(), 2))
                 .ok_or("Potter frame 2 output is missing")?;
-            assert_ne!(
-                frame_one, frame_two,
-                "Potter {id} {name} must change between frames"
-            );
+            if id != "uv_collinear_default_outputs" {
+                assert_ne!(
+                    frame_one, frame_two,
+                    "Potter {id} {name} must change between frames"
+                );
+            }
         }
         for frame in [1, 2] {
             let paint = potter_pixels

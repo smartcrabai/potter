@@ -135,7 +135,7 @@ pub(crate) fn build_surface(
             };
             let uv = face_uv[face_corner];
             // Potter stores UV V down; Blender's IMAGE surface grid is V up.
-            let blender_uv = [uv[0] as f32, 1.0_f32 - uv[1] as f32];
+            let blender_uv = [uv[0] as f32, (1.0 - uv[1]) as f32];
             if !uv[0].is_finite()
                 || !uv[1].is_finite()
                 || !blender_uv[0].is_finite()
@@ -297,27 +297,26 @@ fn line_point_side(first: [f32; 2], second: [f32; 2], point: [f32; 2]) -> f32 {
 
 fn barycentric_weights_v2(triangle: [[f32; 2]; 3], point: [f32; 2]) -> [f32; 3] {
     let [first, second, third] = triangle;
-    let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
     let mut weights = [
-        cross(
-            [second[0] - point[0], second[1] - point[1]],
-            [third[0] - point[0], third[1] - point[1]],
-        ),
-        cross(
-            [third[0] - point[0], third[1] - point[1]],
-            [first[0] - point[0], first[1] - point[1]],
-        ),
-        cross(
-            [first[0] - point[0], first[1] - point[1]],
-            [second[0] - point[0], second[1] - point[1]],
-        ),
+        cross_tri_v2(second, third, point),
+        cross_tri_v2(third, first, point),
+        cross_tri_v2(first, second, point),
     ];
     let total = weights[0] + weights[1] + weights[2];
     let inverse = 1.0 / total;
     for weight in &mut weights {
         *weight *= inverse;
     }
-    weights
+    if weights.iter().all(|weight| weight.is_finite()) {
+        weights
+    } else {
+        [1.0 / 3.0; 3]
+    }
+}
+
+fn cross_tri_v2(first: [f32; 2], second: [f32; 2], third: [f32; 2]) -> f32 {
+    (first[0] - second[0]) * (second[1] - third[1])
+        + (first[1] - second[1]) * (third[0] - second[0])
 }
 
 fn scene_invalid(message: &str) -> PotError {

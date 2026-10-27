@@ -62,23 +62,78 @@ SCENARIOS = (
         "uv_islands": True,
         "output_name_a": "dp_paintmap",
     },
+    {
+        "id": "uv_edge_v01_filename_patterns",
+        "directory": "scenarios/uv_edge_v01_filename_patterns",
+        "brush_source": "POINT",
+        "antialiasing": False,
+        "drying": False,
+        "dissolve": False,
+        "uv_layout": "edge_v01",
+        "image_resolution": 20,
+        "brush_positions": ((-1.0, -1.0), (1.0, -1.0)),
+        "output_name_a": "paint_####.png",
+        "output_name_b": "paint_##.jpg",
+    },
+    {
+        "id": "uv_collinear_default_outputs",
+        "directory": "scenarios/uv_collinear_default_outputs",
+        "brush_source": "POINT",
+        "antialiasing": False,
+        "drying": False,
+        "dissolve": False,
+        "uv_layout": "collinear_v05",
+        "image_resolution": 20,
+        "brush_positions": ((1.0 / 3.0, -1.0 / 3.0), (-1.0 / 3.0, 1.0 / 3.0)),
+        "default_output_names": True,
+    },
 )
 
-
 def frame_filename(output_name, frame):
-    matches = list(re.finditer(r"#+", output_name))
+    extension = os.path.splitext(output_name)[1]
+    known_extensions = (
+        ".png", ".tga", ".bmp", ".jpg", ".jpeg", ".sgi", ".rgb", ".rgba", ".tif",
+        ".tiff", ".tx", ".avif", ".jp2", ".j2c", ".hdr", ".dds", ".dpx", ".cin",
+        ".exr", ".psd", ".pdd", ".psb", ".webp",
+    )
+    stem = (
+        output_name[:-len(extension)]
+        if extension.lower() in known_extensions
+        else output_name
+    )
+    matches = list(re.finditer(r"#+", stem))
     if matches:
         match = matches[-1]
         frame_width = match.end() - match.start()
         frame_text = ("-" if frame < 0 else "") + str(abs(frame)).zfill(frame_width)
-        return output_name[:match.start()] + frame_text + output_name[match.end():] + ".png"
+        return stem[:match.start()] + frame_text + stem[match.end():] + ".png"
     frame_text = ("-" if frame < 0 else "") + str(abs(frame)).zfill(4)
-    return output_name + frame_text + ".png"
+    return stem + frame_text + ".png"
 
 
-def make_mesh(scene, use_uv_islands):
+def make_mesh(scene, spec):
     mesh = bpy.data.meshes.new("ImageCanvasMesh")
-    if use_uv_islands:
+    if spec.get("uv_layout"):
+        vertices = [
+            (-1.0, -1.0, 0.0), (1.0, -1.0, 0.0),
+            (1.0, 1.0, 0.0), (-1.0, 1.0, 0.0),
+        ]
+        mesh.from_pydata(vertices, [], [(0, 1, 2, 3)])
+        mesh.update()
+        uv = mesh.uv_layers.new(name="UVMap")
+        coords = (
+            ((0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9))
+            if spec["uv_layout"] == "edge_v01"
+            else ((0.1, 0.5), (0.9, 0.5), (0.9, 0.5), (0.1, 0.5))
+        )
+        for loop_index, coordinate in enumerate(coords):
+            uv.data[loop_index].uv = coordinate
+        mesh_info = {"uv_layer": "UVMap", "uv_layout": spec["uv_layout"]}
+        if spec["uv_layout"] == "edge_v01":
+            mesh_info.update({"uv_min_v": 0.1, "uv_max_v": 0.9})
+        else:
+            mesh_info.update({"uv_sample_v": 0.5, "uv_face_is_collinear": True})
+    elif spec.get("uv_islands", False):
         # Two disconnected canvas quads map to separate UV islands with a two-pixel margin.
         vertices = [
             (-1.0, -1.0, 0.0), (-0.1, -1.0, 0.0), (-0.1, 1.0, 0.0), (-1.0, 1.0, 0.0),
@@ -143,13 +198,14 @@ def generate_scenario(spec):
         if filename.lower().endswith(".png"):
             os.remove(os.path.join(image_dir, filename))
 
-    canvas, mesh_info = make_mesh(scene, spec["uv_islands"])
-    start_x, end_x = (-1.0, 1.0) if spec["uv_islands"] else (-0.5, 0.5)
+    canvas, mesh_info = make_mesh(scene, spec)
+    start_x, end_x = (-1.0, 1.0) if spec.get("uv_islands", False) else (-0.5, 0.5)
+    brush_positions = spec.get("brush_positions", ((start_x, 0.0), (end_x, 0.0)))
     bpy.ops.mesh.primitive_uv_sphere_add(
         segments=12,
         ring_count=8,
         radius=0.18,
-        location=(start_x, 0.0, 0.15),
+        location=(brush_positions[0][0], brush_positions[0][1], 0.15),
     )
     brush = bpy.context.object
     brush.name = "ImageBrush"
@@ -168,9 +224,13 @@ def generate_scenario(spec):
     brush_settings.paint_wetness = 1.0
     brush_settings.paint_distance = 0.42
     brush_settings.use_absolute_alpha = True
-    for frame, x in ((1, start_x), (2, end_x)):
-        brush.location.x = x
-        brush.keyframe_insert(data_path="location", frame=frame)
+    for frame, (x, y) in zip((1, 2), brush_positions):
+        if "brush_positions" in spec:
+            brush.location = (x, y, 0.15)
+            brush.keyframe_insert(data_path="location", frame=frame)
+        else:
+            brush.location.x = x
+            brush.keyframe_insert(data_path="location", frame=frame)
 
     canvas_modifier = canvas.modifiers.new("ImageCanvasSettings", "DYNAMIC_PAINT")
     canvas_modifier.ui_type = "CANVAS"
@@ -183,7 +243,7 @@ def generate_scenario(spec):
     surface = canvas_modifier.canvas_settings.canvas_surfaces[0]
     surface.surface_type = "PAINT"
     surface.surface_format = "IMAGE"
-    surface.image_resolution = 16
+    surface.image_resolution = spec.get("image_resolution", 16)
     surface.image_output_path = image_dir
     surface.image_fileformat = "PNG"
     surface.frame_start = 1
@@ -194,10 +254,12 @@ def generate_scenario(spec):
     surface.dissolve_speed = 250
     surface.use_drying = spec["drying"]
     surface.dry_speed = 500
-    surface.output_name_a = spec["output_name_a"]
+    if not spec.get("default_output_names", False):
+        surface.output_name_a = spec["output_name_a"]
+        surface.output_name_b = spec.get("output_name_b", "dp_wetmap")
     surface.use_output_a = True
-    surface.output_name_b = "dp_wetmap"
     surface.use_output_b = True
+
 
     scene.frame_set(1)
     bpy.context.view_layer.update()
@@ -232,7 +294,7 @@ def generate_scenario(spec):
             if data[:8] != b"\x89PNG\r\n\x1a\n":
                 raise RuntimeError("Blender did not write a valid PNG: " + path)
             width, height = struct.unpack(">II", data[16:24])
-            if (width, height) != (16, 16):
+            if (width, height) != (surface.image_resolution, surface.image_resolution):
                 raise RuntimeError("Unexpected Dynamic Paint image dimensions: %r" % ((width, height),))
             outputs.append(
                 {

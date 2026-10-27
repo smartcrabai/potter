@@ -3717,6 +3717,11 @@ fn prepare_dynamic_paint_paint(
     }))
 }
 
+fn dynamic_paint_image_output_name(surface: &Value, key: &str, default: &str) -> Option<String> {
+    let name = setting_string(surface, key).unwrap_or(default);
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 fn prepare_dynamic_paint_image(
     context: &FrameContext<'_>,
     canvas_id: &Id,
@@ -3790,14 +3795,12 @@ fn prepare_dynamic_paint_image(
     let cache_key =
         dynamic_paint_hold_cache_key(context, canvas_id, scene_hash, frame_end, modifier_prefix)?;
     let output_a = if bool_setting(surface, "use_output_a", true, "dynamic-paint surface")? {
-        let name = setting_string(surface, "output_name_a").unwrap_or("paintmap");
-        (!name.is_empty()).then(|| name.to_owned())
+        dynamic_paint_image_output_name(surface, "output_name_a", "paintmap")
     } else {
         None
     };
     let output_b = if bool_setting(surface, "use_output_b", false, "dynamic-paint surface")? {
-        let name = setting_string(surface, "output_name_b").unwrap_or("wetmap");
-        (!name.is_empty()).then(|| name.to_owned())
+        dynamic_paint_image_output_name(surface, "output_name_b", "wetmap")
     } else {
         None
     };
@@ -4731,12 +4734,35 @@ fn write_dynamic_paint_weight_group(mesh: &mut Mesh, name: &str, weights: &[f64]
 mod dynamic_paint_frame_tests {
     use serde_json::json;
 
-    use super::{surface_paint_frame, validate_dynamic_paint_canvas};
+    use super::{
+        dynamic_paint_image_output_name, surface_paint_frame, validate_dynamic_paint_canvas,
+    };
     use crate::error::{ErrorCode, Result};
 
     /// The paint frame, as an exact integer-valued frame, for comparisons without float equality.
     fn paint_frame_in_tenths(surface: &serde_json::Value, frame: f64) -> Result<Option<i64>> {
         Ok(surface_paint_frame(surface, frame)?.map(|paint| (paint * 10.0).round() as i64))
+    }
+    #[test]
+    fn image_output_names_use_blender_defaults() {
+        let surface = json!({});
+        assert_eq!(
+            dynamic_paint_image_output_name(&surface, "output_name_a", "paintmap"),
+            Some("paintmap".to_owned())
+        );
+        assert_eq!(
+            dynamic_paint_image_output_name(&surface, "output_name_b", "wetmap"),
+            Some("wetmap".to_owned())
+        );
+        let surface = json!({"output_name_a": "", "output_name_b": "custom"});
+        assert_eq!(
+            dynamic_paint_image_output_name(&surface, "output_name_a", "paintmap"),
+            None
+        );
+        assert_eq!(
+            dynamic_paint_image_output_name(&surface, "output_name_b", "wetmap"),
+            Some("custom".to_owned())
+        );
     }
 
     #[test]
