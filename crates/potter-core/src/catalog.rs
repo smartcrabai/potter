@@ -1946,7 +1946,7 @@ pub fn feature_catalog() -> Value {
             "Blender implicit cloth-solver numerical parity",
             "Cloth",
             &[],
-            "Potter uses deterministic XPBD distance constraints rather than Blender's implicit cloth solver, so later-frame per-vertex trajectories are not numerically equivalent.",
+            "Potter uses deterministic XPBD distance constraints rather than Blender's implicit cloth solver for unbaked simulation; disk-backed cloth caches are replayed exactly through physics.point_cache.is_baked.",
         ),
         unsupported(
             "physics.cloth.vertex_group_mass",
@@ -2123,12 +2123,25 @@ pub fn feature_catalog() -> Value {
             &[],
             "Per-vertex color and weight history can only be mapped when vertex count and order remain stable from frame_start through the requested frame; topology-changing ranges are refused.",
         ),
+        {
+            let mut feature = supported(
+                "physics.point_cache.is_baked",
+                "Baked point caches",
+                "PointCache",
+                &[],
+                [false, false, true, true, true, true, false],
+            );
+            feature["reason"] = json!(
+                "Exact playback and Blender import cover disk-backed Blender 5.2.2 cloth and soft-body caches with positive frame ranges, stable vertex counts, and supported uncompressed or Zstandard BPHYSICS blocks; see physics.point_cache.source_frames for the export limitation. Memory-only, particle, Dynamic Paint, linked-object, and unsupported cache encodings remain refused."
+            );
+            feature
+        },
         unsupported(
-            "physics.point_cache.is_baked",
-            "Baked point caches",
+            "physics.point_cache.source_frames",
+            "Baked point-cache source-frame export",
             "PointCache",
             &[],
-            "Baked point caches are refused with physics.point_cache.is_baked; Potter evaluates frame-cached results without a bake state.",
+            "Potter's .blend exporter does not materialize imported .bphys frames into Blender's cache sidecar; it reports blender.physics.point_cache.source_frames and leaves the exported cache unbaked.",
         ),
         unsupported(
             "physics.fluid.solver_parity",
@@ -2142,7 +2155,7 @@ pub fn feature_catalog() -> Value {
             "Blender soft-body solver numerical parity",
             "SoftBody",
             &[],
-            "Potter uses deterministic XPBD soft-body constraints rather than Blender's soft-body solver, so later-frame vertex trajectories are not numerically equivalent.",
+            "Potter uses deterministic XPBD soft-body constraints rather than Blender's soft-body solver for unbaked simulation; disk-backed soft-body caches are replayed exactly through physics.point_cache.is_baked.",
         ),
         unsupported(
             "physics.dynamic_paint.stateful_canvas",

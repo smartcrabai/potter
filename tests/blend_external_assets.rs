@@ -49,6 +49,20 @@ if font_source is None:
     raise RuntimeError("no external test font is available")
 font_path = os.path.join(assets, os.path.basename(font_source))
 shutil.copyfile(font_source, font_path)
+image_path = os.path.join(assets, "title.png")
+generated_image = bpy.data.images.new("TitleTexture", width=2, height=2)
+generated_image.pixels[:] = [
+    1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+    0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+]
+generated_image.filepath_raw = image_path
+generated_image.file_format = "PNG"
+generated_image.save()
+bpy.data.images.remove(generated_image)
+image = bpy.data.images.load(image_path)
+image.filepath = "//assets/title.png"
+image.name = "TitleTexture"
+
 
 movie_path = os.path.join(assets, "clip.mp4")
 render_scene = bpy.data.scenes.new("MovieSource")
@@ -91,6 +105,15 @@ text_data.font = font
 text_data.size = 0.5
 text = bpy.data.objects.new("Title", text_data)
 scene.collection.objects.link(text)
+material = bpy.data.materials.new("TitleMaterial")
+material.use_nodes = True
+nodes = material.node_tree.nodes
+texture = nodes.new("ShaderNodeTexImage")
+texture.image = image
+material.node_tree.links.new(
+    texture.outputs["Color"], nodes["Principled BSDF"].inputs["Base Color"])
+text_data.materials.append(material)
+
 editor = scene.sequence_editor_create()
 strips = editor.strips if hasattr(editor, "strips") else editor.sequences
 strip = strips.new_movie("Clip", movie_path, 1, 1)
@@ -274,8 +297,8 @@ fn expected_resource_kinds(case: &str) -> &'static [&'static str] {
     match case {
         "volume" => &["volume"],
         "movie" => &["movie"],
-        "text" => &["font"],
-        _ => &["volume", "movie", "font"],
+        "text" => &["font", "image"],
+        _ => &["volume", "movie", "font", "image"],
     }
 }
 
@@ -394,6 +417,8 @@ fn blender_external_assets_copy_link_and_roundtrip() -> Result<(), Box<dyn Error
                 "replace",
                 "--base-revision",
                 "0",
+                "--asset-policy",
+                "copy",
                 "--blender",
                 blender.to_str().unwrap(),
             ],
@@ -503,7 +528,7 @@ fn blender_external_assets_copy_link_and_roundtrip() -> Result<(), Box<dyn Error
     }
 
     let link_root = canonical_source.join("case_link");
-    let input_blend = make_case_blend(&blender, &canonical_source, &link_root, "combined")?;
+    let input_blend = make_case_blend(&blender, &canonical_source, &link_root, "volume")?;
     let link_project = link_root.join("project");
     pot_ok(
         &["init", link_project.to_str().unwrap()],
@@ -529,7 +554,7 @@ fn blender_external_assets_copy_link_and_roundtrip() -> Result<(), Box<dyn Error
         "linked Blender import",
     )?;
     assert_eq!(linked["ok"], true);
-    for kind in expected_resource_kinds("combined") {
+    for kind in expected_resource_kinds("volume") {
         let resource = linked["result"]["resources"]
             .as_array()
             .unwrap()
@@ -544,6 +569,9 @@ fn blender_external_assets_copy_link_and_roundtrip() -> Result<(), Box<dyn Error
         &["assets", link_project.to_str().unwrap(), "--check"],
         "linked asset check",
     )?;
-    assert_eq!(linked_assets["result"]["summary"]["missing"], 0);
+    assert_eq!(
+        linked_assets["result"]["summary"]["missing"], 0,
+        "{linked_assets}"
+    );
     Ok(())
 }
