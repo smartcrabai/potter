@@ -1545,13 +1545,31 @@ pub fn feature_catalog() -> Value {
             ],
             [false, true, true, true, true, true, true],
         ),
-        unsupported(
-            "animation.nla_advanced",
-            "Advanced NLA retiming and blending",
-            "Action/NLA",
-            &[],
-            "Blender-specific NLA retiming and blend semantics beyond the supported basic NLA subset are not implemented.",
-        ),
+        {
+            let mut row = supported(
+                "animation.nla_advanced",
+                "Advanced NLA retiming and blending",
+                "Action/NLA",
+                &[
+                    "action.slot_create",
+                    "nla.track_create",
+                    "nla.track_update",
+                    "nla.track_delete",
+                    "nla.strip_create",
+                    "nla.strip_update",
+                    "nla.strip_delete",
+                    "nla.push_down",
+                    "action.update",
+                    "fcurve.update",
+                ],
+                [true, true, true, true, true, true, true],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "CLIP strips support native scale/repeat/reverse/action ranges, preserved sync-length state (dynamic bounds recalculation after Action edits is not implemented), HOLD/HOLD_FORWARD/NOTHING including gaps, all five blend modes and COMBINE quaternion/Euler/axis-angle/scale channels, static and keyframed influence, blend-in/out/auto blend, strip and track mute/solo/order, animated strip_time, and active-action blend controls through inspect/evaluation and .blend import/export. META, TRANSITION, SOUND, and NLA tweak-mode states are refused; sampled or muted influence/strip-time F-Curves and F-Curves for other strip properties are also refused."
+            );
+            row
+        },
         supported(
             "animation.fcurve_modifiers",
             "Blender F-Curve modifiers",

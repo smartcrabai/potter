@@ -2737,6 +2737,7 @@ def object_dump(obj):
     drivers = []
     nla_tracks = []
     if obj.animation_data:
+        nla_tweak_mode = bool(getattr(obj.animation_data, "use_tweak_mode", False))
         if obj.animation_data.action:
             action = obj.animation_data.action.name_full
         slot = getattr(obj.animation_data, "action_slot", None)
@@ -2753,27 +2754,19 @@ def object_dump(obj):
                                                                    "data_path": target.data_path}
                                                                   for target in variable.targets]}
                                                      for variable in curve.driver.variables]}})
+        action_blend_type = str(getattr(obj.animation_data, "action_blend_type", "REPLACE"))
+        action_influence = float(getattr(obj.animation_data, "action_influence", 1.0))
+        action_extrapolation = str(
+            getattr(obj.animation_data, "action_extrapolation", "HOLD"))
         for track in obj.animation_data.nla_tracks:
-            nla_tracks.append({"name": track.name, "mute": bool(track.mute), "solo": bool(track.is_solo),
-                               "strips": [{"name": strip.name,
-                                           "action": strip.action.name_full if strip.action else None,
-                                           "action_slot": {"identifier": getattr(strip.action_slot, "identifier", ""),
-                                                           "name": getattr(strip.action_slot, "name_display",
-                                                                           getattr(strip.action_slot, "name", "")),
-                                                           "target_type": getattr(strip.action_slot, "target_id_type", "")}
-                                           if getattr(strip, "action_slot", None) else None,
-                                           "properties": {
-                                               **rna_props(strip),
-                                               "use_animated_influence": bool(
-                                                   strip.use_animated_influence),
-                                           },
-                                           "custom_properties": custom_props(strip),
-                                           "influence_curve": next(
-                                               (dump_nla_influence_curve(curve)
-                                                for curve in strip.fcurves
-                                                if curve.data_path == "influence"
-                                                and curve.array_index == 0),
-                                               None)} for strip in track.strips]})
+            nla_tracks.append({"name": track.name, "mute": bool(track.mute),
+                               "solo": bool(track.is_solo),
+                               "strips": [nla_strip_dump(strip) for strip in track.strips]})
+    else:
+        action_blend_type = "REPLACE"
+        action_influence = 1.0
+        action_extrapolation = "HOLD"
+        nla_tweak_mode = False
     return {"name": obj.name_full, "potter_id": obj.get("potter.id"), "type": obj.type,
             "library": library_reference(obj), "override_library": _override_dump(obj),
             "data_name": data.name_full if data else None, "parent": obj.parent.name_full if obj.parent else None,
@@ -2797,7 +2790,11 @@ def object_dump(obj):
             "hide_select": bool(obj.hide_select), "materials": materials,
             "material_links": material_links, "modifiers": modifiers,
             "constraints": constraints, "drivers": drivers, "nla_tracks": nla_tracks,
-            "action": action, "action_slot": action_slot, "pose": _pose_dump(obj),
+            "action": action, "action_slot": action_slot,
+            "action_blend_type": action_blend_type,
+            "action_influence": action_influence,
+            "action_extrapolation": action_extrapolation, "pose": _pose_dump(obj),
+            "nla_tweak_mode": nla_tweak_mode,
             "active_vertex_group_index": _active_vertex_group_index(obj),
             "vertex_groups": _vertex_groups_dump(obj), "rigid_body": _rigid_body_dump(obj),
             "force_field": _force_field_dump(obj), "custom_properties": custom_props(obj),
@@ -2947,6 +2944,51 @@ def dump_nla_influence_curve(curve):
         for point in curve.sampled_points
     ]
     return result
+
+
+def dump_nla_time_curve(curve):
+    result = dump_fcurve(curve)
+    result["sampled_points"] = [
+        {"frame": float(point.co.x), "value": float(point.co.y)}
+        for point in curve.sampled_points
+    ]
+    return result
+
+
+def nla_strip_dump(strip):
+    strip_type = str(getattr(strip, "type", "CLIP"))
+    if strip_type != "CLIP":
+        return {"name": strip.name, "type": strip_type}
+    curves = list(strip.fcurves)
+    return {
+        "name": strip.name,
+        "type": strip_type,
+        "action": strip.action.name_full if strip.action else None,
+        "action_slot": {
+            "identifier": getattr(strip.action_slot, "identifier", ""),
+            "name": getattr(strip.action_slot, "name_display",
+                            getattr(strip.action_slot, "name", "")),
+            "target_type": getattr(strip.action_slot, "target_id_type", ""),
+        } if getattr(strip, "action_slot", None) else None,
+        "properties": {
+            **rna_props(strip),
+            "use_animated_influence": bool(strip.use_animated_influence),
+        },
+        "custom_properties": custom_props(strip),
+        "influence_curve": next(
+            (dump_nla_influence_curve(curve) for curve in curves
+             if curve.data_path == "influence" and curve.array_index == 0),
+            None),
+        "strip_time_curve": next(
+            (dump_nla_time_curve(curve) for curve in curves
+             if curve.data_path == "strip_time" and curve.array_index == 0),
+            None),
+        "unsupported_curves": [
+            dump_fcurve(curve) for curve in curves
+            if (curve.data_path, curve.array_index) not in
+            (("influence", 0), ("strip_time", 0))
+        ],
+    }
 
 
 def collection_dump(collection):
@@ -7649,8 +7691,8 @@ def _curve_data_create(name, data_id, item, source, doc, target, pack):
             layer = action.layers.new("Potter")
             strip = layer.strips.new(type="KEYFRAME")
             channelbag = strip.channelbag(slot, ensure=True)
-            _restore_action_curves(
-                channelbag, eval_time_fcurves, "Curve %s evaluation time" % name, doc)
+            _restore_fcurves(
+                channelbag.fcurves, eval_time_fcurves, "Curve %s evaluation time" % name, doc)
     if item.get("type") in ("text", "surface"):
         curve.resolution_u = int(resolution_u)
     set_id(curve, data_id)
@@ -8443,20 +8485,44 @@ def _canonical_action_data(doc, item, source, action_id, object_map):
     return slot_sources, flat_curves
 
 
-def _restore_action_curves(channelbag, curves, owner, doc):
+def _restore_fcurves(fcurves, curves, owner, doc, keyframe_owner=None):
     for source in curves:
         try:
             path = blender_animation_path(source["path"], doc)
             array_index = blender_animation_index(path, int(source["index"]))
-            curve = channelbag.fcurves.new(
-                data_path=path,
-                index=array_index)
+            source_keys = source.get("keyframes", [])
+            if keyframe_owner is None:
+                curve = fcurves.new(data_path=path, index=array_index)
+            else:
+                if not source_keys:
+                    raise ValueError("NLA strip F-Curve has no keyframes")
+                for key in source_keys:
+                    setattr(keyframe_owner, path, float(key["value"]))
+                    if path in ("influence", "strip_time") and array_index == 0:
+                        inserted = keyframe_owner.keyframe_insert(
+                            data_path=path, frame=float(key["frame"]))
+                    else:
+                        inserted = keyframe_owner.keyframe_insert(
+                            data_path=path, index=array_index, frame=float(key["frame"]))
+                    if not inserted:
+                        raise ValueError("Blender did not insert an NLA strip keyframe")
+                curve = fcurves.find(path, index=array_index)
+                if curve is None:
+                    raise ValueError("Blender did not create the NLA strip F-Curve")
             curve.extrapolation = source.get("extrapolation", "CONSTANT").upper()
             if "auto_smoothing" in source:
                 curve.auto_smoothing = source["auto_smoothing"].upper()
             curve.mute = bool(source.get("mute", False))
-            for key in source.get("keyframes", []):
-                point = curve.keyframe_points.insert(float(key["frame"]), float(key["value"]))
+            points_by_frame = {
+                float(point.co.x): point for point in curve.keyframe_points
+            } if keyframe_owner is not None else {}
+            for key in source_keys:
+                if keyframe_owner is None:
+                    point = curve.keyframe_points.insert(float(key["frame"]), float(key["value"]))
+                else:
+                    point = points_by_frame.get(float(key["frame"]))
+                    if point is None:
+                        raise ValueError("Blender did not create an NLA strip keyframe")
                 point.interpolation = key.get("interpolation", "LINEAR").upper()
                 point.handle_left_type = key.get("handle_left_type", "AUTO").upper()
                 point.handle_right_type = key.get("handle_right_type", "AUTO").upper()
@@ -8590,8 +8656,23 @@ def _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup):
             strip_properties = source_strip.get("properties", {})
             frame_start = int(strip_properties.get("frame_start", 1))
             strip = track.strips.new(source_strip.get("name", action.name), frame_start, action)
-            set_rna(strip, strip_properties, id_lookup, strict=True,
-                    owner="NLA strip %s" % strip.name)
+            timing_properties = (
+                "use_reverse", "use_sync_length", "use_auto_blend", "use_animated_time",
+                "use_animated_time_cyclic")
+            set_rna(
+                strip,
+                {key: strip_properties[key] for key in timing_properties
+                 if key in strip_properties},
+                id_lookup,
+                strict=True,
+                owner="NLA strip %s" % strip.name)
+            set_rna(
+                strip,
+                {key: value for key, value in strip_properties.items()
+                 if key not in timing_properties},
+                id_lookup,
+                strict=True,
+                owner="NLA strip %s" % strip.name)
             set_props(strip, source_strip.get("custom_properties", {}))
             slot_reference = source_strip.get("action_slot")
             action_slots = action_slots_by_name.get(action.name_full, [])
@@ -8604,7 +8685,12 @@ def _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup):
                 raise ValueError("NLA strip %s references missing Action slot" % strip.name)
             if slot is not None and hasattr(strip, "action_slot"):
                 strip.action_slot = slot
-            if bool(strip_properties.get("use_animated_influence", False)):
+            influence_curve = source_strip.get("influence_curve")
+            if influence_curve is not None:
+                _restore_fcurves(
+                    strip.fcurves, [influence_curve],
+                    "NLA strip %s influence" % strip.name, {}, keyframe_owner=strip)
+            elif bool(strip_properties.get("use_animated_influence", False)):
                 strip.use_animated_influence = True
                 strip.influence = float(strip_properties.get("influence", 1.0))
                 for frame in (strip.frame_start, strip.frame_end):
@@ -8617,6 +8703,10 @@ def _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup):
                     raise ValueError("Blender did not create the NLA strip influence curve")
                 for point in curve.keyframe_points:
                     point.interpolation = "CONSTANT"
+            if source_strip.get("strip_time_curve") is not None:
+                _restore_fcurves(
+                    strip.fcurves, [source_strip["strip_time_curve"]],
+                    "NLA strip %s strip time" % strip.name, {}, keyframe_owner=strip)
 
 def _nla_from_model(doc, node, action_slot_refs_by_action_id):
     actions = doc.get("actions", {})
@@ -8631,8 +8721,8 @@ def _nla_from_model(doc, node, action_slot_refs_by_action_id):
                 raise ValueError("NLA strip references missing action %s" %
                                  source_strip.get("action"))
             influence = float(source_strip.get("influence", 1.0))
-            use_animated_influence = (
-                bool(source_strip.get("use_animated_influence", False)) or influence != 1.0)
+            use_animated_influence = bool(
+                source_strip.get("use_animated_influence", False))
             strip = {
                 "name": action.get("name", "Action"),
                 "action": action.get("name"),
@@ -8649,7 +8739,18 @@ def _nla_from_model(doc, node, action_slot_refs_by_action_id):
                     "extrapolation": source_strip.get("extrapolation", "hold").upper(),
                     "blend_in": source_strip.get("blend_in", 0.0),
                     "blend_out": source_strip.get("blend_out", 0.0),
+                    "use_reverse": bool(source_strip.get("reverse", False)),
+                    "use_sync_length": bool(source_strip.get("use_sync_length", False)),
+                    "use_auto_blend": bool(source_strip.get("use_auto_blend", False)),
+                    "mute": bool(source_strip.get("mute", False)),
+                    "strip_time": source_strip.get("strip_time", 0.0),
+                    "use_animated_time": bool(
+                        source_strip.get("use_animated_time", False)),
+                    "use_animated_time_cyclic": bool(
+                        source_strip.get("use_animated_time_cyclic", False)),
                 },
+                "influence_curve": source_strip.get("influence_curve"),
+                "strip_time_curve": source_strip.get("strip_time_curve"),
             }
             slot_reference = _action_slot_reference(
                 action_slot_refs_by_action_id, source_strip.get("action"),
@@ -10218,8 +10319,8 @@ def export_doc(doc, target, pack, scene_hash, context):
                 if not curves:
                     continue
                 channelbag = strip.channelbag(slot, ensure=True)
-                _restore_action_curves(channelbag, curves, "Action %s slot %s" %
-                                       (action.name, slot.name_display), doc)
+                _restore_fcurves(channelbag.fcurves, curves, "Action %s slot %s" %
+                                 (action.name, slot.name_display), doc)
         action_map[action_id] = (action, slots, source_slot_refs)
         action_by_name[action.name_full] = action
         id_lookup[action.name_full] = action
@@ -10293,6 +10394,22 @@ def export_doc(doc, target, pack, scene_hash, context):
         tracks = _canonical_nla(
             doc, node, source_object.get("nla_tracks"), action_slot_refs_by_action_id)
         _restore_nla(obj, tracks, action_by_name, action_slots_by_name, id_lookup)
+        if obj.animation_data is None and (
+            node.get("action_blend_type", "replace") != "replace"
+            or float(node.get("action_influence", 1.0)) != 1.0
+            or node.get("action_extrapolation", "hold") != "hold"
+        ):
+            obj.animation_data_create()
+        if obj.animation_data is not None:
+            for key, value in (
+                ("action_blend_type", node.get("action_blend_type", "replace").upper()),
+                ("action_influence", float(node.get("action_influence", 1.0))),
+                ("action_extrapolation", node.get("action_extrapolation", "hold").upper()),
+            ):
+                try:
+                    setattr(obj.animation_data, key, value)
+                except Exception as error:
+                    raise ValueError("cannot restore %s on %s" % (key, obj.name)) from error
         hide_set_states = source_object.get("hide_set_by_view_layer") or {}
         restored_hide_set = False
         for scene in scene_map.values():

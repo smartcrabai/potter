@@ -35,8 +35,9 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
             {"op":"action.create","id":"offset","name":"Offset"},
             {"op":"action.update","target":{"id":"offset"},"set":{"fcurves":[{"path":"transform.translation","index":0,"keyframes":[{"frame":1.0,"value":4.0},{"frame":11.0,"value":4.0}]}]}},
             {"op":"nla.track_create","target":{"id":"animated"},"id":"track_main","name":"Main"},
+            {"op":"nla.track_create","target":{"id":"animated"},"id":"track_offset","name":"Offset"},
             {"op":"nla.strip_create","target":{"id":"animated"},"track":"track_main","id":"strip_ramp","action":"ramp","frame_start":1.0,"frame_end":11.0,"action_frame_start":1.0,"action_frame_end":11.0,"scale":1.0,"repeat":1.0,"blend_type":"replace","influence":0.5,"extrapolation":"hold","blend_in":0.0,"blend_out":0.0},
-            {"op":"nla.strip_create","target":{"id":"animated"},"track":"track_main","id":"strip_offset","action":"offset","frame_start":1.0,"frame_end":11.0,"action_frame_start":1.0,"action_frame_end":11.0,"scale":1.0,"repeat":1.0,"blend_type":"add","influence":0.5,"extrapolation":"hold","blend_in":0.0,"blend_out":0.0}
+            {"op":"nla.strip_create","target":{"id":"animated"},"track":"track_offset","id":"strip_offset","action":"offset","frame_start":1.0,"frame_end":11.0,"action_frame_start":1.0,"action_frame_end":11.0,"scale":1.0,"repeat":1.0,"blend_type":"add","influence":0.5,"extrapolation":"hold","blend_in":0.0,"blend_out":0.0}
         ]),
     );
     let blended = Snapshot::evaluate(
@@ -56,7 +57,8 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
         &doc,
         &json!([
             {"op":"nla.track_update","target":{"id":"animated"},"track":"track_main","set":{"name":"Main Updated","solo":true}},
-            {"op":"nla.strip_update","target":{"id":"animated"},"track":"track_main","strip":"strip_offset","set":{"influence":0.25}}
+            {"op":"nla.track_update","target":{"id":"animated"},"track":"track_offset","set":{"solo":true}},
+            {"op":"nla.strip_update","target":{"id":"animated"},"track":"track_offset","strip":"strip_offset","set":{"influence":0.25}}
         ]),
     );
     let node_id = potter_core::model::Id::new("animated").unwrap();
@@ -72,7 +74,7 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
     assert!((updated.nodes[&node_id].world_matrix[12] - 3.5).abs() < 1.0e-9);
     doc = apply(
         &doc,
-        &json!([{"op":"nla.strip_delete","target":{"id":"animated"},"track":"track_main","strip":"strip_offset"}]),
+        &json!([{"op":"nla.strip_delete","target":{"id":"animated"},"track":"track_offset","strip":"strip_offset"}]),
     );
     let after_strip_delete = Snapshot::evaluate(
         &doc,
@@ -87,7 +89,8 @@ fn nla_layers_blend_numerically_and_push_down_preserves_samples() {
         &doc,
         &json!([
             {"op":"nla.strip_delete","target":{"id":"animated"},"track":"track_main","strip":"strip_ramp"},
-            {"op":"nla.track_delete","target":{"id":"animated"},"track":"track_main"}
+            {"op":"nla.track_delete","target":{"id":"animated"},"track":"track_main"},
+            {"op":"nla.track_delete","target":{"id":"animated"},"track":"track_offset"}
         ]),
     );
     assert!(

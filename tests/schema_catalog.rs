@@ -1151,6 +1151,32 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "export": true
         })
     );
+
+    let advanced_nla = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "animation.nla_advanced")
+        .expect("advanced NLA is listed in the feature catalog");
+    assert_eq!(advanced_nla["status"], "partial");
+    assert!(
+        advanced_nla["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("TRANSITION") && reason.contains("tweak-mode"))
+    );
+    assert_eq!(
+        advanced_nla["pot_ops"],
+        json!([
+            "action.slot_create",
+            "nla.track_create",
+            "nla.track_update",
+            "nla.track_delete",
+            "nla.strip_create",
+            "nla.strip_update",
+            "nla.strip_delete",
+            "nla.push_down",
+            "action.update",
+            "fcurve.update"
+        ])
+    );
     for feature_id in [
         "constraint.child_of.pending_inverse",
         "constraint.stretch_to.initial_length",
