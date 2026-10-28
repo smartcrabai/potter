@@ -24,6 +24,7 @@ RANDOM_POISSON_ID_OBJECT = "GNRandomValuePoissonID"
 RANDOM_SELECTION_OBJECT = "GNRandomSelectionFalse"
 SMOOTH_RANDOM_OBJECT = "GNSmoothRandomDistribution"
 ZERO_CREASE_SUBDIVISION_OBJECT = "GNZeroCreaseThenSubdivision"
+NEGATIVE_CREASE_SUBDIVISION_OBJECT = "GNNegativeCreaseThenSubdivision"
 STORE_READ_INT_OBJECT = "GNStoreReadInt"
 STORE_READ_BOOLEAN_OBJECT = "GNStoreReadBoolean"
 OBJECT_NAMES = (
@@ -39,6 +40,7 @@ OBJECT_NAMES = (
     RANDOM_SELECTION_OBJECT,
     SMOOTH_RANDOM_OBJECT,
     ZERO_CREASE_SUBDIVISION_OBJECT,
+    NEGATIVE_CREASE_SUBDIVISION_OBJECT,
     STORE_READ_INT_OBJECT,
     STORE_READ_BOOLEAN_OBJECT,
 )
@@ -276,9 +278,9 @@ def build_smooth_random_case():
     }
 
 
-def build_zero_crease_subdivision_case():
+def build_crease_subdivision_case(name, edge_crease):
     obj = mesh_object(
-        ZERO_CREASE_SUBDIVISION_OBJECT,
+        name,
         [(-1.0, -1.0, -1.0), (1.0, -1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, 1.0, -1.0),
          (-1.0, -1.0, 1.0), (1.0, -1.0, 1.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0)],
         [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1), (1, 5, 6, 2), (2, 6, 7, 3), (4, 0, 3, 7)],
@@ -286,9 +288,10 @@ def build_zero_crease_subdivision_case():
     crease = obj.data.attributes.new(name="crease_edge", type="FLOAT", domain="EDGE")
     for edge in obj.data.edges:
         crease.data[edge.index].value = 0.75 if edge.index == 0 else 0.0
-    group, group_input, group_output = geometry_group(obj, "GN Zero Creases Before Subdivision")
+    group, group_input, group_output = geometry_group(obj, f"GN Crease {name}")
     subdiv = group.nodes.new("GeometryNodeSubdivisionSurface")
     subdiv.inputs["Level"].default_value = 1
+    subdiv.inputs["Edge Crease"].default_value = edge_crease
     group.links.new(group_input.outputs["Geometry"], subdiv.inputs["Mesh"])
     group.links.new(subdiv.outputs["Mesh"], group_output.inputs["Geometry"])
     modifier = obj.modifiers.new("Regular Subdivision Surface", "SUBSURF")
@@ -415,7 +418,10 @@ def main():
     build_random_selection_case()
     build_subdivision_case()
     smooth_random = build_smooth_random_case()
-    zero_crease_subdivision = build_zero_crease_subdivision_case()
+    zero_crease_subdivision = build_crease_subdivision_case(ZERO_CREASE_SUBDIVISION_OBJECT, 0.0)
+    negative_crease_subdivision = build_crease_subdivision_case(
+        NEGATIVE_CREASE_SUBDIVISION_OBJECT, -1.0
+    )
     named_attributes = {
         "int": build_store_read_case(STORE_READ_INT_OBJECT, "INT"),
         "boolean": build_store_read_case(STORE_READ_BOOLEAN_OBJECT, "BOOLEAN"),
@@ -518,6 +524,7 @@ def main():
             "point_count": len(objects[SMOOTH_RANDOM_OBJECT]) // 8,
         },
         "zero_crease_subdivision": zero_crease_subdivision,
+        "negative_crease_subdivision": negative_crease_subdivision,
         "named_attributes": named_attributes,
         "realize": {"depth": 5, "realize_all": True, "selection": True},
         "subdivision": {"level": 2, "edge_crease": 0.65, "vertex_crease": 0.8},

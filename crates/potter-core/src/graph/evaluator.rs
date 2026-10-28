@@ -2035,11 +2035,17 @@ impl Evaluator<'_> {
         let boundary_smooth =
             subdivision_boundary_smooth(&self.string_input(id, node, "Boundary Smooth", "ALL")?)?;
 
-        let use_creases = !matches!(
-            (&edge_crease, &vertex_crease),
-            (Field::Constant(edge), Field::Constant(vertex))
-                if edge.as_f64() == Some(0.0) && vertex.as_f64() == Some(0.0)
-        );
+        let constant_crease_is_zero = |field: &Field| {
+            matches!(
+                field,
+                Field::Constant(value)
+                    if value
+                        .as_f64()
+                        .is_some_and(|value| (value as f32).clamp(0.0, 1.0) == 0.0)
+            )
+        };
+        let use_creases =
+            !(constant_crease_is_zero(&edge_crease) && constant_crease_is_zero(&vertex_crease));
         if use_creases {
             let mut edge_values = Map::new();
             for (index, edge) in geometry.mesh.edges.iter().enumerate() {

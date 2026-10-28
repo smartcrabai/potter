@@ -16,7 +16,7 @@ use tempfile::tempdir;
 const BLENDER_REQUIRED: &str =
     "Blender 5.2.2 is required for the Geometry Nodes silent-mismatch oracle";
 const POSITION_TOLERANCE: f64 = 1.0e-5;
-const OBJECT_NAMES: [&str; 14] = [
+const OBJECT_NAMES: [&str; 15] = [
     "GNPoissonInstances",
     "GNCreasedSubdivision",
     "GNSimulationDeltaTime",
@@ -29,6 +29,7 @@ const OBJECT_NAMES: [&str; 14] = [
     "GNRandomSelectionFalse",
     "GNSmoothRandomDistribution",
     "GNZeroCreaseThenSubdivision",
+    "GNNegativeCreaseThenSubdivision",
     "GNStoreReadInt",
     "GNStoreReadBoolean",
 ];
@@ -413,10 +414,27 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
     if oracle_vertices(&oracle, OBJECT_NAMES[11])?.len() <= 8 {
         return Err("zero-crease Geometry Nodes subdivision did not add geometry".into());
     }
+    let negative_crease_subdivision = &oracle["negative_crease_subdivision"];
+    let negative_edge_crease_max = negative_crease_subdivision["input_edge_crease_max"]
+        .as_f64()
+        .ok_or("Blender negative-crease input value is missing")?;
+    if negative_crease_subdivision["edge_crease_default"] != -1.0
+        || negative_crease_subdivision["vertex_crease_default"] != 0.0
+        || negative_edge_crease_max <= 0.0
+        || negative_crease_subdivision["modifier_uses_creases"] != true
+    {
+        return Err(
+            "Blender oracle does not exercise negative Edge Crease with carried input creases"
+                .into(),
+        );
+    }
+    if oracle_vertices(&oracle, OBJECT_NAMES[12])?.len() <= 8 {
+        return Err("negative-crease subdivision did not add geometry".into());
+    }
     let named_attributes = &oracle["named_attributes"];
     for (kind, data_type, name) in [
-        ("int", "INT", OBJECT_NAMES[12]),
-        ("boolean", "BOOLEAN", OBJECT_NAMES[13]),
+        ("int", "INT", OBJECT_NAMES[13]),
+        ("boolean", "BOOLEAN", OBJECT_NAMES[14]),
     ] {
         if named_attributes[kind]["data_type"] != data_type
             || named_attributes[kind]["attribute_name"] != "roundtrip_value"
@@ -446,7 +464,7 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
     {
         return Err("Blender named INT store/read oracle values are invalid".into());
     }
-    let stored_boolean = oracle_vertices(&oracle, OBJECT_NAMES[13])?;
+    let stored_boolean = oracle_vertices(&oracle, OBJECT_NAMES[14])?;
     if !stored_boolean
         .iter()
         .any(|vertex| vertex[2].abs() > POSITION_TOLERANCE)
@@ -503,7 +521,7 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
     let mut apply_operations = Vec::with_capacity(2);
     let mut random_int_data_id = None;
     let mut named_int_data_id = None;
-    for object_name in [OBJECT_NAMES[5], OBJECT_NAMES[12]] {
+    for object_name in [OBJECT_NAMES[5], OBJECT_NAMES[13]] {
         let (node_id, node) = nodes
             .iter()
             .find(|(_, node)| node["name"].as_str() == Some(object_name))
@@ -637,13 +655,18 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
         OBJECT_NAMES[8],
         OBJECT_NAMES[9],
         OBJECT_NAMES[10],
-        OBJECT_NAMES[12],
         OBJECT_NAMES[13],
+        OBJECT_NAMES[14],
     ] {
         let expected = oracle_vertices(&oracle, name)?;
         compare_vertices_ordered(name, &actual[name], &expected)?;
     }
-    for name in [OBJECT_NAMES[1], OBJECT_NAMES[2], OBJECT_NAMES[11]] {
+    for name in [
+        OBJECT_NAMES[1],
+        OBJECT_NAMES[2],
+        OBJECT_NAMES[11],
+        OBJECT_NAMES[12],
+    ] {
         let expected = oracle_vertices(&oracle, name)?;
         compare_vertices(name, &actual[name], &expected)?;
     }
