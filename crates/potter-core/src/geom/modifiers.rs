@@ -640,6 +640,7 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                 collect_instance_attributes,
                 &overrides,
                 frame,
+                context.frame_duration.unwrap_or(1.0 / 24.0),
                 &modifier.runtime.node_bakes,
                 &modifier.runtime.capture_node_bakes,
                 subject_name,
@@ -3043,6 +3044,13 @@ struct SubdivisionOptions {
     preserve_corners: bool,
     use_creases: bool,
 }
+const SUBDIVISION_WRITTEN_KEYS_WITHOUT_CREASE: [&str; 2] = ["uv_layers", "custom_normal"];
+const SUBDIVISION_WRITTEN_KEYS_WITH_CREASE_ALIAS: [&str; 4] = [
+    "crease_edge",
+    "uv_layers",
+    "custom_normal",
+    "user:crease_edge",
+];
 
 fn subdivision(
     mesh: &Mesh,
@@ -3414,6 +3422,12 @@ fn subdivision_with_samples(
     // With levels, the output custom normals are re-encoded from the subdivided loop normals below. The level
     // loop reads only the crease and UV stores, so the other attributes are remapped once, after the loop.
     result.attributes.remove("custom_normal");
+    if options.use_creases
+        && !result.attributes.contains_key("crease_edge")
+        && let Some(crease) = result.attributes.remove("user:crease_edge")
+    {
+        result.attributes.insert("crease_edge".to_owned(), crease);
+    }
     subdivision_origin::retain_written(&mut result);
     let base_polygons = polygons(&result)?;
     let mut source_polygons = base_polygons.clone();
@@ -3529,13 +3543,18 @@ fn subdivision_with_samples(
     let written = subdivision_origin::take_written(&mut result);
     let optimal_display =
         subdivision_origin::optimal_display_mask(modifier, &result, &order.edge_sources);
+    let skipped_keys: &[&str] = if options.use_creases {
+        &SUBDIVISION_WRITTEN_KEYS_WITH_CREASE_ALIAS
+    } else {
+        &SUBDIVISION_WRITTEN_KEYS_WITHOUT_CREASE
+    };
     remap_attributes_staged(
         mesh,
         &mut result,
         &origin,
         Some(&staged),
         subdivision_origin::edge_origins(std::mem::take(&mut order.edge_sources)),
-        &subdivision_origin::WRITTEN_KEYS,
+        skipped_keys,
     )?;
     subdivision_origin::restore_written(&mut result, written);
     if let Some(mask) = optimal_display {
@@ -5039,6 +5058,7 @@ fn edge_crease_values(mesh: &Mesh, enabled: bool) -> Result<BTreeMap<(usize, usi
     let Some(values) = mesh
         .attributes
         .get("crease_edge")
+        .or_else(|| mesh.attributes.get("user:crease_edge"))
         .and_then(|attribute| attribute.get("values"))
         .and_then(Value::as_object)
     else {

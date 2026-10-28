@@ -174,6 +174,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         "GeometryNodeMeshLine" => (
             sockets(&[
                 ("Count", "integer"),
+                ("Resolution", "float"),
                 ("Start Location", "vector"),
                 ("Offset", "vector"),
             ]),
@@ -278,6 +279,10 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
                 ("Level", "integer"),
                 ("Edge Crease", "float"),
                 ("Vertex Crease", "float"),
+                ("Limit Surface", "boolean"),
+                ("Quality", "integer"),
+                ("UV Smooth", "menu"),
+                ("Boundary Smooth", "menu"),
             ]),
             sockets(MESH_OUT),
         ),
@@ -454,15 +459,39 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             sockets(&[("Vector", "vector")]),
             sockets(&[("X", "float"), ("Y", "float"), ("Z", "float")]),
         ),
-        "FunctionNodeRandomValue" => (
-            sockets(&[
-                ("Min", "value"),
-                ("Max", "value"),
-                ("Seed", "integer"),
-                ("ID", "integer"),
-            ]),
-            sockets(&[("Value", "value")]),
-        ),
+        "FunctionNodeRandomValue" => {
+            let data_type = node
+                .properties
+                .get("data_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("FLOAT");
+            let inputs = match data_type {
+                "BOOLEAN" | "BOOL" => sockets(&[
+                    ("Probability", "float"),
+                    ("Seed", "integer"),
+                    ("ID", "integer"),
+                ]),
+                "INT" | "INTEGER" => sockets(&[
+                    ("Min", "integer"),
+                    ("Max", "integer"),
+                    ("Seed", "integer"),
+                    ("ID", "integer"),
+                ]),
+                "VECTOR" | "FLOAT_VECTOR" => sockets(&[
+                    ("Min", "vector"),
+                    ("Max", "vector"),
+                    ("Seed", "integer"),
+                    ("ID", "integer"),
+                ]),
+                _ => sockets(&[
+                    ("Min", "float"),
+                    ("Max", "float"),
+                    ("Seed", "integer"),
+                    ("ID", "integer"),
+                ]),
+            };
+            (inputs, sockets(&[("Value", "value")]))
+        }
         "GeometryNodeRepeatInput" => (
             sockets(&[("Iterations", "integer"), ("Geometry", "geometry")]),
             sockets(&[("Iteration", "integer"), ("Geometry", "geometry")]),

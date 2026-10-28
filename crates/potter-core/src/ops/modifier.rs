@@ -1469,6 +1469,7 @@ fn evaluate_modifier_output(
                     purpose: crate::eval::EvaluationPurpose::Preview,
                     project_root: engine.asset_root,
                     cache_directory: engine.cache_directory,
+                    frame_duration: crate::eval::scene_frame_duration(engine.doc),
                     material_slot_count,
                 },
                 animated_parameter,
@@ -1560,6 +1561,7 @@ fn evaluate_modifier_output(
                 purpose: crate::eval::EvaluationPurpose::Preview,
                 project_root: engine.asset_root,
                 cache_directory: engine.cache_directory,
+                frame_duration: crate::eval::scene_frame_duration(engine.doc),
                 material_slot_count,
             };
             let texture_seed = crate::geom::modifiers::TextureSeed::new(

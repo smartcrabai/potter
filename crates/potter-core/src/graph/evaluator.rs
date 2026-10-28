@@ -5,10 +5,11 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use glam::{DMat4, DQuat, DVec3};
+use glam::{DMat4, DQuat, DVec3, Vec3};
 use serde_json::{Map, Value, json};
 
 use crate::{
+    blender_rng::BlenderRng,
     error::{ErrorCode, PotError, Result},
     geom::{
         GridParams, IcosphereParams, Mesh, MeshError, ORIGINDEX_NONE,
@@ -23,8 +24,6 @@ use super::{
 };
 
 const MAX_GENERATED_POINTS: usize = 1_000_000;
-const MAX_GENERATED_POINTS_F64: f64 = 1_000_000.0;
-const RANDOM_MANTISSA_RANGE: f64 = 9_007_199_254_740_992.0;
 const MAX_ZONE_ITERATIONS: i64 = 100_000;
 const MAX_SIMULATION_CACHE_ENTRIES: usize = 10_000;
 
@@ -154,7 +153,11 @@ enum Field {
     Position,
     Normal,
     Index,
-    Attribute(String),
+    IdOrIndex,
+    Attribute {
+        name: String,
+        data_type: Option<String>,
+    },
     AttributeExists(String),
     Captured {
         domain: String,
@@ -184,7 +187,7 @@ enum Field {
         axis: usize,
     },
     Random {
-        seed: u64,
+        seed: u32,
         data_type: String,
         id: Box<Field>,
         min: Box<Field>,
@@ -202,6 +205,8 @@ struct Evaluator<'a> {
     require_instance_attributes: bool,
     overrides: &'a Map<String, Value>,
     frame: f64,
+    frame_duration: f64,
+    simulation_delta_times: HashMap<Id, f64>,
     simulation_signature: Option<String>,
     simulation_states: HashMap<Id, GeometryValue>,
     repeat_states: HashMap<Id, GeometryValue>,
@@ -280,6 +285,7 @@ pub fn evaluate_at_frame_with_bakes(
         true,
         overrides,
         frame,
+        1.0 / 24.0,
         bake_records,
         capture_bake_nodes,
         subject_name,
@@ -295,10 +301,16 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
     outer_instance_attributes_required: bool,
     overrides: &Map<String, Value>,
     frame: f64,
+    frame_duration: f64,
     bake_records: &BTreeMap<String, NodeBakeRecord>,
     capture_bake_nodes: &BTreeSet<String>,
     subject_name: &str,
 ) -> Result<GraphEvaluation> {
+    if !frame_duration.is_finite() || frame_duration <= 0.0 {
+        return Err(PotError::invalid_argument(
+            "graph evaluation frame duration must be finite and positive",
+        ));
+    }
     if !frame.is_finite() {
         return Err(PotError::invalid_argument(
             "graph evaluation frame must be finite",
@@ -324,13 +336,14 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
         .any(|node| node.node_type == "GeometryNodeSimulationOutput")
         .then(|| {
             let serialized = if capture_instance_attributes {
-                serde_json::to_value((group, input, input_instances, overrides))
+                serde_json::to_value((group, input, input_instances, overrides, frame_duration))
             } else {
                 serde_json::to_value((
                     group,
                     input,
                     input_instances.map(|instances| &instances.transforms),
                     overrides,
+                    frame_duration,
                 ))
             };
             serialized
@@ -413,6 +426,8 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
         input,
         input_instances,
         input_instance_paths,
+        frame_duration,
+        simulation_delta_times: HashMap::new(),
         frame,
         overrides,
         capture_instance_attributes,
@@ -600,7 +615,7 @@ impl Evaluator<'_> {
             "GeometryNodeJoinGeometry" => self.join_node(id),
             "GeometryNodeInstanceOnPoints" => self.instance_on_points(id, node),
             "GeometryNodeRealizeInstances" => self.realize_instances(id, node),
-            "GeometryNodeDistributePointsOnFaces" => self.distribute_points(id, node),
+            "GeometryNodeDistributePointsOnFaces" => self.distribute_points(id, node, socket),
             "GeometryNodeMeshToPoints" => self.mesh_to_points(id, node),
             "GeometryNodeSubdivisionSurface" => self.subdivision(id, node),
             "GeometryNodeInputPosition" => Ok(EvalValue::Field(Field::Position)),
@@ -857,7 +872,9 @@ impl Evaluator<'_> {
                 }
                 self.input_geometry(id, node, "Geometry")
             }
-            "Delta Time" => Ok(EvalValue::Scalar(json!(1.0 / 24.0))),
+            "Delta Time" => Ok(EvalValue::Scalar(json!(
+                self.simulation_delta_times.get(id).copied().unwrap_or(0.0) as f32
+            ))),
             _ => Err(evaluation("unknown Simulation Input output")),
         }
     }
@@ -905,6 +922,14 @@ impl Evaluator<'_> {
             .clone()
             .ok_or_else(|| evaluation("simulation graph cache signature is missing"))?;
         for frame in start_frame..=target_frame {
+            self.simulation_delta_times.insert(
+                input_id.clone(),
+                if frame == start_frame {
+                    0.0
+                } else {
+                    self.frame_duration
+                },
+            );
             if let Some(cached) = cached_simulation_state(&signature, &input_id, frame)? {
                 state = cached;
                 continue;
@@ -1208,7 +1233,7 @@ impl Evaluator<'_> {
     }
 
     fn mesh_primitive(&mut self, id: &Id, node: &GraphNode, kind: &str) -> Result<EvalValue> {
-        let mesh = match kind {
+        let mut mesh = match kind {
             "box" => self.cube_node_mesh(id, node)?,
             "grid" => self.grid_node_mesh(id, node)?,
             "uv_sphere" => self.uv_sphere_node_mesh(id, node)?,
@@ -1223,6 +1248,7 @@ impl Evaluator<'_> {
                 ));
             }
         };
+        mesh.attributes.remove("uv_layers");
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: Vec::new(),
@@ -1288,6 +1314,19 @@ impl Evaluator<'_> {
     }
 
     fn cylinder_node_mesh(&mut self, id: &Id, node: &GraphNode) -> Result<Mesh> {
+        if node
+            .properties
+            .get("fill_type")
+            .and_then(Value::as_str)
+            .unwrap_or("NGON")
+            != "NGON"
+        {
+            return Err(unsupported_graph_feature(
+                id,
+                "graph.node.mesh_cylinder.fill_type",
+                "Cylinder fill types other than NGON are not implemented",
+            ));
+        }
         let vertices =
             self.integer_input(id, node, "Vertices", property_i64(node, "vertices", 32)?)?;
         let side_segments = self.integer_input(
@@ -1314,6 +1353,19 @@ impl Evaluator<'_> {
     }
 
     fn cone_node_mesh(&mut self, id: &Id, node: &GraphNode) -> Result<Mesh> {
+        if node
+            .properties
+            .get("fill_type")
+            .and_then(Value::as_str)
+            .unwrap_or("NGON")
+            != "NGON"
+        {
+            return Err(unsupported_graph_feature(
+                id,
+                "graph.node.mesh_cone.fill_type",
+                "Cone fill types other than NGON are not implemented",
+            ));
+        }
         let vertices =
             self.integer_input(id, node, "Vertices", property_i64(node, "vertices", 32)?)?;
         let side_segments = self.integer_input(
@@ -1352,6 +1404,19 @@ impl Evaluator<'_> {
     }
 
     fn circle_node_mesh(&mut self, id: &Id, node: &GraphNode) -> Result<Mesh> {
+        if node
+            .properties
+            .get("fill_type")
+            .and_then(Value::as_str)
+            .unwrap_or("NONE")
+            != "NONE"
+        {
+            return Err(unsupported_graph_feature(
+                id,
+                "graph.node.mesh_circle.fill_type",
+                "Circle fill types other than NONE are not implemented",
+            ));
+        }
         let vertices =
             self.integer_input(id, node, "Vertices", property_i64(node, "vertices", 32)?)?;
         let radius = self.scalar_input(id, node, "Radius", property_f64(node, "radius", 1.0)?)?;
@@ -1384,7 +1449,31 @@ impl Evaluator<'_> {
     }
 
     fn mesh_line(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
-        let count = self.integer_input(id, node, "Count", property_i64(node, "count", 2)?)?;
+        let mode = node
+            .properties
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("OFFSET");
+        if mode != "OFFSET" {
+            return Err(unsupported_graph_feature(
+                id,
+                "graph.node.mesh_line.endpoint_mode",
+                format!("Mesh Line mode `{mode}` is not implemented"),
+            ));
+        }
+        let count_mode = node
+            .properties
+            .get("count_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("TOTAL");
+        if count_mode != "TOTAL" {
+            return Err(unsupported_graph_feature(
+                id,
+                "graph.node.mesh_line.resolution_count_mode",
+                format!("Mesh Line count mode `{count_mode}` is not implemented"),
+            ));
+        }
+        let count = self.integer_input(id, node, "Count", property_i64(node, "count", 10)?)?;
         if count < 0 {
             return Err(PotError::new(
                 ErrorCode::LimitExceeded,
@@ -1705,7 +1794,26 @@ impl Evaluator<'_> {
         }))
     }
 
-    fn distribute_points(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
+    fn distribute_points(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        if socket != "Points" {
+            return Err(unsupported_graph_feature(
+                id,
+                "graph.node.distribute_points.outputs",
+                format!("Distribute Points on Faces output `{socket}` is not implemented"),
+            ));
+        }
+        let method = node
+            .properties
+            .get("distribute_method")
+            .and_then(Value::as_str)
+            .unwrap_or("RANDOM");
+        if !matches!(method, "RANDOM" | "POISSON") {
+            return Err(unsupported_graph_feature(
+                id,
+                "graph.node.distribute_points.method",
+                format!("Distribute Points on Faces method `{method}` is not implemented"),
+            ));
+        }
         let surface_value = self.input_value_with_node(
             id,
             node,
@@ -1721,140 +1829,54 @@ impl Evaluator<'_> {
             instance_paths,
             instance_attributes,
         } = into_geometry(surface_value)?;
-        let density = as_field(self.input_value_with_node(
-            id,
-            node,
-            "Density",
-            EvalValue::Scalar(json!(1.0)),
-        )?);
-        let minimum_distance = self.scalar_input(id, node, "Distance Min", 0.0)?;
-        let seed = self.integer_input(id, node, "Seed", 0)?;
-        if !minimum_distance.is_finite() || minimum_distance < 0.0 {
-            return Err(evaluation(
-                "minimum point distance must be finite and non-negative",
-            ));
-        }
         let selection = as_field(self.input_value_with_node(
             id,
             node,
             "Selection",
             EvalValue::Scalar(json!(true)),
         )?);
-        let triangles = surface
-            .tessellate()
-            .map_err(|error| mesh_evaluation_error(&error))?;
-        let positions: HashMap<_, _> = surface
-            .vertices
-            .iter()
-            .map(|vertex| (vertex.id, vertex.co))
-            .collect();
-        let mut weighted = Vec::new();
-        let mut triangle_offset = 0_usize;
-        for (face_index, face) in surface.faces.iter().enumerate() {
-            let triangle_count = face.vertices.len().saturating_sub(2);
-            if field_bool(&selection, &surface, face_index, "FACE", false)? {
-                let face_density = field_json(&density, &surface, face_index, "FACE")?
-                    .as_f64()
-                    .filter(|density| density.is_finite() && *density >= 0.0)
-                    .ok_or_else(|| {
-                        evaluation("point density field must be finite and non-negative")
-                    })?;
-                for _ in 0..triangle_count {
-                    let triangle = *triangles
-                        .get(triangle_offset)
-                        .ok_or_else(|| evaluation("surface triangulation result is incomplete"))?;
-                    let first = *positions
-                        .get(&triangle[0])
-                        .ok_or_else(|| evaluation("triangle vertex missing"))?;
-                    let second = *positions
-                        .get(&triangle[1])
-                        .ok_or_else(|| evaluation("triangle vertex missing"))?;
-                    let third = *positions
-                        .get(&triangle[2])
-                        .ok_or_else(|| evaluation("triangle vertex missing"))?;
-                    let area = (second - first).cross(third - first).length() * 0.5;
-                    let weight = area * face_density;
-                    if weight > 0.0 && weight.is_finite() {
-                        weighted.push((triangle, weight));
-                    }
-                    triangle_offset += 1;
-                }
-            } else {
-                triangle_offset += triangle_count;
-            }
-        }
-        if triangle_offset != triangles.len() {
-            return Err(evaluation(
-                "surface triangulation result does not match face domains",
-            ));
-        }
-        let total_area: f64 = weighted.iter().map(|(_, area)| *area).sum();
-        let count = total_area.round();
-        if !count.is_finite() || count > MAX_GENERATED_POINTS_F64 {
-            return Err(PotError::new(
-                ErrorCode::LimitExceeded,
-                "distributed point count exceeds limit",
-            ));
-        }
-        let count = bounded_count_to_usize(count)?;
-        if count == 0 || weighted.is_empty() {
-            return Ok(EvalValue::Geometry(GeometryValue {
-                mesh: Mesh::new(),
-                instance_paths,
-                instance_attributes,
-            }));
-        }
-        let mut random = u64::from_ne_bytes(seed.to_ne_bytes());
-        let cumulative: Vec<_> = weighted
-            .iter()
-            .scan(0.0, |sum, (triangle, area)| {
-                *sum += area;
-                Some((*sum, *triangle))
-            })
-            .collect();
-        let mut mesh = Mesh::new();
-        let mut grid: HashMap<[i64; 3], Vec<DVec3>> = HashMap::new();
-        let attempt_limit = if minimum_distance > 0.0 {
-            count.saturating_mul(30)
+        let density = if method == "RANDOM" {
+            as_field(self.input_value_with_node(
+                id,
+                node,
+                "Density",
+                EvalValue::Scalar(json!(10.0)),
+            )?)
         } else {
-            count
+            Field::Constant(Value::Null)
         };
-        for _ in 0..attempt_limit {
-            if mesh.vertices.len() >= count {
-                break;
-            }
-            let target = next_unit(&mut random) * total_area;
-            let triangle = cumulative
-                .iter()
-                .find(|(cumulative_area, _)| *cumulative_area >= target)
-                .or_else(|| cumulative.last())
-                .map(|(_, triangle)| *triangle)
-                .ok_or_else(|| evaluation("surface triangulation failed"))?;
-            let first = *positions
-                .get(&triangle[0])
-                .ok_or_else(|| evaluation("triangle vertex missing"))?;
-            let second = *positions
-                .get(&triangle[1])
-                .ok_or_else(|| evaluation("triangle vertex missing"))?;
-            let third = *positions
-                .get(&triangle[2])
-                .ok_or_else(|| evaluation("triangle vertex missing"))?;
-            let root = next_unit(&mut random).sqrt();
-            let split = next_unit(&mut random);
-            let point =
-                first * (1.0 - root) + second * (root * (1.0 - split)) + third * (root * split);
-            if minimum_distance > 0.0 && !separated_from_neighbors(point, minimum_distance, &grid)?
-            {
-                continue;
-            }
-            mesh.insert_vertex(point)
-                .map_err(|error| mesh_evaluation_error(&error))?;
-            if minimum_distance > 0.0 {
-                grid.entry(poisson_cell(point, minimum_distance)?)
-                    .or_default()
-                    .push(point);
-            }
-        }
+        let density_factor = if method == "POISSON" {
+            as_field(self.input_value_with_node(
+                id,
+                node,
+                "Density Factor",
+                EvalValue::Scalar(json!(1.0)),
+            )?)
+        } else {
+            Field::Constant(Value::Null)
+        };
+        let density_max = if method == "POISSON" {
+            self.scalar_input(id, node, "Density Max", 10.0)? as f32
+        } else {
+            10.0
+        };
+        let minimum_distance = if method == "POISSON" {
+            self.scalar_input(id, node, "Distance Min", 0.0)? as f32
+        } else {
+            0.0
+        };
+        let seed = self.integer_input(id, node, "Seed", 0)?;
+        let mesh = distribute_points_mesh(
+            id,
+            &surface,
+            method,
+            &density,
+            &density_factor,
+            &selection,
+            seed,
+            density_max,
+            minimum_distance,
+        )?;
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths,
@@ -1865,11 +1887,24 @@ impl Evaluator<'_> {
     fn mesh_to_points(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
         let geometry = self.geometry_input(id, node, "Mesh")?;
         let geometry = into_geometry(geometry)?;
-        let domain = node
+        let mode = node
             .properties
-            .get("domain")
+            .get("mode")
             .and_then(Value::as_str)
-            .unwrap_or("POINT");
+            .unwrap_or("VERTICES");
+        let domain = match mode {
+            "VERTICES" => "POINT",
+            "EDGES" => "EDGE",
+            "FACES" => "FACE",
+            "CORNERS" => "CORNER",
+            _ => {
+                return Err(unsupported_graph_feature(
+                    id,
+                    "graph.node.mesh_to_points.mode",
+                    format!("Mesh to Points mode `{mode}` is not implemented"),
+                ));
+            }
+        };
         let count = domain_element_count(&geometry.mesh, domain)?;
         let selection = as_field(self.input_value_with_node(
             id,
@@ -1956,13 +1991,101 @@ impl Evaluator<'_> {
 
     fn subdivision(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
         let geometry = self.geometry_input(id, node, "Mesh")?;
-        let geometry = into_geometry(geometry)?;
+        let mut geometry = into_geometry(geometry)?;
         let level = self.integer_input(id, node, "Level", 1)?;
         if !(0..=6).contains(&level) {
             return Err(evaluation("subdivision level must be between 0 and 6"));
         }
         if level == 0 {
             return Ok(EvalValue::Geometry(geometry));
+        }
+        let edge_crease = as_field(self.input_value_with_node(
+            id,
+            node,
+            "Edge Crease",
+            EvalValue::Scalar(json!(0.0)),
+        )?);
+        let vertex_crease = as_field(self.input_value_with_node(
+            id,
+            node,
+            "Vertex Crease",
+            EvalValue::Scalar(json!(0.0)),
+        )?);
+        let limit_surface = match self.input_value_with_node(
+            id,
+            node,
+            "Limit Surface",
+            EvalValue::Scalar(json!(true)),
+        )? {
+            EvalValue::Scalar(value) => value
+                .as_bool()
+                .ok_or_else(|| evaluation("Limit Surface must be boolean"))?,
+            _ => return Err(evaluation("Limit Surface must be a constant boolean")),
+        };
+        let quality = self.integer_input(id, node, "Quality", 3)?;
+        if !(1..=10).contains(&quality) {
+            return Err(evaluation("subdivision quality must be between 1 and 10"));
+        }
+        let uv_smooth = subdivision_uv_smooth(&self.string_input(
+            id,
+            node,
+            "UV Smooth",
+            "PRESERVE_BOUNDARIES",
+        )?)?;
+        let boundary_smooth =
+            subdivision_boundary_smooth(&self.string_input(id, node, "Boundary Smooth", "ALL")?)?;
+
+        let use_creases = !matches!(
+            (&edge_crease, &vertex_crease),
+            (Field::Constant(edge), Field::Constant(vertex))
+                if edge.as_f64() == Some(0.0) && vertex.as_f64() == Some(0.0)
+        );
+        if use_creases {
+            let mut edge_values = Map::new();
+            for (index, edge) in geometry.mesh.edges.iter().enumerate() {
+                let value = field_json(&edge_crease, &geometry.mesh, index, "EDGE")?
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| evaluation("Edge Crease must be finite and numeric"))?
+                    as f32;
+                if !value.is_finite() {
+                    return Err(evaluation("Edge Crease must be finite"));
+                }
+                let value = value.clamp(0.0, 1.0);
+                if value > 0.0 {
+                    edge_values.insert(format!("e{}", edge.id), json!(value));
+                }
+            }
+            let mut vertex_values = Map::new();
+            for (index, vertex) in geometry.mesh.vertices.iter().enumerate() {
+                let value = field_json(&vertex_crease, &geometry.mesh, index, "POINT")?
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| evaluation("Vertex Crease must be finite and numeric"))?
+                    as f32;
+                if !value.is_finite() {
+                    return Err(evaluation("Vertex Crease must be finite"));
+                }
+                let value = value.clamp(0.0, 1.0);
+                if value > 0.0 {
+                    vertex_values.insert(format!("v{}", vertex.id), json!(value));
+                }
+            }
+            geometry.mesh.attributes.remove("crease_edge");
+            geometry.mesh.attributes.remove("user:crease_edge");
+            geometry.mesh.attributes.remove("crease_vert");
+            if !edge_values.is_empty() {
+                geometry.mesh.attributes.insert(
+                    "crease_edge".to_owned(),
+                    json!({"domain":"EDGE","type":"FLOAT","values":edge_values}),
+                );
+            }
+            if !vertex_values.is_empty() {
+                geometry.mesh.attributes.insert(
+                    "crease_vert".to_owned(),
+                    json!({"domain":"POINT","type":"FLOAT","values":vertex_values}),
+                );
+            }
         }
         let modifier = Modifier {
             id: Id::new("graph_subdivision")
@@ -1972,12 +2095,24 @@ impl Evaluator<'_> {
             enabled: true,
             show_viewport: true,
             show_render: true,
-            params: Map::from_iter([("levels".to_owned(), json!(level))]),
+            params: Map::from_iter([
+                ("levels".to_owned(), json!(level)),
+                ("quality".to_owned(), json!(quality)),
+                ("use_creases".to_owned(), json!(use_creases)),
+                ("use_limit_surface".to_owned(), json!(limit_surface)),
+                ("uv_smooth".to_owned(), json!(uv_smooth)),
+                ("boundary_smooth".to_owned(), json!(boundary_smooth)),
+            ]),
             binding_data: None,
             baked_ocean_cache: None,
             runtime: crate::model::ModifierRuntime::default(),
         };
-        let mesh = evaluate_modifiers(&geometry.mesh, &[modifier], self.subject_name)?;
+        let mut mesh = evaluate_modifiers(&geometry.mesh, &[modifier], self.subject_name)?;
+        if use_creases {
+            mesh.attributes.remove("crease_edge");
+            mesh.attributes.remove("user:crease_edge");
+            mesh.attributes.remove("crease_vert");
+        }
         Ok(EvalValue::Geometry(GeometryValue {
             mesh,
             instance_paths: geometry.instance_paths,
@@ -1990,8 +2125,10 @@ impl Evaluator<'_> {
         let mut geometry = into_geometry(geometry_value)?;
         let name = self.string_input(id, node, "Name", "")?;
         if name.is_empty() {
-            return Err(evaluation("named attribute requires a non-empty name"));
+            return Ok(EvalValue::Geometry(geometry));
         }
+        let data_type =
+            named_attribute_data_type(id, node, "graph.node.store_named_attribute.data_type")?;
         let domain = node
             .properties
             .get("domain")
@@ -2006,7 +2143,7 @@ impl Evaluator<'_> {
                     "Store Named Attribute on the INSTANCE domain requires instance attribute capture",
                 ));
             }
-            return self.store_instance_named_attribute(id, node, geometry, &name);
+            return self.store_instance_named_attribute(id, node, geometry, &name, &data_type);
         }
         let count = domain_element_count(&geometry.mesh, domain)?;
         let selection = as_field(self.input_value_with_node(
@@ -2015,16 +2152,28 @@ impl Evaluator<'_> {
             "Selection",
             EvalValue::Scalar(json!(true)),
         )?);
-        let value = as_field(self.input_value_with_node(
+        let value = match self.input_value_with_node(
             id,
             node,
             "Value",
-            EvalValue::Scalar(Value::Null),
-        )?);
+            EvalValue::Scalar(named_attribute_zero(&data_type)),
+        )? {
+            EvalValue::Scalar(Value::Null) => Field::Constant(named_attribute_zero(&data_type)),
+            value => as_field(value),
+        };
         let previous = if let Some(attribute) = geometry.mesh.attributes.get(&name) {
             if attribute.get("domain").and_then(Value::as_str) != Some(domain) {
                 return Err(evaluation(
                     "stored attribute domain differs from its existing domain",
+                ));
+            }
+            if attribute
+                .get("data_type")
+                .and_then(Value::as_str)
+                .is_some_and(|previous_type| previous_type != data_type)
+            {
+                return Err(evaluation(
+                    "stored attribute data type differs from its existing type",
                 ));
             }
             let data = attribute
@@ -2043,20 +2192,23 @@ impl Evaluator<'_> {
         let mut values = Vec::with_capacity(count);
         for index in 0..count {
             if field_bool(&selection, &geometry.mesh, index, domain, false)? {
-                values.push(field_json(&value, &geometry.mesh, index, domain)?);
+                values.push(named_attribute_value(
+                    &field_json(&value, &geometry.mesh, index, domain)?,
+                    &data_type,
+                )?);
             } else {
                 values.push(
                     previous
                         .and_then(|data| data.get(index))
                         .cloned()
-                        .unwrap_or(Value::Null),
+                        .unwrap_or_else(|| named_attribute_zero(&data_type)),
                 );
             }
         }
-        geometry
-            .mesh
-            .attributes
-            .insert(name, json!({"domain":domain,"data":values}));
+        geometry.mesh.attributes.insert(
+            name,
+            json!({"domain":domain,"data_type":data_type,"data":values}),
+        );
         Ok(EvalValue::Geometry(geometry))
     }
 
@@ -2066,6 +2218,7 @@ impl Evaluator<'_> {
         node: &GraphNode,
         mut geometry: GeometryValue,
         name: &str,
+        data_type: &str,
     ) -> Result<EvalValue> {
         if !geometry.instance_paths.is_empty() && geometry.instance_attributes.transforms.is_empty()
         {
@@ -2081,14 +2234,8 @@ impl Evaluator<'_> {
             id,
             node,
             "Value",
-            EvalValue::Scalar(Value::Null),
+            EvalValue::Scalar(named_attribute_zero(data_type)),
         )?);
-        let declared_type = node
-            .properties
-            .get("data_type")
-            .and_then(Value::as_str)
-            .map(normalize_instance_data_type)
-            .filter(|data_type| !data_type.is_empty());
         let previous = geometry.instance_attributes.attributes.get(name);
         if previous.is_some_and(|column| column.values.len() != geometry.instance_attributes.len())
         {
@@ -2096,64 +2243,36 @@ impl Evaluator<'_> {
                 "stored instance attribute column length is invalid",
             ));
         }
-        let previous_type = previous.map(|column| normalize_instance_data_type(&column.data_type));
-        if declared_type
-            .as_ref()
-            .zip(previous_type.as_ref())
-            .is_some_and(|(declared, previous)| declared != previous)
+        if previous
+            .is_some_and(|column| normalize_instance_data_type(&column.data_type) != data_type)
         {
             return Err(evaluation(
                 "stored instance attribute data type differs from its existing type",
             ));
         }
 
-        let mut selected_values = Vec::with_capacity(geometry.instance_attributes.len());
+        let mut values = Vec::with_capacity(geometry.instance_attributes.len());
         for index in 0..geometry.instance_attributes.len() {
             if field_bool_in_instances(&selection, &geometry.instance_attributes, index, false)? {
-                selected_values.push(Some(field_json_instances(
-                    &value,
-                    &geometry.instance_attributes,
-                    index,
-                )?));
+                values.push(named_attribute_value(
+                    &field_json_instances(&value, &geometry.instance_attributes, index)?,
+                    data_type,
+                )?);
             } else {
-                selected_values.push(None);
-            }
-        }
-        let inferred_type = selected_values
-            .iter()
-            .flatten()
-            .find(|value| !value.is_null())
-            .map(infer_instance_data_type)
-            .transpose()?;
-        if previous_type
-            .as_ref()
-            .zip(inferred_type.as_ref())
-            .is_some_and(|(previous, inferred)| previous != inferred)
-            && declared_type.is_none()
-        {
-            return Err(evaluation(
-                "stored instance attribute data type differs from its existing type",
-            ));
-        }
-        let data_type = declared_type
-            .or(previous_type)
-            .or(inferred_type)
-            .unwrap_or_else(|| "FLOAT".to_owned());
-        let values = selected_values
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
-                value.unwrap_or_else(|| {
+                values.push(
                     previous
                         .and_then(|column| column.values.get(index))
                         .cloned()
-                        .unwrap_or(Value::Null)
-                })
-            })
-            .collect();
+                        .unwrap_or_else(|| named_attribute_zero(data_type)),
+                );
+            }
+        }
         geometry.instance_attributes.attributes.insert(
             name.to_owned(),
-            InstanceAttributeColumn { data_type, values },
+            InstanceAttributeColumn {
+                data_type: data_type.to_owned(),
+                values,
+            },
         );
         Ok(EvalValue::Geometry(geometry))
     }
@@ -2168,13 +2287,32 @@ impl Evaluator<'_> {
         if socket == "Exists" {
             return Ok(EvalValue::Field(Field::AttributeExists(name)));
         }
-        Ok(EvalValue::Field(Field::Attribute(name)))
+        let data_type =
+            named_attribute_data_type(id, node, "graph.node.input_named_attribute.data_type")?;
+        Ok(EvalValue::Field(Field::Attribute {
+            name,
+            data_type: Some(data_type),
+        }))
     }
 
     fn capture_attribute(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
         if socket != "Attribute" {
             return self.geometry_input(id, node, "Geometry");
         }
+        if node
+            .properties
+            .get("capture_items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        {
+            return Err(unsupported_graph_feature(
+                id,
+                "graph.node.capture_attribute.dynamic_items",
+                "Capture Attribute nodes with dynamic capture items are not implemented",
+            ));
+        }
+        let data_type =
+            named_attribute_data_type(id, node, "graph.node.capture_attribute.data_type")?;
         let geometry = into_geometry(self.geometry_input(id, node, "Geometry")?)?;
         let domain = node
             .properties
@@ -2189,18 +2327,24 @@ impl Evaluator<'_> {
             "Selection",
             EvalValue::Scalar(json!(true)),
         )?);
-        let value = as_field(self.input_value_with_node(
+        let value = match self.input_value_with_node(
             id,
             node,
             "Value",
-            EvalValue::Scalar(Value::Null),
-        )?);
+            EvalValue::Scalar(named_attribute_zero(&data_type)),
+        )? {
+            EvalValue::Scalar(Value::Null) => Field::Constant(named_attribute_zero(&data_type)),
+            value => as_field(value),
+        };
         let mut values = Vec::with_capacity(count);
         for index in 0..count {
             if field_bool(&selection, &geometry.mesh, index, domain, false)? {
-                values.push(field_json(&value, &geometry.mesh, index, domain)?);
+                values.push(named_attribute_value(
+                    &field_json(&value, &geometry.mesh, index, domain)?,
+                    &data_type,
+                )?);
             } else {
-                values.push(Value::Null);
+                values.push(named_attribute_zero(&data_type));
             }
         }
         Ok(EvalValue::Field(Field::Captured {
@@ -2319,38 +2463,88 @@ impl Evaluator<'_> {
     }
 
     fn random_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
-        let seed = self.integer_input(id, node, "Seed", 0)?;
+        if socket != "Value" {
+            return Err(evaluation("unknown Random Value output"));
+        }
+        let seed = self.integer_input(id, node, "Seed", 0)? as i32 as u32;
         let data_type = node
             .properties
             .get("data_type")
             .and_then(Value::as_str)
             .unwrap_or("FLOAT")
             .to_ascii_uppercase();
-        let (min_default, max_default) = match data_type.as_str() {
-            "VECTOR" | "FLOAT_VECTOR" => (json!([0.0, 0.0, 0.0]), json!([1.0, 1.0, 1.0])),
-            "BOOLEAN" | "BOOL" => (json!(false), json!(true)),
-            "INT" | "INTEGER" => (json!(0), json!(1)),
-            _ => (json!(0.0), json!(1.0)),
+        let (min, max) = match data_type.as_str() {
+            "BOOLEAN" | "BOOL" => (
+                as_field(self.input_value_with_node(
+                    id,
+                    node,
+                    "Probability",
+                    EvalValue::Scalar(json!(0.5)),
+                )?),
+                Field::Constant(Value::Null),
+            ),
+            "VECTOR" | "FLOAT_VECTOR" => (
+                as_field(self.input_value_with_node(
+                    id,
+                    node,
+                    "Min",
+                    EvalValue::Scalar(json!([0.0, 0.0, 0.0])),
+                )?),
+                as_field(self.input_value_with_node(
+                    id,
+                    node,
+                    "Max",
+                    EvalValue::Scalar(json!([1.0, 1.0, 1.0])),
+                )?),
+            ),
+            "INT" | "INTEGER" => (
+                as_field(self.input_value_with_node(
+                    id,
+                    node,
+                    "Min",
+                    EvalValue::Scalar(json!(0)),
+                )?),
+                as_field(self.input_value_with_node(
+                    id,
+                    node,
+                    "Max",
+                    EvalValue::Scalar(json!(100)),
+                )?),
+            ),
+            "FLOAT" => (
+                as_field(self.input_value_with_node(
+                    id,
+                    node,
+                    "Min",
+                    EvalValue::Scalar(json!(0.0)),
+                )?),
+                as_field(self.input_value_with_node(
+                    id,
+                    node,
+                    "Max",
+                    EvalValue::Scalar(json!(1.0)),
+                )?),
+            ),
+            _ => {
+                return Err(unsupported_graph_feature(
+                    id,
+                    "graph.node.random_value.data_type",
+                    format!("Random Value data type `{data_type}` is not implemented"),
+                ));
+            }
         };
-        let id_field =
-            as_field(self.input_value_with_node(id, node, "ID", EvalValue::Field(Field::Index))?);
-        let min = as_field(self.input_value_with_node(
-            id,
-            node,
-            "Min",
-            EvalValue::Scalar(min_default),
-        )?);
-        let max = as_field(self.input_value_with_node(
-            id,
-            node,
-            "Max",
-            EvalValue::Scalar(max_default),
-        )?);
-        if socket != "Value" {
-            return Err(evaluation("unknown Random Value output"));
-        }
+        let id_field = if let Some(link) = self
+            .group
+            .links
+            .iter()
+            .find(|link| &link.to_node == id && link.to_socket == "ID")
+        {
+            as_field(self.output_value(&link.from_node, &link.from_socket)?)
+        } else {
+            Field::IdOrIndex
+        };
         Ok(EvalValue::Field(Field::Random {
-            seed: u64::from_ne_bytes(seed.to_ne_bytes()),
+            seed,
             data_type,
             id: Box::new(id_field),
             min: Box::new(min),
@@ -3116,16 +3310,22 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
             | "GeometryNodeMeshToPoints",
             "Selection",
         )
-        | ("GeometryNodeRealizeInstances", "Realize All") => json!(true),
+        | ("GeometryNodeRealizeInstances", "Realize All")
+        | ("GeometryNodeSubdivisionSurface", "Limit Surface") => json!(true),
         ("GeometryNodeRealizeInstances", "Depth")
         | ("GeometryNodeDistributePointsOnFaces", "Seed") => json!(0),
-        ("GeometryNodeDistributePointsOnFaces", "Density") | ("ShaderNodeVectorMath", "Scale") => {
-            json!(1.0)
-        }
+        ("GeometryNodeMeshLine", "Count") => json!(10),
+        ("GeometryNodeDistributePointsOnFaces", "Density" | "Density Max") => json!(10.0),
+        ("GeometryNodeDistributePointsOnFaces", "Density Factor")
+        | ("ShaderNodeVectorMath", "Scale") => json!(1.0),
+        ("GeometryNodeSubdivisionSurface", "Edge Crease" | "Vertex Crease")
+        | ("GeometryNodeCombineXYZ", "X" | "Y" | "Z") => json!(0.0),
+        ("GeometryNodeSubdivisionSurface", "Quality") => json!(3),
+        ("GeometryNodeSubdivisionSurface", "UV Smooth") => json!("PRESERVE_BOUNDARIES"),
+        ("GeometryNodeSubdivisionSurface", "Boundary Smooth") => json!("ALL"),
         ("GeometryNodeSimulationOutput", "Skip") => json!(false),
         ("GeometryNodeRepeatInput", "Iterations") => json!(1),
         ("ShaderNodeMath", "Value" | "Value_001" | "Value_002") => json!(0.5),
-        ("GeometryNodeCombineXYZ", "X" | "Y" | "Z") => json!(0.0),
         _ => return None,
     };
     Some(value)
@@ -3197,6 +3397,55 @@ fn field_json_for_instance(
     )
 }
 
+fn id_or_index_value(
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<Value> {
+    match context {
+        FieldEvaluationContext::Mesh(mesh) => {
+            let Some(attribute) = mesh.attributes.get("id") else {
+                return Ok(json!(index));
+            };
+            if attribute
+                .get("domain")
+                .and_then(Value::as_str)
+                .is_some_and(|attribute_domain| attribute_domain != domain)
+            {
+                return Err(evaluation(
+                    "default Random Value ID field requires the id attribute on its evaluated domain",
+                ));
+            }
+            attribute
+                .get("data")
+                .and_then(Value::as_array)
+                .and_then(|values| values.get(index))
+                .cloned()
+                .ok_or_else(|| evaluation("id attribute payload is malformed"))
+        }
+        FieldEvaluationContext::Instance {
+            attributes,
+            instance_count,
+            ..
+        } if domain == "INSTANCE" => {
+            let Some(attribute) = attributes.get("id") else {
+                return Ok(json!(index));
+            };
+            if attribute.values.len() != instance_count {
+                return Err(evaluation("named instance id column has an invalid length"));
+            }
+            attribute
+                .values
+                .get(index)
+                .cloned()
+                .ok_or_else(|| evaluation("named instance id index is out of range"))
+        }
+        FieldEvaluationContext::Instance { .. } => Err(evaluation(
+            "instance field context has a non-INSTANCE domain",
+        )),
+    }
+}
+
 fn field_json_in_context(
     field: &Field,
     context: FieldEvaluationContext<'_>,
@@ -3228,7 +3477,8 @@ fn field_json_in_context(
             }
         },
         Field::Index => json!(index),
-        Field::Attribute(name) => match context {
+        Field::IdOrIndex => id_or_index_value(context, index, domain)?,
+        Field::Attribute { name, data_type } => match context {
             FieldEvaluationContext::Mesh(mesh) => {
                 let attribute = mesh
                     .attributes
@@ -3247,6 +3497,7 @@ fn field_json_in_context(
                     .get("data")
                     .and_then(Value::as_array)
                     .ok_or_else(|| evaluation("named attribute payload is malformed"))?;
+                validate_named_attribute_conversion(data_type.as_deref(), attribute, values)?;
                 values
                     .get(index)
                     .cloned()
@@ -3258,6 +3509,14 @@ fn field_json_in_context(
                 instance_count,
             } if domain == "INSTANCE" => {
                 if name == "instance_transform" {
+                    if data_type.as_deref().is_some_and(|requested| {
+                        !named_attribute_type_compatible(requested, "FLOAT4X4")
+                    }) {
+                        return Err(unsupported_instance_field_feature(
+                            "graph.node.input_named_attribute.data_type",
+                            "Named Attribute conversion from FLOAT4X4 is not implemented",
+                        ));
+                    }
                     json!(transform)
                 } else {
                     let column = attributes
@@ -3266,6 +3525,17 @@ fn field_json_in_context(
                     if column.values.len() != instance_count {
                         return Err(evaluation(
                             "named instance attribute column has an invalid length",
+                        ));
+                    }
+                    if data_type.as_deref().is_some_and(|requested| {
+                        !named_attribute_type_compatible(
+                            requested,
+                            &normalize_instance_data_type(&column.data_type),
+                        )
+                    }) {
+                        return Err(unsupported_instance_field_feature(
+                            "graph.node.input_named_attribute.data_type",
+                            "Named Attribute instance attribute conversion is not implemented",
                         ));
                     }
                     column.values.get(index).cloned().ok_or_else(|| {
@@ -3342,52 +3612,70 @@ fn field_json_in_context(
             min,
             max,
         } => {
-            let id = integer_field_in_context(id, context, index, domain)?;
-            let mut state = *seed ^ u64::from_ne_bytes(id.to_ne_bytes());
-            let min = field_json_in_context(min, context, index, domain)?;
-            let max = field_json_in_context(max, context, index, domain)?;
-            if data_type == "VECTOR" || data_type == "FLOAT_VECTOR" {
-                let min = json_vec3(&min)
-                    .ok_or_else(|| evaluation("random vector minimum is invalid"))?;
-                let max = json_vec3(&max)
-                    .ok_or_else(|| evaluation("random vector maximum is invalid"))?;
-                vector_json(DVec3::new(
-                    min.x + next_unit(&mut state) * (max.x - min.x),
-                    min.y + next_unit(&mut state) * (max.y - min.y),
-                    min.z + next_unit(&mut state) * (max.z - min.z),
-                ))
-            } else if data_type == "INT" || data_type == "INTEGER" {
-                let min = min
-                    .as_i64()
-                    .ok_or_else(|| evaluation("random integer minimum is invalid"))?;
-                let max = max
-                    .as_i64()
-                    .ok_or_else(|| evaluation("random integer maximum is invalid"))?;
-                json!(random_i64_inclusive(&mut state, min, max)?)
-            } else if data_type == "BOOLEAN" || data_type == "BOOL" {
-                let minimum = min
-                    .as_bool()
-                    .ok_or_else(|| evaluation("random boolean minimum is invalid"))?;
-                let maximum = max
-                    .as_bool()
-                    .ok_or_else(|| evaluation("random boolean maximum is invalid"))?;
-                if minimum == maximum {
-                    json!(minimum)
-                } else {
-                    json!(if next_unit(&mut state) >= 0.5 {
-                        maximum
-                    } else {
-                        minimum
-                    })
+            let id = integer_field_in_context(id, context, index, domain)? as i32 as u32;
+            let minimum = field_json_in_context(min, context, index, domain)?;
+            let maximum = field_json_in_context(max, context, index, domain)?;
+            match data_type.as_str() {
+                "VECTOR" | "FLOAT_VECTOR" => {
+                    let minimum = json_vec3(&minimum)
+                        .ok_or_else(|| evaluation("random vector minimum is invalid"))?
+                        .as_vec3();
+                    let maximum = json_vec3(&maximum)
+                        .ok_or_else(|| evaluation("random vector maximum is invalid"))?
+                        .as_vec3();
+                    vector_json(
+                        Vec3::new(
+                            blender_noise_hash_to_float_3(*seed, id, 0) * (maximum.x - minimum.x)
+                                + minimum.x,
+                            blender_noise_hash_to_float_3(*seed, id, 1) * (maximum.y - minimum.y)
+                                + minimum.y,
+                            blender_noise_hash_to_float_3(*seed, id, 2) * (maximum.z - minimum.z)
+                                + minimum.z,
+                        )
+                        .as_dvec3(),
+                    )
                 }
-            } else {
-                let min = min
-                    .as_f64()
-                    .ok_or_else(|| evaluation("random minimum is not numeric"))?;
-                let max = max
-                    .as_f64()
-                    .ok_or_else(|| evaluation("random maximum is not numeric"))?;
-                json!(min + next_unit(&mut state) * (max - min))
+                "INT" | "INTEGER" => {
+                    let mut minimum = minimum
+                        .as_i64()
+                        .ok_or_else(|| evaluation("random integer minimum is invalid"))?
+                        as i32;
+                    let mut maximum = maximum
+                        .as_i64()
+                        .ok_or_else(|| evaluation("random integer maximum is invalid"))?
+                        as i32;
+                    if minimum > maximum {
+                        std::mem::swap(&mut minimum, &mut maximum);
+                    }
+                    let range = (maximum as u32)
+                        .wrapping_sub(minimum as u32)
+                        .wrapping_add(1);
+                    let hash = blender_noise_hash_2(id, *seed);
+                    let modulo_result = if range == 0 { hash } else { hash % range };
+                    json!((minimum as u32).wrapping_add(modulo_result) as i32)
+                }
+                "BOOLEAN" | "BOOL" => {
+                    let probability = minimum
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| evaluation("random boolean probability is invalid"))?
+                        as f32;
+                    json!(blender_noise_hash_to_float_2(id, *seed) <= probability)
+                }
+                "FLOAT" => {
+                    let minimum = minimum
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| evaluation("random minimum is not numeric"))?
+                        as f32;
+                    let maximum = maximum
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| evaluation("random maximum is not numeric"))?
+                        as f32;
+                    json!(blender_noise_hash_to_float_2(*seed, id) * (maximum - minimum) + minimum)
+                }
+                _ => Err(evaluation("unsupported Random Value data type"))?,
             }
         }
     };
@@ -3761,6 +4049,456 @@ fn infer_instance_data_type(value: &Value) -> Result<String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DistributionTriangle {
+    positions: [Vec3; 3],
+    corners: [usize; 3],
+    area: f32,
+}
+
+#[derive(Clone, Copy)]
+struct DistributedCandidate {
+    position: Vec3,
+    barycentric: Vec3,
+    triangle_index: u32,
+    corners: [usize; 3],
+}
+
+fn distribute_points_mesh(
+    node_id: &Id,
+    surface: &Mesh,
+    method: &str,
+    density: &Field,
+    density_factor: &Field,
+    selection: &Field,
+    seed: i64,
+    density_max: f32,
+    minimum_distance: f32,
+) -> Result<Mesh> {
+    if !minimum_distance.is_finite() || !density_max.is_finite() {
+        return Err(evaluation("point distribution settings must be finite"));
+    }
+    if method == "POISSON" && density_max <= 0.0 {
+        return Ok(Mesh::new());
+    }
+
+    let corner_count = domain_element_count(surface, "CORNER")?;
+    let mut corner_densities = vec![0.0; corner_count];
+    let constant_random_density = if method == "RANDOM"
+        && matches!(
+            (selection, density),
+            (Field::Constant(_), Field::Constant(_))
+        ) {
+        let value = field_json(density, surface, 0, "CORNER")?
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| evaluation("point density field must be finite and numeric"))?
+            as f32;
+        if !value.is_finite() {
+            return Err(evaluation("point density field must be finite"));
+        }
+        Some(value.max(0.0))
+    } else {
+        None
+    };
+    if method == "RANDOM" && constant_random_density.is_none() {
+        for (corner, density_value) in corner_densities.iter_mut().enumerate() {
+            let selected = field_bool(selection, surface, corner, "CORNER", false)?;
+            if selected {
+                let value = field_json(density, surface, corner, "CORNER")?
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| evaluation("point density field must be finite and numeric"))?
+                    as f32;
+                if !value.is_finite() {
+                    return Err(evaluation("point density field must be finite"));
+                }
+                *density_value = value.max(0.0);
+            }
+        }
+    }
+
+    let triangles = surface
+        .tessellate()
+        .map_err(|error| mesh_evaluation_error(&error))?;
+    let positions_by_id: HashMap<_, _> = surface
+        .vertices
+        .iter()
+        .map(|vertex| (vertex.id, vertex.co.as_vec3()))
+        .collect();
+    let mut triangle_data = Vec::with_capacity(triangles.len());
+    let mut triangle_offset = 0_usize;
+    let mut corner_offset = 0_usize;
+    let mut local_corner_by_vertex = HashMap::new();
+    for face in &surface.faces {
+        let triangle_count = face.vertices.len().saturating_sub(2);
+        local_corner_by_vertex.clear();
+        for (local_corner, vertex_id) in face.vertices.iter().enumerate() {
+            local_corner_by_vertex.insert(*vertex_id, local_corner);
+        }
+        for _ in 0..triangle_count {
+            let triangle = *triangles
+                .get(triangle_offset)
+                .ok_or_else(|| evaluation("surface triangulation result is incomplete"))?;
+            let mut positions = [Vec3::ZERO; 3];
+            let mut corners = [0_usize; 3];
+            for vertex in 0..3 {
+                let vertex_id = triangle[vertex];
+                positions[vertex] = *positions_by_id
+                    .get(&vertex_id)
+                    .ok_or_else(|| evaluation("triangle vertex missing"))?;
+                let local_corner = local_corner_by_vertex
+                    .get(&vertex_id)
+                    .copied()
+                    .ok_or_else(|| evaluation("triangle corner missing"))?;
+                corners[vertex] = corner_offset
+                    .checked_add(local_corner)
+                    .ok_or_else(|| evaluation("corner index exceeds supported range"))?;
+            }
+            let area = (positions[0] - positions[1])
+                .cross(positions[1] - positions[2])
+                .length()
+                * 0.5;
+            triangle_data.push(DistributionTriangle {
+                positions,
+                corners,
+                area,
+            });
+            triangle_offset += 1;
+        }
+        corner_offset = corner_offset
+            .checked_add(face.vertices.len())
+            .ok_or_else(|| evaluation("corner count exceeds the supported range"))?;
+    }
+    if triangle_offset != triangles.len() || corner_offset != corner_count {
+        return Err(evaluation(
+            "surface triangulation result does not match face domains",
+        ));
+    }
+
+    let seed = (seed as i32 as u32).wrapping_mul(5_383_843);
+    let mut candidates = Vec::new();
+    for (triangle_index, triangle) in triangle_data.iter().enumerate() {
+        let density = if method == "POISSON" {
+            density_max
+        } else if let Some(constant_density) = constant_random_density {
+            constant_density
+        } else {
+            (corner_densities[triangle.corners[0]]
+                + corner_densities[triangle.corners[1]]
+                + corner_densities[triangle.corners[2]])
+                / 3.0
+        };
+        let weighted_count = triangle.area * density;
+        if !weighted_count.is_finite() || weighted_count < 0.0 {
+            return Err(evaluation("point density and triangle area must be finite"));
+        }
+        let triangle_index_u32 = u32::try_from(triangle_index)
+            .map_err(|_| PotError::new(ErrorCode::LimitExceeded, "too many surface triangles"))?;
+        let triangle_seed = blender_noise_hash_2(triangle_index_u32, seed);
+        let mut count_rng = BlenderRng::seed(triangle_seed);
+        let count = blender_round_probabilistic(weighted_count, &mut count_rng)?;
+        let next_len = candidates
+            .len()
+            .checked_add(count)
+            .filter(|count| *count <= MAX_GENERATED_POINTS)
+            .ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::LimitExceeded,
+                    "distributed point count exceeds limit",
+                )
+            })?;
+        candidates.reserve(next_len.saturating_sub(candidates.len()));
+
+        let mut sample_rng = BlenderRng::seed(triangle_seed);
+        sample_rng.skip(1);
+        for _ in 0..count {
+            let mut first = sample_rng.get_float();
+            let mut second = sample_rng.get_float();
+            if first + second > 1.0 {
+                first = 1.0 - first;
+                second = 1.0 - second;
+            }
+            let barycentric = Vec3::new(first, second, 1.0 - first - second);
+            let position = triangle.positions[0] * barycentric.x
+                + triangle.positions[1] * barycentric.y
+                + triangle.positions[2] * barycentric.z;
+            candidates.push(DistributedCandidate {
+                position,
+                barycentric,
+                triangle_index: triangle_index_u32,
+                corners: triangle.corners,
+            });
+        }
+    }
+    if method == "POISSON" {
+        if candidates.is_empty() {
+            return Ok(Mesh::new());
+        }
+        for (corner, density_value) in corner_densities.iter_mut().enumerate() {
+            let selected = field_bool(selection, surface, corner, "CORNER", false)?;
+            if selected {
+                let value = field_json(density_factor, surface, corner, "CORNER")?
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| evaluation("Density Factor field must be finite and numeric"))?
+                    as f32;
+                if !value.is_finite() {
+                    return Err(evaluation("Density Factor field must be finite"));
+                }
+                *density_value = value.max(0.0);
+            }
+        }
+    }
+
+    let mut elimination_mask = if method == "POISSON" && minimum_distance > 0.0 {
+        eliminate_close_candidates(&candidates, minimum_distance)?
+    } else {
+        vec![false; candidates.len()]
+    };
+    if method == "POISSON" {
+        for (index, candidate) in candidates.iter().enumerate() {
+            if elimination_mask[index] {
+                continue;
+            }
+            let [first, second, third] = candidate.corners.map(|corner| corner_densities[corner]);
+            let probability = first * candidate.barycentric.x
+                + second * candidate.barycentric.y
+                + third * candidate.barycentric.z;
+            if blender_noise_hash_float3_to_float(candidate.barycentric) > probability {
+                elimination_mask[index] = true;
+            }
+        }
+    }
+
+    if method == "POISSON" {
+        for index in (0..candidates.len()).rev() {
+            if elimination_mask[index] {
+                candidates.swap_remove(index);
+            }
+        }
+    }
+    let point_count = candidates.len();
+    if point_count > 0
+        && let Some(attribute_name) = unpropagated_distribute_attribute(surface)
+    {
+        return Err(unsupported_graph_feature(
+            node_id,
+            "graph.node.distribute_points.attribute_propagation",
+            format!(
+                "Distribute Points on Faces cannot propagate input attribute `{attribute_name}`"
+            ),
+        ));
+    }
+    let mut points = Mesh::new();
+    let mut ids = Vec::with_capacity(point_count);
+    let mut radii = Vec::with_capacity(point_count);
+    for candidate in &candidates {
+        points
+            .insert_vertex(candidate.position.as_dvec3())
+            .map_err(|error| mesh_evaluation_error(&error))?;
+        ids.push(i64::from(blender_noise_hash_2(
+            blender_noise_hash_float3(candidate.barycentric),
+            candidate.triangle_index,
+        ) as i32));
+        radii.push(0.05);
+    }
+    points.attributes.insert(
+        "id".to_owned(),
+        json!({"domain":"POINT","data_type":"INT","data":ids}),
+    );
+    points.attributes.insert(
+        "radius".to_owned(),
+        json!({"domain":"POINT","data_type":"FLOAT","data":radii}),
+    );
+    Ok(points)
+}
+
+fn unpropagated_distribute_attribute(mesh: &Mesh) -> Option<String> {
+    if let Some(entries) = mesh
+        .attributes
+        .get("blender_attributes")
+        .and_then(Value::as_array)
+    {
+        for entry in entries {
+            let name = entry.get("name").and_then(Value::as_str)?;
+            let domain = entry
+                .get("domain")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if name.starts_with('.')
+                || matches!(name, "position" | "id" | "radius")
+                || domain.eq_ignore_ascii_case("EDGE")
+                || (crate::geom::attribute_keys::is_internal_key(name)
+                    && !matches!(name, "uv_layers" | "color_layers" | "vertex_groups"))
+            {
+                continue;
+            }
+            return Some(name.to_owned());
+        }
+    }
+    for (name, attribute) in &mesh.attributes {
+        if (crate::geom::attribute_keys::is_internal_key(name)
+            && !matches!(
+                name.as_str(),
+                "uv_layers" | "color_layers" | "vertex_groups"
+            ))
+            || name.starts_with('.')
+            || matches!(name.as_str(), "position" | "id" | "radius")
+            || attribute
+                .get("domain")
+                .and_then(Value::as_str)
+                .is_some_and(|domain| domain.eq_ignore_ascii_case("EDGE"))
+        {
+            continue;
+        }
+        let values = attribute.get("data").or_else(|| attribute.get("values"));
+        if values
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.is_empty())
+            || values
+                .and_then(Value::as_object)
+                .is_some_and(|values| !values.is_empty())
+        {
+            return Some(name.clone());
+        }
+    }
+    for store in ["uv_layers", "color_layers"] {
+        if mesh
+            .attributes
+            .get(store)
+            .and_then(|store| store.get("layers"))
+            .and_then(Value::as_array)
+            .is_some_and(|layers| !layers.is_empty())
+        {
+            return Some(store.to_owned());
+        }
+    }
+    mesh.attributes
+        .get("vertex_groups")
+        .and_then(Value::as_object)
+        .filter(|groups| !groups.is_empty())
+        .map(|_| "vertex_groups".to_owned())
+}
+
+fn blender_round_probabilistic(value: f32, rng: &mut BlenderRng) -> Result<usize> {
+    if !value.is_finite() || value < 0.0 || value > MAX_GENERATED_POINTS as f32 + 1.0 {
+        return Err(PotError::new(
+            ErrorCode::LimitExceeded,
+            "distributed point count exceeds limit",
+        ));
+    }
+    let integer = value as usize;
+    let round_up = value.fract() > rng.get_float();
+    let count = integer + usize::from(round_up);
+    if count > MAX_GENERATED_POINTS {
+        return Err(PotError::new(
+            ErrorCode::LimitExceeded,
+            "distributed point count exceeds limit",
+        ));
+    }
+    Ok(count)
+}
+
+fn blender_noise_hash_2(first: u32, second: u32) -> u32 {
+    let seed = 0xdead_beef_u32.wrapping_add((2 << 2) + 13);
+    blender_noise_hash_finalize(seed.wrapping_add(first), seed.wrapping_add(second), seed)
+}
+fn blender_noise_hash_3(first: u32, second: u32, third: u32) -> u32 {
+    let seed = 0xdead_beef_u32.wrapping_add((3 << 2) + 13);
+    blender_noise_hash_finalize(
+        seed.wrapping_add(first),
+        seed.wrapping_add(second),
+        seed.wrapping_add(third),
+    )
+}
+
+fn blender_noise_hash_to_float_2(first: u32, second: u32) -> f32 {
+    blender_noise_hash_2(first, second) as f32 / u32::MAX as f32
+}
+
+fn blender_noise_hash_to_float_3(first: u32, second: u32, third: u32) -> f32 {
+    blender_noise_hash_3(first, second, third) as f32 / u32::MAX as f32
+}
+
+fn blender_noise_hash_float3(value: Vec3) -> u32 {
+    let seed = 0xdead_beef_u32.wrapping_add((3 << 2) + 13);
+    blender_noise_hash_finalize(
+        seed.wrapping_add(value.x.to_bits()),
+        seed.wrapping_add(value.y.to_bits()),
+        seed.wrapping_add(value.z.to_bits()),
+    )
+}
+
+fn blender_noise_hash_float3_to_float(value: Vec3) -> f32 {
+    blender_noise_hash_float3(value) as f32 / u32::MAX as f32
+}
+
+fn blender_noise_hash_finalize(mut first: u32, mut second: u32, mut third: u32) -> u32 {
+    third ^= second;
+    third = third.wrapping_sub(second.rotate_left(14));
+    first ^= third;
+    first = first.wrapping_sub(third.rotate_left(11));
+    second ^= first;
+    second = second.wrapping_sub(first.rotate_left(25));
+    third ^= second;
+    third = third.wrapping_sub(second.rotate_left(16));
+    first ^= third;
+    first = first.wrapping_sub(third.rotate_left(4));
+    second ^= first;
+    second = second.wrapping_sub(first.rotate_left(14));
+    third ^= second;
+    third.wrapping_sub(second.rotate_left(24))
+}
+
+fn eliminate_close_candidates(
+    candidates: &[DistributedCandidate],
+    minimum_distance: f32,
+) -> Result<Vec<bool>> {
+    let mut elimination_mask = vec![false; candidates.len()];
+    let mut grid = HashMap::<[i64; 3], Vec<usize>>::with_capacity(candidates.len());
+    let cell_size = f64::from(minimum_distance);
+    let minimum_squared = minimum_distance * minimum_distance;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let cell = poisson_cell(candidate.position.as_dvec3(), cell_size)?;
+        grid.entry(cell).or_default().push(index);
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        if elimination_mask[index] {
+            continue;
+        }
+        let cell = poisson_cell(candidate.position.as_dvec3(), cell_size)?;
+        for x_offset in -2_i64..=2 {
+            let Some(x) = cell[0].checked_add(x_offset) else {
+                continue;
+            };
+            for y_offset in -2_i64..=2 {
+                let Some(y) = cell[1].checked_add(y_offset) else {
+                    continue;
+                };
+                for z_offset in -2_i64..=2 {
+                    let Some(z) = cell[2].checked_add(z_offset) else {
+                        continue;
+                    };
+                    if let Some(neighbors) = grid.get(&[x, y, z]) {
+                        for &neighbor in neighbors {
+                            if neighbor != index
+                                && candidate
+                                    .position
+                                    .distance_squared(candidates[neighbor].position)
+                                    <= minimum_squared
+                            {
+                                elimination_mask[neighbor] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(elimination_mask)
+}
+
 fn poisson_cell(point: DVec3, cell_size: f64) -> Result<[i64; 3]> {
     if !cell_size.is_finite() || cell_size <= 0.0 {
         return Err(evaluation(
@@ -3778,38 +4516,6 @@ fn poisson_cell(point: DVec3, cell_size: f64) -> Result<[i64; 3]> {
         floor_to_i64(coordinates.y)?,
         floor_to_i64(coordinates.z)?,
     ])
-}
-
-fn separated_from_neighbors(
-    candidate: DVec3,
-    minimum_distance: f64,
-    grid: &HashMap<[i64; 3], Vec<DVec3>>,
-) -> Result<bool> {
-    let cell = poisson_cell(candidate, minimum_distance)?;
-    let minimum_squared = minimum_distance * minimum_distance;
-    for x_offset in -2_i64..=2 {
-        let Some(x) = cell[0].checked_add(x_offset) else {
-            continue;
-        };
-        for y_offset in -2_i64..=2 {
-            let Some(y) = cell[1].checked_add(y_offset) else {
-                continue;
-            };
-            for z_offset in -2_i64..=2 {
-                let Some(z) = cell[2].checked_add(z_offset) else {
-                    continue;
-                };
-                if grid.get(&[x, y, z]).is_some_and(|points| {
-                    points
-                        .iter()
-                        .any(|point| point.distance_squared(candidate) < minimum_squared)
-                }) {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    Ok(true)
 }
 
 fn json_is_finite(value: &Value) -> bool {
@@ -4093,19 +4799,6 @@ fn vector_math_value(
 
 fn per_axis(value: DVec3, f: impl Fn(f64) -> f64) -> DVec3 {
     DVec3::new(f(value.x), f(value.y), f(value.z))
-}
-
-fn random_i64_inclusive(state: &mut u64, minimum: i64, maximum: i64) -> Result<i64> {
-    if minimum > maximum {
-        return Err(evaluation("random integer minimum exceeds maximum"));
-    }
-    let range = u128::try_from(i128::from(maximum) - i128::from(minimum) + 1)
-        .map_err(|_| evaluation("random integer range is invalid"))?;
-    let offset = (u128::from(next_u64(state)) * range) >> 64;
-    let value = i128::from(minimum)
-        .checked_add(i128::try_from(offset).map_err(|_| evaluation("random integer overflow"))?)
-        .ok_or_else(|| evaluation("random integer overflow"))?;
-    i64::try_from(value).map_err(|_| evaluation("random integer overflow"))
 }
 
 fn field_vec3(field: &Field, mesh: &Mesh, index: usize, fallback: DVec3) -> Result<DVec3> {
@@ -4434,9 +5127,10 @@ impl NodeBakeValue {
                 }))
             }
             Self::Scalar { value } => Ok(EvalValue::Scalar(value)),
-            Self::Field { attribute_name } => {
-                Ok(EvalValue::Field(Field::Attribute(attribute_name)))
-            }
+            Self::Field { attribute_name } => Ok(EvalValue::Field(Field::Attribute {
+                name: attribute_name,
+                data_type: None,
+            })),
         }
     }
 }
@@ -4630,6 +5324,148 @@ fn evaluation(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::EvaluationFailed, message)
 }
 
+fn subdivision_uv_smooth(value: &str) -> Result<&'static str> {
+    match value {
+        "NONE" | "None" => Ok("NONE"),
+        "SMOOTH_ALL" | "All" => Ok("SMOOTH_ALL"),
+        "PRESERVE_CORNERS" | "Keep Corners" => Ok("PRESERVE_CORNERS"),
+        "PRESERVE_CORNERS_AND_JUNCTIONS" | "Keep Corners and Junctions" => {
+            Ok("PRESERVE_CORNERS_AND_JUNCTIONS")
+        }
+        "PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE" | "Keep Corners, Junctions and Concave" => {
+            Ok("PRESERVE_CORNERS_JUNCTIONS_AND_CONCAVE")
+        }
+        "PRESERVE_BOUNDARIES" | "Keep Boundaries" => Ok("PRESERVE_BOUNDARIES"),
+        _ => Err(evaluation(format!(
+            "unknown Subdivision Surface UV Smooth mode `{value}`"
+        ))),
+    }
+}
+
+fn subdivision_boundary_smooth(value: &str) -> Result<&'static str> {
+    match value {
+        "ALL" | "All" => Ok("ALL"),
+        "PRESERVE_CORNERS" | "Keep Corners" => Ok("PRESERVE_CORNERS"),
+        _ => Err(evaluation(format!(
+            "unknown Subdivision Surface Boundary Smooth mode `{value}`"
+        ))),
+    }
+}
+
+fn named_attribute_data_type(node_id: &Id, node: &GraphNode, feature_id: &str) -> Result<String> {
+    let data_type = node
+        .properties
+        .get("data_type")
+        .and_then(Value::as_str)
+        .unwrap_or("FLOAT")
+        .to_ascii_uppercase();
+    if !matches!(
+        data_type.as_str(),
+        "FLOAT" | "FLOAT_VECTOR" | "INT" | "BOOLEAN"
+    ) {
+        return Err(unsupported_graph_feature(
+            node_id,
+            feature_id,
+            format!("Geometry Nodes attribute data type `{data_type}` is not implemented"),
+        ));
+    }
+    Ok(data_type)
+}
+
+fn named_attribute_zero(data_type: &str) -> Value {
+    match data_type {
+        "FLOAT" => json!(0.0),
+        "FLOAT_VECTOR" => json!([0.0, 0.0, 0.0]),
+        "INT" => json!(0),
+        "BOOLEAN" => json!(false),
+        _ => Value::Null,
+    }
+}
+
+fn named_attribute_value(value: &Value, data_type: &str) -> Result<Value> {
+    match data_type {
+        "FLOAT" => {
+            let value = value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| evaluation("FLOAT attribute value must be finite and numeric"))?
+                as f32;
+            if !value.is_finite() {
+                return Err(evaluation("FLOAT attribute value exceeds float32 range"));
+            }
+            Ok(json!(value))
+        }
+        "FLOAT_VECTOR" => {
+            let value = json_vec3(value)
+                .ok_or_else(|| evaluation("FLOAT_VECTOR attribute value must be a finite vec3"))?
+                .as_vec3();
+            if !value.is_finite() {
+                return Err(evaluation(
+                    "FLOAT_VECTOR attribute value exceeds float32 range",
+                ));
+            }
+            Ok(vector_json(value.as_dvec3()))
+        }
+        "INT" => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .map(|value| json!(value))
+            .ok_or_else(|| evaluation("INT attribute value must be a signed 32-bit integer")),
+        "BOOLEAN" => value
+            .as_bool()
+            .map(Value::Bool)
+            .ok_or_else(|| evaluation("BOOLEAN attribute value must be boolean")),
+        _ => Err(evaluation("unsupported Geometry Nodes attribute data type")),
+    }
+}
+fn validate_named_attribute_conversion(
+    requested_type: Option<&str>,
+    attribute: &Value,
+    values: &[Value],
+) -> Result<()> {
+    let Some(requested_type) = requested_type else {
+        return Ok(());
+    };
+    let actual_type = attribute
+        .get("data_type")
+        .or_else(|| attribute.get("type"))
+        .and_then(Value::as_str)
+        .map(normalize_instance_data_type)
+        .or_else(|| {
+            values
+                .first()
+                .and_then(|value| infer_instance_data_type(value).ok())
+        });
+    if actual_type
+        .as_deref()
+        .is_some_and(|actual| !named_attribute_type_compatible(requested_type, actual))
+    {
+        return Err(unsupported_instance_field_feature(
+            "graph.node.input_named_attribute.data_type",
+            format!(
+                "Named Attribute conversion from {} to {requested_type} is not implemented",
+                actual_type.unwrap_or_default()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn named_attribute_type_compatible(requested: &str, actual: &str) -> bool {
+    requested == actual || (requested == "FLOAT" && actual == "INT")
+}
+
+fn unsupported_graph_feature(
+    node_id: &Id,
+    feature_id: &str,
+    detail: impl Into<String>,
+) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        detail,
+        json!({"feature_id": feature_id, "node_id": node_id}),
+    )
+}
 fn unsupported_instance_feature(
     node_id: &Id,
     feature_id: &str,
@@ -4713,20 +5549,6 @@ fn interpolation_factor(index: usize, count: usize) -> f64 {
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the value is an integral rounded count bounded to the supported range"
-)]
-fn bounded_count_to_usize(count: f64) -> Result<usize> {
-    if !count.is_finite() || !(0.0..=MAX_GENERATED_POINTS_F64).contains(&count) {
-        return Err(evaluation(
-            "distributed point count is outside the supported range",
-        ));
-    }
-    Ok(count as usize)
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
     reason = "the floored number was checked to fit in the i64 range"
 )]
 fn floor_to_i64(value: f64) -> Result<i64> {
@@ -4741,52 +5563,6 @@ fn floor_to_i64(value: f64) -> Result<i64> {
     Ok(floored as i64)
 }
 
-fn next_u64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut value = *state;
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "a 53-bit mantissa is exactly representable in IEEE-754 binary64"
-)]
-fn next_unit(state: &mut u64) -> f64 {
-    (next_u64(state) >> 11) as f64 / RANDOM_MANTISSA_RANGE
-}
-#[cfg(test)]
-mod tests {
-    use proptest::prelude::*;
-
-    use super::next_unit;
-
-    proptest! {
-        #[test]
-        fn seeded_sample_stream_is_repeatable_and_bounded(seed in any::<u64>()) {
-            let mut first_state = seed;
-            let mut second_state = seed;
-            for _ in 0..16 {
-                let first = next_unit(&mut first_state);
-                let second = next_unit(&mut second_state);
-                prop_assert_eq!(first.to_bits(), second.to_bits());
-                prop_assert!((0.0..1.0).contains(&first));
-            }
-        }
-    }
-}
-
-#[cfg(kani)]
-#[kani::proof]
-fn kani_seeded_sample_stays_in_unit_interval() {
-    let mut seed: u64 = kani::any();
-    let value = next_unit(&mut seed);
-    kani::assert(
-        value >= 0.0 && value < 1.0,
-        "seeded sample must be in [0, 1)",
-    );
-}
 #[cfg(test)]
 mod node_bake_tests {
     use super::{NodeBakeFrame, NodeBakeRecord, NodeBakeValue, mix_bake_values, read_bake_value};
