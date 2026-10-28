@@ -1215,7 +1215,9 @@ def tree_dump(tree):
                 default = None
             socket_type = getattr(socket, "bl_socket_idname", getattr(socket, "bl_idname", socket.type))
             identifier = (socket.name
-                          if node.bl_idname in ("NodeGroupInput", "NodeGroupOutput")
+                          if node.bl_idname in ("NodeGroupInput", "NodeGroupOutput",
+                                                "GeometryNodeSimulationInput",
+                                                "GeometryNodeSimulationOutput")
                           else socket.identifier)
             sockets.append({"name": socket.name, "identifier": identifier, "type": socket_type,
                             "enabled": socket.enabled, "default": default})
@@ -1258,11 +1260,15 @@ def tree_dump(tree):
         entry = {
             "from_node": link.from_node.name,
             "from_socket": (link.from_socket.name
-                            if link.from_node.bl_idname == "NodeGroupInput"
+                            if link.from_node.bl_idname in (
+                                "NodeGroupInput", "GeometryNodeSimulationInput",
+                                "GeometryNodeSimulationOutput")
                             else link.from_socket.identifier),
             "to_node": link.to_node.name,
             "to_socket": (link.to_socket.name
-                          if link.to_node.bl_idname == "NodeGroupOutput"
+                          if link.to_node.bl_idname in (
+                              "NodeGroupOutput", "GeometryNodeSimulationInput",
+                              "GeometryNodeSimulationOutput")
                           else link.to_socket.identifier),
         }
         links.append(entry)

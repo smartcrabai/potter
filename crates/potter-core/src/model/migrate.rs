@@ -623,9 +623,10 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 13. Version 12 constraint states move
-/// to compatibility data, while version 11 retires unsupported animation outputs. `root` is the
-/// project directory that holds image blobs and linked sources, which the version 3 to 4 step reads.
+/// Upgrades a scene document in place through schema version 15. Version 12 constraint states move
+/// to compatibility data, version 14 migrates the legacy Geometry Nodes Mesh to Points domain, and
+/// version 11 retires unsupported animation outputs. `root` is the project directory that holds
+/// image blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
@@ -668,6 +669,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(13) {
         warnings.extend(upgrade_v13(value));
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(14) {
+        upgrade_v14(value)?;
     }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
@@ -1386,6 +1390,51 @@ fn upgrade_v11(value: &mut Value) -> Result<Vec<Value>> {
 fn upgrade_v13(value: &mut Value) -> Vec<Value> {
     value["schema_version"] = json!(14);
     Vec::new()
+}
+
+/// Upgrades a schema-version-14 scene to version 15, migrating Mesh to Points' former `domain`
+/// property to the current `mode` property.
+fn upgrade_v14(value: &mut Value) -> Result<()> {
+    if let Some(groups) = value.get_mut("node_groups").and_then(Value::as_object_mut) {
+        for group in groups.values_mut() {
+            let Some(nodes) = group.get_mut("nodes").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for node in nodes.values_mut() {
+                if node.get("type").and_then(Value::as_str) != Some("GeometryNodeMeshToPoints") {
+                    continue;
+                }
+                let Some(properties) = node.get_mut("properties").and_then(Value::as_object_mut)
+                else {
+                    continue;
+                };
+                let Some(domain) = properties.remove("domain") else {
+                    continue;
+                };
+                if properties.contains_key("mode") {
+                    continue;
+                }
+                let domain = domain
+                    .as_str()
+                    .ok_or_else(|| invalid("legacy Mesh to Points domain must be a string"))?
+                    .to_ascii_uppercase();
+                let mode = match domain.as_str() {
+                    "POINT" => "VERTICES",
+                    "EDGE" => "EDGES",
+                    "FACE" => "FACES",
+                    "CORNER" => "CORNERS",
+                    _ => {
+                        return Err(invalid(format!(
+                            "unknown legacy Mesh to Points domain `{domain}`"
+                        )));
+                    }
+                };
+                properties.insert("mode".to_owned(), json!(mode));
+            }
+        }
+    }
+    value["schema_version"] = json!(15);
+    Ok(())
 }
 
 fn preserve_uninitialized_initial_constraint_states(
@@ -3057,6 +3106,39 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_v14_maps_legacy_mesh_to_points_domains() {
+        let mut scene = json!({
+            "schema_version": 14,
+            "node_groups": {
+                "scatter": {
+                    "nodes": {
+                        "point": {"type": "GeometryNodeMeshToPoints", "properties": {"domain": "POINT"}},
+                        "edge": {"type": "GeometryNodeMeshToPoints", "properties": {"domain": "EDGE"}},
+                        "face": {"type": "GeometryNodeMeshToPoints", "properties": {"domain": "FACE"}},
+                        "corner": {"type": "GeometryNodeMeshToPoints", "properties": {"domain": "CORNER"}},
+                        "current": {"type": "GeometryNodeMeshToPoints", "properties": {"domain": "FACE", "mode": "CORNERS"}}
+                    }
+                }
+            }
+        });
+        upgrade_scene(&mut scene, no_assets()).expect("upgrade");
+        assert_eq!(scene["schema_version"], json!(15));
+        for (node, mode) in [
+            ("point", "VERTICES"),
+            ("edge", "EDGES"),
+            ("face", "FACES"),
+            ("corner", "CORNERS"),
+        ] {
+            let properties = &scene["node_groups"]["scatter"]["nodes"][node]["properties"];
+            assert_eq!(properties["mode"], json!(mode));
+            assert!(properties.get("domain").is_none());
+        }
+        let current = &scene["node_groups"]["scatter"]["nodes"]["current"]["properties"];
+        assert_eq!(current["mode"], json!("CORNERS"));
+        assert!(current.get("domain").is_none());
+    }
+
+    #[test]
     fn inline_resource_kind_classifies_inline_records_without_treating_binary_as_inline() {
         assert_eq!(
             inline_resource_kind(&json!({"storage":"inline","kind":"legacy_texture"}))
@@ -3217,7 +3299,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -3239,7 +3321,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -3259,7 +3341,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -3330,7 +3412,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         let first: Vec<&str> = scene["node_groups"]["first"]["links"]
             .as_array()
             .expect("first links")
@@ -3385,7 +3467,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         let sources: Vec<&str> = scene["node_groups"]["group"]["links"]
             .as_array()
             .expect("links")
@@ -3451,7 +3533,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
 
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 14);
+        assert_eq!(parsed.doc.schema_version, 15);
         assert!(!parsed.doc.compatibility.contains_key("constraints"));
         let node_id = Id::new("owner")?;
         let constraints = &parsed.doc.nodes[&node_id].constraints;
@@ -3646,27 +3728,27 @@ mod tests {
     }
 
     #[test]
-    fn schema_thirteen_scenes_upgrade_to_fourteen_without_other_changes() {
+    fn schema_thirteen_scenes_upgrade_to_fifteen_without_other_changes() {
         let mut scene = json!({
             "schema_version": 13,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let mut expected = scene.clone();
-        expected["schema_version"] = json!(14);
+        expected["schema_version"] = json!(15);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         assert_eq!(scene, expected);
     }
     #[test]
-    fn schema_twelve_scenes_chain_both_migrations_to_fourteen() {
+    fn schema_twelve_scenes_chain_migrations_to_fifteen() {
         let mut scene = json!({
             "schema_version": 12,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let mut expected = scene.clone();
-        expected["schema_version"] = json!(14);
+        expected["schema_version"] = json!(15);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         assert_eq!(scene, expected);
     }
 
@@ -3774,7 +3856,7 @@ mod tests {
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
         assert_eq!(warnings, Vec::<Value>::new());
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("restored action curves");
@@ -3868,7 +3950,7 @@ mod tests {
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
         assert_eq!(warnings.len(), 2);
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         assert_eq!(
             scene["actions"]["shared"]["fcurves"]
                 .as_array()
@@ -3936,7 +4018,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&doc)?, no_assets())?;
 
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 14);
+        assert_eq!(parsed.doc.schema_version, 15);
         assert_eq!(parsed.doc.actions[&action_id].fcurves.len(), 2);
         assert_eq!(
             parsed.doc.compatibility["animation"]["unsupported_outputs"]
@@ -3989,7 +4071,7 @@ mod tests {
         source["schema_version"] = json!(11);
         let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 14);
+        assert_eq!(parsed.doc.schema_version, 15);
         assert_eq!(parsed.doc.actions[&action_id].fcurves, Vec::new());
         assert_eq!(parsed.doc.nodes[&node_id].drivers, Vec::new());
         assert_eq!(
@@ -4028,7 +4110,7 @@ mod tests {
 
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("migrated action curves");
@@ -4236,7 +4318,7 @@ mod tests {
         )
         .expect("brush migration");
         assert!(migrated.legacy);
-        assert_eq!(migrated.doc.schema_version, 14);
+        assert_eq!(migrated.doc.schema_version, 15);
         let settings = &migrated.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")]
             .properties["physics_dynamic_paint"];
         assert_eq!(settings["paint_source"], json!("POINT"));
@@ -4408,7 +4490,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -4451,7 +4533,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -4499,7 +4581,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 14);
+        assert_eq!(parsed.doc.schema_version, 15);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -4545,7 +4627,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(14));
+        assert_eq!(scene["schema_version"], json!(15));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -4588,7 +4670,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(14);
+        expected["schema_version"] = json!(15);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -4626,7 +4708,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 14);
+        assert_eq!(migrated.schema_version, 15);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -5130,7 +5212,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 14);
+        assert_eq!(record.snapshot.schema_version, 15);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -5197,7 +5279,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 14);
+        assert_eq!(record.snapshot.schema_version, 15);
         let history_mesh = record
             .snapshot
             .data_blocks

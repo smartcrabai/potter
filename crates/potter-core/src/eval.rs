@@ -42,7 +42,7 @@ pub mod animation;
 mod fcurve_modifiers;
 mod ik_solver;
 pub mod rig;
-const EVALUATION_ENGINE: &str = "potter-eval-5";
+const EVALUATION_ENGINE: &str = "potter-eval-6";
 
 // Blender 5.2.2 DNA_curve_types.h:282-286 defines the defaults; displist.cc:674-704 applies
 // fill_rule only in the CDT branch, while SWEEP_LINE falls back to scan-fill.
@@ -63,6 +63,139 @@ fn ensure_curve_fill_supported(curve: &CurveData, owner_id: &Id) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn geometry_nodes_reads_modifier_input(group: &crate::graph::NodeGroup) -> bool {
+    if group.kind != crate::graph::GraphKind::Geometry {
+        return false;
+    }
+    let Some((output_id, output_node)) = group
+        .nodes
+        .iter()
+        .find(|(_, node)| node.node_type == "NodeGroupOutput")
+    else {
+        return false;
+    };
+    let output_socket = if group.interface.outputs.is_empty() {
+        Some(("Geometry", "Geometry"))
+    } else {
+        group
+            .interface
+            .outputs
+            .iter()
+            .find(|socket| socket.socket_type == "geometry")
+            .map(|socket| (socket.id.as_str(), socket.name.as_str()))
+    };
+    let Some((output_socket_id, output_socket_name)) = output_socket else {
+        return false;
+    };
+    if let Some(link) = group.links.iter().find(|link| {
+        &link.to_node == output_id
+            && (link.to_socket.as_str() == output_socket_id
+                || link.to_socket.as_str() == output_socket_name)
+    }) {
+        return geometry_node_output_reads_modifier_input(
+            group,
+            &link.from_node,
+            &link.from_socket,
+            &mut BTreeSet::new(),
+        );
+    }
+    !output_node.inputs.contains_key(output_socket_id)
+        && !output_node.inputs.contains_key(output_socket_name)
+}
+
+fn geometry_node_output_reads_modifier_input(
+    group: &crate::graph::NodeGroup,
+    node_id: &Id,
+    output_socket: &str,
+    visited: &mut BTreeSet<(Id, String)>,
+) -> bool {
+    if !visited.insert((node_id.clone(), output_socket.to_owned())) {
+        return false;
+    }
+    let Some(node) = group.nodes.get(node_id) else {
+        return false;
+    };
+    if node.node_type == "NodeGroupInput" {
+        return group.interface.inputs.iter().any(|socket| {
+            socket.socket_type == "geometry"
+                && (output_socket == socket.id.as_str() || output_socket == socket.name.as_str())
+        });
+    }
+    if group
+        .links
+        .iter()
+        .filter(|link| &link.to_node == node_id)
+        .any(|link| {
+            geometry_node_output_reads_modifier_input(
+                group,
+                &link.from_node,
+                &link.from_socket,
+                visited,
+            )
+        })
+    {
+        return true;
+    }
+    match node.node_type.as_str() {
+        "GeometryNodeTransform"
+        | "GeometryNodeSetPosition"
+        | "GeometryNodeRealizeInstances"
+        | "GeometryNodeStoreNamedAttribute"
+        | "GeometryNodeRepeatInput"
+        | "GeometryNodeSimulationInput" => {
+            output_socket == "Geometry"
+                && geometry_node_input_reads_modifier_input(
+                    group, node_id, node, "Geometry", true, visited,
+                )
+        }
+        "GeometryNodeCaptureAttribute" => {
+            matches!(output_socket, "Geometry" | "Attribute")
+                && geometry_node_input_reads_modifier_input(
+                    group, node_id, node, "Geometry", true, visited,
+                )
+        }
+        "GeometryNodeSubdivisionSurface" => {
+            output_socket == "Mesh"
+                && geometry_node_input_reads_modifier_input(
+                    group, node_id, node, "Mesh", true, visited,
+                )
+        }
+        "GeometryNodeMeshToPoints" | "GeometryNodeDistributePointsOnFaces" => {
+            output_socket == "Points"
+                && geometry_node_input_reads_modifier_input(
+                    group, node_id, node, "Mesh", true, visited,
+                )
+        }
+        _ => false,
+    }
+}
+
+fn geometry_node_input_reads_modifier_input(
+    group: &crate::graph::NodeGroup,
+    node_id: &Id,
+    node: &crate::graph::GraphNode,
+    input_socket: &str,
+    implicit_modifier_input: bool,
+    visited: &mut BTreeSet<(Id, String)>,
+) -> bool {
+    let mut links = group
+        .links
+        .iter()
+        .filter(|link| &link.to_node == node_id && link.to_socket.as_str() == input_socket)
+        .peekable();
+    if links.peek().is_none() {
+        return implicit_modifier_input && !node.inputs.contains_key(input_socket);
+    }
+    links.any(|link| {
+        geometry_node_output_reads_modifier_input(
+            group,
+            &link.from_node,
+            &link.from_socket,
+            visited,
+        )
+    })
 }
 
 /// A render camera explicitly chosen by a preview view rather than a scene camera node.
@@ -291,9 +424,16 @@ pub(crate) struct ModifierEvaluationContext<'a> {
     pub(crate) purpose: EvaluationPurpose,
     pub(crate) project_root: Option<&'a Path>,
     pub(crate) cache_directory: Option<&'a Path>,
+    pub(crate) frame_duration: Option<f64>,
     /// The owning object's material slot count (`Node::material_slot_count`); `None` when there is
     /// no scene object, in which case consumers fall back to the mesh's own face material indices.
     pub(crate) material_slot_count: Option<usize>,
+}
+pub(crate) fn scene_frame_duration(doc: &SceneDoc) -> Option<f64> {
+    doc.scenes.get(&doc.active_scene).map(|scene| {
+        let fps = (f64::from(scene.fps) / scene.fps_base) as f32;
+        f64::from(1.0_f32 / fps)
+    })
 }
 fn adaptive_render_context<'a>(
     doc: &'a SceneDoc,
@@ -1246,6 +1386,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            frame_duration: scene_frame_duration(doc),
             material_slot_count: None,
         };
         let suppressed = BTreeSet::new();
@@ -1323,6 +1464,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            frame_duration: scene_frame_duration(doc),
             material_slot_count: None,
         };
         crate::library::validate_linked_assets(doc, modifier_context.project_root)?;
@@ -1473,6 +1615,7 @@ impl Snapshot {
             purpose: context.purpose,
             project_root,
             cache_directory,
+            frame_duration: scene_frame_duration(source),
             material_slot_count: None,
         };
         crate::library::validate_linked_assets(source, modifier_context.project_root)?;
@@ -2575,6 +2718,36 @@ impl Snapshot {
                         bake_capture,
                         frame,
                     )?;
+                    if data_block.data_type == "curve" {
+                        for modifier in evaluation_modifiers.iter().filter(|modifier| {
+                            modifier.modifier_type == "nodes" && gate.is_active(id, modifier)
+                        }) {
+                            let Some(group_id) = modifier
+                                .params
+                                .get("node_group")
+                                .and_then(Value::as_str)
+                                .and_then(|group_id| Id::new(group_id.to_owned()).ok())
+                            else {
+                                continue;
+                            };
+                            let Some(group) = doc.node_groups.get(&group_id) else {
+                                continue;
+                            };
+                            if geometry_nodes_reads_modifier_input(group) {
+                                return Err(PotError::with_details(
+                                    ErrorCode::UnsupportedFeature,
+                                    "Geometry Nodes modifiers that consume input geometry are not supported on curve objects",
+                                    json!({
+                                        "feature_id":"modifier.geometry_nodes.curve_input_geometry",
+                                        "modifier_id":modifier.id,
+                                        "node_id":id,
+                                        "data_id":data_id,
+                                        "node_group":group_id,
+                                    }),
+                                ));
+                            }
+                        }
+                    }
                     let mut stack_context = gate.context;
                     stack_context.material_slot_count = Some(crate::model::material_slot_count(
                         node.materials.len(),
@@ -9281,6 +9454,7 @@ mod tests {
                 purpose: super::EvaluationPurpose::Preview,
                 project_root: None,
                 cache_directory: None,
+                frame_duration: None,
                 material_slot_count: None,
             },
             suppressed: &suppressed,

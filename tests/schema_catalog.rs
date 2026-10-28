@@ -93,7 +93,7 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
         assert!(result["op"].is_null());
         let schema = result["schema"].clone();
         if kind == "scene" {
-            assert_eq!(schema["properties"]["schema_version"]["const"], 14);
+            assert_eq!(schema["properties"]["schema_version"]["const"], 15);
         }
         let validator = jsonschema::validator_for(&schema)?;
         if matches!(kind, "capabilities" | "formats") {
@@ -1084,6 +1084,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "constraint.pivot.owner_euler_order",
         "constraint.transformation.reversed_range",
         "constraint.limit_distance.initial_distance",
+        "geometry_nodes.evaluator_subset",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1255,6 +1256,21 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "modifier.uv_project.animated_camera_parameters",
         "constraint.clamp_to.custom_spaces",
         "constraint.follow_path.custom_spaces",
+        "modifier.geometry_nodes.curve_input_geometry",
+        "graph.node.distribute_points.outputs",
+        "graph.node.distribute_points.method",
+        "graph.node.distribute_points.attribute_propagation",
+        "graph.node.mesh_line.endpoint_mode",
+        "graph.node.mesh_line.resolution_count_mode",
+        "graph.node.mesh_to_points.mode",
+        "graph.node.mesh_cylinder.fill_type",
+        "graph.node.mesh_cone.fill_type",
+        "graph.node.mesh_circle.fill_type",
+        "graph.node.store_named_attribute.data_type",
+        "graph.node.capture_attribute.data_type",
+        "graph.node.capture_attribute.dynamic_items",
+        "graph.node.input_named_attribute.data_type",
+        "graph.node.random_value.data_type",
     ] {
         assert!(
             features.iter().any(|feature| {

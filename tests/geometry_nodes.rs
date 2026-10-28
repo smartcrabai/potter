@@ -335,7 +335,7 @@ fn listed_primitive_nodes_match_geometry_nodes_defaults() {
     let line = evaluate_primitive_node("GeometryNodeMeshLine", json!({}));
     assert_eq!(
         (line.vertices.len(), line.edges.len(), line.faces.len()),
-        (2, 1, 0)
+        (10, 9, 0)
     );
 
     let circle = evaluate_primitive_node("GeometryNodeMeshCircle", json!({}));
@@ -483,11 +483,16 @@ fn cylinder_and_cone_nodes_honor_side_and_fill_segments() {
 
 #[test]
 fn mesh_to_points_supports_point_edge_face_and_corner_domains() {
-    for (domain, expected_count) in [("POINT", 8), ("EDGE", 12), ("FACE", 6), ("CORNER", 24)] {
+    for (mode, expected_count) in [
+        ("VERTICES", 8),
+        ("EDGES", 12),
+        ("FACES", 6),
+        ("CORNERS", 24),
+    ] {
         let doc = graph_with_nodes(
             vec![
                 json!({"id":"cube","type":"GeometryNodeMeshCube"}),
-                json!({"id":"points","type":"GeometryNodeMeshToPoints","properties":{"domain":domain}}),
+                json!({"id":"points","type":"GeometryNodeMeshToPoints","properties":{"mode":mode}}),
                 json!({"id":"output","type":"NodeGroupOutput"}),
             ],
             vec![
@@ -495,12 +500,56 @@ fn mesh_to_points_supports_point_edge_face_and_corner_domains() {
                 json!({"from_node":"points","from_socket":"Points","to_node":"output","to_socket":"Geometry"}),
             ],
         );
-        assert_eq!(
-            evaluate(&doc).mesh.vertices.len(),
-            expected_count,
-            "{domain}"
-        );
+        assert_eq!(evaluate(&doc).mesh.vertices.len(), expected_count, "{mode}");
     }
+}
+#[test]
+fn random_value_boolean_probability_drives_fields() {
+    let doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":5}}),
+            json!({"id":"random","type":"FunctionNodeRandomValue","properties":{"data_type":"BOOLEAN"},"inputs":{"Probability":1.0,"Seed":17}}),
+            json!({"id":"position","type":"GeometryNodeSetPosition","inputs":{"Offset":[1.0,0.0,0.0]}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"position","to_socket":"Geometry"}),
+            json!({"from_node":"random","from_socket":"Value","to_node":"position","to_socket":"Selection"}),
+            json!({"from_node":"position","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let mesh = evaluate(&doc).mesh;
+    assert_eq!(mesh.vertices.len(), 5);
+    assert!(mesh.vertices.iter().all(|vertex| vertex.co.x == 1.0));
+}
+#[test]
+fn point_distribution_refuses_input_attribute_propagation_until_modeled() {
+    let doc = graph_with_nodes(
+        vec![
+            json!({"id":"points","type":"GeometryNodeDistributePointsOnFaces","properties":{"distribute_method":"RANDOM"},"inputs":{"Density":1.0}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"points","from_socket":"Points","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let mut input = evaluate_primitive_node("GeometryNodeMeshCube", json!({}));
+    input.attributes.insert(
+        "surface_weight".to_owned(),
+        json!({"domain":"POINT","data_type":"FLOAT","data":vec![1.0; input.vertices.len()]}),
+    );
+    let error = graph::evaluate(
+        doc.node_groups.get(&Id::new("geo").unwrap()).unwrap(),
+        Some(&input),
+        &Map::new(),
+        "DistributionAttributeGuard",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+    assert_eq!(
+        error.details["feature_id"],
+        "graph.node.distribute_points.attribute_propagation"
+    );
 }
 
 #[test]
@@ -569,7 +618,7 @@ fn distribute_points_minimum_distance_is_repeatable_and_enforced() {
     let doc = graph_with_nodes(
         vec![
             json!({"id":"surface","type":"GeometryNodeMeshGrid","properties":{"size_x":4.0,"size_y":4.0,"vertices_x":8,"vertices_y":8}}),
-            json!({"id":"points","type":"GeometryNodeDistributePointsOnFaces","inputs":{"Density":3.0,"Distance Min":0.6,"Seed":73}}),
+            json!({"id":"points","type":"GeometryNodeDistributePointsOnFaces","properties":{"distribute_method":"POISSON"},"inputs":{"Density":3.0,"Density Max":3.0,"Density Factor":1.0,"Distance Min":0.6,"Seed":73}}),
             json!({"id":"output","type":"NodeGroupOutput"}),
         ],
         vec![
@@ -683,6 +732,61 @@ fn capture_attribute_keeps_values_from_capture_geometry() {
     assert_close(bounds.size().x, 2.0);
     assert_close(bounds.min.x, 0.0);
     assert_close(bounds.max.x, 2.0);
+}
+
+#[test]
+fn capture_attribute_supports_same_type_int_and_boolean_fields() {
+    let int_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":4}}),
+            json!({"id":"index","type":"GeometryNodeInputIndex"}),
+            json!({"id":"capture","type":"GeometryNodeCaptureAttribute","properties":{"domain":"POINT","data_type":"INT"}}),
+            json!({"id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"INT"},"inputs":{"Name":"captured_int"}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"capture","to_socket":"Geometry"}),
+            json!({"from_node":"index","from_socket":"Index","to_node":"capture","to_socket":"Value"}),
+            json!({"from_node":"capture","from_socket":"Geometry","to_node":"store","to_socket":"Geometry"}),
+            json!({"from_node":"capture","from_socket":"Attribute","to_node":"store","to_socket":"Value"}),
+            json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let int_mesh = evaluate(&int_doc).mesh;
+    assert_eq!(int_mesh.vertices.len(), 4);
+    assert_eq!(
+        int_mesh.attributes["captured_int"]["data"],
+        json!([0, 1, 2, 3])
+    );
+
+    let boolean_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":4}}),
+            json!({"id":"random","type":"FunctionNodeRandomValue","properties":{"data_type":"BOOLEAN"},"inputs":{"Probability":0.35,"Seed":29}}),
+            json!({"id":"capture","type":"GeometryNodeCaptureAttribute","properties":{"domain":"POINT","data_type":"BOOLEAN"}}),
+            json!({"id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"BOOLEAN"},"inputs":{"Name":"captured_boolean"}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"capture","to_socket":"Geometry"}),
+            json!({"from_node":"random","from_socket":"Value","to_node":"capture","to_socket":"Value"}),
+            json!({"from_node":"capture","from_socket":"Geometry","to_node":"store","to_socket":"Geometry"}),
+            json!({"from_node":"capture","from_socket":"Attribute","to_node":"store","to_socket":"Value"}),
+            json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let boolean_mesh = evaluate(&boolean_doc).mesh;
+    assert_eq!(boolean_mesh.vertices.len(), 4);
+    let boolean_values = boolean_mesh
+        .attributes
+        .get("captured_boolean")
+        .and_then(|attribute| attribute.get("data"))
+        .and_then(|data| data.as_array());
+    assert_eq!(boolean_values.map_or(0, Vec::len), 4);
+    assert!(
+        boolean_values.is_some_and(|values| values.iter().all(serde_json::Value::is_boolean)),
+        "captured BOOLEAN fields must remain booleans",
+    );
 }
 
 #[test]
