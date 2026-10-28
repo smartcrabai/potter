@@ -1829,11 +1829,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             outcome.doc.materials[&crate::model::Id::new("indexed").unwrap()].pass_index,
-            32767
+            Some(32767)
         );
         assert_eq!(
             outcome.doc.materials[&crate::model::Id::new("defaulted").unwrap()].pass_index,
-            0
+            Some(0)
         );
     }
 

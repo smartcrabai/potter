@@ -3748,17 +3748,14 @@ fn build_imported_graph(
         let color = vec4_field(item, "base_color", [0.6, 0.6, 0.6, 1.0]);
         let pass_index = item
             .get("pass_index")
-            .map(|value| {
-                value
-                    .as_u64()
-                    .and_then(|index| u32::try_from(index).ok())
-                    .filter(|index| i16::try_from(*index).is_ok())
-                    .ok_or_else(|| {
-                        invalid_intermediate(&format!("material `{name}` has invalid pass_index"))
-                    })
-            })
-            .transpose()?
-            .unwrap_or(0);
+            .and_then(Value::as_u64)
+            .and_then(|index| u32::try_from(index).ok())
+            .filter(|index| i16::try_from(*index).is_ok())
+            .ok_or_else(|| {
+                invalid_intermediate(&format!(
+                    "material `{name}` has missing or invalid pass_index"
+                ))
+            })?;
         let viewport_display = item
             .get("viewport_display")
             .filter(|value| value.is_object())
@@ -3783,7 +3780,7 @@ fn build_imported_graph(
             id,
             Material {
                 name: name.to_owned(),
-                pass_index,
+                pass_index: Some(pass_index),
                 base_color: color,
                 viewport_display,
                 alpha_mode,
@@ -5193,7 +5190,6 @@ fn build_imported_graph(
             .to_owned(),
     };
     let mut losses = import_losses(raw);
-    losses.extend(shader_node_import_losses(&doc));
     losses.extend(uv_project_animated_camera_losses(&doc));
     losses.extend(missing_udim_tile_losses(images, &resource_ids, &doc)?);
     let id_mappings = serde_json::to_value(&mappings).map_err(PotError::internal_json)?;
@@ -5248,6 +5244,7 @@ fn build_imported_graph(
         json!({"intermediate": compatibility_intermediate, "id_mappings": id_mappings.clone(),
             "legacy_texture_names": legacy_texture_names}),
     );
+    losses.extend(shader_node_import_losses(&doc));
     doc.validate()?;
     attach_native_target_vertex_orders(&mut doc);
     Ok(ImportedGraph {
@@ -13132,6 +13129,15 @@ fn socket_rgb(
 /// they are never a loss. Any other mesh attribute is a loss.
 pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
+    for (material_id, material) in &doc.materials {
+        if material.pass_index.is_none() {
+            losses.push(loss(
+                "blender.material.pass_index",
+                Some(material_id.as_str()),
+                "Material.pass_index is unknown, so Blender export would change the material metadata to its default 0",
+            ));
+        }
+    }
     // A USD cache resource has no Blender CacheFile to become: the exporter does not create an Alembic CacheFile
     // on a USD path, so its modifiers are written without a cache file (a no-op in Blender).
     for (resource_id, resource) in &doc.resources {
@@ -14113,6 +14119,18 @@ fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
     let mut losses = Vec::new();
     let mut recorded = BTreeSet::new();
     for (material_id, material) in &doc.materials {
+        let material_pass_index_unknown = material.pass_index.is_none()
+            && doc
+                .compatibility
+                .get("blender_adapter")
+                .and_then(|adapter| adapter.get("id_mappings"))
+                .and_then(Value::as_object)
+                .is_some_and(|mappings| {
+                    mappings.iter().any(|(mapping_key, mapped_id)| {
+                        mapping_key.starts_with("Material:")
+                            && mapped_id.as_str() == Some(material_id.as_str())
+                    })
+                });
         let Some(group_id) = material.node_tree.as_ref() else {
             continue;
         };
@@ -14149,6 +14167,7 @@ fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
             None,
             has_camera,
             path_traced,
+            material_pass_index_unknown,
             &mut group_stack,
             &mut call_sites,
             &mut recorded,
@@ -14167,6 +14186,7 @@ fn collect_shader_node_import_losses(
     sink_socket: Option<&str>,
     has_camera: bool,
     path_traced: bool,
+    material_pass_index_unknown: bool,
     group_stack: &mut BTreeSet<Id>,
     call_sites: &mut Vec<(Id, Id)>,
     recorded: &mut BTreeSet<(String, String)>,
@@ -14280,6 +14300,7 @@ fn collect_shader_node_import_losses(
                     Some(&interface_output.name),
                     has_camera,
                     path_traced,
+                    material_pass_index_unknown,
                     group_stack,
                     call_sites,
                     recorded,
@@ -14313,6 +14334,15 @@ fn collect_shader_node_import_losses(
 
         for output in &outputs {
             let unsupported = match node.node_type.as_str() {
+                "ShaderNodeObjectInfo"
+                    if output == "Material Index" && material_pass_index_unknown =>
+                {
+                    Some((
+                        "shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index"
+                            .to_owned(),
+                        "The Blender-mapped material has no recorded Material.pass_index, so this Object Info output cannot be evaluated without guessing zero.",
+                    ))
+                }
                 "ShaderNodeCameraData" if !has_camera => Some((
                     format!("shader.node.ShaderNodeCameraData.{output}.camera_context"),
                     "Camera Data requires an active camera transform.",
@@ -14998,6 +15028,25 @@ mod tests {
         let losses = export_losses(&doc);
         assert!(losses.iter().any(|loss| loss.feature_id == "cache.usd"
             && loss.data_id.as_deref() == Some("usd_cache_id")));
+    }
+
+    #[test]
+    fn unknown_material_pass_index_is_an_export_loss() -> Result<()> {
+        let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+        let material_id = Id::new("unknown_pass_index")?;
+        doc.materials.insert(
+            material_id.clone(),
+            Material {
+                pass_index: None,
+                ..Material::default()
+            },
+        );
+
+        assert!(export_losses(&doc).iter().any(|loss| {
+            loss.feature_id == "blender.material.pass_index"
+                && loss.data_id.as_deref() == Some(material_id.as_str())
+        }));
+        Ok(())
     }
 
     #[test]
@@ -16220,12 +16269,12 @@ mod tests {
                 "fake_user": false, "users": 2, "rna_properties": {}
             }],
             "materials": [{
-                "name": "Red", "potter_id": "material_red", "base_color": [0.8,0.1,0.2,1],
+                "name": "Red", "potter_id": "material_red", "pass_index": 23, "base_color": [0.8,0.1,0.2,1],
                 "metallic": 0.25, "roughness": 0.4, "double_sided": false,
                 "nodes": {"nodes": [{"name":"Principled BSDF","type":"ShaderNodeBsdfPrincipled"}]},
                 "custom_properties": {}, "fake_user": false, "users": 2
             }, {
-                "name": "Gold", "potter_id": "material_gold", "base_color": [0.8,0.6,0.1,1],
+                "name": "Gold", "potter_id": "material_gold", "pass_index": 0, "base_color": [0.8,0.6,0.1,1],
                 "metallic": 0.4, "roughness": 0.35, "double_sided": false,
                 "nodes": {"nodes": [{"name":"Principled BSDF","type":"ShaderNodeBsdfPrincipled"}]},
                 "custom_properties": {}, "fake_user": false, "users": 1
@@ -16240,6 +16289,25 @@ mod tests {
             "texts": [], "node_groups": [], "other_datablocks": [], "unused_datablocks": []
         }"#).map_err(PotError::internal_json)?;
         validate_intermediate(&raw)?;
+        let mut missing_pass_index = raw.clone();
+        let missing_material = missing_pass_index
+            .get_mut("materials")
+            .and_then(Value::as_array_mut)
+            .and_then(|materials| materials.get_mut(1))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| invalid_intermediate("synthetic material was not imported"))?;
+        assert!(missing_material.remove("pass_index").is_some());
+        let Err(error) = build_imported_graph(
+            &missing_pass_index,
+            Path::new("sample.blend"),
+            b"ORIGINAL".to_vec(),
+            &BTreeMap::new(),
+        ) else {
+            return Err(invalid_intermediate(
+                "material without pass_index was imported",
+            ));
+        };
+        assert!(error.message.contains("missing or invalid pass_index"));
         let imported = build_imported_graph(
             &raw,
             Path::new("sample.blend"),
@@ -16255,6 +16323,14 @@ mod tests {
         assert_eq!(scene.world.as_ref().map(Id::as_str), Some("world_test"));
         assert_eq!(scene.render.resolution_x, 640);
         assert_eq!(scene.render.samples, 12);
+        assert_eq!(
+            imported.doc.materials[&Id::new("material_red")?].pass_index,
+            Some(23)
+        );
+        assert_eq!(
+            imported.doc.materials[&Id::new("material_gold")?].pass_index,
+            Some(0)
+        );
         let world = imported
             .doc
             .worlds
@@ -24312,6 +24388,76 @@ mod workbench_display_loss_tests {
             ["blender.scene.display_background"]
         );
     }
+}
+
+#[test]
+fn blender_material_index_import_loss_requires_a_used_output() -> Result<()> {
+    let mut group = NodeGroup::new("Unknown Material Index", GraphKind::Shader);
+    let output_id = Id::new("output")?;
+    let principled_id = Id::new("principled")?;
+    let object_info_id = Id::new("object_info")?;
+    group.nodes.insert(
+        output_id.clone(),
+        GraphNode::new("ShaderNodeOutputMaterial"),
+    );
+    group.nodes.insert(
+        principled_id.clone(),
+        GraphNode::new("ShaderNodeBsdfPrincipled"),
+    );
+    group.nodes.insert(
+        object_info_id.clone(),
+        GraphNode::new("ShaderNodeObjectInfo"),
+    );
+    group.links = vec![
+        GraphLink {
+            from_node: object_info_id.clone(),
+            from_socket: "Material Index".to_owned(),
+            to_node: principled_id.clone(),
+            to_socket: "Roughness".to_owned(),
+        },
+        GraphLink {
+            from_node: principled_id,
+            from_socket: "BSDF".to_owned(),
+            to_node: output_id,
+            to_socket: "Surface".to_owned(),
+        },
+    ];
+
+    let graph_id = Id::new("unknown_material_index_graph")?;
+    let material_id = Id::new("unknown_material_index")?;
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    doc.node_groups.insert(graph_id.clone(), group);
+    doc.materials.insert(
+        material_id.clone(),
+        Material {
+            name: "Imported".to_owned(),
+            pass_index: None,
+            node_tree: Some(graph_id.clone()),
+            ..Material::default()
+        },
+    );
+    doc.compatibility.insert(
+        "blender_adapter".to_owned(),
+        json!({"id_mappings":{"Material:Imported":material_id}}),
+    );
+
+    let feature_id = "shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index";
+    let losses = shader_node_import_losses(&doc);
+    assert!(losses.iter().any(|loss| {
+        loss.feature_id == feature_id && loss.data_id.as_deref() == Some("object_info")
+    }));
+
+    doc.node_groups
+        .get_mut(&graph_id)
+        .ok_or_else(|| invalid_intermediate("shader test graph is missing"))?
+        .links
+        .retain(|link| link.from_node != object_info_id);
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+    Ok(())
 }
 
 #[test]

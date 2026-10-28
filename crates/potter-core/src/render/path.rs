@@ -3328,7 +3328,7 @@ impl RealtimeVolumeSample<'_, '_> {
             context.object_color = object.object_color;
             context.object_pass_index = object.object_pass_index;
             context.object_random_number = object.object_random_number;
-            context.material_pass_index = f64::from(material.pass_index);
+            context.material_pass_index = material.pass_index.map(f64::from);
             context.generated = medium.generated_origin
                 + DVec3::new(
                     local_point.x * medium.generated_per_local.x,
@@ -8206,7 +8206,7 @@ fn collect_volumes<'a>(
                 .and_then(|paths| paths.first())
                 .is_none_or(Vec::is_empty)
                 .then(|| f64::from(crate::blender_rng::cycles_object_random_number(&node.name)));
-            context.material_pass_index = f64::from(material.pass_index);
+            context.material_pass_index = material.pass_index.map(f64::from);
             context.path_traced = path_traced;
             context.light_falloff_distance = path_traced.then_some(0.0);
             // Cycles maps a volume's Generated as `(P - min) * safe_divide(1, size)` (`blender/volume.cpp`), so a
@@ -8439,7 +8439,7 @@ mod volume_shader_context_tests {
 
         let material = Material {
             name: "Volume object-info context".to_owned(),
-            pass_index: 11,
+            pass_index: Some(11),
             node_tree: Some(graph_id),
             ..Material::default()
         };

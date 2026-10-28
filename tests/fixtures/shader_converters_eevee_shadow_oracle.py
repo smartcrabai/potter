@@ -1,4 +1,4 @@
-"""Blender 5.2.2 EEVEE oracle for a noise-alpha caster with Bump on its shading normal."""
+"""Blender 5.2.2 EEVEE oracle for a transparent caster with Bump on its shading normal."""
 
 import json
 import sys
@@ -11,7 +11,7 @@ if bpy.app.version != (5, 2, 2):
 arguments = sys.argv[sys.argv.index("--") + 1 :]
 blend_out, exr_out, json_out = arguments[:3]
 mode = arguments[3] if len(arguments) > 3 else "normal_only"
-if mode not in ("normal_only", "opacity_bump"):
+if mode not in ("normal_only", "noise_alpha", "opacity_bump"):
     raise ValueError(f"unknown alpha+Bump shadow mode `{mode}`")
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -59,6 +59,10 @@ bump.inputs["Distance"].default_value = 0.2
 caster_tree.links.new(coordinates.outputs["UV"], noise.inputs["Vector"])
 caster_tree.links.new(noise.outputs["Fac"], bump.inputs["Height"])
 if mode == "normal_only":
+    # Keep coverage deterministic across GPU backends; Noise still drives Bump Height.
+    principled.inputs["Alpha"].default_value = 0.5
+    caster_tree.links.new(bump.outputs["Normal"], principled.inputs["Normal"])
+elif mode == "noise_alpha":
     caster_tree.links.new(noise.outputs["Fac"], principled.inputs["Alpha"])
     caster_tree.links.new(bump.outputs["Normal"], principled.inputs["Normal"])
 else:

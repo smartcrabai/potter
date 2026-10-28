@@ -508,8 +508,13 @@ fn complete_scene_schema(root: &mut Value) {
     let material = &mut defs["material"];
     material["properties"]["use_transparent_shadow"] = json!({"type":"boolean"});
     material["properties"]["use_bump_map_correction"] = json!({"type":"boolean"});
-    material["properties"]["pass_index"] =
-        json!({"type":"integer","minimum":0,"maximum":i16::MAX,"default":0});
+    material["properties"]["pass_index"] = json!({
+        "oneOf":[
+            {"type":"integer","minimum":0,"maximum":i16::MAX},
+            {"type":"null"}
+        ],
+        "default":0
+    });
     material["required"] = json!([
         "name",
         "pass_index",
@@ -3453,6 +3458,21 @@ mod tests {
             Some(crate::ops::OP_NAMES.len() + 4)
         );
     }
+    #[test]
+    fn material_pass_index_schema_preserves_null_and_integer_range() -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let pass_index = &scene["$defs"]["material"]["properties"]["pass_index"];
+        assert_eq!(pass_index["oneOf"][0]["type"], "integer");
+        assert_eq!(pass_index["oneOf"][0]["minimum"], 0);
+        assert_eq!(pass_index["oneOf"][0]["maximum"], i16::MAX);
+        assert_eq!(pass_index["oneOf"][1]["type"], "null");
+
+        let create = schema("operations", Some("material.create"))?;
+        assert_eq!(create["properties"]["pass_index"]["minimum"], 0);
+        assert_eq!(create["properties"]["pass_index"]["maximum"], i16::MAX);
+        Ok(())
+    }
+
     #[test]
     fn sequencer_font_and_wrap_width_are_optional_and_typed() -> crate::error::Result<()> {
         let scene = schema("scene", None)?;

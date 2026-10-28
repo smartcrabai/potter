@@ -17,8 +17,9 @@ use native_oracle::{
     write_script,
 };
 use potter_core::{
+    graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
     image::{ImageData, ImageInterpolation, load_image_data, sample},
-    model::{Image, SceneDoc},
+    model::{Id, Image, Material, Registry, SceneDoc},
     shader::{HitContext, evaluate_surface},
 };
 use serde_json::{Value, json};
@@ -59,6 +60,12 @@ fn imported_shader_converters_match_blender_cycles_oracle() -> TestResult {
         "converter fixture re-import lost data: {roundtrip_report}"
     );
     let document: SceneDoc = serde_json::from_value(read_scene(&roundtrip_project)?)?;
+    let material_index = document
+        .materials
+        .values()
+        .find(|material| material.name == "Object Info Material Index")
+        .ok_or("missing imported material-index material")?;
+    assert_eq!(material_index.pass_index, Some(23));
     for (name, pixel_index) in [
         ("Color Converters", 0),
         ("Blackbody", 1),
@@ -152,6 +159,62 @@ fn imported_shader_converters_match_blender_cycles_oracle() -> TestResult {
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn object_info_material_index_refuses_unknown_material_pass_index() -> TestResult {
+    let mut graph = NodeGroup::new("Unknown Material Index", GraphKind::Shader);
+    let output = Id::new("output")?;
+    let principled = Id::new("principled")?;
+    let object_info = Id::new("object_info")?;
+    graph
+        .nodes
+        .insert(output.clone(), GraphNode::new("ShaderNodeOutputMaterial"));
+    graph.nodes.insert(
+        principled.clone(),
+        GraphNode::new("ShaderNodeBsdfPrincipled"),
+    );
+    graph
+        .nodes
+        .insert(object_info.clone(), GraphNode::new("ShaderNodeObjectInfo"));
+    graph.links = vec![
+        GraphLink {
+            from_node: object_info,
+            from_socket: "Material Index".to_owned(),
+            to_node: principled.clone(),
+            to_socket: "Roughness".to_owned(),
+        },
+        GraphLink {
+            from_node: principled,
+            from_socket: "BSDF".to_owned(),
+            to_node: output,
+            to_socket: "Surface".to_owned(),
+        },
+    ];
+
+    let graph_id = Id::new("material_index_graph")?;
+    let mut groups = Registry::default();
+    groups.insert(graph_id.clone(), graph);
+    let material = Material {
+        pass_index: None,
+        node_tree: Some(graph_id),
+        ..Material::default()
+    };
+    let mut context = HitContext::new(&groups);
+    context.material_pass_index = material.pass_index.map(f64::from);
+    let error = evaluate_surface(&material, &context)
+        .err()
+        .ok_or("unknown material pass index was accepted")?;
+
+    assert_eq!(
+        error.code,
+        potter_core::error::ErrorCode::UnsupportedFeature
+    );
+    assert_eq!(
+        error.details["feature_id"],
+        "shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index"
+    );
     Ok(())
 }
 
@@ -411,6 +474,49 @@ fn realtime_transparent_shadow_skips_normal_only_bump_height() -> TestResult {
     assert!(
         potter_shadow < potter_lit,
         "Potter's realtime alpha+Bump caster must leave a transparent shadow, not abort or occlude opaquely: shadow={potter_shadow}, lit={potter_lit}"
+    );
+    Ok(())
+}
+
+#[test]
+fn realtime_transparent_shadow_with_noise_alpha_keeps_normal_only_bump() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let blend = root.path().join("eevee-noise-alpha-bump-shadow.blend");
+    let exr = root.path().join("eevee-noise-alpha-bump-shadow.exr");
+    let oracle_path = root.path().join("eevee-noise-alpha-bump-shadow.json");
+    let script = write_script(
+        root.path(),
+        "generate_eevee_noise_alpha_bump_shadow.py",
+        include_str!("fixtures/shader_converters_eevee_shadow_oracle.py"),
+    )?;
+    run_blender_arguments(
+        &blender,
+        &script,
+        None,
+        &[&blend, &exr, &oracle_path, Path::new("noise_alpha")],
+    )?;
+    let (project, report) =
+        import_blend(&blender, root.path(), "eevee_noise_alpha_shadow", &blend)?;
+    assert!(
+        losses(&report).is_empty(),
+        "noise-alpha, normal-only Bump import lost data: {report}"
+    );
+    let image = render_imported_scene(
+        &project,
+        root.path(),
+        "eevee_noise_alpha_bump_shadow",
+        "realtime",
+        [64, 64],
+        16,
+    )?;
+    let potter_shadow = shadow_patch_mean(&image, 16);
+    let potter_lit = shadow_patch_mean(&image, 38);
+    assert!(
+        potter_shadow < potter_lit,
+        "noise-alpha, normal-only Bump must keep a transparent shadow: shadow={potter_shadow}, lit={potter_lit}"
     );
     Ok(())
 }

@@ -9754,7 +9754,8 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat = bpy.data.materials.new(item["name"])
         viewport = item.get("viewport_display")
         mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
-        mat.pass_index = int(item.get("pass_index", 0))
+        if item.get("pass_index") is not None:
+            mat.pass_index = int(item["pass_index"])
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         fresh = next((node for node in mat.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)

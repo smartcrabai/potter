@@ -626,10 +626,10 @@ fn json_error(error: &serde_json::Error) -> PotError {
 }
 
 /// Upgrades a scene document in place through schema version 16. Version 12 constraint states move
-/// to compatibility data, version 14 migrates legacy Geometry Nodes Mesh to Points domains, version
-/// 15 marks Blender-mapped shader nodes without stored output defaults, and version 11 retires
-/// unsupported animation outputs. `root` is the project directory that holds image blobs and linked
-/// sources, which the version 3 to 4 step reads.
+/// to compatibility data, version 14 migrates legacy Geometry Nodes Mesh to Points domains, and
+/// version 15 marks Blender-mapped materials without saved pass indices unknown and shader nodes
+/// without stored output defaults. Version 11 retires unsupported animation outputs. `root` is the
+/// project directory that holds image blobs and linked sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
@@ -1399,8 +1399,36 @@ fn upgrade_v13(value: &mut Value) -> Vec<Value> {
 }
 fn upgrade_v15(value: &mut Value) -> Result<Vec<Value>> {
     let targets = legacy_shader_output_default_targets(value);
+    let material_targets = legacy_blender_material_pass_index_targets(value);
     let mut entries = Vec::with_capacity(targets.len());
-    let mut warnings = Vec::with_capacity(targets.len());
+    let mut material_entries = Vec::with_capacity(material_targets.len());
+    let mut warnings = Vec::with_capacity(targets.len() + material_targets.len());
+    for (material_id, material_name) in material_targets {
+        let Some(material) = value
+            .get_mut("materials")
+            .and_then(|materials| materials.get_mut(&material_id))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if material.contains_key("pass_index") {
+            continue;
+        }
+        material.insert("pass_index".to_owned(), Value::Null);
+        material_entries.push(json!({
+            "material_id":material_id,
+            "material_name":material_name,
+        }));
+        warnings.push(json!({
+            "code":"material.pass_index_unavailable_migrated",
+            "feature_id":"shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index",
+            "message":format!(
+                "Blender-mapped material `{material_name}` has no recorded pass_index; its value is marked unknown so Object Info Material Index will not guess zero"
+            ),
+            "material_id":material_id,
+            "material_name":material_name,
+        }));
+    }
     for (group_id, node_id, node_type) in targets {
         let Some(node) = value
             .get_mut("node_groups")
@@ -1440,8 +1468,67 @@ fn upgrade_v15(value: &mut Value) -> Result<Vec<Value>> {
         }));
     }
     preserve_unavailable_shader_output_defaults(value, entries)?;
+    preserve_unavailable_material_pass_indices(value, material_entries)?;
     value["schema_version"] = json!(16);
     Ok(warnings)
+}
+
+fn legacy_blender_material_pass_index_targets(value: &Value) -> BTreeSet<(String, String)> {
+    let Some(mappings) = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .and_then(|adapter| adapter.get("id_mappings"))
+        .and_then(Value::as_object)
+    else {
+        return BTreeSet::new();
+    };
+    let Some(materials) = value.get("materials").and_then(Value::as_object) else {
+        return BTreeSet::new();
+    };
+    mappings
+        .iter()
+        .filter_map(|(mapping_key, mapped_id)| {
+            let material_name = mapping_key.strip_prefix("Material:")?;
+            let material_id = mapped_id.as_str()?;
+            materials
+                .get(material_id)
+                .and_then(Value::as_object)
+                .is_some_and(|material| !material.contains_key("pass_index"))
+                .then(|| (material_id.to_owned(), material_name.to_owned()))
+        })
+        .collect()
+}
+
+fn preserve_unavailable_material_pass_indices(
+    value: &mut Value,
+    entries: Vec<Value>,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let document = value
+        .as_object_mut()
+        .ok_or_else(|| invalid("scene document must be an object"))?;
+    let compatibility = document
+        .entry("compatibility".to_owned())
+        .or_insert_with(|| json!({}));
+    let compatibility = compatibility
+        .as_object_mut()
+        .ok_or_else(|| invalid("scene compatibility data must be an object"))?;
+    let adapter = compatibility
+        .entry("blender_adapter".to_owned())
+        .or_insert_with(|| json!({}));
+    let adapter = adapter
+        .as_object_mut()
+        .ok_or_else(|| invalid("Blender adapter compatibility data must be an object"))?;
+    let unavailable = adapter
+        .entry("material_pass_index_unavailable".to_owned())
+        .or_insert_with(|| json!([]));
+    let unavailable = unavailable
+        .as_array_mut()
+        .ok_or_else(|| invalid("material_pass_index_unavailable must be an array"))?;
+    unavailable.extend(entries);
+    Ok(())
 }
 
 fn legacy_shader_output_default_targets(value: &Value) -> BTreeSet<(String, String, String)> {
@@ -3963,10 +4050,17 @@ mod tests {
                     }
                 }
             },
+            "materials":{
+                "material_missing":{"name":"Missing"},
+                "material_exact":{"name":"Exact","pass_index":23},
+                "unmapped_missing":{"name":"Unmapped"}
+            },
             "compatibility":{"blender_adapter":{"id_mappings":{
                 "Node:Imported:Value":"value",
                 "Node:Imported:RGB":"rgb",
-                "Node:Imported:Normal":"normal"
+                "Node:Imported:Normal":"normal",
+                "Material:Missing":"material_missing",
+                "Material:Exact":"material_exact"
             }}}
         });
         let mut chained = scene.clone();
@@ -3986,7 +4080,35 @@ mod tests {
                 json!([])
             );
         }
-        assert_eq!(warnings.len(), 3);
+        assert_eq!(
+            scene["materials"]["material_missing"]["pass_index"],
+            Value::Null
+        );
+        assert_eq!(
+            scene["materials"]["material_exact"]["pass_index"],
+            json!(23)
+        );
+        assert!(
+            scene["materials"]["unmapped_missing"]
+                .get("pass_index")
+                .is_none()
+        );
+        assert_eq!(
+            scene["compatibility"]["blender_adapter"]["material_pass_index_unavailable"],
+            json!([{"material_id":"material_missing","material_name":"Missing"}])
+        );
+        assert_eq!(warnings.len(), 4);
+        assert_eq!(
+            warnings[0]["code"],
+            json!("material.pass_index_unavailable_migrated")
+        );
+        assert_eq!(
+            warnings[0]["feature_id"],
+            json!("shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index")
+        );
+        assert!(warnings[1..].iter().all(|warning| {
+            warning["code"] == json!("shader.output_defaults_unavailable_migrated")
+        }));
 
         let chained_warnings =
             upgrade_scene(&mut chained, no_assets()).expect("upgrade chained scene");

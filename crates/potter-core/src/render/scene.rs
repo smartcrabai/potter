@@ -101,7 +101,7 @@ pub(super) struct MaterialColors {
 #[derive(Clone, Debug)]
 struct MaterialColor {
     material_index: usize,
-    material_pass_index: f64,
+    material_pass_index: Option<f64>,
     render_layer: Option<usize>,
     available_mask: Option<Arc<[u64]>>,
 }
@@ -111,7 +111,7 @@ impl MaterialColors {
     fn insert(
         &mut self,
         material_index: usize,
-        material_pass_index: f64,
+        material_pass_index: Option<f64>,
         render_layer: Option<usize>,
         available_mask: Option<Arc<[u64]>>,
     ) {
@@ -852,7 +852,7 @@ pub(super) fn extract_geometry(
                         material_index,
                         materials
                             .get(material_index)
-                            .map_or(0.0, |material| f64::from(material.pass_index)),
+                            .and_then(|material| material.pass_index.map(f64::from)),
                         slot_color_render,
                         slot_color_mask,
                     );
@@ -2753,7 +2753,7 @@ pub(super) fn layered_context<'a>(
     context.object_color = object.object_color;
     context.object_pass_index = object.object_pass_index;
     context.object_random_number = object.object_random_number;
-    context.material_pass_index = material_colors.map_or(0.0, |colors| colors.material_pass_index);
+    context.material_pass_index = material_colors.and_then(|colors| colors.material_pass_index);
     context.normal = pose.normal;
     context.geometric_normal = pose.geometric_normal;
     context.back_facing = pose.back_facing;

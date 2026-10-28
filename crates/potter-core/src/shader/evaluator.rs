@@ -406,7 +406,7 @@ pub struct HitContext<'a> {
     pub object_color: [f64; 4],
     pub object_pass_index: f64,
     pub object_random_number: Option<f64>,
-    pub material_pass_index: f64,
+    pub material_pass_index: Option<f64>,
     /// The render camera's transform into world space; absent when shading has no camera context.
     pub camera_to_world: Option<DMat4>,
     /// The inverse of `camera_to_world`; absent when shading has no camera context.
@@ -470,7 +470,7 @@ impl<'a> HitContext<'a> {
             object_color: [1.0; 4],
             object_pass_index: 0.0,
             object_random_number: None,
-            material_pass_index: 0.0,
+            material_pass_index: None,
             camera_to_world: None,
             world_to_camera: None,
             realtime_position_f32: None,
@@ -2939,7 +2939,16 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             "Color" => Ok(Value::Color(self.hit_ctx.object_color)),
             "Alpha" => Ok(Value::Scalar(self.hit_ctx.object_color[3])),
             "Object Index" => Ok(Value::Scalar(self.hit_ctx.object_pass_index)),
-            "Material Index" => Ok(Value::Scalar(self.hit_ctx.material_pass_index)),
+            "Material Index" => self
+                .hit_ctx
+                .material_pass_index
+                .map(Value::Scalar)
+                .ok_or_else(|| {
+                    unsupported_node(
+                        id,
+                        "ShaderNodeObjectInfo.Material Index.material_pass_index",
+                    )
+                }),
             "Random" => self
                 .hit_ctx
                 .object_random_number
@@ -6766,6 +6775,23 @@ mod tests {
             error.details["feature_id"],
             json!("shader.node.ShaderNodeObjectInfo.Random.object_random_number")
         );
+        let error =
+            evaluate_input_node_output(&groups, &graph_id, &object_id, "Material Index", &context)
+                .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            json!("shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index")
+        );
+
+        context.material_pass_index = Some(23.0);
+        let super::Value::Scalar(actual) =
+            evaluate_input_node_output(&groups, &graph_id, &object_id, "Material Index", &context)
+                .unwrap()
+        else {
+            panic!("Object Info Material Index must be a scalar")
+        };
+        assert_eq!(actual, 23.0);
     }
 
     #[test]

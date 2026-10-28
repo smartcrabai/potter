@@ -105,7 +105,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         ..Material::default()
     };
     if let Some(value) = operation.get("pass_index") {
-        material.pass_index = read_pass_index(engine, value, "pass_index")?;
+        material.pass_index = Some(read_pass_index(engine, value, "pass_index")?);
     }
     if let Some(value) = operation.get("alpha_mode") {
         material.alpha_mode = parse_alpha_mode(
@@ -568,9 +568,9 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 item_changed = true;
             }
             if let Some(value) = pass_index
-                && material.pass_index != value
+                && material.pass_index != Some(value)
             {
-                material.pass_index = value;
+                material.pass_index = Some(value);
                 item_changed = true;
             }
             if let Some(value) = &alpha_mode

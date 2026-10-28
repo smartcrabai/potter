@@ -7,7 +7,7 @@ use potter_core::{
     graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
     image::{ImageData, ImageInterpolation},
     model::{Id, Material, Registry, TextureRef},
-    shader::{HitContext, HitUvLayers, evaluate_surface, height_gradient},
+    shader::{HitContext, HitDifferentials, HitUvLayers, evaluate_surface, height_gradient},
 };
 use serde_json::{Value, json};
 
@@ -54,6 +54,26 @@ impl Layers {
             render: self.render,
             available_mask: None,
         }
+    }
+
+    fn realtime_hit<'a>(&'a self, groups: &'a Registry<NodeGroup>) -> HitContext<'a> {
+        let render_uvs = self
+            .render
+            .map_or([[0.0; 2]; 3], |index| self.corners[index]);
+        let mut context = HitContext::new(groups).with_uv_layers(self.hit());
+        context.realtime_differentials = Some(HitDifferentials {
+            world_dx: POSITIONS[1] - POSITIONS[0],
+            world_dy: POSITIONS[2] - POSITIONS[0],
+            uv_dx: [
+                render_uvs[1][0] - render_uvs[0][0],
+                render_uvs[1][1] - render_uvs[0][1],
+            ],
+            uv_dy: [
+                render_uvs[2][0] - render_uvs[0][0],
+                render_uvs[2][1] - render_uvs[0][1],
+            ],
+        });
+        context
     }
 }
 
@@ -191,7 +211,7 @@ fn texture_material(uv_layer: Option<&str>) -> (Material, BTreeMap<String, Image
 }
 
 fn surface_normal(material: &Material, groups: &Registry<NodeGroup>, layers: &Layers) -> DVec3 {
-    let context = HitContext::new(groups).with_uv_layers(layers.hit());
+    let context = layers.realtime_hit(groups);
     evaluate_surface(material, &context)
         .unwrap()
         .dominant()
@@ -255,9 +275,7 @@ fn empty_layer_name_is_the_render_layer_and_a_missing_name_warns() {
     let warnings = RefCell::new(Vec::<Value>::new());
 
     let (material, groups) = bump_material(Some(""));
-    let context = HitContext::new(&groups)
-        .with_uv_layers(layers.hit())
-        .with_warnings(&warnings);
+    let context = layers.realtime_hit(&groups).with_warnings(&warnings);
     assert_close(
         evaluate_surface(&material, &context)
             .unwrap()
@@ -269,9 +287,7 @@ fn empty_layer_name_is_the_render_layer_and_a_missing_name_warns() {
     assert!(warnings.borrow().is_empty());
 
     let (material, groups) = bump_material(Some("Missing"));
-    let context = HitContext::new(&groups)
-        .with_uv_layers(layers.hit())
-        .with_warnings(&warnings);
+    let context = layers.realtime_hit(&groups).with_warnings(&warnings);
     assert_close(
         evaluate_surface(&material, &context)
             .unwrap()
