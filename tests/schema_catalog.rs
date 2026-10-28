@@ -1158,11 +1158,15 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         ),
         (
             "shader.input_nodes",
-            "Potter-native materials and source formats without the field use Blender's default 0; .blend imports preserve exact values",
+            "Potter-native materials and source formats without the field use Blender's default 0; fresh `.blend` imports preserve exact values",
         ),
         (
             "shader.input_nodes",
-            ".blend import reports the same gap only when a reachable Material Index output is used",
+            "The unknown state arises only when schema 15-to-16 migration finds a Blender-mapped material record with no saved `pass_index`",
+        ),
+        (
+            "shader.input_nodes",
+            "Blender export reports unknown metadata as `blender.material.pass_index`",
         ),
         (
             "shader.input_nodes",
