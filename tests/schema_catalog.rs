@@ -93,7 +93,7 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
         assert!(result["op"].is_null());
         let schema = result["schema"].clone();
         if kind == "scene" {
-            assert_eq!(schema["properties"]["schema_version"]["const"], 15);
+            assert_eq!(schema["properties"]["schema_version"]["const"], 16);
         }
         let validator = jsonschema::validator_for(&schema)?;
         if matches!(kind, "capabilities" | "formats") {
@@ -1074,6 +1074,10 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "constraint.geometry_attribute.instances",
         "animation.fcurve_non_transform_channels",
         "shader.volume.spectral_extinction",
+        "shader.node_groups",
+        "shader.color_converters",
+        "shader.spectral_nodes",
+        "shader.light_falloff",
         "constraint.copy_scale.modes",
         "constraint.copy_location.offset_invert",
         "constraint.floor.rotation",
@@ -1091,6 +1095,199 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
                 feature["feature_id"] == feature_id && feature["status"] == "supported"
             }),
             "{feature_id} must be reported as supported"
+        );
+    }
+    for feature_id in [
+        "shader.advanced",
+        "shader.vector_space",
+        "shader.input_nodes",
+        "shader.bump",
+    ] {
+        assert!(
+            features.iter().any(|feature| {
+                feature["feature_id"] == feature_id && feature["status"] == "partial"
+            }),
+            "{feature_id} must enumerate its refused shader variants"
+        );
+    }
+    for (feature_id, expected) in [
+        ("shader.advanced", "Cycles/SVM semantics"),
+        (
+            "shader.advanced",
+            "Group Input resolves lazily from the current hit context",
+        ),
+        (
+            "shader.advanced",
+            "Volume hit contexts preserve the object's Color/Alpha/Object Index/Random and material pass index",
+        ),
+        (
+            "shader.advanced",
+            "Cycles path contexts retain exact path distance for Light Falloff",
+        ),
+        (
+            "shader.light_falloff",
+            "volume path contexts retain exact path distance while realtime uses no distance (`None`)",
+        ),
+        (
+            "shader.vector_space",
+            "Cycles applies its convention-specific remap and backface flip",
+        ),
+        (
+            "shader.spectral_nodes",
+            "EEVEE Blackbody/Wavelength 257-entry spectrum tables",
+        ),
+        (
+            "shader.vector_space",
+            "Only a differing conversion involving CAMERA is refused when the active camera matrix is missing",
+        ),
+        (
+            "shader.input_nodes",
+            "EEVEE True Normal is geometric, Pointiness is 0.5, and Random Per Island is 0.0",
+        ),
+        (
+            "shader.input_nodes",
+            "View Z Depth is signed in Cycles and absolute in EEVEE",
+        ),
+        (
+            "shader.input_nodes",
+            "volume hit contexts preserve object Color/Alpha/Object Index/Random and material pass index",
+        ),
+        (
+            "shader.input_nodes",
+            "Camera Data requires an active camera matrix",
+        ),
+        ("shader.advanced", "empty potter_output_defaults"),
+        (
+            "shader.advanced",
+            "Only reachable Blender-origin Value/RGB/Normal nodes",
+        ),
+        (
+            "shader.color_converters",
+            "Cycles final clamp and EEVEE unclamped",
+        ),
+        ("shader.spectral_nodes", "257-entry spectrum tables"),
+        (
+            "shader.vector_space",
+            "realtime stereo uses per-eye camera matrices",
+        ),
+        (
+            "shader.input_nodes",
+            "Incoming points toward the viewer in both Cycles and EEVEE",
+        ),
+        (
+            "shader.input_nodes",
+            "Reflection uses -reflect(view,N) in both engines",
+        ),
+        ("shader.advanced", "broken/non-shader/recursive groups"),
+        (
+            "shader.input_nodes",
+            "Cycles does not support Pointiness or Random Per Island",
+        ),
+        (
+            "shader.input_nodes",
+            "Camera/Window and UV Map from_instancer remain unsupported",
+        ),
+        (
+            "shader.bump",
+            "EEVEE Bump evaluates from screen-space position and render-UV derivatives",
+        ),
+        (
+            "shader.bump",
+            "Cycles Bump uses its separate exact HitFootprint",
+        ),
+        (
+            "shader.bump",
+            "Realtime transparent-shadow opacity evaluation skips Bump used only for shading",
+        ),
+        (
+            "shader.bump",
+            "shader.node.Bump.realtime_transparent_shadow_height",
+        ),
+        (
+            "shader.node.Bump.realtime_transparent_shadow_height",
+            "active EEVEE scene uses a material whose Bump output reaches Principled Alpha, Transparent color, or Mix Shader coverage",
+        ),
+        (
+            "shader.node.Bump.realtime_transparent_shadow_height",
+            "including through shader groups",
+        ),
+        (
+            "shader.bump",
+            "Camera Data also retains the unshifted center point during shifted Height sampling in both engines",
+        ),
+        (
+            "shader.bump",
+            "Cycles keeps Geometry Normal at the center value",
+        ),
+        ("shader.bump", "the Geometry ID applies only to EEVEE"),
+        (
+            "shader.bump",
+            "During shifted Height sampling in either engine, an available interpolated mesh-corner Attribute or Vertex Color output is refused",
+        ),
+        ("shader.bump", "Unlinked Height is a no-op in both engines"),
+        (
+            "shader.bump",
+            "shader.node.ShaderNodeAttribute.bump_height_interpolation",
+        ),
+        (
+            "shader.bump",
+            "shader.node.ShaderNodeVertexColor.bump_height_interpolation",
+        ),
+        (
+            "shader.bump",
+            "per-corner color data is unavailable for differentiation",
+        ),
+        (
+            "shader.bump",
+            "Missing-layer constant fallbacks remain supported",
+        ),
+        (
+            "shader.bump",
+            "Import-loss scanning reports these IDs only for a reachable Bump Height chain",
+        ),
+        (
+            "shader.bump",
+            "scene-linked, render-visible mesh using the material",
+        ),
+        (
+            "shader.bump",
+            "Missing-layer constant fallbacks remain supported and do not emit the two color import-loss IDs",
+        ),
+        ("shader.bump", "without a footprint remain unsupported"),
+        (
+            "shader.bump",
+            "hit-dependent Geometry Incoming/Tangent and Texture Coordinate Normal/Reflection outputs are refused",
+        ),
+        (
+            "shader.bump",
+            "EEVEE additionally refuses shifted Geometry Normal",
+        ),
+        (
+            "shader.bump",
+            "Position/Object/Generated/UV, UV Map, Geometry Parametric, Camera Data, True Normal/Backfacing",
+        ),
+        (
+            "shader.bump",
+            "EEVEE Pointiness/Random Per Island (0.5/0.0) remain supported in shifted samples",
+        ),
+        (
+            "shader.bump",
+            "shader.node.ShaderNodeNewGeometry.bump_height_interpolation",
+        ),
+        (
+            "shader.bump",
+            "shader.node.ShaderNodeTexCoord.bump_height_interpolation",
+        ),
+    ] {
+        let feature = features
+            .iter()
+            .find(|feature| feature["feature_id"] == feature_id)
+            .unwrap_or_else(|| panic!("{feature_id} must be listed in the catalog"));
+        let name = feature["name"].as_str().unwrap_or("");
+        let reason = feature["reason"].as_str().unwrap_or("");
+        assert!(
+            name.contains(expected) || reason.contains(expected),
+            "{feature_id} must describe {expected}"
         );
     }
     let image_surface_format = features
@@ -1233,6 +1430,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "blender.curve.bevel_object",
         "modifier.uv_project.animated_camera_lens",
         "shader.volume.spectral_extinction.realtime_scattering",
+        "shader.node.Bump.realtime_transparent_shadow_height",
         "text.font.external.format",
         "text.font.external.resource",
         "text.font.external.charmap",

@@ -1,0 +1,37 @@
+{
+  "engine": "Blender 5.2.2 EEVEE",
+  "fixture": "realtime_volume_context.blend",
+  "vdb": "../openvdb_transform_types/density.vdb",
+  "resolution": [
+    16,
+    16
+  ],
+  "samples": 8,
+  "object": {
+    "name": "Random Target",
+    "color": [
+      0.20000000298023224,
+      0.4000000059604645,
+      0.6000000238418579,
+      0.699999988079071
+    ],
+    "pass_index": 29,
+    "material_pass_index": 11
+  },
+  "probe": {
+    "pixel": [
+      8,
+      8
+    ],
+    "uv": [
+      0.53125,
+      0.53125
+    ],
+    "rgba": [
+      0.87646484375,
+      1.7529296875,
+      2.58984375,
+      1.0
+    ]
+  }
+}

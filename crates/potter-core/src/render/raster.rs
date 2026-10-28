@@ -1,6 +1,6 @@
 use std::f64::consts::TAU;
 
-use glam::{DVec3, Vec3};
+use glam::{DMat4, DVec3, Vec3};
 use serde::{Deserialize, Serialize};
 
 use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, WireSegment};
@@ -8,6 +8,7 @@ use crate::error::{ErrorCode, PotError, Result};
 use crate::float::equal_f64;
 use crate::geom::GeneratedCorners;
 use crate::model::{CameraData, CameraProjection, RayKind};
+use crate::shader::HitDifferentials;
 
 /// A camera projection in Blender's units: angles in radians, lengths in millimetres.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -324,7 +325,7 @@ impl Triangle {
 }
 
 /// Where a visible hit lies on its triangle, for per-pixel shading.
-pub(crate) struct SurfaceHit {
+pub(crate) struct SurfaceHit<'a> {
     /// Hit point in world space.
     pub(crate) point: DVec3,
     /// Shadow-ray origin (see [`smooth_shadow_origin`]).
@@ -333,6 +334,14 @@ pub(crate) struct SurfaceHit {
     pub(crate) normal: DVec3,
     /// Unit triangle normal.
     pub(crate) geometric: DVec3,
+    /// Face-forwarded geometric normal supplied to the shader context.
+    pub(crate) geometric_normal: DVec3,
+    /// Whether the un-oriented face normal points away from the camera ray.
+    pub(crate) back_facing: bool,
+    /// The EEVEE screen-space derivatives at this hit.
+    pub(crate) realtime_differentials: HitDifferentials,
+    /// The camera matrices for the eye that produced this hit.
+    pub(crate) camera_matrices: Option<&'a (DMat4, DMat4)>,
     /// Barycentric weights of the hit over the triangle's corners.
     pub(crate) barycentric: [f64; 3],
     /// Unit direction from the hit back toward the camera.
@@ -364,7 +373,7 @@ impl SurfaceSample {
 
 /// Linear RGBA and the transparent tint at `hit` on `triangle`.
 pub(crate) trait SurfaceShader {
-    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample>;
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit<'_>) -> Result<SurfaceSample>;
 
     fn worker(&self) -> Result<Option<Box<dyn SurfaceShaderWorker + Send + '_>>> {
         Ok(None)
@@ -377,7 +386,7 @@ pub(crate) trait SurfaceShaderWorker: Send {
     fn shade(
         &self,
         triangle: &Triangle,
-        hit: &SurfaceHit,
+        hit: &SurfaceHit<'_>,
         warnings: &std::cell::RefCell<Vec<serde_json::Value>>,
     ) -> Result<SurfaceSample>;
 }
@@ -392,7 +401,7 @@ enum RasterShader<'a> {
 }
 
 impl RasterShader<'_> {
-    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit<'_>) -> Result<SurfaceSample> {
         match self {
             Self::Main(shader) => shader.shade(triangle, hit),
             Self::Worker(shader, warnings) => shader.shade(triangle, hit, warnings),
@@ -407,20 +416,42 @@ pub(crate) struct ViewBasis {
     right: DVec3,
     up: DVec3,
     backward: DVec3,
+    camera_to_world: Option<DMat4>,
+    world_to_camera: Option<DMat4>,
 }
 
 impl ViewBasis {
     pub(crate) fn from_camera(camera: &Camera) -> Result<Self> {
         let (forward, right, up) = view_axes(camera)?;
+        let camera_matrices = (camera.stereo_mode == StereoMode::None).then(|| {
+            let camera_to_world = DMat4::from_cols(
+                right.extend(0.0),
+                up.extend(0.0),
+                (-forward).extend(0.0),
+                camera.position.extend(1.0),
+            );
+            (camera_to_world, camera_to_world.inverse())
+        });
         Ok(Self {
             right,
             up,
             backward: -forward,
+            camera_to_world: camera_matrices.map(|(camera_to_world, _)| camera_to_world),
+            world_to_camera: camera_matrices.map(|(_, world_to_camera)| world_to_camera),
         })
     }
 
+    pub(crate) fn camera_matrices(&self) -> Option<(&DMat4, &DMat4)> {
+        match (&self.camera_to_world, &self.world_to_camera) {
+            (Some(camera_to_world), Some(world_to_camera)) => {
+                Some((camera_to_world, world_to_camera))
+            }
+            _ => None,
+        }
+    }
+
     /// `direction`, given in world space, expressed in view space.
-    pub(crate) fn to_view(self, direction: DVec3) -> DVec3 {
+    pub(crate) fn direction_to_view(&self, direction: DVec3) -> DVec3 {
         DVec3::new(
             direction.dot(self.right),
             direction.dot(self.up),
@@ -1358,6 +1389,29 @@ pub(crate) fn camera_eye(camera: &Camera, eye: f64) -> Camera {
     result
 }
 
+fn camera_matrices_for_raster(camera: &Camera) -> Result<[(DMat4, DMat4); 2]> {
+    if camera.stereo_mode == StereoMode::SideBySide {
+        let left = camera_matrices_for_camera(&camera_eye(camera, -1.0))?;
+        let right = camera_matrices_for_camera(&camera_eye(camera, 1.0))?;
+        Ok([left, right])
+    } else {
+        let matrices = camera_matrices_for_camera(camera)?;
+        Ok([matrices, matrices])
+    }
+}
+
+fn camera_matrices_for_camera(camera: &Camera) -> Result<(DMat4, DMat4)> {
+    let view = ViewBasis::from_camera(camera)?;
+    view.camera_matrices()
+        .map(|(camera_to_world, world_to_camera)| (*camera_to_world, *world_to_camera))
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "camera matrices are unavailable for this eye",
+            )
+        })
+}
+
 /// The scene world's radiance along a view ray. Realtime Beauty shows it where no surface covers a sample, as EEVEE
 /// shows its world, and modes without one show their constant background colour.
 pub(crate) type WorldRadiance<'a> = &'a (dyn Fn(DVec3) -> Result<DVec3> + Send + Sync);
@@ -1488,6 +1542,8 @@ struct FilmCenterRenderContext<'scene> {
     ao_bvh: Option<&'scene super::bvh::Bvh>,
     frame: &'scene CameraFrame,
     camera: &'scene Camera,
+    camera_matrices: &'scene [(DMat4, DMat4); 2],
+    view_index: usize,
     width: u32,
     height: u32,
     width_usize: usize,
@@ -1534,6 +1590,27 @@ impl FilmCenterRenderContext<'_> {
                     x,
                     y,
                 )?;
+                let hit_context = if shader.is_some() {
+                    Some(raster_hit_context(
+                        self.frame,
+                        self.camera,
+                        self.width,
+                        self.height,
+                        RasterPixelSample {
+                            cached: None,
+                            index: 0,
+                            count: 1,
+                            x,
+                            y,
+                            sample_x: 0.5,
+                            sample_y: 0.5,
+                        },
+                        self.camera_matrices,
+                        self.view_index,
+                    )?)
+                } else {
+                    None
+                };
                 let center_hit = match center_ray {
                     Some(ray) => nearest_visible_hit(
                         self.prepared,
@@ -1542,6 +1619,7 @@ impl FilmCenterRenderContext<'_> {
                         ray,
                         self.frame,
                         shader,
+                        hit_context,
                     )?,
                     None => None,
                 };
@@ -1705,9 +1783,10 @@ struct FilmSampleRenderContext<'scene, 'light_context, 'lights> {
     visibility: &'scene super::bvh::Bvh,
     frame: &'scene CameraFrame,
     camera: &'scene Camera,
+    camera_matrices: &'scene [(DMat4, DMat4); 2],
     width: u32,
-    height: u32,
     width_usize: usize,
+    height: u32,
     mode: Mode,
     background: [f64; 4],
     world: Option<WorldRadiance<'scene>>,
@@ -1757,6 +1836,7 @@ impl FilmSampleRenderContext<'_, '_, '_> {
                     candidates,
                     frame: self.frame,
                     camera: self.camera,
+                    camera_matrices: self.camera_matrices,
                     width: self.width,
                     height: self.height,
                     mode: self.mode,
@@ -1799,6 +1879,7 @@ struct RasterSampleContext<
     candidates: &'borrow mut Vec<usize>,
     frame: &'scene CameraFrame,
     camera: &'scene Camera,
+    camera_matrices: &'scene [(DMat4, DMat4); 2],
     width: u32,
     height: u32,
     mode: Mode,
@@ -1816,6 +1897,19 @@ struct RasterSampleContext<
 
 impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
     fn shade(&mut self, sample: RasterPixelSample) -> Result<([f64; 4], [f64; 4])> {
+        let hit_context = if self.shader.is_some() {
+            Some(raster_hit_context(
+                self.frame,
+                self.camera,
+                self.width,
+                self.height,
+                sample,
+                self.camera_matrices,
+                self.view_index,
+            )?)
+        } else {
+            None
+        };
         let (sample_ray, sample_hit) = if let Some(cached) = sample.cached {
             cached
         } else {
@@ -1837,6 +1931,7 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
                     ray,
                     self.frame,
                     self.shader,
+                    hit_context,
                 )?,
                 None => None,
             };
@@ -1870,7 +1965,7 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
                 },
             ));
         };
-        self.shade_surface(sample, sample_ray, sample_hit)
+        self.shade_surface(sample, sample_ray, sample_hit, hit_context)
     }
 
     fn shade_surface(
@@ -1878,12 +1973,19 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
         sample: RasterPixelSample,
         sample_ray: Ray,
         sample_hit: Option<VisibleHit>,
+        hit_context: Option<RasterHitContext<'_>>,
     ) -> Result<([f64; 4], [f64; 4])> {
+        let eye_index = camera_light_eye_index(
+            self.camera.stereo_mode,
+            sample.x,
+            self.width,
+            self.view_index,
+        );
         let mut volume_sample = self
             .volume_pass
             .as_deref_mut()
             .map(|volume_pass| {
-                volume_pass.begin_sample(super::path::RealtimeVolumeSampleInfo {
+                volume_pass.begin_sample(&super::path::RealtimeVolumeSampleInfo {
                     camera: self.camera,
                     frame: self.frame,
                     width: self.width,
@@ -1895,13 +1997,8 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
                     ray: (sample_ray.origin, sample_ray.direction),
                     sample_index: sample.index,
                     sample_count: sample.count,
-                    view_index: if self.camera.stereo_mode == StereoMode::SideBySide
-                        && sample.x >= self.width / 2
-                    {
-                        1
-                    } else {
-                        self.view_index
-                    },
+                    view_index: eye_index,
+                    camera_matrices: self.camera_matrices.get(eye_index).copied(),
                 })
             })
             .transpose()?;
@@ -1938,6 +2035,7 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
             self.background,
             self.world,
             self.shader,
+            hit_context,
             sample_hit,
             camera_light_view,
             volume_sample.as_mut(),
@@ -2056,6 +2154,11 @@ fn rasterize_with_samples_for_eye(
         )
     })?;
     let frame = camera_frame(camera, width, height)?;
+    let camera_matrices = if shader.is_some() || volume_pass.is_some() {
+        camera_matrices_for_raster(camera)?
+    } else {
+        [(DMat4::IDENTITY, DMat4::IDENTITY); 2]
+    };
     let prepared = prepare_triangles(triangles, mode)?;
     let visibility = super::bvh::Bvh::build_from_positions(
         prepared.iter().map(|triangle| triangle.source.positions),
@@ -2136,6 +2239,8 @@ fn rasterize_with_samples_for_eye(
             ao_bvh: ao_bvh.as_ref(),
             frame: &frame,
             camera,
+            camera_matrices: &camera_matrices,
+            view_index,
             width,
             height,
             width_usize,
@@ -2175,6 +2280,27 @@ fn rasterize_with_samples_for_eye(
                     )
                 })?;
             let center_ray = ray_for_pixel_in_frame(&frame, camera.position, width, height, x, y)?;
+            let hit_context = if shader.is_some() {
+                Some(raster_hit_context(
+                    &frame,
+                    camera,
+                    width,
+                    height,
+                    RasterPixelSample {
+                        cached: None,
+                        index: 0,
+                        count: 1,
+                        x,
+                        y,
+                        sample_x: 0.5,
+                        sample_y: 0.5,
+                    },
+                    &camera_matrices,
+                    view_index,
+                )?)
+            } else {
+                None
+            };
             let center_hit = match center_ray {
                 Some(ray) => nearest_visible_hit(
                     &prepared,
@@ -2183,6 +2309,7 @@ fn rasterize_with_samples_for_eye(
                     ray,
                     &frame,
                     shader.map(RasterShader::Main),
+                    hit_context,
                 )?,
                 None => None,
             };
@@ -2234,6 +2361,7 @@ fn rasterize_with_samples_for_eye(
                         candidates: &mut candidates,
                         frame: &frame,
                         camera,
+                        camera_matrices: &camera_matrices,
                         width,
                         height,
                         mode,
@@ -2310,6 +2438,7 @@ fn rasterize_with_samples_for_eye(
             visibility: &visibility,
             frame: &frame,
             camera,
+            camera_matrices: &camera_matrices,
             width,
             height,
             width_usize,
@@ -3374,6 +3503,12 @@ fn ray_for_pixel_in_frame(
     ray_for_subpixel_in_frame(frame, camera_position, width, height, x, y, 0.5, 0.5)
 }
 
+#[derive(Clone, Copy)]
+struct RaySampleOffsets {
+    pixel: [f64; 2],
+    lens: [f64; 2],
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "subpixel ray generation keeps pixel and sample coordinates explicit"
@@ -3388,7 +3523,40 @@ fn ray_for_subpixel_in_frame(
     sample_x: f64,
     sample_y: f64,
 ) -> Result<Option<Ray>> {
-    if !pixel_in_bounds(width, height, x, y) || !sample_x.is_finite() || !sample_y.is_finite() {
+    ray_for_subpixel_sample_in_frame(
+        frame,
+        camera_position,
+        width,
+        height,
+        x,
+        y,
+        RaySampleOffsets {
+            pixel: [sample_x, sample_y],
+            lens: [sample_x, sample_y],
+        },
+    )
+}
+
+fn ray_for_subpixel_sample_in_frame(
+    frame: &CameraFrame,
+    camera_position: DVec3,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    sample: RaySampleOffsets,
+) -> Result<Option<Ray>> {
+    let sample_x = sample.pixel[0];
+    let sample_y = sample.pixel[1];
+    let lens_sample_x = sample.lens[0];
+    let lens_sample_y = sample.lens[1];
+    if !pixel_in_bounds(width, height, x, y)
+        || !sample
+            .pixel
+            .iter()
+            .chain(sample.lens.iter())
+            .all(|value| value.is_finite())
+    {
         return Err(PotError::invalid_argument(
             "pixel sample offsets must be finite inside a non-empty image",
         ));
@@ -3485,7 +3653,7 @@ fn ray_for_subpixel_in_frame(
     }) else {
         return Ok(None);
     };
-    if let Some(lens_sample) = frame.lens_sample(sample_x, sample_y) {
+    if let Some(lens_sample) = frame.lens_sample(lens_sample_x, lens_sample_y) {
         let plane_distance =
             lens_sample.focus_distance / ray.direction.dot(frame.forward).max(1.0e-6);
         let focus_point = ray.origin + ray.direction * plane_distance;
@@ -3910,21 +4078,230 @@ fn shading_normal(triangle: &PreparedTriangle, hit: Hit) -> DVec3 {
     })
 }
 
+#[derive(Clone, Copy)]
+struct RasterHitContext<'a> {
+    camera_matrices: Option<&'a (DMat4, DMat4)>,
+    x_neighbor: Option<(Ray, f64)>,
+    y_neighbor: Option<(Ray, f64)>,
+}
+
+fn raster_hit_context<'a>(
+    frame: &CameraFrame,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    sample: RasterPixelSample,
+    camera_matrices: &'a [(DMat4, DMat4); 2],
+    view_index: usize,
+) -> Result<RasterHitContext<'a>> {
+    let (view_start, view_end) = if camera.stereo_mode == StereoMode::SideBySide {
+        let split = width / 2;
+        if sample.x < split {
+            (0, split)
+        } else {
+            (split, width)
+        }
+    } else {
+        (0, width)
+    };
+    // EEVEE's fine derivatives use the adjacent lane in each 2x2 fragment pair.
+    // Shift subpixel offsets for helper lanes outside the view instead of crossing stereo eyes.
+    let local_x = sample.x - view_start;
+    let x_neighbor = if local_x.is_multiple_of(2) {
+        if sample.x + 1 < view_end {
+            (
+                sample.x + 1,
+                sample.y,
+                sample.sample_x,
+                sample.sample_y,
+                1.0,
+            )
+        } else {
+            (
+                sample.x,
+                sample.y,
+                sample.sample_x + 1.0,
+                sample.sample_y,
+                1.0,
+            )
+        }
+    } else {
+        (
+            sample.x - 1,
+            sample.y,
+            sample.sample_x,
+            sample.sample_y,
+            -1.0,
+        )
+    };
+    let y_neighbor = if sample.y.is_multiple_of(2) {
+        if sample.y + 1 < height {
+            (
+                sample.x,
+                sample.y + 1,
+                sample.sample_x,
+                sample.sample_y,
+                1.0,
+            )
+        } else {
+            (
+                sample.x,
+                sample.y,
+                sample.sample_x,
+                sample.sample_y + 1.0,
+                1.0,
+            )
+        }
+    } else {
+        (
+            sample.x,
+            sample.y - 1,
+            sample.sample_x,
+            sample.sample_y,
+            -1.0,
+        )
+    };
+    let (neighbor_x, neighbor_y, neighbor_sample_x, neighbor_sample_y, x_sign) = x_neighbor;
+    let x_neighbor = ray_for_subpixel_sample_in_frame(
+        frame,
+        camera.position,
+        width,
+        height,
+        neighbor_x,
+        neighbor_y,
+        RaySampleOffsets {
+            pixel: [neighbor_sample_x, neighbor_sample_y],
+            lens: [sample.sample_x, sample.sample_y],
+        },
+    )?
+    .map(|ray| (ray, x_sign));
+    let (neighbor_x, neighbor_y, neighbor_sample_x, neighbor_sample_y, y_sign) = y_neighbor;
+    let y_neighbor = ray_for_subpixel_sample_in_frame(
+        frame,
+        camera.position,
+        width,
+        height,
+        neighbor_x,
+        neighbor_y,
+        RaySampleOffsets {
+            pixel: [neighbor_sample_x, neighbor_sample_y],
+            lens: [sample.sample_x, sample.sample_y],
+        },
+    )?
+    .map(|ray| (ray, y_sign));
+    let eye_index = camera_light_eye_index(camera.stereo_mode, sample.x, width, view_index);
+    Ok(RasterHitContext {
+        camera_matrices: camera_matrices.get(eye_index),
+        x_neighbor,
+        y_neighbor,
+    })
+}
+
+fn ray_barycentric_on_triangle(ray: Ray, triangle: &Triangle) -> Option<(f64, [f64; 3])> {
+    let edge1 = triangle.positions[1] - triangle.positions[0];
+    let edge2 = triangle.positions[2] - triangle.positions[0];
+    let p_vector = ray.direction.cross(edge2);
+    let determinant = edge1.dot(p_vector);
+    if !determinant.is_finite() || determinant.abs() <= f64::MIN_POSITIVE {
+        return None;
+    }
+    let inverse_determinant = 1.0 / determinant;
+    let from_vertex = ray.origin - triangle.positions[0];
+    let barycentric_1 = from_vertex.dot(p_vector) * inverse_determinant;
+    let q_vector = from_vertex.cross(edge1);
+    let barycentric_2 = ray.direction.dot(q_vector) * inverse_determinant;
+    let distance = edge2.dot(q_vector) * inverse_determinant;
+    let barycentric = [
+        1.0 - barycentric_1 - barycentric_2,
+        barycentric_1,
+        barycentric_2,
+    ];
+    (distance.is_finite() && barycentric.iter().all(|weight| weight.is_finite()))
+        .then_some((distance, barycentric))
+}
+
+fn differential_on_neighbor(
+    triangle: &Triangle,
+    hit: Hit,
+    ray: Ray,
+    neighbor: Option<(Ray, f64)>,
+) -> (DVec3, [f64; 2]) {
+    let Some((neighbor_ray, sign)) = neighbor else {
+        return (DVec3::ZERO, [0.0; 2]);
+    };
+    let Some((distance, barycentric)) = ray_barycentric_on_triangle(neighbor_ray, triangle) else {
+        return (DVec3::ZERO, [0.0; 2]);
+    };
+    let point = ray.origin + ray.direction * hit.distance;
+    let neighbor_point = neighbor_ray.origin + neighbor_ray.direction * distance;
+    let uv = blend_uv(&triangle.uv, hit.barycentric);
+    let neighbor_uv = blend_uv(&triangle.uv, barycentric);
+    (
+        (neighbor_point - point) * sign,
+        [
+            (neighbor_uv[0] - uv[0]) * sign,
+            (neighbor_uv[1] - uv[1]) * sign,
+        ],
+    )
+}
+
+fn realtime_hit_differentials(
+    triangle: &Triangle,
+    hit: Hit,
+    ray: Ray,
+    context: Option<RasterHitContext<'_>>,
+) -> HitDifferentials {
+    let (world_dx, uv_dx) = differential_on_neighbor(
+        triangle,
+        hit,
+        ray,
+        context.and_then(|context| context.x_neighbor),
+    );
+    let (world_dy, uv_dy) = differential_on_neighbor(
+        triangle,
+        hit,
+        ray,
+        context.and_then(|context| context.y_neighbor),
+    );
+    HitDifferentials {
+        world_dx,
+        world_dy,
+        uv_dx,
+        uv_dy,
+    }
+}
+
 /// The surface sample at a visible hit: the surface shader's when one is present, otherwise the triangle's colour.
 fn hit_color(
     triangle: &PreparedTriangle,
     hit: Hit,
     ray: Ray,
     shader: Option<RasterShader<'_>>,
+    hit_context: Option<RasterHitContext<'_>>,
 ) -> Result<SurfaceSample> {
     match shader {
         Some(shader) => {
             let point = ray.origin + ray.direction * hit.distance;
+            let back_facing = triangle.normal.dot(-ray.direction) < 0.0;
+            let geometric_normal = if back_facing {
+                -triangle.normal
+            } else {
+                triangle.normal
+            };
             let surface = SurfaceHit {
                 point,
                 shadow_point: smooth_shadow_origin(&triangle.source, point, hit.barycentric),
                 normal: shading_normal(triangle, hit),
                 geometric: triangle.normal,
+                geometric_normal,
+                back_facing,
+                realtime_differentials: realtime_hit_differentials(
+                    &triangle.source,
+                    hit,
+                    ray,
+                    hit_context,
+                ),
+                camera_matrices: hit_context.and_then(|context| context.camera_matrices),
                 barycentric: hit.barycentric,
                 view: -ray.direction,
             };
@@ -3941,6 +4318,7 @@ fn nearest_visible_hit(
     ray: Ray,
     frame: &CameraFrame,
     shader: Option<RasterShader<'_>>,
+    hit_context: Option<RasterHitContext<'_>>,
 ) -> Result<Option<VisibleHit>> {
     let mut cursor = None;
     // The ray is fixed, so its candidates are too. The nearest is the least (depth, index) pair
@@ -3968,7 +4346,7 @@ fn nearest_visible_hit(
             return Ok(None);
         };
         let triangle = &triangles[triangle_index];
-        let sample = hit_color(triangle, hit, ray, shader)?;
+        let sample = hit_color(triangle, hit, ray, shader, hit_context)?;
         // The nearest surface with opacity is the pixel's data-pass hit (ids, depth, normals, albedo, AO). A transparent
         // pane that only tints is not, so it cannot change those passes; the Beauty composite finds it separately.
         if sample.has_surface && hit_opacity(&triangle.source, sample.color) > 0.0 {
@@ -3998,6 +4376,7 @@ fn composite_sample_with_association(
     background: [f64; 4],
     world: Option<WorldRadiance<'_>>,
     shader: Option<RasterShader<'_>>,
+    hit_context: Option<RasterHitContext<'_>>,
     cached_hit: Option<VisibleHit>,
     camera_lights: Option<super::path::RealtimeCameraLightSample<'_, '_, '_>>,
     mut volume_sample: Option<&mut super::path::RealtimeVolumeSample<'_, '_>>,
@@ -4018,7 +4397,7 @@ fn composite_sample_with_association(
                 cached.triangle_index == triangle_index && equal_f64(cached.hit.depth, hit.depth)
             })
             .map_or_else(
-                || hit_color(triangle, hit, ray, shader),
+                || hit_color(triangle, hit, ray, shader, hit_context),
                 |cached| {
                     Ok(SurfaceSample {
                         color: cached.color,
@@ -5363,7 +5742,7 @@ mod smooth_shading_tests {
     }
 
     impl SurfaceShader for RecordingShader {
-        fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
+        fn shade(&self, _triangle: &Triangle, hit: &SurfaceHit<'_>) -> Result<SurfaceSample> {
             self.calls
                 .borrow_mut()
                 .push((hit.point, hit.normal, hit.geometric));
@@ -5500,8 +5879,8 @@ mod smooth_shading_tests {
         ];
         let mut triangles = Vec::with_capacity(probes.len() * 2);
         for (_, x, y, offset_x, offset_y, _) in probes {
-            let world_x = -1.0 + (f64::from(x) + 0.5) * 2.0 / f64::from(SIZE);
-            let world_y = 1.0 - (f64::from(y) + 0.5) * 2.0 / f64::from(SIZE);
+            let world_x = -1.0 + (x as f64 + 0.5) * 2.0 / f64::from(SIZE);
+            let world_y = 1.0 - (y as f64 + 0.5) * 2.0 / f64::from(SIZE);
             let center = DVec3::new(world_x + offset_x, world_y + offset_y, 0.0);
             let a = center + DVec3::new(-0.25, -0.25, 0.0);
             let b = center + DVec3::new(0.25, -0.25, 0.0);
@@ -5579,7 +5958,7 @@ mod smooth_shading_tests {
     }
 
     impl SurfaceShader for FrontShader {
-        fn shade(&self, triangle: &Triangle, _hit: &SurfaceHit) -> Result<SurfaceSample> {
+        fn shade(&self, triangle: &Triangle, _hit: &SurfaceHit<'_>) -> Result<SurfaceSample> {
             if triangle.object_index == 1 {
                 Ok(SurfaceSample::opaque(self.rgba))
             } else {
@@ -5912,10 +6291,12 @@ mod visibility_tests {
     use glam::DVec3;
 
     use super::{
-        AlphaMode, Camera, CameraFrame, Hit, Layer, Mode, PreparedTriangle, Projection, Ray,
-        StereoMode, Triangle, camera_frame, composite_layers_with_association,
-        composite_sample_with_association, hit_opacity, intersect_triangle, nearest_visible_hit,
-        prepare_triangles, ray_for_pixel_in_frame,
+        AlphaMode, Camera, CameraFrame, Hit, Layer, Mode, PreparedTriangle, Projection,
+        RasterPixelSample, Ray, StereoMode, Triangle, camera_frame, camera_matrices_for_raster,
+        composite_layers_with_association, composite_sample_with_association, hit_opacity,
+        intersect_triangle, nearest_visible_hit, prepare_triangles, raster_hit_context,
+        ray_barycentric_on_triangle, ray_for_pixel_in_frame, ray_for_subpixel_in_frame,
+        realtime_hit_differentials,
     };
     use crate::float::equal_f64;
     use crate::model::RayVisibility;
@@ -6001,6 +6382,67 @@ mod visibility_tests {
         }
     }
 
+    #[test]
+    fn realtime_hit_differentials_follow_neighbor_rays_and_eye_matrices() {
+        let mut camera = test_camera();
+        camera.projection = Projection::Orthographic { height: 2.0 };
+        let frame = camera_frame(&camera, 4, 4).expect("frame");
+        let matrices = camera_matrices_for_raster(&camera).expect("camera matrices");
+        let mut triangle = triangle([
+            DVec3::new(-10.0, -10.0, 0.0),
+            DVec3::new(10.0, -10.0, 0.0),
+            DVec3::new(-10.0, 10.0, 0.0),
+        ]);
+        triangle.uv = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let sample = RasterPixelSample {
+            cached: None,
+            index: 0,
+            count: 1,
+            x: 1,
+            y: 1,
+            sample_x: 0.5,
+            sample_y: 0.5,
+        };
+        let ray = ray_for_subpixel_in_frame(
+            &frame,
+            camera.position,
+            4,
+            4,
+            sample.x,
+            sample.y,
+            sample.sample_x,
+            sample.sample_y,
+        )
+        .expect("pixel ray")
+        .expect("orthographic ray");
+        let (distance, barycentric) =
+            ray_barycentric_on_triangle(ray, &triangle).expect("plane intersection");
+        let hit = Hit {
+            depth: distance,
+            distance,
+            barycentric,
+            direction: ray.direction,
+        };
+        let context =
+            raster_hit_context(&frame, &camera, 4, 4, sample, &matrices, 0).expect("hit context");
+        let differentials = realtime_hit_differentials(&triangle, hit, ray, Some(context));
+        assert!(differentials.world_dx.abs_diff_eq(DVec3::X * 0.5, 1.0e-12));
+        assert!(
+            differentials
+                .world_dy
+                .abs_diff_eq(DVec3::NEG_Y * 0.5, 1.0e-12)
+        );
+        assert!((differentials.uv_dx[0] - 0.025).abs() < 1.0e-12);
+        assert!(differentials.uv_dx[1].abs() < 1.0e-12);
+        assert!(differentials.uv_dy[0].abs() < 1.0e-12);
+        assert!((differentials.uv_dy[1] + 0.025).abs() < 1.0e-12);
+
+        camera.stereo_mode = StereoMode::SideBySide;
+        let stereo = camera_matrices_for_raster(&camera).expect("stereo matrices");
+        assert!((stereo[0].0.w_axis.x + camera.interocular_distance * 0.5).abs() < 1.0e-12);
+        assert!((stereo[1].0.w_axis.x - camera.interocular_distance * 0.5).abs() < 1.0e-12);
+    }
+
     /// The reference: every prepared triangle, least (depth, index) hit.
     fn scan_nearest(
         triangles: &[PreparedTriangle],
@@ -6082,10 +6524,17 @@ mod visibility_tests {
                     .expect("pixel ray")
                     .expect("the perspective test view has a ray");
                 let expected = scan_nearest(&prepared, ray, &frame);
-                let actual =
-                    nearest_visible_hit(&prepared, &visibility, &mut candidates, ray, &frame, None)
-                        .expect("visibility resolves")
-                        .map(|visible| (visible.triangle_index, visible.hit.depth));
+                let actual = nearest_visible_hit(
+                    &prepared,
+                    &visibility,
+                    &mut candidates,
+                    ray,
+                    &frame,
+                    None,
+                    None,
+                )
+                .expect("visibility resolves")
+                .map(|visible| (visible.triangle_index, visible.hit.depth));
                 assert_eq!(actual, expected, "pixel ({x}, {y})");
                 hit_pixels += usize::from(expected.is_some());
             }
@@ -6121,6 +6570,7 @@ mod visibility_tests {
                     &frame,
                     &camera,
                     BACKGROUND,
+                    None,
                     None,
                     None,
                     None,
@@ -6317,13 +6767,14 @@ mod film_band_tests {
             stereo_mode: StereoMode::SideBySide,
             interocular_distance: 0.065,
         };
+        let view = ViewBasis::from_camera(&camera)?;
         let shader = crate::render::scene::surface_shader(
             &doc,
             &snapshot,
             &images,
             &geometry,
             Mode::Beauty,
-            ViewBasis::from_camera(&camera)?,
+            &view,
         );
         let transport = crate::render::path::prepare_realtime_volume_transport(
             &doc,

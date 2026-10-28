@@ -1816,6 +1816,28 @@ mod tests {
     }
 
     #[test]
+    fn material_pass_index_round_trips_through_typed_operations() {
+        let doc = SceneDoc::new("scene-test".to_owned());
+        let outcome = apply_batch(
+            &doc,
+            &batch(json!([
+                {"op":"material.create","id":"indexed","pass_index":7},
+                {"op":"material.update","target":{"id":"indexed"},"set":{"pass_index":32767}},
+                {"op":"material.create","id":"defaulted"}
+            ])),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.doc.materials[&crate::model::Id::new("indexed").unwrap()].pass_index,
+            32767
+        );
+        assert_eq!(
+            outcome.doc.materials[&crate::model::Id::new("defaulted").unwrap()].pass_index,
+            0
+        );
+    }
+
+    #[test]
     fn create_then_delete_collapses_to_a_noop() {
         let doc = SceneDoc::new("scene-test".to_owned());
         let outcome = apply_batch(

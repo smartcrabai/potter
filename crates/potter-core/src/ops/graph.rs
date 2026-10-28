@@ -354,13 +354,15 @@ fn link(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool>
     let graph = get_graph(engine, &graph_id)?;
     let graph_link = read_link(engine, operation)?;
     ensure_link_nodes(engine, graph, &graph_link)?;
-    crate::graph::validate_link(graph, &graph_link).map_err(|error| {
-        engine.error(
-            error.code,
-            error.message,
-            &operation_pointer(engine.operation_index, "to_socket"),
-        )
-    })?;
+    crate::graph::validate_link_with_groups(graph, &engine.doc.node_groups, &graph_link).map_err(
+        |error| {
+            engine.error(
+                error.code,
+                error.message,
+                &operation_pointer(engine.operation_index, "to_socket"),
+            )
+        },
+    )?;
     if let Some(graph) = engine.doc.node_groups.get_mut(&graph_id) {
         graph.links.push(graph_link);
     }

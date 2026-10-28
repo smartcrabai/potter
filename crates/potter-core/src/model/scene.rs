@@ -127,7 +127,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 15,
+            schema_version: 16,
             scene_id,
             revision: 0,
             active_scene,
@@ -155,7 +155,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 15 {
+        if self.schema_version != 16 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -3499,6 +3499,9 @@ impl ThicknessMode {
 #[serde(deny_unknown_fields)]
 pub struct Material {
     pub name: String,
+    /// Blender's Material Index render pass (`Material.pass_index`, in 0..=32767).
+    #[serde(default)]
+    pub pass_index: u32,
     #[serde(default = "default_color")]
     pub base_color: [f64; 4],
     #[serde(default = "default_alpha_mode")]
@@ -3569,6 +3572,7 @@ impl Default for Material {
     fn default() -> Self {
         Self {
             name: String::new(),
+            pass_index: 0,
             base_color: default_color(),
             alpha_mode: default_alpha_mode(),
             alpha_threshold: default_alpha_threshold(),
@@ -3653,7 +3657,7 @@ mod tests {
     #[test]
     fn default_scene_has_contract_initial_state_and_empty_registries() {
         let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-        assert_eq!(doc.schema_version, 15);
+        assert_eq!(doc.schema_version, 16);
         doc.validate().unwrap();
         let value = serde_json::to_value(doc).unwrap();
         assert_eq!(value["revision"], 0);

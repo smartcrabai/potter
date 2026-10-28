@@ -207,7 +207,7 @@ pub fn render_previews(
             })?
         };
         let view = ViewBasis::from_camera(&prepared.camera)?;
-        let shader = surface_shader(doc, snapshot, &images, geometry, mode, view);
+        let shader = surface_shader(doc, snapshot, &images, geometry, mode, &view);
         let background = background_color(doc, snapshot, mode, false);
         let mut raster = if matches!(mode, Mode::Beauty) {
             super::path::render(
@@ -364,14 +364,8 @@ pub(crate) fn render_camera_frame(
         CameraEngine::Raster
     };
     let camera = stored_camera(doc, &snapshot, camera_id, engine_for_camera)?;
-    let shader = surface_shader(
-        doc,
-        &snapshot,
-        &images,
-        &geometry,
-        mode,
-        ViewBasis::from_camera(&camera.camera)?,
-    );
+    let view = ViewBasis::from_camera(&camera.camera)?;
+    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode, &view);
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)

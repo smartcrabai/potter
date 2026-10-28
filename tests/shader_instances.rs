@@ -5,11 +5,11 @@ use std::{cell::RefCell, collections::BTreeMap};
 use glam::DVec3;
 use potter_core::{
     error::ErrorCode,
-    graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
+    graph::{GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
     image::{ImageData, ImageInterpolation, ImageTileData},
     model::{Id, Material, Registry, SceneDoc, TextureRef},
     ops::apply_batch,
-    shader::{HitContext, HitUvLayers, evaluate_surface},
+    shader::{HitContext, HitDifferentials, HitUvLayers, evaluate_surface},
 };
 use serde_json::json;
 
@@ -677,7 +677,7 @@ fn uv_map_node_samples_its_named_layer_and_falls_back_with_a_warning() {
     assert_eq!(warnings.borrow()[0]["layer"], json!("Missing"));
 }
 #[test]
-fn bump_node_perturbs_principled_normal_from_height_gradient() {
+fn bump_node_uses_realtime_differentials_with_exact_normal() {
     let mut graph = NodeGroup::new("Bump", GraphKind::Shader);
     add_node(&mut graph, "out", "OutputMaterial", &[]);
     add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
@@ -685,9 +685,10 @@ fn bump_node_perturbs_principled_normal_from_height_gradient() {
         &mut graph,
         "bump",
         "ShaderNodeBump",
-        &[("Distance", json!(1.0))],
+        &[("Distance", json!(1.0)), ("Strength", json!(1.0))],
     );
     add_node(&mut graph, "coordinates", "ShaderNodeTexCoord", &[]);
+    add_node(&mut graph, "separate", "ShaderNodeSeparateXYZ", &[]);
     add_node(
         &mut graph,
         "height",
@@ -700,18 +701,154 @@ fn bump_node_perturbs_principled_normal_from_height_gradient() {
         .unwrap()
         .properties
         .insert("operation".to_owned(), json!("MULTIPLY"));
-    link(&mut graph, "coordinates", "UV", "height", "Value");
+    link(&mut graph, "coordinates", "UV", "separate", "Vector");
+    link(&mut graph, "separate", "X", "height", "Value");
     link(&mut graph, "height", "Value", "bump", "Height");
     link(&mut graph, "bump", "Normal", "principled", "Normal");
     link(&mut graph, "principled", "BSDF", "out", "Surface");
+
     let (material, groups) = material_with_graph(graph);
-    let context = HitContext::new(&groups);
+    let mut context = HitContext::new(&groups);
+    context.normal = DVec3::Z;
+    context.geometric_normal = DVec3::Z;
+    context.uv = [0.5, 0.5];
+    context.realtime_differentials = Some(HitDifferentials {
+        world_dx: DVec3::X * 0.1875,
+        world_dy: DVec3::Y * 0.1875,
+        uv_dx: [0.125, 0.0],
+        uv_dy: [0.0, 0.125],
+    });
     let bsdf = *evaluate_surface(&material, &context)
         .unwrap()
         .dominant()
         .unwrap();
-    assert!(bsdf.normal.x < -0.5);
-    assert!(bsdf.normal.z > 0.5);
+    assert!((bsdf.normal.x + 0.554_700_196_225_229_1).abs() < 1.0e-12);
+    assert!(bsdf.normal.y.abs() < 1.0e-12);
+    assert!((bsdf.normal.z - 0.832_050_294_337_843_7).abs() < 1.0e-12);
+}
+
+#[test]
+fn nested_bump_group_input_tracks_shifted_hit_uv() {
+    let inner_id = Id::new("bump_inner").unwrap();
+    let mut inner = NodeGroup::new("Bump Height Group", GraphKind::Shader);
+    inner.interface.inputs.push(GraphSocket {
+        id: "height".to_owned(),
+        name: "Height".to_owned(),
+        socket_type: "NodeSocketFloat".to_owned(),
+        default: json!(0.0),
+    });
+    inner.interface.outputs.push(GraphSocket {
+        id: "normal".to_owned(),
+        name: "Normal".to_owned(),
+        socket_type: "NodeSocketVector".to_owned(),
+        default: json!([0.0, 0.0, 1.0]),
+    });
+    add_node(&mut inner, "input", "NodeGroupInput", &[]);
+    add_node(
+        &mut inner,
+        "bump",
+        "ShaderNodeBump",
+        &[("Distance", json!(1.0))],
+    );
+    add_node(&mut inner, "output", "NodeGroupOutput", &[]);
+    inner
+        .nodes
+        .get_mut(&Id::new("output").unwrap())
+        .unwrap()
+        .properties
+        .insert("is_active_output".to_owned(), json!(true));
+    link(&mut inner, "input", "Height", "bump", "Height");
+    link(&mut inner, "bump", "Normal", "output", "Normal");
+
+    let mut outer = NodeGroup::new("Nested Bump", GraphKind::Shader);
+    add_node(&mut outer, "out", "OutputMaterial", &[]);
+    add_node(&mut outer, "principled", "ShaderNodeBsdfPrincipled", &[]);
+    add_node(&mut outer, "coordinates", "ShaderNodeTexCoord", &[]);
+    add_node(&mut outer, "separate", "ShaderNodeSeparateXYZ", &[]);
+    add_node(
+        &mut outer,
+        "height",
+        "ShaderNodeMath",
+        &[("Value_001", json!(0.0))],
+    );
+    outer
+        .nodes
+        .get_mut(&Id::new("height").unwrap())
+        .unwrap()
+        .properties
+        .insert("operation".to_owned(), json!("MULTIPLY"));
+    let mut instance = GraphNode::new("ShaderNodeGroup");
+    instance
+        .properties
+        .insert("node_tree".to_owned(), json!("bump_inner"));
+    outer
+        .nodes
+        .insert(Id::new("bump_instance").unwrap(), instance);
+    link(&mut outer, "coordinates", "UV", "separate", "Vector");
+    link(&mut outer, "separate", "X", "height", "Value");
+    link(&mut outer, "separate", "X", "height", "Value_001");
+    link(&mut outer, "height", "Value", "bump_instance", "Height");
+    link(
+        &mut outer,
+        "bump_instance",
+        "Normal",
+        "principled",
+        "Normal",
+    );
+    link(&mut outer, "principled", "BSDF", "out", "Surface");
+
+    let (material, mut groups) = material_with_graph(outer);
+    groups.insert(inner_id, inner);
+    let differentials = HitDifferentials {
+        world_dx: DVec3::X * 0.1875,
+        world_dy: DVec3::Y * 0.1875,
+        uv_dx: [0.125, 0.0],
+        uv_dy: [0.0, 0.125],
+    };
+    let evaluate_at = |uv_x| {
+        let mut context = HitContext::new(&groups);
+        context.uv = [uv_x, 0.5];
+        context.realtime_differentials = Some(differentials);
+        *evaluate_surface(&material, &context)
+            .unwrap()
+            .dominant()
+            .unwrap()
+    };
+    let left = evaluate_at(0.2).normal;
+    let right = evaluate_at(0.8).normal;
+    assert!(
+        left.distance(DVec3::Z) > 1.0e-3,
+        "left shifted sample did not perturb the normal: {left:?}"
+    );
+    assert!(
+        right.distance(DVec3::Z) > 1.0e-3,
+        "right shifted sample did not perturb the normal: {right:?}"
+    );
+    assert!(
+        left.distance(right) > 0.1,
+        "shifted UV samples kept the same Bump normal: {left:?}"
+    );
+}
+
+#[test]
+fn bump_node_with_unlinked_height_is_noop() {
+    let mut graph = NodeGroup::new("Bump", GraphKind::Shader);
+    add_node(&mut graph, "out", "OutputMaterial", &[]);
+    add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
+    add_node(
+        &mut graph,
+        "bump",
+        "ShaderNodeBump",
+        &[("Distance", json!(1.0))],
+    );
+    link(&mut graph, "bump", "Normal", "principled", "Normal");
+    link(&mut graph, "principled", "BSDF", "out", "Surface");
+    let (material, groups) = material_with_graph(graph);
+    let bsdf = *evaluate_surface(&material, &HitContext::new(&groups))
+        .unwrap()
+        .dominant()
+        .unwrap();
+    assert_eq!(bsdf.normal, DVec3::Z);
 }
 
 #[test]

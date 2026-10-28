@@ -14,7 +14,7 @@ pub use bake::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord, NodeBa
 pub(crate) use evaluator::{EvaluatedInstances, evaluate_at_frame_with_bakes_and_instances};
 pub use evaluator::{GraphEvaluation, evaluate, evaluate_at_frame, evaluate_at_frame_with_bakes};
 pub use model::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup};
-pub use sockets::validate_link;
+pub use sockets::{validate_link, validate_link_with_groups};
 
 pub(crate) fn is_generated_simple_material_graph(group: &NodeGroup) -> bool {
     if group.kind != GraphKind::Shader

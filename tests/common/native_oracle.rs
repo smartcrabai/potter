@@ -185,6 +185,26 @@ pub fn import_blend(
     name: &str,
     source: &Path,
 ) -> TestResult<(PathBuf, Value)> {
+    import_blend_with_lossy(blender, root, name, source, false)
+}
+
+/// Imports a `.blend` while accepting reported losses, for tests that inspect the retained graph.
+pub fn import_blend_allow_lossy(
+    blender: &Path,
+    root: &Path,
+    name: &str,
+    source: &Path,
+) -> TestResult<(PathBuf, Value)> {
+    import_blend_with_lossy(blender, root, name, source, true)
+}
+
+fn import_blend_with_lossy(
+    blender: &Path,
+    root: &Path,
+    name: &str,
+    source: &Path,
+    allow_lossy: bool,
+) -> TestResult<(PathBuf, Value)> {
     let project = root.join(name);
     pot_json(|command| {
         command.arg("init").arg(&project);
@@ -205,6 +225,9 @@ pub fn import_blend(
                 "--blender",
             ])
             .arg(blender);
+        if allow_lossy {
+            command.arg("--allow-lossy");
+        }
     })?;
     Ok((project, report))
 }

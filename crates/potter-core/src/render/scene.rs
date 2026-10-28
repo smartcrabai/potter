@@ -77,9 +77,18 @@ pub(super) struct ObjectRecord {
     /// EEVEE's default refraction thickness of the object (`transmission_thickness`). Not part of the output.
     #[serde(skip)]
     pub thickness: f64,
+    /// Evaluated world transform for shader nodes. Not part of the output.
+    #[serde(skip)]
+    pub object_to_world: DMat4,
     /// Inverse of the evaluated world matrix; `None` when it is not finite, and the point then stays unchanged.
     #[serde(skip)]
     pub world_to_local: Option<DMat4>,
+    #[serde(skip)]
+    pub object_color: [f64; 4],
+    #[serde(skip)]
+    pub object_pass_index: f64,
+    #[serde(skip)]
+    pub object_random_number: Option<f64>,
 }
 
 /// Color state per material of one object, keyed by `Triangle::material_index` and sorted by it, so a hit
@@ -92,6 +101,7 @@ pub(super) struct MaterialColors {
 #[derive(Clone, Debug)]
 struct MaterialColor {
     material_index: usize,
+    material_pass_index: f64,
     render_layer: Option<usize>,
     available_mask: Option<Arc<[u64]>>,
 }
@@ -101,11 +111,13 @@ impl MaterialColors {
     fn insert(
         &mut self,
         material_index: usize,
+        material_pass_index: f64,
         render_layer: Option<usize>,
         available_mask: Option<Arc<[u64]>>,
     ) {
         let entry = MaterialColor {
             material_index,
+            material_pass_index,
             render_layer,
             available_mask,
         };
@@ -251,6 +263,7 @@ struct ShadowOccluders<'a> {
     geometry: &'a TraceGeometry<'a>,
     images: &'a BTreeMap<String, ImageData>,
     workspace: &'a RefCell<EvaluatorWorkspace>,
+    camera_matrices: Option<(&'a DMat4, &'a DMat4)>,
     error: RefCell<Option<PotError>>,
 }
 
@@ -260,12 +273,14 @@ impl<'a> ShadowOccluders<'a> {
         geometry: &'a TraceGeometry<'a>,
         images: &'a BTreeMap<String, ImageData>,
         workspace: &'a RefCell<EvaluatorWorkspace>,
+        camera_matrices: Option<(&'a DMat4, &'a DMat4)>,
     ) -> Self {
         Self {
             doc,
             geometry,
             images,
             workspace,
+            camera_matrices,
             error: RefCell::new(None),
         }
     }
@@ -322,6 +337,7 @@ impl<'a> ShadowOccluders<'a> {
             origin,
             direction,
             self.images,
+            self.camera_matrices,
             &mut self.workspace.borrow_mut(),
         )?;
         Ok(Some(transparent_shadow_pass(&shading.closures)))
@@ -637,16 +653,22 @@ pub(super) fn extract_geometry(
         let texture_space = undeformed
             .and_then(Mesh::manual_texture_space)
             .unwrap_or_else(|| TextureSpace::automatic(undeformed.and_then(Mesh::bounds)));
+        let instance_path = snapshot
+            .instance_paths
+            .get(node_id)
+            .and_then(|paths| paths.first())
+            .cloned()
+            .unwrap_or_default();
+        let object_color = object_info_color(node);
+        let object_pass_index = object_info_pass_index(node);
+        let object_random_number = instance_path
+            .is_empty()
+            .then(|| f64::from(crate::blender_rng::cycles_object_random_number(&node.name)));
         objects.push(ObjectRecord {
             index: object_index,
             node_id: node_id.clone(),
             data_id: node.data.clone(),
-            instance_path: snapshot
-                .instance_paths
-                .get(node_id)
-                .and_then(|paths| paths.first())
-                .cloned()
-                .unwrap_or_default(),
+            instance_path,
             uv_layers: uv_names.clone(),
             uv_render,
             color_layers: carried_layers
@@ -656,7 +678,11 @@ pub(super) fn extract_geometry(
             color_layer_indices: carried,
             thickness,
             material_colors: MaterialColors::default(),
+            object_to_world: matrix,
             world_to_local: object_inverse(matrix),
+            object_color,
+            object_pass_index,
+            object_random_number,
         });
         if let Some(mesh) = mesh
             && !mesh.vertices.is_empty()
@@ -824,6 +850,9 @@ pub(super) fn extract_geometry(
                     })?;
                     object.material_colors.insert(
                         material_index,
+                        materials
+                            .get(material_index)
+                            .map_or(0.0, |material| f64::from(material.pass_index)),
                         slot_color_render,
                         slot_color_mask,
                     );
@@ -992,6 +1021,7 @@ pub(super) fn extract_geometry(
                             material,
                             prepared_material,
                             matrix,
+                            path_traced,
                             &triangle,
                             images,
                             object,
@@ -1616,6 +1646,7 @@ fn subdivide_displaced_triangle(
     material: &Material,
     prepared: &PreparedMaterial,
     object_to_world: DMat4,
+    path_traced: bool,
     triangle: &Triangle,
     images: &BTreeMap<String, ImageData>,
     object: &ObjectRecord,
@@ -1635,6 +1666,11 @@ fn subdivide_displaced_triangle(
                 point: sample.point,
                 object: sample.object,
                 normal: sample.normal,
+                geometric_normal: (triangle.positions[1] - triangle.positions[0])
+                    .cross(triangle.positions[2] - triangle.positions[0])
+                    .normalize_or_zero(),
+                back_facing: false,
+                path_traced,
                 view: DVec3::Z,
                 barycentric: sample.barycentric,
             },
@@ -2136,7 +2172,7 @@ struct SceneShaderCore<'a> {
     geometry: super::path::SharedGeometry<'a>,
     mode: Mode,
     /// The camera's view space, in which Solid's studio lights are fixed.
-    view: ViewBasis,
+    view: &'a ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
     /// Lazily populated once per render and shared by the serial pass and all band workers.
     world_probe: Arc<OnceLock<Result<Option<Arc<WorldProbe>>>>>,
@@ -2150,7 +2186,7 @@ pub(super) fn surface_shader<'a>(
     images: &'a BTreeMap<String, ImageData>,
     geometry: &'a Geometry,
     mode: Mode,
-    view: ViewBasis,
+    view: &'a ViewBasis,
 ) -> Option<Box<dyn SurfaceShader + 'a>> {
     match mode {
         Mode::Solid => {}
@@ -2173,7 +2209,7 @@ pub(super) fn surface_shader<'a>(
 }
 
 impl SurfaceShader for SceneShader<'_> {
-    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit) -> Result<SurfaceSample> {
+    fn shade(&self, triangle: &Triangle, hit: &SurfaceHit<'_>) -> Result<SurfaceSample> {
         self.core.shade(self.warnings, triangle, hit)
     }
 
@@ -2248,7 +2284,7 @@ impl SceneShaderCore<'_> {
         &self,
         warnings: &RefCell<Vec<serde_json::Value>>,
         triangle: &Triangle,
-        hit: &SurfaceHit,
+        hit: &SurfaceHit<'_>,
     ) -> Result<SurfaceSample> {
         let material = self.geometry.materials.get(triangle.material_index);
         let prepared = self.geometry.prepared.get(triangle.material_index);
@@ -2338,17 +2374,22 @@ impl SceneShaderCore<'_> {
                 albedo,
                 roughness,
                 metallic,
-                self.view.to_view(facing),
-                self.view.to_view(hit.view),
+                self.view.direction_to_view(facing),
+                self.view.direction_to_view(hit.view),
             );
             return Ok(SurfaceSample::opaque([lit.x, lit.y, lit.z, alpha]));
         }
+        let camera_matrices = hit
+            .camera_matrices
+            .map(|matrices| (&matrices.0, &matrices.1))
+            .or_else(|| self.view.camera_matrices());
         let trace_geometry = TraceGeometry::with_warnings(self.geometry, warnings);
         let occluders = ShadowOccluders::new(
             self.doc,
             &trace_geometry,
             self.images,
             &self.evaluator_workspace,
+            camera_matrices,
         );
         let shadow = self.geometry.shadows.map(|shadows| ShadowScene {
             bvh: &shadows.bvh,
@@ -2389,7 +2430,7 @@ impl SceneShaderCore<'_> {
         triangle: &Triangle,
         material: &Material,
         prepared: &PreparedMaterial,
-        hit: &SurfaceHit,
+        hit: &SurfaceHit<'_>,
     ) -> Result<SurfaceShading> {
         let object =
             object_for_index(self.geometry.objects, triangle.object_index).ok_or_else(|| {
@@ -2412,7 +2453,7 @@ impl SceneShaderCore<'_> {
             available_mask: element.and_then(|element| element.uv_available_mask),
         };
         let mut tables = LayerTables::new();
-        let context = layered_context(
+        let mut context = layered_context(
             self.doc,
             self.images,
             warnings,
@@ -2422,6 +2463,9 @@ impl SceneShaderCore<'_> {
                 point: hit.point,
                 object: object_space(object, hit.point),
                 normal: hit.normal,
+                geometric_normal: hit.geometric_normal,
+                back_facing: hit.back_facing,
+                path_traced: false,
                 view: hit.view,
                 barycentric: hit.barycentric,
             },
@@ -2429,6 +2473,12 @@ impl SceneShaderCore<'_> {
             uv_layers,
             &mut tables,
         )?;
+        if let Some((camera_to_world, world_to_camera)) = hit.camera_matrices {
+            context.set_camera_matrices(*camera_to_world, *world_to_camera);
+        } else if let Some((camera_to_world, world_to_camera)) = self.view.camera_matrices() {
+            context.set_camera_matrices(*camera_to_world, *world_to_camera);
+        }
+        context.realtime_differentials = Some(hit.realtime_differentials);
         let mut workspace = self.evaluator_workspace.borrow_mut();
         evaluate_surface_with_workspace(material, prepared, &context, &mut workspace)
     }
@@ -2438,7 +2488,7 @@ impl SurfaceShaderWorker for SceneShaderWorker<'_> {
     fn shade(
         &self,
         triangle: &Triangle,
-        hit: &SurfaceHit,
+        hit: &SurfaceHit<'_>,
         warnings: &RefCell<Vec<serde_json::Value>>,
     ) -> Result<SurfaceSample> {
         self.core.shade(warnings, triangle, hit)
@@ -2646,6 +2696,9 @@ pub(super) struct HitPose {
     /// The hit point in the object's local space.
     pub(super) object: DVec3,
     pub(super) normal: DVec3,
+    pub(super) geometric_normal: DVec3,
+    pub(super) back_facing: bool,
+    pub(super) path_traced: bool,
     /// Unit direction from the hit back toward the camera.
     pub(super) view: DVec3,
     pub(super) barycentric: [f64; 3],
@@ -2693,7 +2746,22 @@ pub(super) fn layered_context<'a>(
     context = context.with_generated_corners(triangle.generated, pose.barycentric);
     context.position = pose.point;
     context.object = pose.object;
+    context.object_to_world = object.object_to_world;
+    context.world_to_object = object
+        .world_to_local
+        .unwrap_or_else(|| DMat4::from_cols_array(&[f64::NAN; 16]));
+    context.object_color = object.object_color;
+    context.object_pass_index = object.object_pass_index;
+    context.object_random_number = object.object_random_number;
+    context.material_pass_index = material_colors.map_or(0.0, |colors| colors.material_pass_index);
     context.normal = pose.normal;
+    context.geometric_normal = pose.geometric_normal;
+    context.back_facing = pose.back_facing;
+    context.path_traced = pose.path_traced;
+    if !pose.path_traced {
+        context = context.with_realtime_position_f32(triangle.positions, pose.barycentric);
+    }
+    context.light_falloff_distance = None;
     context.view_direction = pose.view;
     Ok(context)
 }
@@ -2715,6 +2783,50 @@ fn object_inverse(world_matrix: DMat4) -> Option<DMat4> {
         .all(|value| value.is_finite())
         .then_some(inverse)
 }
+pub(super) fn object_info_color(node: &Node) -> [f64; 4] {
+    let default = [1.0; 4];
+    let Some(values) = node
+        .properties
+        .get("blender_object_metadata")
+        .and_then(|metadata| metadata.get("rna_properties"))
+        .and_then(|properties| properties.get("color"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|values| values.len() >= 3)
+    else {
+        return default;
+    };
+    let Some(red) = values.first().and_then(serde_json::Value::as_f64) else {
+        return default;
+    };
+    let Some(green) = values.get(1).and_then(serde_json::Value::as_f64) else {
+        return default;
+    };
+    let Some(blue) = values.get(2).and_then(serde_json::Value::as_f64) else {
+        return default;
+    };
+    let alpha = values
+        .get(3)
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0);
+    let color = [red, green, blue, alpha];
+    if color.iter().all(|channel| channel.is_finite()) {
+        color
+    } else {
+        default
+    }
+}
+
+pub(super) fn object_info_pass_index(node: &Node) -> f64 {
+    node.properties
+        .get("blender_object_metadata")
+        .and_then(|metadata| metadata.get("rna_properties"))
+        .and_then(|properties| properties.get("pass_index"))
+        .and_then(serde_json::Value::as_i64)
+        .map_or(0.0, |pass_index| {
+            i32::try_from(pass_index).map_or(0.0, f64::from)
+        })
+}
+
 /// Per-corner values for a triangle, or `None` when any corner is not on the face.
 fn corner_values<T: Copy>(values: &[T], corners: [Option<usize>; 3]) -> Option<[T; 3]> {
     Some([
@@ -2891,7 +3003,7 @@ fn shade(
                 prefiltered_world(world, reflection, roughness, probe_radiance);
             let specular_f0 = dielectric_f0(params.ior, params.specular_ior_level);
             let f0 = albedo * metallic + DVec3::splat(specular_f0 * dielectric);
-            environment += specular_environment * f0 * (1.0 - roughness).powi(2) * lower;
+            environment += specular_environment * f0 * (1.0_f64 - roughness).powi(2) * lower;
             lobes += environment * ambient;
             if params.thin_wall && params.subsurface_weight > 0.0 {
                 let sphere_thickness = matches!(thickness, Thickness::Sphere(value) if value > 0.0);
@@ -4333,27 +4445,20 @@ mod shading_normal_tests {
             triangle.lit_per_pixel,
             "flat graph materials must be evaluated per hit"
         );
-        let shader = surface_shader(
-            &doc,
-            &snapshot,
-            &images,
-            &geometry,
-            Mode::Beauty,
-            // Beauty shades in world space and ignores the view; any valid camera supplies the basis.
-            ViewBasis::from_camera(&Camera {
-                position: DVec3::new(0.0, 0.0, 2.5),
-                target: DVec3::ZERO,
-                up: DVec3::Y,
-                near: 0.1,
-                far: 100.0,
-                projection: Projection::Orthographic { height: 2.0 },
-                shift: [0.0; 2],
-                depth_of_field: None,
-                stereo_mode: StereoMode::None,
-                interocular_distance: 0.065,
-            })?,
-        )
-        .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
+        let view = ViewBasis::from_camera(&Camera {
+            position: DVec3::new(0.0, 0.0, 2.5),
+            target: DVec3::ZERO,
+            up: DVec3::Y,
+            near: 0.1,
+            far: 100.0,
+            projection: Projection::Orthographic { height: 2.0 },
+            shift: [0.0; 2],
+            depth_of_field: None,
+            stereo_mode: StereoMode::None,
+            interocular_distance: 0.065,
+        })?;
+        let shader = surface_shader(&doc, &snapshot, &images, &geometry, Mode::Beauty, &view)
+            .ok_or_else(|| PotError::new(ErrorCode::InternalError, "Beauty shader is missing"))?;
         let point = triangle.positions.iter().copied().sum::<DVec3>() / 3.0;
         let color = shader
             .shade(
@@ -4363,6 +4468,15 @@ mod shading_normal_tests {
                     shadow_point: point,
                     normal: DVec3::Z,
                     geometric: DVec3::Z,
+                    geometric_normal: DVec3::Z,
+                    back_facing: false,
+                    realtime_differentials: crate::shader::HitDifferentials {
+                        world_dx: DVec3::ZERO,
+                        world_dy: DVec3::ZERO,
+                        uv_dx: [0.0; 2],
+                        uv_dy: [0.0; 2],
+                    },
+                    camera_matrices: None,
                     barycentric: [1.0 / 3.0; 3],
                     view: DVec3::Z,
                 },

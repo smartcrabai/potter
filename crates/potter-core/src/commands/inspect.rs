@@ -653,6 +653,7 @@ fn material_item(doc: &SceneDoc, id: &Id, material: &Material) -> Value {
         "type":"material",
         "id":id,
         "name":material.name,
+        "pass_index":material.pass_index,
         "base_color":material.base_color,
         "metallic":material.metallic,
         "roughness":material.roughness,

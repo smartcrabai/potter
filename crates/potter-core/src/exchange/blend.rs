@@ -43,6 +43,7 @@ use crate::{
         StripBlendType, StripModifier, StripType as SequenceStripType,
         TransitionType as SequenceTransitionType,
     },
+    shader::PreparedMaterial,
     store::Project,
 };
 
@@ -3745,6 +3746,19 @@ fn build_imported_graph(
             "Material",
         )?;
         let color = vec4_field(item, "base_color", [0.6, 0.6, 0.6, 1.0]);
+        let pass_index = item
+            .get("pass_index")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|index| u32::try_from(index).ok())
+                    .filter(|index| i16::try_from(*index).is_ok())
+                    .ok_or_else(|| {
+                        invalid_intermediate(&format!("material `{name}` has invalid pass_index"))
+                    })
+            })
+            .transpose()?
+            .unwrap_or(0);
         let viewport_display = item
             .get("viewport_display")
             .filter(|value| value.is_object())
@@ -3769,6 +3783,7 @@ fn build_imported_graph(
             id,
             Material {
                 name: name.to_owned(),
+                pass_index,
                 base_color: color,
                 viewport_display,
                 alpha_mode,
@@ -5178,6 +5193,7 @@ fn build_imported_graph(
             .to_owned(),
     };
     let mut losses = import_losses(raw);
+    losses.extend(shader_node_import_losses(&doc));
     losses.extend(uv_project_animated_camera_losses(&doc));
     losses.extend(missing_udim_tile_losses(images, &resource_ids, &doc)?);
     let id_mappings = serde_json::to_value(&mappings).map_err(PotError::internal_json)?;
@@ -5684,7 +5700,7 @@ fn import_node_groups(
     let mut group_ids = BTreeMap::new();
     for item in items {
         let name = string_field(item, "name")?;
-        let group_id = mapped_id(
+        mapped_id(
             item,
             "potter_id",
             "node_group",
@@ -5693,6 +5709,13 @@ fn import_node_groups(
             mappings,
             "NodeGroup",
         )?;
+    }
+    for item in items {
+        let name = string_field(item, "name")?;
+        let group_id = group_ids
+            .get(name)
+            .cloned()
+            .ok_or_else(|| invalid_intermediate("node group is missing its mapped ID"))?;
         let tree = item
             .get("tree")
             .filter(|tree| !tree.is_null())
@@ -5743,6 +5766,32 @@ fn import_node_groups(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
+            let node_type = string_field(raw_node, "type")?.to_owned();
+            if matches!(
+                node_type.as_str(),
+                "ShaderNodeValue" | "ShaderNodeRGB" | "ShaderNodeNormal"
+            ) && !properties.contains_key("potter_output_defaults")
+            {
+                // Older Blender imports did not capture output socket defaults.
+                properties.insert("potter_output_defaults".to_owned(), json!([]));
+            }
+            let referenced_group = properties
+                .get("node_tree")
+                .and_then(Value::as_object)
+                .and_then(|reference| reference.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(referenced_group) = referenced_group {
+                let referenced_id = group_ids.get(&referenced_group).ok_or_else(|| {
+                    invalid_intermediate(&format!(
+                        "shader group node references unknown node group `{referenced_group}`"
+                    ))
+                })?;
+                properties.insert(
+                    "node_tree".to_owned(),
+                    Value::String(referenced_id.as_str().to_owned()),
+                );
+            }
             if let Some(custom_properties) = raw_node.get("custom_properties")
                 && custom_properties
                     .as_object()
@@ -5764,7 +5813,7 @@ fn import_node_groups(
             group.nodes.insert(
                 node_id,
                 GraphNode {
-                    node_type: string_field(raw_node, "type")?.to_owned(),
+                    node_type,
                     name: node_name.to_owned(),
                     location,
                     properties,
@@ -13484,6 +13533,14 @@ pub(crate) fn export_losses(doc: &SceneDoc) -> Vec<Loss> {
             ));
         }
     }
+    losses.extend(shader_node_import_losses(doc).into_iter().filter(|loss| {
+        matches!(
+            loss.feature_id.as_str(),
+            "shader.node.ShaderNodeValue.output_defaults"
+                | "shader.node.ShaderNodeRGB.output_defaults"
+                | "shader.node.ShaderNodeNormal.output_defaults"
+        )
+    }));
     losses
 }
 
@@ -14037,6 +14094,661 @@ fn validate_imported_modifier_bindings(doc: &mut SceneDoc) -> Result<()> {
 fn loss(feature: impl Into<String>, data_id: Option<&str>, reason: &str) -> Loss {
     Loss { feature_id: feature.into(), data_id: data_id.map(str::to_owned), reason: reason.to_owned(),
            suggestion: Some("retain the compatibility payload, or use --allow-lossy only when the loss is acceptable".to_owned()) }
+}
+fn shader_node_import_losses(doc: &SceneDoc) -> Vec<Loss> {
+    let has_camera = doc.scenes.values().any(|scene| {
+        scene
+            .camera
+            .as_ref()
+            .and_then(|camera_id| doc.nodes.get(camera_id))
+            .and_then(|camera_node| camera_node.data.as_ref())
+            .and_then(|data_id| doc.data_blocks.get(data_id))
+            .and_then(|data| data.camera.as_ref())
+            .is_some()
+    });
+    let path_traced = doc
+        .scenes
+        .get(&doc.active_scene)
+        .is_none_or(|scene| scene.render.engine == "path");
+    let mut losses = Vec::new();
+    let mut recorded = BTreeSet::new();
+    for (material_id, material) in &doc.materials {
+        let Some(group_id) = material.node_tree.as_ref() else {
+            continue;
+        };
+        let Some(group) = doc.node_groups.get(group_id) else {
+            continue;
+        };
+        if group.kind != GraphKind::Shader {
+            continue;
+        }
+        let Some(output) = shader_output_node(group, "ShaderNodeOutputMaterial") else {
+            continue;
+        };
+        if !path_traced
+            && let Some(bump_id) =
+                PreparedMaterial::new(material, &doc.node_groups).realtime_transparency_bump()
+        {
+            record_shader_loss(
+                &mut recorded,
+                &mut losses,
+                "shader.node.Bump.realtime_transparent_shadow_height",
+                bump_id,
+                "A Bump output affects transparency; the realtime transparent-shadow pass cannot evaluate its shifted Height samples.",
+            );
+        }
+        let mut group_stack = BTreeSet::new();
+        group_stack.insert(group_id.clone());
+        let mut call_sites = Vec::new();
+        collect_shader_node_import_losses(
+            doc,
+            material_id,
+            group_id,
+            group,
+            output,
+            None,
+            has_camera,
+            path_traced,
+            &mut group_stack,
+            &mut call_sites,
+            &mut recorded,
+            &mut losses,
+        );
+    }
+    losses
+}
+
+fn collect_shader_node_import_losses(
+    doc: &SceneDoc,
+    material_id: &Id,
+    group_id: &Id,
+    group: &NodeGroup,
+    sink: &Id,
+    sink_socket: Option<&str>,
+    has_camera: bool,
+    path_traced: bool,
+    group_stack: &mut BTreeSet<Id>,
+    call_sites: &mut Vec<(Id, Id)>,
+    recorded: &mut BTreeSet<(String, String)>,
+    losses: &mut Vec<Loss>,
+) {
+    let reachable = shader_nodes_reaching(group, sink, sink_socket);
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        let outputs: BTreeSet<String> = group
+            .links
+            .iter()
+            .filter(|link| {
+                link.from_node == *node_id
+                    && (reachable.contains(&link.to_node)
+                        || (link.to_node == *sink
+                            && sink_socket.is_none_or(|socket| link.to_socket == socket)))
+            })
+            .map(|link| link.from_socket.clone())
+            .collect();
+        if outputs.is_empty() {
+            continue;
+        }
+        if node.node_type == "ShaderNodeBump" {
+            let mut visited_inputs = BTreeSet::new();
+            collect_bump_height_color_layer_losses(
+                doc,
+                material_id,
+                group_id,
+                group,
+                node_id,
+                node_id,
+                Some("Height"),
+                path_traced,
+                group_stack,
+                call_sites,
+                &mut visited_inputs,
+                recorded,
+                losses,
+            );
+        }
+        if node.node_type == "ShaderNodeGroup" {
+            let Some(child_name) = node.properties.get("node_tree").and_then(Value::as_str) else {
+                record_shader_loss(
+                    recorded,
+                    losses,
+                    "shader.node.ShaderNodeGroup.node_tree",
+                    node_id,
+                    "The shader group node has no resolvable node_tree reference.",
+                );
+                continue;
+            };
+            let Some((child_id, child)) = doc.node_groups.get_key_value(child_name) else {
+                record_shader_loss(
+                    recorded,
+                    losses,
+                    "shader.node.ShaderNodeGroup.node_tree",
+                    node_id,
+                    "The shader group node references a missing node group.",
+                );
+                continue;
+            };
+            if group_stack.contains(child_id) {
+                record_shader_loss(
+                    recorded,
+                    losses,
+                    "shader.node.ShaderNodeGroup.recursion",
+                    node_id,
+                    "Recursive shader node groups are refused by the evaluator.",
+                );
+                continue;
+            }
+            let Some(child_output) = shader_output_node(child, "NodeGroupOutput") else {
+                record_shader_loss(
+                    recorded,
+                    losses,
+                    "shader.node.ShaderNodeGroup.output",
+                    node_id,
+                    "The nested shader group has no active Group Output node.",
+                );
+                continue;
+            };
+            if child.kind != GraphKind::Shader {
+                record_shader_loss(
+                    recorded,
+                    losses,
+                    "shader.node.ShaderNodeGroup.graph_kind",
+                    node_id,
+                    "ShaderNodeGroup references a non-shader node group.",
+                );
+                continue;
+            }
+            for output in &outputs {
+                let Some(interface_output) = child
+                    .interface
+                    .outputs
+                    .iter()
+                    .find(|socket| socket.id == *output || socket.name == *output)
+                else {
+                    continue;
+                };
+                group_stack.insert(child_id.clone());
+                call_sites.push((group_id.clone(), node_id.clone()));
+                collect_shader_node_import_losses(
+                    doc,
+                    material_id,
+                    child_id,
+                    child,
+                    child_output,
+                    Some(&interface_output.name),
+                    has_camera,
+                    path_traced,
+                    group_stack,
+                    call_sites,
+                    recorded,
+                    losses,
+                );
+                let _ = call_sites.pop();
+                group_stack.remove(child_id);
+            }
+            continue;
+        }
+        let missing_output_default = match node.node_type.as_str() {
+            "ShaderNodeValue" => Some(("Value", "shader.node.ShaderNodeValue.output_defaults")),
+            "ShaderNodeRGB" => Some(("Color", "shader.node.ShaderNodeRGB.output_defaults")),
+            "ShaderNodeNormal" => Some(("Normal", "shader.node.ShaderNodeNormal.output_defaults")),
+            _ => None,
+        };
+        if let Some((output_socket, feature_id)) = missing_output_default
+            && node.properties.get("potter_output_defaults").is_some()
+            && !node_has_output_default(node, output_socket)
+        {
+            record_shader_loss(
+                recorded,
+                losses,
+                feature_id,
+                node_id,
+                &format!(
+                    "Imported node `{node_id}` has no captured Blender default for output socket `{output_socket}`."
+                ),
+            );
+        }
+
+        for output in &outputs {
+            let unsupported = match node.node_type.as_str() {
+                "ShaderNodeCameraData" if !has_camera => Some((
+                    format!("shader.node.ShaderNodeCameraData.{output}.camera_context"),
+                    "Camera Data requires an active camera transform.",
+                )),
+                "ShaderNodeTexCoord" if matches!(output.as_str(), "Camera" | "Window") => Some((
+                    format!(
+                        "shader.node.TexCoord.{}.{}",
+                        output,
+                        if output == "Camera" {
+                            "camera_projection"
+                        } else {
+                            "window_position_and_resolution"
+                        }
+                    ),
+                    "This Texture Coordinate output requires camera projection or window position data.",
+                )),
+                "ShaderNodeVectorTransform" => {
+                    let from = node
+                        .properties
+                        .get("convert_from")
+                        .and_then(Value::as_str)
+                        .unwrap_or("WORLD");
+                    let to = node
+                        .properties
+                        .get("convert_to")
+                        .and_then(Value::as_str)
+                        .unwrap_or("OBJECT");
+                    (!has_camera && from != to && (from == "CAMERA" || to == "CAMERA"))
+                        .then(|| {
+                            (
+                                format!("shader.node.VectorTransform:{from}_to_{to}:camera_matrices"),
+                                "Vector Transform camera-space conversion needs camera matrices unavailable to the shader evaluator.",
+                            )
+                        })
+                }
+                "ShaderNodeUVMap"
+                    if node
+                        .properties
+                        .get("from_instancer")
+                        .and_then(Value::as_bool)
+                        == Some(true) =>
+                {
+                    Some((
+                        "shader.node.ShaderNodeUVMap.from_instancer".to_owned(),
+                        "UV Map from_instancer requires the instancer's UV layer context.",
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((feature_id, reason)) = unsupported {
+                record_shader_loss(recorded, losses, &feature_id, node_id, reason);
+            }
+        }
+    }
+}
+
+fn collect_bump_height_color_layer_losses(
+    doc: &SceneDoc,
+    material_id: &Id,
+    group_id: &Id,
+    group: &NodeGroup,
+    bump_id: &Id,
+    sink: &Id,
+    sink_socket: Option<&str>,
+    path_traced: bool,
+    group_stack: &mut BTreeSet<Id>,
+    call_sites: &mut Vec<(Id, Id)>,
+    visited_inputs: &mut BTreeSet<(Id, Id, Id, Id, String)>,
+    recorded: &mut BTreeSet<(String, String)>,
+    losses: &mut Vec<Loss>,
+) {
+    let reachable = shader_nodes_reaching(group, sink, sink_socket);
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        let outputs: BTreeSet<String> = group
+            .links
+            .iter()
+            .filter(|link| {
+                link.from_node == *node_id
+                    && (reachable.contains(&link.to_node)
+                        || (link.to_node == *sink
+                            && sink_socket.is_none_or(|socket| link.to_socket == socket)))
+            })
+            .map(|link| link.from_socket.clone())
+            .collect();
+        if outputs.is_empty() {
+            continue;
+        }
+        match node.node_type.as_str() {
+            "ShaderNodeNewGeometry" => {
+                for output in &outputs {
+                    if matches!(output.as_str(), "Incoming" | "Tangent")
+                        || (output == "Normal" && !path_traced)
+                    {
+                        record_bump_context_loss(
+                            recorded,
+                            losses,
+                            "shader.node.ShaderNodeNewGeometry.bump_height_interpolation",
+                            "ShaderNodeNewGeometry",
+                            output,
+                            node_id,
+                            bump_id,
+                        );
+                    }
+                }
+            }
+            "ShaderNodeTexCoord" => {
+                for output in &outputs {
+                    if matches!(output.as_str(), "Normal" | "Reflection") {
+                        record_bump_context_loss(
+                            recorded,
+                            losses,
+                            "shader.node.ShaderNodeTexCoord.bump_height_interpolation",
+                            "ShaderNodeTexCoord",
+                            output,
+                            node_id,
+                            bump_id,
+                        );
+                    }
+                }
+            }
+            "ShaderNodeAttribute" => {
+                let name = node
+                    .properties
+                    .get("attribute_name")
+                    .or_else(|| node.properties.get("name"))
+                    .and_then(Value::as_str);
+                if name.is_some_and(|name| material_uses_color_layer(doc, material_id, name, false))
+                {
+                    for output in &outputs {
+                        record_bump_color_layer_loss(
+                            recorded,
+                            losses,
+                            "ShaderNodeAttribute",
+                            output,
+                            node_id,
+                            bump_id,
+                        );
+                    }
+                }
+            }
+            "ShaderNodeVertexColor" => {
+                let name = node
+                    .properties
+                    .get("layer_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if material_uses_color_layer(doc, material_id, name, name.is_empty()) {
+                    for output in &outputs {
+                        record_bump_color_layer_loss(
+                            recorded,
+                            losses,
+                            "ShaderNodeVertexColor",
+                            output,
+                            node_id,
+                            bump_id,
+                        );
+                    }
+                }
+            }
+            "ShaderNodeGroup" => {
+                let Some(child_name) = node.properties.get("node_tree").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some((child_id, child)) = doc.node_groups.get_key_value(child_name) else {
+                    continue;
+                };
+                if child.kind != GraphKind::Shader || group_stack.contains(child_id) {
+                    continue;
+                }
+                let Some(child_output) = shader_output_node(child, "NodeGroupOutput") else {
+                    continue;
+                };
+                group_stack.insert(child_id.clone());
+                call_sites.push((group_id.clone(), node_id.clone()));
+                for output in &outputs {
+                    let Some(interface_output) = child
+                        .interface
+                        .outputs
+                        .iter()
+                        .find(|socket| socket.id == *output || socket.name == *output)
+                    else {
+                        continue;
+                    };
+                    collect_bump_height_color_layer_losses(
+                        doc,
+                        material_id,
+                        child_id,
+                        child,
+                        bump_id,
+                        child_output,
+                        Some(&interface_output.name),
+                        path_traced,
+                        group_stack,
+                        call_sites,
+                        visited_inputs,
+                        recorded,
+                        losses,
+                    );
+                }
+                let _ = call_sites.pop();
+                group_stack.remove(child_id);
+            }
+            // Follow this interface input through its specific ShaderNodeGroup call site.
+            "NodeGroupInput" => {
+                let Some((parent_group_id, parent_node_id)) = call_sites.pop() else {
+                    continue;
+                };
+                let current_group_was_active = group_stack.remove(group_id);
+                if let Some(parent_group) = doc.node_groups.get(&parent_group_id) {
+                    for output in &outputs {
+                        if !visited_inputs.insert((
+                            group_id.clone(),
+                            node_id.clone(),
+                            parent_group_id.clone(),
+                            parent_node_id.clone(),
+                            output.clone(),
+                        )) {
+                            continue;
+                        }
+                        let Some(interface_input) = group
+                            .interface
+                            .inputs
+                            .iter()
+                            .find(|socket| socket.id == *output || socket.name == *output)
+                        else {
+                            continue;
+                        };
+                        for link in parent_group.links.iter().filter(|link| {
+                            link.to_node == parent_node_id
+                                && (link.to_socket == interface_input.id
+                                    || link.to_socket == interface_input.name)
+                        }) {
+                            collect_bump_height_color_layer_losses(
+                                doc,
+                                material_id,
+                                &parent_group_id,
+                                parent_group,
+                                bump_id,
+                                &parent_node_id,
+                                Some(&link.to_socket),
+                                path_traced,
+                                group_stack,
+                                call_sites,
+                                visited_inputs,
+                                recorded,
+                                losses,
+                            );
+                        }
+                    }
+                }
+                if current_group_was_active {
+                    group_stack.insert(group_id.clone());
+                }
+                call_sites.push((parent_group_id, parent_node_id));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_bump_context_loss(
+    recorded: &mut BTreeSet<(String, String)>,
+    losses: &mut Vec<Loss>,
+    feature_id: &str,
+    node_type: &str,
+    output: &str,
+    node_id: &Id,
+    bump_id: &Id,
+) {
+    record_shader_loss(
+        recorded,
+        losses,
+        feature_id,
+        node_id,
+        &format!(
+            "{node_type} output `{output}` cannot be differentiated for shifted Bump Height samples because shifted normal/view derivatives are unavailable (Bump node `{bump_id}`)."
+        ),
+    );
+}
+
+fn collection_contains_object(doc: &SceneDoc, collection_id: &Id, object_id: &Id) -> bool {
+    let Some(collection) = doc.collections.get(collection_id) else {
+        return false;
+    };
+    collection.objects.contains(object_id)
+        || collection
+            .children
+            .iter()
+            .any(|child| collection_contains_object(doc, child, object_id))
+}
+
+fn material_uses_color_layer(
+    doc: &SceneDoc,
+    material_id: &Id,
+    layer_name: &str,
+    use_render_layer: bool,
+) -> bool {
+    doc.nodes.iter().any(|(object_id, object)| {
+        if !object.render_visible
+            || !doc
+                .scenes
+                .values()
+                .any(|scene| collection_contains_object(doc, &scene.root_collection, object_id))
+        {
+            return false;
+        }
+        let Some(data_id) = object.data.as_ref() else {
+            return false;
+        };
+        let Some(data) = doc.data_blocks.get(data_id) else {
+            return false;
+        };
+        if data.data_type != "mesh" {
+            return false;
+        }
+        let Some(mesh) = data.mesh.as_ref() else {
+            return false;
+        };
+        let uses_material = mesh.faces.iter().any(|face| {
+            usize::try_from(face.material_index)
+                .ok()
+                .and_then(|slot| object.material_slot(Some(data), slot))
+                == Some(material_id)
+        });
+        if !uses_material {
+            return false;
+        }
+        let Some(color_store) = mesh
+            .attributes
+            .get("color_layers")
+            .and_then(Value::as_object)
+        else {
+            return false;
+        };
+        let Some(layers) = color_store.get("layers").and_then(Value::as_array) else {
+            return false;
+        };
+        let name = if use_render_layer {
+            color_store.get("render").and_then(Value::as_str)
+        } else {
+            Some(layer_name)
+        };
+        name.is_some_and(|name| layers.iter().any(|layer| layer.as_str() == Some(name)))
+    })
+}
+
+fn record_bump_color_layer_loss(
+    recorded: &mut BTreeSet<(String, String)>,
+    losses: &mut Vec<Loss>,
+    node_type: &str,
+    output: &str,
+    node_id: &Id,
+    bump_id: &Id,
+) {
+    let feature_id = format!("shader.node.{node_type}.bump_height_interpolation");
+    record_shader_loss(
+        recorded,
+        losses,
+        &feature_id,
+        node_id,
+        &format!(
+            "Output `{output}` of `{node_type}` node `{node_id}` feeds Bump Height node `{bump_id}` from an available color layer; shifted samples require per-corner color data."
+        ),
+    );
+}
+
+fn shader_nodes_reaching(group: &NodeGroup, sink: &Id, sink_socket: Option<&str>) -> BTreeSet<Id> {
+    let mut reachable = BTreeSet::new();
+    let mut pending: Vec<Id> = group
+        .links
+        .iter()
+        .filter(|link| {
+            link.to_node == *sink && sink_socket.is_none_or(|socket| link.to_socket == socket)
+        })
+        .map(|link| link.from_node.clone())
+        .collect();
+    while let Some(node_id) = pending.pop() {
+        if reachable.insert(node_id.clone()) {
+            pending.extend(
+                group
+                    .links
+                    .iter()
+                    .filter(|link| link.to_node == node_id)
+                    .map(|link| link.from_node.clone()),
+            );
+        }
+    }
+    reachable
+}
+
+fn shader_output_node<'a>(group: &'a NodeGroup, node_type: &str) -> Option<&'a Id> {
+    let mut fallback = None;
+    for (id, node) in &group.nodes {
+        let imported_type = node_type.strip_prefix("ShaderNode").unwrap_or(node_type);
+        if node.node_type != node_type && node.node_type != imported_type {
+            continue;
+        }
+        if node
+            .properties
+            .get("is_active_output")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Some(id);
+        }
+        fallback.get_or_insert(id);
+    }
+    fallback
+}
+
+fn node_has_output_default(node: &GraphNode, socket: &str) -> bool {
+    node.properties
+        .get("potter_output_defaults")
+        .and_then(Value::as_array)
+        .is_some_and(|defaults| {
+            defaults.iter().any(|entry| {
+                entry.get("identifier").and_then(Value::as_str) == Some(socket)
+                    && entry.get("default").is_some_and(|value| !value.is_null())
+            })
+        })
+}
+
+fn record_shader_loss(
+    recorded: &mut BTreeSet<(String, String)>,
+    losses: &mut Vec<Loss>,
+    feature_id: &str,
+    node_id: &Id,
+    reason: &str,
+) {
+    if recorded.insert((feature_id.to_owned(), node_id.as_str().to_owned())) {
+        losses.push(loss(feature_id, Some(node_id.as_str()), reason));
+    }
 }
 
 #[cfg(test)]
@@ -23600,6 +24312,683 @@ mod workbench_display_loss_tests {
             ["blender.scene.display_background"]
         );
     }
+}
+
+#[test]
+fn shader_import_losses_only_report_unavailable_outputs() -> Result<()> {
+    let mut group = NodeGroup::new("Shader", GraphKind::Shader);
+    for (node_id, node_type) in [
+        ("output", "ShaderNodeOutputMaterial"),
+        ("principled", "ShaderNodeBsdfPrincipled"),
+        ("value_missing", "ShaderNodeValue"),
+        ("value_native", "ShaderNodeValue"),
+        ("rgb_missing", "ShaderNodeRGB"),
+        ("normal_missing", "ShaderNodeNormal"),
+        ("normal_known", "ShaderNodeNormal"),
+        ("geometry", "ShaderNodeNewGeometry"),
+        ("bump", "ShaderNodeBump"),
+        ("vector_camera", "ShaderNodeVectorTransform"),
+        ("vector_same", "ShaderNodeVectorTransform"),
+    ] {
+        group
+            .nodes
+            .insert(Id::new(node_id)?, GraphNode::new(node_type));
+    }
+    for (node_id, socket) in [
+        ("value_missing", "Value"),
+        ("value_native", "Value"),
+        ("rgb_missing", "Color"),
+        ("normal_missing", "Normal"),
+        ("normal_known", "Normal"),
+        ("geometry", "Pointiness"),
+        ("geometry", "Random Per Island"),
+        ("geometry", "True Normal"),
+        ("bump", "Normal"),
+        ("vector_camera", "Vector"),
+        ("vector_same", "Vector"),
+    ] {
+        group.links.push(GraphLink {
+            from_node: Id::new(node_id)?,
+            from_socket: socket.to_owned(),
+            to_node: Id::new("principled")?,
+            to_socket: "Base Color".to_owned(),
+        });
+    }
+    group.links.push(GraphLink {
+        from_node: Id::new("principled")?,
+        from_socket: "BSDF".to_owned(),
+        to_node: Id::new("output")?,
+        to_socket: "Surface".to_owned(),
+    });
+    for (node_id, property) in [
+        ("value_missing", "potter_output_defaults"),
+        ("rgb_missing", "potter_output_defaults"),
+        ("normal_missing", "potter_output_defaults"),
+    ] {
+        group
+            .nodes
+            .get_mut(&Id::new(node_id)?)
+            .ok_or_else(|| invalid_intermediate("shader test node is missing"))?
+            .properties
+            .insert(property.to_owned(), json!([]));
+    }
+    group
+        .nodes
+        .get_mut(&Id::new("normal_known")?)
+        .ok_or_else(|| invalid_intermediate("shader test node is missing"))?
+        .properties
+        .insert(
+            "potter_output_defaults".to_owned(),
+            json!([{"identifier":"Normal","default":[0.0,0.0,1.0]}]),
+        );
+    group
+        .nodes
+        .get_mut(&Id::new("vector_camera")?)
+        .ok_or_else(|| invalid_intermediate("shader test node is missing"))?
+        .properties
+        .extend([
+            ("convert_from".to_owned(), json!("WORLD")),
+            ("convert_to".to_owned(), json!("CAMERA")),
+        ]);
+    group
+        .nodes
+        .get_mut(&Id::new("vector_same")?)
+        .ok_or_else(|| invalid_intermediate("shader test node is missing"))?
+        .properties
+        .extend([
+            ("convert_from".to_owned(), json!("CAMERA")),
+            ("convert_to".to_owned(), json!("CAMERA")),
+        ]);
+
+    let graph_id = Id::new("shader_graph")?;
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    doc.scenes
+        .get_mut(&Id::from_static("scene_main"))
+        .ok_or_else(|| invalid_intermediate("shader test scene is missing"))?
+        .render
+        .engine = "realtime".to_owned();
+    doc.node_groups.insert(graph_id.clone(), group);
+    doc.materials.insert(
+        Id::new("shader_material")?,
+        Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        },
+    );
+    let losses = shader_node_import_losses(&doc);
+    assert!(export_losses(&doc).iter().any(|loss| {
+        loss.feature_id == "shader.node.ShaderNodeValue.output_defaults"
+            && loss.data_id.as_deref() == Some("value_missing")
+    }));
+
+    for feature_id in [
+        "shader.node.ShaderNodeValue.output_defaults",
+        "shader.node.ShaderNodeRGB.output_defaults",
+        "shader.node.ShaderNodeNormal.output_defaults",
+        "shader.node.VectorTransform:WORLD_to_CAMERA:camera_matrices",
+    ] {
+        assert!(losses.iter().any(|loss| loss.feature_id == feature_id));
+    }
+    for feature_id in [
+        "shader.node.VectorTransform:CAMERA_to_CAMERA:camera_matrices",
+        "shader.node.Bump.realtime_derivatives",
+        "shader.node.ShaderNodeNewGeometry.Pointiness.mesh_context",
+        "shader.node.ShaderNodeNewGeometry.Random Per Island.mesh_context",
+        "shader.node.ShaderNodeNewGeometry.True Normal.geometric_normal",
+    ] {
+        assert!(!losses.iter().any(|loss| loss.feature_id == feature_id));
+    }
+    assert!(!losses.iter().any(|loss| {
+        loss.data_id.as_deref() == Some("value_native")
+            && loss.feature_id == "shader.node.ShaderNodeValue.output_defaults"
+    }));
+    assert!(losses.iter().any(|loss| {
+        loss.feature_id == "shader.node.ShaderNodeValue.output_defaults"
+            && loss.data_id.as_deref() == Some("value_missing")
+            && loss.reason.contains("output socket `Value`")
+    }));
+    let camera_data_id = Id::new("camera_data")?;
+    let camera_data = CameraData {
+        stereo_mode: "side_by_side".to_owned(),
+        ..CameraData::default()
+    };
+    doc.data_blocks.insert(
+        camera_data_id.clone(),
+        DataBlock {
+            data_type: "camera".to_owned(),
+            camera: Some(camera_data),
+            ..DataBlock::default()
+        },
+    );
+    let camera_id = Id::new("camera_object")?;
+    let camera_node = Node {
+        name: "Camera".to_owned(),
+        kind: "camera".to_owned(),
+        data: Some(camera_data_id),
+        ..Node::default()
+    };
+    doc.nodes.insert(camera_id.clone(), camera_node);
+    doc.scenes
+        .get_mut(&Id::from_static("scene_main"))
+        .ok_or_else(|| invalid_intermediate("shader test scene is missing"))?
+        .camera = Some(camera_id);
+    assert!(!shader_node_import_losses(&doc).iter().any(|loss| {
+        loss.feature_id == "shader.node.VectorTransform:WORLD_to_CAMERA:camera_matrices"
+    }));
+    Ok(())
+}
+
+#[test]
+
+fn shader_bump_height_losses_require_available_color_layers() -> Result<()> {
+    let mut group = NodeGroup::new("Bump Color", GraphKind::Shader);
+    for (node_id, node_type) in [
+        ("output", "ShaderNodeOutputMaterial"),
+        ("principled", "ShaderNodeBsdfPrincipled"),
+        ("attribute", "ShaderNodeAttribute"),
+        ("vertex", "ShaderNodeVertexColor"),
+        ("missing", "ShaderNodeVertexColor"),
+        ("bump_attribute", "ShaderNodeBump"),
+        ("bump_vertex", "ShaderNodeBump"),
+        ("bump_missing", "ShaderNodeBump"),
+        ("attribute_missing", "ShaderNodeAttribute"),
+        ("bump_attribute_missing", "ShaderNodeBump"),
+    ] {
+        group
+            .nodes
+            .insert(Id::new(node_id)?, GraphNode::new(node_type));
+    }
+    group
+        .nodes
+        .get_mut(&Id::new("attribute")?)
+        .ok_or_else(|| invalid_intermediate("shader test node is missing"))?
+        .properties
+        .insert("attribute_name".to_owned(), json!("Col"));
+    group
+        .nodes
+        .get_mut(&Id::new("attribute_missing")?)
+        .ok_or_else(|| invalid_intermediate("shader test node is missing"))?
+        .properties
+        .insert("attribute_name".to_owned(), json!("Ghost"));
+    for (node_id, layer_name) in [("vertex", "Col"), ("missing", "Ghost")] {
+        group
+            .nodes
+            .get_mut(&Id::new(node_id)?)
+            .ok_or_else(|| invalid_intermediate("shader test node is missing"))?
+            .properties
+            .insert("layer_name".to_owned(), json!(layer_name));
+    }
+    for (from_node, from_socket, to_node, to_socket) in [
+        ("attribute", "Color", "bump_attribute", "Height"),
+        ("bump_attribute", "Normal", "principled", "Normal"),
+        ("vertex", "Color", "bump_vertex", "Height"),
+        ("bump_vertex", "Normal", "principled", "Normal"),
+        ("missing", "Color", "bump_missing", "Height"),
+        (
+            "attribute_missing",
+            "Color",
+            "bump_attribute_missing",
+            "Height",
+        ),
+        ("bump_attribute_missing", "Normal", "principled", "Normal"),
+        ("bump_missing", "Normal", "principled", "Normal"),
+        ("principled", "BSDF", "output", "Surface"),
+    ] {
+        group.links.push(GraphLink {
+            from_node: Id::new(from_node)?,
+            from_socket: from_socket.to_owned(),
+            to_node: Id::new(to_node)?,
+            to_socket: to_socket.to_owned(),
+        });
+    }
+
+    let graph_id = Id::new("bump_graph")?;
+    let material_id = Id::new("bump_material")?;
+    let data_id = Id::new("color_mesh_data")?;
+    let mut mesh =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
+            .map_err(|_| PotError::new(ErrorCode::InternalError, "shader test mesh is invalid"))?;
+    color_layers::write(
+        &mut mesh,
+        &ColorStore {
+            layers: vec![ColorLayer {
+                name: "Col".to_owned(),
+                domain: ColorDomain::Corner,
+                values: vec![[0.2, 0.3, 0.4, 1.0]; 3],
+            }],
+            active: Some("Col".to_owned()),
+            render: Some("Col".to_owned()),
+        },
+    );
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    doc.node_groups.insert(graph_id.clone(), group);
+    doc.materials.insert(
+        material_id.clone(),
+        Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        },
+    );
+    doc.data_blocks.insert(
+        data_id.clone(),
+        DataBlock {
+            data_type: "mesh".to_owned(),
+            mesh: Some(mesh),
+            materials: vec![Some(material_id)],
+            ..DataBlock::default()
+        },
+    );
+    let object = Node {
+        kind: "mesh".to_owned(),
+        data: Some(data_id.clone()),
+        ..Node::default()
+    };
+    let object_id = Id::new("color_mesh")?;
+    doc.nodes.insert(object_id.clone(), object);
+    doc.collections
+        .get_mut(&Id::from_static("collection_root"))
+        .ok_or_else(|| invalid_intermediate("shader test collection is missing"))?
+        .objects
+        .push(object_id);
+
+    let losses = shader_node_import_losses(&doc);
+    for (feature_id, node_id) in [
+        (
+            "shader.node.ShaderNodeAttribute.bump_height_interpolation",
+            "attribute",
+        ),
+        (
+            "shader.node.ShaderNodeVertexColor.bump_height_interpolation",
+            "vertex",
+        ),
+    ] {
+        assert!(losses.iter().any(|loss| {
+            loss.feature_id == feature_id && loss.data_id.as_deref() == Some(node_id)
+        }));
+    }
+    for (feature_id, node_id) in [
+        (
+            "shader.node.ShaderNodeAttribute.bump_height_interpolation",
+            "attribute_missing",
+        ),
+        (
+            "shader.node.ShaderNodeVertexColor.bump_height_interpolation",
+            "missing",
+        ),
+    ] {
+        assert!(!losses.iter().any(|loss| {
+            loss.feature_id == feature_id && loss.data_id.as_deref() == Some(node_id)
+        }));
+    }
+
+    let mesh = doc
+        .data_blocks
+        .get_mut(&data_id)
+        .and_then(|data| data.mesh.as_mut())
+        .ok_or_else(|| invalid_intermediate("shader test mesh is missing"))?;
+    mesh.attributes.remove("color_layers");
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id.ends_with(".bump_height_interpolation"))
+    );
+    Ok(())
+}
+#[test]
+fn geometry_normal_bump_height_loss_depends_on_engine() -> Result<()> {
+    let graph_id = Id::new("geometry_normal_bump_graph")?;
+    let material_id = Id::new("geometry_normal_bump_material")?;
+    let mut group = NodeGroup::new("Geometry Normal Bump", GraphKind::Shader);
+    for (node_id, node_type) in [
+        ("output", "ShaderNodeOutputMaterial"),
+        ("principled", "ShaderNodeBsdfPrincipled"),
+        ("geometry", "ShaderNodeNewGeometry"),
+        ("bump", "ShaderNodeBump"),
+    ] {
+        group
+            .nodes
+            .insert(Id::new(node_id)?, GraphNode::new(node_type));
+    }
+    for (from_node, from_socket, to_node, to_socket) in [
+        ("geometry", "Normal", "bump", "Height"),
+        ("bump", "Normal", "principled", "Normal"),
+        ("principled", "BSDF", "output", "Surface"),
+    ] {
+        group.links.push(GraphLink {
+            from_node: Id::new(from_node)?,
+            from_socket: from_socket.to_owned(),
+            to_node: Id::new(to_node)?,
+            to_socket: to_socket.to_owned(),
+        });
+    }
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    doc.node_groups.insert(graph_id.clone(), group);
+    doc.materials.insert(
+        material_id,
+        Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        },
+    );
+
+    let feature_id = "shader.node.ShaderNodeNewGeometry.bump_height_interpolation";
+    let cycles_losses = shader_node_import_losses(&doc);
+    assert!(!cycles_losses.iter().any(|loss| {
+        loss.feature_id == feature_id && loss.data_id.as_deref() == Some("geometry")
+    }));
+
+    let scene_id = doc.active_scene.clone();
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("shader test scene is missing"))?
+        .render
+        .engine = "realtime".to_owned();
+    let eevee_losses = shader_node_import_losses(&doc);
+    assert!(eevee_losses.iter().any(|loss| {
+        loss.feature_id == feature_id
+            && loss.data_id.as_deref() == Some("geometry")
+            && loss.reason.contains("shifted normal/view derivatives")
+    }));
+    Ok(())
+}
+#[test]
+fn eevee_bump_affecting_transparency_reports_shadow_loss() -> Result<()> {
+    let graph_id = Id::new("transparent_bump_graph")?;
+    let material_id = Id::new("transparent_bump_material")?;
+    let mut group = NodeGroup::new("Transparent Bump", GraphKind::Shader);
+    for (node_id, node_type) in [
+        ("output", "ShaderNodeOutputMaterial"),
+        ("principled", "ShaderNodeBsdfPrincipled"),
+        ("bump", "ShaderNodeBump"),
+        ("separate", "ShaderNodeSeparateXYZ"),
+        ("height", "ShaderNodeValue"),
+    ] {
+        group
+            .nodes
+            .insert(Id::new(node_id)?, GraphNode::new(node_type));
+    }
+    for (from_node, from_socket, to_node, to_socket) in [
+        ("height", "Value", "bump", "Height"),
+        ("bump", "Normal", "separate", "Vector"),
+        ("separate", "Z", "principled", "Alpha"),
+        ("principled", "BSDF", "output", "Surface"),
+    ] {
+        group.links.push(GraphLink {
+            from_node: Id::new(from_node)?,
+            from_socket: from_socket.to_owned(),
+            to_node: Id::new(to_node)?,
+            to_socket: to_socket.to_owned(),
+        });
+    }
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    doc.node_groups.insert(graph_id.clone(), group);
+    doc.materials.insert(
+        material_id,
+        Material {
+            node_tree: Some(graph_id),
+            ..Material::default()
+        },
+    );
+    let feature_id = "shader.node.Bump.realtime_transparent_shadow_height";
+    assert!(
+        !shader_node_import_losses(&doc)
+            .iter()
+            .any(|loss| loss.feature_id == feature_id)
+    );
+
+    let scene_id = doc.active_scene.clone();
+    doc.scenes
+        .get_mut(&scene_id)
+        .ok_or_else(|| invalid_intermediate("shader test scene is missing"))?
+        .render
+        .engine = "realtime".to_owned();
+    assert!(shader_node_import_losses(&doc).iter().any(|loss| {
+        loss.feature_id == feature_id
+            && loss.data_id.as_deref() == Some("bump")
+            && loss.reason.contains("affects transparency")
+    }));
+    Ok(())
+}
+
+#[test]
+fn shader_bump_height_loss_follows_group_input_to_call_site() -> Result<()> {
+    let child_id = Id::new("height_group")?;
+    let mut child = NodeGroup::new("Height Group", GraphKind::Shader);
+    child.interface.inputs.push(GraphSocket {
+        id: "Height".to_owned(),
+        name: "Height".to_owned(),
+        socket_type: "NodeSocketColor".to_owned(),
+        default: Value::Null,
+    });
+    child.interface.outputs.push(GraphSocket {
+        id: "Normal".to_owned(),
+        name: "Normal".to_owned(),
+        socket_type: "NodeSocketVector".to_owned(),
+        default: Value::Null,
+    });
+    for (node_id, node_type) in [
+        ("input", "NodeGroupInput"),
+        ("bump", "ShaderNodeBump"),
+        ("geometry", "ShaderNodeNewGeometry"),
+        ("bump_geometry", "ShaderNodeBump"),
+        ("texcoord", "ShaderNodeTexCoord"),
+        ("bump_texcoord", "ShaderNodeBump"),
+        ("output", "NodeGroupOutput"),
+    ] {
+        child
+            .nodes
+            .insert(Id::new(node_id)?, GraphNode::new(node_type));
+    }
+    child.links.extend([
+        GraphLink {
+            from_node: Id::new("input")?,
+            from_socket: "Height".to_owned(),
+            to_node: Id::new("bump")?,
+            to_socket: "Height".to_owned(),
+        },
+        GraphLink {
+            from_node: Id::new("geometry")?,
+            from_socket: "Normal".to_owned(),
+            to_node: Id::new("bump_geometry")?,
+            to_socket: "Height".to_owned(),
+        },
+        GraphLink {
+            from_node: Id::new("texcoord")?,
+            from_socket: "Reflection".to_owned(),
+            to_node: Id::new("bump_texcoord")?,
+            to_socket: "Height".to_owned(),
+        },
+        GraphLink {
+            from_node: Id::new("bump_texcoord")?,
+            from_socket: "Normal".to_owned(),
+            to_node: Id::new("bump_geometry")?,
+            to_socket: "Normal".to_owned(),
+        },
+        GraphLink {
+            from_node: Id::new("bump_geometry")?,
+            from_socket: "Normal".to_owned(),
+            to_node: Id::new("bump")?,
+            to_socket: "Normal".to_owned(),
+        },
+        GraphLink {
+            from_node: Id::new("bump")?,
+            from_socket: "Normal".to_owned(),
+            to_node: Id::new("output")?,
+            to_socket: "Normal".to_owned(),
+        },
+    ]);
+
+    let mut root = NodeGroup::new("Root Shader", GraphKind::Shader);
+    for (node_id, node_type) in [
+        ("output", "ShaderNodeOutputMaterial"),
+        ("principled", "ShaderNodeBsdfPrincipled"),
+        ("group", "ShaderNodeGroup"),
+        ("vertex", "ShaderNodeVertexColor"),
+    ] {
+        root.nodes
+            .insert(Id::new(node_id)?, GraphNode::new(node_type));
+    }
+    root.nodes
+        .get_mut(&Id::new("group")?)
+        .ok_or_else(|| invalid_intermediate("shader test group node is missing"))?
+        .properties
+        .insert("node_tree".to_owned(), json!(child_id.as_str()));
+    root.nodes
+        .get_mut(&Id::new("vertex")?)
+        .ok_or_else(|| invalid_intermediate("shader test node is missing"))?
+        .properties
+        .insert("layer_name".to_owned(), json!("Col"));
+    root.links.extend([
+        GraphLink {
+            from_node: Id::new("vertex")?,
+            from_socket: "Color".to_owned(),
+            to_node: Id::new("group")?,
+            to_socket: "Height".to_owned(),
+        },
+        GraphLink {
+            from_node: Id::new("group")?,
+            from_socket: "Normal".to_owned(),
+            to_node: Id::new("principled")?,
+            to_socket: "Normal".to_owned(),
+        },
+        GraphLink {
+            from_node: Id::new("principled")?,
+            from_socket: "BSDF".to_owned(),
+            to_node: Id::new("output")?,
+            to_socket: "Surface".to_owned(),
+        },
+    ]);
+
+    let material_id = Id::new("group_bump_material")?;
+    let data_id = Id::new("group_bump_mesh_data")?;
+    let mut mesh =
+        Mesh::from_positions_and_faces(vec![DVec3::ZERO, DVec3::X, DVec3::Y], vec![vec![0, 1, 2]])
+            .map_err(|_| PotError::new(ErrorCode::InternalError, "shader test mesh is invalid"))?;
+    color_layers::write(
+        &mut mesh,
+        &ColorStore {
+            layers: vec![ColorLayer {
+                name: "Col".to_owned(),
+                domain: ColorDomain::Corner,
+                values: vec![[0.2, 0.3, 0.4, 1.0]; 3],
+            }],
+            active: Some("Col".to_owned()),
+            render: Some("Col".to_owned()),
+        },
+    );
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    doc.node_groups.insert(child_id, child);
+    let root_id = Id::new("root_shader")?;
+    doc.node_groups.insert(root_id.clone(), root);
+    doc.materials.insert(
+        material_id.clone(),
+        Material {
+            node_tree: Some(root_id),
+            ..Material::default()
+        },
+    );
+    doc.data_blocks.insert(
+        data_id.clone(),
+        DataBlock {
+            data_type: "mesh".to_owned(),
+            mesh: Some(mesh),
+            materials: vec![Some(material_id)],
+            ..DataBlock::default()
+        },
+    );
+    let object = Node {
+        kind: "mesh".to_owned(),
+        data: Some(data_id),
+        ..Node::default()
+    };
+    let object_id = Id::new("group_bump_mesh")?;
+    doc.nodes.insert(object_id.clone(), object);
+    doc.collections
+        .get_mut(&Id::from_static("collection_root"))
+        .ok_or_else(|| invalid_intermediate("shader test collection is missing"))?
+        .objects
+        .push(object_id);
+
+    let active_scene = doc.active_scene.clone();
+    doc.scenes
+        .get_mut(&active_scene)
+        .ok_or_else(|| invalid_intermediate("shader test scene is missing"))?
+        .render
+        .engine = "realtime".to_owned();
+    for (feature_id, node_id, reason_fragment) in [
+        (
+            "shader.node.ShaderNodeVertexColor.bump_height_interpolation",
+            "vertex",
+            "Bump Height node `bump`",
+        ),
+        (
+            "shader.node.ShaderNodeNewGeometry.bump_height_interpolation",
+            "geometry",
+            "output `Normal`",
+        ),
+        (
+            "shader.node.ShaderNodeTexCoord.bump_height_interpolation",
+            "texcoord",
+            "output `Reflection`",
+        ),
+    ] {
+        assert!(shader_node_import_losses(&doc).iter().any(|loss| {
+            loss.feature_id == feature_id
+                && loss.data_id.as_deref() == Some(node_id)
+                && loss.reason.contains(reason_fragment)
+        }));
+    }
+    Ok(())
+}
+#[test]
+fn import_node_groups_marks_uncaptured_blender_output_defaults() -> Result<()> {
+    let item = json!({
+        "name": "Legacy Shader",
+        "type": "ShaderNodeTree",
+        "nodes": [
+            {"name": "Value", "type": "ShaderNodeValue", "properties": {}},
+            {"name": "RGB", "type": "ShaderNodeRGB", "properties": {}},
+            {"name": "Normal", "type": "ShaderNodeNormal", "properties": {}},
+            {"name": "Principled", "type": "ShaderNodeBsdfPrincipled", "properties": {}},
+            {"name": "ValueCaptured", "type": "ShaderNodeValue",
+             "properties": {"potter_output_defaults": [{"identifier": "Value", "default": 42.0}]}},
+        ]
+    });
+    let mut doc = SceneDoc::new(uuid::Uuid::new_v4().to_string());
+    let groups = import_node_groups(std::slice::from_ref(&item), &mut doc, &mut BTreeMap::new())?;
+    let group_id = groups
+        .get("Legacy Shader")
+        .ok_or_else(|| invalid_intermediate("legacy shader group is missing"))?;
+    let group = doc
+        .node_groups
+        .get(group_id)
+        .ok_or_else(|| invalid_intermediate("legacy shader group was not imported"))?;
+    for node_id in ["Value", "RGB", "Normal"] {
+        assert_eq!(
+            group
+                .nodes
+                .values()
+                .find(|node| node.name == node_id)
+                .and_then(|node| node.properties.get("potter_output_defaults")),
+            Some(&json!([]))
+        );
+    }
+    assert!(
+        group
+            .nodes
+            .values()
+            .find(|node| node.name == "Principled")
+            .is_some_and(|node| !node.properties.contains_key("potter_output_defaults"))
+    );
+    assert_eq!(
+        group
+            .nodes
+            .values()
+            .find(|node| node.name == "ValueCaptured")
+            .and_then(|node| node.properties.get("potter_output_defaults")),
+        Some(&json!([{"identifier":"Value","default":42.0}]))
+    );
+    Ok(())
 }
 
 #[cfg(test)]
