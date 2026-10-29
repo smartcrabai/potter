@@ -35,6 +35,15 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "GeometryNodeMeshLine"
             | "GeometryNodeMeshCircle"
             | "ShaderNodeMath"
+            | "ShaderNodeMapRange"
+            | "ShaderNodeClamp"
+            | "FunctionNodeIntegerMath"
+            | "FunctionNodeBooleanMath"
+            | "FunctionNodeCompare"
+            | "ShaderNodeValToRGB"
+            | "ShaderNodeFloatCurve"
+            | "ShaderNodeVectorCurve"
+            | "ShaderNodeRGBCurve"
             | "ShaderNodeBackground"
             | "ShaderNodeEmission"
             | "ShaderNodeOutputMaterial"
@@ -390,7 +399,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             sockets(&[("Red", "float"), ("Green", "float"), ("Blue", "float")]),
         ),
         "ShaderNodeRGBToBW" => (sockets(&[("Color", "color")]), sockets(&[("Val", "float")])),
-        "ShaderNodeInvert" => (
+        "ShaderNodeInvert" | "ShaderNodeRGBCurve" => (
             sockets(&[("Fac", "float"), ("Color", "color")]),
             sockets(&[("Color", "color")]),
         ),
@@ -499,15 +508,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         ),
         "ShaderNodeMixRGB" => (
             sockets(&[("Fac", "float"), ("Color1", "color"), ("Color2", "color")]),
-            sockets(&[("Color", "color"), ("Alpha", "float")]),
-        ),
-        "ShaderNodeMix" => (
-            sockets(&[
-                ("Factor_Float", "float"),
-                ("A_Color", "color"),
-                ("B_Color", "color"),
-            ]),
-            sockets(&[("Result_Color", "color")]),
+            sockets(&[("Color", "color")]),
         ),
         "ShaderNodeVertexColor" => (
             sockets(&[("Layer Name", "string")]),
@@ -575,22 +576,28 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             ]),
             sockets(&[("Displacement", "vector")]),
         ),
-        "ShaderNodeMath" => (
-            sockets(&[
-                ("Value", "float"),
-                ("Value_001", "float"),
-                ("Value_002", "float"),
-            ]),
+        "ShaderNodeMath" => math_sockets(node),
+        "ShaderNodeVectorMath" => vector_math_sockets(node),
+        "FunctionNodeIntegerMath" => integer_math_sockets(node),
+        "FunctionNodeBooleanMath" => boolean_math_sockets(node),
+        "FunctionNodeCompare" => compare_sockets(node),
+        "ShaderNodeMapRange" => map_range_sockets(node),
+        "ShaderNodeClamp" => (
+            sockets(&[("Value", "float"), ("Min", "float"), ("Max", "float")]),
+            sockets(&[("Result", "float")]),
+        ),
+        "ShaderNodeMix" => mix_sockets(node),
+        "ShaderNodeValToRGB" => (
+            sockets(&[("Fac", "float")]),
+            sockets(&[("Color", "color"), ("Alpha", "float")]),
+        ),
+        "ShaderNodeFloatCurve" => (
+            sockets(&[("Factor", "float"), ("Value", "float")]),
             sockets(&[("Value", "float")]),
         ),
-        "ShaderNodeVectorMath" => (
-            sockets(&[
-                ("Vector", "vector"),
-                ("Vector_001", "vector"),
-                ("Vector_002", "vector"),
-                ("Scale", "float"),
-            ]),
-            sockets(&[("Vector", "vector"), ("Value", "float")]),
+        "ShaderNodeVectorCurve" => (
+            sockets(&[("Fac", "float"), ("Vector", "vector")]),
+            sockets(&[("Vector", "vector")]),
         ),
         "ShaderNodeCombineXYZ" => (
             sockets(&[("X", "float"), ("Y", "float"), ("Z", "float")]),
@@ -600,39 +607,7 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
             sockets(&[("Vector", "vector")]),
             sockets(&[("X", "float"), ("Y", "float"), ("Z", "float")]),
         ),
-        "FunctionNodeRandomValue" => {
-            let data_type = node
-                .properties
-                .get("data_type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("FLOAT");
-            let inputs = match data_type {
-                "BOOLEAN" | "BOOL" => sockets(&[
-                    ("Probability", "float"),
-                    ("Seed", "integer"),
-                    ("ID", "integer"),
-                ]),
-                "INT" | "INTEGER" => sockets(&[
-                    ("Min", "integer"),
-                    ("Max", "integer"),
-                    ("Seed", "integer"),
-                    ("ID", "integer"),
-                ]),
-                "VECTOR" | "FLOAT_VECTOR" => sockets(&[
-                    ("Min", "vector"),
-                    ("Max", "vector"),
-                    ("Seed", "integer"),
-                    ("ID", "integer"),
-                ]),
-                _ => sockets(&[
-                    ("Min", "float"),
-                    ("Max", "float"),
-                    ("Seed", "integer"),
-                    ("ID", "integer"),
-                ]),
-            };
-            (inputs, sockets(&[("Value", "value")]))
-        }
+        "FunctionNodeRandomValue" => random_value_sockets(node),
         "GeometryNodeRepeatInput" => (
             sockets(&[("Iterations", "integer"), ("Geometry", "geometry")]),
             sockets(&[("Iteration", "integer"), ("Geometry", "geometry")]),
@@ -648,6 +623,163 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         _ => return None,
     };
     Some(sockets)
+}
+
+fn math_sockets(_node: &super::GraphNode) -> SocketPair {
+    (
+        sockets(&[
+            ("Value", "float"),
+            ("Value_001", "float"),
+            ("Value_002", "float"),
+        ]),
+        sockets(&[("Value", "float")]),
+    )
+}
+
+fn vector_math_sockets(_node: &super::GraphNode) -> SocketPair {
+    (
+        sockets(&[
+            ("Vector", "vector"),
+            ("Vector_001", "vector"),
+            ("Vector_002", "vector"),
+            ("Scale", "float"),
+        ]),
+        sockets(&[("Vector", "vector"), ("Value", "float")]),
+    )
+}
+
+fn property_enum(node: &super::GraphNode, key: &str, default: &str) -> String {
+    node.properties
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(default)
+        .to_ascii_uppercase()
+}
+
+fn integer_math_sockets(_node: &super::GraphNode) -> SocketPair {
+    (
+        sockets(&[
+            ("Value", "integer"),
+            ("Value_001", "integer"),
+            ("Value_002", "integer"),
+        ]),
+        sockets(&[("Value", "integer")]),
+    )
+}
+
+fn boolean_math_sockets(node: &super::GraphNode) -> SocketPair {
+    let operation = property_enum(node, "operation", "AND");
+    let mut inputs = sockets(&[("Boolean", "boolean")]);
+    if operation != "NOT" {
+        inputs.push(("Boolean_001".to_owned(), "boolean".to_owned()));
+    }
+    (inputs, sockets(&[("Boolean", "boolean")]))
+}
+
+fn compare_socket_type(data_type: &str) -> &'static str {
+    match data_type {
+        "FLOAT" => "float",
+        "INT" | "INTEGER" => "integer",
+        "VECTOR" | "FLOAT_VECTOR" => "vector",
+        "RGBA" | "COLOR" => "color",
+        "BOOLEAN" | "BOOL" => "boolean",
+        "STRING" => "string",
+        "OBJECT" => "object",
+        "IMAGE" => "image",
+        "COLLECTION" => "collection",
+        "MATERIAL" => "material",
+        "FONT" => "font",
+        "SOUND" => "sound",
+        _ => "value",
+    }
+}
+
+fn compare_sockets(node: &super::GraphNode) -> SocketPair {
+    let data_type = property_enum(node, "data_type", "FLOAT");
+    let operation = property_enum(node, "operation", "GREATER_THAN");
+    let mode = property_enum(node, "mode", "ELEMENT");
+    let input_type = compare_socket_type(&data_type);
+    let mut inputs = sockets(&[("A", "value"), ("B", "value")]);
+    for input in &mut inputs {
+        input_type.clone_into(&mut input.1);
+    }
+    if matches!(data_type.as_str(), "VECTOR" | "FLOAT_VECTOR") && mode == "DOT_PRODUCT" {
+        inputs.push(("C".to_owned(), "float".to_owned()));
+    }
+    if matches!(data_type.as_str(), "VECTOR" | "FLOAT_VECTOR") && mode == "DIRECTION" {
+        inputs.push(("Angle".to_owned(), "float".to_owned()));
+    }
+    if matches!(operation.as_str(), "EQUAL" | "NOT_EQUAL")
+        && matches!(
+            data_type.as_str(),
+            "FLOAT" | "VECTOR" | "FLOAT_VECTOR" | "RGBA"
+        )
+    {
+        inputs.push(("Epsilon".to_owned(), "float".to_owned()));
+    }
+    (inputs, sockets(&[("Result", "boolean")]))
+}
+
+fn map_range_sockets(_node: &super::GraphNode) -> SocketPair {
+    (
+        sockets(&[
+            ("Value", "float"),
+            ("From Min", "float"),
+            ("From Max", "float"),
+            ("To Min", "float"),
+            ("To Max", "float"),
+            ("Steps", "float"),
+            ("Vector", "vector"),
+            ("From_Min_FLOAT3", "vector"),
+            ("From_Max_FLOAT3", "vector"),
+            ("To_Min_FLOAT3", "vector"),
+            ("To_Max_FLOAT3", "vector"),
+            ("Steps_FLOAT3", "vector"),
+        ]),
+        sockets(&[("Result", "float"), ("Vector", "vector")]),
+    )
+}
+
+fn mix_sockets(_node: &super::GraphNode) -> SocketPair {
+    (
+        sockets(&[
+            ("Factor_Float", "float"),
+            ("Factor_Vector", "vector"),
+            ("A_Float", "float"),
+            ("B_Float", "float"),
+            ("A_Vector", "vector"),
+            ("B_Vector", "vector"),
+            ("A_Color", "color"),
+            ("B_Color", "color"),
+            ("A_Rotation", "rotation"),
+            ("B_Rotation", "rotation"),
+        ]),
+        sockets(&[
+            ("Result_Float", "float"),
+            ("Result_Vector", "vector"),
+            ("Result_Color", "color"),
+            ("Result_Rotation", "rotation"),
+        ]),
+    )
+}
+
+fn random_value_sockets(node: &super::GraphNode) -> SocketPair {
+    let data_type = property_enum(node, "data_type", "FLOAT");
+    let inputs = if matches!(data_type.as_str(), "BOOLEAN" | "BOOL") {
+        sockets(&[
+            ("Probability", "float"),
+            ("Seed", "integer"),
+            ("ID", "integer"),
+        ])
+    } else {
+        sockets(&[
+            ("Min", "value"),
+            ("Max", "value"),
+            ("Seed", "integer"),
+            ("ID", "integer"),
+        ])
+    };
+    (inputs, sockets(&[("Value", "value")]))
 }
 
 /// The socket identifier of a Bake item: its `id`, falling back to `identifier` and then `name`.
@@ -875,13 +1007,35 @@ fn validate_link_structure(
                 ),
             )
         })?;
-    if from_type != to_type {
+    if from_type != to_type && !value_socket_compatible(&from_type, &to_type) {
         return Err(PotError::new(
             ErrorCode::InvalidOperation,
             format!("socket type mismatch: `{from_type}` cannot connect to `{to_type}`"),
         ));
     }
     Ok(())
+}
+fn value_socket_compatible(from_type: &str, to_type: &str) -> bool {
+    let is_value = |socket_type| {
+        matches!(
+            socket_type,
+            "value"
+                | "float"
+                | "integer"
+                | "boolean"
+                | "vector"
+                | "rotation"
+                | "color"
+                | "string"
+                | "object"
+                | "image"
+                | "collection"
+                | "material"
+                | "font"
+                | "sound"
+        )
+    };
+    (from_type == "value" && is_value(to_type)) || (to_type == "value" && is_value(from_type))
 }
 
 fn has_single_link_input(group: &NodeGroup, link: &GraphLink) -> bool {

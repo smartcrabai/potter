@@ -10,8 +10,9 @@
 //! `matrix_basis` on a node; version 6 documents have none, so [`upgrade_v6`] changes nothing else.
 //! Version 10 gates native Dynamic Paint output-layer and brush-source migrations on the source schema.
 //! Version 11 stores multi-input links in descending `multi_input_sort_id` order; version-10 links are reversed by `upgrade_v10`.
-//! Version 15 marks Blender-mapped shader Value, RGB and Normal nodes without stored output defaults,
-//! so evaluation can reject them instead of guessing.
+//! Version 15 marks Blender-mapped materials without saved pass indices unknown and shader nodes
+//! without stored output defaults. Version 16 removes unsupported legacy `ShaderNodeMixRGB` Alpha
+//! links and restores captured CurveMapping/ColorRamp state from the Blender compatibility intermediate.
 //! Legacy documents capture `STRETCH_TO` and `CHILD_OF` first-evaluation state at the active
 //! scene's frame; targeted states that cannot be captured move to compatibility while targetless
 //! constraints remain editable.
@@ -106,7 +107,9 @@ fn parse_scene_inner(
             && has_refused_animation_outputs(&value))
         || (source_schema_version == Some(12) && has_restorable_animation_outputs(&value))
         || (source_schema_version.is_some_and(|version| version <= 13)
-            && has_uninitialized_initial_constraint_states(&value));
+            && has_uninitialized_initial_constraint_states(&value))
+        || (source_schema_version.is_some_and(|version| version <= 16)
+            && has_legacy_mixrgb_alpha_links(&value));
     let source_hash = if retain_original_hash
         && (legacy
             || has_uninitialized_limit_distance_states(&value)
@@ -625,11 +628,12 @@ fn json_error(error: &serde_json::Error) -> PotError {
     )
 }
 
-/// Upgrades a scene document in place through schema version 16. Version 12 constraint states move
+/// Upgrades a scene document in place through schema version 17. Version 12 constraint states move
 /// to compatibility data, version 14 migrates legacy Geometry Nodes Mesh to Points domains, and
 /// version 15 marks Blender-mapped materials without saved pass indices unknown and shader nodes
-/// without stored output defaults. Version 11 retires unsupported animation outputs. `root` is the
-/// project directory that holds image blobs and linked sources, which the version 3 to 4 step reads.
+/// without stored output defaults. Version 16 migrates `NodeMath` shader state. Version 11 retires
+/// unsupported animation outputs. `root` is the project directory that holds image blobs and linked
+/// sources, which the version 3 to 4 step reads.
 pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     let mut warnings = if value.get("schema_version").and_then(Value::as_u64) == Some(1) {
         upgrade_v1(value)?
@@ -678,6 +682,9 @@ pub fn upgrade_scene(value: &mut Value, root: &Path) -> Result<Vec<Value>> {
     }
     if value.get("schema_version").and_then(Value::as_u64) == Some(15) {
         warnings.extend(upgrade_v15(value)?);
+    }
+    if value.get("schema_version").and_then(Value::as_u64) == Some(16) {
+        warnings.extend(upgrade_v16(value)?);
     }
     upgrade_scene_gravity_from_blender_metadata(value);
     Ok(warnings)
@@ -1658,6 +1665,855 @@ fn upgrade_v14(value: &mut Value) -> Result<()> {
     }
     value["schema_version"] = json!(15);
     Ok(())
+}
+
+fn upgrade_v16(value: &mut Value) -> Result<Vec<Value>> {
+    upgrade_missing_graph_node_states(value)?;
+    upgrade_compatibility_graph_node_states(value)?;
+    let mut removed = upgrade_native_mixrgb_alpha_links(value);
+    let mut native_counts = BTreeMap::new();
+    for entry in &removed {
+        *native_counts.entry(entry.2.clone()).or_insert(0_usize) += 1;
+    }
+    if let Some(intermediate) = value
+        .get_mut("compatibility")
+        .and_then(|compatibility| compatibility.get_mut("blender_adapter"))
+        .and_then(|adapter| adapter.get_mut("intermediate"))
+    {
+        upgrade_intermediate_mixrgb_alpha_links(intermediate, &mut removed, &mut native_counts);
+    }
+    let warnings = removed
+        .iter()
+        .map(|(graph, link, _, source)| {
+            json!({
+                "code":"node.shader.mix_rgb.alpha_link_removed",
+                "feature_id":"shader.node_mix_rgb.alpha_socket_link",
+                "message":format!(
+                    "Legacy ShaderNodeMixRGB Alpha link in `{graph}` was removed because Blender 5.2.2 has no equivalent Alpha socket"
+                ),
+                "node_group":graph,
+                "link":link,
+                "source":source,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !removed.is_empty() {
+        let compatibility = value
+            .as_object_mut()
+            .ok_or_else(|| invalid("scene document must be an object"))?
+            .entry("compatibility".to_owned())
+            .or_insert_with(|| json!({}));
+        let compatibility = compatibility
+            .as_object_mut()
+            .ok_or_else(|| invalid("compatibility data must be an object"))?;
+        let losses = compatibility
+            .entry("losses".to_owned())
+            .or_insert_with(|| json!([]));
+        let losses = losses
+            .as_array_mut()
+            .ok_or_else(|| invalid("compatibility losses must be an array"))?;
+        losses.extend(removed.iter().map(|(graph, link, _, source)| {
+            json!({
+                "feature_id":"shader.node_mix_rgb.alpha_socket_link",
+                "data_id":graph,
+                "reason":"The legacy ShaderNodeMixRGB Alpha socket has no equivalent in Blender 5.2.2; the link was removed.",
+                "link":link,
+                "source":source,
+            })
+        }));
+    }
+    value["schema_version"] = json!(17);
+    Ok(warnings)
+}
+
+type AlphaLinkSignature = (String, String, String, String);
+type RemovedAlphaLink = (String, Value, AlphaLinkSignature, &'static str);
+
+fn upgrade_missing_graph_node_states(value: &mut Value) -> Result<()> {
+    let mut replacements = Vec::new();
+    let mut missing = Vec::new();
+    if let Some(groups) = value.get("node_groups").and_then(Value::as_object) {
+        for (group_id, group) in groups {
+            let group_name = group
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(group_id);
+            let Some(nodes) = group.get("nodes").and_then(Value::as_object) else {
+                continue;
+            };
+            for (node_id, node) in nodes {
+                let node_type = node.get("type").and_then(Value::as_str).unwrap_or_default();
+                let property = match node_type {
+                    "ShaderNodeFloatCurve" | "ShaderNodeVectorCurve" | "ShaderNodeRGBCurve" => {
+                        "mapping"
+                    }
+                    "ShaderNodeValToRGB" => "color_ramp",
+                    _ => continue,
+                };
+                let state = node
+                    .get("properties")
+                    .and_then(|properties| properties.get(property));
+                if state.is_some_and(|state| graph_node_state_is_valid(node_type, state)) {
+                    continue;
+                }
+                missing.push((
+                    group_id.clone(),
+                    group_name.to_owned(),
+                    node_id.clone(),
+                    node.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(node_id)
+                        .to_owned(),
+                    node_type.to_owned(),
+                    property.to_owned(),
+                    state.is_none(),
+                ));
+            }
+        }
+    }
+    for (group_id, group_name, node_id, node_name, node_type, property, state_was_missing) in
+        missing
+    {
+        let node = value
+            .get("node_groups")
+            .and_then(|groups| groups.get(&group_id))
+            .and_then(|group| group.get("nodes"))
+            .and_then(|nodes| nodes.get(&node_id));
+        let legacy_state = if property == "color_ramp" {
+            node.and_then(legacy_color_ramp_state)
+        } else {
+            None
+        };
+        let legacy_valid = legacy_state
+            .as_ref()
+            .filter(|state| graph_node_state_is_valid(&node_type, state))
+            .cloned();
+        let compatibility_state = compatibility_graph_node_state(
+            value,
+            &group_id,
+            &group_name,
+            &node_id,
+            &node_name,
+            &node_type,
+            &property,
+        );
+        let state = match compatibility_state {
+            Ok(Some(state)) => Some(state),
+            Ok(None) => legacy_valid,
+            Err(error) => match legacy_valid {
+                Some(state) => Some(state),
+                None => return Err(error),
+            },
+        };
+        let state = match state {
+            Some(state) => Some(state),
+            None if state_was_missing && legacy_state.is_none() => {
+                Some(default_graph_node_state(&node_type)?)
+            }
+            None => None,
+        };
+        let Some(state) = state else {
+            let feature_id = if property == "mapping" {
+                "shader.node_curve_mapping.state"
+            } else {
+                "shader.node_color_ramp.state"
+            };
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!(
+                    "Cannot upgrade {node_type} `{node_name}` in `{group_name}`: its saved {property} state is missing or invalid and no recoverable Blender or legacy payload exists"
+                ),
+                json!({
+                    "feature_id":feature_id,
+                    "node_group_id":group_id,
+                    "node_id":node_id,
+                }),
+            ));
+        };
+        replacements.push((group_id, node_id, property, state));
+    }
+    for (group_id, node_id, property, state) in replacements {
+        let node = value
+            .get_mut("node_groups")
+            .and_then(|groups| groups.get_mut(&group_id))
+            .and_then(|group| group.get_mut("nodes"))
+            .and_then(|nodes| nodes.get_mut(&node_id))
+            .ok_or_else(|| invalid("graph node disappeared during state migration"))?;
+        let properties = node
+            .as_object_mut()
+            .ok_or_else(|| invalid("graph node must be an object"))?
+            .entry("properties".to_owned())
+            .or_insert_with(|| json!({}));
+        let properties = properties
+            .as_object_mut()
+            .ok_or_else(|| invalid("graph node properties must be an object"))?;
+        properties.insert(property.clone(), state);
+        if property == "color_ramp" {
+            for legacy_key in [
+                "elements",
+                "interpolation",
+                "color_mode",
+                "hue_interpolation",
+            ] {
+                properties.remove(legacy_key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn legacy_color_ramp_state(node: &Value) -> Option<Value> {
+    let properties = node.get("properties")?.as_object()?;
+    let keys = [
+        "elements",
+        "interpolation",
+        "color_mode",
+        "hue_interpolation",
+    ];
+    if !keys.iter().any(|key| properties.contains_key(*key)) {
+        return None;
+    }
+    let mut state = default_color_ramp_state();
+    let ramp = state.as_object_mut()?;
+    for key in keys {
+        if let Some(value) = properties.get(key) {
+            ramp.insert(key.to_owned(), value.clone());
+        }
+    }
+    Some(state)
+}
+
+fn default_graph_node_state(node_type: &str) -> Result<Value> {
+    match node_type {
+        "ShaderNodeFloatCurve" | "ShaderNodeVectorCurve" | "ShaderNodeRGBCurve" => {
+            let (curve_count, minimum) = match node_type {
+                "ShaderNodeFloatCurve" => (1, 0.0),
+                "ShaderNodeVectorCurve" => (3, -1.0),
+                "ShaderNodeRGBCurve" => (4, 0.0),
+                _ => unreachable!(),
+            };
+            let points = json!([
+                {"location":[minimum, minimum],"handle":"auto"},
+                {"location":[1.0, 1.0],"handle":"auto"}
+            ]);
+            let curves = (0..curve_count)
+                .map(|_| json!({"points":points}))
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "tone":"standard",
+                "extend_extrapolate":true,
+                "use_clip":true,
+                "clip":[minimum,minimum,1.0,1.0],
+                "black":[0.0,0.0,0.0],
+                "white":[1.0,1.0,1.0],
+                "curves":curves
+            }))
+        }
+        "ShaderNodeValToRGB" => Ok(default_color_ramp_state()),
+        _ => Err(invalid(format!(
+            "no default graph node state exists for `{node_type}`"
+        ))),
+    }
+}
+
+fn default_color_ramp_state() -> Value {
+    json!({
+        "color_mode":"RGB",
+        "hue_interpolation":"NEAR",
+        "interpolation":"LINEAR",
+        "elements":[
+            {"position":0.0,"color":[0.0,0.0,0.0,1.0]},
+            {"position":1.0,"color":[1.0,1.0,1.0,1.0]}
+        ]
+    })
+}
+
+fn graph_node_state_is_valid(node_type: &str, state: &Value) -> bool {
+    match node_type {
+        "ShaderNodeFloatCurve" | "ShaderNodeVectorCurve" | "ShaderNodeRGBCurve" => {
+            CurveMapping::from_node_json(state).is_ok()
+        }
+        "ShaderNodeValToRGB" => {
+            let Some(ramp) = state.as_object() else {
+                return false;
+            };
+            let Some(elements) = ramp.get("elements").and_then(Value::as_array) else {
+                return false;
+            };
+            elements.len() >= 2
+                && ["interpolation", "color_mode", "hue_interpolation"]
+                    .iter()
+                    .all(|key| ramp.get(*key).and_then(Value::as_str).is_some())
+                && elements.iter().all(|element| {
+                    element.get("position").and_then(Value::as_f64).is_some()
+                        && element
+                            .get("color")
+                            .and_then(Value::as_array)
+                            .is_some_and(|color| {
+                                color.len() == 4 && color.iter().all(Value::is_number)
+                            })
+                })
+        }
+        _ => false,
+    }
+}
+
+type SavedGraphNodeState = (String, String, String, String, String, String, Value);
+
+fn upgrade_compatibility_graph_node_states(value: &mut Value) -> Result<()> {
+    fn visit(value: &mut Value, states: &[SavedGraphNodeState]) -> Result<()> {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, states)?;
+                }
+            }
+            Value::Object(object) => {
+                let group_id = object
+                    .get("potter_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let group_name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Blender graph")
+                    .to_owned();
+                if object.get("links").and_then(Value::as_array).is_some()
+                    && let Some(nodes) = object.get_mut("nodes").and_then(Value::as_array_mut)
+                {
+                    for node in nodes {
+                        let node_type =
+                            node.get("type").and_then(Value::as_str).unwrap_or_default();
+                        let property = match node_type {
+                            "ShaderNodeFloatCurve"
+                            | "ShaderNodeVectorCurve"
+                            | "ShaderNodeRGBCurve" => "mapping",
+                            "ShaderNodeValToRGB" => "color_ramp",
+                            _ => continue,
+                        };
+                        let current_state = node
+                            .get("properties")
+                            .and_then(|properties| properties.get(property));
+                        let state_was_missing = current_state.is_none();
+                        if current_state
+                            .is_some_and(|state| graph_node_state_is_valid(node_type, state))
+                        {
+                            continue;
+                        }
+                        let legacy_state = if property == "color_ramp" {
+                            legacy_color_ramp_state(node)
+                        } else {
+                            None
+                        };
+                        let mut state_to_write = legacy_state
+                            .as_ref()
+                            .filter(|state| graph_node_state_is_valid(node_type, state))
+                            .cloned();
+                        let node_name = node
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unnamed node");
+                        let node_id = node
+                            .get("potter_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(node_name);
+                        let candidates = states
+                            .iter()
+                            .filter(|state| {
+                                state.4 == node_type && state.3 == node_name && state.5 == property
+                            })
+                            .collect::<Vec<_>>();
+                        let has_candidates = !candidates.is_empty();
+                        let exact = candidates
+                            .iter()
+                            .filter(|state| state.0 == group_id && state.2 == node_id)
+                            .map(|state| state.6.clone())
+                            .collect::<Vec<_>>();
+                        let in_group = candidates
+                            .iter()
+                            .filter(|state| state.0 == group_id || state.1 == group_name)
+                            .map(|state| state.6.clone())
+                            .collect::<Vec<_>>();
+                        let any = candidates
+                            .iter()
+                            .map(|state| state.6.clone())
+                            .collect::<Vec<_>>();
+                        if state_to_write.is_none() {
+                            state_to_write = consistent_graph_state(exact)
+                                .or_else(|| consistent_graph_state(in_group))
+                                .or_else(|| consistent_graph_state(any));
+                        }
+                        if state_to_write.is_none()
+                            && state_was_missing
+                            && legacy_state.is_none()
+                            && !has_candidates
+                        {
+                            state_to_write = Some(default_graph_node_state(node_type)?);
+                        }
+                        let Some(state) = state_to_write else {
+                            let feature_id = if property == "mapping" {
+                                "shader.node_curve_mapping.state"
+                            } else {
+                                "shader.node_color_ramp.state"
+                            };
+                            return Err(PotError::with_details(
+                                ErrorCode::UnsupportedFeature,
+                                format!(
+                                    "Cannot preserve {node_type} `{node_name}` in compatibility graph `{group_name}`: its saved {property} state is missing or invalid"
+                                ),
+                                json!({
+                                    "feature_id":feature_id,
+                                    "node_group_id":group_id,
+                                    "node_id":node_id,
+                                }),
+                            ));
+                        };
+                        let properties = node
+                            .as_object_mut()
+                            .ok_or_else(|| invalid("intermediate graph node must be an object"))?
+                            .entry("properties".to_owned())
+                            .or_insert_with(|| json!({}));
+                        let properties = properties.as_object_mut().ok_or_else(|| {
+                            invalid("intermediate graph node properties must be an object")
+                        })?;
+                        properties.insert(property.to_owned(), state);
+                        if property == "color_ramp" {
+                            for legacy_key in [
+                                "elements",
+                                "interpolation",
+                                "color_mode",
+                                "hue_interpolation",
+                            ] {
+                                properties.remove(legacy_key);
+                            }
+                        }
+                    }
+                }
+                for value in object.values_mut() {
+                    visit(value, states)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn consistent_graph_state(mut candidates: Vec<Value>) -> Option<Value> {
+        let first = candidates.pop()?;
+        candidates
+            .iter()
+            .all(|candidate| candidate == &first)
+            .then_some(first)
+    }
+    let mut states = Vec::new();
+    if let Some(groups) = value.get("node_groups").and_then(Value::as_object) {
+        for (group_id, group) in groups {
+            let group_name = group
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(group_id)
+                .to_owned();
+            let Some(nodes) = group.get("nodes").and_then(Value::as_object) else {
+                continue;
+            };
+            for (node_id, node) in nodes {
+                let node_type = node.get("type").and_then(Value::as_str).unwrap_or_default();
+                let property = match node_type {
+                    "ShaderNodeFloatCurve" | "ShaderNodeVectorCurve" | "ShaderNodeRGBCurve" => {
+                        "mapping"
+                    }
+                    "ShaderNodeValToRGB" => "color_ramp",
+                    _ => continue,
+                };
+                let Some(state) = node
+                    .get("properties")
+                    .and_then(|properties| properties.get(property))
+                    .filter(|state| graph_node_state_is_valid(node_type, state))
+                else {
+                    continue;
+                };
+                states.push((
+                    group_id.clone(),
+                    group_name.clone(),
+                    node_id.clone(),
+                    node.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(node_id)
+                        .to_owned(),
+                    node_type.to_owned(),
+                    property.to_owned(),
+                    state.clone(),
+                ));
+            }
+        }
+    }
+    let Some(intermediate) = value
+        .get_mut("compatibility")
+        .and_then(|compatibility| compatibility.get_mut("blender_adapter"))
+        .and_then(|adapter| adapter.get_mut("intermediate"))
+    else {
+        return Ok(());
+    };
+    visit(intermediate, &states)
+}
+
+fn compatibility_graph_node_state(
+    value: &Value,
+    group_id: &str,
+    group_name: &str,
+    node_id: &str,
+    node_name: &str,
+    node_type: &str,
+    property: &str,
+) -> Result<Option<Value>> {
+    fn collect_graphs<'a>(value: &'a Value, graphs: &mut Vec<&'a Value>) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    collect_graphs(value, graphs);
+                }
+            }
+            Value::Object(values) => {
+                if values.get("nodes").and_then(Value::as_array).is_some()
+                    && values.get("links").and_then(Value::as_array).is_some()
+                {
+                    graphs.push(value);
+                }
+                for value in values.values() {
+                    collect_graphs(value, graphs);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn consistent(mut candidates: Vec<Value>) -> Option<Value> {
+        let first = candidates.pop()?;
+        candidates
+            .iter()
+            .all(|candidate| candidate == &first)
+            .then_some(first)
+    }
+
+    let Some(intermediate) = value
+        .get("compatibility")
+        .and_then(|compatibility| compatibility.get("blender_adapter"))
+        .and_then(|adapter| adapter.get("intermediate"))
+    else {
+        return Ok(None);
+    };
+    let mut graphs = Vec::new();
+    collect_graphs(intermediate, &mut graphs);
+    let mut exact = Vec::new();
+    let mut group_matches = Vec::new();
+    let mut any_matches = Vec::new();
+    let mut invalid_state = false;
+    for graph in graphs {
+        let group_matches_graph = graph.get("potter_id").and_then(Value::as_str) == Some(group_id)
+            || graph.get("name").and_then(Value::as_str) == Some(group_name);
+        let Some(nodes) = graph.get("nodes").and_then(Value::as_array) else {
+            continue;
+        };
+        for node in nodes {
+            if node.get("name").and_then(Value::as_str) != Some(node_name)
+                || node.get("type").and_then(Value::as_str) != Some(node_type)
+            {
+                continue;
+            }
+            let saved_state = node
+                .get("properties")
+                .and_then(|properties| properties.get(property));
+            let legacy_state = if property == "color_ramp" {
+                legacy_color_ramp_state(node)
+            } else {
+                None
+            };
+            let state = saved_state
+                .filter(|state| graph_node_state_is_valid(node_type, state))
+                .cloned()
+                .or_else(|| {
+                    legacy_state
+                        .as_ref()
+                        .filter(|state| graph_node_state_is_valid(node_type, state))
+                        .cloned()
+                });
+            let Some(state) = state else {
+                invalid_state |= saved_state.is_some() || legacy_state.is_some();
+                continue;
+            };
+            any_matches.push(state.clone());
+            if node.get("potter_id").and_then(Value::as_str) == Some(node_id) {
+                exact.push(state.clone());
+            }
+            if group_matches_graph {
+                group_matches.push(state);
+            }
+        }
+    }
+    let has_any_matches = !any_matches.is_empty();
+    let state = consistent(exact)
+        .or_else(|| consistent(group_matches))
+        .or_else(|| consistent(any_matches));
+    if state.is_some() {
+        return Ok(state);
+    }
+    if invalid_state {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!(
+                "Cannot recover {node_type} `{node_name}` in compatibility graph `{group_name}`: its saved {property} state is missing or invalid"
+            ),
+            json!({
+                "feature_id":if property == "mapping" {
+                    "shader.node_curve_mapping.state"
+                } else {
+                    "shader.node_color_ramp.state"
+                },
+                "node_group_id":group_id,
+                "node_id":node_id,
+            }),
+        ));
+    }
+    if has_any_matches {
+        return Err(PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            format!(
+                "Cannot recover {node_type} `{node_name}` in compatibility graph `{group_name}`: matching {property} states conflict"
+            ),
+            json!({
+                "feature_id":if property == "mapping" {
+                    "shader.node_curve_mapping.state"
+                } else {
+                    "shader.node_color_ramp.state"
+                },
+                "node_group_id":group_id,
+                "node_id":node_id,
+            }),
+        ));
+    }
+    Ok(None)
+}
+
+fn upgrade_native_mixrgb_alpha_links(value: &mut Value) -> Vec<RemovedAlphaLink> {
+    let mut removed = Vec::new();
+    let Some(groups) = value.get_mut("node_groups").and_then(Value::as_object_mut) else {
+        return removed;
+    };
+    for (group_id, group) in groups {
+        let group_name = group
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(group_id)
+            .to_owned();
+        let mut node_types = BTreeMap::new();
+        let mut node_names = BTreeMap::new();
+        if let Some(nodes) = group.get("nodes").and_then(Value::as_object) {
+            for (node_id, node) in nodes {
+                node_types.insert(
+                    node_id.clone(),
+                    node.get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                node_names.insert(
+                    node_id.clone(),
+                    node.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(node_id)
+                        .to_owned(),
+                );
+            }
+        }
+        let Some(links) = group.get_mut("links").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut keep = Vec::with_capacity(links.len());
+        for link in std::mem::take(links) {
+            if mixrgb_alpha_link(&link, &node_types) {
+                removed.push((
+                    group_name.clone(),
+                    link.clone(),
+                    alpha_link_signature(&link, &node_names),
+                    "node_group",
+                ));
+            } else {
+                keep.push(link);
+            }
+        }
+        *links = keep;
+    }
+    removed
+}
+
+fn upgrade_intermediate_mixrgb_alpha_links(
+    value: &mut Value,
+    removed: &mut Vec<RemovedAlphaLink>,
+    native_counts: &mut BTreeMap<AlphaLinkSignature, usize>,
+) {
+    fn visit(
+        value: &mut Value,
+        removed: &mut Vec<RemovedAlphaLink>,
+        native_counts: &mut BTreeMap<AlphaLinkSignature, usize>,
+    ) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, removed, native_counts);
+                }
+            }
+            Value::Object(object) => {
+                let node_types = object.get("nodes").and_then(Value::as_array).map(|nodes| {
+                    nodes
+                        .iter()
+                        .filter_map(|node| {
+                            Some((
+                                node.get("name")?.as_str()?.to_owned(),
+                                node.get("type")?.as_str()?.to_owned(),
+                            ))
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                });
+                let graph_name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Blender graph")
+                    .to_owned();
+                if let (Some(node_types), Some(links)) = (
+                    node_types,
+                    object.get_mut("links").and_then(Value::as_array_mut),
+                ) {
+                    let node_names = node_types
+                        .keys()
+                        .map(|name| (name.clone(), name.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    let mut keep = Vec::with_capacity(links.len());
+                    for link in std::mem::take(links) {
+                        if mixrgb_alpha_link(&link, &node_types) {
+                            let signature = alpha_link_signature(&link, &node_names);
+                            if let Some(count) = native_counts.get_mut(&signature)
+                                && *count > 0
+                            {
+                                *count -= 1;
+                            } else {
+                                removed.push((
+                                    graph_name.clone(),
+                                    link.clone(),
+                                    signature,
+                                    "blender_intermediate",
+                                ));
+                            }
+                        } else {
+                            keep.push(link);
+                        }
+                    }
+                    *links = keep;
+                }
+                for value in object.values_mut() {
+                    visit(value, removed, native_counts);
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(value, removed, native_counts);
+}
+
+fn mixrgb_alpha_link(link: &Value, node_types: &BTreeMap<String, String>) -> bool {
+    let source_is_mixrgb = link
+        .get("from_node")
+        .and_then(Value::as_str)
+        .and_then(|node| node_types.get(node))
+        .is_some_and(|node_type| node_type == "ShaderNodeMixRGB");
+    let target_is_mixrgb = link
+        .get("to_node")
+        .and_then(Value::as_str)
+        .and_then(|node| node_types.get(node))
+        .is_some_and(|node_type| node_type == "ShaderNodeMixRGB");
+    (source_is_mixrgb && link.get("from_socket").and_then(Value::as_str) == Some("Alpha"))
+        || (target_is_mixrgb && link.get("to_socket").and_then(Value::as_str) == Some("Alpha"))
+}
+
+fn alpha_link_signature(link: &Value, node_names: &BTreeMap<String, String>) -> AlphaLinkSignature {
+    let node_name = |key: &str| {
+        link.get(key)
+            .and_then(Value::as_str)
+            .and_then(|id| node_names.get(id))
+            .cloned()
+            .unwrap_or_default()
+    };
+    (
+        node_name("from_node"),
+        link.get("from_socket")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        node_name("to_node"),
+        link.get("to_socket")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+fn has_legacy_mixrgb_alpha_links(value: &Value) -> bool {
+    fn raw_links(value: &Value) -> bool {
+        match value {
+            Value::Array(values) => values.iter().any(raw_links),
+            Value::Object(object) => {
+                let has_link = if let (Some(nodes), Some(links)) = (
+                    object.get("nodes").and_then(Value::as_array),
+                    object.get("links").and_then(Value::as_array),
+                ) {
+                    let types = nodes
+                        .iter()
+                        .filter_map(|node| {
+                            Some((
+                                node.get("name")?.as_str()?.to_owned(),
+                                node.get("type")?.as_str()?.to_owned(),
+                            ))
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    links.iter().any(|link| mixrgb_alpha_link(link, &types))
+                } else {
+                    false
+                };
+                has_link || object.values().any(raw_links)
+            }
+            _ => false,
+        }
+    }
+    let native_link = value
+        .get("node_groups")
+        .and_then(Value::as_object)
+        .is_some_and(|groups| {
+            groups.values().any(|group| {
+                let types = group
+                    .get("nodes")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|nodes| nodes.iter())
+                    .map(|(id, node)| {
+                        (
+                            id.clone(),
+                            node.get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                group
+                    .get("links")
+                    .and_then(Value::as_array)
+                    .is_some_and(|links| links.iter().any(|link| mixrgb_alpha_link(link, &types)))
+            })
+        });
+    native_link
+        || value
+            .get("compatibility")
+            .and_then(|compatibility| compatibility.get("blender_adapter"))
+            .and_then(|adapter| adapter.get("intermediate"))
+            .is_some_and(raw_links)
 }
 
 fn preserve_uninitialized_initial_constraint_states(
@@ -3345,7 +4201,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         for (node, mode) in [
             ("point", "VERTICES"),
             ("edge", "EDGES"),
@@ -3522,7 +4378,7 @@ mod tests {
             }}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         let material = &scene["materials"]["m1"];
         assert_eq!(material["base_color_texture"]["uv_layer"], Value::Null);
         assert!(material["base_color_texture"].get("uv_map").is_none());
@@ -3544,7 +4400,7 @@ mod tests {
         });
         let before = scene.clone();
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         assert_eq!(scene["materials"], before["materials"]);
     }
 
@@ -3564,7 +4420,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         // Both forms drew a full turn in version 5, so both keep it as a 2π equidistant fisheye.
         for id in ["legacy", "panorama"] {
             let camera = &scene["data_blocks"][id]["camera"];
@@ -3635,7 +4491,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         let first: Vec<&str> = scene["node_groups"]["first"]["links"]
             .as_array()
             .expect("first links")
@@ -3690,7 +4546,7 @@ mod tests {
 
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         let sources: Vec<&str> = scene["node_groups"]["group"]["links"]
             .as_array()
             .expect("links")
@@ -3756,7 +4612,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
 
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 16);
+        assert_eq!(parsed.doc.schema_version, 17);
         assert!(!parsed.doc.compatibility.contains_key("constraints"));
         let node_id = Id::new("owner")?;
         let constraints = &parsed.doc.nodes[&node_id].constraints;
@@ -3988,7 +4844,7 @@ mod tests {
 
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         let imported_nodes = &scene["node_groups"]["imported"]["nodes"];
         for node_id in ["value", "rgb", "normal"] {
             assert_eq!(
@@ -4027,8 +4883,9 @@ mod tests {
                 .all(|record| record["node_group_id"] == json!("imported"))
         );
     }
+
     #[test]
-    fn schema_fourteen_chains_mesh_and_shader_default_migrations_to_sixteen() {
+    fn schema_fourteen_chains_mesh_shader_defaults_and_node_math_migrations_to_seventeen() {
         let mut scene = json!({
             "schema_version":14,
             "node_groups":{
@@ -4047,6 +4904,14 @@ mod tests {
                         "value":{"type":"ShaderNodeValue","properties":{}},
                         "rgb":{"type":"ShaderNodeRGB","properties":{}},
                         "normal":{"type":"ShaderNodeNormal"}
+                    }
+                },
+                "native_states":{
+                    "name":"Native",
+                    "kind":"shader",
+                    "nodes":{
+                        "curve":{"type":"ShaderNodeFloatCurve"},
+                        "ramp":{"type":"ShaderNodeValToRGB"}
                     }
                 }
             },
@@ -4109,36 +4974,412 @@ mod tests {
         assert!(warnings[1..].iter().all(|warning| {
             warning["code"] == json!("shader.output_defaults_unavailable_migrated")
         }));
+        assert!(
+            scene["node_groups"]["native_states"]["nodes"]["curve"]["properties"]
+                .get("mapping")
+                .is_none()
+        );
+        let node_math_warnings = upgrade_v16(&mut scene).expect("upgrade v16 to v17");
+        assert_eq!(node_math_warnings, Vec::<Value>::new());
+        assert_eq!(scene["schema_version"], json!(17));
+        assert!(graph_node_state_is_valid(
+            "ShaderNodeFloatCurve",
+            &scene["node_groups"]["native_states"]["nodes"]["curve"]["properties"]["mapping"]
+        ));
+        assert!(graph_node_state_is_valid(
+            "ShaderNodeValToRGB",
+            &scene["node_groups"]["native_states"]["nodes"]["ramp"]["properties"]["color_ramp"]
+        ));
 
         let chained_warnings =
             upgrade_scene(&mut chained, no_assets()).expect("upgrade chained scene");
-        assert_eq!(chained["schema_version"], json!(16));
+        assert_eq!(chained["schema_version"], json!(17));
         assert_eq!(chained, scene);
         assert_eq!(chained_warnings, warnings);
     }
+
     #[test]
-    fn schema_thirteen_scenes_upgrade_to_sixteen_without_other_changes() {
+    fn schema_thirteen_scenes_upgrade_to_seventeen_without_other_changes() {
         let mut scene = json!({
             "schema_version": 13,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let mut expected = scene.clone();
-        expected["schema_version"] = json!(16);
+        expected["schema_version"] = json!(17);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         assert_eq!(scene, expected);
     }
+
     #[test]
-    fn schema_twelve_scenes_chain_migrations_to_sixteen() {
+    fn schema_twelve_scenes_chain_migrations_to_seventeen() {
         let mut scene = json!({
             "schema_version": 12,
             "materials": {"m1": {"base_color_texture": {"image": "img", "uv_layer": "Light"}}}
         });
         let mut expected = scene.clone();
-        expected["schema_version"] = json!(16);
+        expected["schema_version"] = json!(17);
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         assert_eq!(scene, expected);
+    }
+
+    #[test]
+    fn schema_sixteen_removes_legacy_mixrgb_alpha_links_with_named_loss() {
+        let links = json!([
+            {"from_node":"value","from_socket":"Value","to_node":"mix","to_socket":"Alpha"},
+            {"from_node":"mix","from_socket":"Alpha","to_node":"math","to_socket":"Value"},
+            {"from_node":"mix","from_socket":"Color","to_node":"math","to_socket":"A"}
+        ]);
+        let intermediate_links = json!([
+            {"from_node":"Value","from_socket":"Value","to_node":"Mix","to_socket":"Alpha"},
+            {"from_node":"Mix","from_socket":"Alpha","to_node":"Math","to_socket":"Value"},
+            {"from_node":"Mix","from_socket":"Color","to_node":"Math","to_socket":"A"}
+        ]);
+        let mut scene = json!({
+            "schema_version":16,
+            "node_groups":{"graph":{
+                "name":"Graph",
+                "nodes":{
+                    "value":{"name":"Value","type":"ShaderNodeValue"},
+                    "mix":{"name":"Mix","type":"ShaderNodeMixRGB"},
+                    "math":{"name":"Math","type":"ShaderNodeMath"}
+                },
+                "links":links
+            }},
+            "compatibility":{"blender_adapter":{"intermediate":{
+                "node_groups":[{"name":"Graph","tree":{
+                    "name":"Graph",
+                    "nodes":[
+                        {"name":"Value","type":"ShaderNodeValue"},
+                        {"name":"Mix","type":"ShaderNodeMixRGB"},
+                        {"name":"Math","type":"ShaderNodeMath"}
+                    ],
+                    "links":intermediate_links
+                }}]
+            }}}
+        });
+
+        let warnings = upgrade_scene(&mut scene, no_assets()).expect("schema upgrade");
+
+        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings.iter().all(|warning| {
+                warning["code"] == "node.shader.mix_rgb.alpha_link_removed"
+                    && warning["feature_id"] == "shader.node_mix_rgb.alpha_socket_link"
+            }),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            scene["node_groups"]["graph"]["links"]
+                .as_array()
+                .expect("typed node-group links")
+                .len(),
+            1
+        );
+        assert_eq!(
+            scene["node_groups"]["graph"]["links"][0]["from_socket"],
+            "Color"
+        );
+        let raw_links = &scene["compatibility"]["blender_adapter"]["intermediate"]["node_groups"]
+            [0]["tree"]["links"];
+        assert_eq!(
+            raw_links
+                .as_array()
+                .expect("intermediate graph links")
+                .len(),
+            1
+        );
+        assert_eq!(raw_links[0]["from_socket"], "Color");
+        let losses = scene["compatibility"]["losses"]
+            .as_array()
+            .expect("compatibility losses");
+        assert_eq!(losses.len(), 2);
+        assert!(
+            losses
+                .iter()
+                .all(|loss| { loss["feature_id"] == "shader.node_mix_rgb.alpha_socket_link" }),
+            "{losses:?}"
+        );
+    }
+
+    #[test]
+    fn schema_sixteen_alpha_link_migration_preserves_legacy_source_hash() -> TestResult {
+        let mut scene = serde_json::to_value(SceneDoc::new(uuid::Uuid::new_v4().to_string()))?;
+        scene["schema_version"] = json!(16);
+        scene["compatibility"]["blender_adapter"]["intermediate"] = json!({
+            "node_groups":[{"name":"Graph","tree":{
+                "name":"Graph",
+                "nodes":[{"name":"Mix","type":"ShaderNodeMixRGB"}],
+                "links":[{
+                    "from_node":"Value",
+                    "from_socket":"Value",
+                    "to_node":"Mix",
+                    "to_socket":"Alpha"
+                }]
+            }}]
+        });
+        let expected_hash = crate::hash::sha256(&crate::hash::canonicalize(&scene)?);
+        let bytes = serde_json::to_vec(&scene)?;
+
+        let parsed = parse_scene_with_original_hash(&bytes, no_assets(), no_assets())?;
+
+        assert!(parsed.legacy);
+        assert_eq!(parsed.doc.schema_version, 17);
+        assert_eq!(parsed.legacy_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(
+            parsed.doc.compatibility["blender_adapter"]["intermediate"]["node_groups"][0]["tree"]["links"],
+            json!([])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_sixteen_restores_missing_curve_and_ramp_state_from_compatibility() {
+        let mapping = serde_json::to_value(CurveMapping::default()).expect("curve mapping");
+        let ramp = json!({
+            "color_mode":"RGB",
+            "hue_interpolation":"NEAR",
+            "interpolation":"LINEAR",
+            "elements":[
+                {"position":0.0,"color":[0.0,0.0,0.0,1.0]},
+                {"position":1.0,"color":[1.0,1.0,1.0,1.0]}
+            ]
+        });
+        let mut scene = json!({
+            "schema_version":16,
+            "node_groups":{"graph":{
+                "name":"Graph",
+                "nodes":{
+                    "curve":{
+                        "name":"Curve",
+                        "type":"ShaderNodeFloatCurve",
+                        "properties":{"mapping":{"rna_type":"CurveMapping"}}
+                    },
+                    "ramp":{
+                        "name":"Ramp",
+                        "type":"ShaderNodeValToRGB",
+                        "properties":{"color_ramp":ramp}
+                    }
+                },
+                "links":[]
+            }},
+            "compatibility":{"blender_adapter":{"intermediate":{
+                "node_groups":[{"name":"Graph","potter_id":"graph","tree":{
+                    "name":"Graph",
+                    "potter_id":"graph",
+                    "nodes":[
+                        {
+                            "name":"Curve","potter_id":"curve","type":"ShaderNodeFloatCurve",
+                            "properties":{"mapping":mapping}
+                        },
+                        {
+                            "name":"Ramp","potter_id":"ramp","type":"ShaderNodeValToRGB",
+                            "properties":{"color_ramp":{"rna_type":"ColorRamp"}}
+                        }
+                    ],
+                    "links":[]
+                }}]
+            }}}
+        });
+
+        upgrade_scene(&mut scene, no_assets()).expect("schema upgrade");
+
+        assert_eq!(scene["schema_version"], json!(17));
+        assert_eq!(
+            scene["node_groups"]["graph"]["nodes"]["curve"]["properties"]["mapping"],
+            mapping
+        );
+        assert_eq!(
+            scene["node_groups"]["graph"]["nodes"]["ramp"]["properties"]["color_ramp"],
+            ramp
+        );
+        assert_eq!(
+            scene["compatibility"]["blender_adapter"]["intermediate"]["node_groups"][0]["tree"]["nodes"]
+                [1]["properties"]["color_ramp"],
+            ramp
+        );
+    }
+
+    #[test]
+    fn schema_sixteen_materializes_native_curve_and_ramp_defaults() {
+        let mut scene = json!({
+            "schema_version":16,
+            "node_groups":{"graph":{
+                "name":"Graph",
+                "nodes":{
+                    "float":{"name":"Float","type":"ShaderNodeFloatCurve"},
+                    "vector":{"name":"Vector","type":"ShaderNodeVectorCurve"},
+                    "rgb":{"name":"RGB","type":"ShaderNodeRGBCurve"},
+                    "ramp":{"name":"Ramp","type":"ShaderNodeValToRGB"}
+                },
+                "links":[]
+            }}
+        });
+
+        upgrade_scene(&mut scene, no_assets()).expect("schema upgrade");
+
+        for (node_id, curve_count, minimum) in [
+            ("float", 1_usize, 0.0),
+            ("vector", 3, -1.0),
+            ("rgb", 4, 0.0),
+        ] {
+            let mapping = &scene["node_groups"]["graph"]["nodes"][node_id]["properties"]["mapping"];
+            assert_eq!(mapping["tone"], "standard");
+            assert_eq!(mapping["extend_extrapolate"], json!(true));
+            assert_eq!(mapping["use_clip"], json!(true));
+            assert_eq!(mapping["clip"], json!([minimum, minimum, 1.0, 1.0]));
+            let curves = mapping["curves"].as_array().expect("mapping curves");
+            assert_eq!(curves.len(), curve_count);
+            for curve in curves {
+                assert_eq!(
+                    curve["points"],
+                    json!([
+                        {"location":[minimum,minimum],"handle":"auto"},
+                        {"location":[1.0,1.0],"handle":"auto"}
+                    ])
+                );
+            }
+        }
+        assert_eq!(
+            scene["node_groups"]["graph"]["nodes"]["ramp"]["properties"]["color_ramp"],
+            default_color_ramp_state()
+        );
+    }
+
+    #[test]
+    fn schema_sixteen_lifts_legacy_top_level_color_ramp_properties() {
+        let elements = json!([
+            {"position":0.2,"color":[0.1,0.2,0.3,0.4]},
+            {"position":0.8,"color":[0.9,0.8,0.7,0.6]}
+        ]);
+        let mut scene = json!({
+            "schema_version":16,
+            "node_groups":{"graph":{"name":"Graph","nodes":{
+                "ramp":{"name":"Ramp","type":"ShaderNodeValToRGB","properties":{
+                    "color_ramp":{"rna_type":"ColorRamp"},
+                    "elements":elements,
+                    "interpolation":"CONSTANT",
+                    "color_mode":"RGB"
+                }}
+            },"links":[]}}
+        });
+
+        upgrade_scene(&mut scene, no_assets()).expect("schema upgrade");
+
+        let properties = &scene["node_groups"]["graph"]["nodes"]["ramp"]["properties"];
+        assert_eq!(
+            properties["color_ramp"],
+            json!({
+                "elements":elements,
+                "interpolation":"CONSTANT",
+                "color_mode":"RGB",
+                "hue_interpolation":"NEAR"
+            })
+        );
+        for legacy_key in ["elements", "interpolation", "color_mode"] {
+            assert!(properties.get(legacy_key).is_none());
+        }
+    }
+
+    #[test]
+    fn schema_fourteen_history_snapshot_with_native_defaults_is_loadable() {
+        let mut snapshot = serde_json::to_value(SceneDoc::new(
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+        ))
+        .expect("scene snapshot");
+        snapshot["schema_version"] = json!(14);
+        snapshot["node_groups"] = json!({"graph":{
+            "name":"Graph",
+            "kind":"shader",
+            "nodes":{
+                "curve":{"name":"Curve","type":"ShaderNodeFloatCurve"},
+                "ramp":{"name":"Ramp","type":"ShaderNodeValToRGB"}
+            },
+            "links":[]
+        }});
+        let bytes = serde_json::to_vec(&history_record(&snapshot)).expect("history record");
+
+        let (record, warnings) =
+            parse_history_record(&bytes, no_assets()).expect("history snapshot migration");
+
+        assert_eq!(warnings, Vec::<Value>::new());
+        assert_eq!(record.snapshot.schema_version, 17);
+        let snapshot = serde_json::to_value(record.snapshot).expect("upgraded snapshot");
+        assert!(graph_node_state_is_valid(
+            "ShaderNodeFloatCurve",
+            &snapshot["node_groups"]["graph"]["nodes"]["curve"]["properties"]["mapping"]
+        ));
+        assert!(graph_node_state_is_valid(
+            "ShaderNodeValToRGB",
+            &snapshot["node_groups"]["graph"]["nodes"]["ramp"]["properties"]["color_ramp"]
+        ));
+    }
+
+    #[test]
+    fn schema_sixteen_refuses_unrecoverable_curve_and_ramp_state() {
+        for (node_id, node_type, property, rna_type, feature_id) in [
+            (
+                "curve",
+                "ShaderNodeFloatCurve",
+                "mapping",
+                "CurveMapping",
+                "shader.node_curve_mapping.state",
+            ),
+            (
+                "ramp",
+                "ShaderNodeValToRGB",
+                "color_ramp",
+                "ColorRamp",
+                "shader.node_color_ramp.state",
+            ),
+        ] {
+            let mut scene = json!({
+                "schema_version":16,
+                "node_groups":{"graph":{"name":"Graph","nodes":{},"links":[]}}
+            });
+            let mut properties = json!({});
+            properties[property] = json!({"rna_type":rna_type});
+            scene["node_groups"]["graph"]["nodes"][node_id] =
+                json!({"name":node_id,"type":node_type,"properties":properties});
+
+            let error = upgrade_scene(&mut scene, no_assets())
+                .expect_err("invalid state without recovery rejected");
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            assert_eq!(error.details["feature_id"], feature_id);
+            assert!(error.message.contains("missing or invalid"));
+        }
+    }
+
+    #[test]
+    fn schema_sixteen_refuses_unrecoverable_intermediate_stub() {
+        let mut scene = json!({
+            "schema_version":16,
+            "node_groups":{"graph":{"name":"Graph","nodes":{
+                "curve":{"name":"Curve","type":"ShaderNodeFloatCurve"}
+            },"links":[]}},
+            "compatibility":{"blender_adapter":{"intermediate":{
+                "node_groups":[{"name":"Graph","potter_id":"graph","tree":{
+                    "name":"Graph","potter_id":"graph",
+                    "nodes":[{
+                        "name":"Curve","potter_id":"curve","type":"ShaderNodeFloatCurve",
+                        "properties":{"mapping":{"rna_type":"CurveMapping"}}
+                    }],
+                    "links":[]
+                }}]
+            }}}
+        });
+
+        let error = upgrade_scene(&mut scene, no_assets())
+            .expect_err("invalid intermediate state rejected");
+
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            "shader.node_curve_mapping.state"
+        );
+        assert!(error.message.contains("compatibility graph"));
     }
 
     #[test]
@@ -4245,7 +5486,7 @@ mod tests {
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
         assert_eq!(warnings, Vec::<Value>::new());
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("restored action curves");
@@ -4339,7 +5580,7 @@ mod tests {
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
         assert_eq!(warnings.len(), 2);
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         assert_eq!(
             scene["actions"]["shared"]["fcurves"]
                 .as_array()
@@ -4407,7 +5648,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&doc)?, no_assets())?;
 
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 16);
+        assert_eq!(parsed.doc.schema_version, 17);
         assert_eq!(parsed.doc.actions[&action_id].fcurves.len(), 2);
         assert_eq!(
             parsed.doc.compatibility["animation"]["unsupported_outputs"]
@@ -4460,7 +5701,7 @@ mod tests {
         source["schema_version"] = json!(11);
         let parsed = parse_scene(&serde_json::to_vec(&source)?, no_assets())?;
         assert!(parsed.legacy);
-        assert_eq!(parsed.doc.schema_version, 16);
+        assert_eq!(parsed.doc.schema_version, 17);
         assert_eq!(parsed.doc.actions[&action_id].fcurves, Vec::new());
         assert_eq!(parsed.doc.nodes[&node_id].drivers, Vec::new());
         assert_eq!(
@@ -4499,7 +5740,7 @@ mod tests {
 
         let warnings = upgrade_scene(&mut scene, no_assets()).expect("upgrade");
 
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         let curves = scene["actions"]["shared"]["fcurves"]
             .as_array()
             .expect("migrated action curves");
@@ -4707,7 +5948,7 @@ mod tests {
         )
         .expect("brush migration");
         assert!(migrated.legacy);
-        assert_eq!(migrated.doc.schema_version, 16);
+        assert_eq!(migrated.doc.schema_version, 17);
         let settings = &migrated.doc.nodes[&crate::model::Id::new("brush").expect("brush ID")]
             .properties["physics_dynamic_paint"];
         assert_eq!(settings["paint_source"], json!("POINT"));
@@ -4879,7 +6120,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         let nodes = &scene["nodes"];
         assert_eq!(
             nodes["cam_off"]["ray_visibility"],
@@ -4922,7 +6163,7 @@ mod tests {
             ]}}
         });
         upgrade_scene(&mut scene, no_assets()).expect("upgrade");
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         let modifiers = &scene["nodes"]["body"]["modifiers"];
         let first = &modifiers[0]["params"];
         assert_eq!(first["is_sequence"], json!(true));
@@ -4970,7 +6211,7 @@ mod tests {
         scene["schema_version"] = json!(3);
         scene["images"] = json!({ "texel": serde_json::to_value(&image)? });
         let parsed = parse_scene(&serde_json::to_vec(&scene)?, root.path())?;
-        assert_eq!(parsed.doc.schema_version, 16);
+        assert_eq!(parsed.doc.schema_version, 17);
         let id = crate::model::Id::new("texel")?;
         let migrated = &parsed.doc.images[&id];
         assert_eq!(migrated.alpha_mode, ImageAlphaMode::Premultiplied);
@@ -5016,7 +6257,7 @@ mod tests {
             }
         });
         upgrade_scene(&mut scene, no_assets())?;
-        assert_eq!(scene["schema_version"], json!(16));
+        assert_eq!(scene["schema_version"], json!(17));
         assert_eq!(
             scene["scenes"]["empty"]["color_management"]["curve"],
             Value::Null
@@ -5059,7 +6300,7 @@ mod tests {
         let parsed = parse_scene(&serde_json::to_vec(&expected)?, no_assets())?;
         parsed.doc.validate()?;
         let migrated = serde_json::to_value(parsed.doc)?;
-        expected["schema_version"] = json!(16);
+        expected["schema_version"] = json!(17);
         assert_eq!(migrated, expected);
         Ok(())
     }
@@ -5097,7 +6338,7 @@ mod tests {
         });
 
         let migrated = parse_scene(&serde_json::to_vec(&source)?, no_assets())?.doc;
-        assert_eq!(migrated.schema_version, 16);
+        assert_eq!(migrated.schema_version, 17);
         let mesh = migrated.data_blocks[&data_id]
             .mesh
             .as_ref()
@@ -5601,7 +6842,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 16);
+        assert_eq!(record.snapshot.schema_version, 17);
         let history_mesh = record
             .snapshot
             .data_blocks
@@ -5668,7 +6909,7 @@ mod tests {
         let (record, history_warnings) =
             parse_history_record(&serde_json::to_vec(&history_record(&source))?, no_assets())?;
         assert!(history_warnings.is_empty(), "{history_warnings:?}");
-        assert_eq!(record.snapshot.schema_version, 16);
+        assert_eq!(record.snapshot.schema_version, 17);
         let history_mesh = record
             .snapshot
             .data_blocks

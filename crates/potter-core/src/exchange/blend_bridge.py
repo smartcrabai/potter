@@ -1224,7 +1224,18 @@ def tree_dump(tree):
         custom_properties = custom_props(node)
         node_id = custom_properties.pop("potter.id", None)
         simple_material = custom_properties.pop("potter_simple_material", False)
-        properties = rna_props(node, ("inputs", "outputs", "internal_links", "parent", "select", "location", "dimensions"))
+        omitted_node_properties = (
+            "inputs", "outputs", "internal_links", "parent", "select", "location", "dimensions")
+        if node.bl_idname in _NODE_CURVE_MAPPING_TYPES:
+            omitted_node_properties += ("mapping",)
+        if node.bl_idname == "ShaderNodeValToRGB":
+            omitted_node_properties += ("color_ramp",)
+        properties = rna_props(node, omitted_node_properties)
+        if node.bl_idname in _NODE_CURVE_MAPPING_TYPES:
+            properties["mapping"] = _node_curve_mapping_settings(
+                node.mapping, "%s node %s" % (tree.name, node.name))
+        if node.bl_idname == "ShaderNodeValToRGB":
+            properties["color_ramp"] = _color_ramp_settings(node.color_ramp)
         if node.bl_idname in ("ShaderNodeRGB", "ShaderNodeValue", "ShaderNodeNormal"):
             properties["potter_output_defaults"] = [
                 {"identifier": socket.identifier, "default": plain(socket.default_value)}
@@ -3141,6 +3152,134 @@ def _restore_curve_points(target, points, index):
         point.location = source["location"]
         point.handle_type = _CURVE_HANDLE_TO_BLENDER[source["handle"]]
         point.select = False
+
+_NODE_CURVE_MAPPING_TYPES = {
+    "ShaderNodeFloatCurve", "ShaderNodeRGBCurve", "ShaderNodeVectorCurve",
+}
+
+
+def _node_curve_mapping_settings(mapping, owner):
+    if mapping is None or not getattr(mapping, "curves", None):
+        raise ValueError("%s has no CurveMapping" % owner)
+    tone_value = getattr(mapping, "tone", "STANDARD")
+    tone = _CURVE_TONE_TO_POTTER.get(tone_value)
+    if tone is None:
+        raise ValueError("%s CurveMapping has unsupported tone %s" % (owner, tone_value))
+    extend_value = getattr(mapping, "extend", None)
+    extend = _CURVE_EXTEND_TO_POTTER.get(extend_value)
+    if extend is None:
+        raise ValueError("%s CurveMapping has unsupported extend value %s" %
+                         (owner, extend_value))
+    curves = []
+    for curve_index, curve in enumerate(mapping.curves):
+        points = []
+        for point_index, point in enumerate(curve.points):
+            handle = _CURVE_HANDLE_TO_POTTER.get(point.handle_type)
+            if handle is None:
+                raise ValueError(
+                    "%s CurveMapping curve %d point %d has unsupported handle type %s" %
+                    (owner, curve_index, point_index, point.handle_type))
+            points.append({"location": [float(point.location[0]), float(point.location[1])],
+                           "handle": handle})
+        curves.append({"points": points})
+    return {
+        "tone": tone,
+        "extend_extrapolate": extend == "extrapolated",
+        "use_clip": bool(mapping.use_clip),
+        "clip": [float(mapping.clip_min_x), float(mapping.clip_min_y),
+                 float(mapping.clip_max_x), float(mapping.clip_max_y)],
+        "black": [float(value) for value in getattr(mapping, "black_level", (0.0, 0.0, 0.0))],
+        "white": [float(value) for value in getattr(mapping, "white_level", (1.0, 1.0, 1.0))],
+        "curves": curves,
+    }
+
+
+def _restore_node_curve_mapping(mapping, values, owner):
+    if mapping is None or not isinstance(values, dict):
+        raise ValueError("%s has invalid CurveMapping settings" % owner)
+    curves = values.get("curves")
+    target_curves = getattr(mapping, "curves", ())
+    if not isinstance(curves, list) or len(curves) != len(target_curves):
+        raise ValueError("%s CurveMapping has %s curves; Blender requires %d" %
+                         (owner, len(curves) if isinstance(curves, list) else "invalid",
+                          len(target_curves)))
+    tone = values.get("tone")
+    if not isinstance(tone, str) or tone not in _CURVE_TONE_TO_BLENDER:
+        raise ValueError("%s CurveMapping has unsupported tone %s" % (owner, tone))
+    blender_tone = _CURVE_TONE_TO_BLENDER[tone]
+    extend = values.get("extend_extrapolate")
+    if not isinstance(extend, bool):
+        raise ValueError("%s CurveMapping extend_extrapolate must be a boolean" % owner)
+    use_clip = values.get("use_clip")
+    if not isinstance(use_clip, bool):
+        raise ValueError("%s CurveMapping use_clip must be a boolean" % owner)
+
+    def numbers(key, count):
+        source = values.get(key)
+        if not isinstance(source, (list, tuple)) or len(source) != count:
+            raise ValueError("%s CurveMapping %s must contain %d values" %
+                             (owner, key, count))
+        try:
+            return [float(value) for value in source]
+        except (TypeError, ValueError) as error:
+            raise ValueError("%s CurveMapping %s contains a non-numeric value" %
+                             (owner, key)) from error
+
+    clip = numbers("clip", 4)
+    black = numbers("black", 3)
+    white = numbers("white", 3)
+    if not hasattr(mapping, "tone") and tone != "standard":
+        raise ValueError("%s Blender CurveMapping cannot represent tone %s" % (owner, tone))
+    try:
+        if hasattr(mapping, "tone"):
+            mapping.tone = blender_tone
+        mapping.extend = "EXTRAPOLATED" if extend else "HORIZONTAL"
+        mapping.use_clip = use_clip
+        _restore_color_curve_clip(mapping, clip)
+        if hasattr(mapping, "black_level"):
+            mapping.black_level = black
+        elif black != [0.0, 0.0, 0.0]:
+            raise ValueError("%s Blender CurveMapping cannot represent black level" % owner)
+        if hasattr(mapping, "white_level"):
+            mapping.white_level = white
+        elif white != [1.0, 1.0, 1.0]:
+            raise ValueError("%s Blender CurveMapping cannot represent white level" % owner)
+        for curve_index, (target, source) in enumerate(zip(target_curves, curves)):
+            points = source.get("points") if isinstance(source, dict) else None
+            if not isinstance(points, list) or len(points) < 2:
+                raise ValueError("%s CurveMapping curve %d needs at least two points" %
+                                 (owner, curve_index))
+            restored_points = []
+            for point_index, point in enumerate(points):
+                if not isinstance(point, dict):
+                    raise ValueError("%s CurveMapping curve %d point %d is invalid" %
+                                     (owner, curve_index, point_index))
+                handle = point.get("handle")
+                if not isinstance(handle, str) or handle not in _CURVE_HANDLE_TO_BLENDER:
+                    raise ValueError(
+                        "%s CurveMapping curve %d point %d has unsupported handle %s" %
+                        (owner, curve_index, point_index, handle))
+                location = point.get("location")
+                if not isinstance(location, (list, tuple)) or len(location) != 2:
+                    raise ValueError("%s CurveMapping curve %d point %d needs an [x, y] location" %
+                                     (owner, curve_index, point_index))
+                try:
+                    location = [float(value) for value in location]
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "%s CurveMapping curve %d point %d has a non-numeric location" %
+                        (owner, curve_index, point_index)) from error
+                restored_points.append({"location": location, "handle": handle})
+            try:
+                _restore_curve_points(target, restored_points, curve_index)
+            except Exception as error:
+                raise ValueError("%s cannot restore CurveMapping curve %d" %
+                                 (owner, curve_index)) from error
+        mapping.update()
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError("%s cannot restore CurveMapping" % owner) from error
 
 
 def _color_management_dump(scene):
@@ -6043,6 +6182,14 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
                                 if node.bl_idname == "ShaderNodeGroup" else None)
         # Empty lists mark defaults lost by older imports; Rust's loss gate guards Blender's constructor defaults.
         output_defaults = node_properties.pop("potter_output_defaults", [])
+        restore_curve_mapping = (
+            node.bl_idname in _NODE_CURVE_MAPPING_TYPES and "mapping" in node_properties)
+        curve_mapping_settings = (node_properties.pop("mapping")
+                                  if restore_curve_mapping else None)
+        restore_color_ramp = (
+            node.bl_idname == "ShaderNodeValToRGB" and "color_ramp" in node_properties)
+        color_ramp_settings = (node_properties.pop("color_ramp")
+                               if restore_color_ramp else None)
         if node.bl_idname == "GeometryNodeBake" and "bake_items" in node_properties:
             identifier_remaps[node.name] = _restore_bake_items(
                 node, node_properties.pop("bake_items") or [], owner)
@@ -6068,6 +6215,15 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             except Exception as error:
                 raise ValueError("%s cannot restore node group %s" %
                                  (owner, group_tree_reference)) from error
+        if restore_curve_mapping:
+            _restore_node_curve_mapping(
+                node.mapping, curve_mapping_settings, "%s node %s" % (owner, node.name))
+        if restore_color_ramp:
+            if node.color_ramp is None:
+                raise ValueError("%s node %s has no ColorRamp to restore" % (owner, node.name))
+            _restore_color_ramp(
+                node.color_ramp, color_ramp_settings, "%s node %s ColorRamp" %
+                (owner, node.name))
         set_id(node, source.get("potter_id"))
         custom_properties = dict(source.get("custom_properties", {}))
         if simple_material:

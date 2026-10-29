@@ -20,8 +20,8 @@ use crate::{
     model::{Id, Material, Node, RayKind, RayVisibility, SceneDoc},
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
-        SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace,
-        evaluate_surface_with_workspace, fill_color_layers, heaviest, make_orthonormals,
+        SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace_semantics,
+        evaluate_surface_with_workspace_semantics, fill_color_layers, heaviest, make_orthonormals,
     },
 };
 
@@ -424,6 +424,24 @@ pub(super) fn extract_geometry(
     mode: Mode,
     path_traced: bool,
     images: &BTreeMap<String, ImageData>,
+) -> Result<Geometry> {
+    extract_geometry_with_semantics(
+        doc,
+        snapshot,
+        mode,
+        path_traced,
+        images,
+        crate::node_kernels::MathSemantics::Cycles,
+    )
+}
+
+pub(super) fn extract_geometry_with_semantics(
+    doc: &SceneDoc,
+    snapshot: &Snapshot,
+    mode: Mode,
+    path_traced: bool,
+    images: &BTreeMap<String, ImageData>,
+    math_semantics: crate::node_kernels::MathSemantics,
 ) -> Result<Geometry> {
     let scene = doc
         .scenes
@@ -1028,6 +1046,7 @@ pub(super) fn extract_geometry(
                             layers,
                             &shader_warnings,
                             &mut evaluator_workspace,
+                            math_semantics,
                         )?);
                     } else {
                         triangles.push(triangle);
@@ -1653,6 +1672,7 @@ fn subdivide_displaced_triangle(
     layers: HitUvLayers<'_>,
     warnings: &RefCell<Vec<serde_json::Value>>,
     evaluator_workspace: &mut EvaluatorWorkspace,
+    math_semantics: crate::node_kernels::MathSemantics,
 ) -> Result<[Triangle; 4]> {
     subdivide_displaced(triangle, object_to_world, |sample| {
         let mut tables = LayerTables::new();
@@ -1681,7 +1701,13 @@ fn subdivide_displaced_triangle(
             },
             &mut tables,
         )?;
-        evaluate_displacement_with_workspace(material, prepared, &context, evaluator_workspace)
+        evaluate_displacement_with_workspace_semantics(
+            material,
+            prepared,
+            &context,
+            evaluator_workspace,
+            math_semantics,
+        )
     })
 }
 
@@ -2171,6 +2197,7 @@ struct SceneShaderCore<'a> {
     images: &'a BTreeMap<String, ImageData>,
     geometry: super::path::SharedGeometry<'a>,
     mode: Mode,
+    math_semantics: crate::node_kernels::MathSemantics,
     /// The camera's view space, in which Solid's studio lights are fixed.
     view: &'a ViewBasis,
     evaluator_workspace: RefCell<EvaluatorWorkspace>,
@@ -2188,6 +2215,26 @@ pub(super) fn surface_shader<'a>(
     mode: Mode,
     view: &'a ViewBasis,
 ) -> Option<Box<dyn SurfaceShader + 'a>> {
+    surface_shader_with_semantics(
+        doc,
+        snapshot,
+        images,
+        geometry,
+        mode,
+        view,
+        crate::node_kernels::MathSemantics::Cycles,
+    )
+}
+
+pub(super) fn surface_shader_with_semantics<'a>(
+    doc: &'a SceneDoc,
+    snapshot: &'a Snapshot,
+    images: &'a BTreeMap<String, ImageData>,
+    geometry: &'a Geometry,
+    mode: Mode,
+    view: &'a ViewBasis,
+    math_semantics: crate::node_kernels::MathSemantics,
+) -> Option<Box<dyn SurfaceShader + 'a>> {
     match mode {
         Mode::Solid => {}
         Mode::Beauty if geometry.shadows.is_some() => {}
@@ -2200,6 +2247,7 @@ pub(super) fn surface_shader<'a>(
             images,
             geometry: super::path::SharedGeometry::of(geometry),
             mode,
+            math_semantics,
             view,
             evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
             world_probe: Arc::new(OnceLock::new()),
@@ -2252,6 +2300,7 @@ impl SceneShaderCore<'_> {
             geometry: self.geometry,
             mode: self.mode,
             view: self.view,
+            math_semantics: self.math_semantics,
             evaluator_workspace: RefCell::new(EvaluatorWorkspace::default()),
             world_probe: Arc::clone(&self.world_probe),
         }
@@ -2480,7 +2529,13 @@ impl SceneShaderCore<'_> {
         }
         context.realtime_differentials = Some(hit.realtime_differentials);
         let mut workspace = self.evaluator_workspace.borrow_mut();
-        evaluate_surface_with_workspace(material, prepared, &context, &mut workspace)
+        evaluate_surface_with_workspace_semantics(
+            material,
+            prepared,
+            &context,
+            &mut workspace,
+            self.math_semantics,
+        )
     }
 }
 

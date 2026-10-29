@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     fmt::Write as _,
     hash::{Hash, Hasher},
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use glam::{DMat4, DQuat, DVec3, Vec3};
@@ -165,6 +165,7 @@ enum Field {
     },
     Math {
         operation: String,
+        clamp: bool,
         first: Box<Field>,
         second: Box<Field>,
         third: Box<Field>,
@@ -176,6 +177,70 @@ enum Field {
         third: Box<Field>,
         scale: Box<Field>,
         output: String,
+    },
+    IntegerMath {
+        operation: String,
+        first: Box<Field>,
+        second: Box<Field>,
+        third: Box<Field>,
+    },
+    BooleanMath {
+        operation: String,
+        first: Box<Field>,
+        second: Box<Field>,
+    },
+    Compare {
+        operation: String,
+        data_type: String,
+        mode: String,
+        first: Box<Field>,
+        second: Box<Field>,
+        parameter: Box<Field>,
+        epsilon: Box<Field>,
+    },
+    MapRange {
+        data_type: String,
+        interpolation: String,
+        clamp: bool,
+        value: Box<Field>,
+        from_min: Box<Field>,
+        from_max: Box<Field>,
+        to_min: Box<Field>,
+        to_max: Box<Field>,
+        steps: Box<Field>,
+    },
+    Clamp {
+        mode: String,
+        value: Box<Field>,
+        min: Box<Field>,
+        max: Box<Field>,
+    },
+    Mix {
+        node_type: &'static str,
+        output: MixOutput,
+        data_type: String,
+        factor_mode: String,
+        blend_mode: String,
+        clamp_factor: bool,
+        clamp_result: bool,
+        factor: Box<Field>,
+        first: Box<Field>,
+        second: Box<Field>,
+    },
+    ColorRamp {
+        elements: Arc<[(f32, [f32; 4])]>,
+        interpolation: String,
+        color_mode: String,
+        hue_interpolation: String,
+        factor: Box<Field>,
+        output: String,
+    },
+    Curve {
+        kind: String,
+        mapping: Arc<crate::color::curve::CurveMapping>,
+        prepared: Arc<crate::color::curve::PreparedCurve>,
+        factor: Box<Field>,
+        value: Box<Field>,
     },
     CombineXYZ {
         x: Box<Field>,
@@ -193,6 +258,12 @@ enum Field {
         min: Box<Field>,
         max: Box<Field>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MixOutput {
+    Value,
+    Color,
 }
 
 struct Evaluator<'a> {
@@ -626,6 +697,17 @@ impl Evaluator<'_> {
             "GeometryNodeCaptureAttribute" => self.capture_attribute(id, node, socket),
             "ShaderNodeMath" => self.math_node(id, node),
             "ShaderNodeVectorMath" => self.vector_math_node(id, node, socket),
+            "FunctionNodeIntegerMath" => self.integer_math_node(id, node),
+            "FunctionNodeBooleanMath" => self.boolean_math_node(id, node),
+            "FunctionNodeCompare" => self.compare_node(id, node, socket),
+            "ShaderNodeMapRange" => self.map_range_node(id, node, socket),
+            "ShaderNodeClamp" => self.clamp_node(id, node, socket),
+            "ShaderNodeMixRGB" => self.mix_rgb_node(id, node, socket),
+            "ShaderNodeMix" => self.mix_node(id, node, socket),
+            "ShaderNodeValToRGB" => self.color_ramp_node(id, node, socket),
+            "ShaderNodeFloatCurve" => self.curve_node(id, node, socket, "FLOAT"),
+            "ShaderNodeVectorCurve" => self.curve_node(id, node, socket, "VECTOR"),
+            "ShaderNodeRGBCurve" => self.curve_node(id, node, socket, "RGBA"),
             "ShaderNodeCombineXYZ" => self.combine_xyz(id, node),
             "ShaderNodeSeparateXYZ" => self.separate_xyz(id, node, socket),
             "FunctionNodeRandomValue" => self.random_node(id, node, socket),
@@ -1091,7 +1173,7 @@ impl Evaluator<'_> {
         if let Some(value) = node.inputs.get(socket) {
             return Ok(EvalValue::Scalar(value.clone()));
         }
-        Ok(match default_input(&node.node_type, socket) {
+        Ok(match node_default_input(node, socket) {
             Some(value) => EvalValue::Scalar(value),
             None => fallback,
         })
@@ -1118,7 +1200,7 @@ impl Evaluator<'_> {
         if let Some(value) = node.inputs.get(socket) {
             return Ok(EvalValue::Scalar(value.clone()));
         }
-        Ok(match default_input(&node.node_type, socket) {
+        Ok(match node_default_input(node, socket) {
             Some(value) => EvalValue::Scalar(value),
             None => fallback,
         })
@@ -2360,6 +2442,23 @@ impl Evaluator<'_> {
     }
 
     fn math_node(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
+        let operation = node
+            .properties
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or("ADD")
+            .to_ascii_uppercase();
+        let second_default = match operation.as_str() {
+            "ADD" | "SUBTRACT" => 0.0,
+            "MULTIPLY" | "DIVIDE" | "POWER" | "MODULO" | "FLOORED_MODULO" | "ARCTAN2"
+            | "MULTIPLY_ADD" => 1.0,
+            _ => 0.5,
+        };
+        let third_default = match operation.as_str() {
+            "MULTIPLY_ADD" => 0.0,
+            "COMPARE" => 0.001,
+            _ => 0.5,
+        };
         let first = as_field(self.input_value_with_node(
             id,
             node,
@@ -2370,21 +2469,21 @@ impl Evaluator<'_> {
             id,
             node,
             "Value_001",
-            EvalValue::Scalar(json!(0.5)),
+            EvalValue::Scalar(json!(second_default)),
         )?);
         let third = as_field(self.input_value_with_node(
             id,
             node,
             "Value_002",
-            EvalValue::Scalar(json!(0.5)),
+            EvalValue::Scalar(json!(third_default)),
         )?);
         Ok(EvalValue::Field(Field::Math {
-            operation: node
+            operation,
+            clamp: node
                 .properties
-                .get("operation")
-                .and_then(Value::as_str)
-                .unwrap_or("ADD")
-                .to_ascii_uppercase(),
+                .get("use_clamp")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             first: Box::new(first),
             second: Box::new(second),
             third: Box::new(third),
@@ -2392,6 +2491,20 @@ impl Evaluator<'_> {
     }
 
     fn vector_math_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        let operation = node
+            .properties
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or("ADD")
+            .to_ascii_uppercase();
+        let second_default = if matches!(
+            operation.as_str(),
+            "MULTIPLY" | "DIVIDE" | "POWER" | "MODULO" | "MULTIPLY_ADD"
+        ) {
+            [1.0, 1.0, 1.0]
+        } else {
+            [0.0; 3]
+        };
         let first = as_field(self.input_value_with_node(
             id,
             node,
@@ -2402,7 +2515,7 @@ impl Evaluator<'_> {
             id,
             node,
             "Vector_001",
-            EvalValue::Scalar(json!([0.0, 0.0, 0.0])),
+            EvalValue::Scalar(json!(second_default)),
         )?);
         let third = as_field(self.input_value_with_node(
             id,
@@ -2416,12 +2529,6 @@ impl Evaluator<'_> {
             "Scale",
             EvalValue::Scalar(json!(1.0)),
         )?);
-        let operation = node
-            .properties
-            .get("operation")
-            .and_then(Value::as_str)
-            .unwrap_or("ADD")
-            .to_ascii_uppercase();
         if socket != "Vector" && socket != "Value" {
             return Err(evaluation("unknown Vector Math output"));
         }
@@ -2432,6 +2539,371 @@ impl Evaluator<'_> {
             third: Box::new(third),
             scale: Box::new(scale),
             output: socket.to_owned(),
+        }))
+    }
+    fn field_input(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        fallback: Value,
+    ) -> Result<Field> {
+        Ok(as_field(self.input_value_with_node(
+            id,
+            node,
+            socket,
+            EvalValue::Scalar(fallback),
+        )?))
+    }
+
+    fn integer_math_node(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
+        let operation = node_enum(node, "operation", "ADD");
+        let second_default = i32::from(matches!(
+            operation.as_str(),
+            "MULTIPLY"
+                | "DIVIDE"
+                | "MULTIPLY_ADD"
+                | "DIVIDE_CEIL"
+                | "DIVIDE_FLOOR"
+                | "DIVIDE_ROUND"
+                | "FLOORED_MODULO"
+                | "MODULO"
+        ));
+        Ok(EvalValue::Field(Field::IntegerMath {
+            operation,
+            first: Box::new(self.field_input(id, node, "Value", json!(0))?),
+            second: Box::new(self.field_input(id, node, "Value_001", json!(second_default))?),
+            third: Box::new(self.field_input(id, node, "Value_002", json!(0))?),
+        }))
+    }
+
+    fn boolean_math_node(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
+        Ok(EvalValue::Field(Field::BooleanMath {
+            operation: node_enum(node, "operation", "AND"),
+            first: Box::new(self.field_input(id, node, "Boolean", json!(false))?),
+            second: Box::new(self.field_input(id, node, "Boolean_001", json!(false))?),
+        }))
+    }
+
+    fn compare_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        if socket != "Result" {
+            return Err(evaluation("unknown Compare output"));
+        }
+        let mut data_type = node_enum(node, "data_type", "FLOAT");
+        if data_type == "INTEGER" {
+            "INT".clone_into(&mut data_type);
+        } else if data_type == "COLOR" {
+            "RGBA".clone_into(&mut data_type);
+        } else if data_type == "FLOAT_VECTOR" {
+            "VECTOR".clone_into(&mut data_type);
+        }
+        let (first_default, second_default) = match data_type.as_str() {
+            "FLOAT" => (json!(0.0), json!(0.0)),
+            "INT" => (json!(0), json!(0)),
+            "VECTOR" => (json!([0.0, 0.0, 0.0]), json!([0.0, 0.0, 0.0])),
+            "RGBA" => (json!([0.0, 0.0, 0.0, 1.0]), json!([0.0, 0.0, 0.0, 1.0])),
+            "BOOLEAN" | "BOOL" => (json!(false), json!(false)),
+            "STRING" => (json!(""), json!("")),
+            "OBJECT" | "IMAGE" | "COLLECTION" | "MATERIAL" | "FONT" | "SOUND" => {
+                (Value::Null, Value::Null)
+            }
+            _ => {
+                return Err(unsupported_graph_node_state(
+                    node,
+                    &format!("data type `{data_type}`"),
+                ));
+            }
+        };
+        let operation = node_enum(node, "operation", "GREATER_THAN");
+        let mode = node_enum(node, "mode", "ELEMENT");
+        let parameter_socket = match mode.as_str() {
+            "DOT_PRODUCT" => Some(("C", 0.9)),
+            "DIRECTION" => Some(("Angle", 0.087_266_5)),
+            _ => None,
+        };
+        let epsilon_default = if matches!(operation.as_str(), "EQUAL" | "NOT_EQUAL")
+            && matches!(data_type.as_str(), "FLOAT" | "VECTOR" | "RGBA")
+        {
+            0.001
+        } else {
+            0.0
+        };
+        Ok(EvalValue::Field(Field::Compare {
+            operation,
+            data_type,
+            mode,
+            first: Box::new(self.field_input(id, node, "A", first_default)?),
+            second: Box::new(self.field_input(id, node, "B", second_default)?),
+            parameter: Box::new(match parameter_socket {
+                Some((name, default)) => self.field_input(id, node, name, json!(default))?,
+                None => Field::Constant(json!(0.0)),
+            }),
+            epsilon: Box::new(self.field_input(id, node, "Epsilon", json!(epsilon_default))?),
+        }))
+    }
+
+    fn map_range_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        let data_type = node_enum(node, "data_type", "FLOAT");
+        let vector = data_type == "FLOAT_VECTOR";
+        let input_socket = if vector { "Vector" } else { "Value" };
+        let output_socket = if vector { "Vector" } else { "Result" };
+        if !matches!(data_type.as_str(), "FLOAT" | "FLOAT_VECTOR") {
+            return Err(unsupported_graph_node_state(
+                node,
+                &format!("data type `{data_type}`"),
+            ));
+        }
+        if socket != output_socket {
+            return Err(evaluation("unknown Map Range output for its data type"));
+        }
+        let (zero, one, four) = if vector {
+            (
+                json!([0.0, 0.0, 0.0]),
+                json!([1.0, 1.0, 1.0]),
+                json!([4.0, 4.0, 4.0]),
+            )
+        } else {
+            (json!(0.0), json!(1.0), json!(4.0))
+        };
+        let (from_min_socket, from_max_socket, to_min_socket, to_max_socket, steps_socket) =
+            if vector {
+                (
+                    "From_Min_FLOAT3",
+                    "From_Max_FLOAT3",
+                    "To_Min_FLOAT3",
+                    "To_Max_FLOAT3",
+                    "Steps_FLOAT3",
+                )
+            } else {
+                ("From Min", "From Max", "To Min", "To Max", "Steps")
+            };
+        Ok(EvalValue::Field(Field::MapRange {
+            data_type,
+            interpolation: node_enum(node, "interpolation_type", "LINEAR"),
+            clamp: node
+                .properties
+                .get("clamp")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            value: Box::new(self.field_input(
+                id,
+                node,
+                input_socket,
+                if vector { zero.clone() } else { json!(1.0) },
+            )?),
+            from_min: Box::new(self.field_input(id, node, from_min_socket, zero.clone())?),
+            from_max: Box::new(self.field_input(id, node, from_max_socket, one.clone())?),
+            to_min: Box::new(self.field_input(id, node, to_min_socket, zero)?),
+            to_max: Box::new(self.field_input(id, node, to_max_socket, one)?),
+            steps: Box::new(self.field_input(id, node, steps_socket, four)?),
+        }))
+    }
+
+    fn clamp_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        if socket != "Result" {
+            return Err(evaluation("unknown Clamp output"));
+        }
+        Ok(EvalValue::Field(Field::Clamp {
+            mode: node_enum(node, "clamp_type", "MINMAX"),
+            value: Box::new(self.field_input(id, node, "Value", json!(1.0))?),
+            min: Box::new(self.field_input(id, node, "Min", json!(0.0))?),
+            max: Box::new(self.field_input(id, node, "Max", json!(1.0))?),
+        }))
+    }
+
+    fn mix_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        let data_type = node_enum(node, "data_type", "FLOAT");
+        let factor_mode = node_enum(node, "factor_mode", "UNIFORM");
+        let (factor, first, second, output, value_default) = match data_type.as_str() {
+            "FLOAT" => (
+                "Factor_Float",
+                "A_Float",
+                "B_Float",
+                "Result_Float",
+                json!(0.0),
+            ),
+            "VECTOR" => {
+                let factor = if factor_mode == "NON_UNIFORM" {
+                    "Factor_Vector"
+                } else {
+                    "Factor_Float"
+                };
+                (
+                    factor,
+                    "A_Vector",
+                    "B_Vector",
+                    "Result_Vector",
+                    json!([0.0, 0.0, 0.0]),
+                )
+            }
+            "RGBA" => (
+                "Factor_Float",
+                "A_Color",
+                "B_Color",
+                "Result_Color",
+                json!([0.5, 0.5, 0.5, 1.0]),
+            ),
+            "ROTATION" => (
+                "Factor_Float",
+                "A_Rotation",
+                "B_Rotation",
+                "Result_Rotation",
+                json!([0.0, 0.0, 0.0, 1.0]),
+            ),
+            _ => {
+                return Err(unsupported_graph_node_state(
+                    node,
+                    &format!("data type `{data_type}`"),
+                ));
+            }
+        };
+        if socket != output {
+            return Err(evaluation("unknown Mix output for its data type"));
+        }
+        if !matches!(factor_mode.as_str(), "UNIFORM" | "NON_UNIFORM") {
+            return Err(unsupported_graph_node_state(
+                node,
+                &format!("factor mode `{factor_mode}`"),
+            ));
+        }
+        let factor_default = if factor == "Factor_Vector" {
+            json!([0.5, 0.5, 0.5])
+        } else {
+            json!(1.0)
+        };
+        Ok(EvalValue::Field(Field::Mix {
+            node_type: "ShaderNodeMix",
+            output: MixOutput::Value,
+            data_type,
+            factor_mode,
+            blend_mode: node_enum(node, "blend_type", "MIX"),
+            clamp_factor: node
+                .properties
+                .get("clamp_factor")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            clamp_result: node
+                .properties
+                .get("clamp_result")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            factor: Box::new(self.field_input(id, node, factor, factor_default)?),
+            first: Box::new(self.field_input(id, node, first, value_default.clone())?),
+            second: Box::new(self.field_input(id, node, second, value_default)?),
+        }))
+    }
+
+    fn mix_rgb_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        let output = match socket {
+            "Color" => MixOutput::Color,
+            _ => return Err(evaluation("unknown Mix RGB output")),
+        };
+        Ok(EvalValue::Field(Field::Mix {
+            node_type: "ShaderNodeMixRGB",
+            output,
+            data_type: "RGBA".to_owned(),
+            factor_mode: "UNIFORM".to_owned(),
+            blend_mode: node_enum(node, "blend_type", "MIX"),
+            clamp_factor: true,
+            clamp_result: node
+                .properties
+                .get("use_clamp")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            factor: Box::new(self.field_input(id, node, "Fac", json!(0.5))?),
+            first: Box::new(self.field_input(id, node, "Color1", json!([0.5, 0.5, 0.5, 1.0]))?),
+            second: Box::new(self.field_input(id, node, "Color2", json!([0.5, 0.5, 0.5, 1.0]))?),
+        }))
+    }
+
+    fn color_ramp_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
+        if !matches!(socket, "Color" | "Alpha") {
+            return Err(evaluation("unknown Color Ramp output"));
+        }
+        let ramp = node
+            .properties
+            .get("color_ramp")
+            .and_then(Value::as_object)
+            .ok_or_else(|| unsupported_graph_node_state(node, "missing Color Ramp state"))?;
+        let elements = ramp
+            .get("elements")
+            .and_then(Value::as_array)
+            .filter(|elements| elements.len() >= 2)
+            .ok_or_else(|| evaluation("Color Ramp requires at least two elements"))?;
+        let elements = elements
+            .iter()
+            .map(|element| {
+                let position = element
+                    .get("position")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| evaluation("Color Ramp element position is invalid"))?;
+                let color = element
+                    .get("color")
+                    .and_then(json_color4)
+                    .ok_or_else(|| evaluation("Color Ramp element color is invalid"))?;
+                Ok((finite_f32(position, "Color Ramp position")?, color))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let property = |name: &str, default: &str| {
+            ramp.get(name)
+                .and_then(Value::as_str)
+                .unwrap_or(default)
+                .to_ascii_uppercase()
+        };
+        Ok(EvalValue::Field(Field::ColorRamp {
+            elements: Arc::from(elements),
+            interpolation: property("interpolation", "LINEAR"),
+            color_mode: property("color_mode", "RGB"),
+            hue_interpolation: property("hue_interpolation", "NEAR"),
+            factor: Box::new(self.field_input(id, node, "Fac", json!(0.0))?),
+            output: socket.to_owned(),
+        }))
+    }
+
+    fn curve_node(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        kind: &str,
+    ) -> Result<EvalValue> {
+        let mapping_value = node
+            .properties
+            .get("mapping")
+            .ok_or_else(|| unsupported_graph_node_state(node, "missing Curve Mapping state"))?;
+        let mapping = Arc::new(
+            crate::node_kernels::curve_mapping_from_value(mapping_value)
+                .ok_or_else(|| unsupported_graph_node_state(node, "invalid Curve Mapping state"))?,
+        );
+        let prepared = Arc::new(crate::node_kernels::curve_mapping_prepare(&mapping));
+        let (factor_socket, input_socket, output_socket, factor_default, input_default) = match kind
+        {
+            "FLOAT" => ("Factor", "Value", "Value", json!(1.0), json!(1.0)),
+            "VECTOR" => (
+                "Fac",
+                "Vector",
+                "Vector",
+                json!(1.0),
+                json!([0.0, 0.0, 0.0]),
+            ),
+            "RGBA" => (
+                "Fac",
+                "Color",
+                "Color",
+                json!(1.0),
+                json!([1.0, 1.0, 1.0, 1.0]),
+            ),
+            _ => unreachable!(),
+        };
+        if socket != output_socket {
+            return Err(evaluation("unknown Curve output"));
+        }
+        Ok(EvalValue::Field(Field::Curve {
+            kind: kind.to_owned(),
+            mapping,
+            prepared,
+            factor: Box::new(self.field_input(id, node, factor_socket, factor_default)?),
+            value: Box::new(self.field_input(id, node, input_socket, input_default)?),
         }))
     }
 
@@ -2647,32 +3119,31 @@ impl Evaluator<'_> {
             EvalValue::Scalar(json!([0.0, 0.0, 0.0, 1.0])),
         )?;
         match value {
-            EvalValue::Scalar(value) => {
-                if let Some(vector) = json_vec3(&value) {
-                    Ok(DQuat::from_euler(
-                        glam::EulerRot::XYZEx,
-                        vector.x,
-                        vector.y,
-                        vector.z,
-                    ))
-                } else if let Some(values) = value.as_array().filter(|values| values.len() == 4) {
-                    let numbers = values.iter().map(Value::as_f64).collect::<Option<Vec<_>>>();
-                    let numbers = numbers
-                        .filter(|values| values.iter().all(|value| value.is_finite()))
-                        .ok_or_else(|| evaluation("rotation must be finite"))?;
-                    Ok(
-                        DQuat::from_xyzw(numbers[0], numbers[1], numbers[2], numbers[3])
-                            .normalize(),
-                    )
-                } else {
-                    Err(evaluation(
-                        "rotation socket input must be Euler vec3 or quaternion",
-                    ))
-                }
-            }
+            EvalValue::Scalar(value) => quaternion_from_json(&value),
             _ => Err(evaluation("rotation socket received non-scalar value")),
         }
     }
+}
+fn quaternion_from_json(value: &Value) -> Result<DQuat> {
+    if let Some(vector) = json_vec3(value) {
+        return Ok(DQuat::from_euler(
+            glam::EulerRot::XYZEx,
+            vector.x,
+            vector.y,
+            vector.z,
+        ));
+    }
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 4)
+        .ok_or_else(|| evaluation("rotation socket input must be Euler vec3 or quaternion"))?;
+    let component = |index: usize| {
+        values[index]
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| evaluation("rotation must be finite"))
+    };
+    Ok(DQuat::from_xyzw(component(0)?, component(1)?, component(2)?, component(3)?).normalize())
 }
 
 #[expect(
@@ -3294,8 +3765,47 @@ fn cache_simulation_state(
     Ok(())
 }
 
+fn node_default_input(node: &GraphNode, socket: &str) -> Option<Value> {
+    match node.node_type.as_str() {
+        "ShaderNodeMath" => {
+            let operation = node_enum(node, "operation", "ADD");
+            Some(match socket {
+                "Value_001" => match operation.as_str() {
+                    "MULTIPLY" | "DIVIDE" | "POWER" | "FLOORED_MODULO" | "MODULO" | "ARCTAN2" => {
+                        json!(1.0)
+                    }
+                    "ADD" | "SUBTRACT" => json!(0.0),
+                    "MULTIPLY_ADD" => json!(1.0),
+                    _ => json!(0.5),
+                },
+                "Value_002" if operation == "MULTIPLY_ADD" => json!(0.0),
+                "Value_002" if operation == "COMPARE" => json!(0.001),
+                "Value" | "Value_002" => json!(0.5),
+                _ => return None,
+            })
+        }
+        "ShaderNodeVectorMath" => {
+            let operation = node_enum(node, "operation", "ADD");
+            Some(match socket {
+                "Vector_001"
+                    if matches!(
+                        operation.as_str(),
+                        "MULTIPLY" | "DIVIDE" | "POWER" | "MODULO" | "MULTIPLY_ADD"
+                    ) =>
+                {
+                    json!([1.0, 1.0, 1.0])
+                }
+                "Vector_002" if operation == "MULTIPLY_ADD" => json!([0.0, 0.0, 0.0]),
+                _ => default_input(&node.node_type, socket)?,
+            })
+        }
+        _ => default_input(&node.node_type, socket),
+    }
+}
+
 fn default_input(node_type: &str, socket: &str) -> Option<Value> {
     let value = match (node_type, socket) {
+        ("ShaderNodeMixRGB", "Color1" | "Color2") => json!([0.5, 0.5, 0.5, 1.0]),
         ("GeometryNodeTransform", "Mode") => json!("Components"),
         ("GeometryNodeTransform", "Translation")
         | ("GeometryNodeSetPosition", "Offset")
@@ -3331,7 +3841,9 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
         ("GeometryNodeSubdivisionSurface", "Boundary Smooth") => json!("ALL"),
         ("GeometryNodeSimulationOutput", "Skip") => json!(false),
         ("GeometryNodeRepeatInput", "Iterations") => json!(1),
-        ("ShaderNodeMath", "Value" | "Value_001" | "Value_002") => json!(0.5),
+        ("ShaderNodeMixRGB", "Fac") | ("ShaderNodeMath", "Value" | "Value_001" | "Value_002") => {
+            json!(0.5)
+        }
         _ => return None,
     };
     Some(value)
@@ -3577,14 +4089,35 @@ fn field_json_in_context(
         }
         Field::Math {
             operation,
+            clamp,
             first,
             second,
             third,
         } => {
-            let a = numeric_field_in_context(first, context, index, domain, "math")?;
-            let b = numeric_field_in_context(second, context, index, domain, "math")?;
-            let c = numeric_field_in_context(third, context, index, domain, "math")?;
-            json!(math_value(operation, a, b, c)?)
+            let a = numeric_field_in_context(first, context, index, domain, "math")? as f32;
+            let b = if math_uses_second(operation) {
+                numeric_field_in_context(second, context, index, domain, "math")? as f32
+            } else {
+                0.0
+            };
+            let c = if math_uses_third(operation) {
+                numeric_field_in_context(third, context, index, domain, "math")? as f32
+            } else {
+                0.0
+            };
+            let result = crate::node_kernels::math(
+                operation,
+                a,
+                b,
+                c,
+                *clamp,
+                crate::node_kernels::MathSemantics::Geometry,
+            )
+            .ok_or_else(|| unsupported_graph_operation("ShaderNodeMath", operation))?;
+            if !result.is_finite() {
+                return Err(evaluation("math field produced a non-finite value"));
+            }
+            json!(f64::from(result))
         }
         Field::VectorMath {
             operation,
@@ -3594,13 +4127,281 @@ fn field_json_in_context(
             scale,
             output,
         } => {
-            let first = vector_field_in_context(first, context, index, domain, "vector math")?;
-            let second = vector_field_in_context(second, context, index, domain, "vector math")?;
-            let third = vector_field_in_context(third, context, index, domain, "vector math")?;
-            let scale =
-                numeric_field_in_context(scale, context, index, domain, "vector math scale")?;
-            vector_math_value(operation, output, first, second, third, scale)?
+            let first = vector_field_in_context(first, context, index, domain, "vector math")?
+                .to_array()
+                .map(|component| component as f32);
+            let second = if vector_math_uses_second(operation) {
+                vector_field_in_context(second, context, index, domain, "vector math")?
+                    .to_array()
+                    .map(|component| component as f32)
+            } else {
+                [0.0; 3]
+            };
+            let third = if vector_math_uses_third(operation) {
+                vector_field_in_context(third, context, index, domain, "vector math")?
+                    .to_array()
+                    .map(|component| component as f32)
+            } else {
+                [0.0; 3]
+            };
+            let scale = if matches!(operation.as_str(), "SCALE" | "REFRACT") {
+                finite_f32(
+                    numeric_field_in_context(scale, context, index, domain, "vector math scale")?,
+                    "vector math scale",
+                )?
+            } else {
+                1.0
+            };
+            let result = crate::node_kernels::vector_math(
+                operation,
+                output,
+                first,
+                second,
+                third,
+                scale,
+                crate::node_kernels::MathSemantics::Geometry,
+            )
+            .ok_or_else(|| unsupported_graph_operation("ShaderNodeVectorMath", operation))?;
+            match result {
+                crate::node_kernels::KernelValue::Scalar(value)
+                    if output == "Value" && value.is_finite() =>
+                {
+                    json!(f64::from(value))
+                }
+                crate::node_kernels::KernelValue::Vector(value)
+                    if output == "Vector"
+                        && value.iter().all(|component| component.is_finite()) =>
+                {
+                    json!(value.map(f64::from))
+                }
+                _ => return Err(evaluation("vector math produced an invalid output")),
+            }
         }
+        Field::IntegerMath {
+            operation,
+            first,
+            second,
+            third,
+        } => {
+            let a = integer_field_i32(first, context, index, domain)?;
+            let b = if integer_math_uses_second(operation) {
+                integer_field_i32(second, context, index, domain)?
+            } else {
+                0
+            };
+            let c = if operation == "MULTIPLY_ADD" {
+                integer_field_i32(third, context, index, domain)?
+            } else {
+                0
+            };
+            let result = crate::node_kernels::integer_math(operation, a, b, c)
+                .ok_or_else(|| unsupported_graph_operation("FunctionNodeIntegerMath", operation))?;
+            json!(result)
+        }
+        Field::BooleanMath {
+            operation,
+            first,
+            second,
+        } => {
+            let a = boolean_field_in_context(first, context, index, domain)?;
+            let b = if operation == "NOT" {
+                false
+            } else {
+                boolean_field_in_context(second, context, index, domain)?
+            };
+            let result = crate::node_kernels::boolean_math(operation, a, b, false)
+                .ok_or_else(|| unsupported_graph_operation("FunctionNodeBooleanMath", operation))?;
+            json!(result)
+        }
+        Field::Compare {
+            operation,
+            data_type,
+            mode,
+            first,
+            second,
+            parameter,
+            epsilon,
+        } => {
+            let first_value = field_json_in_context(first, context, index, domain)?;
+            let second_value = field_json_in_context(second, context, index, domain)?;
+            let first_value = compare_value_from_json(data_type, &first_value)?;
+            let second_value = compare_value_from_json(data_type, &second_value)?;
+            let parameter =
+                if data_type == "VECTOR" && matches!(mode.as_str(), "DOT_PRODUCT" | "DIRECTION") {
+                    finite_f32(
+                        numeric_field_in_context(
+                            parameter,
+                            context,
+                            index,
+                            domain,
+                            "Compare parameter",
+                        )?,
+                        "Compare parameter",
+                    )?
+                } else {
+                    0.0
+                };
+            let epsilon = if matches!(operation.as_str(), "EQUAL" | "NOT_EQUAL")
+                && matches!(data_type.as_str(), "FLOAT" | "VECTOR" | "RGBA")
+            {
+                finite_f32(
+                    numeric_field_in_context(epsilon, context, index, domain, "Compare epsilon")?,
+                    "Compare epsilon",
+                )?
+            } else {
+                0.0
+            };
+            let result = crate::node_kernels::compare(
+                operation,
+                mode,
+                first_value,
+                second_value,
+                parameter,
+                epsilon,
+            )
+            .ok_or_else(|| unsupported_graph_compare(data_type, operation, mode))?;
+            json!(result)
+        }
+        Field::MapRange {
+            data_type,
+            interpolation,
+            clamp,
+            value,
+            from_min,
+            from_max,
+            to_min,
+            to_max,
+            steps,
+        } => {
+            let value = kernel_value_field(data_type, value, context, index, domain, "Map Range")?;
+            let from_min =
+                kernel_value_field(data_type, from_min, context, index, domain, "Map Range")?;
+            let from_max =
+                kernel_value_field(data_type, from_max, context, index, domain, "Map Range")?;
+            let to_min =
+                kernel_value_field(data_type, to_min, context, index, domain, "Map Range")?;
+            let to_max =
+                kernel_value_field(data_type, to_max, context, index, domain, "Map Range")?;
+            let steps = if interpolation == "STEPPED" {
+                kernel_value_field(data_type, steps, context, index, domain, "Map Range steps")?
+            } else {
+                match data_type.as_str() {
+                    "FLOAT" => crate::node_kernels::KernelValue::Scalar(0.0),
+                    "FLOAT_VECTOR" => crate::node_kernels::KernelValue::Vector([0.0; 3]),
+                    _ => return Err(evaluation("Map Range data type is invalid")),
+                }
+            };
+            let result = crate::node_kernels::map_range(
+                value,
+                from_min,
+                from_max,
+                to_min,
+                to_max,
+                steps,
+                interpolation,
+                *clamp,
+            )
+            .ok_or_else(|| {
+                unsupported_graph_node_state_type("ShaderNodeMapRange", interpolation)
+            })?;
+            kernel_value_json(result)?
+        }
+        Field::Clamp {
+            mode,
+            value,
+            min,
+            max,
+        } => {
+            let value = finite_f32(
+                numeric_field_in_context(value, context, index, domain, "Clamp")?,
+                "Clamp value",
+            )?;
+            let min = finite_f32(
+                numeric_field_in_context(min, context, index, domain, "Clamp")?,
+                "Clamp minimum",
+            )?;
+            let max = finite_f32(
+                numeric_field_in_context(max, context, index, domain, "Clamp")?,
+                "Clamp maximum",
+            )?;
+            let result = crate::node_kernels::clamp(
+                crate::node_kernels::KernelValue::Scalar(value),
+                crate::node_kernels::KernelValue::Scalar(min),
+                crate::node_kernels::KernelValue::Scalar(max),
+                mode,
+            )
+            .ok_or_else(|| unsupported_graph_node_state_type("ShaderNodeClamp", mode))?;
+            kernel_value_json(result)?
+        }
+        Field::Mix {
+            node_type,
+            output,
+            data_type,
+            factor_mode,
+            blend_mode,
+            clamp_factor,
+            clamp_result,
+            factor,
+            first,
+            second,
+        } => mix_field_json(
+            node_type,
+            *output,
+            data_type,
+            factor_mode,
+            blend_mode,
+            *clamp_factor,
+            *clamp_result,
+            factor,
+            first,
+            second,
+            context,
+            index,
+            domain,
+        )?,
+        Field::ColorRamp {
+            elements,
+            interpolation,
+            color_mode,
+            hue_interpolation,
+            factor,
+            output,
+        } => {
+            let factor = finite_f32(
+                numeric_field_in_context(factor, context, index, domain, "Color Ramp factor")?,
+                "Color Ramp factor",
+            )?;
+            let color = crate::node_kernels::color_ramp(
+                elements,
+                factor,
+                interpolation,
+                color_mode,
+                hue_interpolation,
+            )
+            .ok_or_else(|| {
+                unsupported_graph_node_state_type(
+                    "ShaderNodeValToRGB",
+                    &format!("{interpolation}/{color_mode}/{hue_interpolation}"),
+                )
+            })?;
+            if color.iter().any(|component| !component.is_finite()) {
+                return Err(evaluation("Color Ramp produced a non-finite value"));
+            }
+            match output.as_str() {
+                "Color" => json!(color.map(f64::from)),
+                "Alpha" => json!(f64::from(color[3])),
+                _ => return Err(evaluation("unknown Color Ramp output")),
+            }
+        }
+        Field::Curve {
+            kind,
+            mapping,
+            prepared,
+            factor,
+            value,
+        } => curve_field_json(
+            kind, mapping, prepared, factor, value, context, index, domain,
+        )?,
         Field::CombineXYZ { x, y, z } => {
             let x = numeric_field_in_context(x, context, index, domain, "Combine XYZ")?;
             let y = numeric_field_in_context(y, context, index, domain, "Combine XYZ")?;
@@ -3681,7 +4482,7 @@ fn field_json_in_context(
                         as f32;
                     json!(blender_noise_hash_to_float_2(*seed, id) * (maximum - minimum) + minimum)
                 }
-                _ => Err(evaluation("unsupported Random Value data type"))?,
+                _ => return Err(evaluation("unsupported Random Value data type")),
             }
         }
     };
@@ -3689,6 +4490,463 @@ fn field_json_in_context(
         Ok(value)
     } else {
         Err(evaluation("field produced a non-finite value"))
+    }
+}
+
+fn integer_math_uses_second(operation: &str) -> bool {
+    !matches!(operation, "ABSOLUTE" | "SIGN" | "NEGATE")
+}
+
+fn math_uses_second(operation: &str) -> bool {
+    !matches!(
+        operation,
+        "SQRT"
+            | "INVERSE_SQRT"
+            | "INV_SQRT"
+            | "ABSOLUTE"
+            | "EXPONENT"
+            | "SIGN"
+            | "ROUND"
+            | "FLOOR"
+            | "CEIL"
+            | "TRUNC"
+            | "FRACT"
+            | "SINE"
+            | "COSINE"
+            | "TANGENT"
+            | "ARCSINE"
+            | "ASIN"
+            | "ARCCOSINE"
+            | "ACOS"
+            | "ARCTANGENT"
+            | "ATAN"
+            | "SINH"
+            | "COSH"
+            | "TANH"
+            | "DEGREES"
+            | "RADIANS"
+            | "FRACTION"
+    )
+}
+
+fn math_uses_third(operation: &str) -> bool {
+    matches!(
+        operation,
+        "MULTIPLY_ADD" | "COMPARE" | "SMOOTH_MIN" | "SMOOTH_MAX" | "WRAP"
+    )
+}
+
+fn vector_math_uses_second(operation: &str) -> bool {
+    !matches!(
+        operation,
+        "LENGTH"
+            | "SCALE"
+            | "NORMALIZE"
+            | "ABSOLUTE"
+            | "FLOOR"
+            | "CEIL"
+            | "ROUND"
+            | "FRACTION"
+            | "FRACT"
+            | "SIGN"
+            | "SINE"
+            | "COSINE"
+            | "TANGENT"
+    )
+}
+
+fn vector_math_uses_third(operation: &str) -> bool {
+    matches!(operation, "FACEFORWARD" | "WRAP" | "MULTIPLY_ADD")
+}
+
+fn node_enum(node: &GraphNode, key: &str, default: &str) -> String {
+    node.properties
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+        .to_ascii_uppercase()
+}
+
+fn unsupported_graph_node_state(node: &GraphNode, state: &str) -> PotError {
+    unsupported_graph_node_state_type(&node.node_type, state)
+}
+
+fn unsupported_graph_node_state_type(node_type: &str, state: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("{node_type} state `{state}` is not implemented"),
+        json!({
+            "feature_id": format!("graph.node.{}", node_type.to_ascii_lowercase()),
+            "state": state,
+        }),
+    )
+}
+
+fn unsupported_graph_operation(node_type: &str, operation: &str) -> PotError {
+    let feature_id = match node_type {
+        "ShaderNodeMath" => format!("graph.shader_math.{operation}"),
+        "ShaderNodeVectorMath" => format!("graph.shader_vector_math.{operation}"),
+        "FunctionNodeIntegerMath" => format!("graph.function_integer_math.{operation}"),
+        "FunctionNodeBooleanMath" => format!("graph.function_boolean_math.{operation}"),
+        _ => format!(
+            "graph.node.{}.{}",
+            node_type.to_ascii_lowercase(),
+            operation
+        ),
+    };
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("{node_type} operation `{operation}` is not implemented"),
+        json!({"feature_id":feature_id}),
+    )
+}
+
+fn unsupported_graph_compare(data_type: &str, operation: &str, mode: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!("FunctionNodeCompare `{data_type}/{mode}/{operation}` is not implemented"),
+        json!({"feature_id":format!("graph.function_compare.{data_type}.{mode}.{operation}")}),
+    )
+}
+
+fn finite_f32(value: f64, node: &str) -> Result<f32> {
+    let value = value as f32;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(evaluation(format!(
+            "{node} input is outside the finite f32 range"
+        )))
+    }
+}
+
+fn kernel_vec3(value: DVec3, node: &str) -> Result<[f32; 3]> {
+    Ok([
+        finite_f32(value.x, node)?,
+        finite_f32(value.y, node)?,
+        finite_f32(value.z, node)?,
+    ])
+}
+
+fn json_color4(value: &Value) -> Option<[f32; 4]> {
+    let values = value.as_array()?;
+    if values.len() != 4 {
+        return None;
+    }
+    let mut color = [0.0; 4];
+    for (component, value) in color.iter_mut().zip(values) {
+        *component = value.as_f64()? as f32;
+        if !component.is_finite() {
+            return None;
+        }
+    }
+    Some(color)
+}
+
+fn integer_field_i32(
+    field: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<i32> {
+    let value = field_json_in_context(field, context, index, domain)?
+        .as_i64()
+        .ok_or_else(|| evaluation("integer math input must produce an integer"))?;
+    i32::try_from(value).map_err(|_| evaluation("integer math input exceeds Blender's int range"))
+}
+
+fn boolean_field_in_context(
+    field: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<bool> {
+    field_json_in_context(field, context, index, domain)?
+        .as_bool()
+        .ok_or_else(|| evaluation("boolean math input must produce a boolean"))
+}
+
+fn compare_value_from_json<'a>(
+    data_type: &str,
+    value: &'a Value,
+) -> Result<crate::node_kernels::CompareValue<'a>> {
+    use crate::node_kernels::CompareValue;
+    Ok(match data_type {
+        "FLOAT" => {
+            let scalar = value
+                .as_f64()
+                .ok_or_else(|| evaluation("Compare input must produce a number"))?
+                as f32;
+            if scalar.is_nan() {
+                return Err(evaluation("Compare float input must not be NaN"));
+            }
+            CompareValue::Scalar(scalar)
+        }
+        "INT" | "INTEGER" => CompareValue::Integer(
+            i32::try_from(
+                value
+                    .as_i64()
+                    .ok_or_else(|| evaluation("Compare input must produce an integer"))?,
+            )
+            .map_err(|_| evaluation("Compare integer exceeds Blender's int range"))?,
+        ),
+        "VECTOR" | "FLOAT_VECTOR" => {
+            let vector = json_vec3(value)
+                .ok_or_else(|| evaluation("Compare input must produce a finite vector"))?;
+            CompareValue::Vector(kernel_vec3(vector, "Compare")?)
+        }
+        "RGBA" | "COLOR" => CompareValue::Color(
+            json_color4(value).ok_or_else(|| evaluation("Compare input must produce a color"))?,
+        ),
+        "BOOLEAN" | "BOOL" => CompareValue::Boolean(
+            value
+                .as_bool()
+                .ok_or_else(|| evaluation("Compare input must produce a boolean"))?,
+        ),
+        "STRING" => CompareValue::String(
+            value
+                .as_str()
+                .ok_or_else(|| evaluation("Compare input must produce a string"))?,
+        ),
+        "OBJECT" | "IMAGE" | "COLLECTION" | "MATERIAL" | "FONT" | "SOUND" => {
+            let identifier = value
+                .as_object()
+                .and_then(|object| {
+                    object
+                        .get("bridge_id")
+                        .or_else(|| object.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| value.as_str())
+                .unwrap_or("");
+            CompareValue::String(identifier)
+        }
+        _ => return Err(evaluation("Compare data type is invalid")),
+    })
+}
+
+fn kernel_value_field(
+    data_type: &str,
+    field: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+    node: &str,
+) -> Result<crate::node_kernels::KernelValue> {
+    match data_type {
+        "FLOAT" => Ok(crate::node_kernels::KernelValue::Scalar(finite_f32(
+            numeric_field_in_context(field, context, index, domain, node)?,
+            node,
+        )?)),
+        "FLOAT_VECTOR" => Ok(crate::node_kernels::KernelValue::Vector(kernel_vec3(
+            vector_field_in_context(field, context, index, domain, node)?,
+            node,
+        )?)),
+        _ => Err(evaluation(format!("{node} data type is invalid"))),
+    }
+}
+
+fn kernel_value_json(value: crate::node_kernels::KernelValue) -> Result<Value> {
+    match value {
+        crate::node_kernels::KernelValue::Scalar(value) if value.is_finite() => {
+            Ok(json!(f64::from(value)))
+        }
+        crate::node_kernels::KernelValue::Vector(value)
+            if value.iter().all(|component| component.is_finite()) =>
+        {
+            Ok(json!(value.map(f64::from)))
+        }
+        _ => Err(evaluation("math kernel produced an invalid value")),
+    }
+}
+
+fn mix_field_json(
+    node_type: &str,
+    output: MixOutput,
+    data_type: &str,
+    factor_mode: &str,
+    blend_mode: &str,
+    clamp_factor: bool,
+    clamp_result: bool,
+    factor: &Field,
+    first: &Field,
+    second: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<Value> {
+    match data_type {
+        "FLOAT" => {
+            let factor = finite_f32(
+                numeric_field_in_context(factor, context, index, domain, "Mix factor")?,
+                "Mix factor",
+            )?;
+            let first = finite_f32(
+                numeric_field_in_context(first, context, index, domain, "Mix")?,
+                "Mix",
+            )?;
+            let second = finite_f32(
+                numeric_field_in_context(second, context, index, domain, "Mix")?,
+                "Mix",
+            )?;
+            let result =
+                crate::node_kernels::mix_float("MIX", factor, first, second, clamp_factor, false)
+                    .ok_or_else(|| unsupported_graph_node_state_type(node_type, "FLOAT/MIX"))?;
+            if !result.is_finite() {
+                return Err(evaluation("Mix produced a non-finite value"));
+            }
+            Ok(json!(f64::from(result)))
+        }
+        "VECTOR" => {
+            let factor = if factor_mode == "NON_UNIFORM" {
+                kernel_vec3(
+                    vector_field_in_context(factor, context, index, domain, "Mix factor")?,
+                    "Mix factor",
+                )?
+            } else {
+                let factor = finite_f32(
+                    numeric_field_in_context(factor, context, index, domain, "Mix factor")?,
+                    "Mix factor",
+                )?;
+                [factor; 3]
+            };
+            let first = kernel_vec3(
+                vector_field_in_context(first, context, index, domain, "Mix")?,
+                "Mix",
+            )?;
+            let second = kernel_vec3(
+                vector_field_in_context(second, context, index, domain, "Mix")?,
+                "Mix",
+            )?;
+            let result =
+                crate::node_kernels::mix_vector("MIX", factor, first, second, clamp_factor, false)
+                    .ok_or_else(|| unsupported_graph_node_state_type(node_type, "VECTOR/MIX"))?;
+            if result.iter().any(|component| !component.is_finite()) {
+                return Err(evaluation("Mix produced a non-finite vector"));
+            }
+            Ok(json!(result.map(f64::from)))
+        }
+        "RGBA" => {
+            let factor = finite_f32(
+                numeric_field_in_context(factor, context, index, domain, "Mix factor")?,
+                "Mix factor",
+            )?;
+            let first = json_color4(&field_json_in_context(first, context, index, domain)?)
+                .ok_or_else(|| evaluation("Mix input must produce a color"))?;
+            let second = json_color4(&field_json_in_context(second, context, index, domain)?)
+                .ok_or_else(|| evaluation("Mix input must produce a color"))?;
+            let result = crate::node_kernels::mix_color(
+                blend_mode,
+                factor,
+                first,
+                second,
+                clamp_factor,
+                clamp_result,
+            )
+            .ok_or_else(|| {
+                unsupported_graph_node_state_type(
+                    node_type,
+                    &format!("RGBA blend mode `{blend_mode}`"),
+                )
+            })?;
+            if result.iter().any(|component| !component.is_finite()) {
+                return Err(evaluation("Mix produced a non-finite color"));
+            }
+            match output {
+                MixOutput::Value | MixOutput::Color => Ok(json!(result.map(f64::from))),
+            }
+        }
+        "ROTATION" => {
+            let factor = finite_f32(
+                numeric_field_in_context(factor, context, index, domain, "Mix factor")?,
+                "Mix factor",
+            )?;
+            let first =
+                quaternion_from_json(&field_json_in_context(first, context, index, domain)?)?
+                    .to_array()
+                    .map(|component| component as f32);
+            let second =
+                quaternion_from_json(&field_json_in_context(second, context, index, domain)?)?
+                    .to_array()
+                    .map(|component| component as f32);
+            let result = crate::node_kernels::mix_rotation(factor, first, second, clamp_factor)
+                .ok_or_else(|| evaluation("Mix produced an invalid rotation"))?;
+            if result.iter().any(|component| !component.is_finite()) {
+                return Err(evaluation("Mix produced a non-finite rotation"));
+            }
+            Ok(json!(result.map(f64::from)))
+        }
+        _ => Err(evaluation("Mix data type is invalid")),
+    }
+}
+
+fn curve_field_json(
+    kind: &str,
+    mapping: &crate::color::curve::CurveMapping,
+    prepared: &crate::color::curve::PreparedCurve,
+    factor: &Field,
+    value: &Field,
+    context: FieldEvaluationContext<'_>,
+    index: usize,
+    domain: &str,
+) -> Result<Value> {
+    let factor = finite_f32(
+        numeric_field_in_context(factor, context, index, domain, "Curve factor")?,
+        "Curve factor",
+    )?;
+    match kind {
+        "FLOAT" => {
+            let value = finite_f32(
+                numeric_field_in_context(value, context, index, domain, "Float Curve")?,
+                "Float Curve",
+            )?;
+            let mapped = crate::node_kernels::curve_mapping_value(mapping, prepared, 0, value)
+                .ok_or_else(|| {
+                    unsupported_graph_node_state_type("ShaderNodeFloatCurve", "mapping")
+                })?;
+            let result = crate::node_kernels::mix_float("MIX", factor, value, mapped, false, false)
+                .ok_or_else(|| {
+                    unsupported_graph_node_state_type("ShaderNodeFloatCurve", "factor")
+                })?;
+            if !result.is_finite() {
+                return Err(evaluation("Float Curve produced a non-finite value"));
+            }
+            Ok(json!(f64::from(result)))
+        }
+        "VECTOR" => {
+            let value = kernel_vec3(
+                vector_field_in_context(value, context, index, domain, "Vector Curve")?,
+                "Vector Curve",
+            )?;
+            let mapped = crate::node_kernels::curve_mapping_vector(prepared, value);
+            let result =
+                crate::node_kernels::mix_vector("MIX", [factor; 3], value, mapped, false, false)
+                    .ok_or_else(|| {
+                        unsupported_graph_node_state_type("ShaderNodeVectorCurve", "factor")
+                    })?;
+            if result.iter().any(|component| !component.is_finite()) {
+                return Err(evaluation("Vector Curve produced a non-finite value"));
+            }
+            Ok(json!(result.map(f64::from)))
+        }
+        "RGBA" => {
+            let value = json_color4(&field_json_in_context(value, context, index, domain)?)
+                .ok_or_else(|| evaluation("RGB Curve input must produce a color"))?;
+            let mapped_rgb =
+                crate::node_kernels::curve_mapping_rgb(prepared, [value[0], value[1], value[2]]);
+            let mapped = [mapped_rgb[0], mapped_rgb[1], mapped_rgb[2], value[3]];
+            let mut result =
+                crate::node_kernels::mix_color("MIX", factor, value, mapped, false, false)
+                    .ok_or_else(|| {
+                        unsupported_graph_node_state_type("ShaderNodeRGBCurve", "factor")
+                    })?;
+            result[3] = 1.0;
+            if result.iter().any(|component| !component.is_finite()) {
+                return Err(evaluation("RGB Curve produced a non-finite color"));
+            }
+            Ok(json!(result.map(f64::from)))
+        }
+        _ => Err(evaluation("Curve node type is invalid")),
     }
 }
 
@@ -4410,6 +5668,10 @@ fn blender_noise_hash_2(first: u32, second: u32) -> u32 {
     let seed = 0xdead_beef_u32.wrapping_add((2 << 2) + 13);
     blender_noise_hash_finalize(seed.wrapping_add(first), seed.wrapping_add(second), seed)
 }
+
+fn blender_noise_hash_to_float_2(first: u32, second: u32) -> f32 {
+    blender_noise_hash_2(first, second) as f32 / u32::MAX as f32
+}
 fn blender_noise_hash_3(first: u32, second: u32, third: u32) -> u32 {
     let seed = 0xdead_beef_u32.wrapping_add((3 << 2) + 13);
     blender_noise_hash_finalize(
@@ -4417,10 +5679,6 @@ fn blender_noise_hash_3(first: u32, second: u32, third: u32) -> u32 {
         seed.wrapping_add(second),
         seed.wrapping_add(third),
     )
-}
-
-fn blender_noise_hash_to_float_2(first: u32, second: u32) -> f32 {
-    blender_noise_hash_2(first, second) as f32 / u32::MAX as f32
 }
 
 fn blender_noise_hash_to_float_3(first: u32, second: u32, third: u32) -> f32 {
@@ -4530,281 +5788,6 @@ fn json_is_finite(value: &Value) -> bool {
         Value::Array(values) => values.iter().all(json_is_finite),
         _ => true,
     }
-}
-
-fn math_value(operation: &str, a: f64, b: f64, c: f64) -> Result<f64> {
-    let result = match operation {
-        "ADD" => a + b,
-        "SUBTRACT" => a - b,
-        "MULTIPLY" => a * b,
-        "MULTIPLY_ADD" => a.mul_add(b, c),
-        "DIVIDE" => safe_divide(a, b),
-        "POWER" => safe_power(a, b),
-        "LOGARITHM" => safe_log(a, b),
-        "SQRT" => safe_sqrt(a),
-        "INVERSE_SQRT" | "INV_SQRT" => safe_divide(1.0, safe_sqrt(a)),
-        "ABSOLUTE" => a.abs(),
-        "EXPONENT" => a.exp(),
-        "MINIMUM" => a.min(b),
-        "MAXIMUM" => a.max(b),
-        "LESS_THAN" => {
-            if a < b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        "GREATER_THAN" => {
-            if a > b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        "SIGN" => blender_sign(a),
-        "COMPARE" => {
-            if (a - b).abs() <= c.max(0.0) {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        "SMOOTH_MIN" => smooth_min(a, b, c),
-        "SMOOTH_MAX" => -smooth_min(-a, -b, c),
-        "ROUND" => (a + 0.5).floor(),
-        "FLOOR" => a.floor(),
-        "CEIL" => a.ceil(),
-        "TRUNC" => a.trunc(),
-        "FRACT" => a - a.floor(),
-        "MODULO" => safe_modulo(a, b),
-        "FLOORED_MODULO" => safe_floored_modulo(a, b),
-        "WRAP" => blender_wrap(a, b, c),
-        "SNAP" => (safe_divide(a, b)).floor() * b,
-        "PINGPONG" => {
-            let length = b.abs();
-            if crate::float::equal_f64(length, 0.0) {
-                0.0
-            } else {
-                length - ((a.rem_euclid(2.0 * length)) - length).abs()
-            }
-        }
-        "SINE" => a.sin(),
-        "COSINE" => a.cos(),
-        "TANGENT" => a.tan(),
-        "ARCSINE" | "ASIN" => a.clamp(-1.0, 1.0).asin(),
-        "ARCCOSINE" | "ACOS" => a.clamp(-1.0, 1.0).acos(),
-        "ARCTANGENT" | "ATAN" => a.atan(),
-        "ARCTAN2" | "ARCTAN_2" => a.atan2(b),
-        "SINH" => a.sinh(),
-        "COSH" => a.cosh(),
-        "TANH" => a.tanh(),
-        "DEGREES" => a.to_degrees(),
-        "RADIANS" => a.to_radians(),
-        other => {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                format!("ShaderNodeMath operation `{other}` is not implemented"),
-                json!({"feature_id":format!("graph.shader_math.{other}")}),
-            ));
-        }
-    };
-    if result.is_finite() {
-        Ok(result)
-    } else {
-        Err(evaluation("math field produced a non-finite value"))
-    }
-}
-
-fn safe_divide(a: f64, b: f64) -> f64 {
-    if crate::float::equal_f64(b, 0.0) {
-        0.0
-    } else {
-        a / b
-    }
-}
-
-/// Blender's `safe_logf`: non-positive operands and a unit base give zero.
-fn safe_log(value: f64, base: f64) -> f64 {
-    if value > 0.0 && base > 0.0 {
-        safe_divide(value.ln(), base.ln())
-    } else {
-        0.0
-    }
-}
-
-fn safe_sqrt(value: f64) -> f64 {
-    if value > 0.0 { value.sqrt() } else { 0.0 }
-}
-
-/// C `fmod` (the sign follows the dividend); a zero divisor gives zero.
-fn safe_modulo(a: f64, b: f64) -> f64 {
-    if crate::float::equal_f64(b, 0.0) {
-        0.0
-    } else {
-        a % b
-    }
-}
-
-fn safe_floored_modulo(a: f64, b: f64) -> f64 {
-    if crate::float::equal_f64(b, 0.0) {
-        0.0
-    } else {
-        a - b * (a / b).floor()
-    }
-}
-
-/// Blender's `safe_powf`: a negative base is only raised to integer exponents.
-fn safe_power(a: f64, b: f64) -> f64 {
-    if a >= 0.0 || b.fract() == 0.0 {
-        a.powf(b)
-    } else {
-        0.0
-    }
-}
-
-fn blender_sign(value: f64) -> f64 {
-    if value > 0.0 {
-        1.0
-    } else if value < 0.0 {
-        -1.0
-    } else {
-        0.0
-    }
-}
-
-/// Blender's `wrap_f(value, max, min)`; a zero range yields `min`.
-fn blender_wrap(value: f64, max: f64, min: f64) -> f64 {
-    let range = max - min;
-    if crate::float::equal_f64(range, 0.0) {
-        min
-    } else {
-        value - range * ((value - min) / range).floor()
-    }
-}
-
-fn smooth_min(a: f64, b: f64, width: f64) -> f64 {
-    if width == 0.0 {
-        return a.min(b);
-    }
-    let h = (width - (a - b).abs()).max(0.0) / width;
-    a.min(b) - h * h * h * width * (1.0 / 6.0)
-}
-
-fn vector_math_value(
-    operation: &str,
-    output: &str,
-    first: DVec3,
-    second: DVec3,
-    third: DVec3,
-    scale: f64,
-) -> Result<Value> {
-    let scalar = match operation {
-        "DOT_PRODUCT" => Some(first.dot(second)),
-        "DISTANCE" => Some(first.distance(second)),
-        "LENGTH" => Some(first.length()),
-        _ => None,
-    };
-    if let Some(value) = scalar {
-        if output != "Value" {
-            return Err(evaluation(
-                "Vector Math scalar result requested as a vector",
-            ));
-        }
-        return if value.is_finite() {
-            Ok(json!(value))
-        } else {
-            Err(evaluation("vector math produced a non-finite value"))
-        };
-    }
-    if output != "Vector" {
-        return Err(evaluation(
-            "Vector Math vector result requested as a scalar",
-        ));
-    }
-    let vector = match operation {
-        "ADD" => first + second,
-        "SUBTRACT" => first - second,
-        "MULTIPLY" => first * second,
-        "POWER" => DVec3::new(
-            safe_power(first.x, second.x),
-            safe_power(first.y, second.y),
-            safe_power(first.z, second.z),
-        ),
-        "DIVIDE" => DVec3::new(
-            safe_divide(first.x, second.x),
-            safe_divide(first.y, second.y),
-            safe_divide(first.z, second.z),
-        ),
-        "CROSS_PRODUCT" => first.cross(second),
-        "PROJECT" if second.length_squared() > 0.0 => first.project_onto(second),
-        "PROJECT" => DVec3::ZERO,
-        "REFLECT" => {
-            let normal = second.normalize_or_zero();
-            first - 2.0 * first.dot(normal) * normal
-        }
-        "REFRACT" => {
-            let normal = second.normalize_or_zero();
-            let cosine = (-first.dot(normal)).clamp(-1.0, 1.0);
-            let discriminant = 1.0 - scale * scale * (1.0 - cosine * cosine);
-            if discriminant < 0.0 {
-                DVec3::ZERO
-            } else {
-                scale * first + (scale * cosine - discriminant.sqrt()) * normal
-            }
-        }
-        "FACEFORWARD" => {
-            if third.dot(second) < 0.0 {
-                first
-            } else {
-                -first
-            }
-        }
-        "SCALE" => first * scale,
-        "NORMALIZE" => first.normalize_or_zero(),
-        "ABSOLUTE" => first.abs(),
-        "MINIMUM" => first.min(second),
-        "MAXIMUM" => first.max(second),
-        "FLOOR" => first.floor(),
-        "CEIL" => first.ceil(),
-        "ROUND" => per_axis(first, |value| (value + 0.5).floor()),
-        "FRACTION" => first - first.floor(),
-        "MODULO" => DVec3::new(
-            safe_modulo(first.x, second.x),
-            safe_modulo(first.y, second.y),
-            safe_modulo(first.z, second.z),
-        ),
-        "SNAP" => DVec3::new(
-            safe_divide(first.x, second.x).floor() * second.x,
-            safe_divide(first.y, second.y).floor() * second.y,
-            safe_divide(first.z, second.z).floor() * second.z,
-        ),
-        "WRAP" => DVec3::new(
-            blender_wrap(first.x, second.x, third.x),
-            blender_wrap(first.y, second.y, third.y),
-            blender_wrap(first.z, second.z, third.z),
-        ),
-        "SINE" => DVec3::new(first.x.sin(), first.y.sin(), first.z.sin()),
-        "COSINE" => DVec3::new(first.x.cos(), first.y.cos(), first.z.cos()),
-        "TANGENT" => DVec3::new(first.x.tan(), first.y.tan(), first.z.tan()),
-        "SIGN" => per_axis(first, blender_sign),
-        "MULTIPLY_ADD" => first * second + third,
-        other => {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                format!("ShaderNodeVectorMath operation `{other}` is not implemented"),
-                json!({"feature_id":format!("graph.shader_vector_math.{other}")}),
-            ));
-        }
-    };
-    if vector.is_finite() {
-        Ok(vector_json(vector))
-    } else {
-        Err(evaluation("vector math produced a non-finite value"))
-    }
-}
-
-fn per_axis(value: DVec3, f: impl Fn(f64) -> f64) -> DVec3 {
-    DVec3::new(f(value.x), f(value.y), f(value.z))
 }
 
 fn field_vec3(field: &Field, mesh: &Mesh, index: usize, fallback: DVec3) -> Result<DVec3> {
@@ -5367,7 +6350,7 @@ fn named_attribute_data_type(node_id: &Id, node: &GraphNode, feature_id: &str) -
         .to_ascii_uppercase();
     if !matches!(
         data_type.as_str(),
-        "FLOAT" | "FLOAT_VECTOR" | "INT" | "BOOLEAN"
+        "FLOAT" | "FLOAT_VECTOR" | "INT" | "BOOLEAN" | "QUATERNION" | "FLOAT_COLOR"
     ) {
         return Err(unsupported_graph_feature(
             node_id,
@@ -5384,6 +6367,8 @@ fn named_attribute_zero(data_type: &str) -> Value {
         "FLOAT_VECTOR" => json!([0.0, 0.0, 0.0]),
         "INT" => json!(0),
         "BOOLEAN" => json!(false),
+        "QUATERNION" => json!([0.0, 0.0, 0.0, 1.0]),
+        "FLOAT_COLOR" => json!([0.0, 0.0, 0.0, 0.0]),
         _ => Value::Null,
     }
 }
@@ -5421,6 +6406,46 @@ fn named_attribute_value(value: &Value, data_type: &str) -> Result<Value> {
             .as_bool()
             .map(Value::Bool)
             .ok_or_else(|| evaluation("BOOLEAN attribute value must be boolean")),
+        "FLOAT_COLOR" => {
+            let value = json_color4(value)
+                .ok_or_else(|| evaluation("FLOAT_COLOR attribute value must be a finite vec4"))?;
+            Ok(json!(value.map(f64::from)))
+        }
+        "QUATERNION" => {
+            let values = value
+                .as_array()
+                .filter(|values| values.len() == 4)
+                .ok_or_else(|| {
+                    evaluation("QUATERNION attribute value must be an xyzw quaternion")
+                })?;
+            let component = |index: usize| {
+                values[index]
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .map(|value| value as f32)
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| {
+                        evaluation(
+                            "QUATERNION attribute value must be finite and within float32 range",
+                        )
+                    })
+            };
+            let quaternion =
+                glam::Quat::from_xyzw(component(0)?, component(1)?, component(2)?, component(3)?);
+            let length_squared = quaternion.length_squared();
+            if !length_squared.is_finite() || length_squared == 0.0 {
+                return Err(evaluation(
+                    "QUATERNION attribute value cannot be normalized",
+                ));
+            }
+            let normalized = quaternion.normalize().to_array();
+            if normalized.iter().any(|component| !component.is_finite()) {
+                return Err(evaluation(
+                    "QUATERNION attribute value cannot be normalized",
+                ));
+            }
+            Ok(json!(normalized.map(f64::from)))
+        }
         _ => Err(evaluation("unsupported Geometry Nodes attribute data type")),
     }
 }

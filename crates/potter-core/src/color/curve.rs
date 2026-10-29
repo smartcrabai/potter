@@ -240,6 +240,65 @@ impl CurveMapping {
         mapping.check()?;
         Ok(mapping)
     }
+    /// Parses the compact mapping state stored on Blender shader curve nodes. Those nodes own one,
+    /// three, or four curves, while the display mapping uses four; unused channels are identity.
+    pub(crate) fn from_node_json(value: &Value) -> std::result::Result<Self, String> {
+        let root = object(
+            value,
+            "curve",
+            &[
+                "tone",
+                "extend_extrapolate",
+                "use_clip",
+                "clip",
+                "black",
+                "white",
+                "curves",
+            ],
+        )?;
+        let tone = match required(root, "curve", "tone")?.as_str() {
+            Some("standard") => CurveTone::Standard,
+            Some("film_like") => CurveTone::FilmLike,
+            _ => return Err("curve/tone must be `standard` or `film_like`".to_owned()),
+        };
+        let extend_extrapolate = required(root, "curve", "extend_extrapolate")?
+            .as_bool()
+            .ok_or_else(|| "curve/extend_extrapolate must be a boolean".to_owned())?;
+        let use_clip = required(root, "curve", "use_clip")?
+            .as_bool()
+            .ok_or_else(|| "curve/use_clip must be a boolean".to_owned())?;
+        let clip = numbers::<4>(required(root, "curve", "clip")?, "curve/clip")?;
+        let black = numbers::<3>(required(root, "curve", "black")?, "curve/black")?
+            .map(|value| value as f32);
+        let white = numbers::<3>(required(root, "curve", "white")?, "curve/white")?
+            .map(|value| value as f32);
+        let curve_values = required(root, "curve", "curves")?
+            .as_array()
+            .filter(|curves| matches!(curves.len(), 1 | 3 | 4))
+            .ok_or_else(|| "curve/curves must contain one, three, or four curves".to_owned())?;
+        let mut curves = curve_values
+            .iter()
+            .enumerate()
+            .map(|(index, curve)| parse_curve(curve, &format!("curve/curves/{index}")))
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        while curves.len() < 4 {
+            curves.push(identity_curve());
+        }
+        let curves: [CurveMap; 4] = curves
+            .try_into()
+            .map_err(|_| "curve/curves must contain one, three, or four curves".to_owned())?;
+        let mapping = Self {
+            tone,
+            extend_extrapolate,
+            use_clip,
+            clip,
+            black,
+            white,
+            curves,
+        };
+        mapping.check()?;
+        Ok(mapping)
+    }
 
     /// Builds the evaluation tables that Blender's display processor builds
     /// (`ColormanageProcessor`): each R/G/B table is premultiplied by the combined curve, and the

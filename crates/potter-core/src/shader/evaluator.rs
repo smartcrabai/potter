@@ -696,21 +696,51 @@ pub fn evaluate_surface_with_workspace(
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<SurfaceShading> {
+    evaluate_surface_with_workspace_semantics(
+        material,
+        prepared,
+        hit_ctx,
+        workspace,
+        crate::node_kernels::MathSemantics::Cycles,
+    )
+}
+
+pub(crate) fn evaluate_surface_with_workspace_semantics(
+    material: &Material,
+    prepared: &PreparedMaterial,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+    math_semantics: crate::node_kernels::MathSemantics,
+) -> Result<SurfaceShading> {
     let mut shading = SurfaceShading::default();
-    evaluate_surface_with_workspace_into(material, prepared, hit_ctx, workspace, &mut shading)?;
+    evaluate_surface_with_workspace_into_semantics(
+        material,
+        prepared,
+        hit_ctx,
+        workspace,
+        &mut shading,
+        math_semantics,
+    )?;
     Ok(shading)
 }
 
-/// Evaluates a material surface into caller-owned output and graph scratch.
-pub(crate) fn evaluate_surface_with_workspace_into(
+pub(crate) fn evaluate_surface_with_workspace_into_semantics(
     material: &Material,
     prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
     shading: &mut SurfaceShading,
+    math_semantics: crate::node_kernels::MathSemantics,
 ) -> Result<()> {
     workspace.reset();
-    let result = evaluate_surface_inner_into(material, prepared, hit_ctx, workspace, shading);
+    let result = evaluate_surface_inner_into(
+        material,
+        prepared,
+        hit_ctx,
+        workspace,
+        shading,
+        math_semantics,
+    );
     workspace.reset();
     result
 }
@@ -721,6 +751,7 @@ fn evaluate_surface_inner_into(
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
     shading: &mut SurfaceShading,
+    math_semantics: crate::node_kernels::MathSemantics,
 ) -> Result<()> {
     shading.closures.clear();
     shading.volume.clear();
@@ -793,6 +824,7 @@ fn evaluate_surface_inner_into(
         links: prepared.link_index(graph_id, group),
         group_input_binding: None,
         group_depth: 0,
+        math_semantics,
     };
     // Only an unlinked Surface alongside a linked Volume is empty; other Shader sockets keep their defaults.
     if !has_surface && has_volume {
@@ -879,8 +911,25 @@ pub fn evaluate_displacement_with_workspace(
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
 ) -> Result<f64> {
+    evaluate_displacement_with_workspace_semantics(
+        material,
+        prepared,
+        hit_ctx,
+        workspace,
+        crate::node_kernels::MathSemantics::Cycles,
+    )
+}
+
+pub(crate) fn evaluate_displacement_with_workspace_semantics(
+    material: &Material,
+    prepared: &PreparedMaterial,
+    hit_ctx: &HitContext<'_>,
+    workspace: &mut EvaluatorWorkspace,
+    math_semantics: crate::node_kernels::MathSemantics,
+) -> Result<f64> {
     workspace.reset();
-    let result = evaluate_displacement_inner(material, prepared, hit_ctx, workspace);
+    let result =
+        evaluate_displacement_inner(material, prepared, hit_ctx, workspace, math_semantics);
     workspace.reset();
     result
 }
@@ -890,6 +939,7 @@ fn evaluate_displacement_inner(
     prepared: &PreparedMaterial,
     hit_ctx: &HitContext<'_>,
     workspace: &mut EvaluatorWorkspace,
+    math_semantics: crate::node_kernels::MathSemantics,
 ) -> Result<f64> {
     let Some(graph_id) = &material.node_tree else {
         return Ok(0.0);
@@ -939,6 +989,7 @@ fn evaluate_displacement_inner(
         material,
         hit_ctx: *hit_ctx,
         workspace,
+        math_semantics,
         alpha_linked_images: &prepared.alpha_linked_images,
         links: prepared.link_index(graph_id, group),
         group_input_binding: None,
@@ -1116,11 +1167,15 @@ enum NodeKind {
     VectorMath,
     VectorRotate,
     VectorTransform,
+    MapRange,
+    Clamp,
+    FloatCurve,
+    RgbCurve,
+    VectorCurve,
     Mapping,
     Value,
     Rgb,
     CombineColor,
-    SeparateColor,
     RgbToBw,
     Invert,
     Gamma,
@@ -1137,6 +1192,7 @@ enum NodeKind {
     GroupInput,
     SeparateXyz,
     CombineXyz,
+    SeparateColor,
     TexCoord,
     UvMap,
     Tangent,
@@ -1205,6 +1261,26 @@ pub struct EvaluatorWorkspace {
     closures: Vec<ShaderClosure>,
     /// Active nested graph identities; prevents recursive node groups from exhausting the render stack.
     active_groups: Vec<usize>,
+    /// Prepared static node mappings survive hit resets; source JSON equality invalidates edits.
+    curve_mappings: Vec<PreparedNodeCurve>,
+    /// Prepared ramp elements and their lookup tables survive hit resets; source-property equality invalidates edits.
+    ramps: Vec<PreparedNodeRamp>,
+}
+struct PreparedNodeRamp {
+    graph: usize,
+    node: usize,
+    source: serde_json::Map<String, JsonValue>,
+    elements: Vec<(f32, [f32; 4])>,
+    table: Vec<[f32; 4]>,
+    eevee_table: Vec<[f32; 4]>,
+    interpolation: &'static str,
+    color_mode: &'static str,
+}
+struct PreparedNodeCurve {
+    graph: usize,
+    node: usize,
+    source: Option<JsonValue>,
+    prepared: crate::color::curve::PreparedCurve,
 }
 
 /// A run of closures in the workspace arena (`EvaluatorWorkspace::closures`).
@@ -1303,6 +1379,8 @@ struct LinkIndex {
     /// For each target node, the indices into `NodeGroup::links` of its incoming links in link order. The first entry
     /// matching a socket is the same link that a scan of all links finds first.
     incoming: BTreeMap<Id, Vec<usize>>,
+    /// Nodes whose inputs Blender's shader-tree inliner can fold to primitives.
+    primitive_nodes: BTreeSet<Id>,
     /// The output node that the socket flags below describe.
     output: Option<Id>,
     /// Whether a link reaches the output's `Surface` socket.
@@ -1322,6 +1400,12 @@ impl LinkIndex {
                 .or_default()
                 .push(socket_index);
         }
+        let primitive_nodes = group
+            .nodes
+            .keys()
+            .filter(|node_id| super::inline_fold::node_inputs_all_primitive(group, node_id))
+            .cloned()
+            .collect();
         let (has_surface, has_volume, has_displacement) = output
             .map_or((false, false, false), |output| {
                 scan_output_feeds(group, output)
@@ -1331,6 +1415,7 @@ impl LinkIndex {
             links_address: group.links.as_ptr().addr(),
             link_count: group.links.len(),
             incoming,
+            primitive_nodes,
             output: output.cloned(),
             has_volume,
             has_surface,
@@ -1478,6 +1563,7 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared, 'scope> {
     material: &'material Material,
     hit_ctx: HitContext<'registry>,
     workspace: &'workspace mut EvaluatorWorkspace,
+    math_semantics: crate::node_kernels::MathSemantics,
     /// The Alpha-linked Image Texture nodes of the material, from [`PreparedMaterial`].
     alpha_linked_images: &'prepared BTreeSet<Id>,
     /// The incoming-link index of `group` from [`PreparedMaterial`]; `None` scans every link of the group.
@@ -1597,6 +1683,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             material: self.material,
             hit_ctx: self.hit_ctx,
             workspace: self.workspace,
+            math_semantics: self.math_semantics,
             alpha_linked_images: self.alpha_linked_images,
             links: None,
             group_input_binding: parent_binding,
@@ -1655,6 +1742,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             material,
             hit_ctx,
             workspace: self.workspace,
+            math_semantics: self.math_semantics,
             alpha_linked_images,
             links: None,
             group_input_binding: Some(&binding),
@@ -1672,6 +1760,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             .links
             .iter()
             .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket))
+    }
+    fn inputs_fold_to_primitives(&self, node_id: &Id) -> bool {
+        self.links.map_or_else(
+            || super::inline_fold::node_inputs_all_primitive(self.group, node_id),
+            |links| links.primitive_nodes.contains(node_id),
+        )
     }
     /// The effective lobe tangent: explicit Tangent link, or Cycles' implicit Geometry Tangent.
     fn anisotropic_tangent(&mut self, id: &Id, active: bool) -> Result<Option<DVec3>> {
@@ -1746,6 +1840,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             "ShaderNodeValue" => Ok(NodeKind::Value),
             "ShaderNodeRGB" => Ok(NodeKind::Rgb),
             "ShaderNodeCombineColor" => Ok(NodeKind::CombineColor),
+            "ShaderNodeMapRange" => Ok(NodeKind::MapRange),
+            "ShaderNodeClamp" => Ok(NodeKind::Clamp),
+            "ShaderNodeFloatCurve" => Ok(NodeKind::FloatCurve),
+            "ShaderNodeRGBCurve" => Ok(NodeKind::RgbCurve),
+            "ShaderNodeVectorCurve" => Ok(NodeKind::VectorCurve),
             "ShaderNodeSeparateColor" => Ok(NodeKind::SeparateColor),
             "ShaderNodeRGBToBW" => Ok(NodeKind::RgbToBw),
             "ShaderNodeInvert" => Ok(NodeKind::Invert),
@@ -1818,6 +1917,190 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             ));
         }
         Ok(default)
+    }
+    fn prepared_ramp(&mut self, id: &Id) -> Result<usize> {
+        let node = self
+            .group
+            .nodes
+            .get(id)
+            .ok_or_else(|| invalid(format!("shader graph references absent node `{id}`")))?;
+        let graph = std::ptr::from_ref(self.group) as usize;
+        let node_key = std::ptr::from_ref(node) as usize;
+        if let Some(index) = self.workspace.ramps.iter().position(|ramp| {
+            ramp.graph == graph && ramp.node == node_key && ramp.source == node.properties
+        }) {
+            return Ok(index);
+        }
+        let settings = match node.properties.get("color_ramp") {
+            Some(JsonValue::Object(settings)) => {
+                if let Some(field) = settings.keys().find(|field| {
+                    !matches!(
+                        field.as_str(),
+                        "color_mode" | "hue_interpolation" | "interpolation" | "elements"
+                    )
+                }) {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("ShaderNodeValToRGB.color_ramp.{field}"),
+                    ));
+                }
+                settings
+            }
+            Some(_) => {
+                return Err(unsupported_node(id, "ShaderNodeValToRGB.color_ramp.state"));
+            }
+            None => &node.properties,
+        };
+        let raw_elements = settings
+            .get("elements")
+            .or_else(|| node.properties.get("elements"));
+        let elements = if let Some(raw_elements) = raw_elements {
+            let raw_elements = raw_elements
+                .as_array()
+                .ok_or_else(|| unsupported_node(id, "ShaderNodeValToRGB.color_ramp.elements"))?;
+            if raw_elements.is_empty() {
+                return Err(invalid("ColorRamp requires at least one color element"));
+            }
+            let mut elements = Vec::with_capacity(raw_elements.len());
+            for raw in raw_elements {
+                let (position, color) = ramp_element(raw)?;
+                elements.push((position as f32, color.map(|component| component as f32)));
+            }
+            elements
+        } else if node.properties.contains_key("color_ramp") {
+            return Err(unsupported_node(id, "ShaderNodeValToRGB.color_ramp.state"));
+        } else {
+            let first = node
+                .properties
+                .get("color1")
+                .map_or([0.0, 0.0, 0.0, 1.0], |value| {
+                    color(value, [0.0, 0.0, 0.0, 1.0])
+                });
+            let second = node
+                .properties
+                .get("color2")
+                .map_or([1.0; 4], |value| color(value, [1.0; 4]));
+            vec![
+                (0.0, first.map(|component| component as f32)),
+                (1.0, second.map(|component| component as f32)),
+            ]
+        };
+        if elements.iter().any(|(position, color)| {
+            !position.is_finite() || color.iter().any(|component| !component.is_finite())
+        }) {
+            return Err(invalid("ColorRamp elements must contain finite f32 values"));
+        }
+        if elements.windows(2).any(|pair| pair[1].0 < pair[0].0) {
+            return Err(invalid("ColorRamp element positions must be ordered"));
+        }
+        let interpolation = node_setting_string(
+            id,
+            settings,
+            "interpolation",
+            "LINEAR",
+            "ShaderNodeValToRGB.ColorRamp",
+            RAMP_INTERPOLATIONS,
+        )?;
+        let color_mode = node_setting_string(
+            id,
+            settings,
+            "color_mode",
+            "RGB",
+            "ShaderNodeValToRGB.ColorRamp",
+            RAMP_COLOR_MODES,
+        )?;
+        let hue_interpolation = node_setting_string(
+            id,
+            settings,
+            "hue_interpolation",
+            "NEAR",
+            "ShaderNodeValToRGB.ColorRamp",
+            RAMP_HUE_INTERPOLATIONS,
+        )?;
+        let table = (0..crate::node_kernels::COLOR_RAMP_TABLE_SIZE)
+            .map(|index| {
+                crate::node_kernels::color_ramp(
+                    &elements,
+                    index as f32 / (crate::node_kernels::COLOR_RAMP_TABLE_SIZE - 1) as f32,
+                    interpolation,
+                    color_mode,
+                    hue_interpolation,
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| unsupported_node(id, "ShaderNodeValToRGB.color_ramp"))?;
+        let eevee_table = table
+            .iter()
+            .map(|color| {
+                std::array::from_fn(|channel| exr::prelude::f16::from_f32(color[channel]).to_f32())
+            })
+            .collect();
+        let ramp = PreparedNodeRamp {
+            graph,
+            node: node_key,
+            source: node.properties.clone(),
+            elements,
+            table,
+            eevee_table,
+            interpolation,
+            color_mode,
+        };
+        if let Some(index) = self
+            .workspace
+            .ramps
+            .iter()
+            .position(|cached| cached.graph == graph && cached.node == node_key)
+        {
+            self.workspace.ramps[index] = ramp;
+            Ok(index)
+        } else {
+            let index = self.workspace.ramps.len();
+            self.workspace.ramps.push(ramp);
+            Ok(index)
+        }
+    }
+    fn prepared_curve(&mut self, id: &Id) -> Result<usize> {
+        let node = self
+            .group
+            .nodes
+            .get(id)
+            .ok_or_else(|| invalid(format!("shader graph references absent node `{id}`")))?;
+        let graph = std::ptr::from_ref(self.group) as usize;
+        let node_key = std::ptr::from_ref(node) as usize;
+        let source = node.properties.get("mapping");
+        if let Some(index) = self.workspace.curve_mappings.iter().position(|curve| {
+            curve.graph == graph && curve.node == node_key && curve.source.as_ref() == source
+        }) {
+            return Ok(index);
+        }
+        let mapping = match source {
+            Some(value) => {
+                crate::node_kernels::curve_mapping_from_value(value).ok_or_else(|| {
+                    unsupported_node(id, &format!("{}.mapping.CurveMapping", node.node_type))
+                })?
+            }
+            None => crate::color::curve::CurveMapping::default(),
+        };
+        let prepared = crate::node_kernels::curve_mapping_prepare(&mapping);
+        let curve = PreparedNodeCurve {
+            graph,
+            node: node_key,
+            source: source.cloned(),
+            prepared,
+        };
+        if let Some(index) = self
+            .workspace
+            .curve_mappings
+            .iter()
+            .position(|cached| cached.graph == graph && cached.node == node_key)
+        {
+            self.workspace.curve_mappings[index] = curve;
+            Ok(index)
+        } else {
+            let index = self.workspace.curve_mappings.len();
+            self.workspace.curve_mappings.push(curve);
+            Ok(index)
+        }
     }
 
     /// Whether the Alpha output of the Image Texture `id` reaches the group's output (see [`PreparedMaterial`]).
@@ -1900,6 +2183,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             NodeKind::VectorMath => self.vector_math(node_id, socket),
             NodeKind::VectorRotate => self.vector_rotate(node_id, socket),
             NodeKind::VectorTransform => self.vector_transform(node_id, socket),
+            NodeKind::MapRange => self.map_range(node_id, socket),
+            NodeKind::Clamp => self.clamp(node_id, socket),
+            NodeKind::FloatCurve => self.float_curve(node_id, socket),
+            NodeKind::RgbCurve => self.rgb_curve(node_id, socket),
+            NodeKind::VectorCurve => self.vector_curve(node_id, socket),
             NodeKind::Mapping => self.mapping(node_id, socket),
             NodeKind::SeparateXyz => self.separate_xyz(node_id, socket),
             NodeKind::CombineXyz => self.combine_xyz(node_id, socket),
@@ -2547,150 +2835,217 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     }
 
     fn color_ramp(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let factor = self.scalar_input(id, &["Fac"], 0.0)?.clamp(0.0, 1.0);
-        let node = self.node(id)?;
-        let result = if let Some(elements) = node
-            .properties
-            .get("elements")
-            .and_then(JsonValue::as_array)
-        {
-            if elements.len() < 2 {
-                return Err(invalid("ColorRamp requires at least two color elements"));
-            }
-            let interpolation = node
-                .properties
-                .get("interpolation")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("LINEAR");
-            let mut previous = ramp_element(&elements[0])?;
-            if factor <= previous.0 {
-                previous.1
-            } else {
-                let mut result = previous.1;
-                for raw in elements.iter().skip(1) {
-                    let next = ramp_element(raw)?;
-                    if next.0 < previous.0 {
-                        return Err(invalid("ColorRamp element positions must be ordered"));
-                    }
-                    if factor <= next.0 {
-                        let local_factor = if next.0 - previous.0 <= f64::EPSILON {
-                            1.0
-                        } else {
-                            ((factor - previous.0) / (next.0 - previous.0)).clamp(0.0, 1.0)
-                        };
-                        let local_factor = match interpolation {
-                            "LINEAR" => local_factor,
-                            "EASE" => local_factor * local_factor * (3.0 - 2.0 * local_factor),
-                            "CONSTANT" => 0.0,
-                            other => {
-                                return Err(unsupported_node(id, &format!("ColorRamp:{other}")));
-                            }
-                        };
-                        result = color_lerp(previous.1, next.1, local_factor);
-                        break;
-                    }
-                    previous = next;
-                    result = previous.1;
-                }
-                result
-            }
+        if !matches!(socket, "Color" | "Alpha") {
+            return Err(invalid(format!("unknown ColorRamp output `{socket}`")));
+        }
+        let factor = self.scalar_input(id, &["Fac"], 0.5)? as f32;
+        let index = self.prepared_ramp(id)?;
+        let ramp = &self.workspace.ramps[index];
+        let table = if self.math_semantics == crate::node_kernels::MathSemantics::Eevee {
+            &ramp.eevee_table
         } else {
-            let first = node
-                .properties
-                .get("color1")
-                .map_or([0.0, 0.0, 0.0, 1.0], |value| {
-                    color(value, [0.0, 0.0, 0.0, 1.0])
-                });
-            let second = node
-                .properties
-                .get("color2")
-                .map_or([1.0; 4], |value| color(value, [1.0; 4]));
-            color_lerp(first, second, factor)
+            &ramp.table
         };
+        let result = crate::node_kernels::shader_color_ramp(
+            &ramp.elements,
+            table,
+            factor,
+            ramp.interpolation,
+            ramp.color_mode,
+            self.math_semantics,
+        )
+        .ok_or_else(|| unsupported_node(id, "ShaderNodeValToRGB.color_ramp"))?;
+        if result.iter().any(|component| !component.is_finite()) {
+            return Err(eval_error(format!(
+                "Color Ramp node `{id}` produced a non-finite result"
+            )));
+        }
+        let result = result.map(f64::from);
         match socket {
             "Color" => Ok(Value::Color(result)),
             "Alpha" => Ok(Value::Scalar(result[3])),
-            _ => Err(invalid(format!("unknown ColorRamp output `{socket}`"))),
+            _ => unreachable!(),
         }
     }
 
-    /// `ShaderNodeMix` (RGBA, Blender 4.x and later) and the legacy `ShaderNodeMixRGB`.
+    /// `ShaderNodeMix` and the legacy `ShaderNodeMixRGB`.
     fn mix_rgb(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        #[derive(Clone, Copy)]
-        enum Blend {
-            Mix,
-            Add,
-            Multiply,
-            Subtract,
-            Divide,
-        }
-
-        enum BlendSelection {
-            Supported(Blend),
-            Unsupported(String),
-        }
-
-        let (generic, blend, label) = {
+        let (generic, data_type, blend, factor_mode, clamp_factor, clamp_result) = {
             let node = self.node(id)?;
             let generic = node.node_type == "ShaderNodeMix";
-            let label = if generic { "Mix" } else { "MixRGB" };
-            let data_type = node
-                .properties
-                .get("data_type")
-                .and_then(JsonValue::as_str)
-                .unwrap_or(if generic { "FLOAT" } else { "RGBA" });
-            if data_type != "RGBA" {
-                return Err(unsupported_node(id, &format!("Mix:{data_type}")));
-            }
-            let blend = match node
-                .properties
-                .get("blend_type")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("MIX")
-            {
-                "MIX" => BlendSelection::Supported(Blend::Mix),
-                "ADD" => BlendSelection::Supported(Blend::Add),
-                "MULTIPLY" => BlendSelection::Supported(Blend::Multiply),
-                "SUBTRACT" => BlendSelection::Supported(Blend::Subtract),
-                "DIVIDE" => BlendSelection::Supported(Blend::Divide),
-                other => BlendSelection::Unsupported(other.to_owned()),
+            let data_type = if generic {
+                node_setting_string(
+                    id,
+                    &node.properties,
+                    "data_type",
+                    "FLOAT",
+                    "ShaderNodeMix",
+                    MIX_DATA_TYPES,
+                )?
+            } else {
+                "RGBA"
             };
-            (generic, blend, label)
+            let blend = if !generic || data_type == "RGBA" {
+                node_setting_string(
+                    id,
+                    &node.properties,
+                    "blend_type",
+                    "MIX",
+                    if generic {
+                        "ShaderNodeMix"
+                    } else {
+                        "ShaderNodeMixRGB"
+                    },
+                    MIX_BLEND_TYPES,
+                )?
+            } else {
+                "MIX"
+            };
+            let factor_mode = if generic && data_type == "VECTOR" {
+                node_setting_string(
+                    id,
+                    &node.properties,
+                    "factor_mode",
+                    "UNIFORM",
+                    "ShaderNodeMix",
+                    MIX_FACTOR_MODES,
+                )?
+            } else {
+                "UNIFORM"
+            };
+            let clamp_factor = if generic {
+                node_setting_bool(id, &node.properties, "clamp_factor", true, "ShaderNodeMix")?
+            } else {
+                true
+            };
+            let clamp_result = if generic {
+                node_setting_bool(id, &node.properties, "clamp_result", false, "ShaderNodeMix")?
+            } else {
+                node_setting_bool(id, &node.properties, "use_clamp", false, "ShaderNodeMixRGB")?
+            };
+            (
+                generic,
+                data_type,
+                blend,
+                factor_mode,
+                clamp_factor,
+                clamp_result,
+            )
         };
-        // The generic node names its sockets by type; the legacy node uses plain names.
-        let (factor_socket, first_socket, second_socket, result_socket) = if generic {
-            ("Factor_Float", "A_Color", "B_Color", "Result_Color")
-        } else {
-            ("Fac", "Color1", "Color2", "Color")
+        let (factor_socket, first_socket, second_socket, result_socket) = match (generic, data_type)
+        {
+            (false, _) => ("Fac", "Color1", "Color2", "Color"),
+            (true, "FLOAT") => ("Factor_Float", "A_Float", "B_Float", "Result_Float"),
+            (true, "VECTOR") => ("Factor_Float", "A_Vector", "B_Vector", "Result_Vector"),
+            (true, "RGBA") => ("Factor_Float", "A_Color", "B_Color", "Result_Color"),
+            _ => unreachable!(),
         };
-        let factor = self
-            .scalar_input(id, &[factor_socket], 0.5)?
-            .clamp(0.0, 1.0);
-        let first = self.color_input(id, &[first_socket], [0.5, 0.5, 0.5, 1.0])?;
-        let second = self.color_input(id, &[second_socket], [0.5, 0.5, 0.5, 1.0])?;
-        let blend = match blend {
-            BlendSelection::Supported(blend) => blend,
-            BlendSelection::Unsupported(other) => {
-                return Err(unsupported_node(id, &format!("{label}:{other}")));
+        if socket != result_socket {
+            return Err(invalid(format!("unknown Mix output `{socket}`")));
+        }
+        let factor_default = if generic { 1.0 } else { 0.5 };
+        let result = match data_type {
+            "FLOAT" => {
+                let factor = self.scalar_input(id, &[factor_socket], factor_default)? as f32;
+                let first = self.scalar_input(id, &[first_socket], 0.0)? as f32;
+                let second = self.scalar_input(id, &[second_socket], 0.0)? as f32;
+                let result = crate::node_kernels::mix_float(
+                    "MIX",
+                    factor,
+                    first,
+                    second,
+                    clamp_factor,
+                    clamp_result,
+                )
+                .ok_or_else(|| unsupported_node(id, "ShaderNodeMix.data_type.FLOAT"))?;
+                if !result.is_finite() {
+                    return Err(eval_error(format!(
+                        "Mix node `{id}` produced a non-finite result"
+                    )));
+                }
+                Value::Scalar(f64::from(result))
             }
+            "VECTOR" => {
+                let factor = match factor_mode {
+                    "UNIFORM" => {
+                        let factor =
+                            self.scalar_input(id, &["Factor_Float"], factor_default)? as f32;
+                        [factor; 3]
+                    }
+                    "NON_UNIFORM" => self
+                        .vector_input(id, &["Factor_Vector"], DVec3::splat(0.5))?
+                        .to_array()
+                        .map(|component| component as f32),
+                    other => {
+                        return Err(unsupported_node(
+                            id,
+                            &format!("ShaderNodeMix.factor_mode.{other}"),
+                        ));
+                    }
+                };
+                let first = self
+                    .vector_input(id, &[first_socket], DVec3::ZERO)?
+                    .to_array()
+                    .map(|component| component as f32);
+                let second = self
+                    .vector_input(id, &[second_socket], DVec3::ZERO)?
+                    .to_array()
+                    .map(|component| component as f32);
+                let result = crate::node_kernels::mix_vector(
+                    "MIX",
+                    factor,
+                    first,
+                    second,
+                    clamp_factor,
+                    clamp_result,
+                )
+                .ok_or_else(|| unsupported_node(id, "ShaderNodeMix.data_type.VECTOR"))?;
+                if result.iter().any(|component| !component.is_finite()) {
+                    return Err(eval_error(format!(
+                        "Mix node `{id}` produced a non-finite result"
+                    )));
+                }
+                Value::Vector(DVec3::from_array(result.map(f64::from)))
+            }
+            "RGBA" => {
+                let factor = self.scalar_input(id, &[factor_socket], factor_default)? as f32;
+                let first = self
+                    .color_input(id, &[first_socket], [0.5, 0.5, 0.5, 1.0])?
+                    .map(|component| component as f32);
+                let second = self
+                    .color_input(id, &[second_socket], [0.5, 0.5, 0.5, 1.0])?
+                    .map(|component| component as f32);
+                let result = crate::node_kernels::mix_color(
+                    blend,
+                    factor,
+                    first,
+                    second,
+                    clamp_factor || !generic,
+                    clamp_result,
+                )
+                .ok_or_else(|| {
+                    unsupported_node(
+                        id,
+                        &format!(
+                            "{}.blend_type.{blend}",
+                            if generic {
+                                "ShaderNodeMix"
+                            } else {
+                                "ShaderNodeMixRGB"
+                            }
+                        ),
+                    )
+                })?;
+                if result.iter().any(|component| !component.is_finite()) {
+                    return Err(eval_error(format!(
+                        "Mix node `{id}` produced a non-finite result"
+                    )));
+                }
+                Value::Color(result.map(f64::from))
+            }
+            _ => unreachable!(),
         };
-        let blended = match blend {
-            Blend::Mix => second,
-            Blend::Add => color_binary(first, second, |a, b| a + b),
-            Blend::Multiply => color_binary(first, second, |a, b| a * b),
-            Blend::Subtract => color_binary(first, second, |a, b| a - b),
-            Blend::Divide => color_binary(first, second, |a, b| {
-                if b.abs() <= f64::EPSILON { a } else { a / b }
-            }),
-        };
-        let result = color_lerp(first, blended, factor);
-        if socket == result_socket {
-            return Ok(Value::Color(result));
-        }
-        match socket {
-            "Alpha" if !generic => Ok(Value::Scalar(result[3])),
-            _ => Err(invalid(format!("unknown {label} output `{socket}`"))),
-        }
+        Ok(result)
     }
     /// `ShaderNodeSeparateXYZ`: one component of its vector input as a scalar.
     fn separate_xyz(&mut self, id: &Id, socket: &str) -> Result<Value> {
@@ -3105,113 +3460,411 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     }
 
     fn math(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let first = self.scalar_input(id, &["Value", "Value_001"], 0.0)?;
-        let second = self.scalar_input(id, &["Value_001", "Value_002"], 0.0)?;
-        let third = self.scalar_input(id, &["Value_002", "Value_003"], 0.0)?;
-        let operation = self
-            .node(id)?
-            .properties
-            .get("operation")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("ADD");
-        let result = match operation {
-            "ADD" => first + second,
-            "SUBTRACT" => first - second,
-            "MULTIPLY" => first * second,
-            "DIVIDE" => {
-                if crate::float::equal_f64(second, 0.0) {
-                    0.0
-                } else {
-                    first / second
+        if socket != "Value" {
+            return Err(invalid(format!("unknown Math output `{socket}`")));
+        }
+        let operation = {
+            let node = self.node(id)?;
+            node_setting_string(
+                id,
+                &node.properties,
+                "operation",
+                "ADD",
+                "ShaderNodeMath",
+                SHADER_MATH_OPERATIONS,
+            )?
+        };
+        let (default_a, default_b, default_c) = math_input_defaults(operation);
+        let first = self.scalar_input(id, &["Value"], default_a)? as f32;
+        let second = self.scalar_input(id, &["Value_001"], default_b)? as f32;
+        let third = self.scalar_input(id, &["Value_002"], default_c)? as f32;
+        let clamp = {
+            let node = self.node(id)?;
+            node_setting_bool(id, &node.properties, "use_clamp", false, "ShaderNodeMath")?
+        };
+        let math_semantics = if self.inputs_fold_to_primitives(id) {
+            crate::node_kernels::MathSemantics::Geometry
+        } else {
+            self.math_semantics
+        };
+        if math_semantics == crate::node_kernels::MathSemantics::Geometry
+            && operation == "POWER"
+            && first == 0.0
+            && second < 0.0
+            && !clamp
+        {
+            return Err(unsupported_node(
+                id,
+                "ShaderNodeMath.operation.POWER.non_finite_constant_fold",
+            ));
+        }
+        if math_semantics == crate::node_kernels::MathSemantics::Eevee {
+            let undefined = match operation {
+                "INV_SQRT" if first <= 0.0 => {
+                    Some("ShaderNodeMath.operation.INV_SQRT.glsl_undefined_domain")
                 }
-            }
-            "MULTIPLY_ADD" => first * second + third,
-            "POWER" if first >= 0.0 || second.fract() == 0.0 => first.powf(second),
-            "POWER" => 0.0,
-            "SINE" => first.sin(),
-            "COSINE" => first.cos(),
-            "TANGENT" => first.tan(),
-            "SQRT" => first.max(0.0).sqrt(),
-            "ABSOLUTE" => first.abs(),
-            // Cycles' `NODE_MATH_FRACTION` (`intern/cycles/kernel/svm/math_util.h`): `a - floorf(a)`.
-            "FRACT" => first - first.floor(),
-            "MINIMUM" => first.min(second),
-            "MAXIMUM" => first.max(second),
-            "LESS_THAN" => f64::from(first < second),
-            "GREATER_THAN" => f64::from(first > second),
-            "COMPARE" => {
-                let epsilon = self.scalar_input(id, &["Value_002", "Value_003"], 0.001)?;
-                f64::from((first - second).abs() <= epsilon.max(0.0))
-            }
-            "WRAP" => {
-                // Blender's `wrapf(value, max, min)`: the second input is the maximum and the third the minimum.
-                let range = second - third;
-                if crate::float::equal_f64(range, 0.0) {
-                    third
-                } else {
-                    first - range * ((first - third) / range).floor()
+                "INVERSE_SQRT" if first <= 0.0 => {
+                    Some("ShaderNodeMath.operation.INVERSE_SQRT.glsl_undefined_domain")
                 }
+                "LOGARITHM" if first > 0.0 && second.total_cmp(&1.0).is_eq() => {
+                    Some("ShaderNodeMath.operation.LOGARITHM.glsl_undefined_domain")
+                }
+                _ => None,
+            };
+            if let Some(kind) = undefined {
+                return Err(unsupported_node(id, kind));
             }
-            "PINGPONG" => {
-                // Blender's `pingpongf(value, scale)` (`math_base_inline.cc`): a zero scale gives 0, and otherwise the
-                // triangle wave of the signed scale, `|fract((value - scale) / (2 scale)) * 2 scale - scale|`.
-                let wave = if crate::float::equal_f64(second, 0.0) {
-                    0.0
-                } else {
-                    let period = second * 2.0;
-                    let ratio = (first - second) / period;
-                    (ratio - ratio.floor()) * period - second
-                };
-                wave.abs()
-            }
-            other => return Err(unsupported_node(id, &format!("Math:{other}"))),
+        }
+        let result = if math_semantics == crate::node_kernels::MathSemantics::Eevee
+            && operation == "MODULO"
+        {
+            eevee_modulo_result(first, second)
+                .map(|value| if clamp { value.clamp(0.0, 1.0) } else { value })
+                .ok_or_else(|| {
+                    unsupported_node(id, "ShaderNodeMath.operation.MODULO.quotient_out_of_range")
+                })?
+        } else {
+            crate::node_kernels::math(operation, first, second, third, clamp, math_semantics)
+                .ok_or_else(|| {
+                    unsupported_node(id, &format!("ShaderNodeMath.operation.{operation}"))
+                })?
         };
         if !result.is_finite() {
             return Err(eval_error(format!(
                 "Math node `{id}` produced a non-finite result"
             )));
         }
-        match socket {
-            "Value" => Ok(Value::Scalar(result)),
-            _ => Err(invalid(format!("unknown Math output `{socket}`"))),
+        Ok(Value::Scalar(f64::from(result)))
+    }
+    fn vector_math(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        let operation = {
+            let node = self.node(id)?;
+            node_setting_string(
+                id,
+                &node.properties,
+                "operation",
+                "ADD",
+                "ShaderNodeVectorMath",
+                VECTOR_MATH_OPERATIONS,
+            )?
+        };
+        let scalar_result = matches!(operation, "DOT_PRODUCT" | "DISTANCE" | "LENGTH");
+        let output = match socket {
+            "Value" if scalar_result => "Value",
+            "Vector" if !scalar_result => "Vector",
+            "Value" | "Vector" => {
+                return Err(invalid(format!(
+                    "Vector Math operation `{operation}` has no `{socket}` output"
+                )));
+            }
+            _ => return Err(invalid(format!("unknown Vector Math output `{socket}`"))),
+        };
+        let second_default = if matches!(
+            operation,
+            "MULTIPLY" | "DIVIDE" | "POWER" | "MODULO" | "MULTIPLY_ADD"
+        ) {
+            DVec3::ONE
+        } else {
+            DVec3::ZERO
+        };
+        let first = self
+            .vector_input(id, &["Vector"], DVec3::ZERO)?
+            .to_array()
+            .map(|component| component as f32);
+        let second = self
+            .vector_input(id, &["Vector_001"], second_default)?
+            .to_array()
+            .map(|component| component as f32);
+        let third = self
+            .vector_input(id, &["Vector_002"], DVec3::ZERO)?
+            .to_array()
+            .map(|component| component as f32);
+        let scale = self.scalar_input(id, &["Scale"], 1.0)? as f32;
+        let math_semantics = if self.inputs_fold_to_primitives(id) {
+            crate::node_kernels::MathSemantics::Geometry
+        } else {
+            self.math_semantics
+        };
+        let result = match (math_semantics, operation) {
+            (crate::node_kernels::MathSemantics::Eevee, "MODULO") => {
+                let mut value = [0.0; 3];
+                for index in 0..3 {
+                    let Some(result) = eevee_modulo_result(first[index], second[index]) else {
+                        return Err(unsupported_node(
+                            id,
+                            "ShaderNodeVectorMath.operation.MODULO.quotient_out_of_range",
+                        ));
+                    };
+                    value[index] = result;
+                }
+                crate::node_kernels::KernelValue::Vector(value)
+            }
+            (crate::node_kernels::MathSemantics::Eevee, "NORMALIZE") => {
+                crate::node_kernels::KernelValue::Vector(
+                    crate::node_kernels::eevee_normalize(first).ok_or_else(|| {
+                        unsupported_node(
+                            id,
+                            "ShaderNodeVectorMath.operation.NORMALIZE.subnormal_input",
+                        )
+                    })?,
+                )
+            }
+            _ => crate::node_kernels::vector_math(
+                operation,
+                output,
+                first,
+                second,
+                third,
+                scale,
+                math_semantics,
+            )
+            .ok_or_else(|| {
+                unsupported_node(id, &format!("ShaderNodeVectorMath.operation.{operation}"))
+            })?,
+        };
+        match result {
+            crate::node_kernels::KernelValue::Scalar(value) if value.is_finite() => {
+                Ok(Value::Scalar(f64::from(value)))
+            }
+            crate::node_kernels::KernelValue::Vector(value)
+                if value.iter().all(|component| component.is_finite()) =>
+            {
+                Ok(Value::Vector(DVec3::from_array(value.map(f64::from))))
+            }
+            _ => Err(eval_error(format!(
+                "Vector Math node `{id}` produced a non-finite result"
+            ))),
+        }
+    }
+    fn map_range(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        let (data_type, interpolation, clamp) = {
+            let node = self.node(id)?;
+            (
+                node_setting_string(
+                    id,
+                    &node.properties,
+                    "data_type",
+                    "FLOAT",
+                    "ShaderNodeMapRange",
+                    MAP_RANGE_DATA_TYPES,
+                )?,
+                node_setting_string(
+                    id,
+                    &node.properties,
+                    "interpolation_type",
+                    "LINEAR",
+                    "ShaderNodeMapRange",
+                    MAP_RANGE_INTERPOLATIONS,
+                )?,
+                node_setting_bool(id, &node.properties, "clamp", true, "ShaderNodeMapRange")?,
+            )
+        };
+        let vector = match data_type {
+            "FLOAT" => false,
+            "FLOAT_VECTOR" => true,
+            _ => unreachable!(),
+        };
+        let result_socket = if vector { "Vector" } else { "Result" };
+        if socket != result_socket {
+            return Err(invalid(format!(
+                "unknown Map Range output `{socket}` for {data_type}"
+            )));
+        }
+        let (value, from_min, from_max, to_min, to_max, steps) = if vector {
+            let value = self
+                .vector_input(id, &["Vector"], DVec3::ZERO)?
+                .to_array()
+                .map(|component| component as f32);
+            let from_min = self
+                .vector_input(id, &["From_Min_FLOAT3"], DVec3::ZERO)?
+                .to_array()
+                .map(|component| component as f32);
+            let from_max = self
+                .vector_input(id, &["From_Max_FLOAT3"], DVec3::ONE)?
+                .to_array()
+                .map(|component| component as f32);
+            let to_min = self
+                .vector_input(id, &["To_Min_FLOAT3"], DVec3::ZERO)?
+                .to_array()
+                .map(|component| component as f32);
+            let to_max = self
+                .vector_input(id, &["To_Max_FLOAT3"], DVec3::ONE)?
+                .to_array()
+                .map(|component| component as f32);
+            let steps = self
+                .vector_input(id, &["Steps_FLOAT3"], DVec3::splat(4.0))?
+                .to_array()
+                .map(|component| component as f32);
+            (
+                crate::node_kernels::KernelValue::Vector(value),
+                crate::node_kernels::KernelValue::Vector(from_min),
+                crate::node_kernels::KernelValue::Vector(from_max),
+                crate::node_kernels::KernelValue::Vector(to_min),
+                crate::node_kernels::KernelValue::Vector(to_max),
+                crate::node_kernels::KernelValue::Vector(steps),
+            )
+        } else {
+            (
+                crate::node_kernels::KernelValue::Scalar(
+                    self.scalar_input(id, &["Value"], 1.0)? as f32
+                ),
+                crate::node_kernels::KernelValue::Scalar(self.scalar_input(
+                    id,
+                    &["From Min"],
+                    0.0,
+                )? as f32),
+                crate::node_kernels::KernelValue::Scalar(self.scalar_input(
+                    id,
+                    &["From Max"],
+                    1.0,
+                )? as f32),
+                crate::node_kernels::KernelValue::Scalar(
+                    self.scalar_input(id, &["To Min"], 0.0)? as f32
+                ),
+                crate::node_kernels::KernelValue::Scalar(
+                    self.scalar_input(id, &["To Max"], 1.0)? as f32
+                ),
+                crate::node_kernels::KernelValue::Scalar(
+                    self.scalar_input(id, &["Steps"], 4.0)? as f32
+                ),
+            )
+        };
+        let math_semantics = if self.inputs_fold_to_primitives(id) {
+            crate::node_kernels::MathSemantics::Geometry
+        } else {
+            self.math_semantics
+        };
+        let result = crate::node_kernels::shader_map_range(
+            value,
+            from_min,
+            from_max,
+            to_min,
+            to_max,
+            steps,
+            interpolation,
+            clamp,
+            math_semantics,
+        )
+        .ok_or_else(|| unsupported_node(id, "ShaderNodeMapRange"))?;
+        match result {
+            crate::node_kernels::KernelValue::Scalar(value) if !vector && value.is_finite() => {
+                Ok(Value::Scalar(f64::from(value)))
+            }
+            crate::node_kernels::KernelValue::Vector(value)
+                if vector && value.iter().all(|component| component.is_finite()) =>
+            {
+                Ok(Value::Vector(DVec3::from_array(value.map(f64::from))))
+            }
+            _ => Err(eval_error(format!(
+                "Map Range node `{id}` produced an invalid result"
+            ))),
         }
     }
 
-    fn vector_math(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let first = self.vector_input(id, &["Vector", "Vector_001"], DVec3::ZERO)?;
-        let second = self.vector_input(id, &["Vector_001", "Vector_002"], DVec3::ZERO)?;
-        let operation = self
-            .node(id)?
-            .properties
-            .get("operation")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("ADD");
-        let (vector, scalar) = match operation {
-            "ADD" => (first + second, None),
-            "SUBTRACT" => (first - second, None),
-            "MULTIPLY" => (first * second, None),
-            "CROSS_PRODUCT" => (first.cross(second), None),
-            "DOT_PRODUCT" => (DVec3::ZERO, Some(first.dot(second))),
-            "LENGTH" => (DVec3::ZERO, Some(first.length())),
-            "DISTANCE" => (DVec3::ZERO, Some(first.distance(second))),
-            "NORMALIZE" => (normalize_or(first, DVec3::ZERO), None),
-            "SCALE" => (first * self.scalar_input(id, &["Scale"], 1.0)?, None),
-            other => return Err(unsupported_node(id, &format!("VectorMath:{other}"))),
+    fn clamp(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Result" {
+            return Err(invalid(format!("unknown Clamp output `{socket}`")));
+        }
+        let mode = {
+            let node = self.node(id)?;
+            node_setting_string(
+                id,
+                &node.properties,
+                "clamp_type",
+                "MINMAX",
+                "ShaderNodeClamp",
+                CLAMP_TYPES,
+            )?
         };
-        if !vector.is_finite() || scalar.is_some_and(|value| !value.is_finite()) {
+        let value = self.scalar_input(id, &["Value"], 1.0)? as f32;
+        let minimum = self.scalar_input(id, &["Min"], 0.0)? as f32;
+        let maximum = self.scalar_input(id, &["Max"], 1.0)? as f32;
+        let result = crate::node_kernels::clamp(
+            crate::node_kernels::KernelValue::Scalar(value),
+            crate::node_kernels::KernelValue::Scalar(minimum),
+            crate::node_kernels::KernelValue::Scalar(maximum),
+            mode,
+        )
+        .ok_or_else(|| unsupported_node(id, &format!("ShaderNodeClamp.clamp_type.{mode}")))?;
+        match result {
+            crate::node_kernels::KernelValue::Scalar(value) if value.is_finite() => {
+                Ok(Value::Scalar(f64::from(value)))
+            }
+            _ => Err(eval_error(format!(
+                "Clamp node `{id}` produced a non-finite result"
+            ))),
+        }
+    }
+
+    fn float_curve(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Value" {
+            return Err(invalid(format!("unknown Float Curve output `{socket}`")));
+        }
+        let factor = self.scalar_input(id, &["Factor"], 1.0)? as f32;
+        let input = self.scalar_input(id, &["Value"], 1.0)? as f32;
+        let index = self.prepared_curve(id)?;
+        let curve = &self.workspace.curve_mappings[index];
+        let mapped = crate::node_kernels::shader_curve_mapping_value(&curve.prepared, 0, input)
+            .ok_or_else(|| unsupported_node(id, "ShaderNodeFloatCurve.mapping.curves"))?;
+        let result = crate::node_kernels::mix_float("MIX", factor, input, mapped, false, false)
+            .ok_or_else(|| unsupported_node(id, "ShaderNodeFloatCurve.mapping"))?;
+        if !result.is_finite() {
             return Err(eval_error(format!(
-                "Vector Math node `{id}` produced a non-finite result"
+                "Float Curve node `{id}` produced a non-finite result"
             )));
         }
-        if socket == "Value" {
-            scalar
-                .map(Value::Scalar)
-                .ok_or_else(|| invalid("Vector Math node has no scalar result"))
-        } else if socket == "Vector" {
-            Ok(Value::Vector(vector))
-        } else {
-            Err(invalid(format!("unknown Vector Math output `{socket}`")))
+        Ok(Value::Scalar(f64::from(result)))
+    }
+
+    fn rgb_curve(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!("unknown RGB Curve output `{socket}`")));
         }
+        let factor = self.scalar_input(id, &["Fac"], 1.0)? as f32;
+        let input = self
+            .color_input(id, &["Color"], [1.0; 4])?
+            .map(|component| component as f32);
+        let index = self.prepared_curve(id)?;
+        let curve = &self.workspace.curve_mappings[index];
+        let mapped =
+            crate::node_kernels::curve_mapping_rgb(&curve.prepared, [input[0], input[1], input[2]]);
+        let result = crate::node_kernels::mix_color(
+            "MIX",
+            factor,
+            [input[0], input[1], input[2], 1.0],
+            [mapped[0], mapped[1], mapped[2], 1.0],
+            false,
+            false,
+        )
+        .ok_or_else(|| unsupported_node(id, "ShaderNodeRGBCurve.mapping"))?;
+        if result.iter().any(|component| !component.is_finite()) {
+            return Err(eval_error(format!(
+                "RGB Curve node `{id}` produced a non-finite result"
+            )));
+        }
+        Ok(Value::Color(result.map(f64::from)))
+    }
+    fn vector_curve(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Vector" {
+            return Err(invalid(format!("unknown Vector Curve output `{socket}`")));
+        }
+        let factor = self.scalar_input(id, &["Fac"], 1.0)? as f32;
+        let input = self
+            .vector_input(id, &["Vector"], DVec3::ZERO)?
+            .to_array()
+            .map(|component| component as f32);
+        let index = self.prepared_curve(id)?;
+        let curve = &self.workspace.curve_mappings[index];
+        let mapped = crate::node_kernels::curve_mapping_vector(&curve.prepared, input);
+        let result =
+            crate::node_kernels::mix_vector("MIX", [factor; 3], input, mapped, false, false)
+                .ok_or_else(|| unsupported_node(id, "ShaderNodeVectorCurve.mapping"))?;
+        if result.iter().any(|component| !component.is_finite()) {
+            return Err(eval_error(format!(
+                "Vector Curve node `{id}` produced a non-finite result"
+            )));
+        }
+        Ok(Value::Vector(DVec3::from_array(result.map(f64::from))))
     }
     /// Blender 5.2.2 `node_shader_vector_rotate.cc`: rotate about the center; invert reverses
     /// the axis-angle direction or inverts the Euler rotation matrix.
@@ -4507,6 +5160,174 @@ fn color(value: &JsonValue, default: [f64; 4]) -> [f64; 4] {
     }
 }
 
+const SHADER_MATH_OPERATIONS: &[&str] = &[
+    "ADD",
+    "SUBTRACT",
+    "MULTIPLY",
+    "DIVIDE",
+    "SINE",
+    "COSINE",
+    "TANGENT",
+    "ARCSINE",
+    "ARCCOSINE",
+    "ARCTANGENT",
+    "POWER",
+    "LOGARITHM",
+    "MINIMUM",
+    "MAXIMUM",
+    "ROUND",
+    "LESS_THAN",
+    "GREATER_THAN",
+    "MODULO",
+    "FLOORED_MODULO",
+    "ABSOLUTE",
+    "ARCTAN2",
+    "FLOOR",
+    "CEIL",
+    "FRACTION",
+    "FRACT",
+    "SQRT",
+    "INV_SQRT",
+    "INVERSE_SQRT",
+    "SIGN",
+    "EXPONENT",
+    "RADIANS",
+    "DEGREES",
+    "SINH",
+    "COSH",
+    "TANH",
+    "TRUNC",
+    "SNAP",
+    "WRAP",
+    "COMPARE",
+    "MULTIPLY_ADD",
+    "PINGPONG",
+    "SMOOTH_MIN",
+    "SMOOTH_MAX",
+];
+const VECTOR_MATH_OPERATIONS: &[&str] = &[
+    "ADD",
+    "SUBTRACT",
+    "MULTIPLY",
+    "DIVIDE",
+    "CROSS_PRODUCT",
+    "PROJECT",
+    "REFLECT",
+    "DOT_PRODUCT",
+    "DISTANCE",
+    "LENGTH",
+    "SCALE",
+    "NORMALIZE",
+    "SNAP",
+    "ROUND",
+    "FLOOR",
+    "CEIL",
+    "MODULO",
+    "FRACTION",
+    "ABSOLUTE",
+    "MINIMUM",
+    "MAXIMUM",
+    "WRAP",
+    "SINE",
+    "COSINE",
+    "TANGENT",
+    "REFRACT",
+    "FACEFORWARD",
+    "MULTIPLY_ADD",
+    "POWER",
+    "SIGN",
+];
+const MIX_DATA_TYPES: &[&str] = &["FLOAT", "VECTOR", "RGBA"];
+const MIX_BLEND_TYPES: &[&str] = &[
+    "MIX",
+    "ADD",
+    "MULTIPLY",
+    "SUBTRACT",
+    "SCREEN",
+    "DIVIDE",
+    "DIFFERENCE",
+    "DARKEN",
+    "LIGHTEN",
+    "OVERLAY",
+    "DODGE",
+    "BURN",
+    "HUE",
+    "SATURATION",
+    "VALUE",
+    "COLOR",
+    "SOFT_LIGHT",
+    "LINEAR_LIGHT",
+    "EXCLUSION",
+];
+const MIX_FACTOR_MODES: &[&str] = &["UNIFORM", "NON_UNIFORM"];
+const RAMP_INTERPOLATIONS: &[&str] = &["LINEAR", "EASE", "CONSTANT", "CARDINAL", "B_SPLINE"];
+const RAMP_COLOR_MODES: &[&str] = &["RGB", "HSV", "HSL"];
+const RAMP_HUE_INTERPOLATIONS: &[&str] = &["NEAR", "FAR", "CW", "CCW"];
+const MAP_RANGE_DATA_TYPES: &[&str] = &["FLOAT", "FLOAT_VECTOR"];
+const MAP_RANGE_INTERPOLATIONS: &[&str] = &["LINEAR", "STEPPED", "SMOOTHSTEP", "SMOOTHERSTEP"];
+const CLAMP_TYPES: &[&str] = &["MINMAX", "RANGE"];
+
+fn node_setting_string(
+    id: &Id,
+    settings: &serde_json::Map<String, JsonValue>,
+    field: &str,
+    default: &'static str,
+    feature: &str,
+    supported: &[&'static str],
+) -> Result<&'static str> {
+    let value = match settings.get(field) {
+        None => return Ok(default),
+        Some(JsonValue::String(value)) => value.as_str(),
+        Some(_) => {
+            return Err(unsupported_node(id, &format!("{feature}.{field}.invalid")));
+        }
+    };
+    supported
+        .iter()
+        .copied()
+        .find(|option| *option == value)
+        .ok_or_else(|| unsupported_node(id, &format!("{feature}.{field}.{value}")))
+}
+
+fn node_setting_bool(
+    id: &Id,
+    settings: &serde_json::Map<String, JsonValue>,
+    field: &str,
+    default: bool,
+    feature: &str,
+) -> Result<bool> {
+    match settings.get(field) {
+        None => Ok(default),
+        Some(JsonValue::Bool(value)) => Ok(*value),
+        Some(_) => Err(unsupported_node(id, &format!("{feature}.{field}.invalid"))),
+    }
+}
+
+fn eevee_modulo_result(a: f32, b: f32) -> Option<f32> {
+    match crate::node_kernels::eevee_compatible_mod(a, b) {
+        Ok(value) => Some(value),
+        Err(crate::node_kernels::EeveeModuloError::PrecisionBoundary) => {
+            Some(a - (a / b) as i32 as f32 * b)
+        }
+        Err(crate::node_kernels::EeveeModuloError::QuotientOutOfRange) => None,
+    }
+}
+
+fn math_input_defaults(operation: &str) -> (f64, f64, f64) {
+    let second = match operation {
+        "ADD" | "SUBTRACT" => 0.0,
+        "MULTIPLY" | "DIVIDE" | "POWER" | "FLOORED_MODULO" | "MODULO" | "ARCTAN2"
+        | "MULTIPLY_ADD" => 1.0,
+        _ => 0.5,
+    };
+    let third = match operation {
+        "MULTIPLY_ADD" => 0.0,
+        "COMPARE" => 0.001,
+        _ => 0.5,
+    };
+    (0.5, second, third)
+}
+
 fn ramp_element(value: &JsonValue) -> Result<(f64, [f64; 4])> {
     let object = value
         .as_object()
@@ -4527,13 +5348,10 @@ fn ramp_element(value: &JsonValue) -> Result<(f64, [f64; 4])> {
     Ok((position, color))
 }
 
+#[cfg(test)]
 fn color_lerp(first: [f64; 4], second: [f64; 4], factor: f64) -> [f64; 4] {
     let factor = bounded_factor(factor);
     std::array::from_fn(|index| first[index] + (second[index] - first[index]) * factor)
-}
-
-fn color_binary(first: [f64; 4], second: [f64; 4], f: impl Fn(f64, f64) -> f64) -> [f64; 4] {
-    std::array::from_fn(|index| f(first[index], second[index]))
 }
 
 fn bounded_factor(value: f64) -> f64 {
@@ -5023,6 +5841,7 @@ mod tests {
             material: &material,
             hit_ctx: context,
             workspace: &mut workspace,
+            math_semantics: crate::node_kernels::MathSemantics::Cycles,
             alpha_linked_images: &alpha_linked_images,
             links: None,
             group_input_binding: None,
@@ -5054,6 +5873,7 @@ mod tests {
             hit_ctx: context,
             workspace: &mut workspace,
             alpha_linked_images: &alpha_linked_images,
+            math_semantics: crate::node_kernels::MathSemantics::Cycles,
             links: None,
             group_input_binding: None,
             group_depth: 0,
@@ -6114,7 +6934,12 @@ mod tests {
         .dominant()
         .unwrap();
         // Multiply: each channel of A times the interpolated vertex color B, at factor 1.
-        for (actual, expected) in params.base_color.iter().zip([0.1, 0.15, 0.4, 1.0]) {
+        for (actual, expected) in params.base_color.iter().zip([
+            f64::from(0.1_f32),
+            f64::from(0.15_f32),
+            f64::from(0.4_f32),
+            1.0,
+        ]) {
             assert!(
                 (actual - expected).abs() < 1e-12,
                 "base color {:?}",
@@ -6270,16 +7095,16 @@ mod tests {
         // `pingpongf(value, scale)` is the triangle wave of the signed scale (`math_base_inline.cc`).
         let cases = [
             // The importer's REPEAT wrap (max 0, min 1) maps the negative and the overflowing input into [0, 1].
-            ("WRAP", -0.3, 0.0, 1.0, 0.7),
-            ("WRAP", 1.3, 0.0, 1.0, 0.3),
-            ("WRAP", -0.3, 1.0, 0.0, 0.7),
-            ("WRAP", 0.4, 1.0, 0.0, 0.4),
+            ("WRAP", -0.3, 0.0, 1.0, f64::from(0.7_f32)),
+            ("WRAP", 1.3, 0.0, 1.0, f64::from(0.299_999_95_f32)),
+            ("WRAP", -0.3, 1.0, 0.0, f64::from(0.7_f32)),
+            ("WRAP", 0.4, 1.0, 0.0, f64::from(0.4_f32)),
             // A zero range returns the minimum.
             ("WRAP", 0.4, 0.0, 0.0, 0.0),
-            ("PINGPONG", -0.4, 1.0, 0.0, 0.4),
+            ("PINGPONG", -0.4, 1.0, 0.0, f64::from(0.399_999_98_f32)),
             ("PINGPONG", 2.5, 1.0, 0.0, 0.5),
             // The signed scale: a negative scale gives the same wave.
-            ("PINGPONG", -0.4, -1.0, 0.0, 0.4),
+            ("PINGPONG", -0.4, -1.0, 0.0, f64::from(0.399_999_98_f32)),
             // A zero scale returns zero.
             ("PINGPONG", 0.5, 0.0, 0.0, 0.0),
         ];
@@ -6745,6 +7570,7 @@ mod tests {
             material: &material,
             hit_ctx: *hit_ctx,
             workspace: &mut workspace,
+            math_semantics: crate::node_kernels::MathSemantics::Cycles,
             alpha_linked_images: &alpha_linked_images,
             links: None,
             group_input_binding: None,

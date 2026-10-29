@@ -6,8 +6,15 @@
 
 #[path = "common/blender_file.rs"]
 mod blender_file;
+#[path = "common/eevee_film.rs"]
+mod eevee_film;
+use eevee_film::assert_eevee_film_close;
 
-use std::process::Command;
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use potter_core::{
     error::ErrorCode,
@@ -16,7 +23,7 @@ use potter_core::{
     shader::{HitContext, evaluate_surface},
 };
 use serde_json::{Map, Value, json};
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 #[derive(Clone)]
 struct NodeCase {
@@ -26,6 +33,8 @@ struct NodeCase {
     inputs: Value,
     output: &'static str,
     data_type: &'static str,
+    clamp: bool,
+    value_input: Option<f64>,
 }
 
 impl NodeCase {
@@ -48,7 +57,17 @@ impl NodeCase {
             "inputs": input_values,
             "output": self.output,
             "data_type": self.data_type,
+            "clamp": self.clamp,
+            "value_input": self.value_input,
         })
+    }
+
+    fn properties(&self) -> Value {
+        if self.kind == "math" {
+            json!({"operation": self.operation, "use_clamp": self.clamp})
+        } else {
+            json!({"operation": self.operation})
+        }
     }
 }
 
@@ -64,6 +83,28 @@ fn math_case(id: &str, operation: &'static str, first: f64, second: f64, third: 
         }),
         output: "Value",
         data_type: "FLOAT",
+        clamp: false,
+        value_input: None,
+    }
+}
+
+fn clamped_math_case(
+    id: &str,
+    operation: &'static str,
+    first: f64,
+    second: f64,
+    third: f64,
+) -> NodeCase {
+    NodeCase {
+        clamp: true,
+        ..math_case(id, operation, first, second, third)
+    }
+}
+
+fn value_math_case() -> NodeCase {
+    NodeCase {
+        value_input: Some(1.5),
+        ..math_case("math_shader_value_fold_probe", "ARCSINE", 0.0, 0.0, 0.0)
     }
 }
 
@@ -92,12 +133,15 @@ fn vector_case(
         } else {
             "FLOAT_VECTOR"
         },
+        clamp: false,
+        value_input: None,
     }
 }
 
 fn math_cases() -> Vec<NodeCase> {
     let pi = std::f64::consts::PI;
     vec![
+        value_math_case(),
         math_case("math_add", "ADD", 3.25, 2.0, 0.0),
         math_case("math_subtract", "SUBTRACT", 3.25, 2.0, 0.0),
         math_case("math_multiply", "MULTIPLY", -2.5, 3.0, 0.0),
@@ -138,6 +182,7 @@ fn math_cases() -> Vec<NodeCase> {
         math_case("math_power_negative_even_exponent", "POWER", -2.0, 2.0, 0.0),
         math_case("math_power_zero_zero", "POWER", 0.0, 0.0, 0.0),
         math_case("math_power_zero_negative", "POWER", 0.0, -1.0, 0.0),
+        clamped_math_case("math_power_zero_negative_clamped", "POWER", 0.0, -1.0, 0.0),
         math_case("math_log_base_one", "LOGARITHM", 8.0, 1.0, 0.0),
         math_case("math_log_negative_base", "LOGARITHM", 8.0, -2.0, 0.0),
         math_case("math_asin_out_of_range", "ARCSINE", 2.0, 0.0, 0.0),
@@ -178,10 +223,55 @@ fn math_cases() -> Vec<NodeCase> {
         math_case("math_minimum_negative", "MINIMUM", -2.0, -3.0, 0.0),
         math_case("math_trunc_positive", "TRUNC", 2.7, 0.0, 0.0),
         math_case("math_ceil_positive", "CEIL", 2.1, 0.0, 0.0),
-        math_case("math_exponent_negative", "EXPONENT", -2.0, 0.0, 0.0),
         math_case("math_inverse_sqrt_zero", "INVERSE_SQRT", 0.0, 0.0, 0.0),
         math_case("math_divide_negative", "DIVIDE", -7.5, 2.5, 0.0),
         math_case("math_smooth_max", "SMOOTH_MAX", 0.25, 0.75, 1.0),
+        math_case(
+            "math_compare_zero_epsilon_small_difference",
+            "COMPARE",
+            0.0,
+            1.0e-8,
+            0.0,
+        ),
+        math_case(
+            "math_compare_equal_infinities",
+            "COMPARE",
+            3.5e38,
+            3.5e38,
+            0.0,
+        ),
+        math_case("eevee_math_arcsine_in_domain", "ARCSINE", 0.25, 0.0, 0.0),
+        math_case(
+            "eevee_math_arccosine_in_domain",
+            "ARCCOSINE",
+            0.25,
+            0.0,
+            0.0,
+        ),
+        math_case("eevee_math_compare_defined", "COMPARE", 0.0005, 0.0, 0.001),
+        math_case("eevee_math_power_integer", "POWER", -2.0, 2.0, 0.0),
+        math_case(
+            "eevee_math_modulo_safe_fractional",
+            "MODULO",
+            1.23,
+            0.1,
+            0.0,
+        ),
+        math_case(
+            "math_compare_sub_half_float_epsilon",
+            "COMPARE",
+            0.000_005,
+            0.0,
+            0.0,
+        ),
+        math_case(
+            "math_power_negative_near_integer",
+            "POWER",
+            -2.0,
+            2.0005,
+            0.0,
+        ),
+        math_case("math_modulo_precision_boundary", "MODULO", 1.0, 0.1, 0.0),
         math_case("math_smooth_min_zero_width", "SMOOTH_MIN", 0.25, 0.75, 0.0),
         math_case(
             "math_smooth_max_negative_width",
@@ -242,6 +332,24 @@ fn math_cases() -> Vec<NodeCase> {
         math_case("math_wrap_equal_bounds", "WRAP", 5.0, 2.0, 2.0),
         math_case("math_snap_zero_increment", "SNAP", 5.0, 0.0, 0.0),
         math_case("math_pingpong_zero_scale", "PINGPONG", 5.0, 0.0, 0.0),
+        math_case("math_exponent_overflow", "EXPONENT", 1000.0, 0.0, 0.0),
+        clamped_math_case("math_clamp_above_one", "ADD", 0.75, 0.5, 0.0),
+        clamped_math_case("math_clamp_below_zero", "SUBTRACT", 0.25, 0.5, 0.0),
+        clamped_math_case("math_clamp_multiply_add", "MULTIPLY_ADD", 0.75, 0.75, 0.75),
+        math_case(
+            "math_sign_positive_infinite_input",
+            "SIGN",
+            3.5e38,
+            0.0,
+            0.0,
+        ),
+        math_case(
+            "math_sign_negative_infinite_input",
+            "SIGN",
+            -3.5e38,
+            0.0,
+            0.0,
+        ),
     ]
 }
 
@@ -298,12 +406,57 @@ fn vector_cases() -> Vec<NodeCase> {
             "Vector",
         ),
         vector_case(
+            "eevee_vector_sign_zero",
+            "SIGN",
+            [0.0, 2.0, 3.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            "Vector",
+        ),
+        vector_case(
+            "eevee_vector_power_negative_near_integer",
+            "POWER",
+            [-2.0, -2.0, -2.0],
+            [1.0005, 2.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            "Vector",
+        ),
+        vector_case(
+            "eevee_vector_power_negative_integer",
+            "POWER",
+            [-0.5, -0.5, -0.5],
+            [2.0, 2.0, 2.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            "Vector",
+        ),
+        vector_case(
+            "eevee_vector_refract_tiny_normal",
+            "REFRACT",
+            [1.0, 0.0, 0.0],
+            [1.0e-20, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            "Vector",
+        ),
+        vector_case(
             "vector_reflect",
             "REFLECT",
             first,
             second,
             third,
             1.5,
+            "Vector",
+        ),
+        vector_case(
+            "vector_refract_gn_incident_length",
+            "REFRACT",
+            [0.0, 0.0, 2.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            1.0,
             "Vector",
         ),
         vector_case(
@@ -680,6 +833,51 @@ fn vector_cases() -> Vec<NodeCase> {
             1.5,
             "Vector",
         ),
+        vector_case(
+            "vector_power_overflow",
+            "POWER",
+            [2.0, 2.0, 2.0],
+            [2.0, 200.0, 3.0],
+            third,
+            1.5,
+            "Vector",
+        ),
+        vector_case(
+            "vector_sign_infinite_inputs",
+            "SIGN",
+            [3.5e38, -3.5e38, 0.0],
+            [1.0, 1.0, 1.0],
+            third,
+            1.5,
+            "Vector",
+        ),
+        vector_case(
+            "eevee_vector_modulo_fractional_divisor",
+            "MODULO",
+            [1.0, 1.0, 1.0],
+            [0.1, 0.1, 0.1],
+            [0.0, 0.0, 0.0],
+            1.0,
+            "Vector",
+        ),
+        vector_case(
+            "eevee_vector_reflect_tiny_normal",
+            "REFLECT",
+            [1.0, 0.0, 0.0],
+            [1.0e-20, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            1.0,
+            "Vector",
+        ),
+        vector_case(
+            "eevee_vector_modulo_safe_fractional",
+            "MODULO",
+            [1.23, 0.7, 0.4],
+            [0.1, 0.2, 0.3],
+            [0.0, 0.0, 0.0],
+            1.0,
+            "Vector",
+        ),
     ]
 }
 
@@ -724,7 +922,7 @@ fn evaluate_geometry_case(case: &NodeCase) -> potter_core::error::Result<Value> 
             "ShaderNodeVectorMath"
         },
         case.inputs.clone(),
-        json!({"operation": case.operation}),
+        case.properties(),
     );
     add_node(
         &mut group,
@@ -760,29 +958,39 @@ fn evaluate_shader_case(case: &NodeCase) -> potter_core::error::Result<Value> {
         "operation",
         node_type,
         case.inputs.clone(),
-        json!({"operation": case.operation}),
+        case.properties(),
     );
+    if let Some(value) = case.value_input {
+        add_node(
+            &mut group,
+            "value",
+            "ShaderNodeValue",
+            json!({}),
+            json!({"potter_output_defaults": [{"identifier": "Value", "default": value}]}),
+        );
+        link(&mut group, "value", "Value", "operation", "Value");
+    }
     add_node(
         &mut group,
-        "principled",
-        "ShaderNodeBsdfPrincipled",
-        json!({}),
+        "emission",
+        "ShaderNodeEmission",
+        json!({"Color": [1.0, 1.0, 1.0, 1.0], "Strength": 1.0}),
         json!({}),
     );
     add_node(&mut group, "output", "OutputMaterial", json!({}), json!({}));
     let target_socket = if case.output == "Value" {
-        "Emission Strength"
+        "Strength"
     } else {
-        "Emission Color"
+        "Color"
     };
     link(
         &mut group,
         "operation",
         case.output,
-        "principled",
+        "emission",
         target_socket,
     );
-    link(&mut group, "principled", "BSDF", "output", "Surface");
+    link(&mut group, "emission", "Emission", "output", "Surface");
 
     let graph_id = Id::new("shader_math_parity").unwrap();
     let mut groups = Registry::new();
@@ -795,7 +1003,7 @@ fn evaluate_shader_case(case: &NodeCase) -> potter_core::error::Result<Value> {
     let surface = evaluate_surface(&material, &context)?;
     let params = surface
         .dominant()
-        .expect("a Principled surface has one closure");
+        .expect("an emission surface has one closure");
     if case.output == "Value" {
         Ok(json!(params.emission_strength))
     } else {
@@ -803,14 +1011,88 @@ fn evaluate_shader_case(case: &NodeCase) -> potter_core::error::Result<Value> {
     }
 }
 
-fn blender_reference(cases: &[NodeCase]) -> Map<String, Value> {
+struct BlenderOracle {
+    directory: TempDir,
+    geometry: Map<String, Value>,
+    shader: Map<String, Value>,
+    eevee: Map<String, Value>,
+    shader_blend_path: PathBuf,
+    eevee_blend_path: PathBuf,
+}
+
+fn is_eevee_probe(case: &NodeCase) -> bool {
+    matches!(
+        case.id.as_str(),
+        "eevee_math_arcsine_in_domain"
+            | "eevee_math_arccosine_in_domain"
+            | "eevee_math_compare_defined"
+            | "eevee_math_power_integer"
+            | "eevee_math_modulo_safe_fractional"
+            | "eevee_vector_sign_zero"
+            | "vector_normalize_zero"
+            | "eevee_vector_refract_tiny_normal"
+            | "eevee_vector_reflect_tiny_normal"
+            | "eevee_vector_power_negative_integer"
+            | "eevee_vector_modulo_safe_fractional"
+            | "math_shader_value_fold_probe"
+    )
+}
+
+fn shader_cli_cases(cases: &[NodeCase]) -> Vec<NodeCase> {
+    let mut operations = BTreeSet::new();
+    cases
+        .iter()
+        .filter(|case| {
+            case.value_input.is_some()
+                || (!is_eevee_probe(case)
+                    && (case.clamp || operations.insert((case.kind, case.operation))))
+        })
+        .cloned()
+        .collect()
+}
+
+fn eevee_probe_cases(cases: &[NodeCase]) -> Vec<NodeCase> {
+    cases
+        .iter()
+        .filter(|case| is_eevee_probe(case))
+        .cloned()
+        .collect()
+}
+
+fn blender_reference(cases: &[NodeCase], include_shader: bool) -> BlenderOracle {
     let blender = blender_file::blender_executable().expect("Blender is available for this test");
     let directory = tempdir().unwrap();
     let cases_path = directory.path().join("cases.json");
-    let script_path = directory.path().join("node_math_oracle.py");
-    let cases_json = Value::Array(cases.iter().map(NodeCase::blender_input).collect());
+    let shader_blend_path = directory.path().join("shader_node_math.blend");
+    let eevee_blend_path = directory.path().join("shader_node_math_eevee.blend");
+    let script_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/node_math/generate_oracle.py");
+    let shader_blend_arg = if include_shader {
+        shader_blend_path.as_path()
+    } else {
+        Path::new("-")
+    };
+    let eevee_blend_arg = if include_shader {
+        eevee_blend_path.as_path()
+    } else {
+        Path::new("-")
+    };
+    let cli_cases = shader_cli_cases(cases);
+    let cli_ids: BTreeSet<String> = cli_cases.iter().map(|case| case.id.clone()).collect();
+    let eevee_cases = eevee_probe_cases(cases);
+    let eevee_ids: BTreeSet<String> = eevee_cases.iter().map(|case| case.id.clone()).collect();
+    let cases_json = Value::Array(
+        cases
+            .iter()
+            .map(|case| {
+                let mut input = case.blender_input();
+                input["shader_cli"] = json!(cli_ids.contains(&case.id));
+                input["eevee_cli"] = json!(eevee_ids.contains(&case.id));
+                input
+            })
+            .collect(),
+    );
     std::fs::write(&cases_path, serde_json::to_vec(&cases_json).unwrap()).unwrap();
-    std::fs::write(&script_path, BLENDER_ORACLE).unwrap();
     let output = Command::new(blender)
         .args([
             "--background",
@@ -822,11 +1104,13 @@ fn blender_reference(cases: &[NodeCase]) -> Map<String, Value> {
         .arg(&script_path)
         .arg("--")
         .arg(&cases_path)
+        .arg(shader_blend_arg)
+        .arg(eevee_blend_arg)
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "Blender Geometry Nodes oracle failed:\n{}\n{}",
+        "Blender math oracle failed:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -835,74 +1119,16 @@ fn blender_reference(cases: &[NodeCase]) -> Map<String, Value> {
         .lines()
         .find_map(|line| line.strip_prefix("POTTER_NODE_MATH="))
         .expect("Blender oracle emitted a result line");
-    serde_json::from_str(json_line).unwrap()
+    let reference: Value = serde_json::from_str(json_line).unwrap();
+    BlenderOracle {
+        directory,
+        geometry: reference["geometry"].as_object().unwrap().clone(),
+        shader: reference["shader"].as_object().unwrap().clone(),
+        eevee: reference["eevee"].as_object().unwrap().clone(),
+        shader_blend_path,
+        eevee_blend_path,
+    }
 }
-
-const BLENDER_ORACLE: &str = r#"
-import bpy
-import json
-import math
-import sys
-
-with open(sys.argv[sys.argv.index("--") + 1], encoding="utf-8") as source:
-    cases = json.load(source)
-
-tree = bpy.data.node_groups.new("Potter Math Oracle", "GeometryNodeTree")
-tree.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
-tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
-nodes = tree.nodes
-links = tree.links
-mesh_line = nodes.new("GeometryNodeMeshLine")
-mesh_line.inputs["Count"].default_value = 1
-geometry_output = mesh_line.outputs["Mesh"]
-
-for case in cases:
-    if case["kind"] == "math":
-        operation = nodes.new("ShaderNodeMath")
-        operation.operation = case["operation"]
-        for index, value in enumerate(case["inputs"]):
-            operation.inputs[index].default_value = value
-    else:
-        operation = nodes.new("ShaderNodeVectorMath")
-        operation.operation = case["operation"]
-        for index, value in enumerate(case["inputs"]):
-            operation.inputs[index].default_value = value
-    store = nodes.new("GeometryNodeStoreNamedAttribute")
-    store.domain = "POINT"
-    store.data_type = case["data_type"]
-    store.inputs["Name"].default_value = case["id"]
-    links.new(geometry_output, store.inputs["Geometry"])
-    links.new(operation.outputs[case["output"]], store.inputs["Value"])
-    geometry_output = store.outputs["Geometry"]
-
-group_output = nodes.new("NodeGroupOutput")
-links.new(geometry_output, group_output.inputs["Geometry"])
-mesh = bpy.data.meshes.new("Potter Math Oracle Mesh")
-mesh.from_pydata([(0.0, 0.0, 0.0)], [], [])
-obj = bpy.data.objects.new("Potter Math Oracle", mesh)
-bpy.context.collection.objects.link(obj)
-modifier = obj.modifiers.new("Potter Math Oracle", "NODES")
-modifier.node_group = tree
-depsgraph = bpy.context.evaluated_depsgraph_get()
-evaluated = obj.evaluated_get(depsgraph)
-evaluated_mesh = evaluated.to_mesh()
-results = {}
-for case in cases:
-    attribute = evaluated_mesh.attributes.get(case["id"])
-    if attribute is None or len(attribute.data) != 1:
-        raise RuntimeError("missing expected evaluated attribute: " + case["id"])
-    item = attribute.data[0]
-    raw = list(item.vector) if case["data_type"] == "FLOAT_VECTOR" else [item.value]
-    finite = all(math.isfinite(component) for component in raw)
-    if not finite:
-        results[case["id"]] = "non-finite"
-    elif case["data_type"] == "FLOAT_VECTOR":
-        results[case["id"]] = raw
-    else:
-        results[case["id"]] = raw[0]
-evaluated.to_mesh_clear()
-print("POTTER_NODE_MATH=" + json.dumps(results, sort_keys=True))
-"#;
 
 fn json_mismatch(actual: &Value, expected: &Value, label: &str) -> Option<String> {
     match (actual, expected) {
@@ -914,7 +1140,7 @@ fn json_mismatch(actual: &Value, expected: &Value, label: &str) -> Option<String
                 format!("{label}: Blender {expected:?}, Potter {actual:?} (tolerance {tolerance})")
             })
         }
-        (Value::Array(actual), Value::Array(expected)) => actual
+        (Value::Array(actual), Value::Array(expected)) if actual.len() == expected.len() => actual
             .iter()
             .zip(expected)
             .enumerate()
@@ -958,6 +1184,350 @@ fn compare_cases(
     );
 }
 
+struct ProbeImage {
+    width: usize,
+    height: usize,
+    pixels: Vec<[f64; 3]>,
+}
+
+fn read_probe_image(path: &Path) -> ProbeImage {
+    let image = exr::prelude::read_first_rgba_layer_from_file(
+        path,
+        |resolution, _| ProbeImage {
+            width: resolution.width(),
+            height: resolution.height(),
+            pixels: vec![[0.0; 3]; resolution.width() * resolution.height()],
+        },
+        |image: &mut ProbeImage, position, (red, green, blue, _): (f32, f32, f32, f32)| {
+            image.pixels[position.y() * image.width + position.x()] =
+                [f64::from(red), f64::from(green), f64::from(blue)];
+        },
+    )
+    .unwrap();
+    image.layer_data.channel_data.pixels
+}
+fn realtime_film_precision(value: f64) -> f64 {
+    f64::from(exr::prelude::f16::from_f32(value as f32).to_f32())
+}
+
+fn pot_json(command: &mut Command, label: &str) -> Value {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "Potter {label} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn compare_shader_cli(oracle: &BlenderOracle, cases: &[NodeCase]) {
+    let blender = blender_file::blender_executable().expect("Blender is available for this test");
+    let probe_cases = shader_cli_cases(cases);
+    let realtime_cases: Vec<NodeCase> = eevee_probe_cases(cases)
+        .into_iter()
+        .filter(|case| !oracle.eevee[&case.id].is_string())
+        .collect();
+
+    let project = oracle.directory.path().join("shader_cli_project");
+    let project_text = project.to_str().unwrap();
+    let initialized = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot")).args(["init", project_text, "--json"]),
+        "shader project initialization",
+    );
+    assert_eq!(initialized["ok"], true);
+    let imported = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args(["import", project_text, "--file"])
+            .arg(&oracle.shader_blend_path)
+            .args([
+                "--format",
+                "blend",
+                "--mode",
+                "replace",
+                "--base-revision",
+                "0",
+                "--blender",
+            ])
+            .arg(&blender)
+            .arg("--json"),
+        "Cycles shader probe import",
+    );
+    assert_eq!(imported["ok"], true);
+
+    let output_directory = oracle.directory.path().join("shader_cli_render");
+    let rendered = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args([
+                "render",
+                project_text,
+                "--engine",
+                "path",
+                "--format",
+                "exr",
+                "--out",
+            ])
+            .arg(&output_directory)
+            .arg("--json"),
+        "shader surface CLI render",
+    );
+    let frame_path = rendered["result"]["frames"][0]["path"]
+        .as_str()
+        .expect("CLI render returned a frame path");
+    let image = read_probe_image(Path::new(frame_path));
+    assert_eq!(image.width, probe_cases.len() * 8);
+    assert_eq!(image.height, 8);
+
+    let mut mismatches = Vec::new();
+    for (column, case) in probe_cases.iter().enumerate() {
+        let pixel = image.pixels[4 * image.width + column * 8 + 4];
+        let actual = if case.data_type == "FLOAT_VECTOR" {
+            json!(pixel)
+        } else {
+            json!(pixel[0])
+        };
+        let expected = &oracle.shader[&case.id];
+        if expected.is_string() {
+            mismatches.push(format!(
+                "shader_cli_{}: Cycles output is non-finite",
+                case.id
+            ));
+        } else if let Some(mismatch) =
+            json_mismatch(&actual, expected, &format!("shader_cli_{}", case.id))
+        {
+            mismatches.push(mismatch);
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} exact-pixel CLI shader probes diverge from Blender Cycles:\n{}",
+        mismatches.len(),
+        probe_cases.len(),
+        mismatches.join("\n")
+    );
+
+    let realtime_project = oracle.directory.path().join("shader_realtime_project");
+    let realtime_project_text = realtime_project.to_str().unwrap();
+    let initialized = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot")).args(["init", realtime_project_text, "--json"]),
+        "realtime shader project initialization",
+    );
+    assert_eq!(initialized["ok"], true);
+    let imported = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args(["import", realtime_project_text, "--file"])
+            .arg(&oracle.eevee_blend_path)
+            .args([
+                "--format",
+                "blend",
+                "--mode",
+                "replace",
+                "--base-revision",
+                "0",
+                "--blender",
+            ])
+            .arg(&blender)
+            .arg("--json"),
+        "realtime shader probe import",
+    );
+    assert_eq!(imported["ok"], true);
+
+    let realtime_directory = oracle.directory.path().join("shader_realtime_render");
+    let rendered = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args([
+                "render",
+                realtime_project_text,
+                "--engine",
+                "realtime",
+                "--format",
+                "exr",
+                "--out",
+            ])
+            .arg(&realtime_directory)
+            .arg("--json"),
+        "realtime shader CLI render",
+    );
+    let frame_path = rendered["result"]["frames"][0]["path"]
+        .as_str()
+        .expect("CLI realtime render returned a frame path");
+    let image = read_probe_image(Path::new(frame_path));
+    assert_eq!(image.width, realtime_cases.len() * 8);
+    assert_eq!(image.height, 8);
+
+    let mut mismatches = Vec::new();
+    for (column, case) in realtime_cases.iter().enumerate() {
+        let pixel = image.pixels[4 * image.width + column * 8 + 4];
+        let actual = if case.data_type == "FLOAT_VECTOR" {
+            json!(pixel.map(realtime_film_precision))
+        } else {
+            json!(realtime_film_precision(pixel[0]))
+        };
+        let expected = &oracle.eevee[&case.id];
+        let mismatch = if case.id == "eevee_math_arcsine_in_domain" {
+            let actual = actual.as_f64().unwrap();
+            let expected = expected.as_f64().unwrap();
+            let tolerance = 5.0e-6;
+            ((actual - expected).abs() > tolerance).then(|| {
+                format!(
+                    "realtime_cli_{}: Blender {expected:?}, Potter {actual:?} (tolerance {tolerance})",
+                    case.id
+                )
+            })
+        } else {
+            json_mismatch(&actual, expected, &format!("realtime_cli_{}", case.id))
+        };
+        if let Some(mismatch) = mismatch {
+            mismatches.push(mismatch);
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} exact-pixel realtime CLI shader probes diverge from Blender EEVEE:\n{}",
+        mismatches.len(),
+        realtime_cases.len(),
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn realtime_shader_math_dynamic_inputs_match_blender_522() {
+    let Some(blender) = blender_file::blender_executable() else {
+        eprintln!("Skipping dynamic realtime shader parity: no Blender executable was found");
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let blend_path = directory.path().join("dynamic_shader_math.blend");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/node_math/generate_realtime_dynamic_probes.py");
+    let generated = Command::new(&blender)
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(script)
+        .arg("--")
+        .arg(&blend_path)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "Blender dynamic realtime shader oracle failed:\n{}\n{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&generated.stdout);
+    let oracle_line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("POTTER_NODE_MATH_REALTIME_DYNAMIC="))
+        .expect("Blender dynamic realtime oracle emitted a result line");
+    let oracle: Value = serde_json::from_str(oracle_line).unwrap();
+    let cases = oracle["cases"].as_array().unwrap();
+
+    let project = directory.path().join("dynamic_shader_project");
+    let project_text = project.to_str().unwrap();
+    let initialized = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot")).args(["init", project_text, "--json"]),
+        "dynamic realtime shader project initialization",
+    );
+    assert_eq!(initialized["ok"], true);
+    let imported = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args(["import", project_text, "--file"])
+            .arg(&blend_path)
+            .args([
+                "--format",
+                "blend",
+                "--mode",
+                "replace",
+                "--base-revision",
+                "0",
+                "--blender",
+            ])
+            .arg(&blender)
+            .arg("--json"),
+        "dynamic realtime shader import",
+    );
+    assert_eq!(imported["ok"], true);
+
+    let output_directory = directory.path().join("dynamic_shader_render");
+    let rendered = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args([
+                "render",
+                project_text,
+                "--engine",
+                "realtime",
+                "--format",
+                "exr",
+                "--out",
+            ])
+            .arg(&output_directory)
+            .arg("--json"),
+        "dynamic realtime shader render",
+    );
+    let frame_path = rendered["result"]["frames"][0]["path"]
+        .as_str()
+        .expect("CLI dynamic realtime render returned a frame path");
+    let image = read_probe_image(Path::new(frame_path));
+    assert_eq!(image.width, cases.len() * 8);
+    assert_eq!(image.height, 8);
+
+    let mut mismatches = Vec::new();
+    for (column, case) in cases.iter().enumerate() {
+        let pixel = image.pixels[4 * image.width + column * 8 + 4];
+        let actual = if case["kind"] == "scalar" {
+            json!(realtime_film_precision(pixel[0]))
+        } else {
+            json!(pixel.map(realtime_film_precision))
+        };
+        let id = case["id"].as_str().unwrap();
+        let expected = &oracle["eevee"][id];
+        if matches!(
+            id,
+            "dynamic_math_modulo_precision_boundary" | "dynamic_vector_modulo_precision_boundary"
+        ) {
+            match (&actual, expected) {
+                (Value::Number(actual), Value::Number(expected)) => {
+                    assert_eevee_film_close(
+                        actual.as_f64().unwrap(),
+                        expected.as_f64().unwrap(),
+                        &format!("dynamic_realtime_{id}"),
+                    );
+                }
+                (Value::Array(actual), Value::Array(expected))
+                    if actual.len() == expected.len() =>
+                {
+                    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                        assert_eevee_film_close(
+                            actual.as_f64().unwrap(),
+                            expected.as_f64().unwrap(),
+                            &format!("dynamic_realtime_{id}[{index}]"),
+                        );
+                    }
+                }
+                _ => mismatches.push(format!(
+                    "dynamic_realtime_{id}: Blender and Potter returned different value shapes"
+                )),
+            }
+        } else if let Some(mismatch) =
+            json_mismatch(&actual, expected, &format!("dynamic_realtime_{id}"))
+        {
+            mismatches.push(mismatch);
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} per-pixel realtime shader probes diverge from Blender 5.2.2 EEVEE:\n{}",
+        mismatches.len(),
+        cases.len(),
+        mismatches.join("\n")
+    );
+}
+
 #[test]
 fn geometry_node_math_and_vector_math_match_blender_522() {
     let Some(_) = blender_file::blender_executable() else {
@@ -965,69 +1535,175 @@ fn geometry_node_math_and_vector_math_match_blender_522() {
         return;
     };
     let cases: Vec<NodeCase> = math_cases().into_iter().chain(vector_cases()).collect();
-    let expected = blender_reference(&cases);
+    let oracle = blender_reference(&cases, false);
     compare_cases(
         &cases,
-        &expected,
+        &oracle.geometry,
         "geometry_",
         evaluate_geometry_case,
         |_| true,
     );
 }
 
-/// Operations the shader evaluator documents as supported; others must report
-/// `UNSUPPORTED_FEATURE` instead of silently evaluating.
-fn shader_supports(case: &NodeCase) -> bool {
-    match case.kind {
-        "math" => matches!(
-            case.operation,
-            "ADD"
-                | "SUBTRACT"
-                | "MULTIPLY"
-                | "DIVIDE"
-                | "MULTIPLY_ADD"
-                | "POWER"
-                | "SINE"
-                | "COSINE"
-                | "TANGENT"
-                | "SQRT"
-                | "ABSOLUTE"
-                | "MINIMUM"
-                | "MAXIMUM"
-                | "LESS_THAN"
-                | "GREATER_THAN"
-                | "COMPARE"
-                | "PINGPONG"
-        ),
-        _ => matches!(
-            case.operation,
-            "ADD"
-                | "SUBTRACT"
-                | "MULTIPLY"
-                | "CROSS_PRODUCT"
-                | "DOT_PRODUCT"
-                | "LENGTH"
-                | "DISTANCE"
-                | "SCALE"
-                | "NORMALIZE"
-        ),
-    }
-}
-
 #[test]
-fn shader_math_and_vector_math_match_blender_geometry_node_results() {
+fn shader_math_and_vector_math_match_cycles_and_cli() {
     let Some(_) = blender_file::blender_executable() else {
         eprintln!("Skipping Blender shader math parity: no Blender executable was found");
         return;
     };
     let cases: Vec<NodeCase> = math_cases().into_iter().chain(vector_cases()).collect();
-    let expected = blender_reference(&cases);
+    let oracle = blender_reference(&cases, true);
     compare_cases(
         &cases,
-        &expected,
+        &oracle.shader,
         "shader_",
         evaluate_shader_case,
-        shader_supports,
+        |case| {
+            case.value_input.is_some()
+                || (!is_eevee_probe(case)
+                    && !matches!(
+                        case.id.as_str(),
+                        "math_exponent_overflow"
+                            | "vector_power_overflow"
+                            | "math_power_zero_negative"
+                    ))
+        },
+    );
+    let nonfinite_power = cases
+        .iter()
+        .find(|case| case.id == "math_power_zero_negative")
+        .expect("zero-to-negative shader power probe exists");
+    let error = evaluate_shader_case(nonfinite_power).unwrap_err();
+    assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+    assert_eq!(
+        error.details["feature_id"],
+        "shader.node.ShaderNodeMath.operation.POWER.non_finite_constant_fold"
+    );
+    for case in cases.iter().filter(|case| {
+        matches!(
+            case.id.as_str(),
+            "math_exponent_overflow" | "vector_power_overflow"
+        )
+    }) {
+        assert!(
+            evaluate_shader_case(case).is_err(),
+            "overflowing shader result should be refused: {}",
+            case.id
+        );
+    }
+    compare_shader_cli(&oracle, &cases);
+}
+
+fn blender_node_state(blender: &Path, script: &Path, mode: &str, blend_path: &Path) -> Value {
+    let output = Command::new(blender)
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(script)
+        .arg("--")
+        .arg(mode)
+        .arg(blend_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Blender node-state {mode} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("POTTER_NODE_STATE="))
+        .expect("Blender state script emitted its JSON result");
+    serde_json::from_str(line).unwrap()
+}
+
+#[test]
+fn shader_curve_mappings_and_color_ramp_survive_blend_cli_round_trip() {
+    let Some(blender) = blender_file::blender_executable() else {
+        eprintln!("Skipping node-state round trip: no Blender executable was found");
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/node_math/generate_state_roundtrip.py");
+    let source_blend = root.join("node_state.blend");
+    let source = blender_node_state(&blender, &script, "generate", &source_blend);
+    assert_eq!(source["float_curve"]["curves"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        source["vector_curve"]["curves"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(source["rgb_curve"]["curves"].as_array().unwrap().len(), 4);
+    assert_eq!(source["float_curve"]["extend"], "HORIZONTAL");
+    assert_eq!(source["float_curve"]["use_clip"], false);
+    assert_eq!(source["vector_curve"]["extend"], "HORIZONTAL");
+    assert_eq!(source["vector_curve"]["use_clip"], false);
+    assert_eq!(source["rgb_curve"]["tone"], "FILMLIKE");
+    assert_eq!(source["rgb_curve"]["extend"], "HORIZONTAL");
+    assert_eq!(source["rgb_curve"]["use_clip"], true);
+    assert_eq!(
+        source["rgb_curve"]["clip"],
+        json!([0.125, 0.0625, 0.875, 0.9375])
+    );
+    assert_eq!(source["rgb_curve"]["black"], json!([0.0625, 0.125, 0.1875]));
+    assert_eq!(source["rgb_curve"]["white"], json!([0.8125, 0.875, 0.9375]));
+    assert_eq!(
+        source["rgb_curve"]["curves"][3][1]["handle"],
+        "AUTO_CLAMPED"
+    );
+    assert_eq!(source["ramp"]["color_mode"], "HSL");
+    assert_eq!(source["ramp"]["hue_interpolation"], "CW");
+    assert_eq!(source["ramp"]["interpolation"], "EASE");
+    assert_eq!(source["ramp"]["elements"].as_array().unwrap().len(), 3);
+
+    let project = root.join("project");
+    let project_text = project.to_str().unwrap();
+    let initialized = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot")).args(["init", project_text, "--json"]),
+        "node-state project initialization",
+    );
+    assert_eq!(initialized["ok"], true);
+    let imported = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args(["import", project_text, "--file"])
+            .arg(&source_blend)
+            .args([
+                "--format",
+                "blend",
+                "--mode",
+                "replace",
+                "--base-revision",
+                "0",
+                "--blender",
+            ])
+            .arg(&blender)
+            .arg("--json"),
+        "node-state Blender import",
+    );
+    assert_eq!(imported["ok"], true);
+
+    let exported_blend = root.join("node_state_round_trip.blend");
+    let exported = pot_json(
+        Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args(["export", project_text, "--format", "blend", "--out"])
+            .arg(&exported_blend)
+            .args(["--blender"])
+            .arg(&blender)
+            .arg("--json"),
+        "node-state Blender export",
+    );
+    assert_eq!(exported["ok"], true);
+    let round_trip = blender_node_state(&blender, &script, "read", &exported_blend);
+    assert_eq!(
+        round_trip, source,
+        "shader node storage changed across .blend round trip"
     );
 }
 
@@ -1152,31 +1828,29 @@ fn graph_math_rejects_results_that_overflow_to_infinity() {
 }
 
 #[test]
-fn shader_math_reports_unsupported_operations_and_wrong_sockets() {
-    let unsupported = shader_surface_with_node(
+fn shader_math_supports_sign_and_reflect_and_rejects_wrong_sockets() {
+    let sign = shader_surface_with_node(
         "ShaderNodeMath",
-        json!({"Value": 1.0}),
+        json!({"Value": -2.5}),
         json!({"operation": "SIGN"}),
         "Value",
         "Emission Strength",
     )
-    .unwrap_err();
-    assert_eq!(unsupported.code, ErrorCode::UnsupportedFeature);
-    assert_eq!(unsupported.details["feature_id"], "shader.node.Math:SIGN");
+    .unwrap();
+    assert_eq!(sign.emission_strength, -1.0);
 
-    let unsupported_vector = shader_surface_with_node(
+    let reflect = shader_surface_with_node(
         "ShaderNodeVectorMath",
-        json!({"Vector": [1.0, 2.0, 3.0]}),
+        json!({
+            "Vector": [1.0, 2.0, 3.0],
+            "Vector_001": [0.0, 1.0, 0.0],
+        }),
         json!({"operation": "REFLECT"}),
         "Vector",
         "Emission Color",
     )
-    .unwrap_err();
-    assert_eq!(unsupported_vector.code, ErrorCode::UnsupportedFeature);
-    assert_eq!(
-        unsupported_vector.details["feature_id"],
-        "shader.node.VectorMath:REFLECT"
-    );
+    .unwrap();
+    assert_eq!(reflect.emission_color, [1.0, -2.0, 3.0]);
 
     let wrong_socket = shader_surface_with_node(
         "ShaderNodeVectorMath",
@@ -1219,6 +1893,24 @@ fn shader_math_compare_defaults_to_blenders_node_epsilon() {
     )
     .unwrap();
     assert!(outside.emission_strength.abs() < f64::EPSILON);
+}
+#[test]
+fn shader_map_range_defaults_to_blenders_enabled_clamp() {
+    let params = shader_surface_with_node(
+        "ShaderNodeMapRange",
+        json!({
+            "Value": 2.0,
+            "From Min": 0.0,
+            "From Max": 1.0,
+            "To Min": 0.25,
+            "To Max": 0.75
+        }),
+        json!({}),
+        "Result",
+        "Emission Strength",
+    )
+    .unwrap();
+    assert_eq!(params.emission_strength, 0.75);
 }
 
 #[test]
@@ -1314,4 +2006,115 @@ fn voronoi_scale_multiplies_the_sampled_coordinate_and_color_is_a_unit_rgb() {
     )
     .unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidOperation);
+}
+#[test]
+fn realtime_shader_math_guards_report_exact_feature_ids() {
+    let Some(blender) = blender_file::blender_executable() else {
+        eprintln!("Skipping realtime shader guard parity: no Blender executable was found");
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/node_math/generate_realtime_refusals.py");
+    let fixtures = directory.path().join("fixtures");
+    let generated = Command::new(&blender)
+        .args([
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "1",
+            "--python",
+        ])
+        .arg(script)
+        .arg("--")
+        .arg(&fixtures)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "Blender realtime shader guards failed:\n{}\n{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr),
+    );
+
+    for (index, (fixture_id, feature_id)) in [
+        (
+            "shader_math_modulo_quotient_out_of_range",
+            "shader.node.ShaderNodeMath.operation.MODULO.quotient_out_of_range",
+        ),
+        (
+            "shader_vector_math_modulo_quotient_out_of_range",
+            "shader.node.ShaderNodeVectorMath.operation.MODULO.quotient_out_of_range",
+        ),
+        (
+            "shader_vector_math_normalize_subnormal_input",
+            "shader.node.ShaderNodeVectorMath.operation.NORMALIZE.subnormal_input",
+        ),
+        (
+            "shader_math_inverse_sqrt_nonpositive",
+            "shader.node.ShaderNodeMath.operation.INVERSE_SQRT.glsl_undefined_domain",
+        ),
+        (
+            "shader_math_logarithm_base_one",
+            "shader.node.ShaderNodeMath.operation.LOGARITHM.glsl_undefined_domain",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let project = directory.path().join(format!("project_{index}"));
+        let project_text = project.to_str().unwrap();
+        let initialized = pot_json(
+            Command::new(env!("CARGO_BIN_EXE_pot")).args(["init", project_text, "--json"]),
+            "realtime guard project initialization",
+        );
+        assert_eq!(initialized["ok"], true);
+        let imported = pot_json(
+            Command::new(env!("CARGO_BIN_EXE_pot"))
+                .args(["import", project_text, "--file"])
+                .arg(fixtures.join(format!("{fixture_id}.blend")))
+                .args([
+                    "--format",
+                    "blend",
+                    "--mode",
+                    "replace",
+                    "--base-revision",
+                    "0",
+                    "--blender",
+                ])
+                .arg(&blender)
+                .arg("--json"),
+            "realtime guard shader import",
+        );
+        assert_eq!(imported["ok"], true);
+
+        let output_directory = directory.path().join(format!("render_{index}"));
+        let output = Command::new(env!("CARGO_BIN_EXE_pot"))
+            .args([
+                "render",
+                project_text,
+                "--engine",
+                "realtime",
+                "--format",
+                "exr",
+                "--out",
+            ])
+            .arg(output_directory)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{fixture_id}: unsupported realtime shader math unexpectedly rendered"
+        );
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            response["error"]["code"], "UNSUPPORTED_FEATURE",
+            "{fixture_id}"
+        );
+        assert_eq!(
+            response["error"]["details"]["feature_id"], feature_id,
+            "{fixture_id}"
+        );
+    }
 }

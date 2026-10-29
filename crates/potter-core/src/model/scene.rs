@@ -127,7 +127,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 16,
+            schema_version: 17,
             scene_id,
             revision: 0,
             active_scene,
@@ -155,7 +155,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 16 {
+        if self.schema_version != 17 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -3663,7 +3663,7 @@ mod tests {
     #[test]
     fn default_scene_has_contract_initial_state_and_empty_registries() {
         let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-        assert_eq!(doc.schema_version, 16);
+        assert_eq!(doc.schema_version, 17);
         doc.validate().unwrap();
         let value = serde_json::to_value(doc).unwrap();
         assert_eq!(value["revision"], 0);
