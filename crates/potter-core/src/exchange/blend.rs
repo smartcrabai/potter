@@ -43,9 +43,7 @@ use crate::{
         StripBlendType, StripModifier, StripType as SequenceStripType,
         TransitionType as SequenceTransitionType,
     },
-    shader::{
-        PreparedMaterial,
-    },
+    shader::PreparedMaterial,
     store::Project,
 };
 
@@ -11955,6 +11953,7 @@ fn material_volume_graph_has_spatial_dependency(
     })
 }
 
+
 fn mesh_uses_material(mesh: &Value, object: &Value, material_name: &str) -> bool {
     let data_materials = mesh.get("materials").and_then(Value::as_array);
     let object_materials = object.get("materials").and_then(Value::as_array);
@@ -15396,25 +15395,6 @@ fn collect_shader_node_import_losses(
             .collect();
         if outputs.is_empty() {
             continue;
-        }
-        if matches!(
-            node.node_type.as_str(),
-            "ShaderNodeTexWave"
-                | "ShaderNodeTexMagic"
-                | "ShaderNodeTexBrick"
-                | "ShaderNodeTexGabor"
-        ) && node
-            .properties
-            .get("texture_mapping")
-            .is_some_and(|mapping| !crate::shader::texture::texture_mapping_is_default(mapping))
-        {
-            record_shader_loss(
-                recorded,
-                losses,
-                &format!("shader.node.{}.texture_mapping", node.node_type),
-                node_id,
-                "Non-default procedural texture coordinate mapping is preserved but unsupported by native shader evaluation.",
-            );
         }
         if has_realtime_world_graph
             && volume_reachable.contains(node_id)

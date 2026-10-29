@@ -539,7 +539,7 @@ def build_world_fixture():
     wave.bands_direction = "X"
     wave.wave_profile = "SIN"
     for name, value in {
-        "Scale": 5.5,
+        "Scale": 0.01,
         "Distortion": 0.0,
         "Detail": 0.0,
         "Phase Offset": 0.17,

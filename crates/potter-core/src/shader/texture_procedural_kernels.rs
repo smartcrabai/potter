@@ -1,7 +1,9 @@
 // Blender 5.2.2 shader procedural texture kernels. Hash primitives and normalized fBM are shared
 // with `texture_kernels`; the formulas here are the texture-node implementations.
 
-use super::texture_kernels::{NoiseType, hash_uint, hash_uint2, hash_uint3, hash_uint4, noise_factor, uint_to_float};
+use super::texture_kernels::{
+    NoiseType, hash_uint, hash_uint2, hash_uint3, hash_uint4, noise_factor, uint_to_float,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WaveType {
@@ -45,11 +47,7 @@ pub(crate) fn wave(
     rings_direction: WaveRingsDirection,
     profile: WaveProfile,
 ) -> f32 {
-    let mut p = [
-        vector[0] * scale,
-        vector[1] * scale,
-        vector[2] * scale,
-    ];
+    let mut p = [vector[0] * scale, vector[1] * scale, vector[2] * scale];
     for value in &mut p {
         *value = (*value + 0.000_001) * 0.999_999;
     }
@@ -66,9 +64,7 @@ pub(crate) fn wave(
                 WaveRingsDirection::X => p[1] * p[1] + p[2] * p[2],
                 WaveRingsDirection::Y => p[0] * p[0] + p[2] * p[2],
                 WaveRingsDirection::Z => p[0] * p[0] + p[1] * p[1],
-                WaveRingsDirection::Spherical => {
-                    p[0] * p[0] + p[1] * p[1] + p[2] * p[2]
-                }
+                WaveRingsDirection::Spherical => p[0] * p[0] + p[1] * p[1] + p[2] * p[2],
             };
             radius_squared.sqrt() * 20.0
         }
@@ -109,12 +105,7 @@ pub(crate) fn wave(
     }
 }
 
-pub(crate) fn magic(
-    vector: [f32; 3],
-    scale: f32,
-    distortion: f32,
-    depth: u8,
-) -> ([f32; 4], f32) {
+pub(crate) fn magic(vector: [f32; 3], scale: f32, distortion: f32, depth: u8) -> ([f32; 4], f32) {
     let co = [vector[0] * scale, vector[1] * scale, vector[2] * scale];
     magic_from_coordinates(co, distortion, depth)
 }
@@ -230,8 +221,8 @@ pub(crate) fn brick(
     let bricknum = ((p[0] + offset) / width).floor() as i32;
     let x = (p[0] + offset) - width * bricknum as f32;
     let y = p[1] - row_height * rownum as f32;
-    let noise_index = ((rownum as u32).wrapping_shl(16))
-        .wrapping_add((bricknum as u32) & 0xffff) as i32;
+    let noise_index =
+        ((rownum as u32).wrapping_shl(16)).wrapping_add((bricknum as u32) & 0xffff) as i32;
     let tint = (brick_noise(noise_index) + bias).clamp(0.0, 1.0);
 
     let mut min_distance = x.min(y).min(width - x).min(row_height - y);
@@ -250,13 +241,13 @@ pub(crate) fn brick(
     };
 
     let mut color = [0.0; 4];
-    if mortar != 1.0 {
+    if mortar.to_bits() == 1.0_f32.to_bits() {
+        color = color1;
+    } else {
         let color1_weight = 1.0 - tint;
         for channel in 0..4 {
             color[channel] = color1[channel] * color1_weight + color2[channel] * tint;
         }
-    } else {
-        color = color1;
     }
     for channel in 0..4 {
         color[channel] = color[channel] * (1.0 - mortar) + mortar_color[channel] * mortar;
@@ -269,18 +260,16 @@ fn brick_noise(value: i32) -> f32 {
     hash = (hash >> 13) ^ hash;
     hash = hash
         .wrapping_mul(
-            hash.wrapping_mul(hash).wrapping_mul(60_493).wrapping_add(19_990_303),
+            hash.wrapping_mul(hash)
+                .wrapping_mul(60_493)
+                .wrapping_add(19_990_303),
         )
         .wrapping_add(1_376_312_589)
         & 0x7fff_ffff;
     0.5 * (hash as f32 / 1_073_741_824.0)
 }
 
-pub(crate) fn white_noise_value(
-    dimensions: u8,
-    vector: [f32; 3],
-    w: f32,
-) -> Option<f32> {
+pub(crate) fn white_noise_value(dimensions: u8, vector: [f32; 3], w: f32) -> Option<f32> {
     Some(match dimensions {
         1 => hash_float(w),
         2 => hash_vec2([vector[0], vector[1]]),
@@ -290,11 +279,7 @@ pub(crate) fn white_noise_value(
     })
 }
 
-pub(crate) fn white_noise_color(
-    dimensions: u8,
-    vector: [f32; 3],
-    w: f32,
-) -> Option<[f32; 4]> {
+pub(crate) fn white_noise_color(dimensions: u8, vector: [f32; 3], w: f32) -> Option<[f32; 4]> {
     let rgb = match dimensions {
         1 => hash_float_to_vec3(w),
         2 => hash_vec2_to_vec3([vector[0], vector[1]]),
@@ -348,7 +333,10 @@ fn gabor_cell_2d(
         let orientation = base_orientation + random_orientation * isotropy;
         let center_seed = [seed[0], seed[1], seed[2] + 1.0];
         let kernel_center = hash_vec3_to_vec2(center_seed);
-        let position_in_kernel = [position[0] - kernel_center[0], position[1] - kernel_center[1]];
+        let position_in_kernel = [
+            position[0] - kernel_center[0],
+            position[1] - kernel_center[1],
+        ];
         let distance_squared = position_in_kernel[0] * position_in_kernel[0]
             + position_in_kernel[1] * position_in_kernel[1];
         if distance_squared >= 1.0 {
@@ -396,7 +384,14 @@ pub(crate) fn gabor_3d_shader(
     orientation: [f32; 3],
     path_traced: bool,
 ) -> [f32; 3] {
-    gabor_3d_with_azimuth_sign(vector, scale, frequency, anisotropy, orientation, path_traced)
+    gabor_3d_with_azimuth_sign(
+        vector,
+        scale,
+        frequency,
+        anisotropy,
+        orientation,
+        path_traced,
+    )
 }
 
 fn gabor_3d_with_azimuth_sign(
@@ -449,14 +444,23 @@ fn gabor_3d_with_azimuth_sign(
                     local_position[1] - offset[1],
                     local_position[2] - offset[2],
                 ];
-                let sample =
-                    gabor_cell_3d(cell, position, frequency, isotropy, base_orientation, cycles_svm);
+                let sample = gabor_cell_3d(
+                    cell,
+                    position,
+                    frequency,
+                    isotropy,
+                    base_orientation,
+                    cycles_svm,
+                );
                 phasor[0] += sample[0];
                 phasor[1] += sample[1];
             }
         }
     }
-    gabor_outputs(phasor, (8.0 * 0.5 / (4.0 * std::f32::consts::SQRT_2)).sqrt())
+    gabor_outputs(
+        phasor,
+        (8.0 * 0.5 / (4.0 * std::f32::consts::SQRT_2)).sqrt(),
+    )
 }
 
 fn gabor_cell_3d(
@@ -526,9 +530,8 @@ fn gabor_orientation_3d(
 }
 
 fn gabor_kernel_3d(position: [f32; 3], frequency: f32, orientation: [f32; 3]) -> [f32; 2] {
-    let distance_squared = position[0] * position[0]
-        + position[1] * position[1]
-        + position[2] * position[2];
+    let distance_squared =
+        position[0] * position[0] + position[1] * position[1] + position[2] * position[2];
     let window = 0.5 + 0.5 * (std::f32::consts::PI * distance_squared).cos();
     let envelope = (-std::f32::consts::PI * distance_squared).exp() * window;
     let angle = 2.0
@@ -544,8 +547,7 @@ fn gabor_outputs(phasor: [f32; 2], standard_deviation: f32) -> [f32; 3] {
     let normalization = 6.0 * standard_deviation;
     [
         (phasor[1] / normalization) * 0.5 + 0.5,
-        (phasor[1].atan2(phasor[0]) + std::f32::consts::PI)
-            / (2.0 * std::f32::consts::PI),
+        (phasor[1].atan2(phasor[0]) + std::f32::consts::PI) / (2.0 * std::f32::consts::PI),
         (phasor[0] * phasor[0] + phasor[1] * phasor[1]).sqrt() / normalization,
     ]
 }
@@ -576,7 +578,11 @@ fn hash_vec4(value: [f32; 4]) -> f32 {
 }
 
 fn hash_float_to_vec3(value: f32) -> [f32; 3] {
-    [hash_float(value), hash_vec2([value, 1.0]), hash_vec2([value, 2.0])]
+    [
+        hash_float(value),
+        hash_vec2([value, 1.0]),
+        hash_vec2([value, 2.0]),
+    ]
 }
 
 fn hash_vec2_to_vec3(value: [f32; 2]) -> [f32; 3] {
@@ -604,10 +610,7 @@ fn hash_vec4_to_vec3(value: [f32; 4]) -> [f32; 3] {
 }
 
 fn hash_vec3_to_vec2(value: [f32; 3]) -> [f32; 2] {
-    [
-        hash_vec3(value),
-        hash_vec3([value[2], value[0], value[1]]),
-    ]
+    [hash_vec3(value), hash_vec3([value[2], value[0], value[1]])]
 }
 
 fn hash_vec4_to_vec2(value: [f32; 4]) -> [f32; 2] {
@@ -626,4 +629,3 @@ fn sign(value: f32) -> f32 {
         0.0
     }
 }
-

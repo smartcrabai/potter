@@ -3,8 +3,8 @@ pub(crate) mod converters;
 pub(crate) mod inline_fold;
 pub(crate) mod texture;
 mod texture_kernels;
+pub(crate) mod texture_procedural_kernels;
 mod world;
-mod texture_procedural_kernels;
 
 mod evaluator;
 

@@ -6,15 +6,15 @@ use std::{
 use glam::{DMat4, DQuat, DVec3, EulerRot, Mat4, Vec3};
 use serde_json::{Value as JsonValue, json};
 
+use super::texture_procedural_kernels::{
+    self as procedural_texture, WaveBandsDirection, WaveProfile, WaveRingsDirection, WaveType,
+};
 use crate::{
     error::{ErrorCode, PotError, Result},
     geom::{GeneratedCorners, TextureSpace, volume::VolumeData},
     graph::{GraphKind, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef, ThicknessMode},
-};
-use super::texture_procedural_kernels::{
-    self as procedural_texture, WaveBandsDirection, WaveProfile, WaveRingsDirection, WaveType,
 };
 
 /// Blender's Principled "Specular IOR Level" default: `SOCKET_IN_FLOAT(specular_ior_level,
@@ -3485,9 +3485,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             ],
             _ => return Err(invalid("procedural texture node type is invalid")),
         };
-        if let Some(socket) = self.group.links.iter().find(|link| {
-            link.to_node == *id && !valid.contains(&link.to_socket.as_str())
-        }) {
+        if let Some(socket) = self
+            .group
+            .links
+            .iter()
+            .find(|link| link.to_node == *id && !valid.contains(&link.to_socket.as_str()))
+        {
             return Err(invalid(format!(
                 "unknown input socket `{}` on `{}`",
                 socket.to_socket, node.node_type
@@ -3504,12 +3507,13 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             )));
         }
         let inactive = match node.node_type.as_str() {
-            "ShaderNodeTexWhiteNoise" => match shader_node_string(node, "noise_dimensions", "3D")? {
-                "1D" => Some("Vector"),
-                "2D" | "3D" => Some("W"),
-                "4D" => None,
-                _ => None,
-            },
+            "ShaderNodeTexWhiteNoise" => {
+                match shader_node_string(node, "noise_dimensions", "3D")? {
+                    "1D" => Some("Vector"),
+                    "2D" | "3D" => Some("W"),
+                    _ => None,
+                }
+            }
             "ShaderNodeTexGabor" => match shader_node_string(node, "gabor_type", "2D")? {
                 "2D" => Some("Orientation 3D"),
                 "3D" => Some("Orientation 2D"),
@@ -3518,9 +3522,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             _ => None,
         };
         if let Some(socket) = inactive
-            && self.group.links.iter().any(|link| {
-                link.to_node == *id && link.to_socket == socket
-            })
+            && self
+                .group
+                .links
+                .iter()
+                .any(|link| link.to_node == *id && link.to_socket == socket)
         {
             return Err(invalid(format!(
                 "input socket `{socket}` is unavailable on `{}`",
@@ -3663,7 +3669,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         let width = texture_f32(self.scalar_input(id, &["Brick Width"], 0.5)?)?;
         let row_height = texture_f32(self.scalar_input(id, &["Row Height"], 0.25)?)?;
         if width == 0.0 || row_height == 0.0 {
-            return Err(eval_error("Brick Texture width and row height must be nonzero"));
+            return Err(eval_error(
+                "Brick Texture width and row height must be nonzero",
+            ));
         }
         let (mut color, factor) = procedural_texture::brick(
             vector,
@@ -3785,7 +3793,6 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         };
         Ok(Value::Scalar(f64::from(value)))
     }
-
 
     fn noise(&mut self, id: &Id, socket: &str) -> Result<Value> {
         use super::texture_kernels::NoiseType;
@@ -6074,9 +6081,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     fn texture_vector_input(&mut self, id: &Id, default: DVec3) -> Result<DVec3> {
         if self.links.is_none() || self.texture_mapping_unsupported.contains(id) {
             let node = self.node(id)?;
-            if crate::shader::texture::texture_node_color_mapping_is_inert(
-                node.node_type.as_str(),
-            ) {
+            if crate::shader::texture::texture_node_color_mapping_is_inert(node.node_type.as_str())
+            {
                 crate::shader::texture::validate_texture_mapping_only(
                     id,
                     node.node_type.as_str(),
@@ -7106,7 +7112,9 @@ fn shader_node_string<'a>(
     match node.properties.get(property) {
         None => Ok(default),
         Some(value) => value.as_str().ok_or_else(|| {
-            invalid(format!("shader node property `{property}` must be a string"))
+            invalid(format!(
+                "shader node property `{property}` must be a string"
+            ))
         }),
     }
 }
@@ -7115,7 +7123,9 @@ fn shader_node_float(node: &GraphNode, property: &str, default: f64) -> Result<f
     let value = match node.properties.get(property) {
         None => default,
         Some(value) => value.as_f64().ok_or_else(|| {
-            invalid(format!("shader node property `{property}` must be a number"))
+            invalid(format!(
+                "shader node property `{property}` must be a number"
+            ))
         })?,
     };
     texture_f32(value)
@@ -7125,9 +7135,11 @@ fn shader_node_integer(node: &GraphNode, property: &str, default: i32) -> Result
     let Some(value) = node.properties.get(property) else {
         return Ok(default);
     };
-    let value = value
-        .as_i64()
-        .ok_or_else(|| invalid(format!("shader node property `{property}` must be an integer")))?;
+    let value = value.as_i64().ok_or_else(|| {
+        invalid(format!(
+            "shader node property `{property}` must be an integer"
+        ))
+    })?;
     i32::try_from(value)
         .map_err(|_| invalid(format!("shader node property `{property}` is out of range")))
 }
@@ -7137,7 +7149,9 @@ fn texture_f32(value: f64) -> Result<f32> {
     if value.is_finite() {
         Ok(value)
     } else {
-        Err(eval_error("procedural texture input exceeds the float range"))
+        Err(eval_error(
+            "procedural texture input exceeds the float range",
+        ))
     }
 }
 

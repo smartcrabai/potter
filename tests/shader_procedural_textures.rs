@@ -9,18 +9,23 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::{collections::{BTreeMap, BTreeSet}, fs, path::Path};
 use native_oracle::{
     TestResult, apply_operations, assert_close, checked, export, export_raw, import_blend,
     import_blend_allow_lossy, loss_features, losses, pot, read_scene,
 };
 use potter_core::{
+    error::ErrorCode,
     graph::{self, GraphKind, GraphLink, GraphNode, NodeGroup},
     image::{ImageData, ImageInterpolation, load_image_data, sample},
     model::{Id, Image, Material, Registry, SceneDoc},
     shader::{HitContext, evaluate_surface},
 };
 use serde_json::{Map, Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 use tempfile::tempdir;
 
 const PROBE_PIXEL_TOLERANCE: f64 = 1.0e-3;
@@ -31,8 +36,8 @@ fn procedural_shader_textures_match_blender_and_roundtrip_without_losses() -> Te
         return Ok(());
     };
     let root = tempdir()?;
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/shader_procedural_textures");
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shader_procedural_textures");
     let blend = fixtures.join("procedural_textures.blend");
     let oracle_path = fixtures.join("blender_oracle.json");
     let oracle: Value = serde_json::from_slice(&fs::read(&oracle_path)?)?;
@@ -82,18 +87,17 @@ fn procedural_world_texture_matches_cycles_and_eevee() -> TestResult {
         return Ok(());
     };
     let root = tempdir()?;
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/shader_procedural_textures");
-    let oracle: Value =
-        serde_json::from_slice(&fs::read(fixtures.join("blender_oracle.json"))?)?;
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shader_procedural_textures");
+    let oracle: Value = serde_json::from_slice(&fs::read(fixtures.join("blender_oracle.json"))?)?;
     let blend = fixtures.join("world_procedural.blend");
-    let (project, import_report) =
-        import_blend(&blender, root.path(), "procedural_world", &blend)?;
+    let (project, import_report) = import_blend(&blender, root.path(), "procedural_world", &blend)?;
     assert_lossless(&import_report, "procedural world texture import");
 
     for (engine, oracle_engine) in [("path", "cycles"), ("realtime", "eevee")] {
-        let resolution: [u32; 2] =
-            serde_json::from_value(oracle["world_render"]["renders"][oracle_engine]["resolution"].clone())?;
+        let resolution: [u32; 2] = serde_json::from_value(
+            oracle["world_render"]["renders"][oracle_engine]["resolution"].clone(),
+        )?;
         let image = render_project(
             &project,
             root.path(),
@@ -117,8 +121,12 @@ fn shader_wave_refuses_nondefault_texture_mapping() -> TestResult {
         "texture_mapping".to_owned(),
         json!({"vector_type":"POINT", "scale":[2.0, 1.0, 1.0]}),
     );
-    graph.nodes.insert(output.clone(), GraphNode::new("ShaderNodeOutputMaterial"));
-    graph.nodes.insert(emission.clone(), GraphNode::new("ShaderNodeEmission"));
+    graph
+        .nodes
+        .insert(output.clone(), GraphNode::new("ShaderNodeOutputMaterial"));
+    graph
+        .nodes
+        .insert(emission.clone(), GraphNode::new("ShaderNodeEmission"));
     graph.nodes.insert(wave.clone(), wave_node);
     graph.links = vec![
         GraphLink {
@@ -214,9 +222,7 @@ fn shader_procedural_textures_reject_unknown_and_inactive_inputs() -> TestResult
         .nodes
         .insert(emission.clone(), GraphNode::new("ShaderNodeEmission"));
     inactive.nodes.insert(wave.clone(), wave_node);
-    inactive
-        .nodes
-        .insert(white_noise_id.clone(), white_noise);
+    inactive.nodes.insert(white_noise_id.clone(), white_noise);
     inactive.links = vec![
         GraphLink {
             from_node: wave,
@@ -263,8 +269,8 @@ fn nondefault_blend_texture_mapping_refusal_roundtrips_its_nested_property() -> 
         return Ok(());
     };
     let root = tempdir()?;
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/shader_procedural_textures");
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shader_procedural_textures");
     let blend = fixtures.join("mapped_texture_mapping.blend");
     let (project, import_report) =
         import_blend_allow_lossy(&blender, root.path(), "mapped_texture", &blend)?;
@@ -323,8 +329,18 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
         .as_array()
         .ok_or("oracle probes are missing")?;
     assert!(!probes.is_empty(), "oracle produced no probe tiles");
-    assert_eq!(oracle["renders"]["cycles"]["pixels"].as_array().map(Vec::len), Some(probes.len()));
-    assert_eq!(oracle["renders"]["eevee"]["pixels"].as_array().map(Vec::len), Some(probes.len()));
+    assert_eq!(
+        oracle["renders"]["cycles"]["pixels"]
+            .as_array()
+            .map(Vec::len),
+        Some(probes.len())
+    );
+    assert_eq!(
+        oracle["renders"]["eevee"]["pixels"]
+            .as_array()
+            .map(Vec::len),
+        Some(probes.len())
+    );
 
     let expected_nodes = BTreeSet::from([
         "ShaderNodeTexWave",
@@ -337,7 +353,10 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
         ("ShaderNodeTexWave", BTreeSet::from(["Color", "Fac"])),
         ("ShaderNodeTexMagic", BTreeSet::from(["Color", "Fac"])),
         ("ShaderNodeTexBrick", BTreeSet::from(["Color", "Fac"])),
-        ("ShaderNodeTexWhiteNoise", BTreeSet::from(["Color", "Value"])),
+        (
+            "ShaderNodeTexWhiteNoise",
+            BTreeSet::from(["Color", "Value"]),
+        ),
         (
             "ShaderNodeTexGabor",
             BTreeSet::from(["Value", "Phase", "Intensity"]),
@@ -354,7 +373,9 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
     for probe in probes {
         let id = probe["id"].as_str().ok_or("probe id is missing")?;
         assert!(names.insert(id), "duplicate probe {id}");
-        let node = probe["node_type"].as_str().ok_or("probe node type is missing")?;
+        let node = probe["node_type"]
+            .as_str()
+            .ok_or("probe node type is missing")?;
         let output = probe["output"].as_str().ok_or("probe output is missing")?;
         let coordinate = probe["coordinate_source"]
             .as_str()
@@ -368,27 +389,38 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
         if id == "wave_000_constant_color" {
             assert_eq!(probe["color_mapping"]["brightness"], 1.25);
             assert_eq!(probe["color_mapping"]["use_color_ramp"], true);
-            assert_eq!(probe["color_mapping"]["color_ramp"]["interpolation"], "CONSTANT");
+            assert_eq!(
+                probe["color_mapping"]["color_ramp"]["interpolation"],
+                "CONSTANT"
+            );
             let element = &probe["color_mapping"]["color_ramp"]["elements"][1];
-            assert_json_close(&element["position"], &json!(0.68), "ColorMapping ramp position");
+            assert_json_close(
+                &element["position"],
+                &json!(0.68),
+                "ColorMapping ramp position",
+            );
             assert_json_close(
                 &element["color"],
                 &json!([0.22, 0.72, 0.31, 1.0]),
                 "ColorMapping ramp color",
             );
         }
-        let vector_active = !(node == "ShaderNodeTexWhiteNoise"
-            && properties["noise_dimensions"] == "1D");
+        let vector_active =
+            !(node == "ShaderNodeTexWhiteNoise" && properties["noise_dimensions"] == "1D");
         if vector_active {
             let expected_vector = if coordinate == "constant_row9" {
                 json!([0.17, 0.62, 0.53])
             } else {
                 json!([0.17, 0.31, 0.53])
             };
-            assert_probe_input(probe, "Vector", expected_vector)?;
+            assert_probe_input(probe, "Vector", &expected_vector)?;
         }
         if node == "ShaderNodeTexBrick" && coordinate != "generated" {
-            let vector_y = if coordinate == "constant_row9" { 0.62 } else { 0.31 };
+            let vector_y = if coordinate == "constant_row9" {
+                0.62
+            } else {
+                0.31
+            };
             let row = (vector_y * 4.7_f64 / 0.31).floor() as u32;
             if coordinate == "constant_row9" {
                 assert_eq!(row, 9);
@@ -410,15 +442,27 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
                     ("Detail Roughness", json!(0.37)),
                     ("Phase Offset", json!(0.29)),
                 ] {
-                    assert_probe_input(probe, name, expected)?;
+                    assert_probe_input(probe, name, &expected)?;
                 }
                 waves.insert((
-                    properties["wave_type"].as_str().ok_or("wave_type is missing")?.to_owned(),
-                    properties["wave_profile"].as_str().ok_or("wave_profile is missing")?.to_owned(),
+                    properties["wave_type"]
+                        .as_str()
+                        .ok_or("wave_type is missing")?
+                        .to_owned(),
+                    properties["wave_profile"]
+                        .as_str()
+                        .ok_or("wave_profile is missing")?
+                        .to_owned(),
                     if properties["wave_type"] == "BANDS" {
-                        properties["bands_direction"].as_str().ok_or("bands_direction is missing")?.to_owned()
+                        properties["bands_direction"]
+                            .as_str()
+                            .ok_or("bands_direction is missing")?
+                            .to_owned()
                     } else {
-                        properties["rings_direction"].as_str().ok_or("rings_direction is missing")?.to_owned()
+                        properties["rings_direction"]
+                            .as_str()
+                            .ok_or("rings_direction is missing")?
+                            .to_owned()
                     },
                 ));
             }
@@ -429,13 +473,13 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
                 magic_depths.insert(depth);
                 if depth != 6 {
                     assert_eq!(output, "Fac", "edge-depth probe should use Magic Factor");
-                    assert_eq!(coordinate, "constant", "edge-depth probe should use constant coordinates");
+                    assert_eq!(
+                        coordinate, "constant",
+                        "edge-depth probe should use constant coordinates"
+                    );
                 }
-                for (name, expected) in [
-                    ("Scale", json!(5.1)),
-                    ("Distortion", json!(2.3)),
-                ] {
-                    assert_probe_input(probe, name, expected)?;
+                for (name, expected) in [("Scale", json!(5.1)), ("Distortion", json!(2.3))] {
+                    assert_probe_input(probe, name, &expected)?;
                 }
             }
             "ShaderNodeTexBrick" => {
@@ -458,14 +502,20 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
                     ("Brick Width", json!(0.43)),
                     ("Row Height", json!(0.31)),
                 ] {
-                    assert_probe_input(probe, name, expected)?;
+                    assert_probe_input(probe, name, &expected)?;
                 }
             }
             "ShaderNodeTexWhiteNoise" => {
-                white_noise_dimensions.insert(
-                    properties["noise_dimensions"].as_str().ok_or("noise_dimensions is missing")?.to_owned(),
-                );
-                assert_probe_input(probe, "W", json!(0.73))?;
+                let dimensions = properties["noise_dimensions"]
+                    .as_str()
+                    .ok_or("noise_dimensions is missing")?;
+                white_noise_dimensions.insert(dimensions.to_owned());
+                let expected_w = if matches!(dimensions, "1D" | "4D") {
+                    0.73
+                } else {
+                    0.0
+                };
+                assert_probe_input(probe, "W", &json!(expected_w))?;
             }
             "ShaderNodeTexGabor" => {
                 let dimension = properties["gabor_type"]
@@ -480,9 +530,12 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
                 for (name, expected) in [
                     ("Scale", json!(3.7)),
                     ("Frequency", json!(2.4)),
-                    ("Anisotropy", if edge_case { json!(0.5) } else { json!(0.63) }),
+                    (
+                        "Anisotropy",
+                        if edge_case { json!(0.5) } else { json!(0.63) },
+                    ),
                 ] {
-                    assert_probe_input(probe, name, expected)?;
+                    assert_probe_input(probe, name, &expected)?;
                 }
                 let (orientation, expected) = match (dimension, edge_case) {
                     ("2D", _) => ("Orientation 2D", json!(0.73)),
@@ -490,7 +543,7 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
                     ("3D", false) => ("Orientation 3D", json!([0.36, 0.48, 0.8])),
                     _ => return Err(format!("unexpected Gabor dimension `{dimension}`").into()),
                 };
-                assert_probe_input_identifier(probe, orientation, expected)?;
+                assert_probe_input_identifier(probe, orientation, &expected)?;
             }
             _ => return Err(format!("unexpected procedural texture node {node}").into()),
         }
@@ -540,7 +593,12 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
     );
     assert_eq!(
         white_noise_dimensions,
-        BTreeSet::from(["1D".to_owned(), "2D".to_owned(), "3D".to_owned(), "4D".to_owned()])
+        BTreeSet::from([
+            "1D".to_owned(),
+            "2D".to_owned(),
+            "3D".to_owned(),
+            "4D".to_owned()
+        ])
     );
     assert_eq!(
         gabor_dimensions,
@@ -550,41 +608,52 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
     Ok(())
 }
 
-fn assert_probe_input(probe: &Value, name: &str, expected: Value) -> TestResult {
-    let inputs = probe["inputs"].as_array().ok_or("probe inputs are missing")?;
+fn assert_probe_input(probe: &Value, name: &str, expected: &Value) -> TestResult {
+    let inputs = probe["inputs"]
+        .as_array()
+        .ok_or("probe inputs are missing")?;
     let input = inputs
         .iter()
         .find(|input| input["name"] == name)
         .ok_or_else(|| format!("probe input {name} is missing"))?;
     assert_json_close(
         &input["default"],
-        &expected,
+        expected,
         &format!("{}.inputs.{name}", probe["id"]),
     );
     Ok(())
 }
 
-fn assert_probe_input_identifier(probe: &Value, identifier: &str, expected: Value) -> TestResult {
-    let inputs = probe["inputs"].as_array().ok_or("probe inputs are missing")?;
+fn assert_probe_input_identifier(probe: &Value, identifier: &str, expected: &Value) -> TestResult {
+    let inputs = probe["inputs"]
+        .as_array()
+        .ok_or("probe inputs are missing")?;
     let input = inputs
         .iter()
         .find(|input| input["identifier"] == identifier)
         .ok_or_else(|| format!("probe input identifier {identifier} is missing"))?;
     assert_json_close(
         &input["default"],
-        &expected,
+        expected,
         &format!("{}.inputs.{identifier}", probe["id"]),
     );
     Ok(())
 }
 
 fn assert_imported_probes(scene: &Value, oracle: &Value) -> TestResult {
-    let probes = oracle["probes"].as_array().ok_or("oracle probes are missing")?;
+    let probes = oracle["probes"]
+        .as_array()
+        .ok_or("oracle probes are missing")?;
     for probe in probes {
-        let name = probe["node_name"].as_str().ok_or("probe node name is missing")?;
+        let name = probe["node_name"]
+            .as_str()
+            .ok_or("probe node name is missing")?;
         let (group, node_id, node) = find_node(scene, name)?;
         assert_eq!(node["type"], probe["node_type"], "{name} node type");
-        for (key, expected) in probe["properties"].as_object().ok_or("probe properties are missing")? {
+        for (key, expected) in probe["properties"]
+            .as_object()
+            .ok_or("probe properties are missing")?
+        {
             assert_json_close(&node["properties"][key], expected, &format!("{name}.{key}"));
         }
         for key in ["texture_mapping", "color_mapping"] {
@@ -596,7 +665,10 @@ fn assert_imported_probes(scene: &Value, oracle: &Value) -> TestResult {
                 );
             }
         }
-        for input in probe["inputs"].as_array().ok_or("probe inputs are missing")? {
+        for input in probe["inputs"]
+            .as_array()
+            .ok_or("probe inputs are missing")?
+        {
             let identifier = input["identifier"]
                 .as_str()
                 .ok_or("input identifier is missing")?;
@@ -610,16 +682,24 @@ fn assert_imported_probes(scene: &Value, oracle: &Value) -> TestResult {
                 &format!("{name}.inputs.{identifier}"),
             );
         }
-        let links = group["links"].as_array().ok_or("shader graph links are missing")?;
+        let links = group["links"]
+            .as_array()
+            .ok_or("shader graph links are missing")?;
         let vector_active = !(node["type"] == "ShaderNodeTexWhiteNoise"
             && probe["properties"]["noise_dimensions"] == "1D");
-        let vector_linked = links.iter().any(|link| {
-            link["to_node"] == node_id && link["to_socket"] == "Vector"
-        });
+        let vector_linked = links
+            .iter()
+            .any(|link| link["to_node"] == node_id && link["to_socket"] == "Vector");
         if !vector_active {
-            assert!(!vector_linked, "{name} inactive Vector unexpectedly has an incoming link");
+            assert!(
+                !vector_linked,
+                "{name} inactive Vector unexpectedly has an incoming link"
+            );
         } else if probe["coordinate_source"] == "generated" {
-            assert!(vector_linked, "{name} does not consume Generated coordinates through Vector");
+            assert!(
+                vector_linked,
+                "{name} does not consume Generated coordinates through Vector"
+            );
             assert!(
                 links.iter().any(|link| {
                     link["from_socket"] == "Generated"
@@ -637,8 +717,14 @@ fn assert_imported_probes(scene: &Value, oracle: &Value) -> TestResult {
                 .as_str()
                 .ok_or("constant vector source node ID is missing")?;
             let source = &group["nodes"][source_id];
-            assert_eq!(source["type"], "ShaderNodeCombineXYZ", "{name} constant vector source");
-            assert_eq!(vector_link["from_socket"], "Vector", "{name} constant vector source socket");
+            assert_eq!(
+                source["type"], "ShaderNodeCombineXYZ",
+                "{name} constant vector source"
+            );
+            assert_eq!(
+                vector_link["from_socket"], "Vector",
+                "{name} constant vector source socket"
+            );
             let vector_input = probe["inputs"]
                 .as_array()
                 .into_iter()
@@ -663,9 +749,9 @@ fn assert_imported_probes(scene: &Value, oracle: &Value) -> TestResult {
             let w_identifier = w_input["identifier"]
                 .as_str()
                 .ok_or("W input identifier is missing")?;
-            let w_linked = links.iter().any(|link| {
-                link["to_node"] == node_id && link["to_socket"] == w_identifier
-            });
+            let w_linked = links
+                .iter()
+                .any(|link| link["to_node"] == node_id && link["to_socket"] == w_identifier);
             let w_enabled = w_input["enabled"]
                 .as_bool()
                 .ok_or("W socket enabled state is missing")?;
@@ -694,13 +780,32 @@ fn assert_imported_gn_field(scene: &Value, oracle: &Value) -> TestResult {
     let expected_attributes = gn_oracle["attributes"]
         .as_array()
         .ok_or("Blender GN texture field oracle attributes are missing")?;
-    assert_eq!(expected_attributes.len(), 5, "GN texture node family coverage");
+    assert_eq!(
+        expected_attributes.len(),
+        5,
+        "GN texture node family coverage"
+    );
     for (name, node_type, output, data_type) in [
         ("procedural_wave_fac", "ShaderNodeTexWave", "Fac", "FLOAT"),
         ("procedural_magic_fac", "ShaderNodeTexMagic", "Fac", "FLOAT"),
-        ("procedural_brick_color", "ShaderNodeTexBrick", "Color", "FLOAT_COLOR"),
-        ("procedural_white_noise_color", "ShaderNodeTexWhiteNoise", "Color", "FLOAT_COLOR"),
-        ("procedural_gabor_phase", "ShaderNodeTexGabor", "Phase", "FLOAT"),
+        (
+            "procedural_brick_color",
+            "ShaderNodeTexBrick",
+            "Color",
+            "FLOAT_COLOR",
+        ),
+        (
+            "procedural_white_noise_color",
+            "ShaderNodeTexWhiteNoise",
+            "Color",
+            "FLOAT_COLOR",
+        ),
+        (
+            "procedural_gabor_phase",
+            "ShaderNodeTexGabor",
+            "Phase",
+            "FLOAT",
+        ),
     ] {
         let attribute = expected_attributes
             .iter()
@@ -711,7 +816,9 @@ fn assert_imported_gn_field(scene: &Value, oracle: &Value) -> TestResult {
         assert_eq!(attribute["data_type"], data_type);
     }
     for expected in expected_attributes {
-        let name = expected["name"].as_str().ok_or("GN attribute name is missing")?;
+        let name = expected["name"]
+            .as_str()
+            .ok_or("GN attribute name is missing")?;
         let values = evaluation.mesh.attributes[name]["data"]
             .as_array()
             .ok_or_else(|| format!("Potter GN attribute {name} values are missing"))?;
@@ -720,14 +827,23 @@ fn assert_imported_gn_field(scene: &Value, oracle: &Value) -> TestResult {
             .ok_or_else(|| format!("Blender GN attribute {name} values are missing"))?;
         assert_eq!(values.len(), expected_values.len(), "GN {name} point count");
         for (index, (actual, expected)) in values.iter().zip(expected_values).enumerate() {
-            assert_json_close(actual, expected, &format!("Geometry Nodes {name} at point {index}"));
+            assert_json_close(
+                actual,
+                expected,
+                &format!("Geometry Nodes {name} at point {index}"),
+            );
         }
     }
     Ok(())
 }
 
 fn find_node<'a>(scene: &'a Value, name: &str) -> TestResult<(&'a Value, &'a str, &'a Value)> {
-    for group in scene["node_groups"].as_object().into_iter().flatten().map(|(_, value)| value) {
+    for group in scene["node_groups"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(_, value)| value)
+    {
         if let Some(nodes) = group["nodes"].as_object() {
             for (id, node) in nodes {
                 if node["name"].as_str() == Some(name) {
@@ -805,18 +921,30 @@ fn render_project(
     let image_id = format!("{name}_image");
     let image: Image = serde_json::from_value(scene["images"][&image_id].clone())?;
     let image = load_image_data(&image, project, ImageInterpolation::Closest)?;
-    assert_eq!([image.width, image.height], resolution, "Potter render resolution");
+    assert_eq!(
+        [image.width, image.height],
+        resolution,
+        "Potter render resolution"
+    );
     Ok(image)
 }
 
 fn compare_probe_pixels(image: &ImageData, oracle: &Value, engine: &str) -> TestResult {
-    let probes = oracle["probes"].as_array().ok_or("oracle probes are missing")?;
+    let probes = oracle["probes"]
+        .as_array()
+        .ok_or("oracle probes are missing")?;
     let expected_pixels = oracle["renders"][engine]["pixels"]
         .as_array()
         .ok_or("oracle render pixels are missing")?;
-    let columns = oracle["columns"].as_u64().ok_or("oracle columns are missing")? as f64;
+    let columns = oracle["columns"]
+        .as_u64()
+        .ok_or("oracle columns are missing")? as f64;
     let rows = oracle["rows"].as_u64().ok_or("oracle rows are missing")? as f64;
-    assert_eq!(probes.len(), expected_pixels.len(), "{engine} oracle probe count");
+    assert_eq!(
+        probes.len(),
+        expected_pixels.len(),
+        "{engine} oracle probe count"
+    );
     for (probe, expected) in probes.iter().zip(expected_pixels) {
         let id = probe["id"].as_str().ok_or("probe id is missing")?;
         let uv = [
@@ -848,14 +976,11 @@ fn compare_world_pixels(image: &ImageData, oracle: &Value, engine: &str) -> Test
     let probes = render["probes"]
         .as_array()
         .ok_or("world oracle probes are missing")?;
-    let mut first = None;
+    let mut first: Option<[f64; 4]> = None;
     let mut varied = false;
     for probe in probes {
         let [x, y]: [u32; 2] = serde_json::from_value(probe["pixel"].clone())?;
-        let uv = [
-            (f64::from(x) + 0.5) / width,
-            (f64::from(y) + 0.5) / height,
-        ];
+        let uv = [(f64::from(x) + 0.5) / width, (f64::from(y) + 0.5) / height];
         let expected: [f64; 4] = serde_json::from_value(probe["rgba"].clone())?;
         let actual = sample(image, uv, false);
         for channel in 0..4 {
@@ -872,6 +997,9 @@ fn compare_world_pixels(image: &ImageData, oracle: &Value, engine: &str) -> Test
             first = Some(expected);
         }
     }
-    assert!(varied, "{engine} world oracle probes do not distinguish procedural coordinates");
+    assert!(
+        varied,
+        "{engine} world oracle probes do not distinguish procedural coordinates"
+    );
     Ok(())
 }
