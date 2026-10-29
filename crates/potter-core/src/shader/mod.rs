@@ -3,11 +3,14 @@ mod converters;
 mod world;
 
 mod evaluator;
+pub(crate) mod inline_fold;
 
 pub(crate) use evaluator::{
-    AnisotropyModel, dielectric_f0, evaluate_surface_with_workspace_into, heaviest,
-    make_orthonormals,
+    AnisotropyModel, dielectric_f0, evaluate_surface_with_workspace_into_semantics,
+    evaluate_surface_with_workspace_semantics, heaviest, make_orthonormals,
 };
+
+pub(crate) use evaluator::evaluate_displacement_with_workspace_semantics;
 pub use evaluator::{
     BsdfParams, EvaluatorWorkspace, HitContext, HitDifferentials, HitFootprint, HitUvLayers,
     PreparedMaterial, ShaderClosure, SubsurfaceMethod, SurfaceShading, evaluate_displacement,

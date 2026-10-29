@@ -19,8 +19,9 @@ use crate::{
     shader::{
         BsdfParams, EvaluatorWorkspace, HitContext, HitFootprint, HitUvLayers, PreparedMaterial,
         ShaderClosure, SubsurfaceMethod, SurfaceShading, equirectangular_uv,
-        evaluate_displacement_with_workspace, evaluate_surface_with_workspace,
-        evaluate_surface_with_workspace_into, heaviest, height_gradient, make_orthonormals,
+        evaluate_displacement_with_workspace_semantics, evaluate_surface_with_workspace,
+        evaluate_surface_with_workspace_into_semantics, evaluate_surface_with_workspace_semantics,
+        heaviest, height_gradient, make_orthonormals,
     },
 };
 
@@ -1427,6 +1428,7 @@ pub(super) fn render(
         scene.unit.scale_length,
         images,
         &geometry.shader_warnings,
+        crate::node_kernels::MathSemantics::Cycles,
     )?;
     let world_importance = WorldImportanceSampler::build(doc, &snapshot.scene_id, images)?;
     let mut output = RasterOutput {
@@ -3338,12 +3340,13 @@ impl RealtimeVolumeSample<'_, '_> {
             context.generated_per_local = medium.generated_per_local;
             context.normal = -self.direction;
             context.view_direction = -self.direction;
-            evaluate_surface_with_workspace_into(
+            evaluate_surface_with_workspace_into_semantics(
                 material,
                 prepared,
                 &context,
                 evaluator_workspace,
                 froxel_shading,
+                crate::node_kernels::MathSemantics::Eevee,
             )?;
             for active in froxel_media.iter().filter(|active| {
                 active.object_index == medium.object_index
@@ -3770,6 +3773,7 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
         scene.unit.scale_length,
         images,
         warnings,
+        crate::node_kernels::MathSemantics::Eevee,
     )?;
     let is_grey =
         |color: DVec3| color.x.total_cmp(&color.y).is_eq() && color.y.total_cmp(&color.z).is_eq();
@@ -5419,7 +5423,7 @@ fn trace_path(
     } else {
         1.0
     };
-    Ok((radiance.max(DVec3::ZERO), alpha.clamp(0.0, 1.0)))
+    Ok((radiance, alpha.clamp(0.0, 1.0)))
 }
 
 #[expect(
@@ -6029,11 +6033,12 @@ pub(super) fn hit_params(
                 ));
             }
             let context = frame.context.with_opacity_only();
-            let mut shading = evaluate_surface_with_workspace(
+            let mut shading = evaluate_surface_with_workspace_semantics(
                 frame.material,
                 frame.prepared,
                 &context,
                 evaluator_workspace,
+                crate::node_kernels::MathSemantics::Eevee,
             )?;
             for closure in &mut shading.closures {
                 apply_hit_alpha(frame.material, &mut closure.params);
@@ -6299,11 +6304,12 @@ fn make_surface(
                 && frame.material.displacement_method != "displacement"
             {
                 Some(height_gradient(&frame.context, frame.normal, |sample| {
-                    evaluate_displacement_with_workspace(
+                    evaluate_displacement_with_workspace_semantics(
                         frame.material,
                         frame.prepared,
                         sample,
                         evaluator_workspace,
+                        crate::node_kernels::MathSemantics::Cycles,
                     )
                 })?)
             } else {
@@ -8115,6 +8121,7 @@ fn collect_volumes<'a>(
     meters_per_unit: f64,
     images: &BTreeMap<String, ImageData>,
     warnings: &RefCell<Vec<serde_json::Value>>,
+    math_semantics: crate::node_kernels::MathSemantics,
 ) -> Result<Vec<VolumeInstance<'a>>> {
     let mut volumes = Vec::new();
     let mut evaluator_workspace = EvaluatorWorkspace::default();
@@ -8222,11 +8229,12 @@ fn collect_volumes<'a>(
             context.generated = (local_center - bounds_min) * inverse_size;
             context.generated_per_local = inverse_size;
             context.position = matrix.transform_point3(local_center);
-            Some(evaluate_surface_with_workspace(
+            Some(evaluate_surface_with_workspace_semantics(
                 material,
                 prepared,
                 &context,
                 &mut evaluator_workspace,
+                math_semantics,
             )?)
         } else {
             None
@@ -8494,7 +8502,19 @@ mod volume_shader_context_tests {
         let images = BTreeMap::new();
         let warnings = RefCell::new(Vec::new());
         for (path_traced, falloff) in [(false, 5.0), (true, 0.0)] {
-            let volumes = collect_volumes(&doc, &snapshot, path_traced, 1.0, &images, &warnings)?;
+            let volumes = collect_volumes(
+                &doc,
+                &snapshot,
+                path_traced,
+                1.0,
+                &images,
+                &warnings,
+                if path_traced {
+                    crate::node_kernels::MathSemantics::Cycles
+                } else {
+                    crate::node_kernels::MathSemantics::Eevee
+                },
+            )?;
             assert_eq!(volumes.len(), 1);
             let volume = &volumes[0];
             for (channel, color) in [0.2, 0.4, 0.6].into_iter().enumerate() {

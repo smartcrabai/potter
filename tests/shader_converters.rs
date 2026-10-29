@@ -1,5 +1,7 @@
 #[path = "common/blender_checked.rs"]
 mod blender_checked;
+#[path = "common/eevee_film.rs"]
+mod eevee_film;
 #[path = "common/native_oracle.rs"]
 #[expect(
     dead_code,
@@ -8,6 +10,7 @@ mod blender_checked;
 mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
+use eevee_film::assert_eevee_film_close;
 
 use std::{fs, path::Path};
 
@@ -237,16 +240,6 @@ const EEVEE_PROBES: [&str; 10] = [
     "camera_data",
     "camera_data_bump",
 ];
-/// EEVEE stores and re-accumulates its combined film in RGBA16F. The per-sample
-/// accumulation order can differ by one representable half-float value.
-fn assert_eevee_film_close(actual: f64, expected: f64, context: &str) {
-    let magnitude = expected.abs();
-    let mut ulp = 1.0 / 16_777_216.0;
-    while magnitude >= ulp * 2048.0 {
-        ulp *= 2.0;
-    }
-    assert_close(actual, expected, ulp, context);
-}
 
 fn render_imported_scene(
     project: &Path,

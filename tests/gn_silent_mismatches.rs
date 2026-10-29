@@ -16,7 +16,7 @@ use tempfile::tempdir;
 const BLENDER_REQUIRED: &str =
     "Blender 5.2.2 is required for the Geometry Nodes silent-mismatch oracle";
 const POSITION_TOLERANCE: f64 = 1.0e-5;
-const OBJECT_NAMES: [&str; 15] = [
+const OBJECT_NAMES: [&str; 16] = [
     "GNPoissonInstances",
     "GNCreasedSubdivision",
     "GNSimulationDeltaTime",
@@ -32,6 +32,7 @@ const OBJECT_NAMES: [&str; 15] = [
     "GNNegativeCreaseThenSubdivision",
     "GNStoreReadInt",
     "GNStoreReadBoolean",
+    "GNStoreReadQuaternion",
 ];
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -454,6 +455,19 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
             .into());
         }
     }
+    let quaternion_values = named_attributes["quaternion"]["values"]
+        .as_array()
+        .ok_or("Blender source QUATERNION values are missing")?;
+    if named_attributes["quaternion"]["data_type"] != "QUATERNION"
+        || named_attributes["quaternion"]["attribute_name"] != "source_quaternion"
+        || named_attributes["quaternion"]["domain"] != "POINT"
+        || quaternion_values.len() != 2
+        || quaternion_values[0] != serde_json::json!([0.0, 0.0, 0.0, 2.0])
+        || quaternion_values[1] != serde_json::json!([0.0, 0.0, 0.0, 0.0])
+        || oracle_vertices(&oracle, OBJECT_NAMES[15])?.len() != 2
+    {
+        return Err("Blender oracle does not preserve non-unit and zero QUATERNION values".into());
+    }
     let named_int_oracle = named_attributes["int"]["values"]
         .as_array()
         .ok_or("Blender named INT store/read values are missing")?;
@@ -518,6 +532,12 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
     let base_revision = imported_scene["revision"]
         .as_u64()
         .ok_or("imported scene revision is missing")?;
+    let quaternion_data_id = nodes
+        .values()
+        .find(|node| node["name"].as_str() == Some(OBJECT_NAMES[15]))
+        .and_then(|node| node["data"].as_str())
+        .ok_or("Named Attribute QUATERNION mesh data ID is missing")?
+        .to_owned();
     let mut apply_operations = Vec::with_capacity(2);
     let mut random_int_data_id = None;
     let mut named_int_data_id = None;
@@ -549,7 +569,7 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
         random_int_data_id.ok_or("Random Value INT mesh data ID is missing")?;
     let named_int_data_id =
         named_int_data_id.ok_or("Named Attribute INT mesh data ID is missing")?;
-    let apply_batch_path = output_dir.join("apply_integer_attributes.json");
+    let apply_batch_path = output_dir.join("apply_attributes.json");
     fs::write(
         &apply_batch_path,
         serde_json::to_vec(&serde_json::json!({
@@ -565,7 +585,7 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
             .arg("--file")
             .arg(&apply_batch_path)
             .arg("--json"),
-        "pot apply of INT Geometry Nodes attributes",
+        "pot apply of INT and QUATERNION Geometry Nodes attributes",
     )?;
     let applied_scene: Value = serde_json::from_slice(&fs::read(&project_scene_path)?)?;
     let random_attribute = &applied_scene["data_blocks"][random_int_data_id.as_str()]["mesh"]["attributes"]
@@ -622,6 +642,29 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
             .into());
         }
     }
+    let source_quaternion = &applied_scene["data_blocks"][quaternion_data_id.as_str()]["mesh"]["attributes"]
+        ["source_quaternion"];
+    if source_quaternion["domain"] != "point" || source_quaternion["type"] != "quaternion" {
+        return Err("Potter did not preserve the source QUATERNION attribute".into());
+    }
+    let source_values = source_quaternion["values"]
+        .as_object()
+        .ok_or("Potter source QUATERNION data is missing")?;
+    let mut source_values = source_values.iter().collect::<Vec<_>>();
+    source_values.sort_unstable_by_key(|(name, _)| *name);
+    if source_values.len() != quaternion_values.len() {
+        return Err("Potter source QUATERNION data has the wrong point count".into());
+    }
+    for (index, ((_, actual), expected)) in
+        source_values.into_iter().zip(quaternion_values).enumerate()
+    {
+        if actual != expected {
+            return Err(format!(
+                "Source QUATERNION point {index} differs: Potter={actual}, Blender={expected}"
+            )
+            .into());
+        }
+    }
 
     let obj_path = output_dir.join("potter.obj");
     run_ok(
@@ -657,6 +700,7 @@ fn geometry_nodes_silent_mismatches_match_blender_522_obj_oracle() -> TestResult
         OBJECT_NAMES[10],
         OBJECT_NAMES[13],
         OBJECT_NAMES[14],
+        OBJECT_NAMES[15],
     ] {
         let expected = oracle_vertices(&oracle, name)?;
         compare_vertices_ordered(name, &actual[name], &expected)?;

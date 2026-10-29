@@ -9,7 +9,7 @@ use potter_core::{
     image::{ImageData, ImageInterpolation, ImageTileData},
     model::{Id, Material, Registry, SceneDoc, TextureRef},
     ops::apply_batch,
-    shader::{HitContext, HitDifferentials, HitUvLayers, evaluate_surface},
+    shader::{HitContext, HitDifferentials, HitUvLayers, PreparedMaterial, evaluate_surface},
 };
 use serde_json::json;
 
@@ -107,6 +107,116 @@ fn material_with_graph(graph: NodeGroup) -> (Material, Registry<NodeGroup>) {
     (material, groups)
 }
 
+#[test]
+fn shader_math_inputs_use_declaration_defaults() {
+    let mut math_graph = NodeGroup::new("Math defaults", GraphKind::Shader);
+    add_node(&mut math_graph, "out", "OutputMaterial", &[]);
+    add_node(&mut math_graph, "emission", "ShaderNodeEmission", &[]);
+    add_node(&mut math_graph, "math", "ShaderNodeMath", &[]);
+    math_graph
+        .nodes
+        .get_mut(&Id::new("math").unwrap())
+        .unwrap()
+        .properties
+        .insert("operation".to_owned(), json!("ADD"));
+    link(&mut math_graph, "math", "Value", "emission", "Strength");
+    link(&mut math_graph, "emission", "Emission", "out", "Surface");
+    let (material, groups) = material_with_graph(math_graph);
+    let math_strength = evaluate_surface(&material, &HitContext::new(&groups))
+        .unwrap()
+        .dominant()
+        .unwrap()
+        .emission_strength;
+    assert_eq!(math_strength, 1.0);
+
+    let mut vector_graph = NodeGroup::new("Vector defaults", GraphKind::Shader);
+    add_node(&mut vector_graph, "out", "OutputMaterial", &[]);
+    add_node(&mut vector_graph, "emission", "ShaderNodeEmission", &[]);
+    add_node(
+        &mut vector_graph,
+        "vector",
+        "ShaderNodeVectorMath",
+        &[("Vector", json!([2.0, 3.0, 4.0]))],
+    );
+    vector_graph
+        .nodes
+        .get_mut(&Id::new("vector").unwrap())
+        .unwrap()
+        .properties
+        .insert("operation".to_owned(), json!("MULTIPLY"));
+    add_node(&mut vector_graph, "separate", "ShaderNodeSeparateXYZ", &[]);
+    link(&mut vector_graph, "vector", "Vector", "separate", "Vector");
+    link(&mut vector_graph, "separate", "X", "emission", "Strength");
+    link(&mut vector_graph, "emission", "Emission", "out", "Surface");
+    let (material, groups) = material_with_graph(vector_graph);
+    let vector_strength = evaluate_surface(&material, &HitContext::new(&groups))
+        .unwrap()
+        .dominant()
+        .unwrap()
+        .emission_strength;
+    assert_eq!(vector_strength, 0.0);
+
+    let mut scale_graph = NodeGroup::new("Vector scale default", GraphKind::Shader);
+    add_node(&mut scale_graph, "out", "OutputMaterial", &[]);
+    add_node(&mut scale_graph, "emission", "ShaderNodeEmission", &[]);
+    add_node(
+        &mut scale_graph,
+        "vector",
+        "ShaderNodeVectorMath",
+        &[("Vector", json!([2.0, 0.0, 0.0]))],
+    );
+    scale_graph
+        .nodes
+        .get_mut(&Id::new("vector").unwrap())
+        .unwrap()
+        .properties
+        .insert("operation".to_owned(), json!("SCALE"));
+    add_node(&mut scale_graph, "separate", "ShaderNodeSeparateXYZ", &[]);
+    link(&mut scale_graph, "vector", "Vector", "separate", "Vector");
+    link(&mut scale_graph, "separate", "X", "emission", "Strength");
+    link(&mut scale_graph, "emission", "Emission", "out", "Surface");
+    let (material, groups) = material_with_graph(scale_graph);
+    let scale_strength = evaluate_surface(&material, &HitContext::new(&groups))
+        .unwrap()
+        .dominant()
+        .unwrap()
+        .emission_strength;
+    assert_eq!(scale_strength, 2.0);
+}
+
+#[test]
+fn prepared_shader_folds_deep_shared_inputs_without_rescanning() {
+    let mut graph = NodeGroup::new("Deep shared math", GraphKind::Shader);
+    add_node(&mut graph, "out", "OutputMaterial", &[]);
+    add_node(&mut graph, "principled", "ShaderNodeBsdfPrincipled", &[]);
+    let mut previous = None;
+    for index in 0..30 {
+        let node_id = format!("math_{index}");
+        let mut node = GraphNode::new("ShaderNodeMath");
+        node.properties
+            .insert("operation".to_owned(), json!("MULTIPLY"));
+        if index == 0 {
+            node.inputs.insert("Value".to_owned(), json!(1.0));
+            node.inputs.insert("Value_001".to_owned(), json!(1.0));
+        }
+        graph.nodes.insert(Id::new(node_id.clone()).unwrap(), node);
+        if let Some(previous) = previous.as_deref() {
+            link(&mut graph, previous, "Value", &node_id, "Value");
+            link(&mut graph, previous, "Value", &node_id, "Value_001");
+        }
+        previous = Some(node_id);
+    }
+    link(
+        &mut graph,
+        previous.as_deref().unwrap(),
+        "Value",
+        "principled",
+        "Roughness",
+    );
+    link(&mut graph, "principled", "BSDF", "out", "Surface");
+    let (material, groups) = material_with_graph(graph);
+    let _prepared = PreparedMaterial::new(&material, &groups);
+}
 #[test]
 fn simple_pbr_material_evaluates_through_its_principled_graph() {
     let doc = SceneDoc::new("scene-id".to_owned());
@@ -685,7 +795,11 @@ fn bump_node_uses_realtime_differentials_with_exact_normal() {
         &mut graph,
         "bump",
         "ShaderNodeBump",
-        &[("Distance", json!(1.0)), ("Strength", json!(1.0))],
+        &[
+            ("Distance", json!(1.0)),
+            ("Filter Width", json!(0.125)),
+            ("Strength", json!(1.0)),
+        ],
     );
     add_node(&mut graph, "coordinates", "ShaderNodeTexCoord", &[]);
     add_node(&mut graph, "separate", "ShaderNodeSeparateXYZ", &[]);
@@ -722,9 +836,9 @@ fn bump_node_uses_realtime_differentials_with_exact_normal() {
         .unwrap()
         .dominant()
         .unwrap();
-    assert!((bsdf.normal.x + 0.554_700_196_225_229_1).abs() < 1.0e-12);
+    assert!((bsdf.normal.x - -2.0 / 13.0_f64.sqrt()).abs() < 1.0e-12);
     assert!(bsdf.normal.y.abs() < 1.0e-12);
-    assert!((bsdf.normal.z - 0.832_050_294_337_843_7).abs() < 1.0e-12);
+    assert!((bsdf.normal.z - 3.0 / 13.0_f64.sqrt()).abs() < 1.0e-12);
 }
 
 #[test]

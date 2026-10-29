@@ -24,7 +24,9 @@ use super::{
         SurfaceShader, ViewBasis, WorldRadiance, projection_for_camera, rasterize_wireframe,
         rasterize_with_lines,
     },
-    scene::{Geometry, extract_geometry, surface_shader},
+    scene::{
+        Geometry, extract_geometry_with_semantics, surface_shader, surface_shader_with_semantics,
+    },
     wireframe,
 };
 
@@ -117,8 +119,14 @@ pub fn render_previews(
             Some(project_root),
             Some(cache_directory),
         )?;
-        let mut geometry =
-            extract_geometry(doc, &snapshot, mode, matches!(mode, Mode::Beauty), &images)?;
+        let mut geometry = extract_geometry_with_semantics(
+            doc,
+            &snapshot,
+            mode,
+            matches!(mode, Mode::Beauty),
+            &images,
+            crate::node_kernels::MathSemantics::Cycles,
+        )?;
         for (node_id, error) in &node_errors {
             geometry.warnings.push(json!({
                 "code": "UNSUPPORTED_FEATURE",
@@ -168,7 +176,14 @@ pub fn render_previews(
                 Some(project_root),
                 Some(cache_directory),
             )?;
-            let mut geometry = extract_geometry(doc, &snapshot, mode, true, &images)?;
+            let mut geometry = extract_geometry_with_semantics(
+                doc,
+                &snapshot,
+                mode,
+                true,
+                &images,
+                crate::node_kernels::MathSemantics::Cycles,
+            )?;
             geometry
                 .warnings
                 .extend(snapshot.warnings.iter().map(|warning| json!(warning)));
@@ -351,12 +366,18 @@ pub(crate) fn render_camera_frame(
         session,
     )?;
     let images = super::path::load_images(doc, project_root, None)?;
-    let geometry = extract_geometry(
+    let geometry_math_semantics = if engine == "realtime" {
+        crate::node_kernels::MathSemantics::Eevee
+    } else {
+        crate::node_kernels::MathSemantics::Cycles
+    };
+    let geometry = extract_geometry_with_semantics(
         doc,
         &snapshot,
         mode,
         engine == "path" && matches!(mode, Mode::Beauty),
         &images,
+        geometry_math_semantics,
     )?;
     let engine_for_camera = if engine == "path" && matches!(mode, Mode::Beauty) {
         CameraEngine::Path
@@ -365,7 +386,19 @@ pub(crate) fn render_camera_frame(
     };
     let camera = stored_camera(doc, &snapshot, camera_id, engine_for_camera)?;
     let view = ViewBasis::from_camera(&camera.camera)?;
-    let shader = surface_shader(doc, &snapshot, &images, &geometry, mode, &view);
+    let shader = surface_shader_with_semantics(
+        doc,
+        &snapshot,
+        &images,
+        &geometry,
+        mode,
+        &view,
+        if engine == "realtime" && matches!(mode, Mode::Beauty) {
+            crate::node_kernels::MathSemantics::Eevee
+        } else {
+            crate::node_kernels::MathSemantics::Cycles
+        },
+    );
     let scene = doc
         .scenes
         .get(&snapshot.scene_id)

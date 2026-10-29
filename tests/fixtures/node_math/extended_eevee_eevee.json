@@ -1,0 +1,109 @@
+{
+  "cases": [
+    {
+      "id": "map_float_linear_zero_span_distinct_to_min",
+      "render_kind": "scalar"
+    },
+    {
+      "id": "map_float_linear_zero_span_clamped",
+      "render_kind": "scalar"
+    },
+    {
+      "id": "map_float_smoothstep_zero_span_clamped",
+      "render_kind": "scalar"
+    },
+    {
+      "id": "map_vector_stepped_nonpositive_steps",
+      "render_kind": "color"
+    },
+    {
+      "id": "map_float_linear_default_clamp",
+      "render_kind": "scalar"
+    },
+    {
+      "id": "map_float_stepped_zero_steps",
+      "render_kind": "scalar"
+    },
+    {
+      "id": "ramp_constant_factor_after_stop",
+      "render_kind": "color"
+    },
+    {
+      "id": "ramp_linear_two_stop_near_start",
+      "render_kind": "color"
+    },
+    {
+      "id": "ramp_linear_two_stop_near_end",
+      "render_kind": "color"
+    },
+    {
+      "id": "ramp_linear_texture_near_start",
+      "render_kind": "color"
+    },
+    {
+      "id": "ramp_linear_texture_near_end",
+      "render_kind": "color"
+    },
+    {
+      "id": "ramp_constant_table_constant_factor",
+      "render_kind": "color"
+    },
+    {
+      "id": "curve_float_extend_true_clip_true",
+      "render_kind": "scalar"
+    },
+    {
+      "id": "curve_float_clip_constant_input",
+      "render_kind": "scalar"
+    }
+  ],
+  "eevee": {
+    "curve_float_clip_constant_input": 0.919921875,
+    "curve_float_extend_true_clip_true": 0.9619140625,
+    "map_float_linear_default_clamp": 1.0,
+    "map_float_linear_zero_span_clamped": 0.375,
+    "map_float_linear_zero_span_distinct_to_min": 0.0,
+    "map_float_smoothstep_zero_span_clamped": 0.0,
+    "map_float_stepped_zero_steps": 0.375,
+    "map_vector_stepped_nonpositive_steps": [
+      0.75,
+      0.5,
+      1.416015625
+    ],
+    "ramp_constant_factor_after_stop": [
+      0.0999755859375,
+      0.7998046875,
+      0.39990234375
+    ],
+    "ramp_constant_table_constant_factor": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "ramp_linear_texture_near_end": [
+      0.1004638671875,
+      0.79541015625,
+      0.40478515625
+    ],
+    "ramp_linear_texture_near_start": [
+      0.8935546875,
+      0.101318359375,
+      0.20654296875
+    ],
+    "ramp_linear_two_stop_near_end": [
+      0.0999755859375,
+      0.7998046875,
+      0.39990234375
+    ],
+    "ramp_linear_two_stop_near_start": [
+      0.8984375,
+      0.10113525390625,
+      0.2003173828125
+    ]
+  },
+  "engine": "BLENDER_EEVEE",
+  "resolution": [
+    112,
+    8
+  ]
+}

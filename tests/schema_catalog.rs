@@ -93,7 +93,7 @@ fn schema_kinds_are_meta_schemas_and_operation_batches_validate() -> Result<(), 
         assert!(result["op"].is_null());
         let schema = result["schema"].clone();
         if kind == "scene" {
-            assert_eq!(schema["properties"]["schema_version"]["const"], 16);
+            assert_eq!(schema["properties"]["schema_version"]["const"], 17);
         }
         let validator = jsonschema::validator_for(&schema)?;
         if matches!(kind, "capabilities" | "formats") {
@@ -1089,6 +1089,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "constraint.transformation.reversed_range",
         "constraint.limit_distance.initial_distance",
         "geometry_nodes.evaluator_subset",
+        "geometry_nodes.math_family",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1102,6 +1103,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "shader.vector_space",
         "shader.input_nodes",
         "shader.bump",
+        "shader.math_family",
     ] {
         assert!(
             features.iter().any(|feature| {
@@ -1110,7 +1112,27 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "{feature_id} must enumerate its refused shader variants"
         );
     }
+    for feature_id in [
+        "shader.node.ShaderNodeMix.data_type.ROTATION",
+        "shader.node.ShaderNodeMath.operation.POWER.non_finite_constant_fold",
+    ] {
+        assert!(
+            features.iter().any(|feature| {
+                feature["feature_id"] == feature_id && feature["status"] == "not_supported"
+            }),
+            "{feature_id} must remain explicitly unsupported"
+        );
+    }
     for (feature_id, expected) in [
+        ("geometry_nodes.math_family", "ROTATION Mix"),
+        (
+            "shader.node.ShaderNodeMix.data_type.ROTATION",
+            "ShaderNodeMix ROTATION data type is not evaluated",
+        ),
+        (
+            "shader.node.ShaderNodeMath.operation.POWER.non_finite_constant_fold",
+            "Blender's CPU shader fold produces a non-finite value and Cycles film clamps it to zero",
+        ),
         ("shader.advanced", "Cycles/SVM semantics"),
         (
             "shader.advanced",
@@ -1306,6 +1328,15 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
             "{feature_id} must describe {expected}"
         );
     }
+    let shader_math_family = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "shader.math_family")
+        .expect("shader math-family catalog entry is present");
+    assert_eq!(shader_math_family["status"], "partial");
+    assert_eq!(
+        shader_math_family["reason"],
+        "ShaderNodeMix ROTATION remains unsupported; constant-only shader subgraphs, including values forwarded through nested ShaderNodeGroup inputs and Group Output sockets, use Blender's CPU MultiFunctions. Unlinked Math value inputs default to 0.5 and Vector Math vector inputs to zero. Realtime EEVEE refuses varying Math and VectorMath MODULO quotients outside the signed 32-bit range, varying subnormal VectorMath NORMALIZE inputs, varying non-positive inverse square root, and varying positive-input LOGARITHM with base one. Constant-folded ShaderNodeMath POWER with use_clamp disabled, zero base, and negative exponent is refused because Cycles' film clamp sanitizes its non-finite contribution."
+    );
     let image_surface_format = features
         .iter()
         .find(|feature| feature["feature_id"] == "physics.dynamic_paint_surface.surface_format")
@@ -1418,6 +1449,8 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "the obsolete blanket standard-constraint limitation must not be reported"
     );
     for feature_id in [
+        "shader.node_curve_mapping.state",
+        "shader.node_color_ramp.state",
         "physics.dynamic_paint_surface.image_fileformat",
         "physics.dynamic_paint_surface.topology",
         "physics.point_cache.source_frames",
@@ -1429,6 +1462,14 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
         "constraint.geometry_attribute.instances.normal_field",
         "constraint.geometry_attribute.instances.realize_settings",
         "constraint.geometry_attribute.instances.transform_matrix_mode",
+        "shader.node.ShaderNodeMath.operation.INV_SQRT.glsl_undefined_domain",
+        "shader.node.ShaderNodeMath.operation.INVERSE_SQRT.glsl_undefined_domain",
+        "shader.node.ShaderNodeMath.operation.LOGARITHM.glsl_undefined_domain",
+        "shader.node.ShaderNodeMath.operation.POWER.non_finite_constant_fold",
+        "shader.node.ShaderNodeMath.operation.MODULO.quotient_out_of_range",
+        "shader.node.ShaderNodeVectorMath.operation.MODULO.quotient_out_of_range",
+        "shader.node.ShaderNodeVectorMath.operation.NORMALIZE.subnormal_input",
+        "shader.node.ShaderNodeMix.data_type.ROTATION",
         "graph.instance_component.realize_attribute_columns",
         "graph.instance_component.store_named_attribute_uncaptured",
         "graph.bake.legacy_instance_columns_missing",
@@ -1491,6 +1532,33 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
                 feature["feature_id"] == feature_id && feature["status"] == "not_supported"
             }),
             "{feature_id} must be reported as unsupported"
+        );
+    }
+    let store_named_attribute_types = features
+        .iter()
+        .find(|feature| feature["feature_id"] == "graph.node.store_named_attribute.data_type")
+        .expect("Store Named Attribute type limits are listed in the feature catalog");
+    assert_eq!(
+        store_named_attribute_types["name"],
+        "Store Named Attribute types other than FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN"
+    );
+    assert_eq!(
+        store_named_attribute_types["reason"],
+        "Store Named Attribute supports FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN storage; an absent FLOAT_COLOR Value defaults to Blender's [0.8, 0.8, 0.8, 1.0], while unselected elements of a new attribute receive the type zero. FLOAT_COLOR components must be finite f32 values and QUATERNION components are finite f32 values in xyzw order and are stored verbatim without normalization, including zero. INT requires signed 32-bit values and BOOLEAN requires booleans. BYTE_COLOR, FLOAT2, FLOAT4X4, INT8, and STRING are unsupported."
+    );
+    for feature_id in [
+        "shader.node.ShaderNodeMath.operation.ARCSINE.glsl_undefined_domain",
+        "shader.node.ShaderNodeMath.operation.ARCCOSINE.glsl_undefined_domain",
+        "shader.node.ShaderNodeMath.operation.POWER.glsl_undefined_domain",
+        "shader.node.ShaderNodeMath.operation.COMPARE.sub_half_float_epsilon",
+        "shader.node.ShaderNodeMath.operation.MODULO.precision_boundary",
+        "shader.node.ShaderNodeVectorMath.operation.MODULO.precision_boundary",
+    ] {
+        assert!(
+            !features
+                .iter()
+                .any(|feature| feature["feature_id"] == feature_id),
+            "{feature_id} must not remain in the unsupported catalog"
         );
     }
     assert!(

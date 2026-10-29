@@ -9,7 +9,7 @@ mod native_oracle;
 #[path = "common/process.rs"]
 mod process;
 
-use std::fs;
+use std::{fs, path::Path};
 
 use native_oracle::{
     TestResult, assert_close, export, import_blend, losses, read_scene, run_blender, write_script,
@@ -286,5 +286,102 @@ fn shader_group_interface_defaults_and_nested_links_survive_blend_round_trip() -
         "Group Output",
         "Shader"
     ));
+    Ok(())
+}
+
+struct GroupFoldImage {
+    width: usize,
+    height: usize,
+    pixels: Vec<[f64; 3]>,
+}
+
+fn center_pixel(path: &Path) -> TestResult<[f64; 3]> {
+    let image = exr::prelude::read_first_rgba_layer_from_file(
+        path,
+        |resolution, _| GroupFoldImage {
+            width: resolution.width(),
+            height: resolution.height(),
+            pixels: vec![[0.0; 3]; resolution.width() * resolution.height()],
+        },
+        |image: &mut GroupFoldImage, position, (red, green, blue, _): (f32, f32, f32, f32)| {
+            image.pixels[position.y() * image.width + position.x()] =
+                [f64::from(red), f64::from(green), f64::from(blue)];
+        },
+    )?;
+    let image = image.layer_data.channel_data.pixels;
+    let index = image.height / 2 * image.width + image.width / 2;
+    image
+        .pixels
+        .get(index)
+        .copied()
+        .ok_or_else(|| "shader group oracle render has no centre pixel".into())
+}
+
+#[test]
+fn shader_math_folds_across_group_boundaries_in_cycles_and_eevee() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = tempdir()?;
+    let output_dir = fs::canonicalize(root.path())?;
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shader_group_fold/generate.py");
+    run_blender(&blender, &fixture, None, &output_dir)?;
+
+    let oracle: Value = serde_json::from_slice(&fs::read(output_dir.join("oracle.json"))?)?;
+    let blender_version = oracle["blender_version"]
+        .as_str()
+        .ok_or("Blender group-fold oracle version is missing")?;
+    if !blender_version.starts_with("5.2.2") {
+        return Err(format!("expected Blender 5.2.2, got {blender_version}").into());
+    }
+    let blend = output_dir.join("shader_group_fold.blend");
+    if !blend.is_file() {
+        return Err("Blender group-fold generator did not write its .blend scene".into());
+    }
+    let (project, import_report) = import_blend(&blender, &output_dir, "project", &blend)?;
+    assert!(
+        losses(&import_report).is_empty(),
+        "shader group-fold fixture import lost data: {import_report}"
+    );
+    let project = project
+        .to_str()
+        .ok_or("shader group-fold project path is not UTF-8")?;
+    for (oracle_engine, pot_engine, tolerance) in
+        [("cycles", "path", 1.0e-4), ("eevee", "realtime", 5.0e-3)]
+    {
+        let render_dir = output_dir.join(format!("pot_{oracle_engine}"));
+        let report = native_oracle::pot_json(|command| {
+            command
+                .args([
+                    "render", project, "--engine", pot_engine, "--format", "exr", "--out",
+                ])
+                .arg(&render_dir);
+        })?;
+        let frame = report["result"]["frames"]
+            .as_array()
+            .and_then(|frames| frames.first())
+            .ok_or_else(|| format!("Potter {pot_engine} render returned no frame"))?;
+        let frame_path = frame["path"]
+            .as_str()
+            .ok_or_else(|| format!("Potter {pot_engine} render frame path is missing"))?;
+        let actual = center_pixel(Path::new(frame_path))?;
+        let expected = oracle[oracle_engine]
+            .as_array()
+            .ok_or_else(|| format!("Blender {oracle_engine} pixel is missing"))?;
+        if expected.len() != 3 {
+            return Err(format!("Blender {oracle_engine} pixel is not RGB").into());
+        }
+        for (channel, value) in actual.into_iter().enumerate() {
+            assert_close(
+                value,
+                expected[channel]
+                    .as_f64()
+                    .ok_or_else(|| format!("Blender {oracle_engine} channel is not numeric"))?,
+                tolerance,
+                &format!("{oracle_engine} group-fold channel {channel}"),
+            );
+        }
+    }
     Ok(())
 }

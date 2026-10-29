@@ -10,6 +10,7 @@
 mod blender_f32;
 mod blender_rng;
 pub(crate) mod cache_sequence;
+pub(crate) mod node_kernels;
 pub(crate) const BUILD_IDENTITY: &str = env!("POTTER_BUILD_IDENTITY");
 
 pub mod catalog;

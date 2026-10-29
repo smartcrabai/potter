@@ -27,6 +27,7 @@ ZERO_CREASE_SUBDIVISION_OBJECT = "GNZeroCreaseThenSubdivision"
 NEGATIVE_CREASE_SUBDIVISION_OBJECT = "GNNegativeCreaseThenSubdivision"
 STORE_READ_INT_OBJECT = "GNStoreReadInt"
 STORE_READ_BOOLEAN_OBJECT = "GNStoreReadBoolean"
+STORE_READ_QUATERNION_OBJECT = "GNStoreReadQuaternion"
 OBJECT_NAMES = (
     POISSON_OBJECT,
     SUBDIVISION_OBJECT,
@@ -43,6 +44,7 @@ OBJECT_NAMES = (
     NEGATIVE_CREASE_SUBDIVISION_OBJECT,
     STORE_READ_INT_OBJECT,
     STORE_READ_BOOLEAN_OBJECT,
+    STORE_READ_QUATERNION_OBJECT,
 )
 
 
@@ -90,6 +92,41 @@ def evaluated_int_attribute(obj, depsgraph, name):
         return [int(item.value) for item in attribute.data]
     finally:
         evaluated.to_mesh_clear()
+
+def evaluated_quaternion_attribute(obj, depsgraph, name):
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        attribute = mesh.attributes.get(name)
+        if (
+            attribute is None
+            or attribute.domain != "POINT"
+            or attribute.data_type != "QUATERNION"
+        ):
+            raise RuntimeError(f"evaluated {name} QUATERNION point attribute is missing")
+        return [
+            [float(item.value[1]), float(item.value[2]), float(item.value[3]), float(item.value[0])]
+            for item in attribute.data
+        ]
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def build_quaternion_attribute_case():
+    obj = mesh_object(
+        STORE_READ_QUATERNION_OBJECT,
+        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)],
+        [],
+    )
+    source = obj.data.attributes.new(name="source_quaternion", type="QUATERNION", domain="POINT")
+    source.data[0].value = (2.0, 0.0, 0.0, 0.0)
+    source.data[1].value = (0.0, 0.0, 0.0, 0.0)
+    return {
+        "data_type": "QUATERNION",
+        "attribute_name": "source_quaternion",
+        "domain": "POINT",
+        "point_count": 2,
+    }
 
 
 def build_poisson_case():
@@ -425,6 +462,7 @@ def main():
     named_attributes = {
         "int": build_store_read_case(STORE_READ_INT_OBJECT, "INT"),
         "boolean": build_store_read_case(STORE_READ_BOOLEAN_OBJECT, "BOOLEAN"),
+        "quaternion": build_quaternion_attribute_case(),
     }
     build_simulation_case(scene)
 
@@ -443,6 +481,11 @@ def main():
         bpy.data.objects[STORE_READ_INT_OBJECT],
         depsgraph,
         named_attributes["int"]["copy_attribute_name"],
+    )
+    named_attributes["quaternion"]["values"] = evaluated_quaternion_attribute(
+        bpy.data.objects[STORE_READ_QUATERNION_OBJECT],
+        depsgraph,
+        named_attributes["quaternion"]["attribute_name"],
     )
     oracle = {
         "blender_version": bpy.app.version_string,

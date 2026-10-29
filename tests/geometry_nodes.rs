@@ -553,6 +553,169 @@ fn point_distribution_refuses_input_attribute_propagation_until_modeled() {
 }
 
 #[test]
+fn absent_math_family_inputs_use_declaration_defaults() {
+    let math_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+            json!({"id":"math","type":"ShaderNodeMath","properties":{"operation":"ADD"}}),
+            json!({"id":"combine","type":"ShaderNodeCombineXYZ"}),
+            json!({"id":"position","type":"GeometryNodeSetPosition"}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"position","to_socket":"Geometry"}),
+            json!({"from_node":"math","from_socket":"Value","to_node":"combine","to_socket":"X"}),
+            json!({"from_node":"combine","from_socket":"Vector","to_node":"position","to_socket":"Offset"}),
+            json!({"from_node":"position","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    assert_close(evaluate(&math_doc).mesh.vertices[0].co.x, 1.0);
+
+    let vector_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+            json!({"id":"vector","type":"ShaderNodeVectorMath","properties":{"operation":"MULTIPLY"},"inputs":{"Vector":[2.0,3.0,4.0]}}),
+            json!({"id":"position","type":"GeometryNodeSetPosition"}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"position","to_socket":"Geometry"}),
+            json!({"from_node":"vector","from_socket":"Vector","to_node":"position","to_socket":"Offset"}),
+            json!({"from_node":"position","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    assert_close(evaluate(&vector_doc).mesh.vertices[0].co.x, 0.0);
+
+    let scale_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+            json!({"id":"vector","type":"ShaderNodeVectorMath","properties":{"operation":"SCALE"},"inputs":{"Vector":[2.0,0.0,0.0]}}),
+            json!({"id":"position","type":"GeometryNodeSetPosition"}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"position","to_socket":"Geometry"}),
+            json!({"from_node":"vector","from_socket":"Vector","to_node":"position","to_socket":"Offset"}),
+            json!({"from_node":"position","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    assert_close(evaluate(&scale_doc).mesh.vertices[0].co.x, 2.0);
+
+    let integer_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+            json!({"id":"integer","type":"FunctionNodeIntegerMath","properties":{"operation":"MULTIPLY"},"inputs":{"Value":3}}),
+            json!({"id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"INT"},"inputs":{"Name":"default_integer"}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"store","to_socket":"Geometry"}),
+            json!({"from_node":"integer","from_socket":"Value","to_node":"store","to_socket":"Value"}),
+            json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let integer_mesh = evaluate(&integer_doc).mesh;
+    let integer_values = integer_mesh.attributes["default_integer"]["data"]
+        .as_array()
+        .unwrap();
+    assert_eq!(integer_values.len(), 1);
+    assert_eq!(integer_values[0].as_i64().unwrap(), 0);
+}
+
+#[test]
+fn absent_float_color_store_and_capture_values_use_socket_default() {
+    let store_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":4}}),
+            json!({"id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"FLOAT_COLOR"},"inputs":{"Name":"default_color"}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"store","to_socket":"Geometry"}),
+            json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let stored = evaluate(&store_doc).mesh;
+    let stored_colors = stored.attributes["default_color"]["data"]
+        .as_array()
+        .unwrap();
+    let expected = [0.8_f32, 0.8, 0.8, 1.0].map(f64::from);
+    assert_eq!(stored_colors.len(), 4);
+    for color in stored_colors {
+        for (channel, expected) in color.as_array().unwrap().iter().zip(expected) {
+            assert_close(channel.as_f64().unwrap(), expected);
+        }
+    }
+
+    let capture_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":4}}),
+            json!({"id":"capture","type":"GeometryNodeCaptureAttribute","properties":{"domain":"POINT","data_type":"FLOAT_COLOR"}}),
+            json!({"id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"FLOAT_COLOR"},"inputs":{"Name":"captured_color"}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"capture","to_socket":"Geometry"}),
+            json!({"from_node":"capture","from_socket":"Geometry","to_node":"store","to_socket":"Geometry"}),
+            json!({"from_node":"capture","from_socket":"Attribute","to_node":"store","to_socket":"Value"}),
+            json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let captured = evaluate(&capture_doc).mesh;
+    let captured_colors = captured.attributes["captured_color"]["data"]
+        .as_array()
+        .unwrap();
+    assert_eq!(captured_colors.len(), 4);
+    for color in captured_colors {
+        for (channel, expected) in color.as_array().unwrap().iter().zip(expected) {
+            assert_close(channel.as_f64().unwrap(), expected);
+        }
+    }
+
+    let unselected_doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":1}}),
+            json!({"id":"store","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"FLOAT_COLOR"},"inputs":{"Name":"unselected_color","Selection":false}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"store","to_socket":"Geometry"}),
+            json!({"from_node":"store","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    assert_eq!(
+        evaluate(&unselected_doc).mesh.attributes["unselected_color"]["data"],
+        json!([[0.0, 0.0, 0.0, 0.0]])
+    );
+}
+
+#[test]
+fn quaternion_store_preserves_finite_values_verbatim() {
+    let doc = graph_with_nodes(
+        vec![
+            json!({"id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":2}}),
+            json!({"id":"non_unit","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"QUATERNION"},"inputs":{"Name":"non_unit","Value":[0.0,0.0,0.0,2.0]}}),
+            json!({"id":"zero","type":"GeometryNodeStoreNamedAttribute","properties":{"domain":"POINT","data_type":"QUATERNION"},"inputs":{"Name":"zero","Value":[0.0,0.0,0.0,0.0]}}),
+            json!({"id":"output","type":"NodeGroupOutput"}),
+        ],
+        vec![
+            json!({"from_node":"line","from_socket":"Mesh","to_node":"non_unit","to_socket":"Geometry"}),
+            json!({"from_node":"non_unit","from_socket":"Geometry","to_node":"zero","to_socket":"Geometry"}),
+            json!({"from_node":"zero","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let mesh = evaluate(&doc).mesh;
+    assert_eq!(
+        mesh.attributes["non_unit"]["data"],
+        json!([[0.0, 0.0, 0.0, 2.0], [0.0, 0.0, 0.0, 2.0]])
+    );
+    assert_eq!(
+        mesh.attributes["zero"]["data"],
+        json!([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+    );
+}
+
+#[test]
 fn math_vector_math_and_xyz_nodes_evaluate_as_fields() {
     let math_doc = graph_with_nodes(
         vec![

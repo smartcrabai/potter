@@ -28,7 +28,8 @@ use std::{
 
 use native_oracle::{
     FLOAT_TOLERANCE, StoredCorner, TestResult, apply_operations, attribute, build_oracle,
-    import_blend, mesh_of_node, node_id, normal_code_rows, pot, pot_json, read_scene, value_at,
+    import_blend, mesh_of_node, node_id, normal_code_rows, pot, pot_json, read_scene,
+    run_blender_arguments, value_at, write_script,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -39,6 +40,133 @@ use tempfile::TempDir;
 /// The one legacy corner whose vector is a literal zero; it must upgrade to `explicit_zero`. It lies on
 /// flat face 0, a fan of its own, so the zero agrees with no neighbour.
 const LEGACY_EXPLICIT_ZERO: (usize, usize) = (0, 0);
+
+const SCHEMA14_DEFAULT_NODE_GENERATOR: &str = r#"
+import bpy
+import json
+import math
+import sys
+
+if bpy.app.version != (5, 2, 2):
+    raise RuntimeError("schema-14 default node oracle requires Blender 5.2.2")
+
+blend_path, expected_path = sys.argv[sys.argv.index("--") + 1:]
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+expected = {}
+
+def curve_state(node):
+    mapping = node.mapping
+    handles = {"AUTO": "auto", "AUTO_CLAMPED": "auto_clamped", "VECTOR": "vector"}
+    return {
+        "tone": str(getattr(mapping, "tone", "STANDARD")).lower(),
+        "extend_extrapolate": mapping.extend == "EXTRAPOLATED",
+        "use_clip": bool(mapping.use_clip),
+        "clip": [float(mapping.clip_min_x), float(mapping.clip_min_y),
+                 float(mapping.clip_max_x), float(mapping.clip_max_y)],
+        "black": [float(value) for value in getattr(mapping, "black_level", (0.0, 0.0, 0.0))],
+        "white": [float(value) for value in getattr(mapping, "white_level", (1.0, 1.0, 1.0))],
+        "curves": [
+            {"points": [
+                {"location": [float(point.location[0]), float(point.location[1])],
+                 "handle": handles[point.handle_type]}
+                for point in curve.points
+            ]}
+            for curve in mapping.curves
+        ],
+    }
+
+def make_material(name, node_type):
+    material = bpy.data.materials.new("Default " + name)
+    material.use_nodes = True
+    tree = material.node_tree
+    tree.nodes.clear()
+    node = tree.nodes.new(node_type)
+    node.name = "Default " + name
+    emission = tree.nodes.new("ShaderNodeEmission")
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
+
+    if name == "float":
+        value = 0.375
+        node.inputs[0].default_value = 1.0
+        node.inputs[1].default_value = value
+        tree.links.new(node.outputs["Value"], emission.inputs["Strength"])
+        expected[name] = {
+            "mapping": curve_state(node),
+            "emission_strength": float(node.mapping.evaluate(node.mapping.curves[0], value)),
+        }
+    elif name == "vector":
+        value = (0.25, -0.5, 0.75)
+        node.inputs[0].default_value = 1.0
+        node.inputs[1].default_value = value
+        vector_length = tree.nodes.new("ShaderNodeVectorMath")
+        vector_length.operation = "LENGTH"
+        tree.links.new(node.outputs["Vector"], vector_length.inputs[0])
+        tree.links.new(vector_length.outputs["Value"], emission.inputs["Strength"])
+        mapped = [
+            float(node.mapping.evaluate(node.mapping.curves[index], value[index]))
+            for index in range(3)
+        ]
+        expected[name] = {
+            "mapping": curve_state(node),
+            "emission_strength": math.sqrt(sum(component * component for component in mapped)),
+        }
+    elif name == "rgb":
+        value = (0.125, 0.375, 0.625, 0.8)
+        node.inputs[0].default_value = 1.0
+        node.inputs[1].default_value = value
+        tree.links.new(node.outputs["Color"], emission.inputs["Color"])
+        expected[name] = {
+            "mapping": curve_state(node),
+            "emission_color": [
+                float(node.mapping.evaluate(node.mapping.curves[index], value[index]))
+                for index in range(3)
+            ],
+        }
+    elif name == "ramp":
+        factor = 0.25
+        node.inputs[0].default_value = factor
+        tree.links.new(node.outputs["Color"], emission.inputs["Color"])
+        ramp = node.color_ramp
+        expected[name] = {
+            "color_ramp": {
+                "color_mode": ramp.color_mode,
+                "hue_interpolation": ramp.hue_interpolation,
+                "interpolation": ramp.interpolation,
+                "elements": [
+                    {"position": float(element.position),
+                     "color": [float(value) for value in element.color]}
+                    for element in ramp.elements
+                ],
+            },
+            "emission_color": [float(value) for value in ramp.evaluate(factor)],
+        }
+    else:
+        raise RuntimeError("unknown default node " + name)
+
+    mesh = bpy.data.meshes.new("Default " + name + " Mesh")
+    mesh.from_pydata(
+        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)],
+        [],
+        [(0, 1, 2, 3)],
+    )
+    obj = bpy.data.objects.new("Default " + name + " Object", mesh)
+    scene.collection.objects.link(obj)
+    mesh.materials.append(material)
+
+for name, node_type in (
+    ("float", "ShaderNodeFloatCurve"),
+    ("vector", "ShaderNodeVectorCurve"),
+    ("rgb", "ShaderNodeRGBCurve"),
+    ("ramp", "ShaderNodeValToRGB"),
+):
+    make_material(name, node_type)
+
+bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+with open(expected_path, "w", encoding="utf-8") as stream:
+    json.dump(expected, stream, sort_keys=True)
+"#;
 
 fn fixture_v1() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema_v1_project")
@@ -611,7 +739,7 @@ fn schema_v1_fixture_upgrades_on_apply_without_retired_keys() -> TestResult {
     assert_eq!(applied["ok"], true, "{applied}");
     let document = read_json(&scene.join("scene.json"))?;
     assert_eq!(
-        document["schema_version"], 16,
+        document["schema_version"], 17,
         "apply writes the current schema"
     );
     let mesh = stored_oracle_or_cube(&document)?;
@@ -674,7 +802,7 @@ fn schema_v2_scene_keeps_native_semantics_through_apply_undo_and_redo() -> TestR
         json!([{"op": "node.update", "target": {"id": node_id(&read_scene(&legacy)?, "Oracle")?}, "set": {"name": "Legacy Oracle"}}]),
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
-    assert_eq!(read_json(&legacy.join("scene.json"))?["schema_version"], 16);
+    assert_eq!(read_json(&legacy.join("scene.json"))?["schema_version"], 17);
     let upgraded = stored_legacy_mesh(&legacy)?;
     assert_native_semantics(&upgraded, &native)?;
     assert_upgraded_normals(&upgraded)?;
@@ -742,5 +870,164 @@ fn schema_v2_history_record_is_verified_before_it_is_upgraded() -> TestResult {
     let refused: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(refused["ok"], false, "{refused}");
     assert_eq!(refused["error"]["code"], "INTERNAL_ERROR", "{refused}");
+    Ok(())
+}
+
+fn strip_shader_node_states(value: &mut Value) -> usize {
+    match value {
+        Value::Array(values) => values.iter_mut().map(strip_shader_node_states).sum(),
+        Value::Object(object) => {
+            let property = object
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(|node_type| match node_type {
+                    "ShaderNodeFloatCurve" | "ShaderNodeVectorCurve" | "ShaderNodeRGBCurve" => {
+                        Some("mapping")
+                    }
+                    "ShaderNodeValToRGB" => Some("color_ramp"),
+                    _ => None,
+                })
+                .map(str::to_owned);
+            let mut removed = 0;
+            if let Some(property) = property
+                && object
+                    .get_mut("properties")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|properties| properties.remove(&property))
+                    .is_some()
+            {
+                removed += 1;
+            }
+            removed
+                + object
+                    .values_mut()
+                    .map(strip_shader_node_states)
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+#[test]
+fn schema_fourteen_default_shader_nodes_open_and_evaluate_like_blender() -> TestResult {
+    let Some(blender) = blender_checked::blender_executable() else {
+        return Ok(());
+    };
+    let root = TempDir::new()?;
+    let generator = write_script(
+        root.path(),
+        "schema14_default_nodes.py",
+        SCHEMA14_DEFAULT_NODE_GENERATOR,
+    )?;
+    let blend = root.path().join("schema14_default_nodes.blend");
+    let expected_path = root.path().join("schema14_default_nodes.json");
+    run_blender_arguments(&blender, &generator, None, &[&blend, &expected_path])?;
+    let expected = read_json(&expected_path)?;
+
+    let (project, imported) = import_blend(&blender, root.path(), "schema14-defaults", &blend)?;
+    assert_eq!(imported["ok"], true, "{imported}");
+    let scene_path = project.join("scene.json");
+    let mut scene = read_json(&scene_path)?;
+    assert!(strip_shader_node_states(&mut scene) >= 4);
+
+    for (name, property) in [
+        ("float", "mapping"),
+        ("vector", "mapping"),
+        ("rgb", "mapping"),
+        ("ramp", "color_ramp"),
+    ] {
+        let node_name = format!("Default {name}");
+        let node = scene["node_groups"]
+            .as_object()
+            .ok_or("native node groups are missing")?
+            .values()
+            .filter_map(|group| group.get("nodes").and_then(Value::as_object))
+            .flat_map(|nodes| nodes.values())
+            .find(|node| node.get("name").and_then(Value::as_str) == Some(node_name.as_str()))
+            .ok_or_else(|| format!("native shader node `{node_name}` is missing"))?;
+        assert!(
+            node.get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get(property))
+                .is_none(),
+            "{node_name} state remained present after stripping"
+        );
+    }
+    scene["schema_version"] = json!(14);
+    fs::write(&scene_path, serde_json::to_vec_pretty(&scene)?)?;
+
+    let opened = potter_core::store::Project::open(&project)?;
+    assert_eq!(opened.doc().schema_version, 17);
+    let doc = opened.doc();
+    for (name, property) in [
+        ("float", "mapping"),
+        ("vector", "mapping"),
+        ("rgb", "mapping"),
+        ("ramp", "color_ramp"),
+    ] {
+        let material_name = format!("Default {name}");
+        let material = doc
+            .materials
+            .values()
+            .find(|material| material.name == material_name)
+            .ok_or_else(|| format!("imported material `{material_name}` is missing"))?;
+        let graph_id = material
+            .node_tree
+            .as_ref()
+            .ok_or_else(|| format!("{material_name} has no shader graph"))?;
+        let graph = doc
+            .node_groups
+            .get(graph_id)
+            .ok_or_else(|| format!("{material_name} shader graph is missing"))?;
+        let node_name = format!("Default {name}");
+        let node = graph
+            .nodes
+            .values()
+            .find(|node| node.name == node_name)
+            .ok_or_else(|| format!("shader node `{node_name}` is missing"))?;
+        assert_eq!(
+            node.properties.get(property),
+            Some(&expected[name][property]),
+            "{node_name} state differs from Blender's default"
+        );
+
+        let shading = potter_core::shader::evaluate_surface(
+            material,
+            &potter_core::shader::HitContext::new(&doc.node_groups),
+        )?;
+        let bsdf = shading
+            .dominant()
+            .ok_or_else(|| format!("{material_name} produced no surface closure"))?;
+        if matches!(name, "float" | "vector") {
+            json_close(
+                &json!(bsdf.emission_strength),
+                &expected[name]["emission_strength"],
+                &format!("{name} default curve"),
+            );
+        } else {
+            let expected_color = expected[name]["emission_color"].as_array().ok_or_else(|| {
+                format!(
+                    "Blender {name} emission color is not an array: {}",
+                    expected[name]["emission_color"]
+                )
+            })?;
+            let expected_rgb = json!([
+                expected_color[0]
+                    .as_f64()
+                    .ok_or("Blender emission red is missing")?,
+                expected_color[1]
+                    .as_f64()
+                    .ok_or("Blender emission green is missing")?,
+                expected_color[2]
+                    .as_f64()
+                    .ok_or("Blender emission blue is missing")?
+            ]);
+            json_close(
+                &json!(bsdf.emission_color),
+                &expected_rgb,
+                &format!("{name} default ramp/curve"),
+            );
+        }
+    }
     Ok(())
 }
