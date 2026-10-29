@@ -633,6 +633,8 @@ pub(crate) fn evaluate_modifiers_with_scene_context_and_normals(
                 || last_geometry_nodes_modifier.is_some_and(|last| modifier_index < last);
             let graph_result = graph::evaluate_at_frame_with_bakes_and_instances(
                 group,
+                Some(&group_id),
+                node_groups,
                 Some(&evaluated),
                 Some(&instances),
                 Some(&instance_paths),

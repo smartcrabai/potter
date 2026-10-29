@@ -200,6 +200,70 @@ fn graph_rejects_socket_type_mismatch_and_evaluation_rejects_cycles() {
     .unwrap_err();
     assert_eq!(error.code, ErrorCode::EvaluationFailed);
 }
+#[test]
+fn nested_group_io_is_lazy_and_uses_socket_identifier_defaults() {
+    let doc = apply(
+        &SceneDoc::new("c8a8b9d4-2cbf-4bc4-9b17-6297b72e7d22".to_owned()),
+        &[
+            json!({"op":"graph.create","id":"child","kind":"geometry"}),
+            json!({"op":"graph.interface_update","graph":"child","set":{"inputs":[
+                {"id":"geometry","name":"Geometry","socket_type":"geometry"},
+                {"id":"unused","name":"Unused","socket_type":"float","default":"not-a-number"}
+            ]}}),
+            json!({"op":"graph.node_add","graph":"child","id":"input","type":"NodeGroupInput"}),
+            json!({"op":"graph.node_add","graph":"child","id":"output","type":"NodeGroupOutput"}),
+            json!({"op":"graph.link","graph":"child","from_node":"input","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+            json!({"op":"graph.create","id":"geo","kind":"geometry"}),
+            json!({"op":"graph.node_add","graph":"geo","id":"line","type":"GeometryNodeMeshLine","inputs":{"Count":2}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"nested","type":"GeometryNodeGroup","properties":{"node_tree":"child"}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"output","type":"NodeGroupOutput"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"line","from_socket":"Mesh","to_node":"nested","to_socket":"geometry"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"nested","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let result = graph::evaluate_with_node_groups(
+        &Id::new("geo").unwrap(),
+        &doc.node_groups,
+        None,
+        &Map::new(),
+        "NestedGroup",
+    )
+    .unwrap();
+    assert_eq!(result.mesh.vertices.len(), 2);
+}
+
+#[test]
+fn recursive_geometry_group_calls_return_deterministic_errors() {
+    let doc = apply(
+        &SceneDoc::new("c8a8b9d4-2cbf-4bc4-9b17-6297b72e7d22".to_owned()),
+        &[
+            json!({"op":"graph.create","id":"geo","kind":"geometry"}),
+            json!({"op":"graph.node_add","graph":"geo","id":"recursive","type":"GeometryNodeGroup","properties":{"node_tree":"geo"}}),
+            json!({"op":"graph.node_add","graph":"geo","id":"output","type":"NodeGroupOutput"}),
+            json!({"op":"graph.link","graph":"geo","from_node":"recursive","from_socket":"Geometry","to_node":"output","to_socket":"Geometry"}),
+        ],
+    );
+    let group_id = Id::new("geo").unwrap();
+    let first = graph::evaluate_with_node_groups(
+        &group_id,
+        &doc.node_groups,
+        None,
+        &Map::new(),
+        "RecursiveGroup",
+    )
+    .unwrap_err();
+    let second = graph::evaluate_with_node_groups(
+        &group_id,
+        &doc.node_groups,
+        None,
+        &Map::new(),
+        "RecursiveGroup",
+    )
+    .unwrap_err();
+    assert_eq!(first.code, ErrorCode::EvaluationFailed);
+    assert!(first.message.contains("recursive cycle"));
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+}
 
 #[test]
 fn nodes_modifier_evaluates_graph_and_updates_snapshot_bounds() {

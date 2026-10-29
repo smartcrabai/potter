@@ -15,12 +15,12 @@ use crate::{
         GridParams, IcosphereParams, Mesh, MeshError, ORIGINDEX_NONE,
         modifiers::evaluate_modifiers, origindex_values, set_origindex,
     },
-    model::{Id, Modifier},
+    model::{Id, Modifier, Registry},
 };
 
 use super::{
     GraphKind, GraphNode, NodeBakeFrame, NodeBakeRecord, NodeBakeValue, NodeGroup, same_bake_frame,
-    sockets::{bake_item_identifier, is_known_node_type, node_sockets},
+    sockets::{bake_item_identifier, is_known_node_type, node_sockets, node_sockets_with_groups},
 };
 
 const MAX_GENERATED_POINTS: usize = 1_000_000;
@@ -258,6 +258,12 @@ enum Field {
         min: Box<Field>,
         max: Box<Field>,
     },
+    Function {
+        node_type: String,
+        properties: Map<String, Value>,
+        inputs: BTreeMap<String, Box<Field>>,
+        output: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -268,6 +274,10 @@ enum MixOutput {
 
 struct Evaluator<'a> {
     group: &'a NodeGroup,
+    node_groups: &'a Registry<NodeGroup>,
+    group_stack: Vec<Id>,
+    group_inputs: BTreeMap<String, EvalValue>,
+    top_level: bool,
     subject_name: &'a str,
     input: Option<&'a Mesh>,
     input_instances: Option<&'a EvaluatedInstances>,
@@ -309,6 +319,43 @@ pub fn evaluate(
 ) -> Result<GraphEvaluation> {
     evaluate_at_frame(group, input, overrides, 1.0, subject_name)
 }
+/// Evaluate a registered geometry node group with nested `GeometryNodeGroup` calls.
+///
+/// Inputs are keyed by interface socket ID or name.
+///
+/// # Errors
+///
+/// Returns an error for a missing group, invalid graph, unsupported behavior, or recursive group cycle.
+pub fn evaluate_with_node_groups(
+    group_id: &Id,
+    node_groups: &Registry<NodeGroup>,
+    input: Option<&Mesh>,
+    overrides: &Map<String, Value>,
+    subject_name: &str,
+) -> Result<GraphEvaluation> {
+    let group = node_groups.get(group_id).ok_or_else(|| {
+        PotError::new(
+            ErrorCode::TargetNotFound,
+            format!("geometry node group `{group_id}` was not found"),
+        )
+    })?;
+    evaluate_at_frame_with_bakes_and_instances(
+        group,
+        Some(group_id),
+        node_groups,
+        input,
+        None,
+        None,
+        true,
+        true,
+        overrides,
+        1.0,
+        1.0 / 24.0,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+        subject_name,
+    )
+}
 
 /// Evaluate a geometry node group at a scene frame.
 ///
@@ -347,8 +394,11 @@ pub fn evaluate_at_frame_with_bakes(
     capture_bake_nodes: &BTreeSet<String>,
     subject_name: &str,
 ) -> Result<GraphEvaluation> {
+    let node_groups = Registry::new();
     evaluate_at_frame_with_bakes_and_instances(
         group,
+        None,
+        &node_groups,
         input,
         None,
         None,
@@ -365,6 +415,8 @@ pub fn evaluate_at_frame_with_bakes(
 
 pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
     group: &NodeGroup,
+    group_id: Option<&Id>,
+    node_groups: &Registry<NodeGroup>,
     input: Option<&Mesh>,
     input_instances: Option<&EvaluatedInstances>,
     input_instance_paths: Option<&[Vec<Id>]>,
@@ -393,7 +445,7 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
             "native evaluator supports geometry node groups only",
         ));
     }
-    validate_graph(group)?;
+    validate_graph(group, node_groups)?;
     let capture_instance_attributes = collect_instance_attributes
         || !capture_bake_nodes.is_empty()
         || group
@@ -437,25 +489,7 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
                 })
         })
         .transpose()?;
-    let mut output_nodes = group
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.node_type == "NodeGroupOutput");
-    let output_node = output_nodes
-        .next()
-        .map(|(id, _)| id.clone())
-        .ok_or_else(|| {
-            PotError::new(
-                ErrorCode::EvaluationFailed,
-                "geometry node group has no NodeGroupOutput",
-            )
-        })?;
-    if output_nodes.next().is_some() {
-        return Err(PotError::new(
-            ErrorCode::EvaluationFailed,
-            "geometry node group has multiple NodeGroupOutput nodes",
-        ));
-    }
+    let output_node = select_group_output_node(group)?;
     let output_socket = if group.interface.outputs.is_empty() {
         "Geometry".to_owned()
     } else {
@@ -463,7 +497,7 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
             .interface
             .outputs
             .iter()
-            .find(|socket| socket.socket_type == "geometry")
+            .find(|socket| socket_is_geometry(&socket.socket_type))
             .ok_or_else(|| {
                 PotError::new(
                     ErrorCode::EvaluationFailed,
@@ -493,6 +527,10 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
     };
     let mut evaluator = Evaluator {
         group,
+        node_groups,
+        group_stack: group_id.cloned().into_iter().collect(),
+        group_inputs: BTreeMap::new(),
+        top_level: true,
         subject_name,
         input,
         input_instances,
@@ -564,7 +602,7 @@ pub(crate) fn evaluate_at_frame_with_bakes_and_instances(
     })
 }
 
-fn validate_graph(group: &NodeGroup) -> Result<()> {
+fn validate_graph(group: &NodeGroup, node_groups: &Registry<NodeGroup>) -> Result<()> {
     for (node_id, node) in &group.nodes {
         if !is_known_node_type(&node.node_type) {
             return Err(PotError::with_details(
@@ -573,12 +611,13 @@ fn validate_graph(group: &NodeGroup) -> Result<()> {
                 json!({"feature_id": format!("graph.node.{}", node.node_type), "node_id": node_id}),
             ));
         }
-        let (input_sockets, _) = node_sockets(group, node_id).ok_or_else(|| {
-            PotError::new(
-                ErrorCode::InvalidOperation,
-                "graph node has no socket schema",
-            )
-        })?;
+        let (input_sockets, _) =
+            node_sockets_with_groups(group, node_id, node_groups).ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::InvalidOperation,
+                    "graph node has no socket schema",
+                )
+            })?;
         if let Some(unknown) = node
             .inputs
             .keys()
@@ -591,7 +630,7 @@ fn validate_graph(group: &NodeGroup) -> Result<()> {
             ));
         }
     }
-    super::sockets::validate_group_links(group)?;
+    super::sockets::validate_group_links_with_groups(group, node_groups)?;
     validate_acyclic(group)
 }
 
@@ -626,6 +665,350 @@ fn validate_acyclic(group: &NodeGroup) -> Result<()> {
         visit(id, group, &mut active, &mut complete)?;
     }
     Ok(())
+}
+fn select_group_output_node(group: &NodeGroup) -> Result<Id> {
+    let mut output_nodes = group
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.node_type == "NodeGroupOutput");
+    let Some((first_id, _)) = output_nodes.next() else {
+        return Err(PotError::new(
+            ErrorCode::EvaluationFailed,
+            "geometry node group has no NodeGroupOutput",
+        ));
+    };
+    if output_nodes.next().is_none() {
+        return Ok(first_id.clone());
+    }
+    let mut active_output = None;
+    for (id, node) in group.nodes.iter().filter(|(_, node)| {
+        node.node_type == "NodeGroupOutput"
+            && node
+                .properties
+                .get("is_active_output")
+                .and_then(Value::as_bool)
+                == Some(true)
+    }) {
+        if active_output.replace(id).is_some() {
+            active_output = None;
+            break;
+        }
+    }
+    if let Some(id) = active_output {
+        return Ok(id.clone());
+    }
+    Err(PotError::with_details(
+        ErrorCode::EvaluationFailed,
+        "geometry node group must have exactly one active NodeGroupOutput",
+        json!({"output_nodes":group.nodes.iter()
+            .filter_map(|(id, node)| (node.node_type == "NodeGroupOutput").then_some(id))
+            .collect::<Vec<_>>()}),
+    ))
+}
+
+fn socket_is_geometry(socket_type: &str) -> bool {
+    matches!(socket_type, "geometry" | "NodeSocketGeometry")
+}
+
+fn typed_socket_value(socket_type: &str, value: &Value) -> Result<Value> {
+    let kind = match socket_type {
+        "float"
+        | "NodeSocketFloat"
+        | "NodeSocketFloatFactor"
+        | "NodeSocketFloatAngle"
+        | "NodeSocketFloatDistance"
+        | "NodeSocketFloatPercentage"
+        | "NodeSocketFloatWavelength"
+        | "NodeSocketFloatColorTemperature" => "float",
+        "integer" | "NodeSocketInt" => "integer",
+        "boolean" | "NodeSocketBool" => "boolean",
+        "vector"
+        | "NodeSocketVector"
+        | "NodeSocketVectorDirection"
+        | "NodeSocketVectorEuler"
+        | "NodeSocketVectorTranslation"
+        | "NodeSocketVectorXYZ" => "vector",
+        "color" | "NodeSocketColor" => "color",
+        "rotation" | "NodeSocketRotation" => "rotation",
+        "matrix" | "NodeSocketMatrix" => "matrix",
+        "menu" | "NodeSocketMenu" => "menu",
+        "string" | "NodeSocketString" => "string",
+        "object" | "NodeSocketObject" => "object",
+        "collection" | "NodeSocketCollection" => "collection",
+        "material" | "NodeSocketMaterial" => "material",
+        "image" | "NodeSocketImage" => "image",
+        "geometry" | "NodeSocketGeometry" => "geometry",
+        "shader" | "NodeSocketShader" => "shader",
+        _ => {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!("geometry group socket type `{socket_type}` is not implemented"),
+                json!({"feature_id":format!("graph.socket.{socket_type}")}),
+            ));
+        }
+    };
+    if value.is_null() {
+        return Ok(match kind {
+            "float" => json!(0.0),
+            "integer" => json!(0),
+            "boolean" => json!(false),
+            "vector" => json!([0.0, 0.0, 0.0]),
+            "color" => json!([0.0, 0.0, 0.0, 1.0]),
+            "rotation" => json!([0.0, 0.0, 0.0]),
+            "string" | "menu" => json!(""),
+            _ => Value::Null,
+        });
+    }
+    let valid_number = |value: &Value| value.as_f64().is_some_and(f64::is_finite);
+    match kind {
+        "float" if valid_number(value) => Ok(value.clone()),
+        "integer"
+            if value
+                .as_i64()
+                .is_some_and(|value| i32::try_from(value).is_ok()) =>
+        {
+            Ok(value.clone())
+        }
+        "boolean" if value.is_boolean() => Ok(value.clone()),
+        "vector" | "rotation" => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| evaluation(format!("{} socket input must be an array", kind)))?;
+            let valid_len = if kind == "rotation" {
+                matches!(values.len(), 3 | 4)
+            } else {
+                values.len() == 3
+            };
+            if !valid_len || !values.iter().all(valid_number) {
+                return Err(evaluation(format!(
+                    "{} socket input has an invalid vector representation",
+                    kind
+                )));
+            }
+            Ok(value.clone())
+        }
+        "color" => {
+            let values = value
+                .as_array()
+                .filter(|values| matches!(values.len(), 3 | 4))
+                .ok_or_else(|| evaluation("color socket input must be RGB or RGBA"))?;
+            if !values.iter().all(valid_number) {
+                return Err(evaluation("color socket input must be finite"));
+            }
+            if values.len() == 4 {
+                Ok(value.clone())
+            } else {
+                Ok(json!([values[0], values[1], values[2], 1.0]))
+            }
+        }
+        "matrix" => {
+            let rows = value
+                .as_array()
+                .filter(|rows| rows.len() == 4)
+                .ok_or_else(|| evaluation("matrix socket input must be a 4x4 row array"))?;
+            if !rows.iter().all(|row| {
+                row.as_array()
+                    .is_some_and(|row| row.len() == 4 && row.iter().all(valid_number))
+            }) {
+                return Err(evaluation(
+                    "matrix socket input must be a finite 4x4 row array",
+                ));
+            }
+            Ok(value.clone())
+        }
+        "menu" | "string" if value.is_string() => Ok(value.clone()),
+        "object" | "collection" | "material" | "image" => {
+            let expected = match kind {
+                "object" => "Object",
+                "collection" => "Collection",
+                "material" => "Material",
+                "image" => "Image",
+                _ => return Err(evaluation("invalid resource socket type")),
+            };
+            if let Some(reference) = value.as_str() {
+                if reference.is_empty() {
+                    return Err(evaluation(format!(
+                        "{kind} socket reference must not be empty"
+                    )));
+                }
+                return Ok(value.clone());
+            }
+            let reference = value.as_object().ok_or_else(|| {
+                evaluation(format!("{kind} socket input must be a resource reference"))
+            })?;
+            let reference_id = reference
+                .get("id")
+                .or_else(|| reference.get("name"))
+                .and_then(Value::as_str);
+            if reference.get("id_type").and_then(Value::as_str) != Some(expected)
+                || reference_id.map_or(true, str::is_empty)
+            {
+                return Err(evaluation(format!(
+                    "{kind} socket input must reference a Blender {expected}"
+                )));
+            }
+            Ok(value.clone())
+        }
+        "shader" | "geometry" => Err(evaluation(format!(
+            "{kind} socket value must come from a graph link"
+        ))),
+        _ => Err(evaluation(format!(
+            "{} socket input has an invalid JSON type",
+            kind
+        ))),
+    }
+}
+
+fn reachable_group_inputs(
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    output_node: &Id,
+    output_socket: &str,
+    group_stack: &mut Vec<Id>,
+) -> Result<BTreeSet<String>> {
+    fn visit_output(
+        group: &NodeGroup,
+        node_groups: &Registry<NodeGroup>,
+        node_id: &Id,
+        socket: &str,
+        group_stack: &mut Vec<Id>,
+        visited: &mut BTreeSet<(Id, String)>,
+        active: &mut BTreeSet<(Id, String)>,
+        required: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let key = (node_id.clone(), socket.to_owned());
+        if visited.contains(&key) {
+            return Ok(());
+        }
+        if !active.insert(key.clone()) {
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "geometry node graph contains an evaluation cycle",
+                json!({"node_id":node_id,"socket":socket}),
+            ));
+        }
+        let node = group.nodes.get(node_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                format!("graph node `{node_id}` was not found"),
+            )
+        })?;
+        if node.node_type == "NodeGroupInput" {
+            required.insert(socket.to_owned());
+        } else if node.node_type == "GeometryNodeGroup" {
+            let group_id = node
+                .properties
+                .get("node_tree")
+                .and_then(Value::as_str)
+                .ok_or_else(|| evaluation("Geometry Node Group has no node_tree reference"))?;
+            let group_id = Id::new(group_id.to_owned()).map_err(|_| {
+                evaluation("Geometry Node Group has an invalid node_tree reference")
+            })?;
+            if group_stack.contains(&group_id) {
+                let mut cycle = group_stack.clone();
+                cycle.push(group_id.clone());
+                return Err(PotError::with_details(
+                    ErrorCode::EvaluationFailed,
+                    "geometry node groups contain a recursive cycle",
+                    json!({"group_ids":cycle}),
+                ));
+            }
+            let child = node_groups.get(&group_id).ok_or_else(|| {
+                PotError::new(
+                    ErrorCode::TargetNotFound,
+                    format!("geometry node group `{group_id}` was not found"),
+                )
+            })?;
+            let output_socket = if child.interface.outputs.is_empty() && socket == "Geometry" {
+                None
+            } else {
+                Some(
+                    child
+                        .interface
+                        .outputs
+                        .iter()
+                        .find(|candidate| candidate.id == socket || candidate.name == socket)
+                        .ok_or_else(|| {
+                            evaluation(format!("unknown output socket `{socket}` on node group"))
+                        })?,
+                )
+            };
+            let child_output_node = select_group_output_node(child)?;
+            let child_output_socket =
+                output_socket.map_or("Geometry", |socket| socket.name.as_str());
+            group_stack.push(group_id);
+            let child_inputs = reachable_group_inputs(
+                child,
+                node_groups,
+                &child_output_node,
+                child_output_socket,
+                group_stack,
+            )?;
+            group_stack.pop();
+            for child_input in &child.interface.inputs {
+                if !child_inputs.contains(&child_input.id)
+                    && !child_inputs.contains(&child_input.name)
+                {
+                    continue;
+                }
+                for link in group.links.iter().filter(|link| {
+                    link.to_node == *node_id
+                        && (link.to_socket == child_input.id || link.to_socket == child_input.name)
+                }) {
+                    visit_output(
+                        group,
+                        node_groups,
+                        &link.from_node,
+                        &link.from_socket,
+                        group_stack,
+                        visited,
+                        active,
+                        required,
+                    )?;
+                }
+            }
+        } else {
+            for link in group.links.iter().filter(|link| &link.to_node == node_id) {
+                visit_output(
+                    group,
+                    node_groups,
+                    &link.from_node,
+                    &link.from_socket,
+                    group_stack,
+                    visited,
+                    active,
+                    required,
+                )?;
+            }
+        }
+        active.remove(&key);
+        visited.insert(key);
+        Ok(())
+    }
+
+    let mut required = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut active = BTreeSet::new();
+    for link in group.links.iter().filter(|link| {
+        link.to_node == *output_node
+            && (link.to_socket == output_socket
+                || group.interface.outputs.iter().any(|socket| {
+                    (socket.name == output_socket || socket.id == output_socket)
+                        && (link.to_socket == socket.id || link.to_socket == socket.name)
+                }))
+    }) {
+        visit_output(
+            group,
+            node_groups,
+            &link.from_node,
+            &link.from_socket,
+            group_stack,
+            &mut visited,
+            &mut active,
+            &mut required,
+        )?;
+    }
+    Ok(required)
 }
 
 impl Evaluator<'_> {
@@ -664,6 +1047,7 @@ impl Evaluator<'_> {
     fn evaluate_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
         match node.node_type.as_str() {
             "NodeGroupInput" => self.group_input_value(socket),
+            "GeometryNodeGroup" => self.group_node_value(id, node, socket),
             "NodeGroupOutput" => self.input_value(
                 id,
                 socket,
@@ -710,7 +1094,32 @@ impl Evaluator<'_> {
             "ShaderNodeRGBCurve" => self.curve_node(id, node, socket, "RGBA"),
             "ShaderNodeCombineXYZ" => self.combine_xyz(id, node),
             "ShaderNodeSeparateXYZ" => self.separate_xyz(id, node, socket),
-            "FunctionNodeRandomValue" => self.random_node(id, node, socket),
+            "FunctionNodeAlignEulerToVector"
+            | "FunctionNodeAlignRotationToVector"
+            | "FunctionNodeAxesToRotation"
+            | "FunctionNodeAxisAngleToRotation"
+            | "FunctionNodeCombineMatrix"
+            | "FunctionNodeCombineTransform"
+            | "FunctionNodeEulerToRotation"
+            | "FunctionNodeInputRotation"
+            | "FunctionNodeInvertMatrix"
+            | "FunctionNodeInvertRotation"
+            | "FunctionNodeMatrixDeterminant"
+            | "FunctionNodeMatrixMultiply"
+            | "FunctionNodeMatrixSVD"
+            | "FunctionNodeProjectPoint"
+            | "FunctionNodeQuaternionToRotation"
+            | "FunctionNodeRotateEuler"
+            | "FunctionNodeRotateRotation"
+            | "FunctionNodeRotateVector"
+            | "FunctionNodeRotationToAxisAngle"
+            | "FunctionNodeRotationToEuler"
+            | "FunctionNodeRotationToQuaternion"
+            | "FunctionNodeSeparateMatrix"
+            | "FunctionNodeSeparateTransform"
+            | "FunctionNodeTransformDirection"
+            | "FunctionNodeTransformPoint"
+            | "FunctionNodeTransposeMatrix" => self.rotation_matrix_node(id, node, socket),
             "GeometryNodeBake" => self.bake_node(id, node, socket),
             "GeometryNodeRepeatInput" => self.repeat_input_value(id, node, socket),
             "GeometryNodeRepeatOutput" => self.repeat_output_value(id, node, socket),
@@ -724,6 +1133,44 @@ impl Evaluator<'_> {
                 ),
             )),
         }
+    }
+    fn rotation_matrix_node(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        output: &str,
+    ) -> Result<EvalValue> {
+        let (input_sockets, output_sockets) = node_sockets(self.group, id)
+            .ok_or_else(|| evaluation("rotation or matrix node has no socket schema"))?;
+        if !output_sockets.iter().any(|(socket, _)| socket == output) {
+            return Err(evaluation(format!(
+                "unknown output socket `{output}` on `{}`",
+                node.node_type
+            )));
+        }
+        let mut inputs = BTreeMap::new();
+        for (socket, _) in input_sockets {
+            let fallback = default_input(&node.node_type, &socket).unwrap_or(Value::Null);
+            let input =
+                self.input_value_with_node(id, node, &socket, EvalValue::Scalar(fallback))?;
+            let field = match input {
+                EvalValue::Field(field) => field,
+                EvalValue::Scalar(value) => Field::Constant(value),
+                EvalValue::Geometry(_) => {
+                    return Err(evaluation(format!(
+                        "socket `{socket}` on `{}` received geometry",
+                        node.node_type
+                    )));
+                }
+            };
+            inputs.insert(socket, Box::new(field));
+        }
+        Ok(EvalValue::Field(Field::Function {
+            node_type: node.node_type.clone(),
+            properties: node.properties.clone(),
+            inputs,
+            output: output.to_owned(),
+        }))
     }
 
     fn bake_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
@@ -1108,6 +1555,9 @@ impl Evaluator<'_> {
     }
 
     fn group_input_value(&self, socket: &str) -> Result<EvalValue> {
+        if let Some(value) = self.group_inputs.get(socket) {
+            return Ok(value.clone());
+        }
         let Some((socket_index, interface_socket)) = self
             .group
             .interface
@@ -1121,8 +1571,8 @@ impl Evaluator<'_> {
                 format!("unknown group input socket `{socket}`"),
             ));
         };
-        if interface_socket.socket_type == "geometry" {
-            let has_object_geometry = socket_index == 0;
+        if socket_is_geometry(&interface_socket.socket_type) {
+            let has_object_geometry = self.top_level && socket_index == 0;
             return Ok(EvalValue::Geometry(GeometryValue {
                 mesh: if has_object_geometry {
                     self.input.cloned().unwrap_or_default()
@@ -1141,13 +1591,266 @@ impl Evaluator<'_> {
                 },
             }));
         }
-        let value = self
-            .overrides
+        let value = if self.top_level {
+            self.overrides
+                .get(&interface_socket.id)
+                .or_else(|| self.overrides.get(&interface_socket.name))
+                .unwrap_or(&interface_socket.default)
+        } else {
+            &interface_socket.default
+        };
+        typed_socket_value(&interface_socket.socket_type, value).map(EvalValue::Scalar)
+    }
+
+    fn group_node_value(
+        &mut self,
+        node_id: &Id,
+        node: &GraphNode,
+        output_socket: &str,
+    ) -> Result<EvalValue> {
+        let group_id = node
+            .properties
+            .get("node_tree")
+            .and_then(Value::as_str)
+            .ok_or_else(|| evaluation("Geometry Node Group has no node_tree reference"))?;
+        let group_id = Id::new(group_id.to_owned())
+            .map_err(|_| evaluation("Geometry Node Group has an invalid node_tree reference"))?;
+        if self.group_stack.contains(&group_id) {
+            let mut cycle = self.group_stack.clone();
+            cycle.push(group_id.clone());
+            return Err(PotError::with_details(
+                ErrorCode::EvaluationFailed,
+                "geometry node groups contain a recursive cycle",
+                json!({"group_ids":cycle}),
+            ));
+        }
+        let child_group = self.node_groups.get(&group_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                format!("geometry node group `{group_id}` was not found"),
+            )
+        })?;
+        if child_group.kind != GraphKind::Geometry {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Geometry Node Group references a non-geometry node tree",
+                json!({"node_id":node_id,"node_group":group_id}),
+            ));
+        }
+        validate_graph(child_group, self.node_groups)?;
+        let child_output_socket =
+            if child_group.interface.outputs.is_empty() && output_socket == "Geometry" {
+                None
+            } else {
+                Some(
+                    child_group
+                        .interface
+                        .outputs
+                        .iter()
+                        .find(|candidate| {
+                            candidate.id == output_socket || candidate.name == output_socket
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            PotError::with_details(
+                                ErrorCode::InvalidOperation,
+                                format!(
+                                    "unknown output socket `{output_socket}` on Geometry Node Group"
+                                ),
+                                json!({"node_id":node_id,"socket":output_socket}),
+                            )
+                        })?,
+                )
+            };
+        let output_node = select_group_output_node(child_group)?;
+        let output_link_socket = child_output_socket
+            .as_ref()
+            .map_or_else(|| "Geometry".to_owned(), |socket| socket.name.clone());
+        let child_input_sockets = child_group.interface.inputs.clone();
+        let mut group_stack = self.group_stack.clone();
+        group_stack.push(group_id.clone());
+        let required_inputs = reachable_group_inputs(
+            child_group,
+            self.node_groups,
+            &output_node,
+            &output_link_socket,
+            &mut group_stack,
+        )?;
+        let mut group_inputs = BTreeMap::new();
+        for interface_socket in &child_input_sockets {
+            if !required_inputs.contains(&interface_socket.id)
+                && !required_inputs.contains(&interface_socket.name)
+            {
+                continue;
+            }
+            let value = self.group_call_input(node_id, node, interface_socket)?;
+            group_inputs.insert(interface_socket.id.clone(), value.clone());
+            group_inputs.insert(interface_socket.name.clone(), value);
+        }
+        let output_value = match child_output_socket.as_ref() {
+            None => EvalValue::Geometry(GeometryValue {
+                mesh: Mesh::new(),
+                instance_paths: Vec::new(),
+                instance_attributes: EvaluatedInstances::default(),
+            }),
+            Some(socket) if socket_is_geometry(&socket.socket_type) => {
+                EvalValue::Geometry(GeometryValue {
+                    mesh: Mesh::new(),
+                    instance_paths: Vec::new(),
+                    instance_attributes: EvaluatedInstances::default(),
+                })
+            }
+            Some(socket) => {
+                EvalValue::Scalar(typed_socket_value(&socket.socket_type, &socket.default)?)
+            }
+        };
+        let child_group = self.node_groups.get(&group_id).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::TargetNotFound,
+                format!("geometry node group `{group_id}` was not found"),
+            )
+        })?;
+        let output_node_value = child_group.nodes.get(&output_node).ok_or_else(|| {
+            PotError::new(
+                ErrorCode::EvaluationFailed,
+                "geometry node group output is missing",
+            )
+        })?;
+        let output_input_socket = child_group
+            .links
+            .iter()
+            .find(|link| {
+                link.to_node == output_node
+                    && (link.to_socket == output_link_socket
+                        || child_output_socket
+                            .as_ref()
+                            .is_some_and(|socket| link.to_socket == socket.id))
+            })
+            .map(|link| link.to_socket.clone())
+            .or_else(|| {
+                output_node_value
+                    .inputs
+                    .get_key_value(&output_link_socket)
+                    .map(|(key, _)| key.clone())
+                    .or_else(|| {
+                        child_output_socket.as_ref().and_then(|socket| {
+                            output_node_value
+                                .inputs
+                                .get_key_value(&socket.id)
+                                .map(|(key, _)| key.clone())
+                        })
+                    })
+            })
+            .unwrap_or_else(|| output_link_socket.clone());
+        let simulation_signature = self.nested_group_signature(&group_id, node_id, child_group)?;
+        let mut child = Evaluator {
+            group: child_group,
+            node_groups: self.node_groups,
+            group_stack,
+            group_inputs,
+            top_level: false,
+            subject_name: self.subject_name,
+            input: None,
+            input_instances: None,
+            input_instance_paths: None,
+            capture_instance_attributes: self.capture_instance_attributes,
+            require_instance_attributes: self.require_instance_attributes,
+            overrides: self.overrides,
+            frame: self.frame,
+            frame_duration: self.frame_duration,
+            simulation_delta_times: HashMap::new(),
+            simulation_signature: Some(simulation_signature),
+            simulation_states: HashMap::new(),
+            repeat_states: HashMap::new(),
+            repeat_iterations: HashMap::new(),
+            active: BTreeSet::new(),
+            cache: BTreeMap::new(),
+            bake_records: self.bake_records,
+            capture_bake_nodes: self.capture_bake_nodes,
+            bake_captures: BTreeMap::new(),
+            bake_material_refs: BTreeMap::new(),
+        };
+        child.input_value(&output_node, &output_input_socket, output_value)
+    }
+
+    fn group_call_input(
+        &mut self,
+        node_id: &Id,
+        node: &GraphNode,
+        interface_socket: &super::GraphSocket,
+    ) -> Result<EvalValue> {
+        let linked = self.group.links.iter().find(|link| {
+            link.to_node == *node_id
+                && (link.to_socket == interface_socket.id
+                    || link.to_socket == interface_socket.name)
+        });
+        if let Some(link) = linked {
+            return self.output_value(&link.from_node, &link.from_socket);
+        }
+        if let Some(value) = node
+            .inputs
             .get(&interface_socket.id)
-            .or_else(|| self.overrides.get(&interface_socket.name))
-            .cloned()
-            .unwrap_or_else(|| interface_socket.default.clone());
-        Ok(EvalValue::Scalar(value))
+            .or_else(|| node.inputs.get(&interface_socket.name))
+        {
+            if socket_is_geometry(&interface_socket.socket_type) {
+                return Ok(EvalValue::Geometry(GeometryValue {
+                    mesh: Mesh::new(),
+                    instance_paths: Vec::new(),
+                    instance_attributes: EvaluatedInstances::default(),
+                }));
+            }
+            return typed_socket_value(&interface_socket.socket_type, value).map(EvalValue::Scalar);
+        }
+        if socket_is_geometry(&interface_socket.socket_type) {
+            return Ok(EvalValue::Geometry(GeometryValue {
+                mesh: Mesh::new(),
+                instance_paths: Vec::new(),
+                instance_attributes: EvaluatedInstances::default(),
+            }));
+        }
+        typed_socket_value(&interface_socket.socket_type, &interface_socket.default)
+            .map(EvalValue::Scalar)
+    }
+    fn nested_group_signature(
+        &self,
+        group_id: &Id,
+        callsite_id: &Id,
+        child_group: &NodeGroup,
+    ) -> Result<String> {
+        let serialized = if self.capture_instance_attributes {
+            serde_json::to_value((
+                self.simulation_signature.as_deref(),
+                self.group,
+                child_group,
+                group_id,
+                callsite_id,
+                self.input,
+                self.input_instances,
+                self.input_instance_paths,
+                self.overrides,
+                self.frame_duration,
+            ))
+        } else {
+            serde_json::to_value((
+                self.simulation_signature.as_deref(),
+                self.group,
+                child_group,
+                group_id,
+                callsite_id,
+                self.input,
+                self.input_instances.map(|instances| &instances.transforms),
+                self.input_instance_paths,
+                self.overrides,
+                self.frame_duration,
+            ))
+        }
+        .map_err(|error| {
+            PotError::new(
+                ErrorCode::InternalError,
+                format!("could not serialize nested graph simulation inputs: {error}"),
+            )
+        })?;
+        crate::hash::canonicalize(&serialized).map(|bytes| crate::hash::sha256(&bytes))
     }
 
     fn input_value(
@@ -1626,7 +2329,7 @@ impl Evaluator<'_> {
             "Scale",
             EvalValue::Scalar(json!([1.0, 1.0, 1.0])),
         )?);
-        let rotation = self.quaternion_input(id, node, "Rotation")?;
+        let rotation = self.quaternion_input(id, node, "Rotation", &geometry.mesh)?;
         if !rotation.is_finite() {
             return Err(evaluation("transform rotation must be finite"));
         }
@@ -1811,7 +2514,7 @@ impl Evaluator<'_> {
             "Scale",
             EvalValue::Scalar(json!([1.0, 1.0, 1.0])),
         )?);
-        let rotation = self.quaternion_input(id, node, "Rotation")?;
+        let rotation = self.rotation_field_input(id, node, "Rotation")?;
         let source_node = self
             .group
             .links
@@ -1841,7 +2544,9 @@ impl Evaluator<'_> {
                 ));
             }
             let local_scale = field_vec3(&scale, &points.mesh, index, DVec3::ONE)?;
-            let matrix = DMat4::from_scale_rotation_translation(local_scale, rotation, point.co);
+            let local_rotation = field_quaternion(&rotation, &points.mesh, index, "POINT")?;
+            let matrix =
+                DMat4::from_scale_rotation_translation(local_scale, local_rotation, point.co);
             if self.capture_instance_attributes {
                 if point_columns.is_none() {
                     point_columns = Some(point_domain_attribute_columns(&points.mesh, id)?);
@@ -3086,7 +3791,13 @@ impl Evaluator<'_> {
         }
     }
 
-    fn quaternion_input(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<DQuat> {
+    fn quaternion_input(
+        &mut self,
+        id: &Id,
+        node: &GraphNode,
+        socket: &str,
+        mesh: &Mesh,
+    ) -> Result<DQuat> {
         let value = self.input_value_with_node(
             id,
             node,
@@ -3095,7 +3806,20 @@ impl Evaluator<'_> {
         )?;
         match value {
             EvalValue::Scalar(value) => quaternion_from_json(&value),
-            _ => Err(evaluation("rotation socket received non-scalar value")),
+            EvalValue::Field(field) => field_quaternion(&field, mesh, 0, "POINT"),
+            EvalValue::Geometry(_) => Err(evaluation("rotation socket received geometry")),
+        }
+    }
+    fn rotation_field_input(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<Field> {
+        match self.input_value_with_node(
+            id,
+            node,
+            socket,
+            EvalValue::Scalar(json!([0.0, 0.0, 0.0, 1.0])),
+        )? {
+            EvalValue::Field(field) => Ok(field),
+            EvalValue::Scalar(value) => Ok(Field::Constant(value)),
+            EvalValue::Geometry(_) => Err(evaluation("rotation socket received geometry")),
         }
     }
 }
@@ -3747,6 +4471,61 @@ fn node_default_input(node: &GraphNode, socket: &str) -> Option<Value> {
 fn default_input(node_type: &str, socket: &str) -> Option<Value> {
     let value = match (node_type, socket) {
         ("ShaderNodeMixRGB", "Color1" | "Color2") => json!([0.5, 0.5, 0.5, 1.0]),
+        ("FunctionNodeAlignEulerToVector" | "FunctionNodeAlignRotationToVector", "Rotation")
+        | ("FunctionNodeEulerToRotation", "Euler")
+        | ("FunctionNodeInvertRotation" | "FunctionNodeRotateRotation", "Rotation")
+        | ("FunctionNodeRotateRotation", "Rotate By")
+        | ("FunctionNodeRotateEuler", "Rotation" | "Rotate By")
+        | (
+            "FunctionNodeRotationToAxisAngle"
+            | "FunctionNodeRotationToEuler"
+            | "FunctionNodeRotationToQuaternion",
+            "Rotation",
+        ) => json!([0.0, 0.0, 0.0]),
+        ("FunctionNodeAlignEulerToVector" | "FunctionNodeAlignRotationToVector", "Factor") => {
+            json!(1.0)
+        }
+        ("FunctionNodeAlignEulerToVector" | "FunctionNodeAlignRotationToVector", "Vector")
+        | ("FunctionNodeAxisAngleToRotation", "Axis")
+        | ("FunctionNodeAxesToRotation", "Primary Axis") => json!([0.0, 0.0, 1.0]),
+        ("FunctionNodeAxesToRotation", "Secondary Axis") => json!([1.0, 0.0, 0.0]),
+        ("FunctionNodeAxisAngleToRotation", "Angle") => json!(0.0),
+        ("FunctionNodeRotateEuler", "Axis") => json!([0.0, 0.0, 1.0]),
+        ("FunctionNodeRotateEuler", "Angle") => json!(0.0),
+        ("FunctionNodeCombineTransform", "Translation")
+        | ("FunctionNodeRotateVector", "Vector")
+        | ("FunctionNodeProjectPoint", "Vector")
+        | ("FunctionNodeTransformDirection", "Direction")
+        | ("FunctionNodeTransformPoint", "Vector") => json!([0.0, 0.0, 0.0]),
+        ("FunctionNodeCombineTransform", "Rotation") | ("FunctionNodeRotateVector", "Rotation") => {
+            json!([0.0, 0.0, 0.0])
+        }
+        ("FunctionNodeCombineTransform", "Scale") => json!([1.0, 1.0, 1.0]),
+        ("FunctionNodeQuaternionToRotation", "W") => json!(1.0),
+        ("FunctionNodeQuaternionToRotation", "X" | "Y" | "Z") => json!(0.0),
+        ("FunctionNodeCombineMatrix", "Column 1 Row 1")
+        | ("FunctionNodeCombineMatrix", "Column 2 Row 2")
+        | ("FunctionNodeCombineMatrix", "Column 3 Row 3")
+        | ("FunctionNodeCombineMatrix", "Column 4 Row 4") => json!(1.0),
+        ("FunctionNodeCombineMatrix", "Column 1 Row 2" | "Column 1 Row 3" | "Column 1 Row 4")
+        | ("FunctionNodeCombineMatrix", "Column 2 Row 1" | "Column 2 Row 3" | "Column 2 Row 4")
+        | ("FunctionNodeCombineMatrix", "Column 3 Row 1" | "Column 3 Row 2" | "Column 3 Row 4")
+        | ("FunctionNodeCombineMatrix", "Column 4 Row 1" | "Column 4 Row 2" | "Column 4 Row 3") => {
+            json!(0.0)
+        }
+        (
+            "FunctionNodeInvertMatrix"
+            | "FunctionNodeMatrixDeterminant"
+            | "FunctionNodeMatrixMultiply"
+            | "FunctionNodeMatrixSVD"
+            | "FunctionNodeProjectPoint"
+            | "FunctionNodeSeparateMatrix"
+            | "FunctionNodeSeparateTransform"
+            | "FunctionNodeTransformDirection"
+            | "FunctionNodeTransformPoint"
+            | "FunctionNodeTransposeMatrix",
+            "Matrix" | "Matrix_001" | "Transform",
+        ) => Value::Null,
         ("GeometryNodeTransform", "Mode") => json!("Components"),
         ("GeometryNodeTransform", "Translation")
         | ("GeometryNodeSetPosition", "Offset")
@@ -4353,6 +5132,26 @@ fn field_json_in_context(
         Field::SeparateXYZ { vector, axis } => {
             let vector = vector_field_in_context(vector, context, index, domain, "Separate XYZ")?;
             json!(vector[*axis])
+        }
+        Field::Function {
+            node_type,
+            properties,
+            inputs,
+            output,
+        } => {
+            let mut values: [(&str, Value); 16] = std::array::from_fn(|_| ("", Value::Null));
+            let mut count = 0;
+            for (socket, field) in inputs {
+                if count == values.len() {
+                    return Err(evaluation("rotation or matrix node has too many inputs"));
+                }
+                values[count] = (
+                    socket,
+                    field_json_in_context(field, context, index, domain)?,
+                );
+                count += 1;
+            }
+            super::rotation_matrix::evaluate(node_type, properties, &values[..count], output)?
         }
         Field::Random {
             seed,
@@ -6459,6 +7258,48 @@ fn unsupported_instance_field_feature(feature_id: &str, detail: impl Into<String
         detail,
         json!({"feature_id": feature_id}),
     )
+}
+
+fn rotation_json(value: &Value) -> Result<DQuat> {
+    if let Some(euler) = json_vec3(value) {
+        return Ok(DQuat::from_euler(
+            glam::EulerRot::XYZEx,
+            euler.x,
+            euler.y,
+            euler.z,
+        ));
+    }
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 4)
+        .ok_or_else(|| evaluation("rotation socket input must be Euler vec3 or quaternion"))?;
+    let component = |index: usize| {
+        values[index]
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| evaluation("rotation quaternion must be finite"))
+    };
+    let x = component(0)?;
+    let y = component(1)?;
+    let z = component(2)?;
+    let w = component(3)?;
+    let length_squared = x * x + y * y + z * z + w * w;
+    if !length_squared.is_finite() {
+        return Err(evaluation("rotation quaternion cannot be normalized"));
+    }
+    if length_squared == 0.0 {
+        return Ok(DQuat::IDENTITY);
+    }
+    let rotation = DQuat::from_xyzw(x, y, z, w).normalize();
+    if rotation.to_array().iter().all(|value| value.is_finite()) {
+        Ok(rotation)
+    } else {
+        Err(evaluation("rotation quaternion cannot be normalized"))
+    }
+}
+
+fn field_quaternion(field: &Field, mesh: &Mesh, index: usize, domain: &str) -> Result<DQuat> {
+    rotation_json(&field_json(field, mesh, index, domain)?)
 }
 
 fn json_vec3(value: &Value) -> Option<DVec3> {

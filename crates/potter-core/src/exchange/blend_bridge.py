@@ -283,7 +283,10 @@ def plain(value, depth=0):
     if isinstance(value, Matrix):
         return matrix_rows(value)
     if all(hasattr(value, axis) for axis in ("r", "g", "b")):
-        return [float(value.r), float(value.g), float(value.b)]
+        channels = [float(value.r), float(value.g), float(value.b)]
+        if hasattr(value, "a"):
+            channels.append(float(value.a))
+        return channels
     if isinstance(value, Euler):
         return [float(value.x), float(value.y), float(value.z)]
     if hasattr(value, "w") and hasattr(value, "to_euler"):
@@ -6159,8 +6162,17 @@ def compatibility_name(doc, entity_kind, identifier, fallback):
 
 def _resolve_compat_value(value, id_lookup):
     if isinstance(value, dict):
+        if "id_type" in value and "id" in value:
+            candidate = id_lookup.get(value["id"])
+            if candidate is None or candidate.bl_rna.identifier != value["id_type"]:
+                raise ValueError("compatibility data references unavailable %s ID %s"
+                                 % (value["id_type"], value["id"]))
+            return candidate
         if "id_type" in value and "name" in value:
-            candidate = id_lookup.get(value["name"])
+            resource_key = value.get("bridge_id", value["name"])
+            candidate = id_lookup.get("%s:%s" % (value["id_type"], resource_key))
+            if candidate is None:
+                candidate = id_lookup.get(value["name"])
             if candidate is None or candidate.bl_rna.identifier != value["id_type"]:
                 raise ValueError(
                     "compatibility data references unavailable ID %s (available: %s)"
@@ -6255,8 +6267,8 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             node.location = source["location"]
         node_properties = dict(source.get("properties", {}))
         group_tree_reference = (node_properties.pop("node_tree", None)
-                                if node.bl_idname == "ShaderNodeGroup" else None)
-        # Empty lists mark defaults lost by older imports; Rust's loss gate guards Blender's constructor defaults.
+                                if node.bl_idname in ("ShaderNodeGroup", "GeometryNodeGroup")
+                                else None)
         output_defaults = node_properties.pop("potter_output_defaults", [])
         restore_curve_mapping = (
             node.bl_idname in _NODE_CURVE_MAPPING_TYPES and "mapping" in node_properties)
@@ -10262,6 +10274,11 @@ def export_doc(doc, target, pack, scene_hash, context):
     id_lookup.update({image.name_full: image for image in image_map.values()})
     id_lookup.update(image_map)
     id_lookup.update({image.name_full: image for image in linked_maps["resources"].values()})
+    adapter_ids = (doc.get("compatibility", {}).get("blender_adapter", {})
+                   .get("id_mappings", {}))
+    for reference, identifier in adapter_ids.items():
+        if isinstance(identifier, str) and identifier in id_lookup:
+            id_lookup[reference] = id_lookup[identifier]
     texture_map = _legacy_textures_from_doc(doc, image_map)
     socket_maps = _populate_geometry_groups(group_map, group_sources, id_lookup)
     for material_id, item in doc.get("materials", {}).items():

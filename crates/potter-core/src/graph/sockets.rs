@@ -18,6 +18,7 @@ pub fn is_known_node_type(node_type: &str) -> bool {
         node_type,
         "NodeGroupInput"
             | "NodeGroupOutput"
+            | "GeometryNodeGroup"
             | "GeometryNodeMeshCube"
             | "GeometryNodeMeshIcoSphere"
             | "GeometryNodeTransform"
@@ -34,6 +35,32 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "GeometryNodeMeshCone"
             | "GeometryNodeMeshLine"
             | "GeometryNodeMeshCircle"
+            | "FunctionNodeAlignEulerToVector"
+            | "FunctionNodeAlignRotationToVector"
+            | "FunctionNodeAxesToRotation"
+            | "FunctionNodeAxisAngleToRotation"
+            | "FunctionNodeCombineMatrix"
+            | "FunctionNodeCombineTransform"
+            | "FunctionNodeEulerToRotation"
+            | "FunctionNodeInputRotation"
+            | "FunctionNodeInvertMatrix"
+            | "FunctionNodeInvertRotation"
+            | "FunctionNodeMatrixDeterminant"
+            | "FunctionNodeMatrixMultiply"
+            | "FunctionNodeMatrixSVD"
+            | "FunctionNodeProjectPoint"
+            | "FunctionNodeQuaternionToRotation"
+            | "FunctionNodeRotateEuler"
+            | "FunctionNodeRotateRotation"
+            | "FunctionNodeRotateVector"
+            | "FunctionNodeRotationToAxisAngle"
+            | "FunctionNodeRotationToEuler"
+            | "FunctionNodeRotationToQuaternion"
+            | "FunctionNodeSeparateMatrix"
+            | "FunctionNodeSeparateTransform"
+            | "FunctionNodeTransformDirection"
+            | "FunctionNodeTransformPoint"
+            | "FunctionNodeTransposeMatrix"
             | "ShaderNodeMath"
             | "ShaderNodeMapRange"
             | "ShaderNodeClamp"
@@ -214,6 +241,168 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
         "GeometryNodeMeshCircle" => (
             sockets(&[("Vertices", "integer"), ("Radius", "float")]),
             sockets(MESH_OUT),
+        ),
+        "FunctionNodeAlignEulerToVector" => (
+            sockets(&[
+                ("Rotation", "vector"),
+                ("Factor", "float"),
+                ("Vector", "vector"),
+            ]),
+            sockets(&[("Rotation", "vector")]),
+        ),
+        "FunctionNodeAlignRotationToVector" => (
+            sockets(&[
+                ("Rotation", "rotation"),
+                ("Factor", "float"),
+                ("Vector", "vector"),
+            ]),
+            sockets(&[("Rotation", "rotation")]),
+        ),
+        "FunctionNodeAxesToRotation" => (
+            sockets(&[("Primary Axis", "vector"), ("Secondary Axis", "vector")]),
+            sockets(&[("Rotation", "rotation")]),
+        ),
+        "FunctionNodeAxisAngleToRotation" => (
+            sockets(&[("Axis", "vector"), ("Angle", "float")]),
+            sockets(&[("Rotation", "rotation")]),
+        ),
+        "FunctionNodeCombineMatrix" => (
+            sockets(&[
+                ("Column 1 Row 1", "float"),
+                ("Column 1 Row 2", "float"),
+                ("Column 1 Row 3", "float"),
+                ("Column 1 Row 4", "float"),
+                ("Column 2 Row 1", "float"),
+                ("Column 2 Row 2", "float"),
+                ("Column 2 Row 3", "float"),
+                ("Column 2 Row 4", "float"),
+                ("Column 3 Row 1", "float"),
+                ("Column 3 Row 2", "float"),
+                ("Column 3 Row 3", "float"),
+                ("Column 3 Row 4", "float"),
+                ("Column 4 Row 1", "float"),
+                ("Column 4 Row 2", "float"),
+                ("Column 4 Row 3", "float"),
+                ("Column 4 Row 4", "float"),
+            ]),
+            sockets(&[("Matrix", "matrix")]),
+        ),
+        "FunctionNodeCombineTransform" => (
+            sockets(&[
+                ("Translation", "vector"),
+                ("Rotation", "rotation"),
+                ("Scale", "vector"),
+            ]),
+            sockets(&[("Transform", "matrix")]),
+        ),
+        "FunctionNodeEulerToRotation" => (
+            sockets(&[("Euler", "vector")]),
+            sockets(&[("Rotation", "rotation")]),
+        ),
+        "FunctionNodeInputRotation" => (Vec::new(), sockets(&[("Rotation", "rotation")])),
+        "FunctionNodeInvertMatrix" => (
+            sockets(&[("Matrix", "matrix")]),
+            sockets(&[("Matrix", "matrix"), ("Invertible", "boolean")]),
+        ),
+        "FunctionNodeInvertRotation" => (
+            sockets(&[("Rotation", "rotation")]),
+            sockets(&[("Rotation", "rotation")]),
+        ),
+        "FunctionNodeMatrixDeterminant" => (
+            sockets(&[("Matrix", "matrix")]),
+            sockets(&[("Determinant", "float")]),
+        ),
+        "FunctionNodeMatrixMultiply" => (
+            sockets(&[("Matrix", "matrix"), ("Matrix_001", "matrix")]),
+            sockets(&[("Matrix", "matrix")]),
+        ),
+        "FunctionNodeMatrixSVD" => (
+            sockets(&[("Matrix", "matrix")]),
+            sockets(&[("U", "matrix"), ("S", "vector"), ("V", "matrix")]),
+        ),
+        "FunctionNodeProjectPoint" => (
+            sockets(&[("Vector", "vector"), ("Transform", "matrix")]),
+            sockets(&[("Vector", "vector")]),
+        ),
+        "FunctionNodeQuaternionToRotation" => (
+            sockets(&[
+                ("W", "float"),
+                ("X", "float"),
+                ("Y", "float"),
+                ("Z", "float"),
+            ]),
+            sockets(&[("Rotation", "rotation")]),
+        ),
+        "FunctionNodeRotateEuler" => {
+            let inputs = match node
+                .properties
+                .get("rotation_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("EULER")
+            {
+                "EULER" => sockets(&[("Rotation", "vector"), ("Rotate By", "vector")]),
+                "AXIS_ANGLE" => sockets(&[
+                    ("Rotation", "vector"),
+                    ("Axis", "vector"),
+                    ("Angle", "float"),
+                ]),
+                _ => return None,
+            };
+            (inputs, sockets(&[("Rotation", "vector")]))
+        }
+        "FunctionNodeRotateRotation" => (
+            sockets(&[("Rotation", "rotation"), ("Rotate By", "rotation")]),
+            sockets(&[("Rotation", "rotation")]),
+        ),
+        "FunctionNodeRotateVector" => (
+            sockets(&[("Vector", "vector"), ("Rotation", "rotation")]),
+            sockets(&[("Vector", "vector")]),
+        ),
+        "FunctionNodeRotationToAxisAngle" => (
+            sockets(&[("Rotation", "rotation")]),
+            sockets(&[("Axis", "vector"), ("Angle", "float")]),
+        ),
+        "FunctionNodeRotationToEuler" => (
+            sockets(&[("Rotation", "rotation")]),
+            sockets(&[("Euler", "vector")]),
+        ),
+        "FunctionNodeRotationToQuaternion" => (
+            sockets(&[("Rotation", "rotation")]),
+            sockets(&[
+                ("W", "float"),
+                ("X", "float"),
+                ("Y", "float"),
+                ("Z", "float"),
+            ]),
+        ),
+        "FunctionNodeSeparateMatrix" => {
+            let outputs: Vec<_> = (1..=4)
+                .flat_map(|column| {
+                    (1..=4)
+                        .map(move |row| (format!("Column {column} Row {row}"), "float".to_owned()))
+                })
+                .collect();
+            (sockets(&[("Matrix", "matrix")]), outputs)
+        }
+        "FunctionNodeSeparateTransform" => (
+            sockets(&[("Transform", "matrix")]),
+            sockets(&[
+                ("Translation", "vector"),
+                ("Rotation", "rotation"),
+                ("Scale", "vector"),
+            ]),
+        ),
+        "FunctionNodeTransformDirection" => (
+            sockets(&[("Direction", "vector"), ("Transform", "matrix")]),
+            sockets(&[("Direction", "vector")]),
+        ),
+        "FunctionNodeTransformPoint" => (
+            sockets(&[("Vector", "vector"), ("Transform", "matrix")]),
+            sockets(&[("Vector", "vector")]),
+        ),
+        "FunctionNodeTransposeMatrix" => (
+            sockets(&[("Matrix", "matrix")]),
+            sockets(&[("Matrix", "matrix")]),
         ),
         "CompositorNodeRLayers" => (Vec::new(), sockets(&[("Image", "image")])),
         "CompositorNodeAlphaOver" => (
@@ -824,9 +1013,20 @@ fn socket_type(
     output: bool,
 ) -> Option<String> {
     let node = group.nodes.get(node_id)?;
-    if node.node_type == "ShaderNodeGroup" {
+    if matches!(
+        node.node_type.as_str(),
+        "ShaderNodeGroup" | "GeometryNodeGroup"
+    ) {
         let group_id = node.properties.get("node_tree")?.as_str()?;
         let child_group = node_groups?.get(group_id)?;
+        if node.node_type == "GeometryNodeGroup"
+            && output
+            && child_group.kind == super::GraphKind::Geometry
+            && child_group.interface.outputs.is_empty()
+            && socket_name == "Geometry"
+        {
+            return Some("geometry".to_owned());
+        }
         let sockets = if output {
             &child_group.interface.outputs
         } else {
@@ -893,18 +1093,23 @@ fn graph_socket_type(socket_type: &str) -> Option<&'static str> {
         | "NodeSocketFloatColorTemperature" => Some("float"),
         "integer" | "NodeSocketInt" => Some("integer"),
         "boolean" | "NodeSocketBool" => Some("boolean"),
-        "vector" | "NodeSocketVector" | "NodeSocketVectorDirection" | "NodeSocketVectorEuler" => {
-            Some("vector")
-        }
+        "vector"
+        | "NodeSocketVector"
+        | "NodeSocketVectorDirection"
+        | "NodeSocketVectorEuler"
+        | "NodeSocketVectorTranslation"
+        | "NodeSocketVectorXYZ" => Some("vector"),
         "color" | "NodeSocketColor" => Some("color"),
-        "shader" | "NodeSocketShader" => Some("shader"),
-        "geometry" | "NodeSocketGeometry" => Some("geometry"),
-        "string" | "NodeSocketString" => Some("string"),
         "rotation" | "NodeSocketRotation" => Some("rotation"),
+        "matrix" | "NodeSocketMatrix" => Some("matrix"),
+        "menu" | "NodeSocketMenu" => Some("menu"),
+        "object" | "NodeSocketObject" => Some("object"),
+        "collection" | "NodeSocketCollection" => Some("collection"),
+        "material" | "NodeSocketMaterial" => Some("material"),
+        "image" | "NodeSocketImage" => Some("image"),
         _ => None,
     }
 }
-
 fn dynamic_value_type(node: &super::GraphNode) -> String {
     let data_type = node
         .properties
@@ -967,6 +1172,72 @@ fn validate_link_with_registry(
 pub(super) fn validate_group_links(group: &NodeGroup) -> Result<()> {
     for (index, link) in group.links.iter().enumerate() {
         validate_link_structure(group, None, link)?;
+        if group.links[..index].contains(link) {
+            return Err(PotError::new(
+                ErrorCode::InvalidOperation,
+                "graph link already exists",
+            ));
+        }
+        if has_single_link_input(group, link)
+            && group.links[..index].iter().any(|existing| {
+                existing.to_node == link.to_node && existing.to_socket == link.to_socket
+            })
+        {
+            return Err(PotError::new(
+                ErrorCode::InvalidOperation,
+                "input socket already has a link",
+            ));
+        }
+    }
+    Ok(())
+}
+pub(super) fn node_sockets_with_groups(
+    group: &NodeGroup,
+    node_id: &Id,
+    node_groups: &Registry<NodeGroup>,
+) -> Option<SocketPair> {
+    let node = group.nodes.get(node_id)?;
+    if node.node_type != "GeometryNodeGroup" {
+        return node_sockets(group, node_id);
+    }
+    let group_id = node.properties.get("node_tree")?.as_str()?;
+    let child_group = node_groups.get(group_id)?;
+    let input_sockets = child_group
+        .interface
+        .inputs
+        .iter()
+        .flat_map(|socket| {
+            std::iter::once((socket.id.clone(), socket.socket_type.clone())).chain(
+                (socket.name != socket.id)
+                    .then(|| (socket.name.clone(), socket.socket_type.clone())),
+            )
+        })
+        .collect();
+    let output_sockets = if child_group.kind == super::GraphKind::Geometry
+        && child_group.interface.outputs.is_empty()
+    {
+        sockets(GEOMETRY_OUT)
+    } else {
+        child_group
+            .interface
+            .outputs
+            .iter()
+            .flat_map(|socket| {
+                std::iter::once((socket.id.clone(), socket.socket_type.clone())).chain(
+                    (socket.name != socket.id)
+                        .then(|| (socket.name.clone(), socket.socket_type.clone())),
+                )
+            })
+            .collect()
+    };
+    Some((input_sockets, output_sockets))
+}
+pub(super) fn validate_group_links_with_groups(
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+) -> Result<()> {
+    for (index, link) in group.links.iter().enumerate() {
+        validate_link_structure(group, Some(node_groups), link)?;
         if group.links[..index].contains(link) {
             return Err(PotError::new(
                 ErrorCode::InvalidOperation,

@@ -5743,8 +5743,8 @@ fn import_node_groups(
             .unwrap_or(&[]);
         let mut group = NodeGroup::new(name, kind);
         group.interface = GraphInterface {
-            inputs: convert_graph_sockets(inputs),
-            outputs: convert_graph_sockets(outputs),
+            inputs: convert_graph_sockets(inputs, mappings)?,
+            outputs: convert_graph_sockets(outputs, mappings)?,
         };
         let mut node_ids = BTreeMap::new();
         for raw_node in optional_array(tree, "nodes")? {
@@ -5814,7 +5814,7 @@ fn import_node_groups(
                     name: node_name.to_owned(),
                     location,
                     properties,
-                    inputs: graph_node_inputs(raw_node)?,
+                    inputs: graph_node_inputs(raw_node, mappings)?,
                 },
             );
         }
@@ -5842,7 +5842,10 @@ fn import_node_groups(
     Ok(group_ids)
 }
 
-fn convert_graph_sockets(values: &[Value]) -> Vec<GraphSocket> {
+fn convert_graph_sockets(
+    values: &[Value],
+    mappings: &BTreeMap<String, String>,
+) -> Result<Vec<GraphSocket>> {
     values
         .iter()
         .map(|socket| {
@@ -5860,12 +5863,18 @@ fn convert_graph_sockets(values: &[Value]) -> Vec<GraphSocket> {
                 .get("socket_type")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            GraphSocket {
+            let socket_type = blender_graph_socket_type(socket_type).to_owned();
+            let default = resolve_graph_resource_value(
+                &socket.get("default").cloned().unwrap_or(Value::Null),
+                &socket_type,
+                mappings,
+            )?;
+            Ok(GraphSocket {
                 id,
                 name,
-                socket_type: blender_graph_socket_type(socket_type).to_owned(),
-                default: socket.get("default").cloned().unwrap_or(Value::Null),
-            }
+                socket_type,
+                default,
+            })
         })
         .collect()
 }
@@ -5877,16 +5886,22 @@ fn blender_graph_socket_type(value: &str) -> &str {
         "NodeSocketBool" => "boolean",
         "NodeSocketVector" => "vector",
         "NodeSocketRotation" => "rotation",
+        "NodeSocketMatrix" => "matrix",
+        "NodeSocketMenu" => "menu",
         "NodeSocketColor" => "color",
         "NodeSocketString" => "string",
         "NodeSocketObject" => "object",
         "NodeSocketCollection" => "collection",
         "NodeSocketMaterial" => "material",
+        "NodeSocketImage" => "image",
         other => other,
     }
 }
 
-fn graph_node_inputs(raw_node: &Value) -> Result<BTreeMap<String, Value>> {
+fn graph_node_inputs(
+    raw_node: &Value,
+    mappings: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, Value>> {
     match raw_node.get("inputs") {
         None | Some(Value::Null) => Ok(BTreeMap::new()),
         Some(Value::Object(inputs)) => Ok(inputs
@@ -5901,9 +5916,15 @@ fn graph_node_inputs(raw_node: &Value) -> Result<BTreeMap<String, Value>> {
                     .and_then(Value::as_str)
                     .or_else(|| input.get("name").and_then(Value::as_str))
                     .ok_or_else(|| invalid_intermediate("node graph input has no socket name"))?;
+                let value = input.get("default").cloned().unwrap_or(Value::Null);
+                let socket_type = input
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(blender_graph_socket_type)
+                    .unwrap_or_default();
                 converted.insert(
                     name.to_owned(),
-                    input.get("default").cloned().unwrap_or(Value::Null),
+                    resolve_graph_resource_value(&value, socket_type, mappings)?,
                 );
             }
             Ok(converted)
@@ -5912,6 +5933,51 @@ fn graph_node_inputs(raw_node: &Value) -> Result<BTreeMap<String, Value>> {
             "node graph inputs must be an object or array",
         )),
     }
+}
+
+fn resolve_graph_resource_value(
+    value: &Value,
+    socket_type: &str,
+    mappings: &BTreeMap<String, String>,
+) -> Result<Value> {
+    let expected = match socket_type {
+        "object" => Some("Object"),
+        "collection" => Some("Collection"),
+        "material" => Some("Material"),
+        "image" => Some("Image"),
+        _ => None,
+    };
+    let Some(expected) = expected else {
+        return Ok(value.clone());
+    };
+    let Some(reference) = value.as_object() else {
+        return Ok(value.clone());
+    };
+    let id_type = reference.get("id_type").and_then(Value::as_str);
+    let name = reference.get("name").and_then(Value::as_str);
+    if id_type != Some(expected) {
+        return Err(invalid_intermediate(&format!(
+            "{expected} graph socket references a different Blender ID type"
+        )));
+    }
+    let name = name.ok_or_else(|| invalid_intermediate("graph resource reference has no name"))?;
+    let mapping_key = if expected == "Collection" {
+        reference
+            .get("bridge_id")
+            .and_then(Value::as_str)
+            .map_or_else(
+                || format!("{expected}:{name}"),
+                |bridge_id| format!("{expected}:{bridge_id}"),
+            )
+    } else {
+        format!("{expected}:{name}")
+    };
+    let id = mappings.get(&mapping_key).ok_or_else(|| {
+        invalid_intermediate(&format!(
+            "graph {expected} socket references unknown resource `{name}`"
+        ))
+    })?;
+    Ok(json!({"id_type":expected,"id":id}))
 }
 
 fn array<'a>(raw: &'a Value, key: &str) -> Result<&'a [Value]> {

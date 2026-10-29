@@ -1,6 +1,7 @@
 mod bake;
 mod evaluator;
 mod model;
+mod rotation_matrix;
 mod sockets;
 
 pub(crate) use bake::{
@@ -12,7 +13,10 @@ pub(crate) use bake::{
 };
 pub use bake::{NodeBakeFrame, NodeBakePayloadTransaction, NodeBakeRecord, NodeBakeValue};
 pub(crate) use evaluator::{EvaluatedInstances, evaluate_at_frame_with_bakes_and_instances};
-pub use evaluator::{GraphEvaluation, evaluate, evaluate_at_frame, evaluate_at_frame_with_bakes};
+pub use evaluator::{
+    GraphEvaluation, evaluate, evaluate_at_frame, evaluate_at_frame_with_bakes,
+    evaluate_with_node_groups,
+};
 pub use model::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup};
 pub use sockets::{validate_link, validate_link_with_groups};
 
