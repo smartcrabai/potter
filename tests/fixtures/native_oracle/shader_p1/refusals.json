@@ -1,0 +1,32 @@
+{
+  "cases": [
+    {
+      "name": "attribute_object",
+      "blend": "attribute_object.blend",
+      "loss_feature_id": "blender.material.shader_node.attribute_type",
+      "error_code": "UNSUPPORTED_FEATURE",
+      "feature_id": "shader.node.ShaderNodeAttribute.attribute_type.OBJECT"
+    },
+    {
+      "name": "sky_nondefault",
+      "blend": "sky_nondefault.blend",
+      "loss_feature_id": "blender.world.sky_settings",
+      "error_code": "UNSUPPORTED_FEATURE",
+      "feature_id": "world.node.ShaderNodeTexSky.sky_type"
+    },
+    {
+      "name": "sky_default_multiple_scattering",
+      "blend": "sky_default.blend",
+      "loss_feature_id": "blender.world.sky_model",
+      "error_code": "UNSUPPORTED_FEATURE",
+      "feature_id": "world.node.ShaderNodeTexSky.multiple_scattering_model"
+    },
+    {
+      "name": "volume_spatially_varying",
+      "blend": "volume_spatially_varying.blend",
+      "loss_feature_id": "shader.volume.spatially_varying_graph",
+      "error_code": "UNSUPPORTED_FEATURE",
+      "feature_id": "shader.volume.spatially_varying_graph"
+    }
+  ]
+}

@@ -46,8 +46,8 @@ use std::{
 };
 
 use native_oracle::{
-    TestResult, apply_operations, import_blend, pot, read_scene, run_blender_arguments,
-    write_script,
+    TestResult, apply_operations, import_blend, loss_features, pot, pot_json, read_scene,
+    run_blender_arguments, write_script,
 };
 use potter_core::image::{ImageInterpolation, decode_pixels, load_image_data, sample};
 use potter_core::model::{Image, ImageColorspace};
@@ -300,7 +300,88 @@ fn render_realtime_at(
     height: u32,
     volumetric_tile_size: u32,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let (project, _) = import_blend(blender, root, name, blend)?;
+    render_realtime_at_with_import_loss(
+        blender,
+        root,
+        name,
+        blend,
+        id,
+        width,
+        height,
+        volumetric_tile_size,
+        false,
+    )
+}
+
+fn render_realtime_at_allowing_spatial_volume_loss(
+    blender: &Path,
+    root: &Path,
+    name: &str,
+    blend: &Path,
+    id: &str,
+    width: u32,
+    height: u32,
+    volumetric_tile_size: u32,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    render_realtime_at_with_import_loss(
+        blender,
+        root,
+        name,
+        blend,
+        id,
+        width,
+        height,
+        volumetric_tile_size,
+        true,
+    )
+}
+
+fn render_realtime_at_with_import_loss(
+    blender: &Path,
+    root: &Path,
+    name: &str,
+    blend: &Path,
+    id: &str,
+    width: u32,
+    height: u32,
+    volumetric_tile_size: u32,
+    allow_spatial_volume_loss: bool,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let (project, report) = if allow_spatial_volume_loss {
+        let project = root.join(name);
+        pot_json(|command| {
+            command.arg("init").arg(&project);
+        })?;
+        let report = pot_json(|command| {
+            command
+                .arg("import")
+                .arg(&project)
+                .arg("--file")
+                .arg(blend)
+                .args([
+                    "--format",
+                    "blend",
+                    "--mode",
+                    "replace",
+                    "--base-revision",
+                    "0",
+                    "--blender",
+                ])
+                .arg(blender)
+                .arg("--allow-lossy");
+        })?;
+        (project, report)
+    } else {
+        import_blend(blender, root, name, blend)?
+    };
+    if allow_spatial_volume_loss {
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(
+            loss_features(&report),
+            vec!["shader.volume.spatially_varying_graph".to_owned()],
+            "{report}"
+        );
+    }
     let scene = read_scene(&project)?;
     let active = scene["active_scene"]
         .as_str()
@@ -801,12 +882,14 @@ fn realtime_point_shape_evaluates_heterogeneous_mesh_volume_per_froxel_sample() 
         &[blend.as_path(), capture.as_path()],
     )?;
 
-    let project = render_realtime(
+    let project = render_realtime_at_allowing_spatial_volume_loss(
         &blender,
         root.path(),
         "mesh_volume_gradient",
         &blend,
         "mesh_volume_gradient",
+        RESOLUTION,
+        RESOLUTION,
         2,
     )?;
     let centre = RESOLUTION as usize / 2;
@@ -853,12 +936,14 @@ fn realtime_perspective_mesh_volume_uses_the_sample_jittered_column_ray() -> Tes
         ],
     )?;
 
-    let project = render_realtime(
+    let project = render_realtime_at_allowing_spatial_volume_loss(
         &blender,
         root.path(),
         "mesh_volume_gradient_perspective",
         &blend,
         "mesh_volume_gradient_perspective",
+        RESOLUTION,
+        RESOLUTION,
         16,
     )?;
     let actual_center = window_mean(
@@ -908,7 +993,7 @@ fn realtime_light_shape_boundaries_match_eevee() -> TestResult {
     let root = tempdir()?;
     let scenes = generate_boundary_scenes(&blender, root.path())?;
 
-    let project = render_realtime_at(
+    let project = render_realtime_at_allowing_spatial_volume_loss(
         &blender,
         root.path(),
         "odd_viewport",

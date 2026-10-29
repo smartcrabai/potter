@@ -1,0 +1,85 @@
+{
+  "resolution": [
+    64,
+    32
+  ],
+  "renderer": "Blender 5.2.2 Cycles CPU; 1 sample; Raw; box filter 0.001",
+  "source": "Blender 5.2.2 intern/cycles/kernel/svm/voronoi.h",
+  "cases": [
+    {
+      "name": "detail_at_15",
+      "probe": [
+        6,
+        16
+      ],
+      "input_value": 15.0,
+      "clamped_value": 15.0,
+      "property": "Detail",
+      "rgb": [
+        1.319533348083496,
+        1.319533348083496,
+        1.319533348083496
+      ]
+    },
+    {
+      "name": "detail_over_15",
+      "probe": [
+        19,
+        16
+      ],
+      "input_value": 20.0,
+      "clamped_value": 15.0,
+      "property": "Detail",
+      "rgb": [
+        1.3197760581970215,
+        1.3197760581970215,
+        1.3197760581970215
+      ]
+    },
+    {
+      "name": "smooth_f1_lower_detail",
+      "probe": [
+        32,
+        16
+      ],
+      "input_value": 4.0,
+      "clamped_value": 4.0,
+      "property": "Detail",
+      "rgb": [
+        1.210023283958435,
+        1.210023283958435,
+        1.210023283958435
+      ]
+    },
+    {
+      "name": "roughness_at_1",
+      "probe": [
+        45,
+        16
+      ],
+      "input_value": 1.0,
+      "clamped_value": 1.0,
+      "property": "Roughness",
+      "rgb": [
+        1.9021010398864746,
+        1.9021010398864746,
+        1.9021010398864746
+      ]
+    },
+    {
+      "name": "roughness_over_1",
+      "probe": [
+        58,
+        16
+      ],
+      "input_value": 1.4,
+      "clamped_value": 1.0,
+      "property": "Roughness",
+      "rgb": [
+        3.13094425201416,
+        3.13094425201416,
+        3.13094425201416
+      ]
+    }
+  ]
+}

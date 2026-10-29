@@ -212,56 +212,41 @@ fn make_scene(scene: &Path, operations: &[Value]) -> Result<Value, Box<dyn Error
 }
 
 #[test]
-fn analytic_sky_brightness_changes_with_sun_elevation() -> Result<(), Box<dyn Error>> {
+fn default_multiple_scattering_sky_is_refused() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    let mut mean_brightness = Vec::new();
-    for (name, sun_direction) in [
-        ("low_sun", json!([1.0, 0.0, 0.0])),
-        (
-            "high_sun",
-            json!([
-                std::f64::consts::FRAC_1_SQRT_2,
-                0.0,
-                std::f64::consts::FRAC_1_SQRT_2
-            ]),
-        ),
-    ] {
-        let scene = directory.path().join(name);
-        let mut operations = Vec::new();
-        append_world_texture_graph(
-            &mut operations,
-            "sky_graph",
-            "ShaderNodeTexSky",
-            &json!({"Sun Direction":sun_direction}),
-            &json!({}),
-        );
-        append_camera_and_render(
-            &mut operations,
-            &json!({"translation":[0.0,0.0,0.0],"rotation":[1.0,0.0,0.0,0.0]}),
-            &json!({"projection":"perspective","lens_mm":50.0}),
-            &json!({"resolution_x":24,"resolution_y":24,"samples":1,"seed":0,"max_bounces":0}),
-            Some("world_main"),
-        );
-        make_scene(&scene, &operations)?;
-        let (width, height, pixels) = render_png(
-            &scene,
-            &directory.path().join(format!("{name}_render")),
-            Some("path"),
-        )?;
-        mean_brightness.push(luminance(pixel(
-            &pixels,
-            width,
-            height,
-            width / 2,
-            height / 2,
-        )?));
-    }
-
-    let low = *mean_brightness.first().ok_or("low-sun render is missing")?;
-    let high = *mean_brightness.get(1).ok_or("high-sun render is missing")?;
+    let scene = directory.path().join("default_sky");
+    let mut operations = Vec::new();
+    append_world_texture_graph(
+        &mut operations,
+        "sky_graph",
+        "ShaderNodeTexSky",
+        &json!({}),
+        &json!({}),
+    );
+    append_camera_and_render(
+        &mut operations,
+        &json!({"translation":[0.0,0.0,0.0],"rotation":[1.0,0.0,0.0,0.0]}),
+        &json!({"projection":"perspective","lens_mm":50.0}),
+        &json!({"resolution_x":24,"resolution_y":24,"samples":1,"seed":0,"max_bounces":0}),
+        Some("world_main"),
+    );
+    make_scene(&scene, &operations)?;
+    let output = pot()
+        .arg("render")
+        .arg(&scene)
+        .args(["--engine", "path", "--format", "png", "--out"])
+        .arg(directory.path().join("sky_render"))
+        .arg("--json")
+        .output()?;
     assert!(
-        high > low + 100,
-        "raising the sun should brighten the sky: {low} vs {high}"
+        !output.status.success(),
+        "the approximate Sky model rendered"
+    );
+    let response = json(&output)?;
+    assert_eq!(response["error"]["code"], "UNSUPPORTED_FEATURE");
+    assert_eq!(
+        response["error"]["details"]["feature_id"],
+        "world.node.ShaderNodeTexSky.multiple_scattering_model"
     );
     Ok(())
 }

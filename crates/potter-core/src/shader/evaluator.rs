@@ -8,7 +8,7 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     error::{ErrorCode, PotError, Result},
-    geom::{GeneratedCorners, TextureSpace},
+    geom::{GeneratedCorners, TextureSpace, volume::VolumeData},
     graph::{GraphKind, GraphNode, NodeGroup},
     image::{ImageData, ImageExtension, ImageInterpolation, sample_with_extension_alpha},
     model::{Id, Material, Registry, TextureRef, ThicknessMode},
@@ -97,6 +97,12 @@ pub(crate) enum AnisotropyModel {
     Principled,
     Glossy,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GlassDistribution {
+    #[default]
+    Ggx,
+    MultiGgx,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BsdfParams {
@@ -117,6 +123,10 @@ pub struct BsdfParams {
     /// for transmission (`kernel/svm/closure.h`); the Glass BSDF node takes its Color for both.
     pub glass_reflection_tint: [f64; 3],
     pub glass_transmission_tint: [f64; 3],
+    /// True only for the standalone Glass BSDF node, distinct from Principled glass.
+    pub standalone_glass: bool,
+    /// GGX distribution used by glass closures; `MULTI_GGX` enables Cycles' GGX energy compensation.
+    pub(crate) glass_distribution: GlassDistribution,
     /// The view is on the back of the geometric normal (Cycles' `SD_BACKFACING`), where a glass closure uses `1 / ior`.
     pub back_facing: bool,
     pub alpha: f64,
@@ -233,6 +243,8 @@ impl BsdfParams {
             thickness_slab: material.thickness_mode == ThicknessMode::Slab,
             glass_reflection_tint: [1.0; 3],
             glass_transmission_tint: principled_glass_tint(material.base_color),
+            standalone_glass: false,
+            glass_distribution: GlassDistribution::MultiGgx,
             back_facing: false,
             alpha: material.base_color[3],
             transparent_tint: [1.0; 3],
@@ -373,11 +385,39 @@ pub struct HitDifferentials {
     pub uv_dy: [f64; 2],
 }
 
+#[derive(Debug)]
+pub(crate) struct VolumeTemperatureCapture {
+    pub(crate) attribute: String,
+    pub(crate) temperature: f32,
+    pub(crate) blackbody: f32,
+    pub(crate) tint: [f32; 3],
+}
+/// Typed native mesh data that `ShaderNodeAttribute` can sample from its POINT domain.
+#[derive(Clone, Debug)]
+pub(crate) struct GeometryAttribute {
+    pub(crate) name: String,
+    pub(crate) domain: String,
+    pub(crate) data_type: String,
+    pub(crate) values: GeometryAttributeValues,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GeometryAttributeValues {
+    Float(Vec<f64>),
+    Integer(Vec<i32>),
+    Vector(Vec<[f64; 3]>),
+    Unsupported,
+}
 /// Per-hit coordinates and graph context used by procedural shader nodes.
 #[derive(Clone, Copy, Debug)]
 pub struct HitContext<'a> {
     pub node_groups: &'a Registry<NodeGroup>,
-    /// Resolved linear image buffers keyed by their persistent image ID.
+    /// Volume grids available to Principled Volume attribute sockets, for this volume object.
+    pub(crate) volume_data: Option<&'a VolumeData>,
+    /// Whether the marcher already applies the primary `density` grid per segment.
+    pub(crate) volume_density_from_grid: bool,
+    /// Capture evaluated blackbody controls so the volume marcher can sample temperature per step.
+    pub(crate) volume_temperature_capture: Option<&'a RefCell<Vec<VolumeTemperatureCapture>>>,
     pub image_data: Option<&'a BTreeMap<String, ImageData>>,
     /// The render-layer UV at the hit. Without `uv_layers` it is the only UV.
     pub uv: [f64; 2],
@@ -430,8 +470,13 @@ pub struct HitContext<'a> {
     /// Color layers at this hit, by layer name in layer order; see
     /// [`HitContext::with_color_layers`].
     pub color_layers: Option<&'a [(&'a str, [f64; 4])]>,
-    /// The screen differential of a path-traced hit (Cycles' `sd->dP`), required for exact Bump evaluation.
-    /// Realtime and preview contexts without this differential refuse Bump rather than approximate it.
+    /// Native generic mesh attributes sampled from the triangle's source POINT-domain vertices.
+    pub(crate) geometry_attributes: Option<&'a [GeometryAttribute]>,
+    pub(crate) geometry_attribute_vertices: [usize; 3],
+    pub(crate) geometry_attribute_corner_weights: [[f64; 3]; 3],
+    pub(crate) geometry_attribute_barycentric: [f64; 3],
+    /// The camera footprint of a path-traced hit (Cycles' `sd->dP`); `None` where no camera footprint is tracked,
+    /// in which case a bump node uses its finite-difference fallback. See [`HitContext::with_footprint`].
     pub footprint: Option<HitFootprint>,
     /// Centre position reused by Camera Data while this hit is sampled for Bump Height.
     bump_center_position: DVec3,
@@ -450,13 +495,24 @@ pub struct HitFootprint {
     /// The geometric normal of the hit's triangle.
     pub geometric_normal: DVec3,
 }
+/// Per-pixel screen-space differentials for EEVEE-style shader evaluation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct HitDifferentials {
+    pub(crate) world_dx: DVec3,
+    pub(crate) world_dy: DVec3,
+    pub(crate) uv_dx: [f64; 2],
+    pub(crate) uv_dy: [f64; 2],
+}
 
 impl<'a> HitContext<'a> {
     #[must_use]
     pub const fn new(node_groups: &'a Registry<NodeGroup>) -> Self {
         Self {
-            image_data: None,
             node_groups,
+            volume_data: None,
+            volume_density_from_grid: false,
+            volume_temperature_capture: None,
+            image_data: None,
             uv: [0.0; 2],
             uv_layers: None,
             uv_tangents: None,
@@ -476,20 +532,20 @@ impl<'a> HitContext<'a> {
             realtime_position_f32: None,
             world_to_camera_f32: None,
             object: DVec3::ZERO,
+            back_facing: false,
             normal: DVec3::Z,
             geometric_normal: DVec3::Z,
-            back_facing: false,
             view_direction: DVec3::Z,
             light_falloff_distance: None,
             path_traced: false,
             color_render: None,
             color_layers: None,
+            geometry_attributes: None,
+            geometry_attribute_vertices: [0; 3],
+            geometry_attribute_corner_weights: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            geometry_attribute_barycentric: [1.0, 0.0, 0.0],
             footprint: None,
             realtime_differentials: None,
-            bump_center_position: DVec3::ZERO,
-            bump_center_realtime_position_f32: None,
-            opacity_only: false,
-            bump_height_shifted: false,
         }
     }
 
@@ -523,6 +579,21 @@ impl<'a> HitContext<'a> {
         self.footprint = Some(footprint);
         self
     }
+    /// Set whether shader evaluation uses Cycles path-tracing semantics.
+    #[must_use]
+    pub const fn with_path_traced(mut self, path_traced: bool) -> Self {
+        self.path_traced = path_traced;
+        self
+    }
+    /// Attach screen-space differentials for realtime shader evaluation.
+    #[must_use]
+    pub(crate) const fn with_realtime_differentials(
+        mut self,
+        differentials: HitDifferentials,
+    ) -> Self {
+        self.realtime_differentials = Some(differentials);
+        self
+    }
 
     /// Mark evaluation as reading only opacity/shadow coverage; shading-normal-only Bump nodes are skipped.
     #[must_use]
@@ -535,6 +606,27 @@ impl<'a> HitContext<'a> {
     #[must_use]
     pub const fn with_images(mut self, image_data: &'a BTreeMap<String, ImageData>) -> Self {
         self.image_data = Some(image_data);
+        self
+    }
+    /// Attach the scalar and vector grids of a volume object for Principled Volume attributes.
+    #[must_use]
+    pub const fn with_volume_data(mut self, volume_data: &'a VolumeData) -> Self {
+        self.volume_data = Some(volume_data);
+        self
+    }
+    /// The path marcher samples the primary density grid per segment, as Cycles' object density.
+    #[must_use]
+    pub(crate) const fn with_volume_density_grid(mut self) -> Self {
+        self.volume_density_from_grid = true;
+        self
+    }
+    /// Capture resolved Principled Volume blackbody controls for per-step volume emission.
+    #[must_use]
+    pub(crate) const fn with_volume_temperature_capture(
+        mut self,
+        capture: &'a RefCell<Vec<VolumeTemperatureCapture>>,
+    ) -> Self {
+        self.volume_temperature_capture = Some(capture);
         self
     }
 
@@ -593,6 +685,22 @@ impl<'a> HitContext<'a> {
         self.color_render = color_render;
         self
     }
+
+    /// Attach native generic mesh data and the source-vertex frame of this hit triangle.
+    #[must_use]
+    pub(crate) const fn with_geometry_attributes(
+        mut self,
+        attributes: &'a [GeometryAttribute],
+        vertices: [usize; 3],
+        corner_weights: [[f64; 3]; 3],
+        barycentric: [f64; 3],
+    ) -> Self {
+        self.geometry_attributes = Some(attributes);
+        self.geometry_attribute_vertices = vertices;
+        self.geometry_attribute_corner_weights = corner_weights;
+        self.geometry_attribute_barycentric = barycentric;
+        self
+    }
     /// Collect `uv.layer_missing` warnings raised while evaluating this hit. Without a sink the
     /// render UV is still used, but the warning is not recorded.
     #[must_use]
@@ -626,6 +734,7 @@ impl<'a> HitContext<'a> {
                 ..layers
             };
             shifted.uv_layers = Some(moved);
+            shifted.geometry_attribute_barycentric = moved.barycentric;
             if let Some(uv) = moved.render.and_then(|index| moved.uv(index)) {
                 shifted.uv = uv;
             }
@@ -674,6 +783,18 @@ pub fn fill_color_layers<'a, 'n>(
         count += 1;
     }
     Ok(&table[..count])
+}
+
+fn sample_point_attribute(
+    value_at: impl Fn(usize) -> Option<f64>,
+    vertices: [usize; 3],
+    weights: [f64; 3],
+) -> Option<f64> {
+    let mut value = 0.0;
+    for (vertex, weight) in vertices.into_iter().zip(weights) {
+        value += value_at(vertex)? * weight;
+    }
+    Some(value)
 }
 
 /// Evaluate a material's shader graph at a surface hit. Materials without a node tree use their PBR fields.
@@ -825,6 +946,7 @@ fn evaluate_surface_inner_into(
         group_input_binding: None,
         group_depth: 0,
         math_semantics,
+        texture_mapping_unsupported: &prepared.texture_mapping_unsupported,
     };
     // Only an unlinked Surface alongside a linked Volume is empty; other Shader sockets keep their defaults.
     if !has_surface && has_volume {
@@ -994,6 +1116,7 @@ fn evaluate_displacement_inner(
         links: prepared.fold_index(graph_id, group),
         group_input_binding: None,
         group_depth: 0,
+        texture_mapping_unsupported: &prepared.texture_mapping_unsupported,
     };
     match evaluator.input(output, "Displacement", ValueKind::Vector)? {
         Value::Vector(displacement) => Ok(displacement.dot(hit_ctx.normal)),
@@ -1107,6 +1230,16 @@ fn sample_material_texture(
     })?;
     // The field samples through the same path as an Image Texture node with the field's extension.
     let blender_uv = storage_to_blender_uv(layer_uv(hit_ctx, layer));
+    ensure_realtime_linear_image_filtering(
+        hit_ctx,
+        image,
+        blender_uv,
+        texture.interpolation,
+        layer.is_none(),
+        "shader.material_texture.linear_mip_filtering",
+        None,
+        image_id,
+    )?;
     let udim = image.udim;
     let pixel = sample_with_extension_alpha(
         image,
@@ -1122,6 +1255,88 @@ fn sample_material_texture(
         )));
     }
     Ok(pixel)
+}
+
+fn ensure_realtime_linear_image_filtering(
+    hit_ctx: &HitContext<'_>,
+    image: &ImageData,
+    uv: [f64; 2],
+    interpolation: ImageInterpolation,
+    coordinate_gradients_supported: bool,
+    feature_id: &str,
+    node_id: Option<&Id>,
+    image_id: &str,
+) -> Result<()> {
+    if hit_ctx.path_traced || interpolation != ImageInterpolation::Linear {
+        return Ok(());
+    }
+    let unsupported = |reason: &str, footprint: Option<f64>| {
+        PotError::with_details(
+            ErrorCode::UnsupportedFeature,
+            "realtime LINEAR image filtering requires EEVEE mip/aniso filtering",
+            json!({
+                "feature_id": feature_id,
+                "node_id": node_id,
+                "image_id": image_id,
+                "reason": reason,
+                "max_texel_footprint": footprint,
+            }),
+        )
+    };
+    if !coordinate_gradients_supported {
+        return Err(unsupported(
+            "screen-space gradients are unavailable for this texture coordinate source",
+            None,
+        ));
+    }
+    let differentials = hit_ctx
+        .realtime_differentials
+        .ok_or_else(|| unsupported("screen-space texture gradients are unavailable", None))?;
+    let dimensions = if image.udim {
+        if !uv[0].is_finite() || !uv[1].is_finite() {
+            None
+        } else {
+            let column = uv[0].trunc();
+            let row = uv[1].trunc();
+            if !(0.0..10.0).contains(&column) || row < 0.0 {
+                None
+            } else {
+                let tile = 1001.0 + 10.0 * row + column;
+                if tile > f64::from(u32::MAX) {
+                    None
+                } else {
+                    let tile = tile as u32;
+                    image.tiles.get(&tile).map_or_else(
+                        || {
+                            (tile == 1001 && image.width > 0 && image.height > 0)
+                                .then_some((image.width, image.height))
+                        },
+                        |tile| {
+                            (tile.width > 0 && tile.height > 0).then_some((tile.width, tile.height))
+                        },
+                    )
+                }
+            }
+        }
+    } else {
+        (image.width > 0 && image.height > 0).then_some((image.width, image.height))
+    };
+    let Some((width, height)) = dimensions else {
+        return Ok(());
+    };
+    let footprint = |gradient: [f64; 2]| {
+        (gradient[0] * f64::from(width)).hypot(gradient[1] * f64::from(height))
+    };
+    let footprint_dx = footprint(differentials.uv_dx);
+    let footprint_dy = footprint(differentials.uv_dy);
+    let max_footprint = footprint_dx.max(footprint_dy);
+    if !footprint_dx.is_finite() || !footprint_dy.is_finite() || max_footprint > 1.0 {
+        return Err(unsupported(
+            "realtime minification requires EEVEE mip/aniso filtering; only level-0 sampling is implemented",
+            max_footprint.is_finite().then_some(max_footprint),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1149,6 +1364,7 @@ enum NodeKind {
     VolumeScatter,
     Displacement,
     ImageTexture,
+    EnvironmentTexture,
     Emission,
     Diffuse,
     Glossy,
@@ -1356,6 +1572,8 @@ pub struct PreparedMaterial {
     alpha_linked_images: BTreeSet<Id>,
     /// The first Bump whose output feeds realtime transparency or its coverage factor.
     bump_transparency_node: Option<Id>,
+    /// Texture nodes with non-default mapping state, computed once per material rather than once per hit.
+    texture_mapping_unsupported: BTreeSet<Id>,
     /// Whether EEVEE would compile the material as transparent (`GPU_MATFLAG_TRANSPARENT`), which decides whether its
     /// surfaces cast transparent shadows (see [`graph_is_transparent`]).
     transparent: bool,
@@ -1466,12 +1684,24 @@ impl PreparedMaterial {
             &mut alpha_linked_images,
         );
         let transparent = graph_is_transparent(graph_id, group, node_groups, output);
+        let texture_mapping_unsupported = group
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                let has_mapping = node.properties.contains_key("texture_mapping")
+                    || node.properties.contains_key("color_mapping");
+                let unsupported = has_mapping
+                    && !crate::shader::texture::texture_node_mapping_is_default(&node.properties);
+                unsupported.then(|| id.clone())
+            })
+            .collect();
         Self {
             alpha_linked_images,
             bump_transparency_node: transparent
                 .then(|| bump_affecting_transparency(graph_id, group, node_groups, output))
                 .flatten(),
             transparent,
+            texture_mapping_unsupported,
             links,
         }
     }
@@ -1568,6 +1798,8 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared, 'scope> {
     /// The call site whose socket values feed this group's Group Input nodes.
     group_input_binding: Option<&'scope GroupInputBinding<'scope>>,
     group_depth: usize,
+    /// Texture nodes whose unsupported mapping state was found by [`PreparedMaterial`].
+    texture_mapping_unsupported: &'prepared BTreeSet<Id>,
 }
 
 impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
@@ -1828,6 +2060,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             "ShaderNodeVolumeScatter" => Ok(NodeKind::VolumeScatter),
             "ShaderNodeDisplacement" => Ok(NodeKind::Displacement),
             "ShaderNodeTexImage" => Ok(NodeKind::ImageTexture),
+            "ShaderNodeTexEnvironment" => Ok(NodeKind::EnvironmentTexture),
             "ShaderNodeEmission" => Ok(NodeKind::Emission),
             "ShaderNodeBsdfDiffuse" => Ok(NodeKind::Diffuse),
             "ShaderNodeBsdfGlossy" | "ShaderNodeBsdfAnisotropic" => Ok(NodeKind::Glossy),
@@ -2156,6 +2389,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             }
             NodeKind::Displacement => self.displacement(node_id, socket),
             NodeKind::ImageTexture => self.image_texture(node_id, socket),
+            NodeKind::EnvironmentTexture => self.environment_texture(node_id, socket),
             NodeKind::Emission => {
                 let params = self.emission(node_id)?;
                 Ok(self.closure_value(&params))
@@ -2328,15 +2562,124 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
 
     fn volume(&mut self, id: &Id, closure: VolumeClosure) -> Result<BsdfParams> {
         let mut params = self.closure_params();
-        let density = self.scalar_input(id, &["Density"], 1.0)?.max(0.0);
+        let mut density = self.scalar_input(id, &["Density"], 1.0)?.max(0.0);
         // Blender's node defaults: Principled Volume 0.5; Volume Absorption and Scatter 0.8.
         let default_color = match closure {
             VolumeClosure::Principled => [0.5, 0.5, 0.5, 1.0],
             VolumeClosure::Scatter | VolumeClosure::Absorption => [0.8, 0.8, 0.8, 1.0],
         };
-        let color: [f64; 3] = self.color_input(id, &["Color"], default_color)?[..3]
+        let mut color: [f64; 3] = self.color_input(id, &["Color"], default_color)?[..3]
             .try_into()
             .map_err(|_| invalid("invalid volume color"))?;
+        if closure == VolumeClosure::Principled && density > 0.0 {
+            let node = self.node(id)?;
+            let density_attribute = node
+                .inputs
+                .get("Density Attribute")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| unsupported_node(id, "PrincipledVolume:density_attribute"))
+                })
+                .transpose()?
+                .unwrap_or("density");
+            let color_attribute = node
+                .inputs
+                .get("Color Attribute")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| unsupported_node(id, "PrincipledVolume:color_attribute"))
+                })
+                .transpose()?
+                .unwrap_or("");
+            if self.is_linked(id, "Density Attribute") {
+                return Err(unsupported_node(
+                    id,
+                    "PrincipledVolume:density_attribute:linked",
+                ));
+            }
+            if self.is_linked(id, "Color Attribute") {
+                return Err(unsupported_node(
+                    id,
+                    "PrincipledVolume:color_attribute:linked",
+                ));
+            }
+            if !density_attribute.is_empty() {
+                if let Some(volume_data) = self.hit_ctx.volume_data {
+                    if density_attribute != "density" || !self.hit_ctx.volume_density_from_grid {
+                        let attribute = if self.hit_ctx.path_traced {
+                            crate::geom::volume::sample_scalar_attribute_checked(
+                                density_attribute,
+                                self.hit_ctx.object,
+                                volume_data,
+                                self.material.volume_interpolation,
+                            )?
+                        } else {
+                            crate::geom::volume::sample_scalar_attribute_realtime_checked(
+                                density_attribute,
+                                self.hit_ctx.object,
+                                volume_data,
+                                self.material.volume_interpolation,
+                            )?
+                        };
+                        if let Some(attribute) = attribute {
+                            density *= attribute.max(0.0);
+                        }
+                    }
+                } else if density_attribute != "density" {
+                    return Err(unsupported_node(
+                        id,
+                        &format!(
+                            "PrincipledVolume:density_attribute:{density_attribute}:no_volume_data"
+                        ),
+                    ));
+                }
+            }
+            if density > 0.0 && !color_attribute.is_empty() {
+                if let Some(volume_data) = self.hit_ctx.volume_data {
+                    let attribute = if self.hit_ctx.path_traced {
+                        crate::geom::volume::sample_color_attribute_checked(
+                            color_attribute,
+                            self.hit_ctx.object,
+                            volume_data,
+                            self.material.volume_interpolation,
+                        )?
+                    } else {
+                        crate::geom::volume::sample_color_attribute_realtime_checked(
+                            color_attribute,
+                            self.hit_ctx.object,
+                            volume_data,
+                            self.material.volume_interpolation,
+                        )?
+                    };
+                    if let Some(attribute) = attribute {
+                        for (channel, value) in color.iter_mut().zip(attribute) {
+                            *channel *= value;
+                        }
+                    }
+                } else if self.hit_ctx.path_traced {
+                    let attribute_exists =
+                        self.hit_ctx.color_layers.is_some_and(|layers| {
+                            layers.iter().any(|(name, _)| *name == color_attribute)
+                        }) || self.hit_ctx.geometry_attributes.is_some_and(|attributes| {
+                            attributes
+                                .iter()
+                                .any(|attribute| attribute.name == color_attribute)
+                        });
+                    if attribute_exists {
+                        color = [0.0; 3];
+                    } else if self.hit_ctx.color_layers.is_none() {
+                        return Err(unsupported_node(
+                            id,
+                            &format!(
+                                "PrincipledVolume:color_attribute:{color_attribute}:no_attribute_data"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         let weights = match closure {
             VolumeClosure::Principled => {
                 let absorption_color: [f64; 3] =
@@ -2362,16 +2705,134 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         params.volume_anisotropy = self
             .scalar_input(id, &["Anisotropy"], 0.0)?
             .clamp(-0.999, 0.999);
-        params.volume_emission = if closure == VolumeClosure::Absorption {
+        let mut emission = if closure == VolumeClosure::Absorption {
             [0.0; 3]
         } else {
             let emission: [f64; 3] =
-                self.color_input(id, &["Emission Color", "Emission"], [0.0, 0.0, 0.0, 1.0])?[..3]
+                self.color_input(id, &["Emission Color", "Emission"], [1.0; 4])?[..3]
                     .try_into()
                     .map_err(|_| invalid("invalid volume emission color"))?;
             let strength = self.scalar_input(id, &["Emission Strength"], 0.0)?.max(0.0);
             emission.map(|channel| channel * strength)
         };
+        if closure == VolumeClosure::Principled {
+            let blackbody = self.scalar_input(id, &["Blackbody Intensity"], 0.0)? as f32;
+            // EEVEE's Principled Volume enables blackbody only above 1e-3; Cycles accepts any positive value.
+            let minimum_blackbody = if self.hit_ctx.path_traced {
+                0.0
+            } else {
+                1.0e-3
+            };
+            if blackbody > minimum_blackbody {
+                if self.is_linked(id, "Temperature Attribute") {
+                    return Err(unsupported_node(
+                        id,
+                        "PrincipledVolume:temperature_attribute:linked",
+                    ));
+                }
+                let node = self.node(id)?;
+                let temperature_attribute = node
+                    .inputs
+                    .get("Temperature Attribute")
+                    .map(|value| {
+                        value.as_str().ok_or_else(|| {
+                            unsupported_node(id, "PrincipledVolume:temperature_attribute")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or("temperature")
+                    .to_owned();
+                let base_temperature = self.scalar_input(id, &["Temperature"], 1000.0)? as f32;
+                let blackbody_emission_at = |temperature: f32| {
+                    let temperature = temperature.max(0.0);
+                    let temperature_squared = temperature * temperature;
+                    let temperature_fourth = temperature_squared * temperature_squared;
+                    let sigma = 5.670_373e-8_f32 * 1.0e-6_f32 / std::f32::consts::PI;
+                    let intensity = sigma * blackbody.mul_add(temperature_fourth - 1.0, 1.0);
+                    let minimum_intensity = if self.hit_ctx.path_traced {
+                        0.0
+                    } else {
+                        1.0e-5
+                    };
+                    if intensity.partial_cmp(&minimum_intensity)
+                        != Some(std::cmp::Ordering::Greater)
+                    {
+                        return DVec3::ZERO;
+                    }
+                    let color = if self.hit_ctx.path_traced {
+                        crate::shader::blackbody::blackbody_rgb(temperature)
+                    } else {
+                        super::converters::eevee_blackbody_rgb(temperature)
+                    };
+                    DVec3::new(
+                        f64::from(intensity * color[0]),
+                        f64::from(intensity * color[1]),
+                        f64::from(intensity * color[2]),
+                    )
+                };
+                let mut blackbody_emission = blackbody_emission_at(base_temperature);
+                if !temperature_attribute.is_empty() {
+                    if let Some(volume_data) = self.hit_ctx.volume_data {
+                        // EEVEE samples temperature before applying the nonlinear blackbody transform.
+                        let sampled = if self.hit_ctx.path_traced {
+                            crate::geom::volume::sample_scalar_attribute_mapped_checked(
+                                &temperature_attribute,
+                                self.hit_ctx.object,
+                                volume_data,
+                                self.material.volume_interpolation,
+                                |attribute| {
+                                    blackbody_emission_at(
+                                        base_temperature * attribute.max(0.0) as f32,
+                                    )
+                                },
+                            )?
+                        } else {
+                            crate::geom::volume::sample_scalar_attribute_realtime_checked(
+                                &temperature_attribute,
+                                self.hit_ctx.object,
+                                volume_data,
+                                self.material.volume_interpolation,
+                            )?
+                            .map(|attribute| {
+                                blackbody_emission_at(base_temperature * attribute.max(0.0) as f32)
+                            })
+                        };
+                        if let Some(sampled) = sampled {
+                            blackbody_emission = sampled;
+                        } else if !self.hit_ctx.path_traced {
+                            blackbody_emission = DVec3::ZERO;
+                        }
+                    } else if !self.hit_ctx.path_traced {
+                        blackbody_emission = DVec3::ZERO;
+                    }
+                }
+                if !self.hit_ctx.path_traced && self.hit_ctx.volume_data.is_none() {
+                    blackbody_emission = DVec3::ZERO;
+                }
+                let tint = if blackbody_emission.max_element() > 0.0
+                    || self.hit_ctx.volume_temperature_capture.is_some()
+                {
+                    self.color_input(id, &["Blackbody Tint"], [1.0; 4])?
+                } else {
+                    [1.0; 4]
+                };
+                if blackbody_emission.max_element() > 0.0 {
+                    for channel in 0..3 {
+                        emission[channel] +=
+                            f64::from(tint[channel] as f32) * blackbody_emission[channel];
+                    }
+                }
+                if let Some(capture) = self.hit_ctx.volume_temperature_capture {
+                    capture.borrow_mut().push(VolumeTemperatureCapture {
+                        attribute: temperature_attribute,
+                        temperature: base_temperature,
+                        blackbody,
+                        tint: [tint[0] as f32, tint[1] as f32, tint[2] as f32],
+                    });
+                }
+            }
+        }
+        params.volume_emission = emission;
         Ok(params)
     }
 
@@ -2379,14 +2840,57 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         if !matches!(socket, "Displacement" | "Vector") {
             return Err(invalid(format!("unknown Displacement output `{socket}`")));
         }
+        let space = match self.node(id)?.properties.get("space") {
+            None => "OBJECT".to_owned(),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| unsupported_node(id, "Displacement:space"))?
+                .to_owned(),
+        };
         let height = self.scalar_input(id, &["Height"], 0.0)?;
-        let midlevel = self.scalar_input(id, &["Midlevel"], self.material.displacement_midlevel)?;
-        let scale = self.scalar_input(id, &["Scale"], self.material.displacement_scale)?;
-        let normal = normalize_or(
-            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
-            self.hit_ctx.normal,
-        );
-        Ok(Value::Vector(normal * ((height - midlevel) * scale)))
+        let midlevel = self.scalar_input(id, &["Midlevel"], 0.5)?;
+        let scale = self.scalar_input(id, &["Scale"], 1.0)?;
+        // Blender supplies world_normals_get for this hidden socket when it is unlinked.
+        let normal = if self.is_linked(id, "Normal") {
+            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?
+        } else {
+            self.hit_ctx.normal
+        };
+        // EEVEE uses f32 shader values; its transform utilities consume model and model_inverse separately.
+        let amount = (height as f32 - midlevel as f32) * scale as f32;
+        let normal = Vec3::new(normal.x as f32, normal.y as f32, normal.z as f32);
+        let displacement = match space.as_str() {
+            "OBJECT" | "object" => {
+                let object_to_world = Mat4::from_cols_array(
+                    &self
+                        .hit_ctx
+                        .object_to_world
+                        .to_cols_array()
+                        .map(|value| value as f32),
+                );
+                let world_to_object = Mat4::from_cols_array(
+                    &self
+                        .hit_ctx
+                        .world_to_object
+                        .to_cols_array()
+                        .map(|value| value as f32),
+                );
+                let object_normal = if self.hit_ctx.path_traced {
+                    object_to_world.transpose().transform_vector3(normal)
+                } else {
+                    world_to_object.transform_vector3(normal)
+                }
+                .normalize_or_zero();
+                object_to_world.transform_vector3(object_normal * amount)
+            }
+            "WORLD" | "world" => normal.normalize_or_zero() * amount,
+            other => return Err(unsupported_node(id, &format!("Displacement:space:{other}"))),
+        };
+        Ok(Value::Vector(DVec3::new(
+            f64::from(displacement.x),
+            f64::from(displacement.y),
+            f64::from(displacement.z),
+        )))
     }
 
     fn emission(&mut self, id: &Id) -> Result<BsdfParams> {
@@ -2442,10 +2946,24 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     }
 
     fn glass(&mut self, id: &Id) -> Result<BsdfParams> {
+        let distribution = match self.node(id)?.properties.get("distribution") {
+            None => GlassDistribution::MultiGgx,
+            Some(value) => match value.as_str() {
+                Some("GGX" | "ggx") => GlassDistribution::Ggx,
+                Some("MULTI_GGX" | "multi_ggx") => GlassDistribution::MultiGgx,
+                Some(other) => {
+                    return Err(unsupported_node(id, &format!("Glass:distribution:{other}")));
+                }
+                None => return Err(unsupported_node(id, "Glass:distribution")),
+            },
+        };
         let mut params = self.diffuse(id)?;
         params.transmission = 1.0;
+        params.glass_distribution = distribution;
         params.ior = self.scalar_input(id, &["IOR"], 1.5)?;
         params.roughness = self.scalar_input(id, &["Roughness"], 0.0)?;
+        params.thin_film_thickness = self.scalar_input(id, &["Thin Film Thickness"], 0.0)?;
+        params.thin_film_ior = self.scalar_input(id, &["Thin Film IOR"], 1.33)?;
         // Cycles' Glass closure takes its Color as both the reflection and the transmission tint.
         let color = [
             params.base_color[0],
@@ -2454,6 +2972,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         ];
         params.glass_reflection_tint = color;
         params.glass_transmission_tint = color;
+        params.standalone_glass = true;
         Ok(params)
     }
 
@@ -2492,9 +3011,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     }
 
     fn image_texture(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let uv = self.vector_input(
+        let uv = self.texture_vector_input(
             id,
-            &["Vector"],
             DVec3::new(self.hit_ctx.uv[0], 1.0 - self.hit_ctx.uv[1], 0.0),
         )?;
         let node = self.node(id)?;
@@ -2523,29 +3041,33 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 json!({"image_id":image_id,"node_id":id}),
             )
         })?;
-        // A UDIM image routes its lookup from the UV; the node has no tile property (Cycles' kernel_image_udim_map).
-        let udim = image.udim;
-        let interpolation = match node
+        let flat_projection = node
             .properties
-            .get("interpolation")
+            .get("projection")
             .and_then(JsonValue::as_str)
-        {
-            Some("linear" | "Linear" | "LINEAR") => ImageInterpolation::Linear,
-            Some("closest" | "Closest" | "CLOSEST") => ImageInterpolation::Closest,
-            Some(interpolation) => {
-                return Err(PotError::with_details(
-                    ErrorCode::UnsupportedFeature,
-                    format!("Image Texture interpolation `{interpolation}` is not supported"),
-                    json!({"feature_id":"shader.node.ShaderNodeTexImage.interpolation","node_id":id,"interpolation":interpolation}),
-                ));
+            .is_none_or(|projection| projection.eq_ignore_ascii_case("FLAT"));
+        // Cycles routes UDIMs for every projection; EEVEE only binds tiled images for FLAT.
+        let udim = image.udim && (self.hit_ctx.path_traced || flat_projection);
+        let interpolation = crate::shader::texture::image_texture_interpolation(
+            id,
+            &node.node_type,
+            &node.properties,
+            image.interpolation,
+        )?;
+        let extension = match node.properties.get("extension") {
+            None => ImageExtension::Repeat,
+            Some(JsonValue::String(extension)) if extension.eq_ignore_ascii_case("REPEAT") => {
+                ImageExtension::Repeat
             }
-            None => image.interpolation,
-        };
-        let extension = match node.properties.get("extension").and_then(JsonValue::as_str) {
-            None | Some("REPEAT") => ImageExtension::Repeat,
-            Some("EXTEND") => ImageExtension::Extend,
-            Some("CLIP") => ImageExtension::Clip,
-            Some("MIRROR") => ImageExtension::Mirror,
+            Some(JsonValue::String(extension)) if extension.eq_ignore_ascii_case("EXTEND") => {
+                ImageExtension::Extend
+            }
+            Some(JsonValue::String(extension)) if extension.eq_ignore_ascii_case("CLIP") => {
+                ImageExtension::Clip
+            }
+            Some(JsonValue::String(extension)) if extension.eq_ignore_ascii_case("MIRROR") => {
+                ImageExtension::Mirror
+            }
             Some(extension) => {
                 return Err(PotError::with_details(
                     ErrorCode::UnsupportedFeature,
@@ -2554,17 +3076,66 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 ));
             }
         };
-        // Cycles unassociates an Image Texture's colour only when its Alpha output still has a link after
-        // dead nodes are removed, so the colour read depends on that link (see `linked_alpha_image_nodes`).
+        let (uvs, weights) = crate::shader::texture::image_texture_projection_samples(
+            id,
+            &node.node_type,
+            &node.properties,
+            uv,
+            self.hit_ctx.normal,
+            self.hit_ctx.object_to_world,
+        )?;
+        let mipmapping_enabled = !node
+            .properties
+            .get("projection")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|projection| {
+                projection.eq_ignore_ascii_case("SPHERE") || projection.eq_ignore_ascii_case("TUBE")
+            });
+        if mipmapping_enabled {
+            ensure_realtime_linear_image_filtering(
+                &self.hit_ctx,
+                image,
+                [uv.x, uv.y],
+                interpolation,
+                !self.is_linked(id, "Vector")
+                    && node
+                        .properties
+                        .get("projection")
+                        .and_then(JsonValue::as_str)
+                        .is_none_or(|projection| projection.eq_ignore_ascii_case("FLAT")),
+                "shader.node.ShaderNodeTexImage.linear_mip_filtering",
+                Some(id),
+                image_id,
+            )?;
+        }
+        // Cycles unassociates colour only when the node's Alpha output has a surviving link.
         let alpha_linked = self.alpha_linked_image(id);
-        let pixel = sample_with_extension_alpha(
-            image,
-            [uv.x, uv.y],
-            udim,
-            interpolation,
-            extension,
-            alpha_linked,
-        );
+        let mut pixel = [0.0; 4];
+        for (uv, weight) in uvs.into_iter().zip(weights) {
+            if weight > 0.0 {
+                let sample = if image.udim && !udim {
+                    crate::image::sampling::sample_with_extension_alpha_first_tile_axes(
+                        image,
+                        [uv.x, uv.y],
+                        interpolation,
+                        [extension; 2],
+                        alpha_linked,
+                    )
+                } else {
+                    sample_with_extension_alpha(
+                        image,
+                        [uv.x, uv.y],
+                        udim,
+                        interpolation,
+                        extension,
+                        alpha_linked,
+                    )
+                };
+                for (channel, value) in pixel.iter_mut().zip(sample) {
+                    *channel += weight * value;
+                }
+            }
+        }
         if pixel.iter().any(|component| !component.is_finite()) {
             return Err(eval_error(format!(
                 "Image Texture node `{id}` sampled non-finite pixels"
@@ -2575,6 +3146,106 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             "Alpha" => Ok(Value::Scalar(pixel[3])),
             _ => Err(invalid(format!("unknown Image Texture output `{socket}`"))),
         }
+    }
+
+    fn environment_texture(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!(
+                "unknown Environment Texture output `{socket}`"
+            )));
+        }
+        let direction = self.texture_vector_input(id, self.hit_ctx.position)?;
+        let node = self.node(id)?;
+        let image_id = node
+            .properties
+            .get("image")
+            .or_else(|| node.properties.get("image_id"))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "Environment Texture node `{id}` requires an image ID"
+                ))
+            })?;
+        if !Id::is_valid(image_id) {
+            return Err(invalid(format!(
+                "Environment Texture node `{id}` has an invalid image ID"
+            )));
+        }
+        let images = self.hit_ctx.image_data.ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                "Environment Texture evaluation requires resolved image pixels in the hit context",
+                json!({"feature_id":"shader.node.ShaderNodeTexEnvironment.image_data","node_id":id,"image_id":image_id}),
+            )
+        })?;
+        let image = images.get(image_id).ok_or_else(|| {
+            PotError::with_details(
+                ErrorCode::TargetNotFound,
+                format!("environment image data `{image_id}` was not found in the hit context"),
+                json!({"image_id":image_id,"node_id":id}),
+            )
+        })?;
+        let interpolation = crate::shader::texture::image_texture_interpolation(
+            id,
+            &node.node_type,
+            &node.properties,
+            image.interpolation,
+        )?;
+        if !self.hit_ctx.path_traced
+            && interpolation == ImageInterpolation::Linear
+            && node
+                .properties
+                .get("projection")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|projection| projection.eq_ignore_ascii_case("MIRROR_BALL"))
+        {
+            return Err(
+                crate::shader::texture::unsupported_realtime_environment_filtering(id, image_id),
+            );
+        }
+        let uv = crate::shader::environment_texture_uv(
+            id,
+            node,
+            direction,
+            self.hit_ctx.position,
+            self.hit_ctx.path_traced,
+        )?;
+        let extensions = if self.hit_ctx.path_traced {
+            [ImageExtension::Repeat; 2]
+        } else if node
+            .properties
+            .get("projection")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|projection| projection.eq_ignore_ascii_case("MIRROR_BALL"))
+        {
+            [ImageExtension::Extend; 2]
+        } else {
+            [ImageExtension::Repeat, ImageExtension::Extend]
+        };
+        let color = if !self.hit_ctx.path_traced && image.udim {
+            crate::image::sampling::sample_with_extension_alpha_first_tile_axes(
+                image,
+                uv,
+                interpolation,
+                extensions,
+                false,
+            )
+        } else {
+            crate::image::sampling::sample_with_extension_alpha_axes(
+                image,
+                uv,
+                false,
+                interpolation,
+                extensions,
+                false,
+            )
+        };
+        if color.iter().any(|component| !component.is_finite()) {
+            return Err(eval_error(format!(
+                "Environment Texture node `{id}` sampled non-finite pixels"
+            )));
+        }
+        Ok(Value::Color(color))
     }
 
     fn bump(&mut self, id: &Id, socket: &str) -> Result<Value> {
@@ -2730,21 +3401,21 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     }
 
     fn checker(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let vector = self.vector_input(
-            id,
-            &["Vector"],
-            DVec3::new(self.hit_ctx.uv[0], self.hit_ctx.uv[1], 0.0),
-        )?;
+        let default_vector = self.hit_ctx.generated;
+        let vector = self.texture_vector_input(id, default_vector)?;
         let scale = self.scalar_input(id, &["Scale"], 5.0)?;
-        let scaled = vector * scale;
-        let parity = scaled.x.floor() + scaled.y.floor() + scaled.z.floor();
-        let first = self.color_input(id, &["Color1"], [0.2, 0.2, 0.2, 1.0])?;
-        let second = self.color_input(id, &["Color2"], [0.8, 0.8, 0.8, 1.0])?;
-        let first_chosen = parity.rem_euclid(2.0) < 1.0;
+        let parity = |coordinate: f64| {
+            let scaled = coordinate as f32 * scale as f32;
+            let biased = (scaled + 0.000_001_f32) * 0.999_999_f32;
+            (biased.floor() as i32).unsigned_abs() & 1
+        };
+        let first_chosen = parity(vector.x) ^ parity(vector.y) ^ parity(vector.z) != 0;
+        let first = self.color_input(id, &["Color1"], [0.8, 0.8, 0.8, 1.0])?;
+        let second = self.color_input(id, &["Color2"], [0.2, 0.2, 0.2, 1.0])?;
         let chosen = if first_chosen { first } else { second };
         match socket {
             "Color" => Ok(Value::Color(chosen)),
-            "Fac" | "Factor" => Ok(Value::Scalar(if first_chosen { 0.0 } else { 1.0 })),
+            "Fac" | "Factor" => Ok(Value::Scalar(if first_chosen { 1.0 } else { 0.0 })),
             _ => Err(invalid(format!(
                 "unknown Checker Texture output `{socket}`"
             ))),
@@ -2752,61 +3423,245 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     }
 
     fn noise(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let vector = self.vector_input(id, &["Vector"], self.hit_ctx.generated)?;
-        let scale = self.scalar_input(id, &["Scale"], 5.0)?;
-        let detail = self.scalar_input(id, &["Detail"], 2.0)?.clamp(0.0, 8.0);
-        let roughness = self.scalar_input(id, &["Roughness"], 0.5)?.clamp(0.0, 1.0);
-        let mut value = 0.0;
-        let mut amplitude = 1.0;
-        let mut total_amplitude = 0.0;
-        let mut frequency = scale;
-        for _ in 0..=detail.floor() as usize {
-            value += perlin(vector * frequency) * amplitude;
-            total_amplitude += amplitude;
-            frequency *= 2.0;
-            amplitude *= roughness;
+        use super::texture_kernels::NoiseType;
+
+        let dimensions = match self.node(id)?.properties.get("noise_dimensions") {
+            None => 3,
+            Some(value) => match value.as_str() {
+                Some("1D") => 1,
+                Some("2D") => 2,
+                Some("3D") => 3,
+                Some("4D") => 4,
+                Some(other) => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("Noise:noise_dimensions:{other}"),
+                    ));
+                }
+                None => return Err(unsupported_node(id, "Noise:noise_dimensions")),
+            },
+        };
+        let noise_type = match self.node(id)?.properties.get("noise_type") {
+            None => NoiseType::Fbm,
+            Some(value) => match value.as_str() {
+                Some("MULTIFRACTAL") => NoiseType::Multifractal,
+                Some("FBM") => NoiseType::Fbm,
+                Some("HYBRID_MULTIFRACTAL") => NoiseType::HybridMultifractal,
+                Some("RIDGED_MULTIFRACTAL") => NoiseType::RidgedMultifractal,
+                Some("HETERO_TERRAIN") => NoiseType::HeteroTerrain,
+                Some(other) => {
+                    return Err(unsupported_node(id, &format!("Noise:noise_type:{other}")));
+                }
+                None => return Err(unsupported_node(id, "Noise:noise_type")),
+            },
+        };
+        let normalize = if matches!(noise_type, NoiseType::Fbm) {
+            match self.node(id)?.properties.get("normalize") {
+                None => true,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| unsupported_node(id, "Noise:normalize"))?,
+            }
+        } else {
+            true
+        };
+
+        let scale = self.scalar_input(id, &["Scale"], 5.0)? as f32;
+        let detail = (self.scalar_input(id, &["Detail"], 2.0)? as f32).clamp(0.0, 15.0);
+        let roughness = (self.scalar_input(id, &["Roughness"], 0.5)? as f32).max(0.0);
+        let lacunarity = self.scalar_input(id, &["Lacunarity"], 2.0)? as f32;
+        let (offset, gain) = match noise_type {
+            NoiseType::HybridMultifractal | NoiseType::RidgedMultifractal => (
+                self.scalar_input(id, &["Offset"], 0.0)? as f32,
+                self.scalar_input(id, &["Gain"], 1.0)? as f32,
+            ),
+            NoiseType::HeteroTerrain => (self.scalar_input(id, &["Offset"], 0.0)? as f32, 1.0),
+            _ => (0.0, 1.0),
+        };
+        let distortion = self.scalar_input(id, &["Distortion"], 0.0)? as f32;
+        let mut coordinate = [0.0; 4];
+        if dimensions == 1 {
+            coordinate[0] = self.scalar_input(id, &["W"], 0.0)? as f32 * scale;
+        } else {
+            let default_vector = self.hit_ctx.generated;
+            let vector = self.texture_vector_input(id, default_vector)?;
+            coordinate[0] = vector.x as f32 * scale;
+            coordinate[1] = vector.y as f32 * scale;
+            if dimensions >= 3 {
+                coordinate[2] = vector.z as f32 * scale;
+            }
+            if dimensions == 4 {
+                coordinate[3] = self.scalar_input(id, &["W"], 0.0)? as f32 * scale;
+            }
         }
-        let factor = (0.5 + 0.5 * value / total_amplitude.max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
         match socket {
-            "Fac" | "Factor" => Ok(Value::Scalar(factor)),
-            "Color" => Ok(Value::Color([factor, factor, factor, 1.0])),
+            "Fac" | "Factor" => Ok(Value::Scalar(f64::from(
+                super::texture_kernels::noise_factor(
+                    coordinate, dimensions, detail, roughness, lacunarity, offset, gain,
+                    distortion, noise_type, normalize,
+                ),
+            ))),
+            "Color" => {
+                let color = super::texture_kernels::noise_color(
+                    coordinate, dimensions, detail, roughness, lacunarity, offset, gain,
+                    distortion, noise_type, normalize,
+                );
+                Ok(Value::Color([
+                    f64::from(color[0]),
+                    f64::from(color[1]),
+                    f64::from(color[2]),
+                    1.0,
+                ]))
+            }
             _ => Err(invalid(format!("unknown Noise Texture output `{socket}`"))),
         }
     }
 
     fn voronoi(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let vector = self.vector_input(id, &["Vector"], self.hit_ctx.generated)?
-            * self.scalar_input(id, &["Scale"], 5.0)?;
-        let cell = vector.floor();
-        let mut nearest = f64::INFINITY;
-        let mut nearest_point = DVec3::ZERO;
-        for z in -1..=1 {
-            for y in -1..=1 {
-                for x in -1..=1 {
-                    let coordinate = cell + DVec3::new(f64::from(x), f64::from(y), f64::from(z));
-                    let offset = DVec3::new(
-                        lattice_random(coordinate, 0),
-                        lattice_random(coordinate, 1),
-                        lattice_random(coordinate, 2),
-                    );
-                    let point = coordinate + offset;
-                    let distance = (vector - point).length();
-                    if distance < nearest {
-                        nearest = distance;
-                        nearest_point = point;
-                    }
+        use super::texture_kernels::{VoronoiFeature, VoronoiMetric, VoronoiParams};
+
+        let dimensions = match self.node(id)?.properties.get("voronoi_dimensions") {
+            None => 3,
+            Some(value) => match value.as_str() {
+                Some("1D") => 1,
+                Some("2D") => 2,
+                Some("3D") => 3,
+                Some("4D") => 4,
+                Some(other) => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("Voronoi:voronoi_dimensions:{other}"),
+                    ));
                 }
+                None => return Err(unsupported_node(id, "Voronoi:voronoi_dimensions")),
+            },
+        };
+        let feature = match self.node(id)?.properties.get("feature") {
+            None => VoronoiFeature::F1,
+            Some(value) => match value.as_str() {
+                Some("F1") => VoronoiFeature::F1,
+                Some("F2") => VoronoiFeature::F2,
+                Some("SMOOTH_F1") => VoronoiFeature::SmoothF1,
+                Some("DISTANCE_TO_EDGE") => VoronoiFeature::DistanceToEdge,
+                Some("N_SPHERE_RADIUS") => VoronoiFeature::NSphereRadius,
+                Some(other) => {
+                    return Err(unsupported_node(id, &format!("Voronoi:feature:{other}")));
+                }
+                None => return Err(unsupported_node(id, "Voronoi:feature")),
+            },
+        };
+        let is_radius = feature == VoronoiFeature::NSphereRadius;
+        let is_edge = feature == VoronoiFeature::DistanceToEdge;
+        let metric = if is_radius || is_edge {
+            VoronoiMetric::Euclidean
+        } else {
+            match self.node(id)?.properties.get("distance") {
+                None => VoronoiMetric::Euclidean,
+                Some(value) => match value.as_str() {
+                    Some("EUCLIDEAN") => VoronoiMetric::Euclidean,
+                    Some("MANHATTAN") => VoronoiMetric::Manhattan,
+                    Some("CHEBYCHEV") => VoronoiMetric::Chebychev,
+                    Some("MINKOWSKI") => VoronoiMetric::Minkowski,
+                    Some(other) => {
+                        return Err(unsupported_node(id, &format!("Voronoi:distance:{other}")));
+                    }
+                    None => return Err(unsupported_node(id, "Voronoi:distance")),
+                },
+            }
+        };
+        let normalize = if is_radius {
+            false
+        } else {
+            match self.node(id)?.properties.get("normalize") {
+                None => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| unsupported_node(id, "Voronoi:normalize"))?,
+            }
+        };
+        let scale = self.scalar_input(id, &["Scale"], 5.0)? as f32;
+        let randomness = (self.scalar_input(id, &["Randomness"], 1.0)? as f32).clamp(0.0, 1.0);
+        let (detail, roughness, lacunarity) = if is_radius {
+            (0.0, 0.0, 0.0)
+        } else {
+            let detail = self.scalar_input(id, &["Detail"], 0.0)? as f32;
+            let roughness = self.scalar_input(id, &["Roughness"], 0.5)? as f32;
+            let lacunarity = self.scalar_input(id, &["Lacunarity"], 2.0)? as f32;
+            if crate::shader::inline_fold::node_inputs_all_primitive(self.group, id) {
+                (detail, roughness, lacunarity)
+            } else {
+                (
+                    detail.clamp(0.0, 15.0),
+                    roughness.clamp(0.0, 1.0),
+                    lacunarity,
+                )
+            }
+        };
+        let smoothness = if feature == VoronoiFeature::SmoothF1 {
+            (self.scalar_input(id, &["Smoothness"], 1.0)? as f32 / 2.0).clamp(0.0, 0.5)
+        } else {
+            0.0
+        };
+        let exponent = if metric == VoronoiMetric::Minkowski && dimensions != 1 {
+            self.scalar_input(id, &["Exponent"], 0.5)? as f32
+        } else {
+            0.0
+        };
+        let mut coordinate = [0.0; 4];
+        if dimensions == 1 {
+            coordinate[0] = self.scalar_input(id, &["W"], 0.0)? as f32 * scale;
+        } else {
+            let default_vector = self.hit_ctx.position;
+            let vector = self.texture_vector_input(id, default_vector)?;
+            coordinate[0] = vector.x as f32 * scale;
+            coordinate[1] = vector.y as f32 * scale;
+            if dimensions >= 3 {
+                coordinate[2] = vector.z as f32 * scale;
+            }
+            if dimensions == 4 {
+                coordinate[3] = self.scalar_input(id, &["W"], 0.0)? as f32 * scale;
             }
         }
+        let result = super::texture_kernels::voronoi(
+            coordinate,
+            dimensions,
+            VoronoiParams {
+                feature,
+                metric,
+                scale,
+                detail,
+                roughness,
+                lacunarity,
+                smoothness,
+                exponent,
+                randomness,
+                normalize,
+                max_distance: 0.0,
+            },
+            socket == "Color",
+        );
         match socket {
-            "Distance" | "Fac" => Ok(Value::Scalar(nearest)),
-            "Color" => Ok(Value::Color([
-                lattice_random(nearest_point, 3),
-                lattice_random(nearest_point, 4),
-                lattice_random(nearest_point, 5),
+            "Distance" | "Fac" | "Radius" if is_radius => {
+                Ok(Value::Scalar(f64::from(result.radius)))
+            }
+            "Distance" | "Fac" if !is_radius => Ok(Value::Scalar(f64::from(result.distance))),
+            "Color" if !is_edge && !is_radius => Ok(Value::Color([
+                f64::from(result.color[0]),
+                f64::from(result.color[1]),
+                f64::from(result.color[2]),
                 1.0,
             ])),
-            "Position" => Ok(Value::Vector(nearest_point)),
+            "Position" if !is_edge && !is_radius && dimensions != 1 => {
+                Ok(Value::Vector(DVec3::new(
+                    f64::from(result.position[0]),
+                    f64::from(result.position[1]),
+                    f64::from(result.position[2]),
+                )))
+            }
+            "W" if !is_edge && !is_radius && matches!(dimensions, 1 | 4) => {
+                Ok(Value::Scalar(f64::from(result.position[3])))
+            }
+            "Radius" if is_radius => Ok(Value::Scalar(f64::from(result.radius))),
             _ => Err(invalid(format!(
                 "unknown Voronoi Texture output `{socket}`"
             ))),
@@ -2814,26 +3669,42 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     }
 
     fn gradient(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let vector = self.vector_input(id, &["Vector"], self.hit_ctx.generated)?;
-        let gradient_type = self
-            .node(id)?
-            .properties
-            .get("gradient_type")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("LINEAR");
+        let default_vector = self.hit_ctx.generated;
+        let vector = self.texture_vector_input(id, default_vector)?;
+        let gradient_type = match self.node(id)?.properties.get("gradient_type") {
+            None => "LINEAR",
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| unsupported_node(id, "Gradient:gradient_type"))?,
+        };
+        let x = vector.x as f32;
+        let y = vector.y as f32;
+        let z = vector.z as f32;
         let factor = match gradient_type {
-            "LINEAR" => vector.x,
-            "QUADRATIC" => vector.x.max(0.0).powi(2),
-            "EASING" => {
-                let x = vector.x.clamp(0.0, 1.0);
-                x * x * (3.0 - 2.0 * x)
+            "LINEAR" => x,
+            "QUADRATIC" => {
+                let r = x.max(0.0);
+                r * r
             }
-            "SPHERICAL" => vector.length(),
-            "QUADRATIC_SPHERE" => vector.length_squared(),
-            "RADIAL" => vector.y.atan2(vector.x) / std::f64::consts::TAU + 0.5,
+            "EASING" => {
+                let r = x.clamp(0.0, 1.0);
+                let t = r * r;
+                3.0 * t - 2.0 * t * r
+            }
+            "DIAGONAL" => f32::midpoint(x, y),
+            "RADIAL" => y.atan2(x) / std::f32::consts::TAU + 0.5,
+            "SPHERICAL" | "QUADRATIC_SPHERE" => {
+                let r = (0.999_999_f32 - (x * x + y * y + z * z).sqrt()).max(0.0);
+                if gradient_type == "SPHERICAL" {
+                    r
+                } else {
+                    r * r
+                }
+            }
             other => return Err(unsupported_node(id, &format!("Gradient:{other}"))),
         }
         .clamp(0.0, 1.0);
+        let factor = f64::from(factor);
         match socket {
             "Fac" | "Factor" => Ok(Value::Scalar(factor)),
             "Color" => Ok(Value::Color([factor, factor, factor, 1.0])),
@@ -4175,7 +5046,24 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 DVec3::new(uv[0], uv[1], 0.0)
             }
             "Object" => self.hit_ctx.object,
-            "Normal" => self.hit_ctx.normal,
+            "Normal" => {
+                let object_to_world = Mat4::from_cols_array(
+                    &self
+                        .hit_ctx
+                        .object_to_world
+                        .to_cols_array()
+                        .map(|value| value as f32),
+                );
+                let normal = object_to_world
+                    .transpose()
+                    .transform_vector3(f32_vector(self.hit_ctx.normal))
+                    .normalize_or_zero();
+                DVec3::new(
+                    f64::from(normal.x),
+                    f64::from(normal.y),
+                    f64::from(normal.z),
+                )
+            }
             "Position" => self.hit_ctx.position,
             "Reflection" => normalize_or(
                 -self
@@ -4511,42 +5399,203 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         Ok(Value::Vector(normalize_or(mixed, base_normal)))
     }
 
+    fn fresnel_dielectric_cos(cosi: f32, eta: f32) -> f32 {
+        let c = cosi.abs();
+        let mut g = eta * eta - 1.0 + c * c;
+        if g > 0.0 {
+            g = g.sqrt();
+            let a = (g - c) / (g + c);
+            let b = (c * (g + c) - 1.0) / (c * (g - c) + 1.0);
+            0.5 * a * a * (1.0 + b * b)
+        } else {
+            1.0
+        }
+    }
+
     fn fresnel(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let ior = self.scalar_input(id, &["IOR"], 1.45)?.max(1.0);
-        let cos_theta = normalize_or(self.hit_ctx.normal, DVec3::Z)
-            .dot(normalize_or(self.hit_ctx.view_direction, DVec3::Z))
-            .abs()
-            .clamp(0.0, 1.0);
-        let r0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
-        let facing = r0 + (1.0 - r0) * (1.0 - cos_theta).powi(5);
+        let ior = self.scalar_input(id, &["IOR"], 1.5)? as f32;
+        let normal = normalize_f32_or(
+            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
+            self.hit_ctx.normal,
+        );
+        let cosi = f32_vector(self.hit_ctx.view_direction)
+            .normalize_or_zero()
+            .dot(normal);
+        let mut eta = ior.max(1.0e-5);
+        if self.hit_ctx.back_facing {
+            eta = 1.0 / eta;
+        }
         match socket {
-            "Fac" | "Factor" => Ok(Value::Scalar(facing)),
+            "Fac" | "Factor" => Ok(Value::Scalar(f64::from(Self::fresnel_dielectric_cos(
+                cosi, eta,
+            )))),
             _ => Err(invalid(format!("unknown Fresnel output `{socket}`"))),
         }
     }
 
     fn layer_weight(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        let blend = self.scalar_input(id, &["Blend"], 0.5)?.clamp(0.0, 1.0);
-        let cos_theta = normalize_or(self.hit_ctx.normal, DVec3::Z)
-            .dot(normalize_or(self.hit_ctx.view_direction, DVec3::Z))
-            .abs()
-            .clamp(0.0, 1.0);
-        let facing = cos_theta.powf(blend.max(0.001));
-        match socket {
-            "Facing" => Ok(Value::Scalar(facing)),
-            "Fresnel" => Ok(Value::Scalar(1.0 - facing)),
-            _ => Err(invalid(format!("unknown Layer Weight output `{socket}`"))),
+        let blend = self.scalar_input(id, &["Blend"], 0.5)? as f32;
+        let normal = normalize_f32_or(
+            self.vector_input(id, &["Normal"], self.hit_ctx.normal)?,
+            self.hit_ctx.normal,
+        );
+        let cosi = f32_vector(self.hit_ctx.view_direction)
+            .normalize_or_zero()
+            .dot(normal);
+        let factor = match socket {
+            "Fresnel" => {
+                let eta = (1.0 - blend).max(1.0e-5);
+                let eta = if self.hit_ctx.back_facing {
+                    eta
+                } else {
+                    1.0 / eta
+                };
+                Self::fresnel_dielectric_cos(cosi, eta)
+            }
+            "Facing" => {
+                let mut facing = cosi.abs();
+                if blend.to_bits() != 0.5_f32.to_bits() {
+                    let blend = blend.clamp(0.0, 1.0 - 1.0e-5);
+                    let exponent = if blend < 0.5 {
+                        2.0 * blend
+                    } else {
+                        0.5 / (1.0 - blend)
+                    };
+                    facing = facing.powf(exponent);
+                }
+                1.0 - facing
+            }
+            _ => return Err(invalid(format!("unknown Layer Weight output `{socket}`"))),
+        };
+        Ok(Value::Scalar(f64::from(factor)))
+    }
+
+    fn geometry_attribute(&self, id: &Id, name: &str, socket: &str) -> Result<Option<Value>> {
+        let Some(attribute) = self
+            .hit_ctx
+            .geometry_attributes
+            .and_then(|attributes| attributes.iter().find(|attribute| attribute.name == name))
+        else {
+            return Ok(None);
+        };
+        let unsupported = |reason: &str| {
+            PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!("ShaderNodeAttribute cannot sample mesh attribute `{name}`: {reason}"),
+                json!({
+                    "feature_id":"shader.node.ShaderNodeAttribute.geometry_attribute.unsupported",
+                    "node_id":id,
+                    "attribute_name":name,
+                    "attribute_domain":attribute.domain.as_str(),
+                    "attribute_data_type":attribute.data_type.as_str(),
+                    "output_socket":socket,
+                }),
+            )
+        };
+        if matches!(
+            attribute.domain.as_str(),
+            "point" | "POINT" | "corner" | "CORNER"
+        ) && ["color", "float_color", "byte_color"]
+            .iter()
+            .any(|data_type| attribute.data_type.eq_ignore_ascii_case(data_type))
+        {
+            // Blender color attributes use the existing color-layer path, not the generic scalar/vector reader.
+            return Ok(None);
+        }
+        if attribute.domain != "point" {
+            return Err(unsupported("only POINT-domain attributes are supported"));
+        }
+        let weights = std::array::from_fn(|component| {
+            self.hit_ctx.geometry_attribute_corner_weights[0][component]
+                * self.hit_ctx.geometry_attribute_barycentric[0]
+                + self.hit_ctx.geometry_attribute_corner_weights[1][component]
+                    * self.hit_ctx.geometry_attribute_barycentric[1]
+                + self.hit_ctx.geometry_attribute_corner_weights[2][component]
+                    * self.hit_ctx.geometry_attribute_barycentric[2]
+        });
+        match (&attribute.values, socket) {
+            (GeometryAttributeValues::Float(values), "Fac" | "Factor") => sample_point_attribute(
+                |vertex| values.get(vertex).copied(),
+                self.hit_ctx.geometry_attribute_vertices,
+                weights,
+            )
+            .map(|value| Some(Value::Scalar(value)))
+            .ok_or_else(|| unsupported("POINT values do not match the mesh vertices")),
+            (GeometryAttributeValues::Integer(values), "Fac" | "Factor") => sample_point_attribute(
+                |vertex| values.get(vertex).map(|value| f64::from(*value)),
+                self.hit_ctx.geometry_attribute_vertices,
+                weights,
+            )
+            .map(|value| Some(Value::Scalar(value)))
+            .ok_or_else(|| unsupported("POINT values do not match the mesh vertices")),
+            (GeometryAttributeValues::Vector(values), "Vector") => {
+                let Some(x) = sample_point_attribute(
+                    |vertex| values.get(vertex).map(|value| value[0]),
+                    self.hit_ctx.geometry_attribute_vertices,
+                    weights,
+                ) else {
+                    return Err(unsupported("POINT values do not match the mesh vertices"));
+                };
+                let Some(y) = sample_point_attribute(
+                    |vertex| values.get(vertex).map(|value| value[1]),
+                    self.hit_ctx.geometry_attribute_vertices,
+                    weights,
+                ) else {
+                    return Err(unsupported("POINT values do not match the mesh vertices"));
+                };
+                let Some(z) = sample_point_attribute(
+                    |vertex| values.get(vertex).map(|value| value[2]),
+                    self.hit_ctx.geometry_attribute_vertices,
+                    weights,
+                ) else {
+                    return Err(unsupported("POINT values do not match the mesh vertices"));
+                };
+                Ok(Some(Value::Vector(DVec3::new(x, y, z))))
+            }
+            (GeometryAttributeValues::Unsupported, _) => Err(unsupported(
+                "stored domain, data type, or value encoding has no native shader sampling route",
+            )),
+            (GeometryAttributeValues::Float(_) | GeometryAttributeValues::Integer(_), _) => Err(
+                unsupported("scalar attributes are available through Fac/Factor"),
+            ),
+            (GeometryAttributeValues::Vector(_), _) => Err(unsupported(
+                "vector attributes are available through Vector",
+            )),
         }
     }
 
-    /// `ShaderNodeAttribute`. The `Color` output is RGB with alpha 1.0: EEVEE's `node_attribute`
-    /// sets `outcol = float4(attr.xyz, 1.0f)` (`gpu/shaders/material/gpu_shader_material_attribute.glsl`).
-    /// Cycles' Color is a float3 output (`intern/cycles/scene/shader_nodes.cpp`,
-    /// `AttributeNode::compile`, `NODE_ATTR_OUTPUT_FLOAT3`). The `Alpha` output carries the layer
-    /// alpha (EEVEE `outalpha = attr.w`; Cycles `NODE_ATTR_OUTPUT_FLOAT_ALPHA`). A missing layer
-    /// loads as opaque black.
+    /// Generic POINT FLOAT/INT values map to `Fac`; POINT `FLOAT_VECTOR` maps to `Vector`.
+    /// Color-layer `Color` is RGB with alpha 1.0 in EEVEE and float3 in Cycles. Its `Fac` averages
+    /// RGB channels, and `Alpha` carries the layer alpha (EEVEE `outalpha = attr.w`; Cycles
+    /// `NODE_ATTR_OUTPUT_FLOAT_ALPHA`). A missing layer loads as opaque black.
     fn attribute(&self, id: &Id, socket: &str) -> Result<Value> {
         let node = self.node(id)?;
+        let attribute_type = match node.properties.get("attribute_type") {
+            None => "GEOMETRY",
+            Some(JsonValue::String(attribute_type)) => attribute_type.as_str(),
+            Some(value) => {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    "ShaderNodeAttribute has an invalid attribute_type",
+                    json!({
+                        "feature_id":"shader.node.ShaderNodeAttribute.attribute_type.invalid",
+                        "node_id":id,
+                        "attribute_type":value,
+                    }),
+                ));
+            }
+        };
+        if attribute_type != "GEOMETRY" {
+            return Err(PotError::with_details(
+                ErrorCode::UnsupportedFeature,
+                format!("ShaderNodeAttribute attribute type `{attribute_type}` is not supported"),
+                json!({
+                    "feature_id":format!("shader.node.ShaderNodeAttribute.attribute_type.{attribute_type}"),
+                    "node_id":id,
+                    "attribute_type":attribute_type,
+                }),
+            ));
+        }
         let name = node
             .properties
             .get("attribute_name")
@@ -4565,10 +5614,17 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 socket,
             ));
         }
+        if let Some(value) = self.geometry_attribute(id, name, socket)? {
+            return Ok(value);
+        }
         let [red, green, blue, alpha] =
             layer_color(&self.hit_ctx, name, false, [0.0, 0.0, 0.0, 1.0]);
         match socket {
             "Color" => Ok(Value::Color([red, green, blue, 1.0])),
+            "Fac" | "Factor" => Ok(Value::Scalar(f64::from(
+                (red as f32 + green as f32 + blue as f32) * (1.0_f32 / 3.0),
+            ))),
+            "Vector" => Ok(Value::Vector(DVec3::new(red, green, blue))),
             _ => color_output([red, green, blue, alpha], socket, "Attribute"),
         }
     }
@@ -4629,6 +5685,22 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             Value::Shader(_) => Err(invalid("expected a vector shader socket")),
         }
         .map(|value| if value.is_finite() { value } else { default })
+    }
+
+    fn texture_vector_input(&mut self, id: &Id, default: DVec3) -> Result<DVec3> {
+        if self.links.is_none() || self.texture_mapping_unsupported.contains(id) {
+            let node = self.node(id)?;
+            crate::shader::texture::validate_texture_node_mapping(
+                id,
+                node.node_type.as_str(),
+                &node.properties,
+            )?;
+        }
+        if self.is_linked(id, "Vector") {
+            self.vector_input(id, &["Vector"], default)
+        } else {
+            Ok(default)
+        }
     }
 
     fn color_input(&mut self, id: &Id, names: &[&str], default: [f64; 4]) -> Result<[f64; 4]> {
@@ -5350,6 +6422,19 @@ fn normalize_or(value: DVec3, fallback: DVec3) -> DVec3 {
         fallback
     }
 }
+
+fn f32_vector(value: DVec3) -> Vec3 {
+    Vec3::new(value.x as f32, value.y as f32, value.z as f32)
+}
+
+fn normalize_f32_or(value: DVec3, fallback: DVec3) -> Vec3 {
+    let normalized = f32_vector(value).normalize_or_zero();
+    if normalized.length_squared() > f32::EPSILON {
+        normalized
+    } else {
+        f32_vector(fallback).normalize_or_zero()
+    }
+}
 /// Cycles' `make_orthonormals` (`util/math_float3.h`): a tangent from the cross product with
 /// `(1, 1, 1)`, chosen by exact component equality, and the bitangent `N × tangent`.
 #[expect(
@@ -5619,50 +6704,6 @@ pub fn height_gradient<'a>(
     Ok(world_u * along_u + world_v * along_v)
 }
 
-fn perlin(point: DVec3) -> f64 {
-    let base = point.floor();
-    let local = point - base;
-    let fade = |value: f64| value * value * value * (value * (value * 6.0 - 15.0) + 10.0);
-    let fade = DVec3::new(fade(local.x), fade(local.y), fade(local.z));
-    let mut total = 0.0;
-    for z in 0..=1 {
-        for y in 0..=1 {
-            for x in 0..=1 {
-                let lattice = base + DVec3::new(f64::from(x), f64::from(y), f64::from(z));
-                let delta = local - DVec3::new(f64::from(x), f64::from(y), f64::from(z));
-                let angle = lattice_random(lattice, 0) * std::f64::consts::TAU;
-                let vertical = lattice_random(lattice, 1) * 2.0 - 1.0;
-                let horizontal = (1.0 - vertical * vertical).max(0.0).sqrt();
-                let gradient =
-                    DVec3::new(horizontal * angle.cos(), horizontal * angle.sin(), vertical);
-                let wx = if x == 0 { 1.0 - fade.x } else { fade.x };
-                let wy = if y == 0 { 1.0 - fade.y } else { fade.y };
-                let wz = if z == 0 { 1.0 - fade.z } else { fade.z };
-                total += gradient.dot(delta) * wx * wy * wz;
-            }
-        }
-    }
-    total * 1.6
-}
-
-fn lattice_random(point: DVec3, channel: i32) -> f64 {
-    let mut hash = 0x811c_9dc5_u32 ^ channel as u32;
-    for value in [
-        point.x.floor() as i64,
-        point.y.floor() as i64,
-        point.z.floor() as i64,
-    ] {
-        hash = (hash ^ value as u32).wrapping_mul(0x0100_0193);
-        hash ^= (value >> 32) as u32;
-    }
-    hash ^= hash >> 16;
-    hash = hash.wrapping_mul(0x7feb_352d);
-    hash ^= hash >> 15;
-    hash = hash.wrapping_mul(0x846c_a68b);
-    hash ^= hash >> 16;
-    f64::from(hash) / f64::from(u32::MAX)
-}
-
 fn invalid(message: impl Into<String>) -> PotError {
     PotError::new(ErrorCode::InvalidOperation, message)
 }
@@ -5785,9 +6826,10 @@ mod tests {
     };
 
     use super::{
-        BsdfParams, Evaluator, EvaluatorWorkspace, HitContext, HitDifferentials, HitUvLayers,
-        PreparedMaterial, SurfaceShading, color_lerp, evaluate_displacement, evaluate_surface,
-        layer_index, layer_uv,
+        BsdfParams, Evaluator, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues,
+        HitContext, HitDifferentials, HitUvLayers, PreparedMaterial, SurfaceShading,
+        Value as ShaderValue, color_lerp, evaluate_displacement, evaluate_surface, layer_index,
+        layer_uv,
     };
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
         let Value::Object(properties) = properties else {
@@ -6829,6 +7871,83 @@ mod tests {
         .unwrap();
         assert_eq!(params.base_color, [0.0; 4]);
         assert_eq!(sink.borrow()[0]["layer"], json!(""));
+    }
+
+    fn attribute_output(
+        attribute: &GeometryAttribute,
+        socket: &str,
+    ) -> crate::error::Result<ShaderValue> {
+        let mut graph = NodeGroup::new("Attribute", GraphKind::Shader);
+        insert_node(&mut graph, "attribute", "ShaderNodeAttribute", json!({}));
+        set_properties(
+            &mut graph,
+            "attribute",
+            json!({"attribute_type":"GEOMETRY","attribute_name":attribute.name.as_str()}),
+        );
+        let node_id = Id::new("attribute").unwrap();
+        let groups = Registry::new();
+        let hit_ctx = HitContext::new(&groups).with_geometry_attributes(
+            std::slice::from_ref(attribute),
+            [0, 1, 2],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.2, 0.3, 0.5],
+        );
+        let material = Material::default();
+        let mut workspace = EvaluatorWorkspace::default();
+        let empty = BTreeSet::new();
+        let evaluator = Evaluator {
+            group: &graph,
+            material: &material,
+            hit_ctx,
+            workspace: &mut workspace,
+            alpha_linked_images: &empty,
+            links: None,
+            texture_mapping_unsupported: &empty,
+        };
+        evaluator.attribute(&node_id, socket)
+    }
+
+    #[test]
+    fn geometry_attribute_samples_native_point_types() {
+        let scalar = GeometryAttribute {
+            name: "Wear".to_owned(),
+            domain: "point".to_owned(),
+            data_type: "float".to_owned(),
+            values: GeometryAttributeValues::Float(vec![0.0, 0.9, 0.92]),
+        };
+        assert!(matches!(
+            attribute_output(&scalar, "Fac"),
+            Ok(ShaderValue::Scalar(value)) if (value - 0.73).abs() < 1.0e-12
+        ));
+        let integer = GeometryAttribute {
+            name: "Index".to_owned(),
+            domain: "point".to_owned(),
+            data_type: "int".to_owned(),
+            values: GeometryAttributeValues::Integer(vec![3; 3]),
+        };
+        assert!(matches!(
+            attribute_output(&integer, "Factor"),
+            Ok(ShaderValue::Scalar(value)) if value == 3.0
+        ));
+        let vector = GeometryAttribute {
+            name: "Vector".to_owned(),
+            domain: "point".to_owned(),
+            data_type: "float3".to_owned(),
+            values: GeometryAttributeValues::Vector(vec![[0.17, 0.53, 0.89]; 3]),
+        };
+        assert!(matches!(
+            attribute_output(&vector, "Vector"),
+            Ok(ShaderValue::Vector(value)) if (value - DVec3::new(0.17, 0.53, 0.89)).length() < 1.0e-12
+        ));
+        let edge = GeometryAttribute {
+            name: "EdgeValue".to_owned(),
+            domain: "edge".to_owned(),
+            data_type: "float".to_owned(),
+            values: GeometryAttributeValues::Unsupported,
+        };
+        let error = attribute_output(&edge, "Fac").unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+        assert!(error.message.contains("POINT-domain"));
     }
 
     #[test]

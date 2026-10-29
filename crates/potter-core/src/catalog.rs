@@ -199,7 +199,7 @@ pub fn feature_catalog() -> Value {
             [true, true, true, true, true, true, true],
             "partial",
             &json!(
-                "Group Input resolves lazily from the current hit context. Value/RGB, RGB/HSV/HSL converters and color operations, vector rotation/transforms, nested non-recursive shader groups, Object Info, Geometry, Blackbody/Wavelength, and Light Falloff evaluate. Path tracing uses Cycles/SVM semantics; realtime uses EEVEE semantics for Incoming/Reflection signs, Normal Map spaces and backfaces, Hue/Saturation output clamping, spectral tables, and Geometry. Volume hit contexts preserve the object's Color/Alpha/Object Index/Random and material pass index; Cycles path contexts retain exact path distance for Light Falloff, while realtime uses no distance (`None`) and EEVEE strength semantics. Camera Data needs an active camera matrix; a differing Vector Transform involving CAMERA needs the active camera matrix, with realtime stereo supplying the selected eye's matrix. TexCoord Camera/Window and UV Map from_instancer remain unsupported; Object Info Random on instances, broken/non-shader/recursive groups, and Cycles Pointiness/Random Per Island remain unsupported (EEVEE returns 0.5/0.0). Only reachable Blender-origin Value/RGB/Normal nodes with unrecoverable output defaults are refused; imports mark them with empty potter_output_defaults and never guess defaults."
+                "Group Input resolves lazily from the current hit context. Value/RGB, RGB/HSV/HSL converters and color operations, vector rotation/transforms, nested non-recursive shader groups, Object Info, Geometry, Blackbody/Wavelength, and Light Falloff evaluate. Path tracing uses Cycles/SVM semantics; realtime uses EEVEE semantics for Incoming/Reflection signs, Normal Map spaces and backfaces, Hue/Saturation output clamping, spectral tables, and Geometry. Volume hit contexts preserve the object's Color/Alpha/Object Index/Random and material pass index; Cycles path contexts retain exact path distance for Light Falloff, while realtime uses no distance (`None`) and EEVEE strength semantics. Camera Data needs an active camera matrix; a differing Vector Transform involving CAMERA needs the active camera matrix, with realtime stereo supplying the selected eye's matrix. TexCoord Camera/Window and UV Map from_instancer remain unsupported; Object Info Random on instances, broken/non-shader/recursive groups, and Cycles Pointiness/Random Per Island remain unsupported (EEVEE returns 0.5/0.0). Only reachable Blender-origin Value/RGB/Normal nodes with unrecoverable output defaults are refused; imports mark them with empty potter_output_defaults and never guess defaults. Blender 5.2.2 parity also covers Checker defaults, every Gradient mode, all Noise and Voronoi dimensions/modes, Image Texture FLAT/BOX/SPHERE/TUBE with LINEAR/CLOSEST/CUBIC/SMART and Cycles extensions, Environment Texture EQUIRECTANGULAR/MIRROR_BALL with LINEAR/CLOSEST/CUBIC/SMART and world ray/CombineXYZ inputs, exact dielectric Fresnel and Layer Weight, Glass GGX/MULTI_GGX, OBJECT/WORLD Displacement, and Principled Volume blackbody with per-step VDB Temperature Attribute sampling. POINT FLOAT/INT Attribute supports Fac/Factor, POINT FLOAT_VECTOR supports Vector, and POINT/CORNER color layers support Color/Vector/Fac/Alpha; reachable socket/type mismatches return `shader.node.ShaderNodeAttribute.geometry_attribute.unsupported` and `.blend` import reports them only for used outputs on assigned meshes. Legacy marker-only Texture Mapping/Color Mapping values (`rna_type` = `TexMapping`/`ColorMapping`) are unknown, not defaults; reachable texture nodes are refused with `shader.node.<idname>.texture_mapping` or `.color_mapping` and require re-import, and `.blend` import reports the corresponding per-node feature IDs. `.blend` export reports each unknown mapping as a per-node loss with `shader.node.<idname>.texture_mapping` or `.color_mapping` and the node ID as `data_id`, because the missing values cannot be reconstructed. EEVEE realtime minified LINEAR Image Texture sampling requiring mip/aniso remains unsupported; EEVEE LOD-0 and path/Cycles base-level behavior remain supported. MIRROR_BALL+LINEAR Environment, Sky `multiple_scattering_model`, unsupported non-default Sky settings, Density/Color grid selections, Cycles path-traced spatially varying Volume graphs, multi-closure VDB blackbody graphs, Glass BECKMANN, unsupported texture projections/interpolations or BOX blend values remain explicit refusals. Native evidence: `node_shader_attribute.cc:24-35`, `intern/cycles/kernel/svm/attribute.h`, `source/blender/blenkernel/intern/texture.cc`, and `source/blender/nodes/shader/nodes/node_shader_tex_image.cc`."
             ),
         ),
         supported(
@@ -290,6 +290,26 @@ pub fn feature_catalog() -> Value {
                 "Object Info Location/Color/Alpha/Object Index/Random evaluate for regular and volume objects; Material Index evaluates only when the rendered material's pass_index is known and refuses unknown values with `shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index`. Potter-native materials and source formats without the field use Blender's default 0; fresh `.blend` imports preserve exact values. The unknown state arises only when schema 15-to-16 migration finds a Blender-mapped material record with no saved `pass_index`; Blender export reports unknown metadata as `blender.material.pass_index`. Volume hit contexts preserve object Color/Alpha/Object Index/Random and material pass index, including unknown as None. Random on instances is unsupported. Geometry Position/Normal/True Normal/Incoming/Reflection/Tangent/Parametric/Backfacing evaluate with engine-specific normals (Incoming points toward the viewer in both Cycles and EEVEE; Reflection uses -reflect(view,N) in both engines, without extra normalization); EEVEE True Normal is geometric, Pointiness is 0.5, and Random Per Island is 0.0, while Cycles does not support Pointiness or Random Per Island. Camera Data requires an active camera matrix; View Z Depth is signed in Cycles and absolute in EEVEE. Texture Coordinate Reflection evaluates; Camera/Window and UV Map from_instancer remain unsupported."
             ),
         ),
+        {
+            let mut row = supported(
+                "shader.node.ShaderNodeAttribute.geometry_attribute.unsupported",
+                "GEOMETRY Attribute nodes referencing unsupported mesh attributes",
+                "ShaderNodeAttribute",
+                &[
+                    "graph.create",
+                    "graph.node_add",
+                    "graph.link",
+                    "material.create",
+                    "material.update",
+                ],
+                [true, true, true, true, true, true, true],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "GEOMETRY Attribute supports POINT FLOAT/INT through Fac/Factor, POINT FLOAT_VECTOR through Vector, and POINT/CORNER color-layer Color/Vector/Fac/Alpha. A linked POINT FLOAT/INT through Color/Vector/Alpha output or FLOAT_VECTOR through Color/Fac/Alpha output returns `UnsupportedFeature` with `shader.node.ShaderNodeAttribute.geometry_attribute.unsupported`; unsupported non-POINT domains and generic data types remain refused with the same feature ID. `.blend` import reports this loss only when the mismatched output socket is reachable and the material is assigned to a mesh carrying the attribute; unused outputs do not report a mismatch. Non-GEOMETRY `attribute_type` values remain separately refused. Blender 5.2.2 native output declarations are in `source/blender/nodes/shader/nodes/node_shader_attribute.cc`; Cycles conversions are in `intern/cycles/kernel/svm/attribute.h`."
+            );
+            row
+        },
         feature_row(
             "shader.bump",
             "Cycles and EEVEE Bump with invert, distance, and filter width",
@@ -320,6 +340,61 @@ pub fn feature_catalog() -> Value {
             ],
             "Realtime transparent-shadow opacity evaluation skips Bump used only for shading. If a Bump output contributes to transparency or coverage, Potter refuses with this loss rather than approximating shifted Height. `.blend` import reports this ID only when the active EEVEE scene uses a material whose Bump output reaches Principled Alpha, Transparent color, or Mix Shader coverage, including through shader groups.",
         ),
+        unsupported(
+            "shader.node.ShaderNodeTexEnvironment.linear_mip_filtering",
+            "EEVEE realtime MIRROR_BALL + LINEAR Environment Texture filtering",
+            "ShaderNodeTexEnvironment",
+            &[
+                "world.create",
+                "world.update",
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            "EEVEE realtime LINEAR Environment Texture with MIRROR_BALL projection is unsupported because that projection lacks mip/aniso gradients, including at LOD-0. Path/Cycles sampling remains supported.",
+        ),
+        unsupported(
+            "shader.material_texture.linear_mip_filtering",
+            "EEVEE realtime minified LINEAR material-texture mip/aniso filtering",
+            "Material Texture",
+            &["material.create", "material.update"],
+            "EEVEE realtime LINEAR material-texture minification with a texel footprint above 1 requires mip/aniso filtering and is unsupported; only LOD-0 is implemented. UV-layer coordinates without screen-space gradients are also refused. EEVEE LOD-0 and path/Cycles base-level sampling remain supported.",
+        ),
+        unsupported(
+            "shader.node.ShaderNodeTexImage.linear_mip_filtering",
+            "EEVEE realtime minified LINEAR Image Texture mip/aniso filtering",
+            "ShaderNodeTexImage",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            "EEVEE realtime LINEAR Image Texture minification with a texel footprint above 1 requires mip/aniso filtering and is unsupported; only LOD-0 is implemented. Image coordinates without screen-space gradients are also refused. EEVEE LOD-0 and path/Cycles base-level behavior remain supported.",
+        ),
+        {
+            let mut row = supported(
+                "shader.volume.spatially_varying_graph",
+                "Cycles path-traced Volume graphs with spatially varying inputs",
+                "ShaderNodeOutputMaterial",
+                &[
+                    "graph.create",
+                    "graph.node_add",
+                    "graph.link",
+                    "material.create",
+                    "material.update",
+                ],
+                [true, true, true, true, true, true, true],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "Constant Volume Output graphs remain supported. Cycles path-traced Volume graphs whose active Volume arm depends on spatial coordinates, procedural or image textures, geometry attributes, or unsupported volume-grid attributes return `UnsupportedFeature` with `shader.volume.spatially_varying_graph` and are reported as `.blend` import losses; the Cycles path tracer does not evaluate those inputs per step or freeze them at one bounds-center. EEVEE realtime evaluates supported spatial `VolumeAbsorption` density inputs at froxel samples."
+            );
+            row
+        },
         supported(
             "shader.output_material.volume",
             "Output Material volume surface with analytic extinction and scattering",
@@ -2932,19 +3007,26 @@ pub fn feature_catalog() -> Value {
             &["world.create", "world.update"],
             [true, true, true, false, false, false, false],
         ),
-        supported(
-            "world",
-            "World node graphs with analytic sky and equirectangular environment lighting",
-            "World",
-            &[
-                "world.create",
-                "world.update",
-                "graph.create",
-                "graph.node_add",
-                "graph.link",
-            ],
-            [true, true, true, true, true, false, false],
-        ),
+        {
+            let mut row = supported(
+                "world",
+                "World node graphs with Background, Emission, and Environment Texture lighting; Sky is partial",
+                "World",
+                &[
+                    "world.create",
+                    "world.update",
+                    "graph.create",
+                    "graph.node_add",
+                    "graph.link",
+                ],
+                [true, true, true, true, true, false, false],
+            );
+            row["status"] = json!("partial");
+            row["reason"] = json!(
+                "World Background, Emission, and Environment Texture nodes support Cycles and EEVEE coordinate/projection rules. ShaderNodeTexSky remains refused with `world.node.ShaderNodeTexSky.multiple_scattering_model` because its default MULTIPLE_SCATTERING model is not implemented; unsupported non-default Sky settings and EEVEE realtime MIRROR_BALL + LINEAR mip/aniso filtering also return explicit UnsupportedFeature errors."
+            );
+            row
+        },
         supported(
             "render.preview",
             "CPU preview modes: solid, beauty, wire, normal, depth, and ID",

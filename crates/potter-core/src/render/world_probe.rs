@@ -25,7 +25,7 @@ const FACE_TEXELS: usize = 64;
 pub(super) struct WorldProbe {
     /// The six faces in the order of `face_direction`, each `FACE_TEXELS` by `FACE_TEXELS`, row by row.
     radiance: Vec<DVec3>,
-    /// EEVEE's non-directional spherical-harmonic L0, used by sphere-thickness translucent closures.
+    /// EEVEE's non-directional spherical-harmonic L0 for sphere-thickness and isotropic volume lighting.
     average_irradiance: DVec3,
 }
 
@@ -37,25 +37,11 @@ impl WorldProbe {
         images: &BTreeMap<String, ImageData>,
     ) -> Result<Self> {
         let mut radiance = Vec::with_capacity(6 * FACE_TEXELS * FACE_TEXELS);
-        let mut average_irradiance = DVec3::ZERO;
-        let mut total_solid_angle = 0.0;
-        for face in 0..6 {
-            for row in 0..FACE_TEXELS {
-                for column in 0..FACE_TEXELS {
-                    let s = texel_centre(column);
-                    let t = texel_centre(row);
-                    let value = evaluate_world(world, groups, images, face_direction(face, s, t))?;
-                    let solid_angle = cube_texel_solid_angle(column, row);
-                    average_irradiance +=
-                        super::eevee_transmission::irradiance_probe_radiance(value) * solid_angle;
-                    total_solid_angle += solid_angle;
-                    radiance.push(value);
-                }
-            }
-        }
+        let average_irradiance =
+            sample_world_probe(world, groups, images, |value| radiance.push(value))?;
         Ok(Self {
             radiance,
-            average_irradiance: average_irradiance / total_solid_angle,
+            average_irradiance,
         })
     }
 
@@ -65,10 +51,42 @@ impl WorldProbe {
         let index = (face * FACE_TEXELS + texel(t)) * FACE_TEXELS + texel(s);
         self.radiance[index]
     }
-    /// EEVEE's non-directional world-probe value for sphere-thickness translucency.
+    /// EEVEE's non-directional world-probe SH L0.
     pub(super) fn average_irradiance(&self) -> DVec3 {
         self.average_irradiance
     }
+}
+/// EEVEE's isotropic volume-light SH L0, captured from the world probe (`eevee_volume.bsl.hh`).
+pub(super) fn volume_ambient_l0(
+    world: &World,
+    groups: &Registry<NodeGroup>,
+    images: &BTreeMap<String, ImageData>,
+) -> Result<DVec3> {
+    sample_world_probe(world, groups, images, |_| {})
+}
+
+fn sample_world_probe(
+    world: &World,
+    groups: &Registry<NodeGroup>,
+    images: &BTreeMap<String, ImageData>,
+    mut capture_radiance: impl FnMut(DVec3),
+) -> Result<DVec3> {
+    let mut average_irradiance = DVec3::ZERO;
+    let mut total_solid_angle = 0.0;
+    for face in 0..6 {
+        for row in 0..FACE_TEXELS {
+            for column in 0..FACE_TEXELS {
+                let direction = face_direction(face, texel_centre(column), texel_centre(row));
+                let radiance = evaluate_world(world, groups, images, direction, false)?;
+                let solid_angle = cube_texel_solid_angle(column, row);
+                average_irradiance +=
+                    super::eevee_transmission::irradiance_probe_radiance(radiance) * solid_angle;
+                total_solid_angle += solid_angle;
+                capture_radiance(radiance);
+            }
+        }
+    }
+    Ok(average_irradiance / total_solid_angle)
 }
 fn cube_texel_solid_angle(column: usize, row: usize) -> f64 {
     let edge = FACE_TEXELS as f64;

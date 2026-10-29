@@ -1,0 +1,27 @@
+{
+  "source": "Blender 5.2.2 source/blender/nodes/shader/nodes/node_shader_attribute.cc; Mesh POINT FLOAT attribute `Probe` through GEOMETRY Attribute outputs",
+  "cases": [
+    {
+      "name": "geometry_attribute_point_float_color",
+      "blend": "geometry_attribute_point_float_color.blend",
+      "attribute_name": "Probe",
+      "attribute_type": "GEOMETRY",
+      "data_type": "FLOAT",
+      "domain": "POINT",
+      "output_socket": "Color",
+      "expect_loss": true,
+      "loss_feature_id": "shader.node.ShaderNodeAttribute.geometry_attribute.unsupported"
+    },
+    {
+      "name": "geometry_attribute_point_float_fac",
+      "blend": "geometry_attribute_point_float_fac.blend",
+      "attribute_name": "Probe",
+      "attribute_type": "GEOMETRY",
+      "data_type": "FLOAT",
+      "domain": "POINT",
+      "output_socket": "Fac",
+      "expect_loss": false,
+      "loss_feature_id": "shader.node.ShaderNodeAttribute.geometry_attribute.unsupported"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 use std::f64::consts::TAU;
 
-use glam::{DMat4, DVec3, Vec3};
+use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 
 use super::wireframe::{self, PointSquare, ScreenPoint, WireEdge, WirePoint, WireSegment};
@@ -250,6 +250,10 @@ pub(crate) struct Triangle {
     /// its barycentric weights, as Cycles stores Generated per vertex and interpolates it
     /// (`intern/cycles/blender/mesh.cpp`, `ATTR_STD_GENERATED`), so a corner value of zero stays zero.
     pub(crate) generated: GeneratedCorners,
+    /// Source point slots for the three original mesh vertices of this triangle.
+    pub(crate) geometry_vertex_slots: [usize; 3],
+    /// Each current corner's barycentric coordinates in the original source triangle.
+    pub(crate) geometry_vertex_weights: [[f64; 3]; 3],
     pub(crate) object_index: u32,
     /// Source element index; face records carry per-slot UV bindings through subdivision copies.
     pub(crate) element_index: u32,
@@ -285,6 +289,7 @@ impl Triangle {
         layer_uvs: Vec<[[f64; 2]; 3]>,
         layer_tangents: Vec<[DVec3; 3]>,
         layer_colors: Vec<[[f64; 4]; 3]>,
+        geometry_vertex_weights: [[f64; 3]; 3],
     ) -> Self {
         Self {
             positions,
@@ -301,9 +306,15 @@ impl Triangle {
             layer_tangents,
             normals: self.normals,
             layer_colors,
+            geometry_vertex_slots: self.geometry_vertex_slots,
+            geometry_vertex_weights,
             lit_per_pixel: self.lit_per_pixel,
             ray_mask: self.ray_mask,
         }
+    }
+
+    pub(crate) const fn geometry_attribute_frame(&self) -> ([usize; 3], [[f64; 3]; 3]) {
+        (self.geometry_vertex_slots, self.geometry_vertex_weights)
     }
 
     /// A copy without the per-layer data, for passes that only shade the triangle. Per-pixel
@@ -319,6 +330,7 @@ impl Triangle {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                self.geometry_vertex_weights,
             )
         }
     }
@@ -1412,6 +1424,128 @@ fn camera_matrices_for_camera(camera: &Camera) -> Result<(DMat4, DMat4)> {
         })
 }
 
+#[derive(Clone, Copy)]
+struct EeveeWorldRayFrame {
+    view_positions: [Vec3; 3],
+    right: Vec3,
+    up: Vec3,
+    back: Vec3,
+}
+
+impl EeveeWorldRayFrame {
+    fn new(camera: &Camera, frame: &CameraFrame, width: u32, height: u32) -> Option<Self> {
+        let right = Vec3::new(
+            frame.right.x as f32,
+            frame.right.y as f32,
+            frame.right.z as f32,
+        );
+        let up = Vec3::new(frame.up.x as f32, frame.up.y as f32, frame.up.z as f32);
+        let back = Vec3::new(
+            -frame.forward.x as f32,
+            -frame.forward.y as f32,
+            -frame.forward.z as f32,
+        );
+        let view_positions = match (camera.projection, frame.projection) {
+            (Projection::Orthographic { .. }, ProjectionFrame::Orthographic { .. }) => {
+                [Vec3::new(0.0, 0.0, -1.0); 3]
+            }
+            (
+                Projection::Perspective {
+                    lens_mm,
+                    sensor_width_mm,
+                },
+                ProjectionFrame::Perspective { .. },
+            ) => {
+                let view_width = if frame.stereo_mode == StereoMode::SideBySide {
+                    width / 2
+                } else {
+                    width
+                };
+                let near = camera.near as f32;
+                let far = camera.far as f32;
+                let pixel_size = (sensor_width_mm as f32 * near) / lens_mm as f32;
+                let pixel_size = pixel_size / view_width as f32;
+                let shift_x = camera.shift[0] as f32 * view_width as f32;
+                let shift_y = camera.shift[1] as f32 * view_width as f32;
+                let left = (-0.5 * view_width as f32 + shift_x) * pixel_size;
+                let right = (0.5 * view_width as f32 + shift_x) * pixel_size;
+                let bottom = (-0.5 * height as f32 + shift_y) * pixel_size;
+                let top = (0.5 * height as f32 + shift_y) * pixel_size;
+                let width = right - left;
+                let height = top - bottom;
+                let depth = far - near;
+                let projection = Mat4::from_cols(
+                    Vec4::new(2.0 * near / width, 0.0, 0.0, 0.0),
+                    Vec4::new(0.0, 2.0 * near / height, 0.0, 0.0),
+                    Vec4::new(
+                        (right + left) / width,
+                        (top + bottom) / height,
+                        -(far + near) / depth,
+                        -1.0,
+                    ),
+                    Vec4::new(0.0, 0.0, -(2.0 * far * near) / depth, 0.0),
+                );
+                let inverse_projection = projection.inverse();
+                if !inverse_projection.is_finite() {
+                    return None;
+                }
+                // EEVEE inverse-projects the fullscreen-triangle vertices before GPU interpolation.
+                [
+                    Vec4::new(-1.0, -1.0, 1.0, 1.0),
+                    Vec4::new(3.0, -1.0, 1.0, 1.0),
+                    Vec4::new(-1.0, 3.0, 1.0, 1.0),
+                ]
+                .map(|ndc| {
+                    let position = inverse_projection * ndc;
+                    position.truncate() / position.w
+                })
+            }
+            _ => return None,
+        };
+        Some(Self {
+            view_positions,
+            right,
+            up,
+            back,
+        })
+    }
+
+    fn direction(
+        self,
+        camera: &Camera,
+        width: u32,
+        height: u32,
+        x: u32,
+        y: u32,
+        sample_x: f64,
+        sample_y: f64,
+    ) -> DVec3 {
+        let (view_x, view_width) = if camera.stereo_mode == StereoMode::SideBySide {
+            let split = width / 2;
+            if x < split {
+                (x, split)
+            } else {
+                (x - split, width - split)
+            }
+        } else {
+            (x, width)
+        };
+        // Evaluate the fullscreen triangle's f32 attribute plane using raster-space gradients.
+        let pixel_x = view_x as f32 + sample_x as f32;
+        let pixel_y = height as f32 - y as f32 - sample_y as f32;
+        let slope_x = (self.view_positions[1] - self.view_positions[0]) / (2.0 * view_width as f32);
+        let slope_y = (self.view_positions[2] - self.view_positions[0]) / (2.0 * height as f32);
+        let view_position = self.view_positions[0] + slope_x * pixel_x + slope_y * pixel_y;
+        let view_incident = (-view_position).normalize();
+        let world_incident =
+            self.right * view_incident.x + self.up * view_incident.y + self.back * view_incident.z;
+        DVec3::new(
+            f64::from(-world_incident.x),
+            f64::from(-world_incident.y),
+            f64::from(-world_incident.z),
+        )
+    }
+}
 /// The scene world's radiance along a view ray. Realtime Beauty shows it where no surface covers a sample, as EEVEE
 /// shows its world, and modes without one show their constant background colour.
 pub(crate) type WorldRadiance<'a> = &'a (dyn Fn(DVec3) -> Result<DVec3> + Send + Sync);
@@ -1440,6 +1574,7 @@ struct RasterSamplesRequest<'scene, 'context, 'lights, 'volume, 'volume_scene, '
     mode: Mode,
     background: [u8; 4],
     world: Option<WorldRadiance<'scene>>,
+    eevee_world_rays: bool,
     samples: u32,
     seed: u32,
     filter_size: f64,
@@ -1479,6 +1614,7 @@ pub(super) fn rasterize_with_samples(
         mode,
         background,
         world,
+        eevee_world_rays: false,
         samples,
         seed,
         filter_size,
@@ -1790,6 +1926,7 @@ struct FilmSampleRenderContext<'scene, 'light_context, 'lights> {
     mode: Mode,
     background: [f64; 4],
     world: Option<WorldRadiance<'scene>>,
+    eevee_world_ray: Option<&'scene EeveeWorldRayFrame>,
     camera_lights: Option<super::path::RealtimeCameraLightView<'light_context, 'lights>>,
     camera_light_raster_samples: Option<&'scene super::path::CameraLightRasterSamples>,
     view_index: usize,
@@ -1842,6 +1979,7 @@ impl FilmSampleRenderContext<'_, '_, '_> {
                     mode: self.mode,
                     background: self.background,
                     world: self.world,
+                    eevee_world_ray: self.eevee_world_ray,
                     shader,
                     camera_lights: self.camera_lights,
                     camera_light_raster_samples: self.camera_light_raster_samples,
@@ -1885,6 +2023,7 @@ struct RasterSampleContext<
     mode: Mode,
     background: [f64; 4],
     world: Option<WorldRadiance<'scene>>,
+    eevee_world_ray: Option<&'scene EeveeWorldRayFrame>,
     shader: Option<RasterShader<'scene>>,
     camera_lights: Option<super::path::RealtimeCameraLightView<'light_context, 'lights>>,
     camera_light_raster_samples: Option<&'scene super::path::CameraLightRasterSamples>,
@@ -2025,11 +2164,25 @@ impl RasterSampleContext<'_, '_, '_, '_, '_, '_, '_> {
                 sample.y,
             )
         });
+        let world_direction = self
+            .eevee_world_ray
+            .map_or(sample_ray.direction, |world_ray| {
+                world_ray.direction(
+                    self.camera,
+                    self.width,
+                    self.height,
+                    sample.x,
+                    sample.y,
+                    sample.sample_x,
+                    sample.sample_y,
+                )
+            });
         let color = composite_sample_with_association(
             self.triangles,
             self.visibility,
             self.candidates,
             sample_ray,
+            world_direction,
             self.frame,
             self.camera,
             self.background,
@@ -2062,6 +2215,7 @@ fn rasterize_with_samples_for_eye(
         mode,
         background,
         world,
+        eevee_world_rays,
         samples,
         seed,
         filter_size,
@@ -2090,6 +2244,7 @@ fn rasterize_with_samples_for_eye(
             mode,
             background,
             world,
+            eevee_world_rays,
             samples,
             seed,
             filter_size,
@@ -2109,6 +2264,7 @@ fn rasterize_with_samples_for_eye(
             mode,
             background,
             world,
+            eevee_world_rays,
             samples,
             seed,
             filter_size,
@@ -2159,6 +2315,9 @@ fn rasterize_with_samples_for_eye(
     } else {
         [(DMat4::IDENTITY, DMat4::IDENTITY); 2]
     };
+    let eevee_world_ray = (eevee_world_rays && world.is_some())
+        .then(|| EeveeWorldRayFrame::new(camera, &frame, width, height))
+        .flatten();
     let prepared = prepare_triangles(triangles, mode)?;
     let visibility = super::bvh::Bvh::build_from_positions(
         prepared.iter().map(|triangle| triangle.source.positions),
@@ -2367,6 +2526,7 @@ fn rasterize_with_samples_for_eye(
                         mode,
                         background: background_linear,
                         world,
+                        eevee_world_ray: eevee_world_ray.as_ref(),
                         shader: shader.map(RasterShader::Main),
                         camera_lights,
                         camera_light_raster_samples: camera_light_raster_samples.as_ref(),
@@ -2445,6 +2605,7 @@ fn rasterize_with_samples_for_eye(
             mode,
             background: background_linear,
             world,
+            eevee_world_ray: eevee_world_ray.as_ref(),
             camera_lights,
             camera_light_raster_samples: camera_light_raster_samples.as_ref(),
             view_index,
@@ -2610,6 +2771,7 @@ pub(super) fn rasterize_with_lines(
     prepared_materials: &[crate::shader::PreparedMaterial],
     camera_lights: Option<&super::path::RealtimeCameraLightContext<'_>>,
     volume_pass: Option<&mut super::path::RealtimeVolumePass<'_, '_>>,
+    eevee_world_rays: bool,
 ) -> Result<RasterOutput> {
     let mut output = rasterize_with_samples_for_eye(RasterSamplesRequest {
         triangles,
@@ -2618,6 +2780,7 @@ pub(super) fn rasterize_with_lines(
         height,
         mode,
         background,
+        eevee_world_rays,
         world,
         samples,
         seed,
@@ -2810,6 +2973,7 @@ pub(crate) fn rasterize_wireframe(
         &[],
         None,
         None,
+        false,
     )?;
     let frame = camera_frame(camera, width, height)?;
     let orthographic = matches!(frame.projection, ProjectionFrame::Orthographic { .. });
@@ -4371,6 +4535,7 @@ fn composite_sample_with_association(
     visibility: &super::bvh::Bvh,
     candidates: &mut Vec<usize>,
     ray: Ray,
+    world_direction: DVec3,
     frame: &CameraFrame,
     camera: &Camera,
     background: [f64; 4],
@@ -4468,7 +4633,7 @@ fn composite_sample_with_association(
         let background_rgb = if transmittance == DVec3::ZERO {
             [0.0; 3]
         } else {
-            let color = sample_background(background, world, Some(ray.direction))?;
+            let color = sample_background(background, world, Some(world_direction))?;
             [color[0], color[1], color[2]]
         };
         premultiplied += DVec3::from_array(background_rgb) * (transmittance * background_alpha);
@@ -4493,7 +4658,7 @@ fn composite_sample_with_association(
             }
         });
         composite_layers_with_association(layers, background[3], || {
-            let background = sample_background(background, world, Some(ray.direction))?;
+            let background = sample_background(background, world, Some(world_direction))?;
             Ok([background[0], background[1], background[2]])
         })?
     };
@@ -5549,6 +5714,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )?;
         assert!(
             output.ids.contains(&7),
@@ -5591,6 +5757,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )?;
         let mut drawn = 0_usize;
         for y in 0..height {
@@ -5674,6 +5841,7 @@ mod line_tests {
             &[],
             None,
             None,
+            false,
         );
         assert!(output.is_ok());
         let Ok(output) = output else {
@@ -5783,6 +5951,8 @@ mod smooth_shading_tests {
             uv: [[0.0; 2]; 3],
             layer_uvs: Vec::new(),
             layer_tangents: Vec::new(),
+            geometry_vertex_slots: [0; 3],
+            geometry_vertex_weights: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             normals,
             layer_colors: Vec::new(),
             lit_per_pixel: false,
@@ -6328,6 +6498,8 @@ mod visibility_tests {
             layer_uvs: Vec::new(),
             layer_tangents: Vec::new(),
             normals: None,
+            geometry_vertex_slots: [0; 3],
+            geometry_vertex_weights: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             layer_colors: Vec::new(),
             lit_per_pixel: false,
             ray_mask: RayVisibility::default().mask(),
@@ -6567,6 +6739,7 @@ mod visibility_tests {
                     &visibility,
                     &mut candidates,
                     ray,
+                    ray.direction,
                     &frame,
                     &camera,
                     BACKGROUND,
@@ -6807,6 +6980,7 @@ mod film_band_tests {
             mode: Mode::Beauty,
             background: [0, 0, 0, 0],
             world: None,
+            eevee_world_rays: false,
             samples: SAMPLES,
             seed: 7,
             filter_size: 1.5,

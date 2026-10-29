@@ -325,7 +325,8 @@ fn normal_texture_uses_the_frame_of_its_own_layer() {
         let (material, images) = texture_material(uv_layer);
         let context = HitContext::new(&groups)
             .with_images(&images)
-            .with_uv_layers(layers.hit());
+            .with_uv_layers(layers.hit())
+            .with_path_traced(true);
         assert_close(
             evaluate_surface(&material, &context)
                 .unwrap()
@@ -348,7 +349,8 @@ fn normal_texture_empty_layer_is_render_and_missing_layer_warns() {
         let context = HitContext::new(&groups)
             .with_images(&images)
             .with_uv_layers(layers.hit())
-            .with_warnings(&warnings);
+            .with_warnings(&warnings)
+            .with_path_traced(true);
         assert_close(
             evaluate_surface(&material, &context)
                 .unwrap()
@@ -364,7 +366,8 @@ fn normal_texture_empty_layer_is_render_and_missing_layer_warns() {
     let context = HitContext::new(&groups)
         .with_images(&images)
         .with_uv_layers(layers.hit())
-        .with_warnings(&warnings);
+        .with_warnings(&warnings)
+        .with_path_traced(true);
     assert_close(
         evaluate_surface(&material, &context)
             .unwrap()
@@ -417,7 +420,8 @@ fn imported_normal_map_matches_direct_texture_with_unrelated_graph_nodes() {
     let direct_groups = Registry::new();
     let direct_context = HitContext::new(&direct_groups)
         .with_images(&images)
-        .with_uv_layers(layers.hit());
+        .with_uv_layers(layers.hit())
+        .with_path_traced(true);
     let expected = evaluate_surface(&direct_material, &direct_context)
         .unwrap()
         .dominant()
@@ -470,7 +474,8 @@ fn imported_normal_map_matches_direct_texture_with_unrelated_graph_nodes() {
     );
     let context = HitContext::new(&groups)
         .with_images(&images)
-        .with_uv_layers(layers.hit());
+        .with_uv_layers(layers.hit())
+        .with_path_traced(true);
     assert_close(
         evaluate_surface(&material, &context)
             .unwrap()

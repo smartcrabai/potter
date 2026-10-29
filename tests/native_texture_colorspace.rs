@@ -72,7 +72,9 @@ fn native_field_decodes_its_image_by_colourspace() -> TestResult {
             .materials
             .get(&Id::new(material)?)
             .ok_or("material is missing")?;
-        let context = HitContext::new(&doc.node_groups).with_images(&images);
+        let context = HitContext::new(&doc.node_groups)
+            .with_images(&images)
+            .with_path_traced(true);
         let shading = evaluate_surface(material, &context)?;
         Ok(shading
             .dominant()

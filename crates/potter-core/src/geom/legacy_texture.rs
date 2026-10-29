@@ -222,6 +222,8 @@ const DEFAULT_COLOR_RAMP: ColorRamp = ColorRamp {
 pub(crate) struct ImageSamplerSettings {
     pub(crate) extension: ImageExtension,
     pub(crate) interpolation: bool,
+    /// Cubic image filtering is not representable by Blender's legacy Texture sampler.
+    pub(crate) cubic: bool,
     pub(crate) filter_size: f32,
     pub(crate) flip_axis: bool,
     pub(crate) repeat_x: u32,
@@ -256,6 +258,7 @@ pub(crate) struct ImageSamplerSettings {
 pub(crate) const DEFAULT_IMAGE_SETTINGS: ImageSamplerSettings = ImageSamplerSettings {
     extension: ImageExtension::Repeat,
     interpolation: true,
+    cubic: false,
     filter_size: 1.0,
     flip_axis: false,
     repeat_x: 1,
@@ -317,12 +320,14 @@ impl ResolvedTexture {
     /// A texture for an image already in memory, sampled as Blender's image Tex is: the
     /// `DNA_texture_types.h` defaults (`extend = TEX_REPEAT`, `imaflag = TEX_INTERPOL | TEX_USEALPHA`,
     /// `flag = TEX_CHECKER_ODD | TEX_NO_CLAMP`) with `TEX_INTERPOL` cleared for `Closest` images, read
-    /// through `BKE_texture_get_value` as in `MOD_weightvg_util.cc:166`.
+    /// through `BKE_texture_get_value` as in `MOD_weightvg_util.cc:166`. Cubic interpolation is refused because this
+    /// legacy sampler cannot represent it.
     #[must_use]
     pub fn from_image(image: ImageData) -> Self {
         // The file facts `load_legacy_image` records, taken from the image itself: sRGB storage, and 8-bit texels.
         let settings = ImageSamplerSettings {
             interpolation: matches!(image.interpolation, ImageInterpolation::Linear),
+            cubic: matches!(image.interpolation, ImageInterpolation::Cubic),
             source_srgb_encoded: image.srgb,
             source_byte: image.storage.precision == Precision::Byte,
             ..DEFAULT_IMAGE_SETTINGS
@@ -1970,6 +1975,11 @@ fn sample_image(
     coords: DVec3,
     settings: &ImageSamplerSettings,
 ) -> Result<TextureResult> {
+    if settings.cubic {
+        return Err(invalid_image_sample(
+            "the legacy image sampler cannot represent cubic interpolation",
+        ));
+    }
     if image.width == 0 && image.height == 0 && image.pixels.is_empty() && image.tiles.is_empty() {
         return Ok(empty_image_sample(settings));
     }

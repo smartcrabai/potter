@@ -11,7 +11,7 @@ use crate::{
     error::{ErrorCode, PotError, Result},
     eval::Snapshot,
     geom::{
-        GeneratedCorners, GeneratedVertex, Mesh, TextureSpace,
+        GeneratedCorners, GeneratedVertex, Mesh, TextureSpace, attribute_keys,
         color_layers::{self, ColorDomain, ColorLayer, ColorStore},
         normals::{render_corner_normals, smooth_face_flags},
         uv_layers::{self, UvStore},
@@ -19,9 +19,10 @@ use crate::{
     image::ImageData,
     model::{Id, Material, Node, RayKind, RayVisibility, SceneDoc},
     shader::{
-        BsdfParams, EvaluatorWorkspace, HitContext, HitUvLayers, PreparedMaterial, ShaderClosure,
-        SurfaceShading, dielectric_f0, evaluate_displacement_with_workspace_semantics,
-        evaluate_surface_with_workspace_semantics, fill_color_layers, heaviest, make_orthonormals,
+        BsdfParams, EvaluatorWorkspace, GeometryAttribute, GeometryAttributeValues, HitContext,
+        HitUvLayers, PreparedMaterial, ShaderClosure, SurfaceShading, dielectric_f0,
+        evaluate_displacement_with_workspace_semantics, evaluate_surface_with_workspace_semantics,
+        fill_color_layers, heaviest, make_orthonormals,
     },
 };
 
@@ -74,6 +75,9 @@ pub(super) struct ObjectRecord {
     /// Joined color registry indices, matching `color_layers`.
     #[serde(skip)]
     pub color_layer_indices: Vec<usize>,
+    /// Typed generic mesh attributes, in the source mesh's point order.
+    #[serde(skip)]
+    pub geometry_attributes: Vec<GeometryAttribute>,
     /// EEVEE's default refraction thickness of the object (`transmission_thickness`). Not part of the output.
     #[serde(skip)]
     pub thickness: f64,
@@ -89,6 +93,9 @@ pub(super) struct ObjectRecord {
     pub object_pass_index: f64,
     #[serde(skip)]
     pub object_random_number: Option<f64>,
+    /// Evaluated object-to-world transform, retained for shader projections.
+    #[serde(skip)]
+    pub object_to_world: DMat4,
 }
 
 /// Color state per material of one object, keyed by `Triangle::material_index` and sorted by it, so a hit
@@ -579,6 +586,9 @@ pub(super) fn extract_geometry_with_semantics(
             )
         })?;
         let matrix = DMat4::from_cols_array(&evaluated.world_matrix);
+        // Match Cycles' `triangle_normal` for `object_negative_scale_applied`: reverse baked winding,
+        // not corner normals.
+        let mirrored = matrix.determinant() < 0.0;
         if volume.is_some()
             && let Some(volume_bounds) = evaluated.bounds
         {
@@ -610,6 +620,8 @@ pub(super) fn extract_geometry_with_semantics(
             .collect();
         let uv_render = (!uv_names.is_empty()).then_some(uv_store.render_index().unwrap_or(0));
         let color_store = mesh.map_or_else(ColorStore::default, color_layers::read);
+        let geometry_attributes = mesh.map_or_else(Vec::new, mesh_geometry_attributes);
+        let has_geometry_attributes = !geometry_attributes.is_empty();
         let color_slot_count = snapshot.slot_count(node_id, node, data_block).max(1);
         let mut color_slots = Vec::with_capacity(color_slot_count);
         for slot in 0..color_slot_count {
@@ -694,6 +706,7 @@ pub(super) fn extract_geometry_with_semantics(
                 .map(|layer| layer.name.clone())
                 .collect(),
             color_layer_indices: carried,
+            geometry_attributes,
             thickness,
             material_colors: MaterialColors::default(),
             object_to_world: matrix,
@@ -779,15 +792,16 @@ pub(super) fn extract_geometry_with_semantics(
                 Vec::new()
             };
             let mut wire_builder = WireEdgeBuilder::new(&mesh_edge_pairs);
-            let vertex_slots: BTreeMap<u32, usize> = if carried_layers.is_empty() {
-                BTreeMap::new()
-            } else {
-                mesh.vertices
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, vertex)| (vertex.id, slot))
-                    .collect()
-            };
+            let vertex_slots: BTreeMap<u32, usize> =
+                if carried_layers.is_empty() && !has_geometry_attributes {
+                    BTreeMap::new()
+                } else {
+                    mesh.vertices
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, vertex)| (vertex.id, slot))
+                        .collect()
+                };
             for (face_index, face) in mesh.faces.iter().enumerate() {
                 let material_slot = usize::try_from(face.material_index).ok();
                 let binding_slot =
@@ -901,11 +915,15 @@ pub(super) fn extract_geometry_with_semantics(
                         )
                     })?;
                 for triangle in face_triangles {
+                    let mut triangle_vertices = *triangle;
+                    if mirrored {
+                        triangle_vertices.swap(1, 2);
+                    }
                     let mut positions = [DVec3::ZERO; 3];
                     let mut vertices = [GeneratedVertex::default(); 3];
-                    let corners = triangle_corners(face, triangle);
+                    let corners = triangle_corners(face, &triangle_vertices);
                     let layer_uvs = triangle_layer_uvs(&uv_store, face_index, corners);
-                    for (index, vertex_id) in triangle.iter().enumerate() {
+                    for (index, vertex_id) in triangle_vertices.iter().enumerate() {
                         let local = vertex_positions.get(vertex_id).copied().ok_or_else(|| {
                             PotError::new(
                                 ErrorCode::SceneInvalid,
@@ -934,13 +952,42 @@ pub(super) fn extract_geometry_with_semantics(
                         &carried_layers,
                         face_corner_base,
                         corners,
-                        *triangle,
+                        triangle_vertices,
                         &vertex_slots,
                     );
-                    let layer_tangents = mikk_tangents
+                    let geometry_vertex_slots = if has_geometry_attributes {
+                        [
+                            *vertex_slots.get(&triangle_vertices[0]).ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::SceneInvalid,
+                                    "triangle references a missing generic attribute point",
+                                )
+                            })?,
+                            *vertex_slots.get(&triangle_vertices[1]).ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::SceneInvalid,
+                                    "triangle references a missing generic attribute point",
+                                )
+                            })?,
+                            *vertex_slots.get(&triangle_vertices[2]).ok_or_else(|| {
+                                PotError::new(
+                                    ErrorCode::SceneInvalid,
+                                    "triangle references a missing generic attribute point",
+                                )
+                            })?,
+                        ]
+                    } else {
+                        [0; 3]
+                    };
+                    let mut layer_tangents = mikk_tangents
                         .as_mut()
                         .and_then(Iterator::next)
                         .unwrap_or_default();
+                    if mirrored {
+                        for tangents in &mut layer_tangents {
+                            tangents.swap(1, 2);
+                        }
+                    }
                     let raw_normal =
                         (positions[1] - positions[0]).cross(positions[2] - positions[0]);
                     if raw_normal.length_squared() <= f64::EPSILON || !raw_normal.is_finite() {
@@ -973,6 +1020,12 @@ pub(super) fn extract_geometry_with_semantics(
                     let triangle = Triangle {
                         positions,
                         generated,
+                        geometry_vertex_slots,
+                        geometry_vertex_weights: [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
                         object_index,
                         element_index,
                         color,
@@ -1692,6 +1745,7 @@ fn subdivide_displaced_triangle(
                 back_facing: false,
                 path_traced,
                 view: DVec3::Z,
+                back_facing: false,
                 barycentric: sample.barycentric,
             },
             Some(sample.uv),
@@ -1701,6 +1755,7 @@ fn subdivide_displaced_triangle(
             },
             &mut tables,
         )?;
+        let context = context.with_path_traced(path_traced);
         evaluate_displacement_with_workspace_semantics(
             material,
             prepared,
@@ -1745,6 +1800,7 @@ fn subdivide_displaced(
         [0.0, 0.0, 1.0],
     ];
     let mut positions = [DVec3::ZERO; 6];
+    let mut geometry_samples = [[0.0; 3]; 6];
     let mut generated = [DVec3::ZERO; 6];
     let mut uvs = [[0.0; 2]; 6];
     let mut layer_samples = vec![[[0.0; 2]; 6]; triangle.layer_uvs.len()];
@@ -1783,6 +1839,11 @@ fn subdivide_displaced(
         // Generated of its undisplaced point, blended from the parent corners.
         let [first, second, third] = triangle.generated.corners;
         generated[index] = first * weights[0] + second * weights[1] + third * weights[2];
+        for (component, sample) in geometry_samples[index].iter_mut().enumerate() {
+            *sample = triangle.geometry_vertex_weights[0][component] * weights[0]
+                + triangle.geometry_vertex_weights[1][component] * weights[1]
+                + triangle.geometry_vertex_weights[2][component] * weights[2];
+        }
         sample_normals[index] = sample_normal;
         uvs[index] = uv;
         for (table, corners) in layer_samples.iter_mut().zip(&triangle.layer_uvs) {
@@ -1817,6 +1878,7 @@ fn subdivide_displaced(
                 .iter()
                 .map(|table| corners.map(|vertex| table[vertex]))
                 .collect(),
+            corners.map(|vertex| geometry_samples[vertex]),
         );
         if triangle.normals.is_some() {
             let average = corners
@@ -2516,6 +2578,7 @@ impl SceneShaderCore<'_> {
                 back_facing: hit.back_facing,
                 path_traced: false,
                 view: hit.view,
+                back_facing: hit.view.dot(hit.geometric) < 0.0,
                 barycentric: hit.barycentric,
             },
             None,
@@ -2632,6 +2695,135 @@ fn triangle_layer_colors(
             }),
         })
         .collect()
+}
+
+fn mesh_geometry_attributes(mesh: &Mesh) -> Vec<GeometryAttribute> {
+    let mut attributes = Vec::new();
+    for (key, value) in &mesh.attributes {
+        let Some(name) = attribute_keys::user_name(key) else {
+            continue;
+        };
+        let domain = value
+            .get("domain")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let data_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        attributes.push(GeometryAttribute {
+            name: name.to_owned(),
+            domain: domain.to_owned(),
+            data_type: data_type.to_owned(),
+            values: point_attribute_values(mesh, value.get("values"), domain, data_type),
+        });
+    }
+    for value in mesh
+        .attributes
+        .get("blender_attributes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = value.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if attributes.iter().any(|attribute| attribute.name == name) {
+            continue;
+        }
+        let domain = value
+            .get("domain")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let data_type = value
+            .get("data_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        attributes.push(GeometryAttribute {
+            name: name.to_owned(),
+            domain: domain.to_ascii_lowercase(),
+            data_type: data_type.to_owned(),
+            values: point_attribute_values(mesh, value.get("values"), domain, data_type),
+        });
+    }
+    attributes
+}
+
+fn point_attribute_values(
+    mesh: &Mesh,
+    values: Option<&serde_json::Value>,
+    domain: &str,
+    data_type: &str,
+) -> GeometryAttributeValues {
+    if !matches!(domain, "point" | "POINT") {
+        return GeometryAttributeValues::Unsupported;
+    }
+    let Some(values) = values else {
+        return GeometryAttributeValues::Unsupported;
+    };
+    let value_at = |slot: usize| {
+        if let Some(values) = values.as_array() {
+            if values.len() == mesh.vertices.len() {
+                values.get(slot)
+            } else {
+                None
+            }
+        } else if let Some(values) = values.as_object() {
+            let vertex = mesh.vertices.get(slot)?;
+            values.get(&format!("v{}", vertex.id))
+        } else {
+            None
+        }
+    };
+    match data_type {
+        "float" | "FLOAT" => {
+            let mut result = Vec::with_capacity(mesh.vertices.len());
+            for slot in 0..mesh.vertices.len() {
+                let Some(value) = value_at(slot)
+                    .and_then(serde_json::Value::as_f64)
+                    .filter(|value| value.is_finite())
+                else {
+                    return GeometryAttributeValues::Unsupported;
+                };
+                result.push(value);
+            }
+            GeometryAttributeValues::Float(result)
+        }
+        "int" | "INT" => {
+            let mut result = Vec::with_capacity(mesh.vertices.len());
+            for slot in 0..mesh.vertices.len() {
+                let Some(value) = value_at(slot)
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                else {
+                    return GeometryAttributeValues::Unsupported;
+                };
+                result.push(value);
+            }
+            GeometryAttributeValues::Integer(result)
+        }
+        "float3" | "FLOAT_VECTOR" => {
+            let mut result = Vec::with_capacity(mesh.vertices.len());
+            for slot in 0..mesh.vertices.len() {
+                let Some(values) = value_at(slot).and_then(serde_json::Value::as_array) else {
+                    return GeometryAttributeValues::Unsupported;
+                };
+                if values.len() != 3 {
+                    return GeometryAttributeValues::Unsupported;
+                }
+                let mut vector = [0.0; 3];
+                for (component, value) in vector.iter_mut().zip(values) {
+                    let Some(value) = value.as_f64().filter(|value| value.is_finite()) else {
+                        return GeometryAttributeValues::Unsupported;
+                    };
+                    *component = value;
+                }
+                result.push(vector);
+            }
+            GeometryAttributeValues::Vector(result)
+        }
+        _ => GeometryAttributeValues::Unsupported,
+    }
 }
 
 #[derive(Default)]
@@ -2756,6 +2948,7 @@ pub(super) struct HitPose {
     pub(super) path_traced: bool,
     /// Unit direction from the hit back toward the camera.
     pub(super) view: DVec3,
+    pub(super) back_facing: bool,
     pub(super) barycentric: [f64; 3],
 }
 
@@ -2788,6 +2981,7 @@ pub(super) fn layered_context<'a>(
         .and_then(|colors| colors.render_layer)
         .and_then(|index| triangle.layer_colors.get(index))
         .map(|corners| blend_color(corners, pose.barycentric));
+    let (geometry_vertices, geometry_corner_weights) = triangle.geometry_attribute_frame();
     let mut context = HitContext::new(&doc.node_groups)
         .with_images(images)
         .with_uv_layers(HitUvLayers {
@@ -2796,7 +2990,14 @@ pub(super) fn layered_context<'a>(
         })
         .with_uv_tangents(&triangle.layer_tangents)
         .with_color_layers(color_maps, color_render)
-        .with_warnings(warnings);
+        .with_geometry_attributes(
+            &object.geometry_attributes,
+            geometry_vertices,
+            geometry_corner_weights,
+            pose.barycentric,
+        )
+        .with_warnings(warnings)
+        .with_path_traced(false);
     context.uv = uv_override.unwrap_or_else(|| blend_uv(&triangle.uv, pose.barycentric));
     context = context.with_generated_corners(triangle.generated, pose.barycentric);
     context.position = pose.point;
@@ -2818,6 +3019,9 @@ pub(super) fn layered_context<'a>(
     }
     context.light_falloff_distance = None;
     context.view_direction = pose.view;
+    context.object_to_world = object.object_to_world;
+    context.world_to_object = object.world_to_local.unwrap_or(DMat4::IDENTITY);
+    context.back_facing = pose.back_facing;
     Ok(context)
 }
 
@@ -4534,6 +4738,12 @@ mod shading_normal_tests {
                     camera_matrices: None,
                     barycentric: [1.0 / 3.0; 3],
                     view: DVec3::Z,
+                    realtime_differentials: crate::shader::HitDifferentials {
+                        world_dx: DVec3::ZERO,
+                        world_dy: DVec3::ZERO,
+                        uv_dx: [0.0; 2],
+                        uv_dy: [0.0; 2],
+                    },
                 },
             )?
             .color;
@@ -4610,6 +4820,8 @@ mod shading_normal_tests {
         Triangle {
             positions,
             generated: crate::geom::GeneratedCorners::default(),
+            geometry_vertex_slots: [0; 3],
+            geometry_vertex_weights: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             object_index: 1,
             element_index: 1,
             color: [1.0; 4],

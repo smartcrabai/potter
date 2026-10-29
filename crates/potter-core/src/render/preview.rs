@@ -250,6 +250,7 @@ pub fn render_previews(
                 mode,
                 background,
                 None,
+                false,
                 1,
                 0,
                 scene.render.filter_size,
@@ -419,7 +420,13 @@ pub(crate) fn render_camera_frame(
     let images_ref = &images;
     let world_radiance = beauty_world.map(|world| {
         move |direction: DVec3| {
-            crate::shader::evaluate_world(world, &doc.node_groups, images_ref, direction)
+            crate::shader::evaluate_world(
+                world,
+                &doc.node_groups,
+                images_ref,
+                direction,
+                engine == "path",
+            )
         }
     });
     let realtime_volume_transport = if engine == "realtime" && matches!(mode, Mode::Beauty) {
@@ -478,6 +485,7 @@ pub(crate) fn render_camera_frame(
             world_radiance
                 .as_ref()
                 .map(|evaluate| evaluate as WorldRadiance<'_>),
+            engine == "realtime",
             samples,
             seed,
             scene.render.filter_size,
@@ -487,6 +495,7 @@ pub(crate) fn render_camera_frame(
             volume_pass.as_mut(),
         )?
     };
+
     drop(shader);
     crate::compositor::apply(
         &mut raster,
@@ -743,6 +752,7 @@ fn rasterize_view(
     mode: Mode,
     background: [u8; 4],
     world: Option<WorldRadiance<'_>>,
+    eevee_world_rays: bool,
     samples: u32,
     seed: u32,
     filter_size: f64,
@@ -769,6 +779,7 @@ fn rasterize_view(
             geometry.prepared.as_slice(),
             camera_lights,
             volume_pass,
+            eevee_world_rays,
         );
     }
     // The overlay's edges and points come from the scene's wire geometry; the lines feed the pick buffers.

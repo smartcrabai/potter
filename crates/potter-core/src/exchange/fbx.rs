@@ -5517,7 +5517,8 @@ mod tests {
         };
         let hit = crate::shader::HitContext::new(&doc.node_groups)
             .with_images(&images)
-            .with_uv_layers(hit_uvs);
+            .with_uv_layers(hit_uvs)
+            .with_path_traced(true);
         let shading = crate::shader::evaluate_surface(material, &hit)?;
         Ok(shading
             .dominant()

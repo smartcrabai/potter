@@ -1,0 +1,39 @@
+{
+  "resolution": [
+    96,
+    96
+  ],
+  "samples": 64,
+  "renderer": "Blender 5.2.2 EEVEE Next; 64 TAA samples; Standard",
+  "source": "Blender 5.2.2 source/blender/nodes/shader/nodes/node_shader_bsdf_glass.cc and source/blender/gpu/shaders/material/gpu_shader_material_glass.glsl",
+  "cases": [
+    {
+      "name": "glass_ggx",
+      "region": [
+        26,
+        44,
+        8,
+        8
+      ],
+      "mean": [
+        0.03642749786376953,
+        0.03642749786376953,
+        0.03642749786376953
+      ]
+    },
+    {
+      "name": "glass_multi_ggx",
+      "region": [
+        62,
+        44,
+        8,
+        8
+      ],
+      "mean": [
+        0.03978776931762695,
+        0.03978776931762695,
+        0.03978776931762695
+      ]
+    }
+  ]
+}
