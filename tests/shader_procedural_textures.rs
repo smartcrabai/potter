@@ -348,6 +348,7 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
     let mut coordinates = BTreeMap::<&str, BTreeSet<&str>>::new();
     let mut waves = BTreeSet::<(String, String, String)>::new();
     let mut white_noise_dimensions = BTreeSet::new();
+    let mut gabor_dimensions = BTreeSet::new();
     let mut magic_depths = BTreeSet::new();
     let mut names = BTreeSet::new();
     for probe in probes {
@@ -537,8 +538,14 @@ fn assert_probe_coverage(oracle: &Value) -> TestResult {
         .into_iter()
         .collect()
     );
-    assert_eq!(white_noise_dimensions, BTreeSet::from(["1D", "2D", "3D", "4D"]));
-    assert_eq!(gabor_dimensions, BTreeSet::from(["2D", "3D"]));
+    assert_eq!(
+        white_noise_dimensions,
+        BTreeSet::from(["1D".to_owned(), "2D".to_owned(), "3D".to_owned(), "4D".to_owned()])
+    );
+    assert_eq!(
+        gabor_dimensions,
+        BTreeSet::from(["2D".to_owned(), "3D".to_owned()])
+    );
     assert_eq!(magic_depths, BTreeSet::from([0_i64, 6, 10]));
     Ok(())
 }
