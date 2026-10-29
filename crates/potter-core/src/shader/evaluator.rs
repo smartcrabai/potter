@@ -7961,6 +7961,7 @@ mod tests {
             links: None,
             group_input_binding: None,
             group_depth: 0,
+            math_semantics: crate::node_kernels::MathSemantics::Cycles,
             texture_mapping_unsupported: &empty,
         };
         evaluator.attribute(&node_id, socket)

@@ -8,8 +8,7 @@ mod world;
 mod evaluator;
 
 pub(crate) use evaluator::{
-    AnisotropyModel, GeometryAttribute, GeometryAttributeValues, GlassDistribution,
-    dielectric_f0, evaluate_surface_with_workspace_into,
+    AnisotropyModel, GeometryAttribute, GeometryAttributeValues, GlassDistribution, dielectric_f0,
     evaluate_surface_with_workspace_into_semantics, evaluate_surface_with_workspace_semantics,
     heaviest, make_orthonormals,
 };
