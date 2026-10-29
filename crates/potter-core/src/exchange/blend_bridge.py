@@ -1225,6 +1225,11 @@ def tree_dump(tree):
         node_id = custom_properties.pop("potter.id", None)
         simple_material = custom_properties.pop("potter_simple_material", False)
         properties = rna_props(node, ("inputs", "outputs", "internal_links", "parent", "select", "location", "dimensions"))
+        if node.bl_idname in ("ShaderNodeRGB", "ShaderNodeValue", "ShaderNodeNormal"):
+            properties["potter_output_defaults"] = [
+                {"identifier": socket.identifier, "default": plain(socket.default_value)}
+                for socket in node.outputs if hasattr(socket, "default_value")
+            ]
         if node.bl_idname == "GeometryNodeBake":
             bake_items = []
             for index, item in enumerate(getattr(node, "bake_items", ())):
@@ -3683,7 +3688,8 @@ def material_dump(material):
                     ior = float(ior_socket.default_value)
             except Exception:
                 pass
-    return {"name": material.name_full, "potter_id": material.get("potter.id"),
+    return {"name": material.name_full, "pass_index": int(material.pass_index),
+            "potter_id": material.get("potter.id"),
             "library": library_reference(material),
             "base_color": base_color,
             "viewport_display": {"diffuse_color": [float(c) for c in material.diffuse_color],
@@ -6009,7 +6015,7 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
                     socket = interface.new_socket(name=entry["name"], in_out=direction,
                                                   socket_type=socket_type)
                     socket_map[entry.get("id", "")] = socket.identifier
-                    if direction == "INPUT" and entry.get("default") is not None and hasattr(socket, "default_value"):
+                    if entry.get("default") is not None and hasattr(socket, "default_value"):
                         socket.default_value = _resolve_compat_value(entry["default"], id_lookup)
                 except Exception as error:
                     raise ValueError("%s cannot restore interface socket %s" %
@@ -6033,6 +6039,10 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
         if source.get("location") is not None:
             node.location = source["location"]
         node_properties = dict(source.get("properties", {}))
+        group_tree_reference = (node_properties.pop("node_tree", None)
+                                if node.bl_idname == "ShaderNodeGroup" else None)
+        # Empty lists mark defaults lost by older imports; Rust's loss gate guards Blender's constructor defaults.
+        output_defaults = node_properties.pop("potter_output_defaults", [])
         if node.bl_idname == "GeometryNodeBake" and "bake_items" in node_properties:
             identifier_remaps[node.name] = _restore_bake_items(
                 node, node_properties.pop("bake_items") or [], owner)
@@ -6046,11 +6056,34 @@ def _restore_node_tree(tree, raw, id_lookup, owner):
             node.inputs["Size"].default_value = tuple(node_properties.pop("size"))
         set_rna(node, node_properties, id_lookup, strict=True,
                 owner="%s node %s" % (owner, node.name))
+        if group_tree_reference is not None:
+            group_tree = (id_lookup.get(group_tree_reference)
+                          if isinstance(group_tree_reference, str)
+                          else _resolve_compat_value(group_tree_reference, id_lookup))
+            if group_tree is None:
+                raise ValueError("%s references unavailable node group %s" %
+                                 (owner, group_tree_reference))
+            try:
+                node.node_tree = group_tree
+            except Exception as error:
+                raise ValueError("%s cannot restore node group %s" %
+                                 (owner, group_tree_reference)) from error
         set_id(node, source.get("potter_id"))
         custom_properties = dict(source.get("custom_properties", {}))
         if simple_material:
             custom_properties["potter_simple_material"] = True
         set_props(node, custom_properties)
+        for socket_source in output_defaults:
+            identifier = socket_source.get("identifier")
+            socket = next((value for value in node.outputs
+                           if value.identifier == identifier), None)
+            if socket is None or not hasattr(socket, "default_value"):
+                raise ValueError("%s cannot restore output default on node %s" % (owner, node.name))
+            try:
+                socket.default_value = _resolve_compat_value(socket_source["default"], id_lookup)
+            except Exception as error:
+                raise ValueError("%s cannot restore output default on node %s" %
+                                 (owner, node.name)) from error
         for socket_source in source.get("inputs", []):
             identifier = identifier_remaps.get(node.name, {}).get(
                 socket_source.get("identifier"), socket_source.get("identifier"))
@@ -6429,6 +6462,7 @@ def _create_geometry_groups(doc, linked_group_map=None):
 
 def _populate_geometry_groups(group_map, group_sources, id_lookup):
     socket_maps = {}
+    id_lookup.update(group_map)
     id_lookup.update({tree.name_full: tree for tree in group_map.values()})
     populated = set()
     for name, source in group_sources.items():
@@ -9720,6 +9754,8 @@ def export_doc(doc, target, pack, scene_hash, context):
         mat = bpy.data.materials.new(item["name"])
         viewport = item.get("viewport_display")
         mat.diffuse_color = viewport["diffuse_color"] if viewport else item["base_color"]
+        if item.get("pass_index") is not None:
+            mat.pass_index = int(item["pass_index"])
         mat.use_nodes = True
         set_id(mat.node_tree, item.get("node_tree"))
         fresh = next((node for node in mat.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
@@ -9892,6 +9928,15 @@ def export_doc(doc, target, pack, scene_hash, context):
             if key.startswith("hide_") and key not in ("hide_viewport", "hide_render", "hide_select")
         }
         set_rna(obj, hide_rna)
+        object_info_rna = metadata.get("rna_properties") or {}
+        set_rna(
+            obj,
+            {
+                key: object_info_rna[key]
+                for key in ("color", "pass_index")
+                if key in object_info_rna
+            },
+        )
         ray_visibility = item.get("ray_visibility") or {}
         for field, prop in (("camera", "visible_camera"), ("diffuse", "visible_diffuse"),
                             ("glossy", "visible_glossy"), ("transmission", "visible_transmission"),

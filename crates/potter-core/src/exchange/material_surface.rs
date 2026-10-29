@@ -2448,12 +2448,17 @@ fn output_node(group: &NodeGroup) -> Option<&Id> {
 }
 
 /// Node-group name of a `ShaderNodeGroup` (`node_tree.name`, or a plain string).
-fn group_tree_name(node: &GraphNode) -> Option<&str> {
+fn group_tree_name<'a>(node: &'a GraphNode, doc: &'a SceneDoc) -> Option<&'a str> {
     let value = node.properties.get("node_tree")?;
-    value
+    let tree = value
         .get("name")
         .and_then(Value::as_str)
-        .or_else(|| value.as_str())
+        .or_else(|| value.as_str())?;
+    Some(
+        doc.node_groups
+            .get(tree)
+            .map_or(tree, |group| group.name.as_str()),
+    )
 }
 
 /// Interface name of input `socket` of the node group named `tree`.
@@ -2519,7 +2524,7 @@ impl GraphReducer<'_> {
             if node.node_type != "ShaderNodeGroup" {
                 continue;
             }
-            let Some(tree) = group_tree_name(node) else {
+            let Some(tree) = group_tree_name(node, doc) else {
                 continue;
             };
             if !tree.starts_with("glTF Material Output") {

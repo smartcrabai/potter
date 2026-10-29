@@ -145,9 +145,47 @@ pub(crate) fn psys_frand(system_seed: u32, seed: u32) -> f32 {
     table.base[index as usize % PSYS_FRAND_COUNT]
 }
 
+/// Cycles' object random value (`object.cpp:350`, `scene/object.cpp:579`).
+#[must_use]
+pub(crate) fn cycles_object_random_number(name: &str) -> f32 {
+    let name_hash = name.bytes().fold(0_u32, |hash, byte| {
+        let character = if byte & 0x80 == 0 {
+            u32::from(byte)
+        } else {
+            u32::from(byte) | 0xffff_ff00
+        };
+        hash.wrapping_mul(37).wrapping_add(character)
+    });
+    let random_id = cycles_hash_uint2(name_hash, 0);
+    random_id as f32 * (1.0 / u32::MAX as f32)
+}
+
+fn cycles_hash_uint2(kx: u32, ky: u32) -> u32 {
+    let mut a = 0xdead_beefu32.wrapping_add((2 << 2) + 13);
+    let mut b = a;
+    let mut c = a;
+    a = a.wrapping_add(kx);
+    b = b.wrapping_add(ky);
+
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(14));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(11));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(25));
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(16));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(4));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(14));
+    c ^= b;
+    c.wrapping_sub(b.rotate_left(24))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BlenderRng, hash_frand, psys_frand};
+    use super::{BlenderRng, cycles_object_random_number, hash_frand, psys_frand};
 
     #[test]
     fn direct_seed_matches_blender_rng_sequence() {
@@ -169,5 +207,12 @@ mod tests {
         assert_eq!(psys_frand(7, 3579), 0.494_628_64);
         assert_eq!(psys_frand(7, 77374), 0.802_313_7);
         assert!((0.0..1.0).contains(&hash_frand(77091)));
+    }
+    #[test]
+    fn object_random_matches_blender_cycles_shader_oracle() {
+        assert_eq!(
+            cycles_object_random_number("Random Target"),
+            0.451_880_46_f32
+        );
     }
 }

@@ -139,7 +139,7 @@ pub(crate) fn export(doc: &SceneDoc, _snapshot: &Snapshot) -> Result<Vec<u8>> {
         let frame = f64::from(scene.frame_start) + f64::from(frame_offset);
         let poses = animated_pose_bones(node, doc, frame)?;
         let mut values = Vec::with_capacity(ordered.len() * 3 + roots.len() * 3);
-        for joint_id in &ordered {
+        for joint_id in ordered.iter().copied() {
             let joint = joints.get(joint_id).ok_or_else(|| {
                 PotError::new(ErrorCode::InternalError, "BVH output joint is missing")
             })?;

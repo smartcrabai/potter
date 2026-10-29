@@ -10988,7 +10988,7 @@ mod tests {
         let imported_node = imported
             .doc
             .nodes
-            .get(&"animated".parse()?)
+            .get("animated")
             .ok_or("animated node was not imported")?;
         let imported_action = imported_node
             .action
@@ -11137,7 +11137,7 @@ mod tests {
         let exported_uvs = super::read_vec2(&document, &buffers, uv_accessor)?;
         let source_uvs = source
             .nodes
-            .get(&"skin_mesh".parse()?)
+            .get("skin_mesh")
             .and_then(|node| node.data.as_ref())
             .and_then(|data_id| source.data_blocks.get(data_id))
             .and_then(|data| data.mesh.as_ref())
@@ -11201,7 +11201,7 @@ mod tests {
         let mesh = imported
             .doc
             .nodes
-            .get(&"skin_mesh".parse()?)
+            .get("skin_mesh")
             .ok_or("skinned mesh was not imported")?;
         assert!(
             mesh.modifiers
@@ -11213,7 +11213,7 @@ mod tests {
             .as_ref()
             .and_then(|id| imported.doc.data_blocks.get(id))
             .ok_or("skinned mesh data is missing")?;
-        let lift_id = "lift".parse()?;
+        let lift_id: crate::model::Id = "lift".parse()?;
         let shape_keys = mesh_data
             .shape_keys
             .as_ref()
@@ -11227,7 +11227,7 @@ mod tests {
                 .values()
                 .any(|position| (position[2] - 1.0).abs() < 1.0e-6)
         );
-        let surface_id = "surface".parse()?;
+        let surface_id: crate::model::Id = "surface".parse()?;
         let material = imported
             .doc
             .materials
@@ -11253,7 +11253,7 @@ mod tests {
         let camera = imported
             .doc
             .nodes
-            .get(&"camera".parse()?)
+            .get("camera")
             .and_then(|node| node.data.as_ref())
             .and_then(|id| imported.doc.data_blocks.get(id))
             .and_then(|data| data.camera.as_ref())
@@ -11266,7 +11266,7 @@ mod tests {
         let light = imported
             .doc
             .nodes
-            .get(&"light".parse()?)
+            .get("light")
             .and_then(|node| node.data.as_ref())
             .and_then(|id| imported.doc.data_blocks.get(id))
             .and_then(|data| data.light.as_ref())
@@ -11276,7 +11276,7 @@ mod tests {
         let instance = imported
             .doc
             .nodes
-            .get(&"collection_instance".parse()?)
+            .get("collection_instance")
             .ok_or("collection instance was not imported")?;
         assert_eq!(
             instance.properties["instance_collection"],
@@ -11288,7 +11288,7 @@ mod tests {
             "joint vertex groups were not imported"
         );
         assert!(!mesh_data.vertex_weights.is_empty());
-        let root_group_id = "root_group".parse()?;
+        let root_group_id: crate::model::Id = "root_group".parse()?;
         assert!(
             mesh_data
                 .vertex_weights
@@ -11305,7 +11305,7 @@ mod tests {
             let node = imported
                 .doc
                 .nodes
-                .get(&node_id.parse()?)
+                .get(node_id)
                 .ok_or("animated node was not imported")?;
             let action_id = node
                 .action

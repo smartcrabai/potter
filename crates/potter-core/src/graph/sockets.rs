@@ -1,6 +1,6 @@
 use crate::{
     error::{ErrorCode, PotError, Result},
-    model::Id,
+    model::{Id, Registry},
 };
 
 use super::{GraphLink, NodeGroup};
@@ -42,6 +42,7 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "ShaderNodeTexSky"
             | "ShaderNodeTexEnvironment"
             | "ShaderNodeTexCoord"
+            | "ShaderNodeGroup"
             | "ShaderNodeMixRGB"
             | "ShaderNodeMix"
             | "ShaderNodeVertexColor"
@@ -55,6 +56,27 @@ pub fn is_known_node_type(node_type: &str) -> bool {
             | "ShaderNodeVolumeScatter"
             | "ShaderNodeDisplacement"
             | "ShaderNodeVectorMath"
+            | "ShaderNodeRGB"
+            | "ShaderNodeValue"
+            | "ShaderNodeCombineColor"
+            | "ShaderNodeSeparateColor"
+            | "ShaderNodeRGBToBW"
+            | "ShaderNodeInvert"
+            | "ShaderNodeGamma"
+            | "ShaderNodeBrightContrast"
+            | "ShaderNodeHueSaturation"
+            | "ShaderNodeVectorRotate"
+            | "ShaderNodeVectorTransform"
+            | "ShaderNodeNormal"
+            | "ShaderNodeWavelength"
+            | "ShaderNodeBlackbody"
+            | "ShaderNodeLightFalloff"
+            | "ShaderNodeObjectInfo"
+            | "ShaderNodeNewGeometry"
+            | "ShaderNodeCameraData"
+            | "ShaderNodeUVMap"
+            | "ShaderNodeBump"
+            | "ShaderNodeNormalMap"
             | "GeometryNodeInputPosition"
             | "GeometryNodeInputNormal"
             | "GeometryNodeInputIndex"
@@ -353,8 +375,127 @@ pub(super) fn node_sockets(group: &NodeGroup, node_id: &Id) -> Option<SocketPair
                 ("Object", "vector"),
                 ("Camera", "vector"),
                 ("Window", "vector"),
-                ("Incoming", "vector"),
+                ("Reflection", "vector"),
             ]),
+        ),
+        "ShaderNodeUVMap" => (Vec::new(), sockets(&[("UV", "vector")])),
+        "ShaderNodeRGB" => (Vec::new(), sockets(&[("Color", "color")])),
+        "ShaderNodeValue" => (Vec::new(), sockets(&[("Value", "float")])),
+        "ShaderNodeCombineColor" => (
+            sockets(&[("Red", "float"), ("Green", "float"), ("Blue", "float")]),
+            sockets(&[("Color", "color")]),
+        ),
+        "ShaderNodeSeparateColor" => (
+            sockets(&[("Color", "color")]),
+            sockets(&[("Red", "float"), ("Green", "float"), ("Blue", "float")]),
+        ),
+        "ShaderNodeRGBToBW" => (sockets(&[("Color", "color")]), sockets(&[("Val", "float")])),
+        "ShaderNodeInvert" => (
+            sockets(&[("Fac", "float"), ("Color", "color")]),
+            sockets(&[("Color", "color")]),
+        ),
+        "ShaderNodeGamma" => (
+            sockets(&[("Color", "color"), ("Gamma", "float")]),
+            sockets(&[("Color", "color")]),
+        ),
+        "ShaderNodeBrightContrast" => (
+            sockets(&[
+                ("Color", "color"),
+                ("Bright", "float"),
+                ("Contrast", "float"),
+            ]),
+            sockets(&[("Color", "color")]),
+        ),
+        "ShaderNodeHueSaturation" => (
+            sockets(&[
+                ("Hue", "float"),
+                ("Saturation", "float"),
+                ("Value", "float"),
+                ("Fac", "float"),
+                ("Color", "color"),
+            ]),
+            sockets(&[("Color", "color")]),
+        ),
+        "ShaderNodeVectorRotate" => (
+            sockets(&[
+                ("Vector", "vector"),
+                ("Center", "vector"),
+                ("Axis", "vector"),
+                ("Angle", "float"),
+                ("Rotation", "vector"),
+            ]),
+            sockets(&[("Vector", "vector")]),
+        ),
+        "ShaderNodeVectorTransform" => (
+            sockets(&[("Vector", "vector")]),
+            sockets(&[("Vector", "vector")]),
+        ),
+        "ShaderNodeNormal" => (
+            sockets(&[("Normal", "vector")]),
+            sockets(&[("Normal", "vector"), ("Dot", "float")]),
+        ),
+        "ShaderNodeWavelength" => (
+            sockets(&[("Wavelength", "float")]),
+            sockets(&[("Color", "color")]),
+        ),
+        "ShaderNodeBlackbody" => (
+            sockets(&[("Temperature", "float")]),
+            sockets(&[("Color", "color")]),
+        ),
+        "ShaderNodeLightFalloff" => (
+            sockets(&[("Strength", "float"), ("Smooth", "float")]),
+            sockets(&[
+                ("Quadratic", "float"),
+                ("Linear", "float"),
+                ("Constant", "float"),
+            ]),
+        ),
+        "ShaderNodeObjectInfo" => (
+            Vec::new(),
+            sockets(&[
+                ("Location", "vector"),
+                ("Color", "color"),
+                ("Alpha", "float"),
+                ("Object Index", "float"),
+                ("Material Index", "float"),
+                ("Random", "float"),
+            ]),
+        ),
+        "ShaderNodeNewGeometry" => (
+            Vec::new(),
+            sockets(&[
+                ("Position", "vector"),
+                ("Normal", "vector"),
+                ("Tangent", "vector"),
+                ("True Normal", "vector"),
+                ("Incoming", "vector"),
+                ("Parametric", "vector"),
+                ("Backfacing", "float"),
+                ("Pointiness", "float"),
+                ("Random Per Island", "float"),
+            ]),
+        ),
+        "ShaderNodeCameraData" => (
+            Vec::new(),
+            sockets(&[
+                ("View Vector", "vector"),
+                ("View Z Depth", "float"),
+                ("View Distance", "float"),
+            ]),
+        ),
+        "ShaderNodeBump" => (
+            sockets(&[
+                ("Strength", "float"),
+                ("Distance", "float"),
+                ("Filter Width", "float"),
+                ("Height", "float"),
+                ("Normal", "vector"),
+            ]),
+            sockets(&[("Normal", "vector")]),
+        ),
+        "ShaderNodeNormalMap" => (
+            sockets(&[("Strength", "float"), ("Color", "color")]),
+            sockets(&[("Normal", "vector")]),
         ),
         "ShaderNodeMixRGB" => (
             sockets(&[("Fac", "float"), ("Color1", "color"), ("Color2", "color")]),
@@ -538,8 +679,27 @@ fn sockets(items: &[Socket]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn socket_type(group: &NodeGroup, node_id: &Id, socket_name: &str, output: bool) -> Option<String> {
+fn socket_type(
+    group: &NodeGroup,
+    node_groups: Option<&Registry<NodeGroup>>,
+    node_id: &Id,
+    socket_name: &str,
+    output: bool,
+) -> Option<String> {
     let node = group.nodes.get(node_id)?;
+    if node.node_type == "ShaderNodeGroup" {
+        let group_id = node.properties.get("node_tree")?.as_str()?;
+        let child_group = node_groups?.get(group_id)?;
+        let sockets = if output {
+            &child_group.interface.outputs
+        } else {
+            &child_group.interface.inputs
+        };
+        let socket = sockets
+            .iter()
+            .find(|socket| socket.id == socket_name || socket.name == socket_name)?;
+        return graph_socket_type(&socket.socket_type).map(str::to_owned);
+    }
     if node.node_type == "ShaderNodeVectorMath" && output {
         let operation = node
             .properties
@@ -559,7 +719,7 @@ fn socket_type(group: &NodeGroup, node_id: &Id, socket_name: &str, output: bool)
             .inputs
             .iter()
             .find(|socket| socket.name == socket_name || socket.id == socket_name)
-            .map(|socket| socket.socket_type.clone());
+            .and_then(|socket| graph_socket_type(&socket.socket_type).map(str::to_owned));
     }
     if node.node_type == "NodeGroupOutput" && !output {
         if group.interface.outputs.is_empty() && socket_name == "Geometry" {
@@ -570,7 +730,7 @@ fn socket_type(group: &NodeGroup, node_id: &Id, socket_name: &str, output: bool)
             .outputs
             .iter()
             .find(|socket| socket.name == socket_name || socket.id == socket_name)
-            .map(|socket| socket.socket_type.clone());
+            .and_then(|socket| graph_socket_type(&socket.socket_type).map(str::to_owned));
     }
     if let Some((inputs, outputs)) = node_sockets(group, node_id) {
         let sockets = if output { outputs } else { inputs };
@@ -582,6 +742,30 @@ fn socket_type(group: &NodeGroup, node_id: &Id, socket_name: &str, output: bool)
         }
     }
     None
+}
+
+fn graph_socket_type(socket_type: &str) -> Option<&'static str> {
+    match socket_type {
+        "float"
+        | "NodeSocketFloat"
+        | "NodeSocketFloatFactor"
+        | "NodeSocketFloatAngle"
+        | "NodeSocketFloatDistance"
+        | "NodeSocketFloatPercentage"
+        | "NodeSocketFloatWavelength"
+        | "NodeSocketFloatColorTemperature" => Some("float"),
+        "integer" | "NodeSocketInt" => Some("integer"),
+        "boolean" | "NodeSocketBool" => Some("boolean"),
+        "vector" | "NodeSocketVector" | "NodeSocketVectorDirection" | "NodeSocketVectorEuler" => {
+            Some("vector")
+        }
+        "color" | "NodeSocketColor" => Some("color"),
+        "shader" | "NodeSocketShader" => Some("shader"),
+        "geometry" | "NodeSocketGeometry" => Some("geometry"),
+        "string" | "NodeSocketString" => Some("string"),
+        "rotation" | "NodeSocketRotation" => Some("rotation"),
+        _ => None,
+    }
 }
 
 fn dynamic_value_type(node: &super::GraphNode) -> String {
@@ -607,13 +791,29 @@ fn dynamic_value_type(node: &super::GraphNode) -> String {
 ///
 /// Returns `INVALID_OPERATION` for absent nodes/sockets, type mismatches, or duplicate links.
 pub fn validate_link(group: &NodeGroup, link: &GraphLink) -> Result<()> {
+    validate_link_with_registry(group, None, link)
+}
+
+pub fn validate_link_with_groups(
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    link: &GraphLink,
+) -> Result<()> {
+    validate_link_with_registry(group, Some(node_groups), link)
+}
+
+fn validate_link_with_registry(
+    group: &NodeGroup,
+    node_groups: Option<&Registry<NodeGroup>>,
+    link: &GraphLink,
+) -> Result<()> {
     if group.links.contains(link) {
         return Err(PotError::new(
             ErrorCode::InvalidOperation,
             "graph link already exists",
         ));
     }
-    validate_link_structure(group, link)?;
+    validate_link_structure(group, node_groups, link)?;
     if has_single_link_input(group, link)
         && group.links.iter().any(|existing| {
             existing.to_node == link.to_node && existing.to_socket == link.to_socket
@@ -629,7 +829,7 @@ pub fn validate_link(group: &NodeGroup, link: &GraphLink) -> Result<()> {
 
 pub(super) fn validate_group_links(group: &NodeGroup) -> Result<()> {
     for (index, link) in group.links.iter().enumerate() {
-        validate_link_structure(group, link)?;
+        validate_link_structure(group, None, link)?;
         if group.links[..index].contains(link) {
             return Err(PotError::new(
                 ErrorCode::InvalidOperation,
@@ -650,9 +850,13 @@ pub(super) fn validate_group_links(group: &NodeGroup) -> Result<()> {
     Ok(())
 }
 
-fn validate_link_structure(group: &NodeGroup, link: &GraphLink) -> Result<()> {
-    let from_type =
-        socket_type(group, &link.from_node, &link.from_socket, true).ok_or_else(|| {
+fn validate_link_structure(
+    group: &NodeGroup,
+    node_groups: Option<&Registry<NodeGroup>>,
+    link: &GraphLink,
+) -> Result<()> {
+    let from_type = socket_type(group, node_groups, &link.from_node, &link.from_socket, true)
+        .ok_or_else(|| {
             PotError::new(
                 ErrorCode::InvalidOperation,
                 format!(
@@ -661,15 +865,16 @@ fn validate_link_structure(group: &NodeGroup, link: &GraphLink) -> Result<()> {
                 ),
             )
         })?;
-    let to_type = socket_type(group, &link.to_node, &link.to_socket, false).ok_or_else(|| {
-        PotError::new(
-            ErrorCode::InvalidOperation,
-            format!(
-                "unknown input socket `{}` on `{}`",
-                link.to_socket, link.to_node
-            ),
-        )
-    })?;
+    let to_type = socket_type(group, node_groups, &link.to_node, &link.to_socket, false)
+        .ok_or_else(|| {
+            PotError::new(
+                ErrorCode::InvalidOperation,
+                format!(
+                    "unknown input socket `{}` on `{}`",
+                    link.to_socket, link.to_node
+                ),
+            )
+        })?;
     if from_type != to_type {
         return Err(PotError::new(
             ErrorCode::InvalidOperation,

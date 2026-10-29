@@ -68,7 +68,7 @@ fn collection_instance_duplicates_geometry_and_offsets_bounds_and_paths() {
     )
     .unwrap();
     assert_eq!(
-        instanced_doc.nodes[&"instance".parse().unwrap()].kind,
+        instanced_doc.nodes[&"instance".parse::<Id>().unwrap()].kind,
         "collection_instance"
     );
     let snapshot = Snapshot::evaluate(&instanced_doc, &EvaluationContext::default()).unwrap();
@@ -85,14 +85,16 @@ fn collection_instance_duplicates_geometry_and_offsets_bounds_and_paths() {
 
     assert_eq!(evaluated_triangles, 2 * original_triangles);
     assert_eq!(
-        snapshot.meshes[&"instance".parse().unwrap()].faces.len(),
+        snapshot.meshes[&"instance".parse::<Id>().unwrap()]
+            .faces
+            .len(),
         12
     );
-    let instance = &snapshot.nodes[&"instance".parse().unwrap()];
+    let instance = &snapshot.nodes[&"instance".parse::<Id>().unwrap()];
     let bounds = instance.bounds.unwrap();
     assert_eq!(bounds.min.to_array(), [9.0, -1.0, -1.0]);
     assert_eq!(bounds.max.to_array(), [15.0, 1.0, 1.0]);
-    let paths = &snapshot.instance_paths[&"instance".parse().unwrap()];
+    let paths = &snapshot.instance_paths[&"instance".parse::<Id>().unwrap()];
     assert_eq!(paths.len(), 2);
     assert!(
         paths
@@ -149,13 +151,13 @@ fn collection_instance_cycles_are_rejected() {
     .unwrap();
     cyclic_doc
         .collections
-        .get_mut(&"collection_a".parse().unwrap())
+        .get_mut(&"collection_a".parse::<Id>().unwrap())
         .unwrap()
         .objects
         .push("instance_a".parse().unwrap());
     cyclic_doc
         .collections
-        .get_mut(&"collection_b".parse().unwrap())
+        .get_mut(&"collection_b".parse::<Id>().unwrap())
         .unwrap()
         .objects
         .push("instance_b".parse().unwrap());

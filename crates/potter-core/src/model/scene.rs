@@ -127,7 +127,7 @@ impl SceneDoc {
             },
         )]);
         Self {
-            schema_version: 15,
+            schema_version: 16,
             scene_id,
             revision: 0,
             active_scene,
@@ -155,7 +155,7 @@ impl SceneDoc {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 15 {
+        if self.schema_version != 16 {
             return Err(PotError::with_details(
                 ErrorCode::UnsupportedVersion,
                 format!("unsupported scene schema_version {}", self.schema_version),
@@ -3499,6 +3499,9 @@ impl ThicknessMode {
 #[serde(deny_unknown_fields)]
 pub struct Material {
     pub name: String,
+    /// Blender's Material Index render pass (`Material.pass_index`, when recorded, in 0..=32767).
+    #[serde(default = "default_material_pass_index")]
+    pub pass_index: Option<u32>,
     #[serde(default = "default_color")]
     pub base_color: [f64; 4],
     #[serde(default = "default_alpha_mode")]
@@ -3569,6 +3572,7 @@ impl Default for Material {
     fn default() -> Self {
         Self {
             name: String::new(),
+            pass_index: DEFAULT_MATERIAL_PASS_INDEX,
             base_color: default_color(),
             alpha_mode: default_alpha_mode(),
             alpha_threshold: default_alpha_threshold(),
@@ -3598,6 +3602,12 @@ impl Default for Material {
             viewport_display: None,
         }
     }
+}
+
+const DEFAULT_MATERIAL_PASS_INDEX: Option<u32> = Some(0);
+
+fn default_material_pass_index() -> Option<u32> {
+    DEFAULT_MATERIAL_PASS_INDEX
 }
 
 fn default_color() -> [f64; 4] {
@@ -3653,7 +3663,7 @@ mod tests {
     #[test]
     fn default_scene_has_contract_initial_state_and_empty_registries() {
         let doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
-        assert_eq!(doc.schema_version, 15);
+        assert_eq!(doc.schema_version, 16);
         doc.validate().unwrap();
         let value = serde_json::to_value(doc).unwrap();
         assert_eq!(value["revision"], 0);
@@ -3893,6 +3903,25 @@ mod tests {
         let mut value = serde_json::to_value(SceneDoc::new(String::new())).unwrap();
         value["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<SceneDoc>(value).is_err());
+    }
+
+    #[test]
+    fn material_pass_index_keeps_unknown_distinct_from_legacy_default() {
+        assert_eq!(Material::default().pass_index, Some(0));
+        let legacy: Material =
+            serde_json::from_value(serde_json::json!({"name":"Legacy"})).unwrap();
+        assert_eq!(legacy.pass_index, Some(0));
+
+        let unknown: Material = serde_json::from_value(serde_json::json!({
+            "name":"Unknown",
+            "pass_index":null
+        }))
+        .unwrap();
+        assert_eq!(unknown.pass_index, None);
+        assert_eq!(
+            serde_json::to_value(unknown).unwrap()["pass_index"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

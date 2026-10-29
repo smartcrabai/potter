@@ -57,7 +57,8 @@ use super::{
         ray_for_sample_in_frame, smooth_shadow_origin,
     },
     scene::{
-        ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, layered_context, object_space,
+        ElementRecord, Geometry, HitPose, LayerTables, ObjectRecord, layered_context,
+        object_info_color, object_info_pass_index, object_space,
     },
 };
 
@@ -1126,6 +1127,23 @@ fn render_rows(
         volumes: job.volumes,
         images: job.images,
         importance: job.importance,
+        camera_matrices: None,
+    };
+    let camera = job.eyes[0].0;
+    let side_by_side = camera.stereo_mode == StereoMode::SideBySide;
+    let left_camera = if side_by_side {
+        camera_eye(&camera, -1.0)
+    } else {
+        camera
+    };
+    let first_camera_matrices = camera_matrices_for_render(&left_camera)?;
+    let second_camera_matrices = if let Some((camera, _)) = job.eyes.get(1) {
+        camera_matrices_for_render(camera)?
+    } else if side_by_side {
+        let right_camera = camera_eye(&camera, 1.0);
+        camera_matrices_for_render(&right_camera)?
+    } else {
+        None
     };
     let bounces = Bounces {
         surface: job.max_bounces,
@@ -1181,11 +1199,12 @@ fn render_rows(
                     )?;
                     let mut left_rng = rng.clone();
                     let mut right_rng = rng.clone();
+                    let right_camera_matrices = second_camera_matrices.as_ref();
                     // A sample with no ray (outside a fisheye's circle, or past its field of view) is opaque black: Blender's
                     // film writes a pixel with no ray as black with alpha 1 under either film (`probe_transparent_film_fisheye.py`).
                     let (left, left_alpha) = match left_ray {
                         Some((left_origin, left_direction)) => trace_path(
-                            scene,
+                            scene.with_camera_matrices(first_camera_matrices.as_ref()),
                             bounces,
                             left_origin,
                             left_direction,
@@ -1209,7 +1228,7 @@ fn render_rows(
                     };
                     let (right, right_alpha) = match right_ray {
                         Some((right_origin, right_direction)) => trace_path(
-                            scene,
+                            scene.with_camera_matrices(right_camera_matrices),
                             bounces,
                             right_origin,
                             right_direction,
@@ -1237,11 +1256,17 @@ fn render_rows(
                     )
                 } else {
                     let (camera, frame) = &job.eyes[0];
+                    let camera_matrices =
+                        if camera.stereo_mode == StereoMode::SideBySide && x >= job.width / 2 {
+                            second_camera_matrices.as_ref()
+                        } else {
+                            first_camera_matrices.as_ref()
+                        };
                     match ray_for_sample_in_frame(
                         frame, camera, job.width, job.height, x, y, sample_x, sample_y,
                     )? {
                         Some((origin, direction)) => trace_path(
-                            scene,
+                            scene.with_camera_matrices(camera_matrices),
                             bounces,
                             origin,
                             direction,
@@ -1398,6 +1423,7 @@ pub(super) fn render(
     let volumes = collect_volumes(
         doc,
         snapshot,
+        true,
         scene.unit.scale_length,
         images,
         &geometry.shader_warnings,
@@ -2804,7 +2830,6 @@ pub(super) struct RealtimeVolumePassTemplate<'pass, 'scene> {
     seed: u32,
 }
 
-#[derive(Clone, Copy)]
 pub(super) struct RealtimeVolumeSampleInfo<'a> {
     pub(super) camera: &'a Camera,
     pub(super) frame: &'a CameraFrame,
@@ -2818,6 +2843,7 @@ pub(super) struct RealtimeVolumeSampleInfo<'a> {
     pub(super) sample_index: u32,
     pub(super) sample_count: u32,
     pub(super) view_index: usize,
+    pub(super) camera_matrices: Option<(DMat4, DMat4)>,
 }
 
 pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
@@ -2826,6 +2852,7 @@ pub(super) struct RealtimeVolumeSample<'sample, 'scene> {
     scratch: &'sample mut RealtimeVolumeScratch,
     camera: Camera,
     frame: CameraFrame,
+    camera_matrices: Option<(DMat4, DMat4)>,
     width: u32,
     height: u32,
     y: u32,
@@ -2876,7 +2903,7 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
 
     pub(super) fn begin_sample<'sample>(
         &'sample mut self,
-        sample: RealtimeVolumeSampleInfo<'_>,
+        sample: &RealtimeVolumeSampleInfo<'_>,
     ) -> Result<RealtimeVolumeSample<'sample, 'scene>>
     where
         'pass: 'sample,
@@ -2909,6 +2936,7 @@ impl<'pass, 'scene> RealtimeVolumePass<'pass, 'scene> {
             scratch: &mut *self.scratch,
             camera: *sample.camera,
             frame: *sample.frame,
+            camera_matrices: sample.camera_matrices,
             width: sample.width,
             height: sample.height,
             layout_x,
@@ -3216,6 +3244,7 @@ impl RealtimeVolumeSample<'_, '_> {
             volumes: &self.transport.volumes,
             images: self.transport.images,
             importance: None,
+            camera_matrices: self.camera_matrices.as_ref(),
         };
         let query = RealtimeMeshQuery {
             transport: self.transport,
@@ -3285,8 +3314,21 @@ impl RealtimeVolumeSample<'_, '_> {
             let local_point = object_space(object, point);
             let mut context =
                 HitContext::new(&self.transport.doc.node_groups).with_images(self.transport.images);
+            context.path_traced = false;
+            context.light_falloff_distance = None;
+            if let Some((camera_to_world, world_to_camera)) = self.camera_matrices {
+                context.set_camera_matrices(camera_to_world, world_to_camera);
+            }
             context.position = point;
             context.object = local_point;
+            context.object_to_world = object.object_to_world;
+            context.world_to_object = object
+                .world_to_local
+                .unwrap_or_else(|| DMat4::from_cols_array(&[f64::NAN; 16]));
+            context.object_color = object.object_color;
+            context.object_pass_index = object.object_pass_index;
+            context.object_random_number = object.object_random_number;
+            context.material_pass_index = material.pass_index.map(f64::from);
             context.generated = medium.generated_origin
                 + DVec3::new(
                     local_point.x * medium.generated_per_local.x,
@@ -3527,6 +3569,7 @@ impl RealtimeVolumeSample<'_, '_> {
                 volumes: &transport.volumes,
                 images: transport.images,
                 importance: None,
+                camera_matrices: self.camera_matrices.as_ref(),
             };
             let query = RealtimeMeshQuery {
                 transport,
@@ -3720,7 +3763,14 @@ pub(super) fn prepare_realtime_volume_transport<'a>(
         .scenes
         .get(&snapshot.scene_id)
         .ok_or_else(|| PotError::new(ErrorCode::TargetNotFound, "selected scene does not exist"))?;
-    let volumes = collect_volumes(doc, snapshot, scene.unit.scale_length, images, warnings)?;
+    let volumes = collect_volumes(
+        doc,
+        snapshot,
+        false,
+        scene.unit.scale_length,
+        images,
+        warnings,
+    )?;
     let is_grey =
         |color: DVec3| color.x.total_cmp(&color.y).is_eq() && color.y.total_cmp(&color.z).is_eq();
     if volumes.iter().any(|volume| {
@@ -3813,6 +3863,11 @@ fn prepare_realtime_mesh_sample(
         ray.origin,
         transport.images,
         ray.footprint,
+        query
+            .scene
+            .camera_matrices
+            .map(|matrices| (&matrices.0, &matrices.1)),
+        false,
         media,
         hit_media,
         evaluator_workspace,
@@ -3846,6 +3901,12 @@ fn prepare_realtime_mesh_sample(
                 transport.images,
                 Some(ray.footprint.at_distance(distance)),
                 RayKind::Camera,
+                query
+                    .scene
+                    .camera_matrices
+                    .map(|matrices| (&matrices.0, &matrices.1)),
+                false,
+                None,
                 hit_media,
                 Some(&mut *froxel_hit_media),
                 evaluator_workspace,
@@ -4388,6 +4449,20 @@ struct SceneRefs<'a, 'v> {
     volumes: &'a [VolumeInstance<'v>],
     images: &'a BTreeMap<String, ImageData>,
     importance: Option<&'a WorldImportanceSampler>,
+    camera_matrices: Option<&'a (DMat4, DMat4)>,
+}
+
+impl<'a> SceneRefs<'a, '_> {
+    fn with_camera_matrices(mut self, camera_matrices: Option<&'a (DMat4, DMat4)>) -> Self {
+        self.camera_matrices = camera_matrices;
+        self
+    }
+}
+fn camera_matrices_for_render(camera: &Camera) -> Result<Option<(DMat4, DMat4)>> {
+    let view = super::raster::ViewBasis::from_camera(camera)?;
+    Ok(view
+        .camera_matrices()
+        .map(|(camera_to_world, world_to_camera)| (*camera_to_world, *world_to_camera)))
 }
 
 /// One path's budgets: surface bounces, volume scatters (Cycles' `volume_bounces + 1` vertices take direct light), and
@@ -4583,6 +4658,7 @@ fn trace_path(
         volumes,
         images,
         importance,
+        camera_matrices,
     } = scene;
     let Bounces {
         surface: max_bounces,
@@ -4639,6 +4715,8 @@ fn trace_path(
         origin,
         images,
         footprint,
+        camera_matrices.map(|matrices| (&matrices.0, &matrices.1)),
+        true,
         &mut media,
         &mut hit_media,
         evaluator_workspace,
@@ -5117,6 +5195,7 @@ fn trace_path(
             direction,
             images,
             footprint_here,
+            camera_matrices,
             ray,
             evaluator_workspace,
         )?;
@@ -5367,6 +5446,19 @@ fn write_center_passes(
 
     // The camera's frame is built once for the pass, as the render builds each eye's frame once.
     let frame = camera_frame(camera, width, height)?;
+    let side_by_side = camera.stereo_mode == StereoMode::SideBySide;
+    let left_camera = if side_by_side {
+        camera_eye(camera, -1.0)
+    } else {
+        *camera
+    };
+    let left_camera_matrices = camera_matrices_for_render(&left_camera)?;
+    let right_camera_matrices = if side_by_side {
+        let right_camera = camera_eye(camera, 1.0);
+        camera_matrices_for_render(&right_camera)?
+    } else {
+        None
+    };
     for y in 0..height {
         for x in 0..width {
             let index = usize::try_from(y)
@@ -5425,6 +5517,11 @@ fn write_center_passes(
                 0.5,
                 (origin, direction),
             )?;
+            let camera_matrices = if side_by_side && x >= width / 2 {
+                right_camera_matrices.as_ref()
+            } else {
+                left_camera_matrices.as_ref()
+            };
             let surface = make_surface(
                 doc,
                 geometry,
@@ -5433,6 +5530,7 @@ fn write_center_passes(
                 direction,
                 images,
                 footprint.at_distance(hit.distance),
+                camera_matrices,
                 RayKind::Camera,
                 evaluator_workspace,
             )?;
@@ -5629,6 +5727,7 @@ mod overlay_tests {
             volumes: &[],
             images: &images,
             importance: None,
+            camera_matrices: None,
         };
         let world_only_scene = SceneRefs {
             lights: &[],
@@ -5902,6 +6001,7 @@ pub(super) fn hit_params(
     origin: DVec3,
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
+    camera_matrices: Option<(&DMat4, &DMat4)>,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<SurfaceShading> {
     with_hit_frame(
@@ -5912,11 +6012,27 @@ pub(super) fn hit_params(
         direction,
         images,
         None,
+        camera_matrices,
+        false,
+        None,
         |frame| {
+            if let Some(node_id) = frame.prepared.realtime_transparency_bump() {
+                return Err(PotError::with_details(
+                    ErrorCode::UnsupportedFeature,
+                    format!(
+                        "Bump node `{node_id}` affects realtime transparent-shadow coverage through its Height samples"
+                    ),
+                    serde_json::json!({
+                        "feature_id": "shader.node.Bump.realtime_transparent_shadow_height",
+                        "node_id": node_id.as_str(),
+                    }),
+                ));
+            }
+            let context = frame.context.with_opacity_only();
             let mut shading = evaluate_surface_with_workspace(
                 frame.material,
                 frame.prepared,
-                &frame.context,
+                &context,
                 evaluator_workspace,
             )?;
             for closure in &mut shading.closures {
@@ -5951,6 +6067,9 @@ fn with_hit_frame<T>(
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
     footprint: Option<f64>,
+    camera_matrices: Option<(&DMat4, &DMat4)>,
+    path_traced: bool,
+    light_falloff_distance: Option<f64>,
     body: impl FnOnce(&HitFrame<'_>) -> Result<T>,
 ) -> Result<T> {
     let triangle = geometry.triangles.get(hit.triangle_index).ok_or_else(|| {
@@ -6020,7 +6139,7 @@ fn with_hit_frame<T>(
         available_mask: element.and_then(|element| element.uv_available_mask),
     };
     let mut tables = LayerTables::new();
-    let context = layered_context(
+    let mut context = layered_context(
         doc,
         images,
         geometry.warnings,
@@ -6030,6 +6149,9 @@ fn with_hit_frame<T>(
             point,
             object: object_space(object, point),
             normal,
+            geometric_normal,
+            back_facing,
+            path_traced,
             view: -direction,
             barycentric: hit.barycentric,
         },
@@ -6037,12 +6159,24 @@ fn with_hit_frame<T>(
         uv_layers,
         &mut tables,
     )?;
-    let context = match footprint {
-        Some(dp) => context.with_footprint(HitFootprint {
-            dp,
-            geometric_normal,
-        }),
-        None => context,
+    if let Some((camera_to_world, world_to_camera)) = camera_matrices {
+        context.set_camera_matrices(*camera_to_world, *world_to_camera);
+    }
+    context.geometric_normal = geometric_normal;
+    context.back_facing = back_facing;
+    context.realtime_differentials = None;
+    context.light_falloff_distance = light_falloff_distance;
+    context.path_traced = path_traced;
+    let context = if path_traced {
+        match footprint {
+            Some(dp) => context.with_footprint(HitFootprint {
+                dp,
+                geometric_normal,
+            }),
+            None => context,
+        }
+    } else {
+        context
     };
     body(&HitFrame {
         point,
@@ -6136,6 +6270,7 @@ fn make_surface(
     direction: DVec3,
     images: &BTreeMap<String, ImageData>,
     footprint: f64,
+    camera_matrices: Option<&(DMat4, DMat4)>,
     ray_kind: RayKind,
     evaluator_workspace: &mut EvaluatorWorkspace,
 ) -> Result<Surface> {
@@ -6148,6 +6283,9 @@ fn make_surface(
         direction,
         images,
         Some(footprint),
+        camera_matrices.map(|matrices| (&matrices.0, &matrices.1)),
+        true,
+        Some(hit.distance),
         |frame| {
             let shading = evaluate_surface_with_workspace(
                 frame.material,
@@ -6281,6 +6419,9 @@ fn shadow_hit(
         images,
         footprint,
         RayKind::Shadow,
+        None,
+        true,
+        Some(hit.distance),
         &mut media,
         None,
         evaluator_workspace,
@@ -6297,6 +6438,9 @@ fn shadow_hit_into(
     images: &BTreeMap<String, ImageData>,
     footprint: Option<f64>,
     ray_kind: RayKind,
+    camera_matrices: Option<(&DMat4, &DMat4)>,
+    path_traced: bool,
+    light_falloff_distance: Option<f64>,
     media: &mut Vec<MeshMedium>,
     froxel_media: Option<&mut Vec<FroxelMeshMedium>>,
     evaluator_workspace: &mut EvaluatorWorkspace,
@@ -6309,6 +6453,9 @@ fn shadow_hit_into(
         direction,
         images,
         footprint,
+        camera_matrices,
+        path_traced,
+        light_falloff_distance,
         |frame| {
             let shading = evaluate_surface_with_workspace(
                 frame.material,
@@ -7964,6 +8111,7 @@ fn weighted_volume_channels(
 fn collect_volumes<'a>(
     doc: &'a SceneDoc,
     snapshot: &'a Snapshot,
+    path_traced: bool,
     meters_per_unit: f64,
     images: &BTreeMap<String, ImageData>,
     warnings: &RefCell<Vec<serde_json::Value>>,
@@ -8040,35 +8188,49 @@ fn collect_volumes<'a>(
             .slot_material(node_id, node, Some(data_block), 0)
             .and_then(|material_id| doc.materials.get(material_id));
         let prepared = material.map(|material| PreparedMaterial::new(material, &doc.node_groups));
-        let evaluated_material =
-            if let (Some(material), Some(prepared)) = (material, prepared.as_ref()) {
-                let local_center = (bounds_min + bounds_max) * 0.5;
-                let mut context = HitContext::new(&doc.node_groups)
-                    .with_images(images)
-                    .with_warnings(warnings);
-                context.object = local_center;
-                // Cycles maps a volume's Generated as `(P - min) * safe_divide(1, size)` (`blender/volume.cpp`), so a
-                // zero-thickness axis maps to 0, where a mesh's degenerate axis maps to 0.5.
-                let size = bounds_max - bounds_min;
-                let inverse_size = DVec3::from_array(size.to_array().map(|extent| {
-                    if crate::float::equal_f64(extent, 0.0) {
-                        0.0
-                    } else {
-                        1.0 / extent
-                    }
-                }));
-                context.generated = (local_center - bounds_min) * inverse_size;
-                context.generated_per_local = inverse_size;
-                context.position = matrix.transform_point3(local_center);
-                Some(evaluate_surface_with_workspace(
-                    material,
-                    prepared,
-                    &context,
-                    &mut evaluator_workspace,
-                )?)
-            } else {
-                None
-            };
+        let evaluated_material = if let (Some(material), Some(prepared)) =
+            (material, prepared.as_ref())
+        {
+            let local_center = (bounds_min + bounds_max) * 0.5;
+            let mut context = HitContext::new(&doc.node_groups)
+                .with_images(images)
+                .with_warnings(warnings);
+            context.object = local_center;
+            context.object_to_world = matrix;
+            context.world_to_object = matrix.inverse();
+            context.object_color = object_info_color(node);
+            context.object_pass_index = object_info_pass_index(node);
+            context.object_random_number = snapshot
+                .instance_paths
+                .get(node_id)
+                .and_then(|paths| paths.first())
+                .is_none_or(Vec::is_empty)
+                .then(|| f64::from(crate::blender_rng::cycles_object_random_number(&node.name)));
+            context.material_pass_index = material.pass_index.map(f64::from);
+            context.path_traced = path_traced;
+            context.light_falloff_distance = path_traced.then_some(0.0);
+            // Cycles maps a volume's Generated as `(P - min) * safe_divide(1, size)` (`blender/volume.cpp`), so a
+            // zero-thickness axis maps to 0, where a mesh's degenerate axis maps to 0.5.
+            let size = bounds_max - bounds_min;
+            let inverse_size = DVec3::from_array(size.to_array().map(|extent| {
+                if crate::float::equal_f64(extent, 0.0) {
+                    0.0
+                } else {
+                    1.0 / extent
+                }
+            }));
+            context.generated = (local_center - bounds_min) * inverse_size;
+            context.generated_per_local = inverse_size;
+            context.position = matrix.transform_point3(local_center);
+            Some(evaluate_surface_with_workspace(
+                material,
+                prepared,
+                &context,
+                &mut evaluator_workspace,
+            )?)
+        } else {
+            None
+        };
         let has_volume_output = prepared
             .as_ref()
             .is_some_and(PreparedMaterial::has_volume_output);
@@ -8171,6 +8333,182 @@ fn collect_volumes<'a>(
         });
     }
     Ok(volumes)
+}
+#[cfg(test)]
+mod volume_shader_context_tests {
+    use std::{cell::RefCell, collections::BTreeMap};
+
+    use glam::DVec3;
+    use serde_json::json;
+
+    use crate::{
+        eval::{EvaluationContext, EvaluationPurpose, Snapshot},
+        geom::volume::{VolumeData, VolumeGrid},
+        graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
+        model::{DataBlock, Id, Material, Node, SceneDoc},
+    };
+
+    use super::collect_volumes;
+
+    #[test]
+    fn realtime_volume_uses_eevee_falloff_and_volume_object_info() -> crate::error::Result<()> {
+        let mut doc = SceneDoc::new("00000000-0000-4000-8000-000000000000".to_owned());
+        let graph_id = Id::from_static("volume_shader");
+        let material_id = Id::from_static("volume_material");
+        let data_id = Id::from_static("volume_data");
+        let object_id = Id::from_static("volume_object");
+        let mut group = NodeGroup::new("Volume shader context", GraphKind::Shader);
+        for (id, node_type) in [
+            ("info", "ShaderNodeObjectInfo"),
+            ("falloff", "ShaderNodeLightFalloff"),
+            ("alpha_scatter", "ShaderNodeVolumeScatter"),
+            ("object_scatter", "ShaderNodeVolumeScatter"),
+            ("random_scatter", "ShaderNodeVolumeScatter"),
+            ("material_scatter", "ShaderNodeVolumeScatter"),
+            ("falloff_scatter", "ShaderNodeVolumeScatter"),
+            ("add_alpha_object", "ShaderNodeAddShader"),
+            ("add_random_material", "ShaderNodeAddShader"),
+            ("add_object_info", "ShaderNodeAddShader"),
+            ("add_falloff", "ShaderNodeAddShader"),
+            ("output", "ShaderNodeOutputMaterial"),
+        ] {
+            let _ = group
+                .nodes
+                .insert(Id::from_static(id), GraphNode::new(node_type));
+        }
+        if let Some(node) = group.nodes.get_mut(&Id::from_static("falloff")) {
+            let _ = node.inputs.insert("Strength".to_owned(), json!(5.0));
+            let _ = node.inputs.insert("Smooth".to_owned(), json!(0.0));
+        }
+        if let Some(node) = group.nodes.get_mut(&Id::from_static("output")) {
+            let _ = node
+                .properties
+                .insert("is_active_output".to_owned(), json!(true));
+        }
+        for (density, scatter) in [
+            ("Alpha", "alpha_scatter"),
+            ("Object Index", "object_scatter"),
+            ("Random", "random_scatter"),
+            ("Material Index", "material_scatter"),
+        ] {
+            group.links.push(GraphLink {
+                from_node: Id::from_static("info"),
+                from_socket: density.to_owned(),
+                to_node: Id::from_static(scatter),
+                to_socket: "Density".to_owned(),
+            });
+            group.links.push(GraphLink {
+                from_node: Id::from_static("info"),
+                from_socket: "Color".to_owned(),
+                to_node: Id::from_static(scatter),
+                to_socket: "Color".to_owned(),
+            });
+        }
+        group.links.push(GraphLink {
+            from_node: Id::from_static("falloff"),
+            from_socket: "Linear".to_owned(),
+            to_node: Id::from_static("falloff_scatter"),
+            to_socket: "Density".to_owned(),
+        });
+        for (first, second, add) in [
+            ("alpha_scatter", "object_scatter", "add_alpha_object"),
+            ("random_scatter", "material_scatter", "add_random_material"),
+            ("add_alpha_object", "add_random_material", "add_object_info"),
+            ("add_object_info", "falloff_scatter", "add_falloff"),
+        ] {
+            group.links.push(GraphLink {
+                from_node: Id::from_static(first),
+                from_socket: "Volume".to_owned(),
+                to_node: Id::from_static(add),
+                to_socket: "Shader".to_owned(),
+            });
+            group.links.push(GraphLink {
+                from_node: Id::from_static(second),
+                from_socket: "Volume".to_owned(),
+                to_node: Id::from_static(add),
+                to_socket: "Shader_001".to_owned(),
+            });
+        }
+        group.links.push(GraphLink {
+            from_node: Id::from_static("add_falloff"),
+            from_socket: "Shader".to_owned(),
+            to_node: Id::from_static("output"),
+            to_socket: "Volume".to_owned(),
+        });
+        let _ = doc.node_groups.insert(graph_id.clone(), group);
+
+        let material = Material {
+            name: "Volume object-info context".to_owned(),
+            pass_index: Some(11),
+            node_tree: Some(graph_id),
+            ..Material::default()
+        };
+        let _ = doc.materials.insert(material_id.clone(), material);
+
+        let grid = VolumeGrid {
+            dims: [2, 2, 2],
+            values: Some(vec![1.0; 8]),
+            ..VolumeGrid::default()
+        };
+        let mut volume = VolumeData::default();
+        volume.grids.push(grid);
+        let data = DataBlock {
+            data_type: "volume".to_owned(),
+            mesh: None,
+            volume: Some(volume),
+            ..DataBlock::default()
+        };
+        let _ = doc.data_blocks.insert(data_id.clone(), data);
+
+        let mut object = Node {
+            name: "Volume Info Target".to_owned(),
+            kind: "volume".to_owned(),
+            data: Some(data_id),
+            materials: vec![Some(material_id)],
+            ..Node::default()
+        };
+        let _ = object.properties.insert(
+            "blender_object_metadata".to_owned(),
+            json!({"rna_properties": {
+                "color": [0.2, 0.4, 0.6, 0.7],
+                "pass_index": 29
+            }}),
+        );
+        let _ = doc.nodes.insert(object_id.clone(), object);
+        if let Some(root) = doc.collections.get_mut(&Id::from_static("collection_root")) {
+            root.objects.push(object_id);
+        }
+
+        let snapshot = Snapshot::evaluate(
+            &doc,
+            &EvaluationContext {
+                scene_id: Some(doc.active_scene.clone()),
+                purpose: EvaluationPurpose::Render,
+                ..EvaluationContext::default()
+            },
+        )?;
+        let expected_random = f64::from(crate::blender_rng::cycles_object_random_number(
+            "Volume Info Target",
+        ));
+        let object_info_density = 0.7 + 29.0 + 11.0 + expected_random;
+        let images = BTreeMap::new();
+        let warnings = RefCell::new(Vec::new());
+        for (path_traced, falloff) in [(false, 5.0), (true, 0.0)] {
+            let volumes = collect_volumes(&doc, &snapshot, path_traced, 1.0, &images, &warnings)?;
+            assert_eq!(volumes.len(), 1);
+            let volume = &volumes[0];
+            for (channel, color) in [0.2, 0.4, 0.6].into_iter().enumerate() {
+                let expected_extinction = color * object_info_density + 0.8 * falloff;
+                assert!(
+                    (volume.extinction_rgb_scale[channel] - expected_extinction).abs() < 1.0e-5,
+                    "volume channel {channel}: {:?}",
+                    volume.extinction_rgb_scale
+                );
+            }
+            assert_eq!(volume.albedo, DVec3::ONE);
+        }
+        Ok(())
+    }
 }
 
 fn homogeneous_segment_transmittance(extinction: f64, distance: f64) -> f64 {
@@ -8342,6 +8680,8 @@ fn camera_media(
     origin: DVec3,
     images: &BTreeMap<String, ImageData>,
     footprint: CameraFootprint,
+    camera_matrices: Option<(&DMat4, &DMat4)>,
+    path_traced: bool,
     inside: &mut Vec<MeshMedium>,
     hit_media: &mut Vec<MeshMedium>,
     evaluator_workspace: &mut EvaluatorWorkspace,
@@ -8378,6 +8718,9 @@ fn camera_media(
                 images,
                 Some(footprint.at_distance(hit.distance)),
                 RayKind::Camera,
+                camera_matrices,
+                path_traced,
+                path_traced.then_some(0.0),
                 hit_media,
                 froxel_hit_media.as_deref_mut(),
                 evaluator_workspace,

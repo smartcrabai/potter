@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-use glam::{DQuat, DVec3, EulerRot};
+use glam::{DMat4, DQuat, DVec3, EulerRot, Mat4, Vec3};
 use serde_json::{Value as JsonValue, json};
 
 use crate::{
@@ -364,6 +364,15 @@ impl HitUvLayers<'_> {
     }
 }
 
+/// The realtime screen-space differentials used by EEVEE's shader bump evaluator.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitDifferentials {
+    pub world_dx: DVec3,
+    pub world_dy: DVec3,
+    pub uv_dx: [f64; 2],
+    pub uv_dy: [f64; 2],
+}
+
 /// Per-hit coordinates and graph context used by procedural shader nodes.
 #[derive(Clone, Copy, Debug)]
 pub struct HitContext<'a> {
@@ -386,18 +395,50 @@ pub struct HitContext<'a> {
     /// The Generated/orco values of this hit's triangle, used to transform radial tangent axes.
     generated_corners: Option<GeneratedCorners>,
     pub position: DVec3,
+    /// The EEVEE world position interpolated from triangle vertices using f32 arithmetic.
+    realtime_position_f32: Option<Vec3>,
     pub object: DVec3,
+    /// The object's evaluated transform into world space for Vector Transform and Object Info.
+    pub object_to_world: DMat4,
+    /// The inverse of `object_to_world`; identity when it cannot be inverted.
+    pub world_to_object: DMat4,
+    /// Blender Object color/alpha and Cycles Object Info data resolved for this hit.
+    pub object_color: [f64; 4],
+    pub object_pass_index: f64,
+    pub object_random_number: Option<f64>,
+    pub material_pass_index: Option<f64>,
+    /// The render camera's transform into world space; absent when shading has no camera context.
+    pub camera_to_world: Option<DMat4>,
+    /// The inverse of `camera_to_world`; absent when shading has no camera context.
+    pub world_to_camera: Option<DMat4>,
+    /// EEVEE's f32 world-to-camera matrix, cached when the camera matrices are assigned.
+    world_to_camera_f32: Option<Mat4>,
     pub normal: DVec3,
+    pub geometric_normal: DVec3,
+    pub back_facing: bool,
+    /// EEVEE screen-space surface and render-UV differentials for Bump.
+    pub realtime_differentials: Option<HitDifferentials>,
+
     pub view_direction: DVec3,
+    /// Cycles' `ShaderData.ray_length` for the current path hit; absent in realtime shading.
+    pub light_falloff_distance: Option<f64>,
+    /// Whether this hit is evaluated by Cycles semantics rather than the realtime shader path.
+    pub path_traced: bool,
     /// The render color layer at this hit: the value a Vertex Color node with an empty layer name
     /// reads.
     pub color_render: Option<[f64; 4]>,
     /// Color layers at this hit, by layer name in layer order; see
     /// [`HitContext::with_color_layers`].
     pub color_layers: Option<&'a [(&'a str, [f64; 4])]>,
-    /// The camera footprint of a path-traced hit (Cycles' `sd->dP`); `None` where no camera footprint is tracked,
-    /// in which case a bump node uses its finite-difference fallback. See [`HitContext::with_footprint`].
+    /// The screen differential of a path-traced hit (Cycles' `sd->dP`), required for exact Bump evaluation.
+    /// Realtime and preview contexts without this differential refuse Bump rather than approximate it.
     pub footprint: Option<HitFootprint>,
+    /// Centre position reused by Camera Data while this hit is sampled for Bump Height.
+    bump_center_position: DVec3,
+    bump_center_realtime_position_f32: Option<Vec3>,
+    /// Shadow opacity evaluation must not evaluate Bump Height when only the shading normal uses it.
+    opacity_only: bool,
+    bump_height_shifted: bool,
 }
 
 /// The camera footprint of a path-traced hit: Cycles' compact `sd->dP` (`kernel/geom/shader_data.h`) and the
@@ -424,19 +465,69 @@ impl<'a> HitContext<'a> {
             generated_per_local: DVec3::ONE,
             generated_corners: None,
             position: DVec3::ZERO,
+            object_to_world: DMat4::IDENTITY,
+            world_to_object: DMat4::IDENTITY,
+            object_color: [1.0; 4],
+            object_pass_index: 0.0,
+            object_random_number: None,
+            material_pass_index: None,
+            camera_to_world: None,
+            world_to_camera: None,
+            realtime_position_f32: None,
+            world_to_camera_f32: None,
             object: DVec3::ZERO,
             normal: DVec3::Z,
+            geometric_normal: DVec3::Z,
+            back_facing: false,
             view_direction: DVec3::Z,
+            light_falloff_distance: None,
+            path_traced: false,
             color_render: None,
             color_layers: None,
             footprint: None,
+            realtime_differentials: None,
+            bump_center_position: DVec3::ZERO,
+            bump_center_realtime_position_f32: None,
+            opacity_only: false,
+            bump_height_shifted: false,
         }
+    }
+
+    /// Set the camera transforms and cache EEVEE's f32 world-to-camera matrix.
+    pub fn set_camera_matrices(&mut self, camera_to_world: DMat4, world_to_camera: DMat4) {
+        self.camera_to_world = Some(camera_to_world);
+        self.world_to_camera = Some(world_to_camera);
+        self.world_to_camera_f32 = Some(Mat4::from_cols_array(
+            &world_to_camera.to_cols_array().map(|value| value as f32),
+        ));
+    }
+
+    /// Set EEVEE's interpolated world position for a realtime triangle hit.
+    #[must_use]
+    pub(crate) fn with_realtime_position_f32(
+        mut self,
+        positions: [DVec3; 3],
+        barycentric: [f64; 3],
+    ) -> Self {
+        let [first, second, third] = positions
+            .map(|position| Vec3::new(position.x as f32, position.y as f32, position.z as f32));
+        let [first_weight, second_weight, third_weight] = barycentric.map(|weight| weight as f32);
+        self.realtime_position_f32 =
+            Some(first * first_weight + second * second_weight + third * third_weight);
+        self
     }
 
     /// Attach the camera footprint of a path-traced hit, which bump nodes read (Cycles' `sd->dP`).
     #[must_use]
     pub const fn with_footprint(mut self, footprint: HitFootprint) -> Self {
         self.footprint = Some(footprint);
+        self
+    }
+
+    /// Mark evaluation as reading only opacity/shadow coverage; shading-normal-only Bump nodes are skipped.
+    #[must_use]
+    pub(crate) const fn with_opacity_only(mut self) -> Self {
+        self.opacity_only = true;
         self
     }
 
@@ -514,7 +605,19 @@ impl<'a> HitContext<'a> {
     /// the moved position; without them only `uv` moves, by the step's UV change.
     fn shifted(&self, step: SurfaceStep) -> Self {
         let mut shifted = *self;
+        if !self.bump_height_shifted {
+            shifted.bump_center_position = self.position;
+            shifted.bump_center_realtime_position_f32 = self.realtime_position_f32;
+        }
         shifted.generated += step.world * self.generated_per_local;
+        shifted.realtime_position_f32 = shifted.realtime_position_f32.map(|position| {
+            position
+                + Vec3::new(
+                    step.world.x as f32,
+                    step.world.y as f32,
+                    step.world.z as f32,
+                )
+        });
         shifted.position += step.world;
         shifted.object += step.world;
         if let Some(layers) = self.uv_layers {
@@ -531,6 +634,21 @@ impl<'a> HitContext<'a> {
             shifted.uv[1] += step.uv[1];
         }
         shifted
+    }
+
+    fn shifted_realtime(&self, step: SurfaceStep) -> Option<Self> {
+        if !self.world_to_object.is_finite() {
+            return None;
+        }
+        let local_step = self.world_to_object.transform_vector3(step.world);
+        if !local_step.is_finite() {
+            return None;
+        }
+        let mut shifted = self.shifted(step);
+        shifted.object = self.object + local_step;
+        shifted.generated = self.generated + local_step * self.generated_per_local;
+        shifted.uv = [self.uv[0] + step.uv[0], self.uv[1] + step.uv[1]];
+        Some(shifted)
     }
 }
 
@@ -673,6 +791,8 @@ fn evaluate_surface_inner_into(
         workspace,
         alpha_linked_images: &prepared.alpha_linked_images,
         links: prepared.link_index(graph_id, group),
+        group_input_binding: None,
+        group_depth: 0,
     };
     // Only an unlinked Surface alongside a linked Volume is empty; other Shader sockets keep their defaults.
     if !has_surface && has_volume {
@@ -821,6 +941,8 @@ fn evaluate_displacement_inner(
         workspace,
         alpha_linked_images: &prepared.alpha_linked_images,
         links: prepared.link_index(graph_id, group),
+        group_input_binding: None,
+        group_depth: 0,
     };
     match evaluator.input(output, "Displacement", ValueKind::Vector)? {
         Value::Vector(displacement) => Ok(displacement.dot(hit_ctx.normal)),
@@ -992,8 +1114,27 @@ enum NodeKind {
     MixRgb,
     Math,
     VectorMath,
+    VectorRotate,
+    VectorTransform,
     Mapping,
+    Value,
+    Rgb,
+    CombineColor,
     SeparateColor,
+    RgbToBw,
+    Invert,
+    Gamma,
+    BrightContrast,
+    HueSaturation,
+    Normal,
+    Wavelength,
+    Blackbody,
+    LightFalloff,
+    ObjectInfo,
+    Geometry,
+    CameraData,
+    Group,
+    GroupInput,
     SeparateXyz,
     CombineXyz,
     TexCoord,
@@ -1004,6 +1145,48 @@ enum NodeKind {
     LayerWeight,
     Attribute,
     VertexColor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorRotationType {
+    AxisAngle,
+    AxisX,
+    AxisY,
+    AxisZ,
+    EulerXyz,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorTransformType {
+    Point,
+    Vector,
+    Normal,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorTransformSpace {
+    Object,
+    World,
+    Camera,
+}
+
+impl VectorTransformSpace {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Object => "OBJECT",
+            Self::World => "WORLD",
+            Self::Camera => "CAMERA",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NormalMapSpace {
+    Tangent,
+    Object,
+    World,
+    BlenderObject,
+    BlenderWorld,
 }
 
 // Tokens identify a canonical node key and a source socket link without owning either string.
@@ -1020,6 +1203,8 @@ pub struct EvaluatorWorkspace {
     /// The closures of the evaluation in progress. A `Value::Shader` names a span of them, so a node's value stays
     /// `Copy` and Mix and Add append to the arena instead of allocating per node.
     closures: Vec<ShaderClosure>,
+    /// Active nested graph identities; prevents recursive node groups from exhausting the render stack.
+    active_groups: Vec<usize>,
 }
 
 /// A run of closures in the workspace arena (`EvaluatorWorkspace::closures`).
@@ -1034,6 +1219,7 @@ impl EvaluatorWorkspace {
     fn reset(&mut self) {
         self.active.clear();
         self.closures.clear();
+        self.active_groups.clear();
     }
 
     /// A node's single closure at weight 1.
@@ -1092,6 +1278,8 @@ impl EvaluatorWorkspace {
 pub struct PreparedMaterial {
     /// The Image Texture nodes whose Alpha output reaches the graph's output (see [`linked_alpha_image_nodes`]).
     alpha_linked_images: BTreeSet<Id>,
+    /// The first Bump whose output feeds realtime transparency or its coverage factor.
+    bump_transparency_node: Option<Id>,
     /// Whether EEVEE would compile the material as transparent (`GPU_MATFLAG_TRANSPARENT`), which decides whether its
     /// surfaces cast transparent shadows (see [`graph_is_transparent`]).
     transparent: bool,
@@ -1193,12 +1381,23 @@ impl PreparedMaterial {
                 ..Self::default()
             };
         };
+        let mut alpha_linked_images = BTreeSet::new();
+        let mut visited_groups = BTreeSet::new();
+        visited_groups.insert(graph_id.clone());
+        collect_linked_alpha_images(
+            node_groups,
+            group,
+            output,
+            &mut visited_groups,
+            &mut alpha_linked_images,
+        );
+        let transparent = graph_is_transparent(graph_id, group, node_groups, output);
         Self {
-            alpha_linked_images: linked_alpha_image_nodes(group, output)
-                .into_iter()
-                .cloned()
-                .collect(),
-            transparent: graph_is_transparent(group, output),
+            alpha_linked_images,
+            bump_transparency_node: transparent
+                .then(|| bump_affecting_transparency(graph_id, group, node_groups, output))
+                .flatten(),
+            transparent,
             links,
         }
     }
@@ -1228,6 +1427,10 @@ impl PreparedMaterial {
     /// Whether a surface of this material casts a transparent shadow, as EEVEE's static transparency decides it.
     pub(crate) fn is_transparent(&self) -> bool {
         self.transparent
+    }
+    /// A Bump that changes realtime transparent-shadow coverage must be refused, not evaluated with an unbumped normal.
+    pub(crate) fn realtime_transparency_bump(&self) -> Option<&Id> {
+        self.bump_transparency_node.as_ref()
     }
     /// Whether this material graph has a linked Volume output.
     pub(crate) fn has_volume_output(&self) -> bool {
@@ -1262,7 +1465,15 @@ impl PreparedMaterial {
     }
 }
 
-struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared> {
+#[derive(Clone, Copy)]
+struct GroupInputBinding<'a> {
+    group: &'a NodeGroup,
+    node_id: &'a Id,
+    binding: Option<&'a GroupInputBinding<'a>>,
+    depth: usize,
+}
+
+struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared, 'scope> {
     group: &'graph NodeGroup,
     material: &'material Material,
     hit_ctx: HitContext<'registry>,
@@ -1271,9 +1482,29 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared> {
     alpha_linked_images: &'prepared BTreeSet<Id>,
     /// The incoming-link index of `group` from [`PreparedMaterial`]; `None` scans every link of the group.
     links: Option<&'prepared LinkIndex>,
+    /// The call site whose socket values feed this group's Group Input nodes.
+    group_input_binding: Option<&'scope GroupInputBinding<'scope>>,
+    group_depth: usize,
 }
 
-impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
+impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
+    fn group_interface_input_default<'a>(
+        &'a self,
+        node: &GraphNode,
+        socket: &str,
+    ) -> Option<&'a JsonValue> {
+        let group_id = node.properties.get("node_tree")?.as_str()?;
+        self.hit_ctx
+            .node_groups
+            .get(group_id)?
+            .interface
+            .inputs
+            .iter()
+            .find(|candidate| candidate.id == socket || candidate.name == socket)
+            .map(|candidate| &candidate.default)
+            .filter(|default| !default.is_null())
+    }
+
     fn input(&mut self, node_id: &Id, socket: &str, kind: ValueKind) -> Result<Value> {
         let node = self.node(node_id)?;
         let group = self.group;
@@ -1286,12 +1517,19 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                     .flatten()
                     .find_map(|&socket_index| {
                         let link = group.links.get(socket_index)?;
-                        (link.to_node == *node_id && socket_matches(&link.to_socket, socket))
-                            .then_some((socket_index, link))
+                        (link.to_node == *node_id
+                            && input_socket_matches(
+                                self.hit_ctx.node_groups,
+                                node,
+                                &link.to_socket,
+                                socket,
+                            ))
+                        .then_some((socket_index, link))
                     })
             }
             None => group.links.iter().enumerate().find(|(_, link)| {
-                link.to_node == *node_id && socket_matches(&link.to_socket, socket)
+                link.to_node == *node_id
+                    && input_socket_matches(self.hit_ctx.node_groups, node, &link.to_socket, socket)
             }),
         };
         if let Some((socket_index, link)) = incoming {
@@ -1300,10 +1538,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let raw = node
             .inputs
             .iter()
-            .find(|(name, _)| socket_matches(name, socket))
+            .find(|(name, _)| input_socket_matches(self.hit_ctx.node_groups, node, name, socket))
             .map(|(_, value)| value)
             .filter(|value| !value.is_null());
-        let default = raw.or_else(|| socket_default(node, socket));
+        let default = raw.or_else(|| socket_default(node, socket)).or_else(|| {
+            (node.node_type == "ShaderNodeGroup")
+                .then(|| self.group_interface_input_default(node, socket))
+                .flatten()
+        });
         match kind {
             ValueKind::Scalar => Ok(Value::Scalar(
                 default.map_or(f64::NAN, |value| number(value, f64::NAN)),
@@ -1327,6 +1569,100 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
                 }
             }
         }
+    }
+
+    fn group_input(&mut self, node_id: &Id, socket: &str) -> Result<Value> {
+        let Some(binding) = self.group_input_binding else {
+            return Err(unsupported_node(node_id, "NodeGroupInput.call_site"));
+        };
+        let Some(input_socket) = self
+            .group
+            .interface
+            .inputs
+            .iter()
+            .find(|candidate| candidate.id == socket || candidate.name == socket)
+        else {
+            return Err(invalid(format!("unknown Group Input output `{socket}`")));
+        };
+        let kind = group_socket_value_kind(&input_socket.socket_type)
+            .ok_or_else(|| unsupported_node_id("NodeGroupInput", socket))?;
+        let (parent_group, parent_node_id, parent_binding, parent_depth) = (
+            binding.group,
+            binding.node_id,
+            binding.binding,
+            binding.depth,
+        );
+        let mut parent = Evaluator {
+            group: parent_group,
+            material: self.material,
+            hit_ctx: self.hit_ctx,
+            workspace: self.workspace,
+            alpha_linked_images: self.alpha_linked_images,
+            links: None,
+            group_input_binding: parent_binding,
+            group_depth: parent_depth,
+        };
+        parent.input(parent_node_id, &input_socket.id, kind)
+    }
+
+    fn group_node(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if self.group_depth >= 64 {
+            return Err(unsupported_node(id, "ShaderNodeGroup.recursion"));
+        }
+        let node = self.node(id)?;
+        let Some(group_id) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
+            return Err(unsupported_node(id, "ShaderNodeGroup.node_tree"));
+        };
+        let node_groups = self.hit_ctx.node_groups;
+        let Some((_, child_group)) = node_groups.get_key_value(group_id) else {
+            return Err(unsupported_node(id, "ShaderNodeGroup.node_tree"));
+        };
+        if child_group.kind != GraphKind::Shader {
+            return Err(unsupported_node(id, "ShaderNodeGroup.graph_kind"));
+        }
+        let Some(output_socket) = child_group
+            .interface
+            .outputs
+            .iter()
+            .find(|candidate| candidate.id == socket || candidate.name == socket)
+        else {
+            return Err(invalid(format!("unknown Shader Group output `{socket}`")));
+        };
+        let output_kind = group_socket_value_kind(&output_socket.socket_type)
+            .ok_or_else(|| unsupported_node(id, "ShaderNodeGroup.output_socket_type"))?;
+        let Some(output_node) = active_group_output(child_group) else {
+            return Err(unsupported_node(id, "ShaderNodeGroup.output"));
+        };
+
+        let child_key = std::ptr::from_ref(child_group).addr();
+        if self.workspace.active_groups.contains(&child_key) {
+            return Err(unsupported_node(id, "ShaderNodeGroup.recursion"));
+        }
+        let active_start = self.workspace.active_groups.len();
+        let group_depth = self.group_depth + 1;
+        let material = self.material;
+        let hit_ctx = self.hit_ctx;
+        let alpha_linked_images = self.alpha_linked_images;
+        let binding = GroupInputBinding {
+            group: self.group,
+            node_id: id,
+            binding: self.group_input_binding,
+            depth: self.group_depth,
+        };
+        self.workspace.active_groups.push(child_key);
+        let mut nested = Evaluator {
+            group: child_group,
+            material,
+            hit_ctx,
+            workspace: self.workspace,
+            alpha_linked_images,
+            links: None,
+            group_input_binding: Some(&binding),
+            group_depth,
+        };
+        let result = nested.input(output_node, &output_socket.name, output_kind);
+        self.workspace.active_groups.truncate(active_start);
+        result
     }
 
     /// Whether `socket` of `node_id` takes a link, so its value comes from another node rather than the socket's
@@ -1405,8 +1741,27 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             "ShaderNodeMixRGB" | "ShaderNodeMix" => Ok(NodeKind::MixRgb),
             "ShaderNodeMath" => Ok(NodeKind::Math),
             "ShaderNodeVectorMath" => Ok(NodeKind::VectorMath),
-            "ShaderNodeMapping" => Ok(NodeKind::Mapping),
+            "ShaderNodeGroup" => Ok(NodeKind::Group),
+            "NodeGroupInput" => Ok(NodeKind::GroupInput),
+            "ShaderNodeValue" => Ok(NodeKind::Value),
+            "ShaderNodeRGB" => Ok(NodeKind::Rgb),
+            "ShaderNodeCombineColor" => Ok(NodeKind::CombineColor),
             "ShaderNodeSeparateColor" => Ok(NodeKind::SeparateColor),
+            "ShaderNodeRGBToBW" => Ok(NodeKind::RgbToBw),
+            "ShaderNodeInvert" => Ok(NodeKind::Invert),
+            "ShaderNodeGamma" => Ok(NodeKind::Gamma),
+            "ShaderNodeBrightContrast" => Ok(NodeKind::BrightContrast),
+            "ShaderNodeHueSaturation" => Ok(NodeKind::HueSaturation),
+            "ShaderNodeNormal" => Ok(NodeKind::Normal),
+            "ShaderNodeWavelength" => Ok(NodeKind::Wavelength),
+            "ShaderNodeBlackbody" => Ok(NodeKind::Blackbody),
+            "ShaderNodeLightFalloff" => Ok(NodeKind::LightFalloff),
+            "ShaderNodeObjectInfo" => Ok(NodeKind::ObjectInfo),
+            "ShaderNodeNewGeometry" => Ok(NodeKind::Geometry),
+            "ShaderNodeCameraData" => Ok(NodeKind::CameraData),
+            "ShaderNodeVectorRotate" => Ok(NodeKind::VectorRotate),
+            "ShaderNodeVectorTransform" => Ok(NodeKind::VectorTransform),
+            "ShaderNodeMapping" => Ok(NodeKind::Mapping),
             "ShaderNodeSeparateXYZ" => Ok(NodeKind::SeparateXyz),
             "ShaderNodeCombineXYZ" => Ok(NodeKind::CombineXyz),
             "ShaderNodeTexCoord" => Ok(NodeKind::TexCoord),
@@ -1434,6 +1789,36 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .get(node_id)
             .ok_or_else(|| invalid(format!("shader graph references absent node `{node_id}`")))
     }
+    fn output_default(&self, node_id: &Id, socket: &str) -> Option<&JsonValue> {
+        self.node(node_id)
+            .ok()?
+            .properties
+            .get("potter_output_defaults")?
+            .as_array()?
+            .iter()
+            .find(|entry| entry.get("identifier").and_then(JsonValue::as_str) == Some(socket))
+            .and_then(|entry| entry.get("default"))
+            .filter(|value| !value.is_null())
+    }
+    fn required_output_default(
+        &self,
+        node_id: &Id,
+        node_type: &str,
+        socket: &str,
+    ) -> Result<Option<&JsonValue>> {
+        let default = self.output_default(node_id, socket);
+        let node = self.node(node_id)?;
+        if default.is_none()
+            && (node.properties.contains_key("bl_idname")
+                || node.properties.contains_key("potter_output_defaults"))
+        {
+            return Err(unsupported_node(
+                node_id,
+                &format!("{node_type}.output_defaults"),
+            ));
+        }
+        Ok(default)
+    }
 
     /// Whether the Alpha output of the Image Texture `id` reaches the group's output (see [`PreparedMaterial`]).
     fn alpha_linked_image(&self, id: &Id) -> bool {
@@ -1442,6 +1827,24 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
 
     fn evaluate_node(&mut self, node_id: &Id, kind: NodeKind, socket: &str) -> Result<Value> {
         match kind {
+            NodeKind::Group => self.group_node(node_id, socket),
+            NodeKind::GroupInput => self.group_input(node_id, socket),
+            NodeKind::Value => self.value(node_id, socket),
+            NodeKind::Rgb => self.rgb(node_id, socket),
+            NodeKind::CombineColor => self.combine_color(node_id, socket),
+            NodeKind::SeparateColor => self.separate_color(node_id, socket),
+            NodeKind::RgbToBw => self.rgb_to_bw(node_id, socket),
+            NodeKind::Invert => self.invert(node_id, socket),
+            NodeKind::Gamma => self.gamma(node_id, socket),
+            NodeKind::BrightContrast => self.bright_contrast(node_id, socket),
+            NodeKind::HueSaturation => self.hue_saturation(node_id, socket),
+            NodeKind::Normal => self.normal(node_id, socket),
+            NodeKind::Wavelength => self.wavelength(node_id, socket),
+            NodeKind::Blackbody => self.blackbody(node_id, socket),
+            NodeKind::LightFalloff => self.light_falloff(node_id, socket),
+            NodeKind::ObjectInfo => self.object_info(node_id, socket),
+            NodeKind::Geometry => self.geometry(node_id, socket),
+            NodeKind::CameraData => self.camera_data(node_id, socket),
             NodeKind::OutputMaterial => Err(invalid("material output has no output sockets")),
             NodeKind::Principled => {
                 let params = self.principled(node_id)?;
@@ -1495,11 +1898,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             NodeKind::MixRgb => self.mix_rgb(node_id, socket),
             NodeKind::Math => self.math(node_id, socket),
             NodeKind::VectorMath => self.vector_math(node_id, socket),
+            NodeKind::VectorRotate => self.vector_rotate(node_id, socket),
+            NodeKind::VectorTransform => self.vector_transform(node_id, socket),
             NodeKind::Mapping => self.mapping(node_id, socket),
-            NodeKind::SeparateColor => self.separate_color(node_id, socket),
             NodeKind::SeparateXyz => self.separate_xyz(node_id, socket),
             NodeKind::CombineXyz => self.combine_xyz(node_id, socket),
-            NodeKind::TexCoord => self.tex_coord(socket),
+            NodeKind::TexCoord => self.tex_coord(node_id, socket),
             NodeKind::UvMap => self.uv_map(node_id, socket),
             NodeKind::Tangent => self.tangent(node_id, socket),
             NodeKind::NormalMap => self.normal_map(node_id, socket),
@@ -1880,13 +2284,18 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         if socket != "Normal" {
             return Err(invalid(format!("unknown Bump output `{socket}`")));
         }
-        // Cycles' `stack_load_float3_default(stack, normal_offset, sd->N)` (`kernel/svm/displace.h`): an unlinked
-        // Normal is the shading normal, whatever the socket stores (Blender stores a zero vector there).
+        if self.hit_ctx.opacity_only {
+            return Ok(Value::Vector(self.hit_ctx.normal));
+        }
         let normal = if self.is_linked(id, "Normal") {
             self.vector_input(id, &["Normal"], self.hit_ctx.normal)?
         } else {
             self.hit_ctx.normal
         };
+        // An unlinked Height is a true no-op in both render engines, including a linked Normal.
+        if !self.is_linked(id, "Height") {
+            return Ok(Value::Vector(normal));
+        }
         let strength = self.scalar_input(id, &["Strength"], 1.0)?.max(0.0);
         let distance = self.scalar_input(id, &["Distance"], 0.001)?;
         let invert = self
@@ -1896,21 +2305,71 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
         let scale = if invert { -distance } else { distance };
-        if let Some(footprint) = self.hit_ctx.footprint {
-            let filter_width = self.scalar_input(id, &["Filter Width"], 0.1)?;
-            self.footprint_bump(id, normal, strength, scale, filter_width, footprint)
-        } else {
-            // Without a camera footprint (realtime, preview, baking) the height is a symmetric finite difference
-            // over a fixed step, and Filter Width has no footprint to scale: a known gap against Cycles.
-            if strength.abs() <= f64::EPSILON || distance.abs() <= f64::EPSILON {
-                return Ok(Value::Vector(normalize_or(normal, self.hit_ctx.normal)));
+        let filter_width = self.scalar_input(id, &["Filter Width"], 0.1)?;
+        if self.hit_ctx.path_traced {
+            if let Some(footprint) = self.hit_ctx.footprint {
+                self.footprint_bump(id, normal, strength, scale, filter_width, footprint)
+            } else {
+                Err(unsupported_node(id, "Bump.path_footprint"))
             }
-            let unit = normalize_or(normal, self.hit_ctx.normal);
-            let context = self.hit_ctx;
-            let gradient = height_gradient(&context, unit, |context| self.height_at(id, context))?;
-            let perturbed = unit - gradient * (strength * scale);
-            Ok(Value::Vector(normalize_or(perturbed, unit)))
+        } else if let Some(differentials) = self.hit_ctx.realtime_differentials {
+            self.realtime_bump(id, normal, strength, scale, filter_width, differentials)
+        } else {
+            Err(unsupported_node(id, "Bump.realtime_derivatives"))
         }
+    }
+
+    /// EEVEE's `node_bump` (`gpu_shader_material_bump.glsl`): finite-difference the height along the two
+    /// screen derivatives, then use the world-space surface gradient and signed determinant.
+    fn realtime_bump(
+        &mut self,
+        id: &Id,
+        normal: DVec3,
+        strength: f64,
+        scale: f64,
+        filter_width: f64,
+        differentials: HitDifferentials,
+    ) -> Result<Value> {
+        let normal = normalize_or(normal, DVec3::Z);
+        let dp_x = differentials.world_dx;
+        let dp_y = differentials.world_dy;
+        let rx = dp_y.cross(normal);
+        let ry = normal.cross(dp_x);
+        let det = dp_x.dot(rx);
+        let context = self.hit_ctx;
+        let center = self.height_at(id, &context, false)?;
+        let shifted_x = context
+            .shifted_realtime(SurfaceStep {
+                world: dp_x * filter_width,
+                uv: [
+                    differentials.uv_dx[0] * filter_width,
+                    differentials.uv_dx[1] * filter_width,
+                ],
+            })
+            .ok_or_else(|| unsupported_node(id, "Bump.realtime_derivatives.object_transform"))?;
+        let shifted_y = context
+            .shifted_realtime(SurfaceStep {
+                world: dp_y * filter_width,
+                uv: [
+                    differentials.uv_dy[0] * filter_width,
+                    differentials.uv_dy[1] * filter_width,
+                ],
+            })
+            .ok_or_else(|| unsupported_node(id, "Bump.realtime_derivatives.object_transform"))?;
+        let height_x = self.height_at(id, &shifted_x, true)?;
+        let height_y = self.height_at(id, &shifted_y, true)?;
+        let surfgrad = (height_x - center) * rx + (height_y - center) * ry;
+        let facing_scale = if self.hit_ctx.back_facing {
+            -scale
+        } else {
+            scale
+        };
+        let raw = normal * (filter_width * det.abs()) - surfgrad * (facing_scale * det.signum());
+        let bumped = normalize_or(raw, normal);
+        Ok(Value::Vector(normalize_or(
+            normal.lerp(bumped, strength),
+            normal,
+        )))
     }
 
     /// Cycles' `svm_node_set_bump` (`kernel/svm/displace.h`). The screen differentials `dP/dx` and `dP/dy` are
@@ -1934,7 +2393,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let ry = normal.cross(dp_x);
         let det = dp_x.dot(rx);
         let context = self.hit_ctx;
-        let center = self.height_at(id, &context)?;
+        let center = self.height_at(id, &context, false)?;
         let shifted_x = context.shifted(SurfaceStep {
             world: dp_x * filter_width,
             uv: [0.0; 2],
@@ -1943,8 +2402,8 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             world: dp_y * filter_width,
             uv: [0.0; 2],
         });
-        let height_x = self.height_at(id, &shifted_x)?;
-        let height_y = self.height_at(id, &shifted_y)?;
+        let height_x = self.height_at(id, &shifted_x, true)?;
+        let height_y = self.height_at(id, &shifted_y, true)?;
         let surfgrad = (height_x - center) * rx + (height_y - center) * ry;
         // Cycles' `signf`, which maps zero to +1.
         let sign = if det < 0.0 { -1.0 } else { 1.0 };
@@ -1958,14 +2417,21 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             normal,
         )))
     }
-
-    fn height_at(&mut self, id: &Id, context: &HitContext<'registry>) -> Result<f64> {
+    /// Evaluates the Height input at a shifted surface context, restoring the current hit even when evaluation fails.
+    fn height_at(
+        &mut self,
+        id: &Id,
+        context: &HitContext<'registry>,
+        shifted: bool,
+    ) -> Result<f64> {
         let previous = self.hit_ctx;
         self.hit_ctx = *context;
-        let result = self.scalar_input(id, &["Height"], 0.5);
+        self.hit_ctx.bump_height_shifted = shifted;
+        let result = self.scalar_input(id, &["Height"], 0.0);
         self.hit_ctx = previous;
         result
     }
+
     fn checker(&mut self, id: &Id, socket: &str) -> Result<Value> {
         let vector = self.vector_input(
             id,
@@ -2248,6 +2714,395 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         let z = self.scalar_input(id, &["Z"], 0.0)?;
         Ok(Value::Vector(DVec3::new(x, y, z)))
     }
+    fn value(&self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Value" {
+            return Err(invalid(format!("unknown Value output `{socket}`")));
+        }
+        let value = match self.required_output_default(id, "ShaderNodeValue", socket)? {
+            Some(value) => JsonValue::as_f64(value)
+                .ok_or_else(|| unsupported_node(id, "ShaderNodeValue.output_defaults"))?,
+            None => 0.0,
+        };
+        if !value.is_finite() {
+            return Err(invalid(format!(
+                "Value node `{id}` has a non-finite output"
+            )));
+        }
+        Ok(Value::Scalar(value))
+    }
+
+    fn rgb(&self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!("unknown RGB output `{socket}`")));
+        }
+        let color = match self.required_output_default(id, "ShaderNodeRGB", socket)? {
+            Some(value) => {
+                let color = color(value, [f64::NAN; 4]);
+                if color.iter().any(|channel| !channel.is_finite()) {
+                    return Err(unsupported_node(id, "ShaderNodeRGB.output_defaults"));
+                }
+                color
+            }
+            None => [0.5, 0.5, 0.5, 1.0],
+        };
+        Ok(Value::Color(color))
+    }
+
+    fn combine_color(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!("unknown Combine Color output `{socket}`")));
+        }
+        let mode = match self
+            .node(id)?
+            .properties
+            .get("mode")
+            .and_then(JsonValue::as_str)
+        {
+            None | Some("RGB") => "RGB",
+            Some("HSV") => "HSV",
+            Some("HSL") => "HSL",
+            Some(mode) => return Err(unsupported_node(id, &format!("CombineColor:{mode}"))),
+        };
+        let red = self.scalar_input(id, &["Red"], 0.0)?;
+        let green = self.scalar_input(id, &["Green"], 0.0)?;
+        let blue = self.scalar_input(id, &["Blue"], 0.0)?;
+        super::converters::combine_color(mode, red, green, blue)
+            .map(Value::Color)
+            .ok_or_else(|| unsupported_node(id, &format!("CombineColor:{mode}")))
+    }
+
+    fn rgb_to_bw(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Val" {
+            return Err(invalid(format!("unknown RGB to BW output `{socket}`")));
+        }
+        let color = self.color_input(id, &["Color"], [0.5, 0.5, 0.5, 1.0])?;
+        Ok(Value::Scalar(super::converters::rgb_to_bw(color)))
+    }
+
+    fn invert(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!("unknown Invert Color output `{socket}`")));
+        }
+        let factor = self.scalar_input(id, &["Fac", "Factor"], 1.0)?;
+        let color = self.color_input(id, &["Color"], [0.0, 0.0, 0.0, 1.0])?;
+        Ok(Value::Color(super::converters::invert_color(color, factor)))
+    }
+
+    fn gamma(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!("unknown Gamma output `{socket}`")));
+        }
+        let color = self.color_input(id, &["Color"], [1.0; 4])?;
+        let gamma = self.scalar_input(id, &["Gamma"], 1.0)?;
+        Ok(Value::Color(super::converters::gamma_color(color, gamma)))
+    }
+
+    fn bright_contrast(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!(
+                "unknown Brightness/Contrast output `{socket}`"
+            )));
+        }
+        let color = self.color_input(id, &["Color"], [1.0; 4])?;
+        let brightness = self.scalar_input(id, &["Bright", "Brightness"], 0.0)?;
+        let contrast = self.scalar_input(id, &["Contrast"], 0.0)?;
+        Ok(Value::Color(super::converters::brightness_contrast(
+            color, brightness, contrast,
+        )))
+    }
+
+    fn hue_saturation(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!(
+                "unknown Hue/Saturation/Value output `{socket}`"
+            )));
+        }
+        let hue = self.scalar_input(id, &["Hue"], 0.5)?;
+        let saturation = self.scalar_input(id, &["Saturation"], 1.0)?;
+        let value = self.scalar_input(id, &["Value"], 1.0)?;
+        let factor = self.scalar_input(id, &["Fac", "Factor"], 1.0)?;
+        let color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let mut result = super::converters::hue_saturation(color, hue, saturation, value, factor);
+        if self.hit_ctx.path_traced {
+            result[..3]
+                .iter_mut()
+                .for_each(|channel| *channel = channel.max(0.0));
+        }
+        Ok(Value::Color(result))
+    }
+
+    fn normal(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        let direction = match self.required_output_default(id, "ShaderNodeNormal", "Normal")? {
+            Some(value) => {
+                let direction = vector(value, DVec3::splat(f64::NAN));
+                if !direction.is_finite() {
+                    return Err(unsupported_node(id, "ShaderNodeNormal.output_defaults"));
+                }
+                direction
+            }
+            None => DVec3::Z,
+        };
+        match socket {
+            "Normal" => Ok(Value::Vector(direction)),
+            "Dot" => {
+                let normal = self.vector_input(id, &["Normal"], DVec3::Z)?;
+                Ok(Value::Scalar(normalize_or(normal, DVec3::Z).dot(direction)))
+            }
+            _ => Err(invalid(format!("unknown Normal output `{socket}`"))),
+        }
+    }
+
+    fn wavelength(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!("unknown Wavelength output `{socket}`")));
+        }
+        let wavelength = self.scalar_input(id, &["Wavelength"], 500.0)? as f32;
+        let [red, green, blue] = if self.hit_ctx.path_traced {
+            super::converters::wavelength_rgb(wavelength)
+        } else {
+            super::converters::eevee_wavelength_rgb(wavelength)
+        };
+        Ok(Value::Color([
+            f64::from(red),
+            f64::from(green),
+            f64::from(blue),
+            1.0,
+        ]))
+    }
+
+    fn blackbody(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Color" {
+            return Err(invalid(format!("unknown Blackbody output `{socket}`")));
+        }
+        let temperature = self.scalar_input(id, &["Temperature"], 6500.0)? as f32;
+        let [red, green, blue] = if self.hit_ctx.path_traced {
+            super::blackbody::blackbody_rgb(temperature).map(|channel| channel.max(0.0))
+        } else {
+            super::converters::eevee_blackbody_rgb(temperature)
+        };
+        Ok(Value::Color([
+            f64::from(red.max(0.0)),
+            f64::from(green.max(0.0)),
+            f64::from(blue.max(0.0)),
+            1.0,
+        ]))
+    }
+
+    fn light_falloff(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if !matches!(socket, "Quadratic" | "Linear" | "Constant") {
+            return Err(invalid(format!("unknown Light Falloff output `{socket}`")));
+        }
+        let strength = self.scalar_input(id, &["Strength"], 100.0)? as f32;
+        let Some(distance) = self.hit_ctx.light_falloff_distance else {
+            if self.hit_ctx.path_traced {
+                return Err(unsupported_node(
+                    id,
+                    "ShaderNodeLightFalloff.path_ray_length",
+                ));
+            }
+            // EEVEE's `node_light_falloff` outputs Strength for all falloff sockets.
+            return Ok(Value::Scalar(f64::from(strength)));
+        };
+        let distance = distance as f32;
+        let mut result = match socket {
+            "Quadratic" => strength,
+            "Linear" => strength * distance,
+            "Constant" => strength * distance * distance,
+            _ => return Err(invalid(format!("unknown Light Falloff output `{socket}`"))),
+        };
+        let smooth = self.scalar_input(id, &["Smooth"], 0.0)? as f32;
+        if smooth > 0.0 {
+            let squared = distance * distance;
+            result *= squared / (smooth + squared);
+        }
+        if !result.is_finite() {
+            return Err(eval_error(format!(
+                "Light Falloff node `{id}` produced a non-finite result"
+            )));
+        }
+        Ok(Value::Scalar(f64::from(result)))
+    }
+
+    fn object_info(&self, id: &Id, socket: &str) -> Result<Value> {
+        match socket {
+            "Location" => {
+                if !self.hit_ctx.object_to_world.is_finite() {
+                    return Err(unsupported_node(
+                        id,
+                        "ShaderNodeObjectInfo.Location.object_matrix",
+                    ));
+                }
+                Ok(Value::Vector(
+                    self.hit_ctx.object_to_world.w_axis.truncate(),
+                ))
+            }
+            "Color" => Ok(Value::Color(self.hit_ctx.object_color)),
+            "Alpha" => Ok(Value::Scalar(self.hit_ctx.object_color[3])),
+            "Object Index" => Ok(Value::Scalar(self.hit_ctx.object_pass_index)),
+            "Material Index" => self
+                .hit_ctx
+                .material_pass_index
+                .map(Value::Scalar)
+                .ok_or_else(|| {
+                    unsupported_node(
+                        id,
+                        "ShaderNodeObjectInfo.Material Index.material_pass_index",
+                    )
+                }),
+            "Random" => self
+                .hit_ctx
+                .object_random_number
+                .map(Value::Scalar)
+                .ok_or_else(|| {
+                    unsupported_node(id, "ShaderNodeObjectInfo.Random.object_random_number")
+                }),
+            _ => Err(invalid(format!("unknown Object Info output `{socket}`"))),
+        }
+    }
+
+    fn geometry(&self, id: &Id, socket: &str) -> Result<Value> {
+        if self.hit_ctx.bump_height_shifted
+            && (matches!(socket, "Incoming" | "Tangent")
+                || (socket == "Normal" && !self.hit_ctx.path_traced))
+        {
+            return Err(unsupported_shifted_bump_context(
+                id,
+                "ShaderNodeNewGeometry",
+                socket,
+            ));
+        }
+        match socket {
+            "Position" => Ok(Value::Vector(self.hit_ctx.position)),
+            "Normal" => Ok(Value::Vector(self.hit_ctx.normal)),
+            // Both SVM `shading_incoming` and EEVEE `coordinate_incoming` point toward the viewer.
+            "Incoming" => Ok(Value::Vector(self.hit_ctx.view_direction)),
+            "True Normal" => Ok(Value::Vector(self.hit_ctx.geometric_normal)),
+            "Tangent" if !self.hit_ctx.path_traced => {
+                let point = self.hit_ctx.generated;
+                let tangent = DVec3::new(-(point.y - 0.5), point.x - 0.5, 0.0);
+                let tangent = self.hit_ctx.object_to_world.transform_vector3(tangent);
+                surface_tangent(tangent, self.hit_ctx.normal)
+                    .map(Value::Vector)
+                    .ok_or_else(|| {
+                        unsupported_node(id, "ShaderNodeNewGeometry.Tangent.orco_attribute")
+                    })
+            }
+            "Tangent" => {
+                let Some(layers) = self.hit_ctx.uv_layers else {
+                    return Err(unsupported_node(
+                        id,
+                        "ShaderNodeNewGeometry.Tangent.triangle_positions",
+                    ));
+                };
+                if self.hit_ctx.generated_corners.is_some() {
+                    return self.radial_tangent(id, "Z").map(Value::Vector);
+                }
+
+                let [first, second, third] = layers.positions;
+                let mut tangent = second - first;
+                if (second - first)
+                    .cross(third - first)
+                    .dot(self.hit_ctx.view_direction)
+                    < 0.0
+                {
+                    tangent = -tangent;
+                }
+                Ok(Value::Vector(tangent.normalize_or_zero()))
+            }
+            "Parametric" => self
+                .hit_ctx
+                .uv_layers
+                .map(|layers| {
+                    Value::Vector(DVec3::new(
+                        1.0 - layers.barycentric[1] - layers.barycentric[2],
+                        layers.barycentric[1],
+                        0.0,
+                    ))
+                })
+                .ok_or_else(|| {
+                    unsupported_node(id, "ShaderNodeNewGeometry.Parametric.barycentric")
+                }),
+            "Backfacing" => Ok(Value::Scalar(if self.hit_ctx.back_facing {
+                1.0
+            } else {
+                0.0
+            })),
+            "Pointiness" if !self.hit_ctx.path_traced => Ok(Value::Scalar(0.5)),
+            "Random Per Island" if !self.hit_ctx.path_traced => Ok(Value::Scalar(0.0)),
+            "Pointiness" => Err(unsupported_node(
+                id,
+                "ShaderNodeNewGeometry.Pointiness.pointiness_attribute",
+            )),
+            "Random Per Island" => Err(unsupported_node(
+                id,
+                "ShaderNodeNewGeometry.Random Per Island.random_per_island_attribute",
+            )),
+            _ => Err(invalid(format!("unknown Geometry output `{socket}`"))),
+        }
+    }
+
+    fn camera_data(&self, id: &Id, socket: &str) -> Result<Value> {
+        if !matches!(socket, "View Vector" | "View Z Depth" | "View Distance") {
+            return Err(invalid(format!("unknown Camera Data output `{socket}`")));
+        }
+        if self.hit_ctx.path_traced {
+            let position = if self.hit_ctx.bump_height_shifted {
+                self.hit_ctx.bump_center_position
+            } else {
+                self.hit_ctx.position
+            };
+            let camera_point = self
+                .hit_ctx
+                .world_to_camera
+                .filter(DMat4::is_finite)
+                .map(|matrix| matrix.transform_point3(position))
+                .filter(|point| point.is_finite())
+                .ok_or_else(|| {
+                    unsupported_node(id, &format!("ShaderNodeCameraData.{socket}.camera_context"))
+                })?;
+            return match socket {
+                "View Vector" => Ok(Value::Vector(camera_point.normalize_or_zero())),
+                "View Z Depth" => Ok(Value::Scalar(-camera_point.z)),
+                "View Distance" => Ok(Value::Scalar(camera_point.length())),
+                _ => Err(invalid(format!("unknown Camera Data output `{socket}`"))),
+            };
+        }
+        let camera_position = if self.hit_ctx.bump_height_shifted {
+            self.hit_ctx
+                .bump_center_realtime_position_f32
+                .unwrap_or_else(|| {
+                    let position = self.hit_ctx.bump_center_position;
+                    Vec3::new(position.x as f32, position.y as f32, position.z as f32)
+                })
+        } else {
+            self.hit_ctx.realtime_position_f32.unwrap_or_else(|| {
+                let position = self.hit_ctx.position;
+                Vec3::new(position.x as f32, position.y as f32, position.z as f32)
+            })
+        };
+        let camera_point = self
+            .hit_ctx
+            .world_to_camera_f32
+            .filter(Mat4::is_finite)
+            .map(|matrix| matrix.transform_point3(camera_position))
+            .filter(|point| point.is_finite())
+            .ok_or_else(|| {
+                unsupported_node(id, &format!("ShaderNodeCameraData.{socket}.camera_context"))
+            })?;
+        match socket {
+            "View Vector" => {
+                let view = Vec3::new(camera_point.x, camera_point.y, -camera_point.z).normalize();
+                Ok(Value::Vector(DVec3::new(
+                    f64::from(view.x),
+                    f64::from(view.y),
+                    f64::from(view.z),
+                )))
+            }
+            "View Z Depth" => Ok(Value::Scalar(f64::from(camera_point.z.abs()))),
+            "View Distance" => Ok(Value::Scalar(f64::from(camera_point.length()))),
+            _ => Err(invalid(format!("unknown Camera Data output `{socket}`"))),
+        }
+    }
 
     fn math(&mut self, id: &Id, socket: &str) -> Result<Value> {
         let first = self.scalar_input(id, &["Value", "Value_001"], 0.0)?;
@@ -2358,6 +3213,239 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             Err(invalid(format!("unknown Vector Math output `{socket}`")))
         }
     }
+    /// Blender 5.2.2 `node_shader_vector_rotate.cc`: rotate about the center; invert reverses
+    /// the axis-angle direction or inverts the Euler rotation matrix.
+    fn vector_rotate(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Vector" {
+            return Err(invalid(format!("unknown Vector Rotate output `{socket}`")));
+        }
+        let vector = self.vector_input(id, &["Vector"], DVec3::ZERO)?;
+        let center = self.vector_input(id, &["Center"], DVec3::ZERO)?;
+        let (rotation_type, invert) = {
+            let node = self.node(id)?;
+            let rotation_type = match node
+                .properties
+                .get("rotation_type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("AXIS_ANGLE")
+            {
+                "AXIS_ANGLE" => VectorRotationType::AxisAngle,
+                "X_AXIS" => VectorRotationType::AxisX,
+                "Y_AXIS" => VectorRotationType::AxisY,
+                "Z_AXIS" => VectorRotationType::AxisZ,
+                "EULER_XYZ" => VectorRotationType::EulerXyz,
+                other => return Err(unsupported_node(id, &format!("VectorRotate:{other}"))),
+            };
+            let invert = node
+                .properties
+                .get("invert")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            (rotation_type, invert)
+        };
+        let rotation = match rotation_type {
+            VectorRotationType::AxisAngle => {
+                let axis = self
+                    .vector_input(id, &["Axis"], DVec3::Z)?
+                    .normalize_or_zero();
+                let angle = self.scalar_input(id, &["Angle"], 0.0)?;
+                let angle = if invert { -angle } else { angle };
+                if axis == DVec3::ZERO {
+                    DQuat::IDENTITY
+                } else {
+                    DQuat::from_axis_angle(axis, angle)
+                }
+            }
+            VectorRotationType::AxisX | VectorRotationType::AxisY | VectorRotationType::AxisZ => {
+                let axis = match rotation_type {
+                    VectorRotationType::AxisX => DVec3::X,
+                    VectorRotationType::AxisY => DVec3::Y,
+                    _ => DVec3::Z,
+                };
+                let angle = self.scalar_input(id, &["Angle"], 0.0)?;
+                DQuat::from_axis_angle(axis, if invert { -angle } else { angle })
+            }
+            VectorRotationType::EulerXyz => {
+                let euler = self.vector_input(id, &["Rotation"], DVec3::ZERO)?;
+                let rotation = DQuat::from_euler(EulerRot::XYZ, euler.x, euler.y, euler.z);
+                if invert {
+                    rotation.conjugate()
+                } else {
+                    rotation
+                }
+            }
+        };
+        let rotated = rotation * (vector - center) + center;
+        if !rotated.is_finite() {
+            return Err(eval_error(format!(
+                "Vector Rotate node `{id}` produced a non-finite result"
+            )));
+        }
+        Ok(Value::Vector(rotated))
+    }
+
+    /// Blender uses affine camera and object transforms for points/directions, and inverse-transpose
+    /// transforms for normals.
+    fn vector_transform(&mut self, id: &Id, socket: &str) -> Result<Value> {
+        if socket != "Vector" {
+            return Err(invalid(format!(
+                "unknown Vector Transform output `{socket}`"
+            )));
+        }
+        let vector = self.vector_input(id, &["Vector"], DVec3::splat(0.5))?;
+        let (vector_type, from, to) = {
+            let node = self.node(id)?;
+            let vector_type = match node
+                .properties
+                .get("vector_type")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("VECTOR")
+            {
+                "POINT" => VectorTransformType::Point,
+                "VECTOR" => VectorTransformType::Vector,
+                "NORMAL" => VectorTransformType::Normal,
+                other => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("VectorTransform:type:{other}"),
+                    ));
+                }
+            };
+            let from = match node
+                .properties
+                .get("convert_from")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("WORLD")
+            {
+                "OBJECT" => VectorTransformSpace::Object,
+                "WORLD" => VectorTransformSpace::World,
+                "CAMERA" => VectorTransformSpace::Camera,
+                other => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("VectorTransform:convert_from:{other}"),
+                    ));
+                }
+            };
+            let to = match node
+                .properties
+                .get("convert_to")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("OBJECT")
+            {
+                "OBJECT" => VectorTransformSpace::Object,
+                "WORLD" => VectorTransformSpace::World,
+                "CAMERA" => VectorTransformSpace::Camera,
+                other => {
+                    return Err(unsupported_node(
+                        id,
+                        &format!("VectorTransform:convert_to:{other}"),
+                    ));
+                }
+            };
+            (vector_type, from, to)
+        };
+
+        let transformed = if from == to {
+            if vector_type == VectorTransformType::Normal {
+                vector.normalize_or_zero()
+            } else {
+                vector
+            }
+        } else {
+            let unsupported_camera = || {
+                unsupported_node(
+                    id,
+                    &format!(
+                        "VectorTransform:{}_to_{}:camera_matrices",
+                        from.name(),
+                        to.name()
+                    ),
+                )
+            };
+            let from_to_world = match from {
+                VectorTransformSpace::Object => self.hit_ctx.object_to_world,
+                VectorTransformSpace::World => DMat4::IDENTITY,
+                VectorTransformSpace::Camera => self
+                    .hit_ctx
+                    .camera_to_world
+                    .ok_or_else(unsupported_camera)?,
+            };
+            let world_to_to = match to {
+                VectorTransformSpace::Object => self.hit_ctx.world_to_object,
+                VectorTransformSpace::World => DMat4::IDENTITY,
+                VectorTransformSpace::Camera => self
+                    .hit_ctx
+                    .world_to_camera
+                    .ok_or_else(unsupported_camera)?,
+            };
+            let vector = if from == VectorTransformSpace::Camera {
+                DVec3::new(vector.x, vector.y, -vector.z)
+            } else {
+                vector
+            };
+            let matrix = world_to_to * from_to_world;
+            let normal_matrix = matrix.inverse().transpose();
+            let matrix_context =
+                if from == VectorTransformSpace::Object || to == VectorTransformSpace::Object {
+                    "object_matrices"
+                } else {
+                    "camera_matrices"
+                };
+            let transformed = match vector_type {
+                VectorTransformType::Point => {
+                    if !matrix.is_finite() {
+                        return Err(unsupported_node(
+                            id,
+                            &format!(
+                                "VectorTransform:{}_to_{}:{matrix_context}",
+                                from.name(),
+                                to.name()
+                            ),
+                        ));
+                    }
+                    matrix.transform_point3(vector)
+                }
+                VectorTransformType::Vector => {
+                    if !matrix.is_finite() {
+                        return Err(unsupported_node(
+                            id,
+                            &format!(
+                                "VectorTransform:{}_to_{}:{matrix_context}",
+                                from.name(),
+                                to.name()
+                            ),
+                        ));
+                    }
+                    matrix.transform_vector3(vector)
+                }
+                VectorTransformType::Normal => {
+                    if !normal_matrix.is_finite() {
+                        return Err(unsupported_node(
+                            id,
+                            &format!(
+                                "VectorTransform:{}_to_{}:{matrix_context}",
+                                from.name(),
+                                to.name()
+                            ),
+                        ));
+                    }
+                    normal_matrix.transform_vector3(vector).normalize_or_zero()
+                }
+            };
+            if to == VectorTransformSpace::Camera {
+                DVec3::new(transformed.x, transformed.y, -transformed.z)
+            } else {
+                transformed
+            }
+        };
+        if !transformed.is_finite() {
+            return Err(eval_error(format!(
+                "Vector Transform node `{id}` produced a non-finite result"
+            )));
+        }
+        Ok(Value::Vector(transformed))
+    }
 
     fn mapping(&mut self, id: &Id, socket: &str) -> Result<Value> {
         let vector = self.vector_input(id, &["Vector"], self.hit_ctx.generated)?;
@@ -2394,32 +3482,39 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             _ => Err(invalid(format!("unknown Mapping output `{socket}`"))),
         }
     }
-    /// `ShaderNodeSeparateColor`: one channel of its color input as a scalar.
+    /// `ShaderNodeSeparateColor`: one color component in the node's selected color model.
     fn separate_color(&mut self, id: &Id, socket: &str) -> Result<Value> {
-        if let Some(mode) = self
+        let mode = match self
             .node(id)?
             .properties
             .get("mode")
             .and_then(JsonValue::as_str)
-            .filter(|mode| *mode != "RGB")
         {
-            return Err(PotError::with_details(
-                ErrorCode::UnsupportedFeature,
-                format!("Separate Color mode `{mode}` is not implemented"),
-                json!({"feature_id":format!("shader.node.SeparateColor.{mode}"),"node_id":id}),
-            ));
-        }
-        let color = self.color_input(id, &["Color"], [0.0; 4])?;
+            None | Some("RGB") => "RGB",
+            Some("HSV") => "HSV",
+            Some("HSL") => "HSL",
+            Some(mode) => return Err(unsupported_node(id, &format!("SeparateColor.{mode}"))),
+        };
+        let color = self.color_input(id, &["Color"], [0.8, 0.8, 0.8, 1.0])?;
+        let channels = super::converters::separate_color(mode, color)
+            .ok_or_else(|| unsupported_node(id, &format!("SeparateColor.{mode}")))?;
         let channel = match socket {
-            "Red" => color[0],
-            "Green" => color[1],
-            "Blue" => color[2],
+            "Red" => channels[0],
+            "Green" => channels[1],
+            "Blue" => channels[2],
             _ => return Err(invalid(format!("unknown Separate Color output `{socket}`"))),
         };
         Ok(Value::Scalar(channel))
     }
 
-    fn tex_coord(&self, socket: &str) -> Result<Value> {
+    fn tex_coord(&self, id: &Id, socket: &str) -> Result<Value> {
+        if self.hit_ctx.bump_height_shifted && matches!(socket, "Normal" | "Reflection") {
+            return Err(unsupported_shifted_bump_context(
+                id,
+                "ShaderNodeTexCoord",
+                socket,
+            ));
+        }
         let value = match socket {
             "Generated" => self.hit_ctx.generated,
             "UV" => {
@@ -2429,8 +3524,21 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             "Object" => self.hit_ctx.object,
             "Normal" => self.hit_ctx.normal,
             "Position" => self.hit_ctx.position,
-            "Camera" | "Window" | "Reflection" => {
-                return Err(unsupported_node_id("TexCoord", socket));
+            "Reflection" => normalize_or(
+                -self
+                    .hit_ctx
+                    .view_direction
+                    .reflect(normalize_or(self.hit_ctx.normal, DVec3::Z)),
+                DVec3::ZERO,
+            ),
+            "Camera" => {
+                return Err(unsupported_node_id("TexCoord", "Camera.camera_projection"));
+            }
+            "Window" => {
+                return Err(unsupported_node_id(
+                    "TexCoord",
+                    "Window.window_position_and_resolution",
+                ));
             }
             _ => {
                 return Err(invalid(format!(
@@ -2446,6 +3554,14 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             return Err(invalid(format!("unknown UV Map output `{socket}`")));
         }
         let node = self.node(id)?;
+        if node
+            .properties
+            .get("from_instancer")
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+        {
+            return Err(unsupported_node(id, "ShaderNodeUVMap.from_instancer"));
+        }
         let layer = layer_index(
             &self.hit_ctx,
             node.properties.get("uv_map").and_then(JsonValue::as_str),
@@ -2537,50 +3653,209 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
         if socket != "Normal" {
             return Err(invalid(format!("unknown Normal Map output `{socket}`")));
         }
-        let space = self
-            .node(id)?
-            .properties
-            .get("space")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("TANGENT_SPACE");
-        if !matches!(space, "TANGENT_SPACE" | "TANGENT") {
-            return Err(unsupported_node(id, &format!("NormalMap:{space}")));
-        }
-        let imported_normal_map = self
-            .node(id)?
-            .properties
-            .get("potter_gltf_imported_normal_map")
-            .and_then(JsonValue::as_bool)
-            == Some(true);
+        let (space, imported_normal_map) = {
+            let node = self.node(id)?;
+            let space = match node
+                .properties
+                .get("space")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("TANGENT_SPACE")
+            {
+                "TANGENT_SPACE" | "TANGENT" => NormalMapSpace::Tangent,
+                "OBJECT" => NormalMapSpace::Object,
+                "WORLD" => NormalMapSpace::World,
+                "BLENDER_OBJECT" => NormalMapSpace::BlenderObject,
+                "BLENDER_WORLD" => NormalMapSpace::BlenderWorld,
+                other => return Err(unsupported_node(id, &format!("NormalMap:{other}"))),
+            };
+            let imported_normal_map = node
+                .properties
+                .get("potter_gltf_imported_normal_map")
+                .and_then(JsonValue::as_bool)
+                == Some(true);
+            (space, imported_normal_map)
+        };
         let color = self.color_input(id, &["Color"], [0.5, 0.5, 1.0, 1.0])?;
-        let tangent_normal = DVec3::new(
+        let base_normal = normalize_or(self.hit_ctx.normal, DVec3::Z);
+        if self.hit_ctx.path_traced {
+            return self.cycles_normal_map(id, space, imported_normal_map, color, base_normal);
+        }
+        if space == NormalMapSpace::Tangent {
+            let tangent_normal = DVec3::new(
+                color[0] * 2.0 - 1.0,
+                color[1] * 2.0 - 1.0,
+                color[2] * 2.0 - 1.0,
+            );
+            let uv_map = self
+                .node(id)?
+                .properties
+                .get("uv_map")
+                .and_then(JsonValue::as_str);
+            let layer = layer_index(&self.hit_ctx, uv_map);
+            let (tangent_u, tangent_v) = if imported_normal_map {
+                layer_frame(&self.hit_ctx, layer, base_normal)
+            } else {
+                blender_layer_frame(&self.hit_ctx, layer, base_normal)
+            };
+            let mapped_normal = normalize_or(
+                tangent_u * tangent_normal.x
+                    + tangent_v * tangent_normal.y
+                    + base_normal * tangent_normal.z,
+                base_normal,
+            );
+            let strength = self.scalar_input(id, &["Strength"], 1.0)?.clamp(0.0, 1.0);
+            return Ok(Value::Vector(normalize_or(
+                base_normal.lerp(mapped_normal, strength),
+                base_normal,
+            )));
+        }
+
+        let direct_x = match self
+            .node(id)?
+            .properties
+            .get("convention")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("OPENGL")
+        {
+            "OPENGL" => false,
+            "DIRECTX" => true,
+            other => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("NormalMap:convention:{other}"),
+                ));
+            }
+        };
+        // Blender 5.2.2's color_to_blender_normal_new_shading maps channels to
+        // (2r - 1, -2g - 1, -2b - 1).
+        let mut mapped_normal = match space {
+            NormalMapSpace::BlenderObject | NormalMapSpace::BlenderWorld => DVec3::new(
+                color[0] * 2.0 - 1.0,
+                color[1] * -2.0 - 1.0,
+                color[2] * -2.0 - 1.0,
+            ),
+            _ => DVec3::new(
+                color[0] * 2.0 - 1.0,
+                color[1] * 2.0 - 1.0,
+                color[2] * 2.0 - 1.0,
+            ),
+        };
+        if direct_x {
+            mapped_normal.y = -mapped_normal.y;
+        }
+        if matches!(
+            space,
+            NormalMapSpace::Object | NormalMapSpace::BlenderObject
+        ) {
+            if !self.hit_ctx.world_to_object.is_finite() {
+                return Err(unsupported_node(id, "NormalMap:OBJECT:object_matrices"));
+            }
+            mapped_normal = self
+                .hit_ctx
+                .world_to_object
+                .transpose()
+                .transform_vector3(mapped_normal);
+        }
+        let strength = self.scalar_input(id, &["Strength"], 1.0)?.max(0.0);
+        let mixed = base_normal.lerp(mapped_normal, strength);
+        if !mixed.is_finite() {
+            return Err(eval_error(format!(
+                "Normal Map node `{id}` produced a non-finite result"
+            )));
+        }
+        Ok(Value::Vector(normalize_or(mixed, base_normal)))
+    }
+
+    fn cycles_normal_map(
+        &mut self,
+        id: &Id,
+        space: NormalMapSpace,
+        imported_normal_map: bool,
+        color: [f64; 4],
+        base_normal: DVec3,
+    ) -> Result<Value> {
+        let direct_x = match self
+            .node(id)?
+            .properties
+            .get("convention")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("OPENGL")
+        {
+            "OPENGL" => false,
+            "DIRECTX" => true,
+            other => {
+                return Err(unsupported_node(
+                    id,
+                    &format!("NormalMap:convention:{other}"),
+                ));
+            }
+        };
+        let mut mapped = DVec3::new(
             color[0] * 2.0 - 1.0,
             color[1] * 2.0 - 1.0,
             color[2] * 2.0 - 1.0,
         );
-        let base_normal = normalize_or(self.hit_ctx.normal, DVec3::Z);
-        let uv_map = self
-            .node(id)?
-            .properties
-            .get("uv_map")
-            .and_then(JsonValue::as_str);
-        let layer = layer_index(&self.hit_ctx, uv_map);
-        let (tangent_u, tangent_v) = if imported_normal_map {
-            layer_frame(&self.hit_ctx, layer, base_normal)
+        if direct_x {
+            mapped.y = -mapped.y;
+        }
+        if matches!(
+            space,
+            NormalMapSpace::BlenderObject | NormalMapSpace::BlenderWorld
+        ) {
+            mapped.y = -mapped.y;
+            mapped.z = -mapped.z;
+        }
+
+        if space == NormalMapSpace::Tangent {
+            let strength = self.scalar_input(id, &["Strength"], 1.0)?;
+            mapped.x *= strength;
+            mapped.y *= strength;
+            mapped.z = 1.0 + (mapped.z - 1.0) * strength.clamp(0.0, 1.0);
+            let uv_map = self
+                .node(id)?
+                .properties
+                .get("uv_map")
+                .and_then(JsonValue::as_str);
+            let layer = layer_index(&self.hit_ctx, uv_map);
+            let (tangent_u, tangent_v) = if imported_normal_map {
+                layer_frame(&self.hit_ctx, layer, base_normal)
+            } else {
+                blender_layer_frame(&self.hit_ctx, layer, base_normal)
+            };
+            let mut normal = normalize_or(
+                tangent_u * mapped.x + tangent_v * mapped.y + base_normal * mapped.z,
+                base_normal,
+            );
+            if self.hit_ctx.back_facing {
+                normal = -normal;
+            }
+            return Ok(Value::Vector(normalize_or(normal, base_normal)));
+        }
+
+        if matches!(
+            space,
+            NormalMapSpace::Object | NormalMapSpace::BlenderObject
+        ) {
+            if !self.hit_ctx.world_to_object.is_finite() {
+                return Err(unsupported_node(id, "NormalMap:OBJECT:object_matrices"));
+            }
+            mapped = self
+                .hit_ctx
+                .world_to_object
+                .transpose()
+                .transform_vector3(mapped);
+        }
+        mapped = normalize_or(mapped, base_normal);
+        if self.hit_ctx.back_facing {
+            mapped = -mapped;
+        }
+        let strength = self.scalar_input(id, &["Strength"], 1.0)?;
+        let mixed = if strength.to_bits() == 1.0_f64.to_bits() {
+            mapped
         } else {
-            blender_layer_frame(&self.hit_ctx, layer, base_normal)
+            base_normal.lerp(mapped, strength.max(0.0))
         };
-        let mapped_normal = normalize_or(
-            tangent_u * tangent_normal.x
-                + tangent_v * tangent_normal.y
-                + base_normal * tangent_normal.z,
-            base_normal,
-        );
-        let strength = self.scalar_input(id, &["Strength"], 1.0)?.clamp(0.0, 1.0);
-        Ok(Value::Vector(normalize_or(
-            base_normal.lerp(mapped_normal, strength),
-            base_normal,
-        )))
+        Ok(Value::Vector(normalize_or(mixed, base_normal)))
     }
 
     fn fresnel(&mut self, id: &Id, socket: &str) -> Result<Value> {
@@ -2625,6 +3900,18 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .or_else(|| node.properties.get("name"))
             .and_then(JsonValue::as_str)
             .ok_or_else(|| invalid("Attribute node requires attribute_name"))?;
+        if self.hit_ctx.bump_height_shifted
+            && self
+                .hit_ctx
+                .color_layers
+                .is_some_and(|layers| layers.iter().any(|(layer, _)| *layer == name))
+        {
+            return Err(unsupported_shifted_bump_color_layer(
+                id,
+                "ShaderNodeAttribute",
+                socket,
+            ));
+        }
         let [red, green, blue, alpha] =
             layer_color(&self.hit_ctx, name, false, [0.0, 0.0, 0.0, 1.0]);
         match socket {
@@ -2641,8 +3928,23 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_> {
             .get("layer_name")
             .and_then(JsonValue::as_str)
             .unwrap_or("");
+        let use_render = name.is_empty();
+        let layer_available = if use_render {
+            self.hit_ctx.color_render.is_some()
+        } else {
+            self.hit_ctx
+                .color_layers
+                .is_some_and(|layers| layers.iter().any(|(layer, _)| *layer == name))
+        };
+        if self.hit_ctx.bump_height_shifted && layer_available {
+            return Err(unsupported_shifted_bump_color_layer(
+                id,
+                "ShaderNodeVertexColor",
+                socket,
+            ));
+        }
         color_output(
-            layer_color(&self.hit_ctx, name, name.is_empty(), [0.0, 0.0, 0.0, 0.0]),
+            layer_color(&self.hit_ctx, name, use_render, [0.0, 0.0, 0.0, 0.0]),
             socket,
             "Vertex Color",
         )
@@ -2732,6 +4034,68 @@ fn socket_matches(candidate: &str, requested: &str) -> bool {
             | ("Emission Color", "Emission")
     )
 }
+fn input_socket_matches(
+    groups: &Registry<NodeGroup>,
+    node: &GraphNode,
+    candidate: &str,
+    requested: &str,
+) -> bool {
+    if socket_matches(candidate, requested) {
+        return true;
+    }
+    if node.node_type != "ShaderNodeGroup" {
+        return false;
+    }
+    node.properties
+        .get("node_tree")
+        .and_then(JsonValue::as_str)
+        .and_then(|group_id| groups.get(group_id))
+        .is_some_and(|group| {
+            group.interface.inputs.iter().any(|socket| {
+                (socket.id == candidate || socket.name == candidate)
+                    && (socket.id == requested || socket.name == requested)
+            })
+        })
+}
+fn group_socket_value_kind(socket_type: &str) -> Option<ValueKind> {
+    match socket_type {
+        "float"
+        | "integer"
+        | "boolean"
+        | "NodeSocketFloat"
+        | "NodeSocketFloatFactor"
+        | "NodeSocketFloatAngle"
+        | "NodeSocketFloatWavelength"
+        | "NodeSocketFloatColorTemperature"
+        | "NodeSocketInt"
+        | "NodeSocketBool" => Some(ValueKind::Scalar),
+        "vector" | "NodeSocketVector" | "NodeSocketVectorDirection" | "NodeSocketVectorEuler" => {
+            Some(ValueKind::Vector)
+        }
+        "color" | "NodeSocketColor" => Some(ValueKind::Color),
+        "shader" | "NodeSocketShader" => Some(ValueKind::Shader),
+        _ => None,
+    }
+}
+
+fn active_group_output(group: &NodeGroup) -> Option<&Id> {
+    let mut fallback = None;
+    for (id, node) in &group.nodes {
+        if node.node_type != "NodeGroupOutput" {
+            continue;
+        }
+        if node
+            .properties
+            .get("is_active_output")
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+        {
+            return Some(id);
+        }
+        fallback.get_or_insert(id);
+    }
+    fallback
+}
 
 /// The Image Texture nodes whose Alpha output reaches the group's output. Cycles decides this in two steps.
 /// `ShaderGraph::clean` (`intern/cycles/scene/shader_graph.cpp`, ~lines 801-860) runs `break_cycles(output())`,
@@ -2776,21 +4140,75 @@ fn reachable_nodes<'graph>(group: &'graph NodeGroup, output: &'graph Id) -> BTre
     }
     reachable
 }
+fn collect_linked_alpha_images(
+    node_groups: &Registry<NodeGroup>,
+    group: &NodeGroup,
+    output: &Id,
+    visited_groups: &mut BTreeSet<Id>,
+    alpha_linked_images: &mut BTreeSet<Id>,
+) {
+    for image in linked_alpha_image_nodes(group, output) {
+        alpha_linked_images.insert(image.clone());
+    }
+    for node_id in reachable_nodes(group, output) {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.node_type != "ShaderNodeGroup" {
+            continue;
+        }
+        let Some(child_id) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((child_key, child_group)) = node_groups.get_key_value(child_id) else {
+            continue;
+        };
+        if child_group.kind != GraphKind::Shader || !visited_groups.insert(child_key.clone()) {
+            continue;
+        }
+        if let Some(child_output) = active_group_output(child_group) {
+            collect_linked_alpha_images(
+                node_groups,
+                child_group,
+                child_output,
+                visited_groups,
+                alpha_linked_images,
+            );
+        }
+    }
+}
 
 /// Whether EEVEE compiles the graph as transparent, `GPU_MATFLAG_TRANSPARENT`, which is set statically per node:
 /// a Transparent BSDF whose Color is linked or not black (`node_shader_bsdf_transparent.cc:30`), and a Principled
 /// whose Alpha is linked or not one (`node_shader_bsdf_principled.cc:400`). Only the nodes that feed the output count.
 /// Specular and Ray Portal set the same flag in Blender, but Potter's evaluator rejects both node types, so a material
 /// with one never evaluates and needs no rule.
-fn graph_is_transparent(group: &NodeGroup, output: &Id) -> bool {
-    let reachable = reachable_nodes(group, output);
+fn graph_is_transparent(
+    graph_id: &Id,
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    output: &Id,
+) -> bool {
+    let mut group_stack = BTreeSet::new();
+    group_stack.insert(graph_id.clone());
+    graph_is_transparent_output(group, node_groups, output, "Surface", &mut group_stack)
+}
+
+fn graph_is_transparent_output(
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    output: &Id,
+    output_socket: &str,
+    group_stack: &mut BTreeSet<Id>,
+) -> bool {
+    let reachable = nodes_reaching_socket(group, output, output_socket);
     let linked = |node: &Id, socket: &str| {
         group
             .links
             .iter()
             .any(|link| link.to_node == *node && link.to_socket == socket)
     };
-    group.nodes.iter().any(|(id, node)| {
+    if group.nodes.iter().any(|(id, node)| {
         if !reachable.contains(id) {
             return false;
         }
@@ -2804,14 +4222,236 @@ fn graph_is_transparent(group: &NodeGroup, output: &Id) -> bool {
             }
             "ShaderNodeBsdfPrincipled" => {
                 linked(id, "Alpha")
-                    || node.inputs.get("Alpha").is_some_and(|value| {
-                        // Blender's `alpha != 1.0`. `number` never yields a NaN, and `total_cmp` is exact for 1.0.
-                        number(value, 1.0).total_cmp(&1.0).is_ne()
-                    })
+                    || node
+                        .inputs
+                        .get("Alpha")
+                        .is_some_and(|value| number(value, 1.0).total_cmp(&1.0).is_ne())
             }
             _ => false,
         }
-    })
+    }) {
+        return true;
+    }
+    for node_id in &reachable {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.node_type != "ShaderNodeGroup" {
+            continue;
+        }
+        let Some(child_name) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((child_id, child)) = node_groups.get_key_value(child_name) else {
+            continue;
+        };
+        if child.kind != GraphKind::Shader || !group_stack.insert(child_id.clone()) {
+            continue;
+        }
+        let Some(child_output) = active_group_output(child) else {
+            group_stack.remove(child_id);
+            continue;
+        };
+        for link in group.links.iter().filter(|link| {
+            link.from_node == *node_id
+                && (reachable.contains(&link.to_node)
+                    || (link.to_node == *output && link.to_socket == output_socket))
+        }) {
+            let Some(interface_output) =
+                child.interface.outputs.iter().find(|socket| {
+                    socket.id == link.from_socket || socket.name == link.from_socket
+                })
+            else {
+                continue;
+            };
+            if graph_is_transparent_output(
+                child,
+                node_groups,
+                child_output,
+                &interface_output.name,
+                group_stack,
+            ) {
+                group_stack.remove(child_id);
+                return true;
+            }
+        }
+        group_stack.remove(child_id);
+    }
+    false
+}
+
+fn nodes_reaching_socket(group: &NodeGroup, sink: &Id, socket: &str) -> BTreeSet<Id> {
+    let mut pending: Vec<Id> = group
+        .links
+        .iter()
+        .filter(|link| link.to_node == *sink && link.to_socket == socket)
+        .map(|link| link.from_node.clone())
+        .collect();
+    let mut ancestors = BTreeSet::new();
+    while let Some(node_id) = pending.pop() {
+        if ancestors.insert(node_id.clone()) {
+            pending.extend(
+                group
+                    .links
+                    .iter()
+                    .filter(|link| link.to_node == node_id)
+                    .map(|link| link.from_node.clone()),
+            );
+        }
+    }
+    ancestors
+}
+
+/// Finds a Bump whose output contributes to a transparency input in the active surface graph.
+fn bump_affecting_transparency(
+    graph_id: &Id,
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    output: &Id,
+) -> Option<Id> {
+    let mut group_stack = BTreeSet::new();
+    group_stack.insert(graph_id.clone());
+    bump_in_surface_output(group, node_groups, output, "Surface", &mut group_stack)
+}
+
+fn bump_in_surface_output(
+    group: &NodeGroup,
+    node_groups: &Registry<NodeGroup>,
+    output: &Id,
+    output_socket: &str,
+    group_stack: &mut BTreeSet<Id>,
+) -> Option<Id> {
+    let surface_nodes = nodes_reaching_socket(group, output, output_socket);
+    for node_id in &surface_nodes {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        let socket = match node.node_type.as_str() {
+            "ShaderNodeBsdfPrincipled" => "Alpha",
+            "ShaderNodeBsdfTransparent" => "Color",
+            "ShaderNodeMixShader" => "Fac",
+            _ => continue,
+        };
+        let ancestors = nodes_reaching_socket(group, node_id, socket);
+        if let Some(bump) = bump_in_transparency_ancestors(
+            node_groups,
+            group,
+            &ancestors,
+            node_id,
+            socket,
+            group_stack,
+        ) {
+            return Some(bump);
+        }
+    }
+    for node_id in &surface_nodes {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.node_type != "ShaderNodeGroup" {
+            continue;
+        }
+        let Some(child_name) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((child_id, child)) = node_groups.get_key_value(child_name) else {
+            continue;
+        };
+        if child.kind != GraphKind::Shader || !group_stack.insert(child_id.clone()) {
+            continue;
+        }
+        let Some(child_output) = active_group_output(child) else {
+            group_stack.remove(child_id);
+            continue;
+        };
+        for link in group.links.iter().filter(|link| {
+            link.from_node == *node_id
+                && (surface_nodes.contains(&link.to_node)
+                    || (link.to_node == *output && link.to_socket == output_socket))
+        }) {
+            let Some(interface_output) =
+                child.interface.outputs.iter().find(|socket| {
+                    socket.id == link.from_socket || socket.name == link.from_socket
+                })
+            else {
+                continue;
+            };
+            if let Some(bump) = bump_in_surface_output(
+                child,
+                node_groups,
+                child_output,
+                &interface_output.name,
+                group_stack,
+            ) {
+                group_stack.remove(child_id);
+                return Some(bump);
+            }
+        }
+        group_stack.remove(child_id);
+    }
+    None
+}
+
+fn bump_in_transparency_ancestors(
+    node_groups: &Registry<NodeGroup>,
+    group: &NodeGroup,
+    ancestors: &BTreeSet<Id>,
+    sink: &Id,
+    socket: &str,
+    group_stack: &mut BTreeSet<Id>,
+) -> Option<Id> {
+    for node_id in ancestors {
+        let Some(node) = group.nodes.get(node_id) else {
+            continue;
+        };
+        if node.node_type == "ShaderNodeBump" {
+            return Some(node_id.clone());
+        }
+        if node.node_type != "ShaderNodeGroup" {
+            continue;
+        }
+        let Some(child_name) = node.properties.get("node_tree").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some((child_id, child)) = node_groups.get_key_value(child_name) else {
+            continue;
+        };
+        if child.kind != GraphKind::Shader || !group_stack.insert(child_id.clone()) {
+            continue;
+        }
+        let Some(child_output) = active_group_output(child) else {
+            group_stack.remove(child_id);
+            continue;
+        };
+        for link in group.links.iter().filter(|link| {
+            link.from_node == *node_id
+                && (ancestors.contains(&link.to_node)
+                    || (link.to_node == *sink && link.to_socket == socket))
+        }) {
+            let Some(interface_output) =
+                child.interface.outputs.iter().find(|output| {
+                    output.id == link.from_socket || output.name == link.from_socket
+                })
+            else {
+                continue;
+            };
+            let child_ancestors =
+                nodes_reaching_socket(child, child_output, &interface_output.name);
+            if let Some(bump) = bump_in_transparency_ancestors(
+                node_groups,
+                child,
+                &child_ancestors,
+                child_output,
+                &interface_output.name,
+                group_stack,
+            ) {
+                group_stack.remove(child_id);
+                return Some(bump);
+            }
+        }
+        group_stack.remove(child_id);
+    }
+    None
 }
 
 fn number(value: &JsonValue, default: f64) -> f64 {
@@ -3284,6 +4924,34 @@ fn unsupported_node(id: &Id, kind: &str) -> PotError {
     )
 }
 
+fn unsupported_shifted_bump_color_layer(id: &Id, node_type: &str, socket: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!(
+            "{node_type} output `{socket}` cannot be differentiated for shifted Bump Height samples because per-corner color data is unavailable"
+        ),
+        json!({
+            "feature_id": format!("shader.node.{node_type}.bump_height_interpolation"),
+            "node_id": id,
+            "output": socket,
+        }),
+    )
+}
+
+fn unsupported_shifted_bump_context(id: &Id, node_type: &str, socket: &str) -> PotError {
+    PotError::with_details(
+        ErrorCode::UnsupportedFeature,
+        format!(
+            "{node_type} output `{socket}` cannot be differentiated for shifted Bump Height samples because shifted normal/view derivatives are unavailable"
+        ),
+        json!({
+            "feature_id": format!("shader.node.{node_type}.bump_height_interpolation"),
+            "node_id": id,
+            "output": socket,
+        }),
+    )
+}
+
 fn unsupported_node_id(node: &str, output: &str) -> PotError {
     PotError::with_details(
         ErrorCode::UnsupportedFeature,
@@ -3296,23 +4964,28 @@ fn unsupported_node_id(node: &str, output: &str) -> PotError {
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests")]
 
-    use std::{cell::RefCell, collections::BTreeMap};
+    use std::{
+        cell::RefCell,
+        collections::{BTreeMap, BTreeSet},
+    };
 
-    use glam::DVec3;
+    use glam::{DMat4, DQuat, DVec3};
     use proptest::prelude::*;
     use serde_json::{Value, json};
 
     use crate::{
-        graph::{GraphKind, GraphLink, GraphNode, NodeGroup},
+        error::ErrorCode,
+        geom::GeneratedCorners,
+        graph::{GraphInterface, GraphKind, GraphLink, GraphNode, GraphSocket, NodeGroup},
         image::{ImageData, ImageExtension, ImageInterpolation},
         model::{Id, Material, Registry, TextureRef},
     };
 
     use super::{
-        BsdfParams, HitContext, HitUvLayers, PreparedMaterial, SurfaceShading, color_lerp,
-        evaluate_displacement, evaluate_surface, layer_index, layer_uv,
+        BsdfParams, Evaluator, EvaluatorWorkspace, HitContext, HitDifferentials, HitUvLayers,
+        PreparedMaterial, SurfaceShading, color_lerp, evaluate_displacement, evaluate_surface,
+        layer_index, layer_uv,
     };
-
     fn set_properties(group: &mut NodeGroup, id: &str, properties: Value) {
         let Value::Object(properties) = properties else {
             unreachable!("shader test properties must be an object")
@@ -3322,6 +4995,219 @@ mod tests {
             .get_mut(&Id::new(id.to_owned()).unwrap())
             .unwrap()
             .properties = properties;
+    }
+    fn evaluate_vector_output(
+        node_type: &str,
+        output: &str,
+        inputs: Value,
+        properties: Value,
+        matrices: Option<&(DMat4, DMat4)>,
+    ) -> DVec3 {
+        let mut group = NodeGroup::new("Vector Node", GraphKind::Shader);
+        insert_node(&mut group, "node", node_type, inputs);
+        set_properties(&mut group, "node", properties);
+        let graph_id = Id::new("vector_node_graph".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), group);
+        let graph = groups.get(&graph_id).unwrap();
+        let mut context = HitContext::new(&groups);
+        if let Some((object_to_world, world_to_object)) = matrices {
+            context.object_to_world = *object_to_world;
+            context.world_to_object = *world_to_object;
+        }
+        let material = Material::default();
+        let alpha_linked_images = BTreeSet::new();
+        let mut workspace = EvaluatorWorkspace::default();
+        let mut evaluator = Evaluator {
+            group: graph,
+            material: &material,
+            hit_ctx: context,
+            workspace: &mut workspace,
+            alpha_linked_images: &alpha_linked_images,
+            links: None,
+            group_input_binding: None,
+            group_depth: 0,
+        };
+        let node_id = Id::new("node".to_owned()).unwrap();
+        let super::Value::Vector(value) = evaluator.output(&node_id, output, 0).unwrap() else {
+            panic!("the vector shader output must evaluate to a vector")
+        };
+        value
+    }
+
+    fn evaluate_camera_data_view_vector(position: DVec3, world_to_camera: DMat4) -> DVec3 {
+        let mut group = NodeGroup::new("Camera Node", GraphKind::Shader);
+        insert_node(&mut group, "node", "ShaderNodeCameraData", json!({}));
+        let graph_id = Id::new("camera_data_graph".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), group);
+        let graph = groups.get(&graph_id).unwrap();
+        let mut context = HitContext::new(&groups);
+        context.position = position;
+        context.set_camera_matrices(world_to_camera.inverse(), world_to_camera);
+        let material = Material::default();
+        let alpha_linked_images = BTreeSet::new();
+        let mut workspace = EvaluatorWorkspace::default();
+        let mut evaluator = Evaluator {
+            group: graph,
+            material: &material,
+            hit_ctx: context,
+            workspace: &mut workspace,
+            alpha_linked_images: &alpha_linked_images,
+            links: None,
+            group_input_binding: None,
+            group_depth: 0,
+        };
+        let node_id = Id::new("node".to_owned()).unwrap();
+        let super::Value::Vector(value) = evaluator.output(&node_id, "View Vector", 0).unwrap()
+        else {
+            panic!("Camera Data View Vector must evaluate to a vector")
+        };
+        value
+    }
+
+    #[test]
+    fn vector_rotate_modes_invert_and_vector_transform_spaces_match_blender() {
+        let quarter_turn = std::f64::consts::FRAC_PI_2;
+        let cases = [
+            ("AXIS_ANGLE", DVec3::X, DVec3::Y, false),
+            ("AXIS_ANGLE", DVec3::X, -DVec3::Y, true),
+            ("X_AXIS", DVec3::Y, DVec3::Z, false),
+            ("Y_AXIS", DVec3::Z, DVec3::X, false),
+            ("Z_AXIS", DVec3::X, DVec3::Y, false),
+            ("EULER_XYZ", DVec3::X, DVec3::Y, false),
+            ("EULER_XYZ", DVec3::X, -DVec3::Y, true),
+        ];
+        for (rotation_type, input, expected, invert) in cases {
+            let actual = evaluate_vector_output(
+                "ShaderNodeVectorRotate",
+                "Vector",
+                json!({
+                    "Vector": input.to_array(),
+                    "Center": [0.0, 0.0, 0.0],
+                    "Axis": [0.0, 0.0, 1.0],
+                    "Angle": quarter_turn,
+                    "Rotation": [0.0, 0.0, quarter_turn],
+                }),
+                json!({"rotation_type":rotation_type,"invert":invert}),
+                None,
+            );
+            assert!(
+                (actual - expected).length() < 1e-12,
+                "{rotation_type}: {actual:?}"
+            );
+        }
+        let centered = evaluate_vector_output(
+            "ShaderNodeVectorRotate",
+            "Vector",
+            json!({
+                "Vector": [2.0, 0.0, 0.0],
+                "Center": [1.0, 0.0, 0.0],
+                "Axis": [0.0, 0.0, 1.0],
+                "Angle": quarter_turn,
+            }),
+            json!({"rotation_type":"AXIS_ANGLE","invert":false}),
+            None,
+        );
+        assert!((centered - DVec3::new(1.0, 1.0, 0.0)).length() < 1e-12);
+
+        let object_to_world = DMat4::from_scale_rotation_translation(
+            DVec3::new(2.0, 3.0, 4.0),
+            DQuat::from_rotation_z(quarter_turn),
+            DVec3::new(4.0, 5.0, 6.0),
+        );
+        let world_to_object = object_to_world.inverse();
+        let matrices = (object_to_world, world_to_object);
+        let point = evaluate_vector_output(
+            "ShaderNodeVectorTransform",
+            "Vector",
+            json!({"Vector":[1.0,0.0,0.0]}),
+            json!({"vector_type":"POINT","convert_from":"OBJECT","convert_to":"WORLD"}),
+            Some(&matrices),
+        );
+        assert!((point - DVec3::new(4.0, 7.0, 6.0)).length() < 1e-12);
+        let direction = evaluate_vector_output(
+            "ShaderNodeVectorTransform",
+            "Vector",
+            json!({"Vector":[1.0,0.0,0.0]}),
+            json!({"vector_type":"VECTOR","convert_from":"OBJECT","convert_to":"WORLD"}),
+            Some(&matrices),
+        );
+        assert!((direction - DVec3::new(0.0, 2.0, 0.0)).length() < 1e-12);
+        let normal = evaluate_vector_output(
+            "ShaderNodeVectorTransform",
+            "Vector",
+            json!({"Vector":[1.0,0.0,0.0]}),
+            json!({"vector_type":"NORMAL","convert_from":"OBJECT","convert_to":"WORLD"}),
+            Some(&matrices),
+        );
+        assert!((normal - DVec3::Y).length() < 1e-12);
+        let default_direction = evaluate_vector_output(
+            "ShaderNodeVectorTransform",
+            "Vector",
+            json!({"Vector":[1.0,0.0,0.0]}),
+            json!({"convert_from":"OBJECT","convert_to":"WORLD"}),
+            Some(&matrices),
+        );
+        assert!((default_direction - DVec3::new(0.0, 2.0, 0.0)).length() < 1e-12);
+        let camera_normal = evaluate_vector_output(
+            "ShaderNodeVectorTransform",
+            "Vector",
+            json!({"Vector":[0.0,3.0,4.0]}),
+            json!({"vector_type":"NORMAL","convert_from":"CAMERA","convert_to":"CAMERA"}),
+            None,
+        );
+        assert!((camera_normal - DVec3::new(0.0, 0.6, 0.8)).length() < 1e-12);
+    }
+
+    #[test]
+    fn camera_data_view_vector_flips_view_space_z() {
+        let camera_to_world = DMat4::from_translation(DVec3::new(0.0, 0.0, 3.0));
+        let view = evaluate_camera_data_view_vector(DVec3::ZERO, camera_to_world.inverse());
+        assert_eq!(view, DVec3::Z);
+    }
+    #[test]
+    fn normal_map_non_tangent_spaces_transform_world_normals() {
+        let quarter_turn = std::f64::consts::FRAC_PI_2;
+        let object_to_world = DMat4::from_scale_rotation_translation(
+            DVec3::new(2.0, 3.0, 4.0),
+            DQuat::from_rotation_z(quarter_turn),
+            DVec3::new(4.0, 5.0, 6.0),
+        );
+        let matrices = (object_to_world, object_to_world.inverse());
+        let mapped = evaluate_vector_output(
+            "ShaderNodeNormalMap",
+            "Normal",
+            json!({"Color":[1.0,0.5,0.5,1.0],"Strength":1.0}),
+            json!({"space":"OBJECT","convention":"OPENGL"}),
+            Some(&matrices),
+        );
+        assert!((mapped - DVec3::Y).length() < 1e-12);
+        let world_normal = evaluate_vector_output(
+            "ShaderNodeNormalMap",
+            "Normal",
+            json!({"Color":[1.0,0.5,0.5,1.0],"Strength":1.0}),
+            json!({"space":"WORLD","convention":"OPENGL"}),
+            None,
+        );
+        assert!((world_normal - DVec3::X).length() < 1e-12);
+        let directx = evaluate_vector_output(
+            "ShaderNodeNormalMap",
+            "Normal",
+            json!({"Color":[0.5,0.75,1.0,1.0],"Strength":1.0}),
+            json!({"space":"WORLD","convention":"DIRECTX"}),
+            None,
+        );
+        assert!((directx - DVec3::new(0.0, -1.0, 2.0).normalize()).length() < 1e-12);
+
+        let blender_world = evaluate_vector_output(
+            "ShaderNodeNormalMap",
+            "Normal",
+            json!({"Color":[0.5,0.5,1.0,1.0],"Strength":1.0}),
+            json!({"space":"BLENDER_WORLD","convention":"OPENGL"}),
+            None,
+        );
+        assert!((blender_world - DVec3::new(0.0, -2.0, -3.0).normalize()).length() < 1e-12);
     }
 
     fn mapped_image_color(
@@ -3683,6 +5569,52 @@ mod tests {
         insert_node(&mut linked, "texture", "ShaderNodeTexImage", json!({}));
         link(&mut linked, "texture", "Alpha", "principled", "Alpha");
         assert!(is_transparent(linked));
+    }
+    #[test]
+    fn nested_group_transparency_tracks_bump_alpha_dependency() {
+        let child_id = Id::new("transparent_child".to_owned()).unwrap();
+        let root_id = Id::new("transparent_root".to_owned()).unwrap();
+        let mut child = NodeGroup::new("Transparent Child", GraphKind::Shader);
+        child.interface.outputs.push(GraphSocket {
+            id: "Shader".to_owned(),
+            name: "Shader".to_owned(),
+            socket_type: "shader".to_owned(),
+            default: Value::Null,
+        });
+        insert_node(&mut child, "output", "NodeGroupOutput", json!({}));
+        insert_node(
+            &mut child,
+            "principled",
+            "ShaderNodeBsdfPrincipled",
+            json!({}),
+        );
+        insert_node(&mut child, "bump", "ShaderNodeBump", json!({}));
+        insert_node(&mut child, "separate", "ShaderNodeSeparateXYZ", json!({}));
+        insert_node(&mut child, "height", "ShaderNodeValue", json!({}));
+        link(&mut child, "height", "Value", "bump", "Height");
+        link(&mut child, "bump", "Normal", "separate", "Vector");
+        link(&mut child, "separate", "Z", "principled", "Alpha");
+        link(&mut child, "principled", "BSDF", "output", "Shader");
+
+        let mut root = NodeGroup::new("Transparent Root", GraphKind::Shader);
+        insert_node(&mut root, "output", "ShaderNodeOutputMaterial", json!({}));
+        insert_node(&mut root, "child", "ShaderNodeGroup", json!({}));
+        set_properties(&mut root, "child", json!({"node_tree": child_id.as_str()}));
+        link(&mut root, "child", "Shader", "output", "Surface");
+
+        let mut groups = Registry::new();
+        groups.insert(child_id, child);
+        groups.insert(root_id.clone(), root);
+        let material = Material {
+            node_tree: Some(root_id),
+            ..Material::default()
+        };
+        let prepared = PreparedMaterial::new(&material, &groups);
+        assert!(prepared.is_transparent());
+        assert_eq!(
+            prepared.realtime_transparency_bump().map(Id::as_str),
+            Some("bump")
+        );
     }
 
     #[test]
@@ -4192,7 +6124,7 @@ mod tests {
     }
 
     #[test]
-    fn separate_color_refuses_a_non_rgb_mode() {
+    fn separate_color_hsv_mode_matches_the_blender_color_kernel() {
         let mut graph = NodeGroup::new("Separate", GraphKind::Shader);
         insert_node(&mut graph, "output", "ShaderNodeOutputMaterial", json!({}));
         insert_node(
@@ -4231,8 +6163,8 @@ mod tests {
         };
         let mut context = HitContext::new(&groups);
         context.normal = DVec3::Z;
-        let error = evaluate_displacement(&material, &context).unwrap_err();
-        assert_eq!(error.code, crate::error::ErrorCode::UnsupportedFeature);
+        let displacement = evaluate_displacement(&material, &context).unwrap();
+        assert!((displacement - 1.0 / 6.0).abs() < 1.0e-6);
     }
 
     #[test]
@@ -4377,6 +6309,594 @@ mod tests {
             let value = color_lerp([0.0; 4], [1.0; 4], factor);
             prop_assert!(value.iter().all(|component| (0.0..=1.0).contains(component)));
         }
+    }
+
+    fn input_node_graph() -> (Registry<NodeGroup>, Id, Id, Id) {
+        let mut group = NodeGroup::new("Shader Inputs", GraphKind::Shader);
+        insert_node(&mut group, "object", "ShaderNodeObjectInfo", json!({}));
+        insert_node(&mut group, "geometry", "ShaderNodeNewGeometry", json!({}));
+        let graph_id = Id::new("shader_input_graph".to_owned()).unwrap();
+        let object_id = Id::new("object".to_owned()).unwrap();
+        let geometry_id = Id::new("geometry".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), group);
+        (groups, graph_id, object_id, geometry_id)
+    }
+
+    #[test]
+    fn group_input_is_lazy_and_uses_shifted_realtime_bump_context() {
+        let child_id = Id::new("bump_group".to_owned()).unwrap();
+        let mut child = NodeGroup::new("Bump Group", GraphKind::Shader);
+        child.interface = GraphInterface {
+            inputs: vec![
+                GraphSocket {
+                    id: "height".to_owned(),
+                    name: "Height".to_owned(),
+                    socket_type: "NodeSocketFloat".to_owned(),
+                    default: json!(0.0),
+                },
+                GraphSocket {
+                    id: "unused".to_owned(),
+                    name: "Unused".to_owned(),
+                    socket_type: "NodeSocketFloat".to_owned(),
+                    default: json!(0.0),
+                },
+            ],
+            outputs: vec![GraphSocket {
+                id: "normal".to_owned(),
+                name: "Normal".to_owned(),
+                socket_type: "NodeSocketVector".to_owned(),
+                default: json!([0.0, 0.0, 1.0]),
+            }],
+        };
+        insert_node(&mut child, "input", "NodeGroupInput", json!({}));
+        insert_node(
+            &mut child,
+            "bump",
+            "ShaderNodeBump",
+            json!({"Strength": 1.0, "Distance": 1.0, "Filter Width": 1.0}),
+        );
+        insert_node(
+            &mut child,
+            "unused_sink",
+            "ShaderNodeUnsupported",
+            json!({}),
+        );
+        insert_node(&mut child, "output", "NodeGroupOutput", json!({}));
+        link(&mut child, "input", "height", "bump", "Height");
+        link(&mut child, "input", "unused", "unused_sink", "Value");
+        link(&mut child, "bump", "Normal", "output", "Normal");
+
+        let graph_id = Id::new("parent_graph".to_owned()).unwrap();
+        let mut parent = NodeGroup::new("Parent", GraphKind::Shader);
+        insert_node(
+            &mut parent,
+            "group",
+            "ShaderNodeGroup",
+            json!({"Height": 0.0, "Unused": 0.0}),
+        );
+        set_properties(
+            &mut parent,
+            "group",
+            json!({"node_tree": child_id.as_str()}),
+        );
+        insert_node(&mut parent, "geometry", "ShaderNodeNewGeometry", json!({}));
+        insert_node(
+            &mut parent,
+            "unsupported",
+            "ShaderNodeUnsupported",
+            json!({}),
+        );
+        link(&mut parent, "geometry", "Position", "group", "Height");
+        link(&mut parent, "unsupported", "Value", "group", "Unused");
+
+        let mut groups = Registry::new();
+        groups.insert(child_id, child);
+        groups.insert(graph_id.clone(), parent);
+        let mut context = HitContext::new(&groups);
+        context.realtime_differentials = Some(HitDifferentials {
+            world_dx: DVec3::new(0.1, 0.0, 0.0),
+            world_dy: DVec3::new(0.0, 0.1, 0.0),
+            uv_dx: [0.0; 2],
+            uv_dy: [0.0; 2],
+        });
+        let group_id = Id::new("group".to_owned()).unwrap();
+        let super::Value::Vector(normal) =
+            evaluate_input_node_output(&groups, &graph_id, &group_id, "Normal", &context).unwrap()
+        else {
+            panic!("group output must be a vector")
+        };
+        assert!(
+            normal.x < -0.5,
+            "shifted Group Input height was not reevaluated: {normal:?}"
+        );
+    }
+
+    #[test]
+    fn engine_specific_normal_map_hsv_and_wavelength_outputs_are_distinct() {
+        let mut graph = NodeGroup::new("Engine Semantics", GraphKind::Shader);
+        insert_node(
+            &mut graph,
+            "hsv",
+            "ShaderNodeHueSaturation",
+            json!({
+                "Hue": 0.5,
+                "Saturation": 1.0,
+                "Value": 1.0,
+                "Fac": 0.0,
+                "Color": [-0.25, 0.2, 0.2, 1.0]
+            }),
+        );
+        insert_node(
+            &mut graph,
+            "normal_map",
+            "ShaderNodeNormalMap",
+            json!({"Color": [0.5, 0.75, 0.25, 1.0], "Strength": 1.0}),
+        );
+        set_properties(
+            &mut graph,
+            "normal_map",
+            json!({"space": "WORLD", "convention": "OPENGL"}),
+        );
+        insert_node(
+            &mut graph,
+            "wavelength",
+            "ShaderNodeWavelength",
+            json!({"Wavelength": 300.0}),
+        );
+        insert_node(
+            &mut graph,
+            "blackbody",
+            "ShaderNodeBlackbody",
+            json!({"Temperature": 12_000.0}),
+        );
+        insert_node(&mut graph, "geometry", "ShaderNodeNewGeometry", json!({}));
+        insert_node(&mut graph, "tex_coord", "ShaderNodeTexCoord", json!({}));
+        insert_node(&mut graph, "camera", "ShaderNodeCameraData", json!({}));
+        let graph_id = Id::new("engine_semantics".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let mut context = HitContext::new(&groups);
+        context.set_camera_matrices(DMat4::IDENTITY, DMat4::IDENTITY);
+        context.position = DVec3::new(0.0, 0.0, 3.0);
+        context.view_direction = DVec3::Z;
+        context.back_facing = true;
+        for path_traced in [false, true] {
+            context.path_traced = path_traced;
+            let super::Value::Vector(incoming) = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new("geometry".to_owned()).unwrap(),
+                "Incoming",
+                &context,
+            )
+            .unwrap() else {
+                panic!("Geometry Incoming output must be a vector")
+            };
+            let super::Value::Vector(reflection) = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new("tex_coord".to_owned()).unwrap(),
+                "Reflection",
+                &context,
+            )
+            .unwrap() else {
+                panic!("Texture Coordinate Reflection output must be a vector")
+            };
+            let super::Value::Scalar(depth) = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new("camera".to_owned()).unwrap(),
+                "View Z Depth",
+                &context,
+            )
+            .unwrap() else {
+                panic!("Camera Data View Z Depth output must be scalar")
+            };
+            assert_eq!(depth, if path_traced { -3.0 } else { 3.0 });
+            assert_eq!(incoming, DVec3::Z);
+            assert_eq!(reflection, DVec3::Z);
+        }
+        context.path_traced = false;
+
+        let super::Value::Color(eevee_hsv) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &Id::new("hsv".to_owned()).unwrap(),
+            "Color",
+            &context,
+        )
+        .unwrap() else {
+            panic!("HSV output must be a color")
+        };
+        let super::Value::Vector(eevee_normal) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &Id::new("normal_map".to_owned()).unwrap(),
+            "Normal",
+            &context,
+        )
+        .unwrap() else {
+            panic!("Normal Map output must be a vector")
+        };
+        let super::Value::Color(eevee_wavelength) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &Id::new("wavelength".to_owned()).unwrap(),
+            "Color",
+            &context,
+        )
+        .unwrap() else {
+            panic!("Wavelength output must be a color")
+        };
+        let super::Value::Color(eevee_blackbody) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &Id::new("blackbody".to_owned()).unwrap(),
+            "Color",
+            &context,
+        )
+        .unwrap() else {
+            panic!("Blackbody output must be a color")
+        };
+
+        context.path_traced = true;
+        let super::Value::Color(cycles_hsv) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &Id::new("hsv".to_owned()).unwrap(),
+            "Color",
+            &context,
+        )
+        .unwrap() else {
+            panic!("HSV output must be a color")
+        };
+        let super::Value::Vector(cycles_normal) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &Id::new("normal_map".to_owned()).unwrap(),
+            "Normal",
+            &context,
+        )
+        .unwrap() else {
+            panic!("Normal Map output must be a vector")
+        };
+        let super::Value::Color(cycles_wavelength) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &Id::new("wavelength".to_owned()).unwrap(),
+            "Color",
+            &context,
+        )
+        .unwrap() else {
+            panic!("Wavelength output must be a color")
+        };
+        let super::Value::Color(cycles_blackbody) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &Id::new("blackbody".to_owned()).unwrap(),
+            "Color",
+            &context,
+        )
+        .unwrap() else {
+            panic!("Blackbody output must be a color")
+        };
+
+        assert_eq!(eevee_hsv[0], -0.25);
+        assert_eq!(cycles_hsv[0], 0.0);
+        assert!(eevee_normal.y > 0.6);
+        assert!(eevee_normal.z < -0.6);
+        assert!(cycles_normal.y < -0.6);
+        assert!(cycles_normal.z > 0.6);
+        assert!(eevee_wavelength[2] > 0.0);
+        assert!(cycles_wavelength[..3].iter().all(|channel| *channel == 0.0));
+        assert_ne!(eevee_blackbody[0], cycles_blackbody[0]);
+    }
+
+    #[test]
+    fn imported_node_output_defaults_fail_closed_when_missing() {
+        for (node_type, output) in [
+            ("ShaderNodeValue", "Value"),
+            ("ShaderNodeRGB", "Color"),
+            ("ShaderNodeNormal", "Normal"),
+        ] {
+            let mut graph = NodeGroup::new("Imported Defaults", GraphKind::Shader);
+            insert_node(&mut graph, "node", node_type, json!({}));
+            set_properties(&mut graph, "node", json!({"bl_idname": node_type}));
+            let graph_id = Id::new(format!("defaults_{}", node_type.to_lowercase())).unwrap();
+            let mut groups = Registry::new();
+            groups.insert(graph_id.clone(), graph);
+            let context = HitContext::new(&groups);
+            let error = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new("node".to_owned()).unwrap(),
+                output,
+                &context,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            let expected_feature = format!("shader.node.{node_type}.output_defaults");
+            assert_eq!(
+                error.details["feature_id"].as_str(),
+                Some(expected_feature.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn shifted_bump_height_refuses_available_interpolated_color_layers() {
+        for node_type in ["ShaderNodeAttribute", "ShaderNodeVertexColor"] {
+            let mut graph = NodeGroup::new("Interpolated Bump Height", GraphKind::Shader);
+            insert_node(&mut graph, "color", node_type, json!({}));
+            let properties = if node_type == "ShaderNodeAttribute" {
+                json!({"attribute_name": "Col"})
+            } else {
+                json!({"layer_name": "Col"})
+            };
+            set_properties(&mut graph, "color", properties);
+            insert_node(
+                &mut graph,
+                "bump",
+                "ShaderNodeBump",
+                json!({"Strength": 1.0, "Distance": 1.0}),
+            );
+            link(&mut graph, "color", "Color", "bump", "Height");
+            let graph_id = Id::new(format!("bump_color_{}", node_type.to_lowercase())).unwrap();
+            let mut groups = Registry::new();
+            groups.insert(graph_id.clone(), graph);
+            let color_layer = [("Col", [0.2, 0.3, 0.4, 1.0])];
+            let mut available_context =
+                HitContext::new(&groups).with_color_layers(&color_layer, None);
+            available_context.realtime_differentials = Some(HitDifferentials {
+                world_dx: DVec3::new(0.1, 0.0, 0.0),
+                world_dy: DVec3::new(0.0, 0.1, 0.0),
+                uv_dx: [0.0; 2],
+                uv_dy: [0.0; 2],
+            });
+            let error = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new("bump".to_owned()).unwrap(),
+                "Normal",
+                &available_context,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            let expected_feature = format!("shader.node.{node_type}.bump_height_interpolation");
+            assert_eq!(
+                error.details["feature_id"].as_str(),
+                Some(expected_feature.as_str())
+            );
+            assert!(
+                error
+                    .message
+                    .contains("per-corner color data is unavailable")
+            );
+
+            let mut missing_context = HitContext::new(&groups).with_color_layers(&[], None);
+            missing_context.realtime_differentials = available_context.realtime_differentials;
+            let super::Value::Vector(normal) = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new("bump".to_owned()).unwrap(),
+                "Normal",
+                &missing_context,
+            )
+            .unwrap() else {
+                panic!("Bump output must be a vector")
+            };
+            assert_eq!(normal, DVec3::Z);
+        }
+    }
+
+    #[test]
+    fn shifted_bump_height_refuses_unshifted_geometry_and_texture_directions() {
+        let mut graph = NodeGroup::new("Shifted Directions", GraphKind::Shader);
+        insert_node(&mut graph, "geometry", "ShaderNodeNewGeometry", json!({}));
+        insert_node(&mut graph, "tex_coord", "ShaderNodeTexCoord", json!({}));
+        let graph_id = Id::new("shifted_directions".to_owned()).unwrap();
+        let mut groups = Registry::new();
+        groups.insert(graph_id.clone(), graph);
+        let mut context = HitContext::new(&groups);
+        context.bump_height_shifted = true;
+        for (node_id, node_type, socket) in [
+            ("geometry", "ShaderNodeNewGeometry", "Normal"),
+            ("geometry", "ShaderNodeNewGeometry", "Incoming"),
+            ("geometry", "ShaderNodeNewGeometry", "Tangent"),
+            ("tex_coord", "ShaderNodeTexCoord", "Normal"),
+            ("tex_coord", "ShaderNodeTexCoord", "Reflection"),
+        ] {
+            let error = evaluate_input_node_output(
+                &groups,
+                &graph_id,
+                &Id::new(node_id.to_owned()).unwrap(),
+                socket,
+                &context,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+            let expected_feature = format!("shader.node.{node_type}.bump_height_interpolation");
+            assert_eq!(
+                error.details["feature_id"].as_str(),
+                Some(expected_feature.as_str())
+            );
+            assert!(
+                error
+                    .message
+                    .contains("shifted normal/view derivatives are unavailable")
+            );
+        }
+    }
+
+    fn evaluate_input_node_output(
+        groups: &Registry<NodeGroup>,
+        graph_id: &Id,
+        node_id: &Id,
+        output: &str,
+        hit_ctx: &HitContext<'_>,
+    ) -> crate::error::Result<super::Value> {
+        let group = groups.get(graph_id).unwrap();
+        let material = Material::default();
+        let alpha_linked_images = BTreeSet::new();
+        let mut workspace = EvaluatorWorkspace::default();
+        let mut evaluator = Evaluator {
+            group,
+            material: &material,
+            hit_ctx: *hit_ctx,
+            workspace: &mut workspace,
+            alpha_linked_images: &alpha_linked_images,
+            links: None,
+            group_input_binding: None,
+            group_depth: 0,
+        };
+        evaluator.output(node_id, output, 0)
+    }
+
+    #[test]
+    fn object_info_location_uses_world_transform_and_other_outputs_name_required_data() {
+        let (groups, graph_id, object_id, _) = input_node_graph();
+        let location = DVec3::new(2.0, -3.0, 5.0);
+        let mut context = HitContext::new(&groups);
+        context.object_to_world = DMat4::from_translation(location);
+
+        let super::Value::Vector(actual) =
+            evaluate_input_node_output(&groups, &graph_id, &object_id, "Location", &context)
+                .unwrap()
+        else {
+            panic!("Object Info Location must be a vector")
+        };
+        assert_eq!(actual, location);
+
+        let error = evaluate_input_node_output(&groups, &graph_id, &object_id, "Random", &context)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            json!("shader.node.ShaderNodeObjectInfo.Random.object_random_number")
+        );
+        let error =
+            evaluate_input_node_output(&groups, &graph_id, &object_id, "Material Index", &context)
+                .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedFeature);
+        assert_eq!(
+            error.details["feature_id"],
+            json!("shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index")
+        );
+
+        context.material_pass_index = Some(23.0);
+        let super::Value::Scalar(actual) =
+            evaluate_input_node_output(&groups, &graph_id, &object_id, "Material Index", &context)
+                .unwrap()
+        else {
+            panic!("Object Info Material Index must be a scalar")
+        };
+        assert_eq!(actual, 23.0);
+    }
+
+    #[test]
+    fn geometry_tangent_and_parametric_use_cycles_hit_data() {
+        let (groups, graph_id, _, geometry_id) = input_node_graph();
+        let barycentric = [0.2, 0.3, 0.5];
+        let names: [String; 0] = [];
+        let uv_corners: [[[f64; 2]; 3]; 0] = [];
+        let layers = HitUvLayers {
+            names: &names,
+            corners: &uv_corners,
+            positions: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            barycentric,
+            render: None,
+            available_mask: None,
+        };
+        let generated = GeneratedCorners {
+            corners: [DVec3::ZERO, DVec3::X, DVec3::Y],
+            per_local: DVec3::ONE,
+        };
+        let mut context = HitContext::new(&groups)
+            .with_uv_layers(layers)
+            .with_generated_corners(generated, barycentric);
+        context.path_traced = true;
+        context.normal = DVec3::Z;
+
+        let super::Value::Vector(tangent) =
+            evaluate_input_node_output(&groups, &graph_id, &geometry_id, "Tangent", &context)
+                .unwrap()
+        else {
+            panic!("Geometry Tangent must be a vector")
+        };
+        assert!(tangent.abs_diff_eq(-DVec3::Y, 1.0e-12));
+        let mut derivative_context = HitContext::new(&groups).with_uv_layers(layers);
+        derivative_context.path_traced = true;
+        derivative_context.normal = DVec3::Z;
+        let super::Value::Vector(front_tangent) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &geometry_id,
+            "Tangent",
+            &derivative_context,
+        )
+        .unwrap() else {
+            panic!("Geometry Tangent must use the surface derivative without Generated data")
+        };
+        assert_eq!(front_tangent, DVec3::X);
+
+        derivative_context.view_direction = -DVec3::Z;
+        let super::Value::Vector(back_tangent) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &geometry_id,
+            "Tangent",
+            &derivative_context,
+        )
+        .unwrap() else {
+            panic!("Geometry Tangent must orient the surface derivative on a backface")
+        };
+        assert_eq!(back_tangent, -DVec3::X);
+
+        let super::Value::Vector(parametric) =
+            evaluate_input_node_output(&groups, &graph_id, &geometry_id, "Parametric", &context)
+                .unwrap()
+        else {
+            panic!("Geometry Parametric must be a vector")
+        };
+        assert!((parametric - DVec3::new(0.2, 0.3, 0.0)).length() <= 1.0e-15);
+
+        let super::Value::Scalar(front_facing) =
+            evaluate_input_node_output(&groups, &graph_id, &geometry_id, "Backfacing", &context)
+                .unwrap()
+        else {
+            panic!("Geometry Backfacing must be a scalar")
+        };
+        assert_eq!(front_facing, 0.0);
+
+        let mut back_facing_context = context;
+        back_facing_context.view_direction = -DVec3::Z;
+        back_facing_context.back_facing = true;
+        let super::Value::Scalar(back_facing) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &geometry_id,
+            "Backfacing",
+            &back_facing_context,
+        )
+        .unwrap() else {
+            panic!("Geometry Backfacing must be a scalar")
+        };
+        assert_eq!(back_facing, 1.0);
+
+        let mut realtime_context = HitContext::new(&groups);
+        realtime_context.back_facing = true;
+        let super::Value::Scalar(realtime_back_facing) = evaluate_input_node_output(
+            &groups,
+            &graph_id,
+            &geometry_id,
+            "Backfacing",
+            &realtime_context,
+        )
+        .unwrap() else {
+            panic!("realtime Geometry Backfacing must be a scalar")
+        };
+        assert_eq!(realtime_back_facing, 1.0);
     }
 }
 

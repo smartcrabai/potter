@@ -156,7 +156,7 @@ fn scene_schema() -> Value {
     let mut root = base("Potter scene document");
     root["required"] = json!(["schema_version", "scene_id", "revision", "active_scene"]);
     root["properties"] = json!({
-        "schema_version":{"const":15},
+        "schema_version":{"const":16},
         "scene_id":{"type":"string","format":"uuid"},
         "revision":{"type":"integer","minimum":0,"maximum":9_007_199_254_740_991_u64},
         "active_scene":{"$ref":"#/$defs/id"},
@@ -508,8 +508,16 @@ fn complete_scene_schema(root: &mut Value) {
     let material = &mut defs["material"];
     material["properties"]["use_transparent_shadow"] = json!({"type":"boolean"});
     material["properties"]["use_bump_map_correction"] = json!({"type":"boolean"});
+    material["properties"]["pass_index"] = json!({
+        "oneOf":[
+            {"type":"integer","minimum":0,"maximum":i16::MAX},
+            {"type":"null"}
+        ],
+        "default":0
+    });
     material["required"] = json!([
         "name",
+        "pass_index",
         "base_color",
         "alpha_mode",
         "alpha_threshold",
@@ -1234,6 +1242,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec![
                 "id",
                 "name",
+                "pass_index",
                 "alpha_mode",
                 "alpha_threshold",
                 "base_color",
@@ -1263,7 +1272,7 @@ fn operation_contract(name: &str) -> OperationContract {
             vec!["op", "id"],
             "material",
             "none",
-            json!({"name":"id","base_color":[0.6,0.6,0.6,1.0],"metallic":0.0,"roughness":0.8,"double_sided":false,"emission_color":[0.0,0.0,0.0],"emission_strength":0.0,"transmission":0.0,"ior":1.45}),
+            json!({"name":"id","pass_index":0,"base_color":[0.6,0.6,0.6,1.0],"metallic":0.0,"roughness":0.8,"double_sided":false,"emission_color":[0.0,0.0,0.0],"emission_strength":0.0,"transmission":0.0,"ior":1.45}),
         ),
         "material.update" => (
             vec!["target", "set"],
@@ -2749,6 +2758,7 @@ fn field_schema(operation: &str, field: &str) -> Value {
             }
             "volume_anisotropy" => json!({"type":"number","minimum":-0.999,"maximum":0.999}),
             "displacement_scale" => json!({"type":"number"}),
+            "pass_index" => json!({"type":"integer","minimum":0,"maximum":i16::MAX}),
             _ => common_field_schema(field),
         };
     }
@@ -3334,6 +3344,7 @@ fn physics_native_properties(system: &str) -> Value {
 fn material_set_properties() -> Value {
     json!({
         "name":{"type":"string"},
+        "pass_index":{"type":"integer","minimum":0,"maximum":i16::MAX},
         "alpha_mode":{"enum":["opaque","blend","clip"]},
         "alpha_threshold":{"type":"number","minimum":0,"maximum":1},
         "base_color":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":4,"maxItems":4},
@@ -3447,6 +3458,21 @@ mod tests {
             Some(crate::ops::OP_NAMES.len() + 4)
         );
     }
+    #[test]
+    fn material_pass_index_schema_preserves_null_and_integer_range() -> crate::error::Result<()> {
+        let scene = schema("scene", None)?;
+        let pass_index = &scene["$defs"]["material"]["properties"]["pass_index"];
+        assert_eq!(pass_index["oneOf"][0]["type"], "integer");
+        assert_eq!(pass_index["oneOf"][0]["minimum"], 0);
+        assert_eq!(pass_index["oneOf"][0]["maximum"], i16::MAX);
+        assert_eq!(pass_index["oneOf"][1]["type"], "null");
+
+        let create = schema("operations", Some("material.create"))?;
+        assert_eq!(create["properties"]["pass_index"]["minimum"], 0);
+        assert_eq!(create["properties"]["pass_index"]["maximum"], i16::MAX);
+        Ok(())
+    }
+
     #[test]
     fn sequencer_font_and_wrap_width_are_optional_and_typed() -> crate::error::Result<()> {
         let scene = schema("scene", None)?;

@@ -1,3 +1,5 @@
+mod blackbody;
+mod converters;
 mod world;
 
 mod evaluator;
@@ -7,8 +9,8 @@ pub(crate) use evaluator::{
     make_orthonormals,
 };
 pub use evaluator::{
-    BsdfParams, EvaluatorWorkspace, HitContext, HitFootprint, HitUvLayers, PreparedMaterial,
-    ShaderClosure, SubsurfaceMethod, SurfaceShading, evaluate_displacement,
+    BsdfParams, EvaluatorWorkspace, HitContext, HitDifferentials, HitFootprint, HitUvLayers,
+    PreparedMaterial, ShaderClosure, SubsurfaceMethod, SurfaceShading, evaluate_displacement,
     evaluate_displacement_with_workspace, evaluate_surface, evaluate_surface_with_workspace,
     fill_color_layers, height_gradient,
 };

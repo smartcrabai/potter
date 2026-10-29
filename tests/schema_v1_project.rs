@@ -167,7 +167,7 @@ fn schema_v1_project_keeps_revisions_uv_state_and_hashes_through_edit_history_an
     )?;
     assert_eq!(edited["ok"], true, "{edited}");
     assert_eq!(edited["scene"]["revision"], 3);
-    assert_eq!(document(&scene)?["schema_version"], 15);
+    assert_eq!(document(&scene)?["schema_version"], 16);
     let store = &mesh_attributes(&scene)?["uv_layers"];
     assert_eq!(store["layers"][0]["name"], "UVMap");
     assert_eq!(store["active"], "UVMap");
@@ -296,7 +296,7 @@ fn schema_v1_active_blender_layer_survives_migration_and_omitted_selector_uv_tra
     )?;
     assert_eq!(applied["ok"], true, "{applied}");
     assert_eq!(applied["scene"]["revision"], 3);
-    assert_eq!(document(&scene)?["schema_version"], 15);
+    assert_eq!(document(&scene)?["schema_version"], 16);
     let attributes = mesh_attributes(&scene)?;
     assert_eq!(attributes["uv_layers"]["active"], "Light");
     assert_eq!(attributes["uv_layers"]["render"], "UVMap");
@@ -568,7 +568,7 @@ fn schema_v1_deleted_face_row_is_reported_and_its_bytes_stay_recoverable() -> Te
         1,
         "{applied}"
     );
-    assert_eq!(document(&scene)?["schema_version"], 15);
+    assert_eq!(document(&scene)?["schema_version"], 16);
     assert_eq!(stored_face_ids(&scene, "UVMap")?, vec![1_u64, 2, 3, 4, 5]);
     assert_corner_close(
         stored_corner(&scene, "UVMap", 1)?,
@@ -683,7 +683,7 @@ fn schema_v1_extruded_blender_layers_are_skipped_with_warnings_and_stay_recovera
         2,
         "{applied}"
     );
-    assert_eq!(document(&scene)?["schema_version"], 15);
+    assert_eq!(document(&scene)?["schema_version"], 16);
     let attributes = mesh_attributes(&scene)?;
     assert!(
         attributes.get("uv_layers").is_none(),

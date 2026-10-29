@@ -30,6 +30,20 @@ pub(super) fn apply(
     }
 }
 
+fn read_pass_index(engine: &Engine<'_>, value: &Value, field: &str) -> Result<u32> {
+    value
+        .as_u64()
+        .and_then(|index| u32::try_from(index).ok())
+        .filter(|index| i16::try_from(*index).is_ok())
+        .ok_or_else(|| {
+            engine.error(
+                ErrorCode::InvalidOperation,
+                "pass_index must be an integer in 0..=32767",
+                &operation_pointer(engine.operation_index, field),
+            )
+        })
+}
+
 fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<bool> {
     check_fields(
         engine,
@@ -38,6 +52,7 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
             "op",
             "id",
             "name",
+            "pass_index",
             "alpha_mode",
             "alpha_threshold",
             "base_color",
@@ -89,6 +104,9 @@ fn create(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         ior: 1.5,
         ..Material::default()
     };
+    if let Some(value) = operation.get("pass_index") {
+        material.pass_index = Some(read_pass_index(engine, value, "pass_index")?);
+    }
     if let Some(value) = operation.get("alpha_mode") {
         material.alpha_mode = parse_alpha_mode(
             engine,
@@ -277,6 +295,7 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
         if ![
             "name",
             "alpha_mode",
+            "pass_index",
             "alpha_threshold",
             "base_color",
             "metallic",
@@ -325,6 +344,10 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 )
             })
         })
+        .transpose()?;
+    let pass_index = set
+        .get("pass_index")
+        .map(|value| read_pass_index(engine, value, "set/pass_index"))
         .transpose()?;
     let base_color = set
         .get("base_color")
@@ -542,6 +565,12 @@ fn update(engine: &mut Engine<'_>, operation: &Map<String, Value>) -> Result<boo
                 && material.name != *name
             {
                 material.name.clone_from(name);
+                item_changed = true;
+            }
+            if let Some(value) = pass_index
+                && material.pass_index != Some(value)
+            {
+                material.pass_index = Some(value);
                 item_changed = true;
             }
             if let Some(value) = &alpha_mode

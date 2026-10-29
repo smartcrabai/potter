@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{borrow::Borrow, fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -30,6 +30,11 @@ impl Id {
 
     #[must_use]
     pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl Borrow<str> for Id {
+    fn borrow(&self) -> &str {
         &self.0
     }
 }

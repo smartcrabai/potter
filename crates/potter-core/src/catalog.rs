@@ -103,12 +103,141 @@ pub fn feature_catalog() -> Value {
             &["material.create", "material.update"],
             [true, true, true, true, true, true, true],
         ),
-        unsupported(
+        feature_row(
             "shader.advanced",
-            "Other Blender shader nodes",
+            "Additional Blender shader nodes with precise unsupported cases",
             "ShaderNodeTree",
-            &[],
-            "Shader nodes outside the native surface, volume, displacement, and world evaluator subsets are not supported.",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "graph.unlink",
+                "material.create",
+                "material.update",
+            ],
+            [true, true, true, true, true, true, true],
+            "partial",
+            &json!(
+                "Group Input resolves lazily from the current hit context. Value/RGB, RGB/HSV/HSL converters and color operations, vector rotation/transforms, nested non-recursive shader groups, Object Info, Geometry, Blackbody/Wavelength, and Light Falloff evaluate. Path tracing uses Cycles/SVM semantics; realtime uses EEVEE semantics for Incoming/Reflection signs, Normal Map spaces and backfaces, Hue/Saturation output clamping, spectral tables, and Geometry. Volume hit contexts preserve the object's Color/Alpha/Object Index/Random and material pass index; Cycles path contexts retain exact path distance for Light Falloff, while realtime uses no distance (`None`) and EEVEE strength semantics. Camera Data needs an active camera matrix; a differing Vector Transform involving CAMERA needs the active camera matrix, with realtime stereo supplying the selected eye's matrix. TexCoord Camera/Window and UV Map from_instancer remain unsupported; Object Info Random on instances, broken/non-shader/recursive groups, and Cycles Pointiness/Random Per Island remain unsupported (EEVEE returns 0.5/0.0). Only reachable Blender-origin Value/RGB/Normal nodes with unrecoverable output defaults are refused; imports mark them with empty potter_output_defaults and never guess defaults."
+            ),
+        ),
+        supported(
+            "shader.node_groups",
+            "Nested ShaderNodeGroup interfaces, defaults, lazy hit-context Group Input, and linked shader outputs",
+            "ShaderNodeGroup",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "graph.unlink",
+                "graph.interface_update",
+                "material.create",
+                "material.update",
+            ],
+            [true, true, true, true, true, true, true],
+        ),
+        supported(
+            "shader.color_converters",
+            "Value/RGB constants; RGB/HSV/HSL converters and color operations; Hue/Saturation/Value with the Cycles final clamp and EEVEE unclamped result",
+            "ShaderNodeTree",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            [true, true, true, true, true, true, true],
+        ),
+        supported(
+            "shader.spectral_nodes",
+            "Cycles Wavelength CIE table and Blackbody polynomial; EEVEE Blackbody/Wavelength 257-entry spectrum tables",
+            "ShaderNodeTree",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            [true, true, true, true, true, true, true],
+        ),
+        supported(
+            "shader.light_falloff",
+            "Cycles distance-based and EEVEE strength Light Falloff; volume path contexts retain exact path distance while realtime uses no distance (`None`)",
+            "ShaderNodeLightFalloff",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            [true, true, true, true, true, true, true],
+        ),
+        feature_row(
+            "shader.vector_space",
+            "Vector Rotate, Vector Transform, and Normal Map spaces",
+            "ShaderNodeTree",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            [true, true, true, true, true, true, true],
+            "partial",
+            &json!(
+                "Vector Rotate and Normal Map follow engine-specific Cycles/EEVEE spaces and color-channel conventions; Cycles applies its convention-specific remap and backface flip, while EEVEE keeps its GPU mapping. Object/World/Camera Vector Transform evaluates when its required matrices exist; realtime stereo uses per-eye camera matrices. Only a differing conversion involving CAMERA is refused when the active camera matrix is missing."
+            ),
+        ),
+        feature_row(
+            "shader.input_nodes",
+            "Shader input nodes and texture-coordinate outputs",
+            "ShaderNodeTree",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            [true, true, true, true, true, true, true],
+            "partial",
+            &json!(
+                "Object Info Location/Color/Alpha/Object Index/Random evaluate for regular and volume objects; Material Index evaluates only when the rendered material's pass_index is known and refuses unknown values with `shader.node.ShaderNodeObjectInfo.Material Index.material_pass_index`. Potter-native materials and source formats without the field use Blender's default 0; fresh `.blend` imports preserve exact values. The unknown state arises only when schema 15-to-16 migration finds a Blender-mapped material record with no saved `pass_index`; Blender export reports unknown metadata as `blender.material.pass_index`. Volume hit contexts preserve object Color/Alpha/Object Index/Random and material pass index, including unknown as None. Random on instances is unsupported. Geometry Position/Normal/True Normal/Incoming/Reflection/Tangent/Parametric/Backfacing evaluate with engine-specific normals (Incoming points toward the viewer in both Cycles and EEVEE; Reflection uses -reflect(view,N) in both engines, without extra normalization); EEVEE True Normal is geometric, Pointiness is 0.5, and Random Per Island is 0.0, while Cycles does not support Pointiness or Random Per Island. Camera Data requires an active camera matrix; View Z Depth is signed in Cycles and absolute in EEVEE. Texture Coordinate Reflection evaluates; Camera/Window and UV Map from_instancer remain unsupported."
+            ),
+        ),
+        feature_row(
+            "shader.bump",
+            "Cycles and EEVEE Bump with invert, distance, and filter width",
+            "ShaderNodeBump",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            [true, true, true, true, true, true, true],
+            "partial",
+            &json!(
+                "Cycles Bump uses its separate exact HitFootprint; EEVEE Bump evaluates from screen-space position and render-UV derivatives. Realtime transparent-shadow opacity evaluation skips Bump used only for shading; if a Bump output contributes to transparency/coverage, it refuses with `shader.node.Bump.realtime_transparent_shadow_height` rather than approximating shifted Height. During shifted Height sampling in either engine, an available interpolated mesh-corner Attribute or Vertex Color output is refused because per-corner color data is unavailable for differentiation; hit-dependent Geometry Incoming/Tangent and Texture Coordinate Normal/Reflection outputs are refused because shifted normal/view derivatives are unavailable, and EEVEE additionally refuses shifted Geometry Normal. Cycles keeps Geometry Normal at the center value, so it is valid in shifted samples and does not produce an import loss. Camera Data also retains the unshifted center point during shifted Height sampling in both engines. Error feature IDs are `shader.node.ShaderNodeAttribute.bump_height_interpolation`, `shader.node.ShaderNodeVertexColor.bump_height_interpolation`, `shader.node.ShaderNodeNewGeometry.bump_height_interpolation`, and `shader.node.ShaderNodeTexCoord.bump_height_interpolation`; the Geometry ID applies only to EEVEE. Position/Object/Generated/UV, UV Map, Geometry Parametric, Camera Data, True Normal/Backfacing, and EEVEE Pointiness/Random Per Island (0.5/0.0) remain supported in shifted samples. Missing-layer constant fallbacks remain supported and do not emit the two color import-loss IDs. Import-loss scanning reports these IDs only for a reachable Bump Height chain when its named Attribute or render Vertex Color layer exists on a scene-linked, render-visible mesh using the material. Unlinked Height is a no-op in both engines. Cycles path contexts without a footprint remain unsupported."
+            ),
+        ),
+        unsupported(
+            "shader.node.Bump.realtime_transparent_shadow_height",
+            "Bump Height affecting realtime transparent-shadow coverage",
+            "ShaderNodeBump",
+            &[
+                "graph.create",
+                "graph.node_add",
+                "graph.link",
+                "material.create",
+                "material.update",
+            ],
+            "Realtime transparent-shadow opacity evaluation skips Bump used only for shading. If a Bump output contributes to transparency or coverage, Potter refuses with this loss rather than approximating shifted Height. `.blend` import reports this ID only when the active EEVEE scene uses a material whose Bump output reaches Principled Alpha, Transparent color, or Mix Shader coverage, including through shader groups.",
         ),
         supported(
             "shader.output_material.volume",
