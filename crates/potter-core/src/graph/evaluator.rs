@@ -3305,12 +3305,7 @@ impl Evaluator<'_> {
             third: Box::new(third),
         }))
     }
-    fn texture_node(
-        &mut self,
-        id: &Id,
-        node: &GraphNode,
-        socket: &str,
-    ) -> Result<EvalValue> {
+    fn texture_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
         let mut inputs = Vec::with_capacity(10);
         let kind = match node.node_type.as_str() {
             "ShaderNodeTexWave" => {
@@ -3323,7 +3318,14 @@ impl Evaluator<'_> {
                 let wave_type = match texture_string_property(node, "wave_type", "BANDS")? {
                     "BANDS" => WaveType::Bands,
                     "RINGS" => WaveType::Rings,
-                    value => return Err(unsupported_texture_mode(id, "ShaderNodeTexWave", "wave_type", value)),
+                    value => {
+                        return Err(unsupported_texture_mode(
+                            id,
+                            "ShaderNodeTexWave",
+                            "wave_type",
+                            value,
+                        ));
+                    }
                 };
                 let bands_direction = if matches!(wave_type, WaveType::Bands) {
                     match texture_string_property(node, "bands_direction", "X")? {
@@ -3415,24 +3417,9 @@ impl Evaluator<'_> {
                 let squash = texture_float_property(node, "squash", 1.0)?;
                 let squash_frequency = texture_integer_property(node, "squash_frequency", 2)?;
                 inputs.push(self.texture_vector_input(id, node)?);
-                inputs.push(self.texture_input(
-                    id,
-                    node,
-                    "Color1",
-                    json!([0.8, 0.8, 0.8, 1.0]),
-                )?);
-                inputs.push(self.texture_input(
-                    id,
-                    node,
-                    "Color2",
-                    json!([0.2, 0.2, 0.2, 1.0]),
-                )?);
-                inputs.push(self.texture_input(
-                    id,
-                    node,
-                    "Mortar",
-                    json!([0.0, 0.0, 0.0, 1.0]),
-                )?);
+                inputs.push(self.texture_input(id, node, "Color1", json!([0.8, 0.8, 0.8, 1.0]))?);
+                inputs.push(self.texture_input(id, node, "Color2", json!([0.2, 0.2, 0.2, 1.0]))?);
+                inputs.push(self.texture_input(id, node, "Mortar", json!([0.0, 0.0, 0.0, 1.0]))?);
                 inputs.push(self.texture_input(id, node, "Scale", json!(5.0))?);
                 inputs.push(self.texture_input(id, node, "Mortar Size", json!(0.02))?);
                 inputs.push(self.texture_input(id, node, "Mortar Smooth", json!(0.1))?);
@@ -3513,11 +3500,7 @@ impl Evaluator<'_> {
                         id,
                         node,
                         "Orientation 3D",
-                        json!([
-                            std::f64::consts::SQRT_2,
-                            std::f64::consts::SQRT_2,
-                            0.0
-                        ]),
+                        json!([std::f64::consts::SQRT_2, std::f64::consts::SQRT_2, 0.0]),
                     )?);
                 }
                 TextureFieldKind::Gabor { dimensions }
@@ -3558,7 +3541,6 @@ impl Evaluator<'_> {
             Ok(Field::Position)
         }
     }
-
 
     fn vector_math_node(&mut self, id: &Id, node: &GraphNode, socket: &str) -> Result<EvalValue> {
         let operation = node
@@ -5739,7 +5721,9 @@ fn procedural_texture_field_value(
             let width = texture_field_number(inputs, 8, context, index, domain)?;
             let row_height = texture_field_number(inputs, 9, context, index, domain)?;
             if width == 0.0 || row_height == 0.0 {
-                return Err(evaluation("Brick Texture width and row height must be nonzero"));
+                return Err(evaluation(
+                    "Brick Texture width and row height must be nonzero",
+                ));
             }
             let (color, factor) = procedural_texture::brick(
                 vector,
@@ -5845,7 +5829,9 @@ fn texture_field_number(
     if value.is_finite() {
         Ok(value)
     } else {
-        Err(evaluation("procedural texture field exceeds the float range"))
+        Err(evaluation(
+            "procedural texture field exceeds the float range",
+        ))
     }
 }
 
@@ -5867,7 +5853,9 @@ fn texture_field_vector(
     if vector.iter().all(|component| component.is_finite()) {
         Ok(vector)
     } else {
-        Err(evaluation("procedural texture vector exceeds the float range"))
+        Err(evaluation(
+            "procedural texture vector exceeds the float range",
+        ))
     }
 }
 
@@ -5899,7 +5887,9 @@ fn texture_field_color(
     if color.iter().all(|component| component.is_finite()) {
         Ok(color)
     } else {
-        Err(evaluation("procedural texture color exceeds the float range"))
+        Err(evaluation(
+            "procedural texture color exceeds the float range",
+        ))
     }
 }
 
@@ -8037,8 +8027,11 @@ fn texture_float_property(node: &GraphNode, property: &str, default: f32) -> Res
 
 fn texture_integer_property(node: &GraphNode, property: &str, default: i32) -> Result<i32> {
     let value = property_i64(node, property, i64::from(default))?;
-    i32::try_from(value)
-        .map_err(|_| evaluation(format!("texture property `{property}` exceeds the integer range")))
+    i32::try_from(value).map_err(|_| {
+        evaluation(format!(
+            "texture property `{property}` exceeds the integer range"
+        ))
+    })
 }
 
 fn unsupported_texture_mode(
@@ -8057,7 +8050,6 @@ fn unsupported_texture_mode(
         }),
     )
 }
-
 
 #[expect(
     clippy::cast_precision_loss,
