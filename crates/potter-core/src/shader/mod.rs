@@ -10,7 +10,7 @@ mod evaluator;
 pub(crate) use evaluator::{
     AnisotropyModel, GeometryAttribute, GeometryAttributeValues, GlassDistribution, dielectric_f0,
     evaluate_surface_with_workspace_into_semantics, evaluate_surface_with_workspace_semantics,
-    heaviest, make_orthonormals,
+    heaviest, make_orthonormals, shader_node_type_supported,
 };
 
 pub(crate) use evaluator::evaluate_displacement_with_workspace_semantics;

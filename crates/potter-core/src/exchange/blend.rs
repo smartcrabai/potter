@@ -11779,70 +11779,6 @@ fn material_volume_graph_has_spatial_dependency(
     })
 }
 
-fn material_shader_node_type_supported(node_type: &str) -> bool {
-    matches!(
-        node_type,
-        "OutputMaterial"
-            | "ShaderNodeOutputMaterial"
-            | "ShaderNodeBsdfPrincipled"
-            | "ShaderNodeVolumePrincipled"
-            | "ShaderNodeVolumeAbsorption"
-            | "ShaderNodeVolumeScatter"
-            | "ShaderNodeDisplacement"
-            | "ShaderNodeBlackbody"
-            | "ShaderNodeBrightContrast"
-            | "ShaderNodeCameraData"
-            | "ShaderNodeCombineColor"
-            | "ShaderNodeGamma"
-            | "ShaderNodeHueSaturation"
-            | "ShaderNodeInvert"
-            | "ShaderNodeLightFalloff"
-            | "ShaderNodeNewGeometry"
-            | "ShaderNodeNormal"
-            | "ShaderNodeObjectInfo"
-            | "ShaderNodeRGB"
-            | "ShaderNodeRGBToBW"
-            | "ShaderNodeValue"
-            | "ShaderNodeVectorRotate"
-            | "ShaderNodeVectorTransform"
-            | "ShaderNodeWavelength"
-            | "NodeGroupInput"
-            | "NodeGroupOutput"
-            | "ShaderNodeTexImage"
-            | "ShaderNodeTexEnvironment"
-            | "ShaderNodeEmission"
-            | "ShaderNodeBsdfDiffuse"
-            | "ShaderNodeBsdfGlossy"
-            | "ShaderNodeBsdfAnisotropic"
-            | "ShaderNodeBsdfGlass"
-            | "ShaderNodeBsdfTransparent"
-            | "ShaderNodeMixShader"
-            | "ShaderNodeAddShader"
-            | "ShaderNodeBump"
-            | "ShaderNodeTexChecker"
-            | "ShaderNodeTexNoise"
-            | "ShaderNodeTexVoronoi"
-            | "ShaderNodeTexGradient"
-            | "ShaderNodeValToRGB"
-            | "ShaderNodeMixRGB"
-            | "ShaderNodeMix"
-            | "ShaderNodeMath"
-            | "ShaderNodeVectorMath"
-            | "ShaderNodeMapping"
-            | "ShaderNodeSeparateColor"
-            | "ShaderNodeSeparateXYZ"
-            | "ShaderNodeCombineXYZ"
-            | "ShaderNodeTexCoord"
-            | "ShaderNodeUVMap"
-            | "ShaderNodeTangent"
-            | "ShaderNodeNormalMap"
-            | "ShaderNodeFresnel"
-            | "ShaderNodeLayerWeight"
-            | "ShaderNodeAttribute"
-            | "ShaderNodeVertexColor"
-    )
-}
-
 fn mesh_uses_material(mesh: &Value, object: &Value, material_name: &str) -> bool {
     let data_materials = mesh.get("materials").and_then(Value::as_array);
     let object_materials = object.get("materials").and_then(Value::as_array);
@@ -11983,7 +11919,7 @@ fn material_shader_graph_import_losses(raw: &Value, material: &Value, losses: &m
         let Some(node_type) = node.get("type").and_then(Value::as_str) else {
             continue;
         };
-        if node_type != "ShaderNodeGroup" && !material_shader_node_type_supported(node_type) {
+        if !crate::shader::shader_node_type_supported(node_type) {
             losses.push(loss(
                 "blender.material.shader_node.unsupported",
                 material_name,
