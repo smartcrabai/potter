@@ -821,7 +821,7 @@ fn evaluate_surface_inner_into(
         hit_ctx: *hit_ctx,
         workspace,
         alpha_linked_images: &prepared.alpha_linked_images,
-        links: prepared.link_index(graph_id, group),
+        links: prepared.fold_index(graph_id, group),
         group_input_binding: None,
         group_depth: 0,
         math_semantics,
@@ -991,7 +991,7 @@ fn evaluate_displacement_inner(
         workspace,
         math_semantics,
         alpha_linked_images: &prepared.alpha_linked_images,
-        links: prepared.link_index(graph_id, group),
+        links: prepared.fold_index(graph_id, group),
         group_input_binding: None,
         group_depth: 0,
     };
@@ -1376,11 +1376,8 @@ struct LinkIndex {
     /// target node and socket of each candidate link.
     links_address: usize,
     link_count: usize,
-    /// For each target node, the indices into `NodeGroup::links` of its incoming links in link order. The first entry
-    /// matching a socket is the same link that a scan of all links finds first.
-    incoming: BTreeMap<Id, Vec<usize>>,
-    /// Nodes whose inputs Blender's shader-tree inliner can fold to primitives.
-    primitive_nodes: BTreeSet<Id>,
+    /// Prebuilt incoming-link index and primitive folds for every nested group invocation.
+    folds: super::inline_fold::FoldIndex,
     /// The output node that the socket flags below describe.
     output: Option<Id>,
     /// Whether a link reaches the output's `Surface` socket.
@@ -1392,20 +1389,13 @@ struct LinkIndex {
 }
 
 impl LinkIndex {
-    fn new(graph_id: &Id, group: &NodeGroup, output: Option<&Id>) -> Self {
-        let mut incoming = BTreeMap::<Id, Vec<usize>>::new();
-        for (socket_index, link) in group.links.iter().enumerate() {
-            incoming
-                .entry(link.to_node.clone())
-                .or_default()
-                .push(socket_index);
-        }
-        let primitive_nodes = group
-            .nodes
-            .keys()
-            .filter(|node_id| super::inline_fold::node_inputs_all_primitive(group, node_id))
-            .cloned()
-            .collect();
+    fn new(
+        graph_id: &Id,
+        group: &NodeGroup,
+        output: Option<&Id>,
+        node_groups: &Registry<NodeGroup>,
+    ) -> Self {
+        let folds = super::inline_fold::FoldIndex::new(graph_id, group, node_groups);
         let (has_surface, has_volume, has_displacement) = output
             .map_or((false, false, false), |output| {
                 scan_output_feeds(group, output)
@@ -1414,8 +1404,7 @@ impl LinkIndex {
             graph: Some(graph_id.clone()),
             links_address: group.links.as_ptr().addr(),
             link_count: group.links.len(),
-            incoming,
-            primitive_nodes,
+            folds,
             output: output.cloned(),
             has_volume,
             has_surface,
@@ -1459,7 +1448,7 @@ impl PreparedMaterial {
             };
         };
         let output = Self::active_output(group);
-        let links = LinkIndex::new(graph_id, group, output);
+        let links = LinkIndex::new(graph_id, group, output, node_groups);
         let Some(output) = output else {
             return Self {
                 links,
@@ -1498,6 +1487,13 @@ impl PreparedMaterial {
         .then_some(index)
     }
 
+    fn fold_index(
+        &self,
+        graph_id: &Id,
+        group: &NodeGroup,
+    ) -> Option<&super::inline_fold::FoldIndex> {
+        self.link_index(graph_id, group).map(|index| &index.folds)
+    }
     /// Whether a link reaches the `Surface`, `Volume`, and `Displacement` sockets of `output` in `group`.
     fn output_feeds(&self, graph_id: &Id, group: &NodeGroup, output: &Id) -> (bool, bool, bool) {
         match self
@@ -1555,6 +1551,7 @@ struct GroupInputBinding<'a> {
     group: &'a NodeGroup,
     node_id: &'a Id,
     binding: Option<&'a GroupInputBinding<'a>>,
+    links: Option<&'a super::inline_fold::FoldIndex>,
     depth: usize,
 }
 
@@ -1566,8 +1563,8 @@ struct Evaluator<'graph, 'material, 'registry, 'workspace, 'prepared, 'scope> {
     math_semantics: crate::node_kernels::MathSemantics,
     /// The Alpha-linked Image Texture nodes of the material, from [`PreparedMaterial`].
     alpha_linked_images: &'prepared BTreeSet<Id>,
-    /// The incoming-link index of `group` from [`PreparedMaterial`]; `None` scans every link of the group.
-    links: Option<&'prepared LinkIndex>,
+    /// The graph's prebuilt incoming-link and fold index; `None` scans the links and skips prepared folding.
+    links: Option<&'scope super::inline_fold::FoldIndex>,
     /// The call site whose socket values feed this group's Group Input nodes.
     group_input_binding: Option<&'scope GroupInputBinding<'scope>>,
     group_depth: usize,
@@ -1672,10 +1669,11 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
         };
         let kind = group_socket_value_kind(&input_socket.socket_type)
             .ok_or_else(|| unsupported_node_id("NodeGroupInput", socket))?;
-        let (parent_group, parent_node_id, parent_binding, parent_depth) = (
+        let (parent_group, parent_node_id, parent_binding, parent_links, parent_depth) = (
             binding.group,
             binding.node_id,
             binding.binding,
+            binding.links,
             binding.depth,
         );
         let mut parent = Evaluator {
@@ -1685,7 +1683,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             workspace: self.workspace,
             math_semantics: self.math_semantics,
             alpha_linked_images: self.alpha_linked_images,
-            links: None,
+            links: parent_links,
             group_input_binding: parent_binding,
             group_depth: parent_depth,
         };
@@ -1734,6 +1732,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             group: self.group,
             node_id: id,
             binding: self.group_input_binding,
+            links: self.links,
             depth: self.group_depth,
         };
         self.workspace.active_groups.push(child_key);
@@ -1744,7 +1743,7 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             workspace: self.workspace,
             math_semantics: self.math_semantics,
             alpha_linked_images,
-            links: None,
+            links: self.links.and_then(|index| index.children.get(id)),
             group_input_binding: Some(&binding),
             group_depth,
         };
@@ -1756,10 +1755,20 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
     /// Whether `socket` of `node_id` takes a link, so its value comes from another node rather than the socket's
     /// stored default.
     fn is_linked(&self, node_id: &Id, socket: &str) -> bool {
-        self.group
-            .links
-            .iter()
-            .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket))
+        match self.links {
+            Some(index) => index
+                .incoming
+                .get(node_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|&link_index| self.group.links.get(link_index))
+                .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket)),
+            None => self
+                .group
+                .links
+                .iter()
+                .any(|link| link.to_node == *node_id && socket_matches(&link.to_socket, socket)),
+        }
     }
     fn inputs_fold_to_primitives(&self, node_id: &Id) -> bool {
         self.links.map_or_else(
@@ -3474,10 +3483,9 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
                 SHADER_MATH_OPERATIONS,
             )?
         };
-        let (default_a, default_b, default_c) = math_input_defaults(operation);
-        let first = self.scalar_input(id, &["Value"], default_a)? as f32;
-        let second = self.scalar_input(id, &["Value_001"], default_b)? as f32;
-        let third = self.scalar_input(id, &["Value_002"], default_c)? as f32;
+        let first = self.scalar_input(id, &["Value"], 0.5)? as f32;
+        let second = self.scalar_input(id, &["Value_001"], 0.5)? as f32;
+        let third = self.scalar_input(id, &["Value_002"], 0.5)? as f32;
         let clamp = {
             let node = self.node(id)?;
             node_setting_bool(id, &node.properties, "use_clamp", false, "ShaderNodeMath")?
@@ -3559,20 +3567,12 @@ impl<'registry> Evaluator<'_, '_, 'registry, '_, '_, '_> {
             }
             _ => return Err(invalid(format!("unknown Vector Math output `{socket}`"))),
         };
-        let second_default = if matches!(
-            operation,
-            "MULTIPLY" | "DIVIDE" | "POWER" | "MODULO" | "MULTIPLY_ADD"
-        ) {
-            DVec3::ONE
-        } else {
-            DVec3::ZERO
-        };
         let first = self
             .vector_input(id, &["Vector"], DVec3::ZERO)?
             .to_array()
             .map(|component| component as f32);
         let second = self
-            .vector_input(id, &["Vector_001"], second_default)?
+            .vector_input(id, &["Vector_001"], DVec3::ZERO)?
             .to_array()
             .map(|component| component as f32);
         let third = self
@@ -5311,21 +5311,6 @@ fn eevee_modulo_result(a: f32, b: f32) -> Option<f32> {
         }
         Err(crate::node_kernels::EeveeModuloError::QuotientOutOfRange) => None,
     }
-}
-
-fn math_input_defaults(operation: &str) -> (f64, f64, f64) {
-    let second = match operation {
-        "ADD" | "SUBTRACT" => 0.0,
-        "MULTIPLY" | "DIVIDE" | "POWER" | "FLOORED_MODULO" | "MODULO" | "ARCTAN2"
-        | "MULTIPLY_ADD" => 1.0,
-        _ => 0.5,
-    };
-    let third = match operation {
-        "MULTIPLY_ADD" => 0.0,
-        "COMPARE" => 0.001,
-        _ => 0.5,
-    };
-    (0.5, second, third)
 }
 
 fn ramp_element(value: &JsonValue) -> Result<(f64, [f64; 4])> {

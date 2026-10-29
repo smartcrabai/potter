@@ -1,0 +1,238 @@
+{
+  "cases": [
+    {
+      "id": "dynamic_math_arcsine_in_domain",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_arccosine_in_domain",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_arcsine_out_of_range",
+      "kind": "scalar"
+    },
+    {
+      "id": "constant_math_arcsine_out_of_range",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_arccosine_out_of_range",
+      "kind": "scalar"
+    },
+    {
+      "id": "constant_math_arccosine_out_of_range",
+      "kind": "scalar"
+    },
+    {
+      "id": "constant_map_range_arcsine_out_of_range",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_compare_defined",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_compare_sub_half_float_epsilon",
+      "kind": "scalar"
+    },
+    {
+      "id": "constant_math_compare_sub_half_float_epsilon",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_inverse_sqrt_positive",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_power_near_integer",
+      "kind": "scalar"
+    },
+    {
+      "id": "constant_math_power_near_integer",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_power_negative_noninteger",
+      "kind": "scalar"
+    },
+    {
+      "id": "constant_math_power_negative_noninteger",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_modulo",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_math_modulo_precision_boundary",
+      "kind": "scalar"
+    },
+    {
+      "id": "constant_math_modulo_precision_boundary",
+      "kind": "scalar"
+    },
+    {
+      "id": "constant_math_modulo_quotient_out_of_range",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_vector_sign",
+      "kind": "vector"
+    },
+    {
+      "id": "dynamic_vector_power_integer",
+      "kind": "vector"
+    },
+    {
+      "id": "dynamic_vector_power_near_integer",
+      "kind": "vector"
+    },
+    {
+      "id": "dynamic_vector_modulo",
+      "kind": "vector"
+    },
+    {
+      "id": "dynamic_vector_modulo_precision_boundary",
+      "kind": "vector"
+    },
+    {
+      "id": "constant_vector_modulo_precision_boundary",
+      "kind": "vector"
+    },
+    {
+      "id": "constant_vector_modulo_quotient_out_of_range",
+      "kind": "vector"
+    },
+    {
+      "id": "dynamic_vector_reflect_tiny_normal",
+      "kind": "vector"
+    },
+    {
+      "id": "dynamic_vector_refract_tiny_normal",
+      "kind": "vector"
+    },
+    {
+      "id": "dynamic_map_range_linear_zero_span",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_map_range_stepped_zero_steps",
+      "kind": "scalar"
+    },
+    {
+      "id": "dynamic_color_ramp_constant_table",
+      "kind": "color"
+    },
+    {
+      "id": "dynamic_color_ramp_linear_two_stop",
+      "kind": "color"
+    },
+    {
+      "id": "dynamic_color_ramp_linear_table_near_start",
+      "kind": "color"
+    },
+    {
+      "id": "dynamic_color_ramp_linear_table_near_end",
+      "kind": "color"
+    },
+    {
+      "id": "dynamic_float_curve_clip",
+      "kind": "scalar"
+    }
+  ],
+  "eevee": {
+    "constant_map_range_arcsine_out_of_range": 1.5703125,
+    "constant_math_arccosine_out_of_range": 3.140625,
+    "constant_math_arcsine_out_of_range": 1.5703125,
+    "constant_math_compare_sub_half_float_epsilon": 0.0,
+    "constant_math_modulo_precision_boundary": 0.0,
+    "constant_math_modulo_quotient_out_of_range": 0.0,
+    "constant_math_power_near_integer": 0.0,
+    "constant_math_power_negative_noninteger": 0.0,
+    "constant_vector_modulo_precision_boundary": [
+      0.0,
+      0.0999755859375,
+      0.0999755859375
+    ],
+    "constant_vector_modulo_quotient_out_of_range": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "dynamic_color_ramp_constant_table": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "dynamic_color_ramp_linear_table_near_end": [
+      0.1004638671875,
+      0.79541015625,
+      0.40478515625
+    ],
+    "dynamic_color_ramp_linear_table_near_start": [
+      0.8935546875,
+      0.101318359375,
+      0.20654296875
+    ],
+    "dynamic_color_ramp_linear_two_stop": [
+      0.8984375,
+      0.10125732421875,
+      0.2003173828125
+    ],
+    "dynamic_float_curve_clip": 0.919921875,
+    "dynamic_map_range_linear_zero_span": 0.0,
+    "dynamic_map_range_stepped_zero_steps": 0.25,
+    "dynamic_math_arccosine_in_domain": 1.3173828125,
+    "dynamic_math_arccosine_out_of_range": 0.0,
+    "dynamic_math_arcsine_in_domain": 0.252685546875,
+    "dynamic_math_arcsine_out_of_range": 0.0,
+    "dynamic_math_compare_defined": 1.0,
+    "dynamic_math_compare_sub_half_float_epsilon": 1.0,
+    "dynamic_math_inverse_sqrt_positive": 1.0,
+    "dynamic_math_modulo": 0.029998779296875,
+    "dynamic_math_modulo_precision_boundary": 0.0506591796875,
+    "dynamic_math_power_near_integer": 4.0,
+    "dynamic_math_power_negative_noninteger": 0.0,
+    "dynamic_vector_modulo": [
+      0.029998779296875,
+      0.0999755859375,
+      0.0999755859375
+    ],
+    "dynamic_vector_modulo_precision_boundary": [
+      0.0506591796875,
+      0.12493896484375,
+      0.114990234375
+    ],
+    "dynamic_vector_power_integer": [
+      0.25,
+      0.25,
+      0.25
+    ],
+    "dynamic_vector_power_near_integer": [
+      0.499755859375,
+      0.25,
+      1.0
+    ],
+    "dynamic_vector_reflect_tiny_normal": [
+      1.0,
+      0.0,
+      0.0
+    ],
+    "dynamic_vector_refract_tiny_normal": [
+      1.0,
+      0.0,
+      0.0
+    ],
+    "dynamic_vector_sign": [
+      0.058013916015625,
+      1.0,
+      1.0
+    ]
+  },
+  "engine": "BLENDER_EEVEE",
+  "resolution": [
+    280,
+    8
+  ]
+}

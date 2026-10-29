@@ -2244,9 +2244,11 @@ impl Evaluator<'_> {
             id,
             node,
             "Value",
-            EvalValue::Scalar(named_attribute_zero(&data_type)),
+            EvalValue::Scalar(named_attribute_input_default(&data_type)),
         )? {
-            EvalValue::Scalar(Value::Null) => Field::Constant(named_attribute_zero(&data_type)),
+            EvalValue::Scalar(Value::Null) => {
+                Field::Constant(named_attribute_input_default(&data_type))
+            }
             value => as_field(value),
         };
         let previous = if let Some(attribute) = geometry.mesh.attributes.get(&name) {
@@ -2322,7 +2324,7 @@ impl Evaluator<'_> {
             id,
             node,
             "Value",
-            EvalValue::Scalar(named_attribute_zero(data_type)),
+            EvalValue::Scalar(named_attribute_input_default(data_type)),
         )?);
         let previous = geometry.instance_attributes.attributes.get(name);
         if previous.is_some_and(|column| column.values.len() != geometry.instance_attributes.len())
@@ -2419,9 +2421,11 @@ impl Evaluator<'_> {
             id,
             node,
             "Value",
-            EvalValue::Scalar(named_attribute_zero(&data_type)),
+            EvalValue::Scalar(named_attribute_input_default(&data_type)),
         )? {
-            EvalValue::Scalar(Value::Null) => Field::Constant(named_attribute_zero(&data_type)),
+            EvalValue::Scalar(Value::Null) => {
+                Field::Constant(named_attribute_input_default(&data_type))
+            }
             value => as_field(value),
         };
         let mut values = Vec::with_capacity(count);
@@ -2448,17 +2452,6 @@ impl Evaluator<'_> {
             .and_then(Value::as_str)
             .unwrap_or("ADD")
             .to_ascii_uppercase();
-        let second_default = match operation.as_str() {
-            "ADD" | "SUBTRACT" => 0.0,
-            "MULTIPLY" | "DIVIDE" | "POWER" | "MODULO" | "FLOORED_MODULO" | "ARCTAN2"
-            | "MULTIPLY_ADD" => 1.0,
-            _ => 0.5,
-        };
-        let third_default = match operation.as_str() {
-            "MULTIPLY_ADD" => 0.0,
-            "COMPARE" => 0.001,
-            _ => 0.5,
-        };
         let first = as_field(self.input_value_with_node(
             id,
             node,
@@ -2469,13 +2462,13 @@ impl Evaluator<'_> {
             id,
             node,
             "Value_001",
-            EvalValue::Scalar(json!(second_default)),
+            EvalValue::Scalar(json!(0.5)),
         )?);
         let third = as_field(self.input_value_with_node(
             id,
             node,
             "Value_002",
-            EvalValue::Scalar(json!(third_default)),
+            EvalValue::Scalar(json!(0.5)),
         )?);
         Ok(EvalValue::Field(Field::Math {
             operation,
@@ -2497,14 +2490,7 @@ impl Evaluator<'_> {
             .and_then(Value::as_str)
             .unwrap_or("ADD")
             .to_ascii_uppercase();
-        let second_default = if matches!(
-            operation.as_str(),
-            "MULTIPLY" | "DIVIDE" | "POWER" | "MODULO" | "MULTIPLY_ADD"
-        ) {
-            [1.0, 1.0, 1.0]
-        } else {
-            [0.0; 3]
-        };
+        let second_default = [0.0; 3];
         let first = as_field(self.input_value_with_node(
             id,
             node,
@@ -2558,21 +2544,10 @@ impl Evaluator<'_> {
 
     fn integer_math_node(&mut self, id: &Id, node: &GraphNode) -> Result<EvalValue> {
         let operation = node_enum(node, "operation", "ADD");
-        let second_default = i32::from(matches!(
-            operation.as_str(),
-            "MULTIPLY"
-                | "DIVIDE"
-                | "MULTIPLY_ADD"
-                | "DIVIDE_CEIL"
-                | "DIVIDE_FLOOR"
-                | "DIVIDE_ROUND"
-                | "FLOORED_MODULO"
-                | "MODULO"
-        ));
         Ok(EvalValue::Field(Field::IntegerMath {
             operation,
             first: Box::new(self.field_input(id, node, "Value", json!(0))?),
-            second: Box::new(self.field_input(id, node, "Value_001", json!(second_default))?),
+            second: Box::new(self.field_input(id, node, "Value_001", json!(0))?),
             third: Box::new(self.field_input(id, node, "Value_002", json!(0))?),
         }))
     }
@@ -3766,41 +3741,7 @@ fn cache_simulation_state(
 }
 
 fn node_default_input(node: &GraphNode, socket: &str) -> Option<Value> {
-    match node.node_type.as_str() {
-        "ShaderNodeMath" => {
-            let operation = node_enum(node, "operation", "ADD");
-            Some(match socket {
-                "Value_001" => match operation.as_str() {
-                    "MULTIPLY" | "DIVIDE" | "POWER" | "FLOORED_MODULO" | "MODULO" | "ARCTAN2" => {
-                        json!(1.0)
-                    }
-                    "ADD" | "SUBTRACT" => json!(0.0),
-                    "MULTIPLY_ADD" => json!(1.0),
-                    _ => json!(0.5),
-                },
-                "Value_002" if operation == "MULTIPLY_ADD" => json!(0.0),
-                "Value_002" if operation == "COMPARE" => json!(0.001),
-                "Value" | "Value_002" => json!(0.5),
-                _ => return None,
-            })
-        }
-        "ShaderNodeVectorMath" => {
-            let operation = node_enum(node, "operation", "ADD");
-            Some(match socket {
-                "Vector_001"
-                    if matches!(
-                        operation.as_str(),
-                        "MULTIPLY" | "DIVIDE" | "POWER" | "MODULO" | "MULTIPLY_ADD"
-                    ) =>
-                {
-                    json!([1.0, 1.0, 1.0])
-                }
-                "Vector_002" if operation == "MULTIPLY_ADD" => json!([0.0, 0.0, 0.0]),
-                _ => default_input(&node.node_type, socket)?,
-            })
-        }
-        _ => default_input(&node.node_type, socket),
-    }
+    default_input(&node.node_type, socket)
 }
 
 fn default_input(node_type: &str, socket: &str) -> Option<Value> {
@@ -3829,7 +3770,8 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
         | ("GeometryNodeRealizeInstances", "Realize All")
         | ("GeometryNodeSubdivisionSurface", "Limit Surface") => json!(true),
         ("GeometryNodeRealizeInstances", "Depth")
-        | ("GeometryNodeDistributePointsOnFaces", "Seed") => json!(0),
+        | ("GeometryNodeDistributePointsOnFaces", "Seed")
+        | ("FunctionNodeIntegerMath", "Value" | "Value_001" | "Value_002") => json!(0),
         ("GeometryNodeMeshLine", "Count") => json!(10),
         ("GeometryNodeDistributePointsOnFaces", "Density" | "Density Max") => json!(10.0),
         ("GeometryNodeDistributePointsOnFaces", "Density Factor")
@@ -3841,7 +3783,7 @@ fn default_input(node_type: &str, socket: &str) -> Option<Value> {
         ("GeometryNodeSubdivisionSurface", "Boundary Smooth") => json!("ALL"),
         ("GeometryNodeSimulationOutput", "Skip") => json!(false),
         ("GeometryNodeRepeatInput", "Iterations") => json!(1),
-        ("ShaderNodeMixRGB", "Fac") | ("ShaderNodeMath", "Value" | "Value_001" | "Value_002") => {
+        ("ShaderNodeMath", "Value" | "Value_001" | "Value_002") | ("ShaderNodeMixRGB", "Fac") => {
             json!(0.5)
         }
         _ => return None,
@@ -6372,6 +6314,13 @@ fn named_attribute_zero(data_type: &str) -> Value {
         _ => Value::Null,
     }
 }
+fn named_attribute_input_default(data_type: &str) -> Value {
+    if data_type == "FLOAT_COLOR" {
+        json!([0.8, 0.8, 0.8, 1.0])
+    } else {
+        named_attribute_zero(data_type)
+    }
+}
 
 fn named_attribute_value(value: &Value, data_type: &str) -> Result<Value> {
     match data_type {
@@ -6430,21 +6379,8 @@ fn named_attribute_value(value: &Value, data_type: &str) -> Result<Value> {
                         )
                     })
             };
-            let quaternion =
-                glam::Quat::from_xyzw(component(0)?, component(1)?, component(2)?, component(3)?);
-            let length_squared = quaternion.length_squared();
-            if !length_squared.is_finite() || length_squared == 0.0 {
-                return Err(evaluation(
-                    "QUATERNION attribute value cannot be normalized",
-                ));
-            }
-            let normalized = quaternion.normalize().to_array();
-            if normalized.iter().any(|component| !component.is_finite()) {
-                return Err(evaluation(
-                    "QUATERNION attribute value cannot be normalized",
-                ));
-            }
-            Ok(json!(normalized.map(f64::from)))
+            let values = [component(0)?, component(1)?, component(2)?, component(3)?];
+            Ok(json!(values.map(f64::from)))
         }
         _ => Err(evaluation("unsupported Geometry Nodes attribute data type")),
     }

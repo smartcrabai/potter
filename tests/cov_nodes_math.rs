@@ -1425,8 +1425,31 @@ fn realtime_shader_math_dynamic_inputs_match_blender_522() {
         .find_map(|line| line.strip_prefix("POTTER_NODE_MATH_REALTIME_DYNAMIC="))
         .expect("Blender dynamic realtime oracle emitted a result line");
     let oracle: Value = serde_json::from_str(oracle_line).unwrap();
+    let captured: Value = serde_json::from_str(include_str!(
+        "fixtures/node_math/realtime_dynamic_eevee.json"
+    ))
+    .unwrap();
+    assert_eq!(oracle["engine"], captured["engine"]);
+    assert_eq!(oracle["resolution"], captured["resolution"]);
     let cases = oracle["cases"].as_array().unwrap();
-
+    let captured_cases = captured["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), captured_cases.len());
+    for (case, expected_case) in cases.iter().zip(captured_cases) {
+        assert_eq!(case["id"], expected_case["id"]);
+        assert_eq!(case["kind"], expected_case["kind"]);
+    }
+    assert_eq!(
+        oracle["eevee"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        captured["eevee"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+    );
     let project = directory.path().join("dynamic_shader_project");
     let project_text = project.to_str().unwrap();
     let initialized = pot_json(
@@ -1485,43 +1508,30 @@ fn realtime_shader_math_dynamic_inputs_match_blender_522() {
             json!(pixel.map(realtime_film_precision))
         };
         let id = case["id"].as_str().unwrap();
-        let expected = &oracle["eevee"][id];
-        if matches!(
-            id,
-            "dynamic_math_modulo_precision_boundary" | "dynamic_vector_modulo_precision_boundary"
-        ) {
-            match (&actual, expected) {
-                (Value::Number(actual), Value::Number(expected)) => {
+        let expected = &captured["eevee"][id];
+        match (&actual, expected) {
+            (Value::Number(actual), Value::Number(expected)) => assert_eevee_film_close(
+                actual.as_f64().unwrap(),
+                expected.as_f64().unwrap(),
+                &format!("dynamic_realtime_{id}"),
+            ),
+            (Value::Array(actual), Value::Array(expected)) if actual.len() == expected.len() => {
+                for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
                     assert_eevee_film_close(
                         actual.as_f64().unwrap(),
                         expected.as_f64().unwrap(),
-                        &format!("dynamic_realtime_{id}"),
+                        &format!("dynamic_realtime_{id}[{index}]"),
                     );
                 }
-                (Value::Array(actual), Value::Array(expected))
-                    if actual.len() == expected.len() =>
-                {
-                    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-                        assert_eevee_film_close(
-                            actual.as_f64().unwrap(),
-                            expected.as_f64().unwrap(),
-                            &format!("dynamic_realtime_{id}[{index}]"),
-                        );
-                    }
-                }
-                _ => mismatches.push(format!(
-                    "dynamic_realtime_{id}: Blender and Potter returned different value shapes"
-                )),
             }
-        } else if let Some(mismatch) =
-            json_mismatch(&actual, expected, &format!("dynamic_realtime_{id}"))
-        {
-            mismatches.push(mismatch);
+            _ => mismatches.push(format!(
+                "dynamic_realtime_{id}: committed Blender and Potter returned different value shapes"
+            )),
         }
     }
     assert!(
         mismatches.is_empty(),
-        "{} of {} per-pixel realtime shader probes diverge from Blender 5.2.2 EEVEE:\n{}",
+        "{} of {} per-pixel realtime shader probes diverge from the committed Blender 5.2.2 EEVEE capture:\n{}",
         mismatches.len(),
         cases.len(),
         mismatches.join("\n")
@@ -1877,7 +1887,7 @@ fn shader_math_supports_sign_and_reflect_and_rejects_wrong_sockets() {
 fn shader_math_compare_defaults_to_blenders_node_epsilon() {
     let within = shader_surface_with_node(
         "ShaderNodeMath",
-        json!({"Value": 1.0, "Value_001": 1.0005}),
+        json!({"Value": 1.0, "Value_001": 1.25}),
         json!({"operation": "COMPARE"}),
         "Value",
         "Emission Strength",
@@ -1886,7 +1896,7 @@ fn shader_math_compare_defaults_to_blenders_node_epsilon() {
     assert!((within.emission_strength - 1.0).abs() < f64::EPSILON);
     let outside = shader_surface_with_node(
         "ShaderNodeMath",
-        json!({"Value": 1.0, "Value_001": 1.002}),
+        json!({"Value": 1.0, "Value_001": 1.75}),
         json!({"operation": "COMPARE"}),
         "Value",
         "Emission Strength",

@@ -1335,7 +1335,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
     assert_eq!(shader_math_family["status"], "partial");
     assert_eq!(
         shader_math_family["reason"],
-        "ShaderNodeMix ROTATION remains unsupported; primitive-only shader subgraphs use Blender's CPU MultiFunctions, while realtime EEVEE refuses varying Math and VectorMath MODULO quotients outside the signed 32-bit range, varying subnormal VectorMath NORMALIZE inputs, varying non-positive inverse square root, and varying positive-input LOGARITHM with base one. Constant-folded ShaderNodeMath POWER with use_clamp disabled, zero base, and negative exponent is refused because Cycles' film clamp sanitizes its non-finite contribution."
+        "ShaderNodeMix ROTATION remains unsupported; constant-only shader subgraphs, including values forwarded through nested ShaderNodeGroup inputs and Group Output sockets, use Blender's CPU MultiFunctions. Unlinked Math value inputs default to 0.5 and Vector Math vector inputs to zero. Realtime EEVEE refuses varying Math and VectorMath MODULO quotients outside the signed 32-bit range, varying subnormal VectorMath NORMALIZE inputs, varying non-positive inverse square root, and varying positive-input LOGARITHM with base one. Constant-folded ShaderNodeMath POWER with use_clamp disabled, zero base, and negative exponent is refused because Cycles' film clamp sanitizes its non-finite contribution."
     );
     let image_surface_format = features
         .iter()
@@ -1544,7 +1544,7 @@ fn feature_catalog_operations_and_unsupported_rows_are_consistent() {
     );
     assert_eq!(
         store_named_attribute_types["reason"],
-        "Store Named Attribute supports FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN storage; FLOAT_COLOR components must be finite f32 values and QUATERNION components are finite f32 values in xyzw order. INT requires signed 32-bit values and BOOLEAN requires booleans. BYTE_COLOR, FLOAT2, FLOAT4X4, INT8, and STRING are unsupported."
+        "Store Named Attribute supports FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN storage; an absent FLOAT_COLOR Value defaults to Blender's [0.8, 0.8, 0.8, 1.0], while unselected elements of a new attribute receive the type zero. FLOAT_COLOR components must be finite f32 values and QUATERNION components are finite f32 values in xyzw order and are stored verbatim without normalization, including zero. INT requires signed 32-bit values and BOOLEAN requires booleans. BYTE_COLOR, FLOAT2, FLOAT4X4, INT8, and STRING are unsupported."
     );
     for feature_id in [
         "shader.node.ShaderNodeMath.operation.ARCSINE.glsl_undefined_domain",

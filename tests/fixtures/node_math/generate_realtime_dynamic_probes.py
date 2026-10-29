@@ -9,7 +9,9 @@ import tempfile
 if bpy.app.version != (5, 2, 2):
     raise RuntimeError("dynamic node math oracle requires Blender 5.2.2, found " + bpy.app.version_string)
 
-blend_path = sys.argv[sys.argv.index("--") + 1]
+arguments = sys.argv[sys.argv.index("--") + 1:]
+blend_path = arguments[0]
+capture_path = arguments[1] if len(arguments) > 1 else None
 
 CASES = [
     ("dynamic_math_arcsine_in_domain", "scalar"),
@@ -461,9 +463,17 @@ def capture(probes):
 build_scene(CASES)
 eevee_results = capture(CASES)
 bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+scene = bpy.context.scene
+result = {
+    "engine": scene.render.engine,
+    "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+    "cases": [{"id": identifier, "kind": kind} for identifier, kind in CASES],
+    "eevee": eevee_results,
+}
+if capture_path:
+    with open(capture_path, "w", encoding="utf-8") as capture_file:
+        json.dump(result, capture_file, sort_keys=True, indent=2, allow_nan=False)
+        capture_file.write("\n")
 print("POTTER_NODE_MATH_REALTIME_DYNAMIC=" + json.dumps(
-    {"cases": [{"id": identifier, "kind": kind} for identifier, kind in CASES],
-     "eevee": eevee_results},
-    sort_keys=True,
-    allow_nan=False,
+    result, sort_keys=True, allow_nan=False,
 ))

@@ -83,7 +83,7 @@ pub fn feature_catalog() -> Value {
             [true, false, true, true, false, false, true],
             "partial",
             &json!(
-                "ShaderNodeMix ROTATION remains unsupported; primitive-only shader subgraphs use Blender's CPU MultiFunctions, while realtime EEVEE refuses varying Math and VectorMath MODULO quotients outside the signed 32-bit range, varying subnormal VectorMath NORMALIZE inputs, varying non-positive inverse square root, and varying positive-input LOGARITHM with base one. Constant-folded ShaderNodeMath POWER with use_clamp disabled, zero base, and negative exponent is refused because Cycles' film clamp sanitizes its non-finite contribution."
+                "ShaderNodeMix ROTATION remains unsupported; constant-only shader subgraphs, including values forwarded through nested ShaderNodeGroup inputs and Group Output sockets, use Blender's CPU MultiFunctions. Unlinked Math value inputs default to 0.5 and Vector Math vector inputs to zero. Realtime EEVEE refuses varying Math and VectorMath MODULO quotients outside the signed 32-bit range, varying subnormal VectorMath NORMALIZE inputs, varying non-positive inverse square root, and varying positive-input LOGARITHM with base one. Constant-folded ShaderNodeMath POWER with use_clamp disabled, zero base, and negative exponent is refused because Cycles' film clamp sanitizes its non-finite contribution."
             ),
         ),
         unsupported(
@@ -204,7 +204,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "shader.node_groups",
-            "Nested ShaderNodeGroup interfaces, defaults, lazy hit-context Group Input, and linked shader outputs",
+            "Nested ShaderNodeGroup interfaces and defaults, constant math folding across Group Input/Group Output boundaries, lazy hit-context Group Input, and linked shader outputs",
             "ShaderNodeGroup",
             &[
                 "graph.create",
@@ -1541,7 +1541,7 @@ pub fn feature_catalog() -> Value {
         ),
         supported(
             "geometry_nodes.math_family",
-            "Math/Vector Math, typed Integer/Boolean/Compare, Map Range, Clamp, FLOAT/VECTOR/RGBA/ROTATION Mix, legacy MixRGB, Color Ramp/Curves, and Boolean Random Value fields",
+            "Math/Vector Math and Integer Math use Blender declaration defaults; Boolean/Compare, Map Range, Clamp, FLOAT/VECTOR/RGBA/ROTATION Mix, legacy MixRGB, Color Ramp/Curves, and Boolean Random Value fields",
             "GeometryNodeTree",
             &[
                 "graph.create",
@@ -1630,14 +1630,14 @@ pub fn feature_catalog() -> Value {
             "Store Named Attribute types other than FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN",
             "GeometryNodeTree",
             &[],
-            "Store Named Attribute supports FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN storage; FLOAT_COLOR components must be finite f32 values and QUATERNION components are finite f32 values in xyzw order. INT requires signed 32-bit values and BOOLEAN requires booleans. BYTE_COLOR, FLOAT2, FLOAT4X4, INT8, and STRING are unsupported.",
+            "Store Named Attribute supports FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN storage; an absent FLOAT_COLOR Value defaults to Blender's [0.8, 0.8, 0.8, 1.0], while unselected elements of a new attribute receive the type zero. FLOAT_COLOR components must be finite f32 values and QUATERNION components are finite f32 values in xyzw order and are stored verbatim without normalization, including zero. INT requires signed 32-bit values and BOOLEAN requires booleans. BYTE_COLOR, FLOAT2, FLOAT4X4, INT8, and STRING are unsupported.",
         ),
         unsupported(
             "graph.node.capture_attribute.data_type",
-            "Capture Attribute types other than FLOAT, FLOAT_VECTOR, INT, and BOOLEAN",
+            "Capture Attribute types other than FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN",
             "GeometryNodeTree",
             &[],
-            "Capture Attribute captures FLOAT, FLOAT_VECTOR, INT, and BOOLEAN fields; other Blender attribute data types are refused.",
+            "Capture Attribute supports FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN fields; an absent FLOAT_COLOR Value defaults to Blender's [0.8, 0.8, 0.8, 1.0]. Other attribute data types are refused.",
         ),
         unsupported(
             "graph.node.capture_attribute.dynamic_items",
@@ -1648,10 +1648,10 @@ pub fn feature_catalog() -> Value {
         ),
         unsupported(
             "graph.node.input_named_attribute.data_type",
-            "Named Attribute types other than FLOAT, FLOAT_VECTOR, INT, and BOOLEAN",
+            "Named Attribute types other than FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN",
             "GeometryNodeTree",
             &[],
-            "Named Attribute supports FLOAT, FLOAT_VECTOR, INT, and BOOLEAN outputs plus INT-to-FLOAT conversion; other conversions are refused.",
+            "Named Attribute supports FLOAT, FLOAT_VECTOR, FLOAT_COLOR, QUATERNION, INT, and BOOLEAN outputs plus INT-to-FLOAT conversion; other conversions are refused.",
         ),
         unsupported(
             "graph.node.random_value.data_type",

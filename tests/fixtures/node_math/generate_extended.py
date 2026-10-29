@@ -11,7 +11,9 @@ import tempfile
 if bpy.app.version != (5, 2, 2):
     raise RuntimeError("extended node math oracle requires Blender 5.2.2, found " + bpy.app.version_string)
 
-blend_path = sys.argv[sys.argv.index("--") + 1]
+arguments = sys.argv[sys.argv.index("--") + 1:]
+blend_path = arguments[0]
+capture_path = arguments[1] if len(arguments) > 1 else None
 F32_MAX = 3.4028234663852886e38
 
 
@@ -968,12 +970,33 @@ def main():
     realtime_cases = [case for case in cases if case["realtime_probe"]]
     bpy.ops.wm.read_factory_settings(use_empty=True)
     build_shader_scene(realtime_cases)
-    bpy.context.scene.render.engine = "BLENDER_EEVEE"
+    scene = bpy.context.scene
+    scene.render.engine = "BLENDER_EEVEE"
     eevee_results = read_shader_reference(realtime_cases, "eevee_probe.exr")
+    capture = {
+        "engine": scene.render.engine,
+        "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+        "cases": [
+            {"id": case["id"], "render_kind": case["render_kind"]}
+            for case in realtime_cases
+        ],
+        "eevee": eevee_results,
+    }
+    if capture_path:
+        with open(capture_path, "w", encoding="utf-8") as capture_file:
+            json.dump(capture, capture_file, sort_keys=True, indent=2, allow_nan=False)
+            capture_file.write("\n")
     print("POTTER_NODE_MATH_EXTENDED=" + json.dumps(
-        {"cases": cases, "geometry": geometry_results, "shader": shader_results,
-         "eevee": eevee_results},
-        sort_keys=True, allow_nan=False))
+        {
+            "cases": cases,
+            "geometry": geometry_results,
+            "shader": shader_results,
+            "eevee_engine": capture["engine"],
+            "eevee_resolution": capture["resolution"],
+            "eevee": eevee_results,
+        },
+        sort_keys=True, allow_nan=False,
+    ))
 
 
 main()

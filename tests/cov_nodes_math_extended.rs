@@ -29,6 +29,8 @@ struct Oracle {
     geometry: Map<String, Value>,
     shader: Map<String, Value>,
     eevee: Map<String, Value>,
+    eevee_engine: String,
+    eevee_resolution: Value,
     blend_path: PathBuf,
 }
 
@@ -69,6 +71,8 @@ fn run_oracle() -> Oracle {
         geometry: result["geometry"].as_object().unwrap().clone(),
         shader: result["shader"].as_object().unwrap().clone(),
         eevee: result["eevee"].as_object().unwrap().clone(),
+        eevee_engine: result["eevee_engine"].as_str().unwrap().to_owned(),
+        eevee_resolution: result["eevee_resolution"].clone(),
         blend_path,
     }
 }
@@ -238,6 +242,29 @@ fn pot_json(command: &mut Command, label: &str) -> Value {
 
 fn compare_potter_shader_render(oracle: &Oracle) {
     let blender = blender_file::blender_executable().expect("Blender 5.2.2 is available");
+    let captured: Value =
+        serde_json::from_str(include_str!("fixtures/node_math/extended_eevee_eevee.json")).unwrap();
+    assert_eq!(oracle.eevee_engine, captured["engine"].as_str().unwrap());
+    assert_eq!(oracle.eevee_resolution, captured["resolution"]);
+    let realtime_cases: Vec<&Value> = oracle
+        .cases
+        .iter()
+        .filter(|case| case["realtime_probe"].as_bool() == Some(true))
+        .collect();
+    let captured_cases = captured["cases"].as_array().unwrap();
+    assert_eq!(realtime_cases.len(), captured_cases.len());
+    for (case, expected_case) in realtime_cases.iter().zip(captured_cases) {
+        assert_eq!(case["id"], expected_case["id"]);
+        assert_eq!(case["render_kind"], expected_case["render_kind"]);
+    }
+    assert_eq!(
+        oracle.eevee.keys().collect::<Vec<_>>(),
+        captured["eevee"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+    );
     let project = oracle.directory.path().join("extended_shader_project");
     let project_text = project.to_str().unwrap();
     let initialized = pot_json(
@@ -313,13 +340,9 @@ fn compare_potter_shader_render(oracle: &Oracle) {
         shader_cases.len(),
         mismatches.join("\n")
     );
-    let realtime_cases: Vec<&Value> = oracle
-        .cases
-        .iter()
-        .filter(|case| {
-            case["realtime_probe"].as_bool() == Some(true)
-                && !oracle.eevee[case["id"].as_str().unwrap()].is_string()
-        })
+    let realtime_cases: Vec<&Value> = realtime_cases
+        .into_iter()
+        .filter(|case| !captured["eevee"][case["id"].as_str().unwrap()].is_string())
         .collect();
     let realtime_directory = oracle
         .directory
@@ -360,30 +383,30 @@ fn compare_potter_shader_render(oracle: &Oracle) {
             json!(pixel.map(realtime_film_precision))
         };
         let id = case["id"].as_str().unwrap();
-        if matches!(
-            id,
-            "ramp_linear_two_stop_near_start" | "map_vector_stepped_nonpositive_steps"
-        ) {
-            let actual_values = actual.as_array().unwrap();
-            let expected_values = oracle.eevee[id].as_array().unwrap();
-            for (channel, (actual, expected)) in
-                actual_values.iter().zip(expected_values).enumerate()
-            {
-                assert_eevee_film_close(
-                    actual.as_f64().unwrap(),
-                    expected.as_f64().unwrap(),
-                    &format!("realtime_shader_{id}[{channel}]"),
-                );
+        let expected = &captured["eevee"][id];
+        match (&actual, expected) {
+            (Value::Number(actual), Value::Number(expected)) => assert_eevee_film_close(
+                actual.as_f64().unwrap(),
+                expected.as_f64().unwrap(),
+                &format!("realtime_shader_{id}"),
+            ),
+            (Value::Array(actual), Value::Array(expected)) if actual.len() == expected.len() => {
+                for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                    assert_eevee_film_close(
+                        actual.as_f64().unwrap(),
+                        expected.as_f64().unwrap(),
+                        &format!("realtime_shader_{id}[{channel}]"),
+                    );
+                }
             }
-        } else if let Some(mismatch) =
-            json_mismatch(&actual, &oracle.eevee[id], &format!("realtime_shader_{id}"))
-        {
-            mismatches.push(mismatch);
+            _ => mismatches.push(format!(
+                "realtime_shader_{id}: committed Blender and Potter returned different value shapes"
+            )),
         }
     }
     assert!(
         mismatches.is_empty(),
-        "{} of {} exact-pixel Potter realtime probes diverge from Blender 5.2.2 EEVEE:\n{}",
+        "{} of {} Potter realtime probes diverge from the committed Blender 5.2.2 EEVEE capture:\n{}",
         mismatches.len(),
         realtime_cases.len(),
         mismatches.join("\n")
